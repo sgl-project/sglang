@@ -1935,9 +1935,18 @@ class ServerArgs:
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
+            )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            # TODO: check compatible runner backend
+            if os.environ.get("SGLANG_MOE_NVFP4_DISPATCH") is None:
+                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
+                logger.warning(
+                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
+                )
+            assert self.moe_runner_backend in ["flashinfer_cutlass", "flashinfer_cutedsl"], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):

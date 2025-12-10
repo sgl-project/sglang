@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -13,13 +14,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.environ import envs
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
-from sglang.srt.utils import get_int_env_var, is_flashinfer_available, round_up
-
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import get_int_env_var, is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +84,9 @@ class FlashinferDispatcher(BaseDispatcher):
         params_dtype: torch.dtype = None,  # Unused
     ):
         try:
+            from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
             from flashinfer.comm.mapping import Mapping
             from flashinfer.comm.mnnvl import MnnvlConfig
-            from flashinfer.comm import (
-                MoeAlltoAll,
-                moe_a2a_get_workspace_size_per_rank,
-            )
         except ImportError:
             raise ImportError(
                 "Flashinfer is not installed or does not support A2A. "
@@ -135,8 +131,7 @@ class FlashinferDispatcher(BaseDispatcher):
             total_dispatch_payload_size_per_token=total_dispatch_payload_size_per_token,
             combine_payload_size_per_token=combine_payload_size_per_token,
         )
-        # Pad to required alignment for mnnvl memory
-        self.workspace_size = round_up(self.workspace_size, 1 << 29)
+
         self.mapping = Mapping(
             rank=self.group.rank(),
             tp_size=self.group.size(),
@@ -179,12 +174,16 @@ class FlashinferDispatcher(BaseDispatcher):
                 dtype=x.dtype,
                 device=x.device,
             )
+            # -1 will be ignored by flashinfer cutlass moe
             topk_ids = torch.full(
                 (1, topk_ids.shape[1]), -1, dtype=topk_ids.dtype, device=topk_ids.device
             )
-            # Hack for dummy token so it is routed to this rank and requires no transfer
+            # Dispatch doesn't handle -1 topk id properly. Hack for dispatch with dummy token - will route the dummy token to this rank and requires no transfer.
             topk_ids_current_rank = torch.full(
-                (1, topk_ids.shape[1]), self.group.rank()*self.num_local_experts, dtype=topk_ids.dtype, device=topk_ids.device
+                (1, topk_ids.shape[1]),
+                self.group.rank() * self.num_local_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
             )
             topk_weights = torch.zeros(
                 (1, topk_weights.shape[1]),
@@ -215,7 +214,6 @@ class FlashinferDispatcher(BaseDispatcher):
             topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=-1,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:
