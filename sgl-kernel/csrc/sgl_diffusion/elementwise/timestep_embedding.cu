@@ -14,16 +14,17 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cassert>
-#include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <torch/extension.h>
 
+#include <cassert>
+#include <cmath>
+
 // TODO: temp include for debug
 #include "utils.h"
-#include "vec_dtypes.cuh" // #include <flashinfer/vec_dtypes.cuh>
+#include "vec_dtypes.cuh"  // #include <flashinfer/vec_dtypes.cuh>
 using namespace flashinfer;
 
 // // TODO: debug only for now
@@ -37,7 +38,8 @@ using namespace flashinfer;
 
 // TODO: hard code for now. reuse in some where
 // at::vec::convert_to_float instead later
-template <typename T> __device__ float convert_to_float(T x) {
+template <typename T>
+__device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -50,7 +52,8 @@ template <typename T> __device__ float convert_to_float(T x) {
   }
 }
 
-template <typename T> __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
+template <typename T>
+__device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   if constexpr (std::is_same_v<T, __nv_bfloat16>) {
     return x;
   } else if constexpr (std::is_same_v<T, __half>) {
@@ -62,7 +65,8 @@ template <typename T> __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   }
 }
 
-template <typename T> __device__ __half convert_to_float16(T x) {
+template <typename T>
+__device__ __half convert_to_float16(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return x;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -74,7 +78,8 @@ template <typename T> __device__ __half convert_to_float16(T x) {
   }
 }
 
-template <typename O, typename T> __device__ O cast_to(T x) {
+template <typename O, typename T>
+__device__ O cast_to(T x) {
   if constexpr (std::is_same_v<O, float>) {
     return convert_to_float(x);
   } else if constexpr (std::is_same_v<O, __half>) {
@@ -86,27 +91,27 @@ template <typename O, typename T> __device__ O cast_to(T x) {
   }
 }
 
-#define DIM_SWITCH(COND, CONST_NAME, BAD_CASE, ...)                            \
-  [&] {                                                                        \
-    if (COND == 512) {                                                         \
-      constexpr static int CONST_NAME = 512;                                   \
-      return __VA_ARGS__();                                                    \
-    } else if (COND == 1024) {                                                 \
-      constexpr static int CONST_NAME = 1024;                                  \
-      return __VA_ARGS__();                                                    \
-    } else if (COND == 2048) {                                                 \
-      constexpr static int CONST_NAME = 2048;                                  \
-      return __VA_ARGS__();                                                    \
-    } else if (COND == 4096) {                                                 \
-      constexpr static int CONST_NAME = 4096;                                  \
-      return __VA_ARGS__();                                                    \
-    } else if (COND == 8192) {                                                 \
-      constexpr static int CONST_NAME = 8192;                                  \
-      return __VA_ARGS__();                                                    \
-    } else {                                                                   \
-      constexpr static int CONST_NAME = BAD_CASE;                              \
-      return __VA_ARGS__();                                                    \
-    }                                                                          \
+#define DIM_SWITCH(COND, CONST_NAME, BAD_CASE, ...) \
+  [&] {                                             \
+    if (COND == 512) {                              \
+      constexpr static int CONST_NAME = 512;        \
+      return __VA_ARGS__();                         \
+    } else if (COND == 1024) {                      \
+      constexpr static int CONST_NAME = 1024;       \
+      return __VA_ARGS__();                         \
+    } else if (COND == 2048) {                      \
+      constexpr static int CONST_NAME = 2048;       \
+      return __VA_ARGS__();                         \
+    } else if (COND == 4096) {                      \
+      constexpr static int CONST_NAME = 4096;       \
+      return __VA_ARGS__();                         \
+    } else if (COND == 8192) {                      \
+      constexpr static int CONST_NAME = 8192;       \
+      return __VA_ARGS__();                         \
+    } else {                                        \
+      constexpr static int CONST_NAME = BAD_CASE;   \
+      return __VA_ARGS__();                         \
+    }                                               \
   }()
 
 // // TODO: remove
@@ -119,9 +124,7 @@ template <typename O, typename T> __device__ O cast_to(T x) {
 // }
 
 template <typename T, typename O, uint32_t kBlockSizeDim, uint32_t kVecSize = 8, uint32_t kNumThr>
-__global__ void
-timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
-                          int max_period, int stride_out_b) {
+__global__ void timestep_embedding_kernel(T* t_ptr, O* output_ptr, int B, int dim, int max_period, int stride_out_b) {
   // TODO: add comments
   int pid_b = blockIdx.x;
   int pid_d = blockIdx.y;
@@ -152,7 +155,6 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
   // main loop
   int d_idx = d_start + tid * kVecSize;
   for (; d_idx < end; d_idx += num_thread_values) {
-
 #pragma unroll
     for (int i = 0; i < kVecSize; i++) {
       if (d_idx + i >= end) {
@@ -202,9 +204,7 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
 
 // NOTE: output always be float32 now. According to python code:
 // timestep_embedding
-torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
-                                             torch::Tensor &output, int dim,
-                                             int max_period) {
+torch::Tensor timestep_embedding_kernel(torch::Tensor& t, torch::Tensor& output, int64_t dim, int64_t max_period) {
   TORCH_CHECK(t.dim() == 1 and t.stride(0) == 1, "t should be 1D");
   TORCH_CHECK(output.dim() == 2 and output.stride(1) == 1, "output should be a contiguous 2D tensor.");
 
@@ -214,13 +214,11 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
 
   TORCH_CHECK(t.device().is_cuda(), "t must be a CUDA tensor");
   TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
-  TORCH_CHECK(t.device() == output.device(),
-              "t and output must be on the same device");
+  TORCH_CHECK(t.device() == output.device(), "t and output must be on the same device");
 
   // TODO: review
   // To align with timestep_embedding python code.
-  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float,
-              "Output buffer should be float32.");
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float, "Output buffer should be float32.");
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -230,10 +228,7 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
   DIM_SWITCH(dim, kDim, /* bad case */ 1, [&] {
     // if dim not in [512, 1024, 2048, 4096]:
     //    vec_size = 1
-    constexpr int vec_size = (kDim % 16 == 0)   ? 8
-                             : (kDim % 8 == 0) ? 4
-                             : (kDim % 4 == 0) ? 2
-                                               : 1;
+    constexpr int vec_size = (kDim % 16 == 0) ? 8 : (kDim % 8 == 0) ? 4 : (kDim % 4 == 0) ? 2 : 1;
     // constexpr int num_threads = 512;
     // constexpr int BLOCK_SIZE_DIM = vec_size * num_threads;
     constexpr int num_threads = 128;
@@ -253,20 +248,21 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
       using o_type = float;
       timestep_embedding_kernel<t_type, o_type, BLOCK_SIZE_DIM, vec_size, num_threads>
           <<<grid_size, block_size, 0, stream>>>(
-              static_cast<t_type *>(t.data_ptr()),
-              static_cast<o_type *>(output.data_ptr()), B, dim, max_period,
+              static_cast<t_type*>(t.data_ptr()),
+              static_cast<o_type*>(output.data_ptr()),
+              B,
+              dim,
+              max_period,
               stride_out_b);
     });
   });
 
   cudaDeviceSynchronize();
   cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess,
-              "CUDA kernel launch failed: ", cudaGetErrorString(err));
+  TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
   return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("timestep_embedding_kernel_cuda", &timestep_embedding_kernel_cuda,
-        "timestep_embedding_kernel_cuda");
+  m.def("timestep_embedding_kernel", &timestep_embedding_kernel, "timestep_embedding_kernel");
 }

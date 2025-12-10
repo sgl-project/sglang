@@ -404,3 +404,18 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
+
+
+def timestep_embedding(
+    t: torch.Tensor,
+    dim: int,
+    max_period: int = 10000,
+    dtype: torch.dtype = torch.float32,
+):
+    # TODO: review, output dtype always be float32. According to python code:
+    #  sglang/python/sglang/multimodal_gen/runtime/layers/visual_embedding.py
+    dtype = torch.float32
+
+    B = t.shape[0]
+    output = torch.empty((B, dim), dtype=dtype, device=t.device)
+    return torch.ops.sgl_kernel.timestep_embedding_kernel(t, output, dim, max_period)

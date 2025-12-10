@@ -608,6 +608,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
   m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
+
+  /*
+   * From csrc/sgl_diffusion/elementwise
+   */
+  m.def("timestep_embedding_kernel(Tensor input, Tensor output, int dim, int max_period) -> Tensor");
+  m.impl("timestep_embedding_kernel", torch::kCUDA, &timestep_embedding_kernel);
 }
 
 REGISTER_EXTENSION(common_ops)

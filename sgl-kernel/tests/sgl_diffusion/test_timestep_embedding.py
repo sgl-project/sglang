@@ -14,6 +14,8 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     timestep_embedding_triton,
 )
 
+# TODO: refactor with sgl-kernel style
+
 
 class TestTimestepEmbed(unittest.TestCase):
     NUM_BATCH = [1, 2, 8, 63, 256, 512, 613, 1024, 1536]
