@@ -455,16 +455,6 @@ def alloc_for_extend(
             out_index_cache_loc,
         )
 
-    # Log allocation info per request
-    if is_enable_hierarchical_nsa(batch.tree_cache.token_to_kv_pool_allocator):
-        allocator = batch.tree_cache.token_to_kv_pool_allocator
-        for i, req in enumerate(batch.reqs):
-            logger.info(
-                f"[KV_ALLOC] req={req.rid[:8]}, extend_len={batch.extend_lens[i]}, "
-                f"prefix_len={batch.prefix_lens[i]}, seq_len={batch.seq_lens_cpu[i].item()}, "
-                f"kv_avail={allocator.kv_allocator.available_size()}/{allocator._size_kv}"
-            )
-
     return out_cache_loc, req_pool_indices_device, req_pool_indices, out_index_cache_loc
 
 
@@ -725,7 +715,7 @@ def _alloc_decode_nsa(batch: ScheduleBatch, token_per_req: int) -> tuple:
 
         out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
         batch.req_to_token_pool.write(
-            (batch.req_pool_indices, locs[non_truncated_indices]),
+            (batch.req_pool_indices[non_truncated_indices], locs[non_truncated_indices]),
             out_cache_loc[non_truncated_indices],
         )
 
