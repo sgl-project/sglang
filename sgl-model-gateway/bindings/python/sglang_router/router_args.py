@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Dict, List, Optional
 
+from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+
 logger = logging.getLogger(__name__)
 
 
@@ -520,11 +522,14 @@ class RouterArgs:
             default=None,
             help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
         )
+        # Get parser choices dynamically from the Rust implementation
+        tool_call_parser_choices = get_available_tool_call_parsers()
         parser.add_argument(
             f"--{prefix}tool-call-parser",
             type=str,
             default=None,
-            help="Specify the parser for handling tool-call interactions",
+            choices=tool_call_parser_choices,
+            help=f"Specify the parser for tool-call interactions (e.g., json, qwen)",
         )
         # MCP server configuration
         parser.add_argument(
