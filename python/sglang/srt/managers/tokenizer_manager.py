@@ -80,6 +80,7 @@ from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicat
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -668,25 +669,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-        # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
 
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.reserve_input_token_num
-        if input_token_num >= self.context_len:
-            if self.server_args.allow_auto_truncate:
-                logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
-                )
-                del input_ids[_max_req_len:]
-                input_token_num = len(input_ids)
-            else:
-                raise ValueError(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
-                )
+        error_msg = validate_input_length(
+            input_ids,
+            self.context_len,
+            self.server_args.allow_auto_truncate,
+            revised_input_token_num=input_token_num,
+        )
+        if error_msg:
+            raise ValueError(error_msg)
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(

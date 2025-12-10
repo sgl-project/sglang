@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -88,31 +87,50 @@ class GenerationBatchResult:
 
 
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    input_ids: List[int],
+    max_req_input_len: int,
+    allow_auto_truncate: bool,
+    revised_input_token_num: int = None,
+    is_session_validation: bool = False,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
     Args:
-        req: The request containing input_ids to validate
+        input_ids: The input_ids to validate
         max_req_input_len: Maximum allowed input length
         allow_auto_truncate: Whether to truncate long inputs
+        revised_input_token_num: revised input token counts for comparison.
+            If not provided,fall back to the input_ids length
+        is_session_validation: If the validation is for the aggregated session
+            request in scheduler or a single request in tokenizer.
 
     Returns:
         Error message if validation fails, None if successful
     """
-    if len(req.origin_input_ids) >= max_req_input_len:
+    request_type_str = (
+        "aggregated session request" if is_session_validation else "request"
+    )
+    length_limit_type_str = (
+        "maximum allowed length" if is_session_validation else "model's context length"
+    )
+
+    input_token_num = (
+        revised_input_token_num if revised_input_token_num else len(input_ids)
+    )
+
+    if input_token_num >= max_req_input_len:
         if allow_auto_truncate:
             logger.warning(
-                "Request length is longer than the KV cache pool size or "
-                "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
+                f"Length of the {request_type_str} is longer than the KV cache pool "
+                "size or the max context length. Truncated. "
+                f"{input_token_num=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            input_ids = input_ids[:max_req_input_len]
             return None
         else:
             error_msg = (
-                f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"Input length ({input_token_num} tokens) of the {request_type_str} "
+                f"exceeds the {length_limit_type_str} ({max_req_input_len} tokens). "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             return error_msg

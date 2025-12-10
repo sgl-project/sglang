@@ -1441,9 +1441,10 @@ class Scheduler(
 
         # Validate prompt length
         error_msg = validate_input_length(
-            req,
+            req.origin_input_ids,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            is_session_validation=True,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -1672,9 +1673,10 @@ class Scheduler(
 
         # Validate prompts length
         error_msg = validate_input_length(
-            req,
+            req.origin_input_ids,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            is_session_validation=True,
         )
         if error_msg:
             self._add_request_to_queue(req)
