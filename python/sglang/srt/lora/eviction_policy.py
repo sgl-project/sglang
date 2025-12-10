@@ -105,7 +105,7 @@ class FIFOEvictionPolicy(EvictionPolicy):
                 return uid
 
         # Should never reach here if candidates is non-empty
-        raise ValueError(f"Failed to select FIFO victim from candidates: {candidates}")
+        assert False, f"Failed to select FIFO victim from candidates: {candidates}"
 
     def remove(self, uid: Optional[str]) -> None:
         if uid is not None:

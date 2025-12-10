@@ -1787,7 +1787,6 @@ class Scheduler(
                         # which is slow. We'll try to schedule it in a future iteration.
                         continue
 
-
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True

@@ -214,9 +214,9 @@ class LoRAMemoryPool:
                     lora_ref = lora_refs.get(uid)
                     if lora_ref and lora_ref.pinned:
                         continue
-                
+
                 candidates.add(uid)
-            
+
             # Always protect base model (None) from eviction to ensure non-LoRA requests
             # can always be scheduled. All non-LoRA requests share this single slot.
             candidates.discard(None)
