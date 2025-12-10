@@ -292,13 +292,9 @@ class SchedulePolicy:
         """
         if enable_priority_scheduling:
             if schedule_low_priority_values_first:
-                waiting_queue.sort(
-                    key=lambda x: (x.priority, len(x.origin_input_ids))
-                )
+                waiting_queue.sort(key=lambda x: (x.priority, len(x.origin_input_ids)))
             else:
-                waiting_queue.sort(
-                    key=lambda x: (-x.priority, len(x.origin_input_ids))
-                )
+                waiting_queue.sort(key=lambda x: (-x.priority, len(x.origin_input_ids)))
         else:
             waiting_queue.sort(key=lambda x: len(x.origin_input_ids))
 
