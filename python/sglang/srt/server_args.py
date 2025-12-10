@@ -79,6 +79,7 @@ LOAD_FORMAT_CHOICES = [
     "gguf",
     "bitsandbytes",
     "layered",
+    "flash_rl",
     "remote",
     "remote_instance",
 ]
@@ -250,6 +251,7 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
+    rl_quant_profile: Optional[str] = None  # For flash_rl load format
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
@@ -2169,6 +2171,12 @@ class ServerArgs:
             help="Extra config for model loader. "
             "This will be passed to the model loader corresponding to the chosen load_format.",
             default=ServerArgs.model_loader_extra_config,
+        )
+        parser.add_argument(
+            "--rl-quant-profile",
+            type=str,
+            default=ServerArgs.rl_quant_profile,
+            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
         )
         parser.add_argument(
             "--trust-remote-code",
