@@ -71,6 +71,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from unittest import SkipTest
 from urllib.parse import urlparse
 
 import numpy as np
@@ -227,9 +228,7 @@ def is_blackwell():
 def is_blackwell_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
-    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
-        torch.version.cuda >= "12.8"
-    )
+    return is_sm100_supported(device) or is_sm120_supported(device)
 
 
 @lru_cache(maxsize=1)
@@ -243,7 +242,7 @@ def is_sm120_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
@@ -252,7 +251,7 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
@@ -314,7 +313,6 @@ try:
     )
 except:
     is_intel_amx_backend_available = False
-
 
 try:
     # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -1505,6 +1503,31 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter
+
+    http_response_status_counter = Counter(
+        name="sglang:http_responses_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        response = await call_next(request)
+
+        route = request.scope.get("route")
+        endpoint = route.path if route else "Unknown"
+
+        http_response_status_counter.labels(
+            endpoint=endpoint,
+            status_code=str(response.status_code),
+            method=request.method,
+        ).inc()
+
+        return response
+
+
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2518,6 +2541,9 @@ def retry(
     for try_index in itertools.count():
         try:
             return fn()
+        except SkipTest:
+            # Do NOT retry skipped tests - used in CI and unittest
+            raise
         except Exception as e:
             traceback.print_exc()
 
@@ -2707,15 +2733,18 @@ def is_fa3_default_architecture(hf_config):
     if not isinstance(architectures, list) or not architectures:
         return False
     default_archs = {
-        "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
         "Glm4MoeForCausalLM",
+        "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
@@ -2797,6 +2826,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
@@ -2805,7 +2836,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend == "none":
+        elif get_moe_a2a_backend().is_none():
             return True
         else:
             return (
@@ -2820,8 +2851,10 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -3318,6 +3351,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

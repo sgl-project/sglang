@@ -122,6 +122,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
@@ -497,14 +498,17 @@ async def get_model_info():
 @app.get("/model_info")
 async def model_info():
     """Get the model information."""
+    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
-        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
-        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "model_type": getattr(model_config.hf_config, "model_type", None),
+        "architectures": getattr(model_config.hf_config, "architectures", None),
     }
     return result
 
@@ -1393,6 +1397,9 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
