@@ -536,6 +536,35 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    pub fn remove_worker_metrics(worker_url: &str) {
+        // Set gauge metrics to 0 to indicate the worker no longer exists
+        // Prometheus will eventually stop exporting these after upkeep_timeout
+        gauge!("sgl_router_cb_state",
+            "worker" => worker_url.to_string()
+        )
+        .set(0.0);
+        
+        gauge!("sgl_router_worker_health",
+            "worker" => worker_url.to_string()
+        )
+        .set(0.0);
+        
+        gauge!("sgl_router_worker_load",
+            "worker" => worker_url.to_string()
+        )
+        .set(0.0);
+        
+        gauge!("sgl_router_running_requests",
+            "worker" => worker_url.to_string()
+        )
+        .set(0.0);
+        
+        gauge!("sgl_router_tree_size",
+            "worker" => worker_url.to_string()
+        )
+        .set(0.0);
+    }
+
     pub fn set_job_queue_depth(depth: usize) {
         gauge!("sgl_router_job_queue_depth").set(depth as f64);
     }
