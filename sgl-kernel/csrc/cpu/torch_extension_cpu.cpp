@@ -124,6 +124,14 @@ std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 at::Tensor
 weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
+// gemm fusion
+at::Tensor fused_linear_sigmoid_mul(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    const at::Tensor& post_mul_mat);
+
 // igemm
 at::Tensor int8_scaled_mm_cpu(
     at::Tensor& mat1,
@@ -276,6 +284,25 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
+// fused_sigmoid_gating_delta_rule_update
+at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
+    const at::Tensor& A_log,
+    const at::Tensor& dt_bias,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    at::Tensor& initial_state_source,
+    const at::Tensor& initial_state_indices,
+    const at::Tensor& cu_seqlens,
+    bool use_qk_l2norm_in_kernel,
+    double softplus_beta = 1.0,
+    double softplus_threshold = 20.0);
+// fused_gdn_gating
+std::tuple<at::Tensor, at::Tensor>
+fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b, const at::Tensor& dt_bias);
+
 // fused_qkvzba_split_reshape_cat_cpu
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_reshape_cat_cpu(
     const at::Tensor& mixed_qkvz,
@@ -354,6 +381,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // gemm
   m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
+
+  // gemm fusion
+  m.def(
+      "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
+  m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
 
   // igemm
   m.def(
@@ -440,6 +472,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
 
+  // fused_sigmoid_gating_delta_rule_update
+  m.def(
+      "fused_sigmoid_gating_delta_rule_update_cpu(Tensor A_log, Tensor dt_bias, Tensor q, Tensor k, Tensor v, Tensor "
+      "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, bool "
+      "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
+  m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
+  // fused_gdn_gating
+  m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
+  m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);
   // fused_qkvzba_split_reshape_cat_cpu
   m.def(
       "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
