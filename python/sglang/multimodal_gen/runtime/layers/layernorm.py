@@ -329,6 +329,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
+        # print(f"qwen, residual.shape, {residual.shape}, x.shape, {x.shape}, gate.shape, {gate if isinstance(gate, int) else gate.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
 
         can_use_cuda = (
             x.is_cuda
@@ -362,46 +363,23 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             if scale.dim() == 4 and shift.dim() == 4:
                 # scale/shift: [B, F, 1, C]
                 y_2d, residual_output = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
+                    residual_2d,
                     x_2d,
                     gamma,
                     beta,
                     scale.contiguous().to(dtype=x.dtype, device=x.device),
                     shift.contiguous().to(dtype=x.dtype, device=x.device),
+                    gate_opt,
                 )
                 return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
-            # Also support scalar (0D or 1-element)
-            if scale.dim() == 0 or (scale.dim() == 1 and scale.numel() == 1):
-                scale_blc = scale.reshape(1)
-            elif scale.dim() == 2:
-                scale_blc = scale[:, None, :]
-            elif scale.dim() == 3:
-                scale_blc = scale
-            else:
-                raise ValueError("scale must be 0D/1D(1)/2D/3D or 4D")
+            def get_arg(t):
+                if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
+                    return t.reshape(1).to(dtype=x.dtype, device=x.device)
+                return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
 
-            if shift.dim() == 0 or (shift.dim() == 1 and shift.numel() == 1):
-                shift_blc = shift.reshape(1)
-            elif shift.dim() == 2:
-                shift_blc = shift[:, None, :]
-            elif shift.dim() == 3:
-                shift_blc = shift
-            else:
-                # broadcast later via expand if possible
-                shift_blc = shift
-
-            need_scale_scalar = scale_blc.dim() == 1 and scale_blc.numel() == 1
-            need_shift_scalar = shift_blc.dim() == 1 and shift_blc.numel() == 1
-
-            if not need_scale_scalar:
-                scale_exp = scale_blc.expand(B, L, C)
-
-            if not need_shift_scalar:
-                shift_exp = shift_blc.expand(B, L, C)
-            else:
-                sh_sb = sh_sl = sh_sc = 0
-            scale_arg = scale_blc.to(dtype=x.dtype, device=x.device) if need_scale_scalar else scale_exp.contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
-            shift_arg = shift_blc.to(dtype=x.dtype, device=x.device) if need_shift_scalar else shift_exp.contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+            scale_arg = get_arg(scale)
+            shift_arg = get_arg(shift)
 
             gate_opt = None
             if isinstance(gate, int):
@@ -419,12 +397,11 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             else:
                 raise ValueError(f"Gate type {type(gate)} not supported")    
             
-            if scale_arg is not None and shift_arg is not None:
-                # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
-                y_2d, residual_output = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-                    residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
-                )
-                return y_2d.view(B, L, C), residual_output.view(B, L, C)
+            # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
+            y_2d, residual_output = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
+                residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
+            )
+            return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
         else:
             # x.shape: [batch_size, seq_len, inner_dim]
@@ -491,6 +468,7 @@ class LayerNormScaleShift(nn.Module):
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
+        # print(f"qwen, x.shape, {x.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
         can_use_cuda = (
             x.is_cuda
             and self.norm_type == "layer"
@@ -523,38 +501,15 @@ class LayerNormScaleShift(nn.Module):
                 )
                 return y_2d.view(B, L, C)
 
-            # Also support scalar (0D or 1-element)
-            if scale.dim() == 0 or (scale.dim() == 1 and scale.numel() == 1):
-                scale_blc = scale.reshape(1)
-            elif scale.dim() == 2:
-                scale_blc = scale[:, None, :]
-            elif scale.dim() == 3:
-                scale_blc = scale
-            else:
-                raise ValueError("scale must be 0D/1D(1)/2D/3D or 4D")
+            def get_arg(t):
+                if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
+                    return t.reshape(1).to(dtype=x.dtype, device=x.device)
+                return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
 
-            if shift.dim() == 0 or (shift.dim() == 1 and shift.numel() == 1):
-                shift_blc = shift.reshape(1)
-            elif shift.dim() == 2:
-                shift_blc = shift[:, None, :]
-            elif shift.dim() == 3:
-                shift_blc = shift
-            else:
-                # broadcast later via expand if possible
-                shift_blc = shift
+            scale_arg = get_arg(scale)
+            shift_arg = get_arg(shift)
 
-            need_scale_scalar = scale_blc.dim() == 1 and scale_blc.numel() == 1
-            need_shift_scalar = shift_blc.dim() == 1 and shift_blc.numel() == 1
-
-            if not need_scale_scalar:
-                scale_exp = scale_blc.expand(B, L, C)
-
-            if not need_shift_scalar:
-                shift_exp = shift_blc.expand(B, L, C)
-            else:
-                sh_sb = sh_sl = sh_sc = 0
-
-            y_2d = sgl_kernel.fused_layernorm_scale_shift(x_2d, gamma, beta, scale_blc if need_scale_scalar else scale_exp.contiguous().view(M, C), shift_blc if need_shift_scalar else shift_exp.contiguous().view(M, C))
+            y_2d = sgl_kernel.fused_layernorm_scale_shift(x_2d, gamma, beta, scale_arg, shift_arg)
             return y_2d.view(B, L, C)
 
         else:
