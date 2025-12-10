@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
 from typing import Any
 
-import PIL
 import numpy as np
+import PIL
 import torch
 from einops import rearrange
 
