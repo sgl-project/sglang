@@ -127,7 +127,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     parameters[param_name] = param_value.strip()
         return parameters
 
-    def _parse_parameters_partially(self, invoke_content: str) -> str:
+    def _parse_parameters_partially(self, invoke_content: str) -> Tuple[str, str]:
         # 1. check json format
         if invoke_content.strip().startswith("{"):
             return invoke_content, "json"
