@@ -455,24 +455,24 @@ struct DeviceGemmFp8RowwiseSm90 {
   static constexpr bool swap_ab = SwapAB;  // Compile-time swap_ab flag
 
   // A matrix configuration
-  using ElementA = ElementType;               // Element type for A matrix operand
-  using LayoutA = cutlass::layout::RowMajor;  // Layout type for A matrix operand
+  using ElementA = ElementType;                                                // Element type for A matrix operand
+  using LayoutA = cutlass::layout::RowMajor;                                   // Layout type for A matrix operand
   using LayoutA_T = typename cutlass::layout::LayoutTranspose<LayoutA>::type;  // Transposed layout for swap_ab
   static constexpr int AlignmentA =
       128 / cutlass::sizeof_bits<ElementA>::value;  // Memory access granularity/alignment of A
                                                     // matrix in units of elements (up to 16 bytes)
 
   // B matrix configuration
-  using ElementB = ElementType;                  // Element type for B matrix operand
-  using LayoutB = cutlass::layout::ColumnMajor;  // Layout type for B matrix operand
+  using ElementB = ElementType;                                                // Element type for B matrix operand
+  using LayoutB = cutlass::layout::ColumnMajor;                                // Layout type for B matrix operand
   using LayoutB_T = typename cutlass::layout::LayoutTranspose<LayoutB>::type;  // Transposed layout for swap_ab
   static constexpr int AlignmentB =
       128 / cutlass::sizeof_bits<ElementB>::value;  // Memory access granularity/alignment of B
                                                     // matrix in units of elements (up to 16 bytes)
 
   // C/D matrix configuration
-  using ElementC = void;                      // Element type for C matrix operands
-  using LayoutC = cutlass::layout::RowMajor;  // Layout type for C matrix operands
+  using ElementC = void;                                                       // Element type for C matrix operands
+  using LayoutC = cutlass::layout::RowMajor;                                   // Layout type for C matrix operands
   using LayoutC_T = typename cutlass::layout::LayoutTranspose<LayoutC>::type;  // Transposed layout for swap_ab
   static constexpr int AlignmentC =
       128 / cutlass::sizeof_bits<OutElementType>::value;  // Memory access granularity/alignment of C matrices in
@@ -481,7 +481,8 @@ struct DeviceGemmFp8RowwiseSm90 {
   // Output matrix configuration
   using ElementOutput = OutElementType;            // Element type for output matrix operands
   using LayoutOutput = cutlass::layout::RowMajor;  // Layout type for output matrix operands
-  using LayoutOutput_T = typename cutlass::layout::LayoutTranspose<LayoutOutput>::type;  // Transposed layout for swap_ab
+  using LayoutOutput_T =
+      typename cutlass::layout::LayoutTranspose<LayoutOutput>::type;  // Transposed layout for swap_ab
   static constexpr int AlignmentOutput = 128 / cutlass::sizeof_bits<ElementOutput>::value;
 
   // // Auxiliary matrix configuration and other fusion types
@@ -596,11 +597,11 @@ struct DeviceGemmFp8RowwiseSm90 {
       typename cutlass::gemm::collective::CollectiveBuilder<
           ArchTag,
           OperatorClass,
-          ElementB,      // B becomes A
-          LayoutB_T,     // B's transposed layout
+          ElementB,   // B becomes A
+          LayoutB_T,  // B's transposed layout
           AlignmentB,
-          ElementA,      // A becomes B
-          LayoutA_T,     // A's transposed layout
+          ElementA,   // A becomes B
+          LayoutA_T,  // A's transposed layout
           AlignmentA,
           ElementAccumulator,
           TileShape,
@@ -643,7 +644,7 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
   static constexpr bool swap_ab = SwapAB;  // Get swap_ab flag from template parameter
-  
+
   using ElementT = typename Gemm::ElementA;
   using ElementOutput = typename Gemm::ElementD;
   using ElementComputeEpilogue = float;
@@ -667,15 +668,14 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
   ElementComputeEpilogue const* ptr_scales_b = reinterpret_cast<ElementComputeEpilogue const*>(scales_b.data_ptr());
 
   // Adjust problem shape based on swap_ab
-  typename Gemm::GemmKernel::ProblemShape problem_shape = swap_ab 
-      ? cute::make_shape(n, m, k, 1)  // Swap M and N
-      : cute::make_shape(m, n, k, 1);
+  typename Gemm::GemmKernel::ProblemShape problem_shape = swap_ab ? cute::make_shape(n, m, k, 1)  // Swap M and N
+                                                                  : cute::make_shape(m, n, k, 1);
 
   StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
   StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
   StrideC stride_c;
   StrideD stride_d = cutlass::make_cute_packed_stride(
-      StrideD{}, 
+      StrideD{},
       swap_ab ? make_shape(n, m, 1)  // Swap output dimensions
               : make_shape(m, n, 1));
 
@@ -706,8 +706,8 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
         {swap_ab ? ptr_scales_b : ptr_scales_a},  // XScale: ColOrScalarBroadcast with col_broadcast flag
         {
             {swap_ab ? ptr_scales_a : ptr_scales_b},  // WScale: RowOrScalarBroadcast with row_broadcast flag
-            {},  // Accumulator
-            {}   // Multiplies
+            {},                                       // Accumulator
+            {}                                        // Multiplies
         },
         {ptr_bias},
         {},  // Multiplies
@@ -717,8 +717,8 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
         {swap_ab ? ptr_scales_b : ptr_scales_a},  // XScale: ColOrScalarBroadcast with col_broadcast flag
         {
             {swap_ab ? ptr_scales_a : ptr_scales_b},  // WScale: RowOrScalarBroadcast with row_broadcast flag
-            {},  // Accumulator
-            {}   // Multiplies
+            {},                                       // Accumulator
+            {}                                        // Multiplies
         },
         {},  // Multiplies
     };
@@ -742,7 +742,7 @@ void launch_sm90_fp8_scaled_mm(
   // If swap_ab, problem shape is (n, m, k) instead of (m, n, k)
   int32_t prob_m = SwapAB ? n : m;
   int32_t prob_n = SwapAB ? m : n;
-  
+
   auto args = prepare_sm90_fp8_args<Gemm, WithBias, SwapAB>(out, a, b, scales_a, scales_b, bias);
   Gemm gemm_op;
 
@@ -790,7 +790,7 @@ void sm90_fp8_dispatch_bias(
         MainloopScheduleType,
         EpilogueScheduleType,
         TileSchedulerType,
-        true,    // WithBias
+        true,           // WithBias
         SwapAB>::Gemm;  // SwapAB
     return launch_sm90_fp8_scaled_mm<Gemm, true, SwapAB>(out, a, b, scales_a, scales_b, bias);
   } else {
@@ -803,7 +803,7 @@ void sm90_fp8_dispatch_bias(
         MainloopScheduleType,
         EpilogueScheduleType,
         TileSchedulerType,
-        false,   // WithBias
+        false,          // WithBias
         SwapAB>::Gemm;  // SwapAB
     return launch_sm90_fp8_scaled_mm<Gemm, false, SwapAB>(out, a, b, scales_a, scales_b, bias);
   }
@@ -822,28 +822,29 @@ void sm90_fp8_dispatch_shape(
   using FastBasicScheduler = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
   using PersistentTileScheduler = cutlass::gemm::PersistentScheduler;
   using BasicTileScheduler = void;
-  if (m <= 1) {
+  if (m <= 16) {
+    // m in [1, 16]
     uint32_t const n = b.size(1);
     if (n <= 1280) {
       return sm90_fp8_dispatch_bias<
           OutType,
-          Shape<_64, _16, _256>,    
-          Shape<_1, _2, _1>,        
+          Shape<_64, _16, _256>,
+          Shape<_1, _2, _1>,
           FastBasicScheduler,
           BasicTileScheduler,
-          true>(out, a, b, scales_a, scales_b, bias); 
+          true>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm90_fp8_dispatch_bias<
           OutType,
-          Shape<_64, _16, _256>,   
-          Shape<_1, _1, _1>,       
+          Shape<_64, _16, _256>,
+          Shape<_1, _1, _1>,
           FastBasicScheduler,
           BasicTileScheduler,
-          true>(out, a, b, scales_a, scales_b, bias); 
+          true>(out, a, b, scales_a, scales_b, bias);
     }
   }
   if (m <= 64) {
-    // m in [1, 64]
+    // m in (16, 64]
     return sm90_fp8_dispatch_bias<
         OutType,
         Shape<_64, _64, _128>,
