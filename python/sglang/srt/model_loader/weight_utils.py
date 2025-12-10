@@ -327,9 +327,7 @@ def _find_local_hf_snapshot_dir_unlocked(
         return None
 
     # Check for incomplete files and clean up if found
-    repo_folder = os.path.abspath(
-        os.path.join(found_local_snapshot_dir, "..", "..")
-    )
+    repo_folder = os.path.abspath(os.path.join(found_local_snapshot_dir, "..", ".."))
     blobs_dir = os.path.join(repo_folder, "blobs")
 
     # Check for incomplete download markers
@@ -353,9 +351,7 @@ def _find_local_hf_snapshot_dir_unlocked(
     local_weight_files: List[str] = []
     try:
         for pattern in allow_patterns:
-            matched_files = glob.glob(
-                os.path.join(found_local_snapshot_dir, pattern)
-            )
+            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
             for f in matched_files:
                 # os.path.exists returns False for broken symlinks.
                 if not os.path.exists(f):
@@ -384,9 +380,7 @@ def _find_local_hf_snapshot_dir_unlocked(
                     f"{model_name_or_path}: {error_msg}. "
                     "Will selectively clean and re-download only these files.",
                 )
-                _cleanup_corrupted_files_selective(
-                    model_name_or_path, corrupted_files
-                )
+                _cleanup_corrupted_files_selective(model_name_or_path, corrupted_files)
                 return None
             else:
                 # Cannot selectively clean (e.g., missing shards) - remove entire cache
