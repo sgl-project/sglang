@@ -15,7 +15,6 @@ from __future__ import annotations
 # ==============================================================================
 """Request scheduler policy"""
 
-import logging
 import os
 import random
 from collections import defaultdict
@@ -61,8 +60,6 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
-
-logger = logging.getLogger(__name__)
 
 
 class CacheAwarePolicy(Enum):
