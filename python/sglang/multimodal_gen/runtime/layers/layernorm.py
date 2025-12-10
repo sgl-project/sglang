@@ -351,30 +351,15 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             else:
                 beta = torch.zeros(C, device=x.device, dtype=x.dtype)
 
-            # scale/shift: 2D [M,N] or 4D [B,F,1,N]
-            # print("scale.dim(), shift.dim(), ", scale.dim(), shift.dim())
-            # print("scale.shape, shift.shape, ", scale.shape, shift.shape)
-            # print("scale, shift, ", scale, shift)
-            # import sys
-            # sys.stdout.flush()
-
-            if scale.dim() == 4 and shift.dim() == 4:
-                # scale/shift: [B, F, 1, C]
-                y_2d, residual_output = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-                    residual_2d,
-                    x_2d,
-                    gamma,
-                    beta,
-                    scale.contiguous().to(dtype=x.dtype, device=x.device),
-                    shift.contiguous().to(dtype=x.dtype, device=x.device),
-                    gate_opt,
-                )
-                return y_2d.view(B, L, C), residual_output.view(B, L, C)
-
             def get_arg(t):
                 if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
                     return t.reshape(1).to(dtype=x.dtype, device=x.device)
-                return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+                elif t.dim() == 2 or t.dim() == 3:
+                    return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+                elif t.dim() == 4:
+                    return t.contiguous().to(dtype=x.dtype, device=x.device)                    
+                else:
+                    raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
 
             scale_arg = get_arg(scale)
             shift_arg = get_arg(shift)
@@ -384,7 +369,6 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 # used by cross-attention, should be 1
                 assert gate == 1
                 gate_opt = torch.ones(M, C, device=x.device, dtype=x.dtype)
-
             elif isinstance(gate, torch.Tensor):
                 if gate.dim() == 4:
                     # gate.shape: [batch_size, num_frames, 1, inner_dim]
@@ -404,6 +388,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
         else:
+            # Fallback path for triton kernel (not fused)
             # x.shape: [batch_size, seq_len, inner_dim]
             # Compute residual_output to return (kernel also computes this internally)
             if isinstance(gate, int):
@@ -488,22 +473,15 @@ class LayerNormScaleShift(nn.Module):
             else:
                 beta = torch.zeros(C, device=x.device, dtype=x.dtype)
 
-
-            if scale.dim() == 4 and shift.dim() == 4:
-                # scale/shift: [B, F, 1, C]
-                y_2d = sgl_kernel.fused_layernorm_scale_shift(
-                    x_2d,
-                    gamma,
-                    beta,
-                    scale.contiguous().to(dtype=x.dtype, device=x.device),
-                    shift.contiguous().to(dtype=x.dtype, device=x.device),
-                )
-                return y_2d.view(B, L, C)
-
             def get_arg(t):
                 if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
                     return t.reshape(1).to(dtype=x.dtype, device=x.device)
-                return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+                elif t.dim() == 2 or t.dim() == 3:
+                    return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+                elif t.dim() == 4:
+                    return t.contiguous().to(dtype=x.dtype, device=x.device)                    
+                else:
+                    raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
 
             scale_arg = get_arg(scale)
             shift_arg = get_arg(shift)
@@ -512,7 +490,7 @@ class LayerNormScaleShift(nn.Module):
             return y_2d.view(B, L, C)
 
         else:
-            # Fallback (RMSNorm or FP32 compute)
+            # Fallback path for triton kernel (not fused)
             normalized = self.norm(x)
             if self.compute_dtype == torch.float32:
                 normalized = normalized.float()
