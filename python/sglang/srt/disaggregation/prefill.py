@@ -408,7 +408,7 @@ class SchedulerDisaggregationPrefillMixin:
         # The context's lifecycle is managed by transfer_contexts dict in KVManager,
         # which will be cleaned up when transfer is complete
         transfer_context = TransferContext(
-            batch=batch,
+            batch=batch.copy(),
             result=result,
             metadata_buffers=self.disagg_metadata_buffers,
             scheduler=self,
