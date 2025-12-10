@@ -630,6 +630,8 @@ class Qwen2MoeModel(nn.Module):
                 ctx = (
                     nullcontext()
                     if get_global_server_args().enable_piecewise_cuda_graph
+                    or get_global_server_args().enable_torch_compile
+                    or get_global_server_args().enable_piecewise_npu_graph_decode
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
