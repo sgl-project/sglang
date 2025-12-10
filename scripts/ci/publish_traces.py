@@ -58,30 +58,33 @@ def verify_token_permissions(repo_owner, repo_name, token):
     """Verify that the token has necessary permissions for the repository"""
     print("Verifying token permissions...")
 
-    # Check if we can access the repository
-    try:
-        url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
-        response = make_github_request(url, token)
-        repo_data = json.loads(response)
-        print(f"Repository access verified: {repo_data['full_name']}")
-    except Exception as e:
-        if is_rate_limit_error(e):
-            warnings.warn("GitHub API rate limit exceeded during token verification.")
-            return "rate_limited"
-        print(f"Failed to access repository: {e}")
-        return False
+    checks = [
+        (
+            f"https://api.github.com/repos/{repo_owner}/{repo_name}",  # Check if we can access the repository
+            "Repository access verified",
+        ),
+        (
+            f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents",  # Check if we can read the repository contents
+            "Repository contents access verified",
+        ),
+    ]
 
-    # Check if we can read the repository contents
-    try:
-        url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents"
-        response = make_github_request(url, token)
-        print("Repository contents access verified")
-    except Exception as e:
-        if is_rate_limit_error(e):
-            warnings.warn("GitHub API rate limit exceeded during token verification.")
-            return "rate_limited"
-        print(f"Failed to access repository contents: {e}")
-        return False
+    for url, success_message in checks:
+        try:
+            response = make_github_request(url, token)
+            if success_message == "Repository access verified":
+                repo_data = json.loads(response)
+                print(f"{success_message}: {repo_data['full_name']}")
+            else:
+                print(success_message)
+        except Exception as e:
+            if is_rate_limit_error(e):
+                warnings.warn(
+                    "GitHub API rate limit exceeded during token verification."
+                )
+                return "rate_limited"
+            print(f"Failed to verify permissions for {url}: {e}")
+            return False
 
     return True
 
@@ -128,10 +131,8 @@ def create_blob(repo_owner, repo_name, content, token, max_retries=3):
                 raise
 
 
-def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=3):
-    """Create a new tree with files"""
-    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees"
-
+def create_blobs(repo_owner, repo_name, files, token):
+    """Create blobs for all files and return tree items with blob SHAs"""
     tree_items = []
     for i, (file_path, content) in enumerate(files):
         # Create blob first to get SHA
@@ -147,6 +148,12 @@ def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=
         # Progress indicator for large uploads
         if (i + 1) % 10 == 0 or (i + 1) == len(files):
             print(f"Created {i + 1}/{len(files)} blobs...")
+    return tree_items
+
+
+def create_tree(repo_owner, repo_name, base_tree_sha, tree_items, token, max_retries=3):
+    """Create a new tree from pre-created blob SHAs"""
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees"
 
     data = {"base_tree": base_tree_sha, "tree": tree_items}
 
@@ -308,6 +315,19 @@ def publish_traces(traces_dir, run_id, run_number):
     max_retries = 5
     retry_delay = 5  # seconds
 
+    # Create blobs once before retry loop to avoid re-uploading on failures
+    try:
+        tree_items = create_blobs(repo_owner, repo_name, files_to_upload, token)
+    except Exception as e:
+        # Check for rate limit errors during blob creation
+        if is_rate_limit_error(e):
+            warnings.warn(
+                "GitHub API rate limit exceeded during blob creation. Skipping trace upload."
+            )
+            return
+        print(f"Failed to create blobs: {e}")
+        raise
+
     for attempt in range(max_retries):
         try:
             # Get current branch head
@@ -318,9 +338,9 @@ def publish_traces(traces_dir, run_id, run_number):
             tree_sha = get_tree_sha(repo_owner, repo_name, branch_sha, token)
             print(f"Current tree SHA: {tree_sha}")
 
-            # Create new tree with all files
+            # Create new tree with pre-created blobs
             new_tree_sha = create_tree(
-                repo_owner, repo_name, tree_sha, files_to_upload, token
+                repo_owner, repo_name, tree_sha, tree_items, token
             )
             print(f"Created new tree: {new_tree_sha}")
 
