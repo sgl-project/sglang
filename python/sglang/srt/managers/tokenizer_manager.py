@@ -916,6 +916,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+        if self.server_args.disaggregation_mode == "decode":
+            if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+                mm_items = tokenized_obj.mm_inputs.get("mm_items", [])
+                for idx, item in enumerate(mm_items):
+                    if hasattr(item, "feature"):
+                        item.feature = None
+                        item.pad_value = item.hash = int(obj.rid, 16)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
