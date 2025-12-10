@@ -1978,7 +1978,7 @@ class NativeSparseAttnMultiStepBackend:
             spec_info=forward_batch.spec_info,
         )
 
-        # NEW: Fast copy to each backend (3-5x faster than computing N times)
+        # NEW: Fast copy to each backend (1-2x faster than computing N times)
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph_from_precomputed(
                 bs=bs,
