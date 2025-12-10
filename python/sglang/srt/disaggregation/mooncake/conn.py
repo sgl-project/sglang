@@ -1021,6 +1021,8 @@ class MooncakeKVManager(CommonKVManager):
         shard_idx = session_port_sum % len(self.transfer_queues)
         # Store transfer_context if provided (shared across all chunks for the same room)
         if transfer_context is not None:
+            if bootstrap_room not in self.transfer_contexts:
+                self.transfer_contexts[bootstrap_room] = deque()
             self.transfer_contexts[bootstrap_room].append(transfer_context)
 
         self.transfer_queues[shard_idx].put(
