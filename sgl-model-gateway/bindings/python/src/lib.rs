@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use sgl_model_gateway::*;
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 
 // Define the enums with PyO3 bindings
@@ -733,8 +734,13 @@ fn get_verbose_version_string() -> String {
 /// Get the list of available tool call parsers from the Rust factory.
 #[pyfunction]
 fn get_available_tool_call_parsers() -> Vec<String> {
-    let factory = tool_parser::ParserFactory::new();
-    factory.list_parsers()
+    static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
+    PARSERS
+        .get_or_init(|| {
+            let factory = tool_parser::ParserFactory::new();
+            factory.list_parsers()
+        })
+        .clone()
 }
 
 #[pymodule]
