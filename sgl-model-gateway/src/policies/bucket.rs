@@ -7,7 +7,7 @@ use std::{
 
 use dashmap::DashMap;
 use rand::Rng;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy};
@@ -259,14 +259,14 @@ impl LoadBalancingPolicy for BucketPolicy {
             let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
             let is_imbalanced =
                 abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
-            info!(
+            debug!(
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
             );
 
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
-                info!("select prefill instance by Load Balance policy");
+                debug!("select prefill instance by Load Balance policy");
                 let min_url = chars_per_url_snapshot
                     .iter()
                     .min_by_key(|(_, &chars)| chars)
@@ -279,7 +279,7 @@ impl LoadBalancingPolicy for BucketPolicy {
                     });
                 min_url
             } else {
-                info!("select prefill instance by Bucket policy");
+                debug!("select prefill instance by Bucket policy");
                 match choiced_url {
                     Some(url) if !url.is_empty() => url,
                     _ => {
@@ -310,25 +310,6 @@ impl LoadBalancingPolicy for BucketPolicy {
         };
 
         workers.iter().position(|w| w.url() == prefill_url)
-    }
-
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-
-        let healthy_decode = get_healthy_worker_indices(decode_workers);
-        if healthy_decode.is_empty() {
-            return None;
-        }
-
-        let mut rng = rand::rng();
-        let decode_idx = rng.random_range(0..healthy_decode.len());
-
-        Some((prefill_idx, decode_idx))
     }
 
     fn name(&self) -> &'static str {
