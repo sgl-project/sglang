@@ -567,11 +567,13 @@ class NPUW4A8Int4DynamicMoEMethod(FusedMoEMethodBase):
         group_list,
         output_dtype,
     ):
+        from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[self.w13_weight],
-            scale=[self.w13_weight_scale],
-            bias=[self.w13_scale_bias],
+            weight=[layer.w13_weight],
+            scale=[layer.w13_weight_scale],
+            bias=[layer.w13_scale_bias],
             per_token_scale=[hidden_states_scale],
             group_list=group_list,
             split_item=2,
@@ -580,15 +582,15 @@ class NPUW4A8Int4DynamicMoEMethod(FusedMoEMethodBase):
             output_dtype=output_dtype,
         )[0]
 
-        # act_fn: swiglu
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        hidden_states, swiglu_out_scale = swiglu_quant(
+            hidden_states, group_list, group_list_type
+        )
 
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
-            weight=[self.w2_weight],
-            scale=[self.w2_weight_scale],
-            bias=[self.w2_scale_bias],
+            weight=[layer.w2_weight],
+            scale=[layer.w2_weight_scale],
+            bias=[layer.w2_scale_bias],
             per_token_scale=[swiglu_out_scale],
             group_list=group_list,
             split_item=2,
