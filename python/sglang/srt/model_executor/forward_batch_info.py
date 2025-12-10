@@ -204,6 +204,16 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+def _clamp_value(
+    value: Union[torch.Tensor, int], min_val: int, max_val: int
+) -> Union[torch.Tensor, int]:
+    """Clamp a value to [min_val, max_val]. Handles both tensors and Python ints."""
+    if isinstance(value, torch.Tensor):
+        return torch.clamp(value, min_val, max_val)
+    else:
+        return math.clamp(value, min_val, max_val)
+
+
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
@@ -217,10 +227,10 @@ def compute_local_num_token_non_padded(
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
 
-    return torch.clamp(
+    return _clamp_value(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
-        min=0,
-        max=tokens_per_rank,
+        min_val=0,
+        max_val=tokens_per_rank,
     )
 
 
@@ -546,7 +556,9 @@ class ForwardBatch:
 
         self.num_token_non_padded = local
         local_cpu = self.num_token_non_padded_cpu - tokens_per_rank * tp_rank
-        self.num_token_non_padded_cpu = math.clamp(local_cpu, 0, tokens_per_rank)
+        self.num_token_non_padded_cpu = _clamp_value(
+            local_cpu, min_val=0, max_val=tokens_per_rank
+        )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
