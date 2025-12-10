@@ -22,9 +22,13 @@ if _is_npu:
     import numpy as np
     import torch_npu
     from mindspore import Tensor, mint, mutable, ops
+    from mindspore._c_expression import MSContext
 
 logger = logging.getLogger(__name__)
 
+def is_310p():
+    device = MSContext.get_instance().get_ascend_soc_version()
+    return device in ["310p", "ascend310p"]
 
 def tensor_torch2ms(x: torch.Tensor):
     if x is None or not isinstance(x, torch.Tensor):
@@ -222,6 +226,15 @@ class MindSporeForCausalLM(torch.nn.Module):
                 if cache_ms.ndim == 3:
                     cache_ms = mint.unsqueeze(cache_ms, 2)
                 cache_list.append(cache_ms)
+                if is_310p():
+                    cache_shape = cache_ms.shape
+                    n_block, block_size, n_kv_heads, head_size = cache_shape
+                    cache_shape = (n_block, block_size, n_kv_heads * head_size)
+                    cache_ms = cache_ms.view(cache_shape)
+                    cache_list.append(cache_ms, "nz")
+
+                del cache
+                ms.runtime.empty_cache()              
 
         if self.use_mla:
             if not self.key_cache:
@@ -259,11 +272,10 @@ class MindSporeForCausalLM(torch.nn.Module):
 
         max_seq_lens = mint.max(tensor_torch2ms(forward_batch.seq_lens).to(ms.int32))
         col_indices = ops.arange(0, max_seq_lens, page_size, dtype=ms.int32)
-        req_to_token_ids = tensor_torch2ms(forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices])
+        req_to_token_ids = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices]
         req_to_token_ids = tensor_torch2ms(req_to_token_ids).to(ms.int32)
 
-        block_tables = ops.gather(
-            req_to_token_ids, col_indices, axis=1)//page_size
+        block_tables = ops.gather(req_to_token_ids, col_indices, axis=1)//page_size
 
         model_inputs = {}
         model_inputs["input_ids"] = tensor_torch2ms(input_ids).to(ms.int32)
@@ -286,6 +298,8 @@ class MindSporeForCausalLM(torch.nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+
+
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tensor:
@@ -293,6 +307,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         model_inputs = self.prepare_inputs(input_ids, positions, forward_batch)
         # prepare model inputs
         model_inputs = self.model.prepare_inputs(forward_batch, model_inputs)
+        torch_npu.npu.synchronize()
 
         logits = self.model(**model_inputs)
 
