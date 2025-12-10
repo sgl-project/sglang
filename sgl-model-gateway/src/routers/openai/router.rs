@@ -37,11 +37,6 @@ use crate::{
     data_connector::{ConversationId, ListParams, ResponseId, SortOrder},
     protocols::{
         chat::ChatCompletionRequest,
-        classify::ClassifyRequest,
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        generate::GenerateRequest,
-        rerank::RerankRequest,
         responses::{
             generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponsesGetParams, ResponsesRequest,
@@ -522,27 +517,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         (StatusCode::OK, Json(response_json)).into_response()
     }
 
-    async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "get_model_info not implemented for OpenAI router",
-        )
-            .into_response()
-    }
-
-    async fn route_generate(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Generate endpoint not supported for OpenAI backend",
-        )
-            .into_response()
-    }
-
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
@@ -669,19 +643,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             response
         }
-    }
-
-    async fn route_completion(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &CompletionRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Completion endpoint not implemented",
-        )
-            .into_response()
     }
 
     async fn route_responses(
@@ -1001,14 +962,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Cancel response not implemented for OpenAI router",
-        )
-            .into_response()
-    }
-
     async fn list_response_input_items(
         &self,
         _headers: Option<&HeaderMap>,
@@ -1078,33 +1031,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     .into_response()
             }
         }
-    }
-
-    async fn route_embeddings(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &EmbeddingRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Embeddings not supported").into_response()
-    }
-
-    async fn route_classify(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ClassifyRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Classify not supported").into_response()
-    }
-
-    async fn route_rerank(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &RerankRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
     }
 
     fn router_type(&self) -> &'static str {
