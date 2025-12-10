@@ -91,7 +91,7 @@ class SGLDiffusionProfiler:
         if not self.full_profile and self.num_active_steps >= 0:
             self._step()
             self.num_active_steps -= 1
-            if self.num_active_steps == 0:
+            if self.num_active_steps < 0:
                 # early exit when enough steps are captured, to reduce the trace file size
                 self.stop(dump_rank=0)
 
