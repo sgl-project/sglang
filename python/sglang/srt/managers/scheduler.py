@@ -24,7 +24,7 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -33,9 +33,6 @@ import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
-from sglang.srt.distributed.device_communicators.shm_broadcast import (
-                MessageQueue,
-            )
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
@@ -62,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.device_communicators.shm_broadcast import MessageQueue
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -609,7 +607,7 @@ class Scheduler(
     def init_message_queues(self):
         """
         Initialize MessageQueue for TP communication.
-        
+
         Replaces broadcast_pyobj with zero-copy shared memory communication.
         Uses sglang's MessageQueue (adapted from vLLM) for efficient IPC.
         Only initialized when tp_size > 1.
@@ -618,13 +616,13 @@ class Scheduler(
         self.attn_tp_mq = None
         self.is_tp_mq_writer = False
         self.is_attn_tp_mq_writer = False
-        
+
         # Initialize MessageQueue for TP group using the convenient API
         if self.tp_size > 1:
             writer_rank = 0  # First rank in TP group is always the writer
             max_chunk_bytes = 2 * 1024 * 1024 * 1024  # 2 GB per chunk
             max_chunks = 8  # Support up to 8 pending messages
-            
+
             try:
                 # Use create_from_process_group - handles all the setup automatically
                 self.tp_mq = MessageQueue.create_from_process_group(
@@ -633,10 +631,10 @@ class Scheduler(
                     max_chunks=max_chunks,
                     writer_rank=writer_rank,
                 )
-                
+
                 # Track writer status for logging
-                self.is_tp_mq_writer = (self.tp_rank == writer_rank)
-                
+                self.is_tp_mq_writer = self.tp_rank == writer_rank
+
                 if self.is_tp_mq_writer:
                     logger.info(
                         f"TP Rank {self.tp_rank}: Created MessageQueue as writer "
@@ -656,7 +654,7 @@ class Scheduler(
             writer_rank = 0  # First rank in attention TP group is the writer
             max_chunk_bytes = 2 * 1024 * 1024 * 1024  # 2 GB per chunk
             max_chunks = 8
-            
+
             try:
                 # Use create_from_process_group for attention TP group
                 self.attn_tp_mq = MessageQueue.create_from_process_group(
@@ -665,10 +663,10 @@ class Scheduler(
                     max_chunks=max_chunks,
                     writer_rank=writer_rank,
                 )
-                
+
                 # Track writer status
-                self.is_attn_tp_mq_writer = (self.attn_tp_rank == writer_rank)
-                
+                self.is_attn_tp_mq_writer = self.attn_tp_rank == writer_rank
+
                 if self.is_attn_tp_mq_writer:
                     logger.info(
                         f"Attention TP Rank {self.attn_tp_rank}: "
@@ -786,6 +784,7 @@ class Scheduler(
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
+                    mm_processor_kwargs_set=bool(server_args.mm_processor_kwargs),
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -1130,10 +1129,15 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     if isinstance(recv_req, TokenizedGenerateReqInput):
-                        if recv_req.mm_inputs is not None and "mm_items" in recv_req.mm_inputs.keys():
+                        if (
+                            recv_req.mm_inputs is not None
+                            and "mm_items" in recv_req.mm_inputs.keys()
+                        ):
                             for item in recv_req.mm_inputs["mm_items"]:
                                 if item.feature is not None:
-                                    item.feature = item.feature.to(self.device, non_blocking=True)
+                                    item.feature = item.feature.to(
+                                        self.device, non_blocking=True
+                                    )
                     recv_reqs.append(recv_req)
 
                 while True:
@@ -1212,7 +1216,7 @@ class Scheduler(
                         self.attn_tp_group.device_group,
                         src=self.attn_tp_group.ranks[0],
                     )
-            
+
             # Distribute control_reqs via MessageQueue or broadcast_pyobj
             if self.tp_size != 1:
                 if self.tp_mq is not None:

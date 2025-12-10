@@ -433,6 +433,7 @@ def get_processor(
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
     use_fast: Optional[bool] = True,
+    mm_processor_kwargs_set: bool = False,
     **kwargs,
 ):
     # pop 'revision' from kwargs if present.
@@ -450,8 +451,10 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
-    if config.model_type not in {"llava", "clip"}:
-        kwargs["use_fast"] = use_fast
+    # Only apply default use_fast logic if mm_processor_kwargs was not set by user
+    if not mm_processor_kwargs_set:
+        if config.model_type not in {"llava", "clip"}:
+            kwargs["use_fast"] = use_fast
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(

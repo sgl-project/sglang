@@ -23,7 +23,7 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
-MIN_PIXELS = 4 * 28 * 28
+MIN_PIXELS = envs.SGLANG_IMAGE_MIN_PIXELS.get()
 MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
 MAX_RATIO = 200
 RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
@@ -282,10 +282,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         # Qwen-specific: resize images if they are raw Image objects
-        if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
-            base_output.images = await asyncio.gather(*resize_tasks)
-
+        # Only apply default resize logic if mm_processor_kwargs was not set by user
+        if not self.server_args.mm_processor_kwargs:
+            if base_output.images and isinstance(base_output.images[0], Image.Image):
+                resize_tasks = [
+                    resize_image_async(image) for image in base_output.images
+                ]
+                base_output.images = await asyncio.gather(*resize_tasks)
         video_metadata = None
         if base_output.videos:
             video_results = await asyncio.gather(

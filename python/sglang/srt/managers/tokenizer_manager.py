@@ -183,6 +183,23 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
+
+            # Parse mm_processor_kwargs if provided
+            import json
+
+            processor_kwargs = {}
+            mm_processor_kwargs_set = False
+            if server_args.mm_processor_kwargs:
+                mm_processor_kwargs_set = True
+                try:
+                    processor_kwargs = json.loads(server_args.mm_processor_kwargs)
+                    logger.info(
+                        f"Using multimodal processor kwargs: {processor_kwargs}"
+                    )
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"Failed to parse mm_processor_kwargs: {e}. Ignoring."
+                    )
             try:
                 _processor = get_processor(
                     server_args.tokenizer_path,
@@ -190,6 +207,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
+                    mm_processor_kwargs_set=mm_processor_kwargs_set,
+                    **processor_kwargs,
                 )
             except ValueError as e:
                 error_message = str(e)
@@ -203,6 +222,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         trust_remote_code=server_args.trust_remote_code,
                         revision=server_args.revision,
                         use_fast=True,
+                        mm_processor_kwargs_set=mm_processor_kwargs_set,
+                        **processor_kwargs,
                     )
                 else:
                     raise e

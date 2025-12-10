@@ -483,6 +483,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
+    mm_processor_kwargs: Optional[str] = None
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -1756,6 +1757,16 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+
+        # Define multimodal argument configurations
+        multimodal_kwargs = {
+            "mm_processor_kwargs": {
+                "type": str,
+                "default": ServerArgs.mm_processor_kwargs,
+                "help": "Additional keyword arguments to pass to the multimodal processor. "
+                'Example: \'{"max_pixels": 1000, "min_pixels": 1000}\'',
+            }
+        }
 
         # Model and tokenizer
         parser.add_argument(
@@ -3298,6 +3309,10 @@ class ServerArgs:
             "--keep-mm-feature-on-device",
             action="store_true",
             help="Keep multimodal feature tensors on device after processing to save D2H copy.",
+        )
+        parser.add_argument(
+            "--mm-processor-kwargs",
+            **multimodal_kwargs["mm_processor_kwargs"],
         )
         parser.add_argument(
             "--enable-return-hidden-states",
