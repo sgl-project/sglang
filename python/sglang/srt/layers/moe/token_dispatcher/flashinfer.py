@@ -13,12 +13,17 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.environ import envs
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.utils import get_int_env_var, is_flashinfer_available, round_up
 
 
 logger = logging.getLogger(__name__)
+
+MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 
 
 class FlashinferDispatchOutput(NamedTuple):
@@ -82,7 +87,7 @@ class FlashinferDispatcher(BaseDispatcher):
         try:
             from flashinfer.comm.mapping import Mapping
             from flashinfer.comm.mnnvl import MnnvlConfig
-            from flashinfer.comm.trtllm_moe_alltoall import (
+            from flashinfer.comm import (
                 MoeAlltoAll,
                 moe_a2a_get_workspace_size_per_rank,
             )
@@ -95,6 +100,10 @@ class FlashinferDispatcher(BaseDispatcher):
         self.router_topk = router_topk
         self.hidden_size = hidden_size
         self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+
+        # TODO: Can other moe runners use payload_in_workspace too?
+        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (
@@ -102,13 +111,23 @@ class FlashinferDispatcher(BaseDispatcher):
             * self.group.size()
         )
 
-        # Calculate workspace size
-        total_dispatch_payload_size_per_token = (
-            hidden_size // 2  # nvfp4 hidden states
-            + hidden_size // 16  # fp8 scaling factors
-            + self.router_topk * 4  # int32 topks ids
-            + self.router_topk * 4  # float32 topk weights
+        # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
+        speculative_algo = SpeculativeAlgorithm.from_string(
+            get_global_server_args().speculative_algorithm
         )
+        if MOE_NVFP4_DISPATCH and not speculative_algo.is_eagle():
+            total_dispatch_payload_size_per_token = (
+                hidden_size // 2  # nvfp4 hidden states
+                + hidden_size // 16  # fp8 scaling factors
+                + self.router_topk * 4  # int32 topks ids
+                + self.router_topk * 4  # float32 topk weights
+            )
+        else:
+            total_dispatch_payload_size_per_token = (
+                hidden_size * 2  # bf16 hidden states
+                + self.router_topk * 4  # int32 topks ids
+                + self.router_topk * 4  # float32 topk weights
+            )
         combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
         self.workspace_size = moe_a2a_get_workspace_size_per_rank(
             ep_size=self.group.size(),
@@ -143,27 +162,29 @@ class FlashinferDispatcher(BaseDispatcher):
     ) -> DispatchOutput:
         from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
 
-        global_scale = self.quant_config.get("input_global_scale", None)
-        assert (
-            global_scale is not None
-        ), "input_global_scale is not set, use SGLANG_MOE_NVFP4_DISPATCH=1"
-
         output_dtype = hidden_states.dtype
+        x = hidden_states
+        x_sf = None
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
         # Handle case where there are no tokens on this DP worker
         # moe_a2a.dispatch requires at least one token
         self.has_dummy_token = False
-        if hidden_states.shape[0] == 0:
+        topk_ids_current_rank = None
+        if x.shape[0] == 0:
             self.has_dummy_token = True
-            hidden_states = torch.zeros(
-                (1, hidden_states.shape[1]),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+            x = torch.empty(
+                (1, x.shape[1]),
+                dtype=x.dtype,
+                device=x.device,
             )
             topk_ids = torch.full(
                 (1, topk_ids.shape[1]), -1, dtype=topk_ids.dtype, device=topk_ids.device
+            )
+            # Hack for dummy token so it is routed to this rank and requires no transfer
+            topk_ids_current_rank = torch.full(
+                (1, topk_ids.shape[1]), self.group.rank()*self.num_local_experts, dtype=topk_ids.dtype, device=topk_ids.device
             )
             topk_weights = torch.zeros(
                 (1, topk_weights.shape[1]),
@@ -171,33 +192,46 @@ class FlashinferDispatcher(BaseDispatcher):
                 device=topk_weights.device,
             )
 
-        x, x_sf = fp4_quantize(hidden_states, global_scale, is_sf_swizzled_layout=False)
+        global_scale = self.quant_config.get("input_global_scale", None)
+        if global_scale is not None:
+            x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
 
-        payloads = [x, x_sf, topk_ids, topk_weights]
-        expert_id_payload_index = 2
+        payloads = []
+        payloads.append(x)
+        if x_sf is not None:
+            payloads.append(x_sf)
+            expert_id_payload_index = 2
+        else:
+            expert_id_payload_index = 1
+        payloads.append(topk_ids)
+        payloads.append(topk_weights)
+
         self.runtime_max_tokens_per_rank = (
             max(get_dp_global_num_tokens())
             if get_dp_global_num_tokens() is not None
             else x.shape[0]
         )
         recv_tensors = self.moe_a2a.dispatch(
-            topk_ids,
+            topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=-1,  # Caution: Cutlass MoE uses num_slots as invalid token expert id
             expert_id_payload_index=expert_id_payload_index,
         )
-        x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
+        if x_sf is not None:
+            x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
+            x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
+            # TODO: fuse interleave into cutlass moe
+            x_sf = nvfp4_block_scale_interleave(x_sf)
+        else:
+            x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])
-        x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-        # TODO: fuse interleave into cutlass moe
-        x_sf = nvfp4_block_scale_interleave(x_sf)
         topk_ids = topk_ids_recv.view(-1, topk_ids_recv.shape[-1])
         topk_weights = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
 
         # Provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output = None
-        if get_moe_runner_backend().is_flashinfer_cutlass():
+        if self.payload_in_workspace:
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 self.runtime_max_tokens_per_rank, self.hidden_size, output_dtype
             ).view(-1, self.hidden_size)
@@ -216,7 +250,7 @@ class FlashinferDispatcher(BaseDispatcher):
                 self.group.size(), self.runtime_max_tokens_per_rank, output_hidden_size
             ),
             self.runtime_max_tokens_per_rank,
-            payload_in_workspace=get_moe_runner_backend().is_flashinfer_cutlass(),
+            payload_in_workspace=self.payload_in_workspace,
         )
 
         # Remove dummy token if it was added in dispatch
