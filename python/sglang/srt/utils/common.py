@@ -227,9 +227,7 @@ def is_blackwell():
 def is_blackwell_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
-    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
-        torch.version.cuda >= "12.8"
-    )
+    return is_sm100_supported(device) or is_sm120_supported(device)
 
 
 @lru_cache(maxsize=1)
@@ -243,7 +241,7 @@ def is_sm120_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
@@ -252,7 +250,7 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
@@ -314,7 +312,6 @@ try:
     )
 except:
     is_intel_amx_backend_available = False
-
 
 try:
     # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -643,60 +640,6 @@ def make_layers_non_pp(
         )
     )
     return layers
-
-
-cmo_stream = None
-
-
-def get_cmo_stream():
-    """
-    Cache Management Operation(CMO).
-    Launch a new stream to prefetch the weight of matmul when running other
-    AIV or communication kernels, aiming to overlap the memory access time.
-    """
-    global cmo_stream
-    return cmo_stream
-
-
-def set_cmo_stream(stream):
-    global cmo_stream
-    cmo_stream = stream
-
-
-def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
-    """
-    PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
-    This affects the time spent in prefetch:
-        time ≈ PREFETCH_MAX_SIZE / system_bandwidth
-    """
-    import torch_npu
-
-    stream = get_cmo_stream()
-    if stream is None:
-        stream = torch.get_device_module().Stream()
-        set_cmo_stream(stream)
-    stream.wait_stream(torch.get_device_module().current_stream())
-    with torch.get_device_module().stream(stream):
-        if isinstance(cache, list):
-            for weight in cache:
-                torch_npu.npu_prefetch(
-                    weight,
-                    handle,
-                    PREFETCH_MAX_SIZE,
-                )
-        else:
-            torch_npu.npu_prefetch(
-                cache,
-                handle,
-                PREFETCH_MAX_SIZE,
-            )
-
-
-def wait_cmo_stream():
-    stream = get_cmo_stream()
-    if stream is not None:
-        cur_stream = torch.get_device_module().current_stream()
-        cur_stream.wait_stream(stream)
 
 
 @lru_cache(maxsize=1)
@@ -1894,7 +1837,7 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2761,15 +2704,18 @@ def is_fa3_default_architecture(hf_config):
     if not isinstance(architectures, list) or not architectures:
         return False
     default_archs = {
-        "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
         "Glm4MoeForCausalLM",
+        "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
@@ -2851,6 +2797,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
@@ -2859,7 +2807,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend == "none":
+        elif get_moe_a2a_backend().is_none():
             return True
         else:
             return (
@@ -2874,8 +2822,10 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -3372,6 +3322,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
