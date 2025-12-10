@@ -18,9 +18,7 @@ from sglang.test.test_utils import (
 class TestParallelToolCall(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        import os
-
-        cls.model = os.environ["QWEN3_8B"]
+        cls.model = "Qwen/Qwen3-8B"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         other_args = [
