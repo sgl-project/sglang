@@ -831,7 +831,9 @@ impl Tree {
             }
         }
 
-        min_tenant.unwrap_or_else(|| "empty".to_string())
+        min_tenant
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "empty".to_string())
     }
 
     #[allow(dead_code)]
