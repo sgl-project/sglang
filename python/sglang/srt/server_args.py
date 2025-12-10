@@ -2843,7 +2843,7 @@ class ServerArgs:
         parser.add_argument(
             "--preferred-sampling-params",
             type=str,
-            help="json-formatted sampling settings that will be returned in /get_model_info",
+            help="json-formatted sampling settings that will be returned in /model_info",
         )
 
         # LoRA

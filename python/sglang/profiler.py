@@ -41,7 +41,7 @@ def run_profile(
     # Dump server args.
     file_path = Path(output_dir) / "server_args.json"
     if not file_path.exists():
-        response = requests.get(url + "/get_server_info")
+        response = requests.get(url + "/server_info")
         response.raise_for_status()
         server_args_data = response.json()
         with open(file_path, "w") as file:
