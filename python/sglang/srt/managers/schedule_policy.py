@@ -74,6 +74,7 @@ class CacheAgnosticPolicy(Enum):
 
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
+    SJF = "sjf"  # shortest job first (by input length)
     RANDOM = "random"
 
 
@@ -126,6 +127,12 @@ class SchedulePolicy:
                 pass
             elif policy == CacheAgnosticPolicy.LOF:
                 SchedulePolicy._sort_by_longest_output(
+                    waiting_queue,
+                    self.enable_priority_scheduling,
+                    self.schedule_low_priority_values_first,
+                )
+            elif policy == CacheAgnosticPolicy.SJF:
+                SchedulePolicy._sort_by_shortest_job(
                     waiting_queue,
                     self.enable_priority_scheduling,
                     self.schedule_low_priority_values_first,
@@ -269,6 +276,31 @@ class SchedulePolicy:
                 )
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+
+    @staticmethod
+    def _sort_by_shortest_job(
+        waiting_queue: List[Req],
+        enable_priority_scheduling: bool,
+        schedule_low_priority_values_first: bool,
+    ) -> None:
+        """Sorts the waiting queue based on the shortest input length (origin_input_ids).
+
+        This policy is particularly useful for prefill-only nodes in disaggregated
+        serving (PD separation), where prioritizing shorter requests can minimize
+        the average/mean TTFT by reducing overall queue waiting time.
+        If using priority scheduling, sort by priority first.
+        """
+        if enable_priority_scheduling:
+            if schedule_low_priority_values_first:
+                waiting_queue.sort(
+                    key=lambda x: (x.priority, len(x.origin_input_ids))
+                )
+            else:
+                waiting_queue.sort(
+                    key=lambda x: (-x.priority, len(x.origin_input_ids))
+                )
+        else:
+            waiting_queue.sort(key=lambda x: len(x.origin_input_ids))
 
     @staticmethod
     def _sort_randomly(waiting_queue: List[Req]) -> None:
