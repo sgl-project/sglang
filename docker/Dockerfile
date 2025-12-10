@@ -299,16 +299,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages
-# TODO: Move cutlass-dsl to pyproject.toml after drivers on CI runners are updated
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 ; \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps ; \
 fi
 
 # Install development tools

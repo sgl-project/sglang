@@ -67,17 +67,10 @@ fi
 cd ${DEEPEP_DIR}
 if [ "$GRACE_BLACKWELL" = "1" ]; then
     CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}')
-    if [ "$CUDA_VERSION" = "12.8" ]; then
-        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
-    elif awk -v ver="$CUDA_VERSION" 'BEGIN {exit !(ver > 12.8)}'; then
-        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
-    else
-        echo "Unsupported CUDA version for Grace Blackwell: $CUDA_VERSION" && exit 1
-    fi && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi
-    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
+    TORCH_CUDA_ARCH_LIST="10.0" pip install --no-build-isolation .
 else
     python3 setup.py install
 fi
