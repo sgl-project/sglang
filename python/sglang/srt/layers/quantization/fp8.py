@@ -744,6 +744,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.process_weights_hip_int4(layer)
             return
 
+        if self.runner.runner_backend.is_alpha_moe():
+            from alpha_moe_python.utils import interleave_tensor
+
+            w13_weight = interleave_tensor(layer.w13_weight, 8)
+            w13_weight_scale_inv = interleave_tensor(layer.w13_weight_scale_inv, 1)
+            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+            layer.w13_weight_scale_inv = torch.nn.Parameter(
+                w13_weight_scale_inv, requires_grad=False
+            )
+
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -1105,7 +1115,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+        if (
+            moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_alpha_moe()
+        ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -1231,7 +1245,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale=w2_scale,
                 block_shape=block_shape,
             )
-        elif self.runner.runner_backend.is_triton():
+        elif (
+            self.runner.runner_backend.is_triton()
+            or self.runner.runner_backend.is_alpha_moe()
+        ):
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
