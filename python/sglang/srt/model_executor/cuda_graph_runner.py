@@ -835,10 +835,11 @@ class CudaGraphRunner:
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
-                next_token_logits = full_logits = None
-            else:
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = None
                 full_logits = output.full_logits[: self.raw_num_token]
+            else:
+                full_logits = None
+                next_token_logits = output.next_token_logits[: self.raw_num_token]
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
