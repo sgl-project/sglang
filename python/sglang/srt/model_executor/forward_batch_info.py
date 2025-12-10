@@ -215,7 +215,7 @@ def _clamp_value(
 
 
 def compute_local_num_token_non_padded(
-    global_num_token_non_padded: torch.Tensor,
+    global_num_token_non_padded: torch.Tensor | int,
     num_tokens_per_dp: int,
 ) -> torch.Tensor:
     """Compute local non-padded token count for this attention-TP rank.
@@ -540,24 +540,20 @@ class ForwardBatch:
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_attention_dp_rank()
-        tp_rank = get_attention_tp_rank()
-        tokens_per_rank = None
+
         if require_mlp_tp_gather(server_args):
             num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
         else:
             num_tokens_per_dp = self.global_num_tokens_gpu[0]
 
-        tokens_per_rank = num_tokens_per_dp // get_attention_tp_size()
-
-        local = compute_local_num_token_non_padded(
+        self.num_token_non_padded = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
-        self.num_token_non_padded = local
-        local_cpu = self.num_token_non_padded_cpu - tokens_per_rank * tp_rank
-        self.num_token_non_padded_cpu = _clamp_value(
-            local_cpu, min_val=0, max_val=tokens_per_rank
+        self.num_token_non_padded_cpu = compute_local_num_token_non_padded(
+            global_num_token_non_padded=self.num_token_non_padded_cpu,
+            num_tokens_per_dp=num_tokens_per_dp,
         )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
