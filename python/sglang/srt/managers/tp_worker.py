@@ -354,6 +354,18 @@ class TpModelWorker(BaseTpWorker):
     def is_dllm(self):
         return self.dllm_algorithm is not None
 
+    def _forward_batch_generation_dllm(
+        self, forward_batch: ForwardBatch
+    ) -> GenerationBatchResult:
+        logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
+            self.model_runner, forward_batch
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -383,14 +395,7 @@ class TpModelWorker(BaseTpWorker):
 
         if self.pp_group.is_last_rank:
             if self.is_dllm():
-                logits_output, next_token_ids, can_run_cuda_graph = (
-                    self.dllm_algorithm.run(self.model_runner, forward_batch)
-                )
-                return GenerationBatchResult(
-                    logits_output=logits_output,
-                    next_token_ids=next_token_ids,
-                    can_run_cuda_graph=can_run_cuda_graph,
-                )
+                return self._forward_batch_generation_dllm(forward_batch)
 
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
