@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -529,10 +530,14 @@ class ForwardBatch:
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_attention_dp_rank()
+        tp_rank = get_attention_tp_rank()
+        tokens_per_rank = None
         if require_mlp_tp_gather(server_args):
             num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
         else:
             num_tokens_per_dp = self.global_num_tokens_gpu[0]
+
+        tokens_per_rank = num_tokens_per_dp // get_attention_tp_size()
 
         local = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded,
@@ -540,7 +545,8 @@ class ForwardBatch:
         )
 
         self.num_token_non_padded = local
-        self.num_token_non_padded_cpu = int(local.item())
+        local_cpu = self.num_token_non_padded_cpu - tokens_per_rank * tp_rank
+        self.num_token_non_padded_cpu = math.clamp(local_cpu, 0, tokens_per_rank)
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
