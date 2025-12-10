@@ -66,19 +66,70 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
+    /// Returns the text content, cloning only when necessary.
+    /// For simple text, returns a clone of the string.
+    /// For parts, concatenates text parts with spaces.
+    /// Optimized to avoid intermediate Vec allocation.
     pub fn to_simple_string(&self) -> String {
         match self {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(parts) => {
-                let texts: Vec<String> = parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                texts.join(" ")
+                // Use fold to build string directly without intermediate Vec allocation
+                let mut result = String::new();
+                let mut first = true;
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        if !first {
+                            result.push(' ');
+                        }
+                        result.push_str(text);
+                        first = false;
+                    }
+                }
+                result
             }
+        }
+    }
+
+    /// Appends text content directly to a buffer, avoiding intermediate allocations.
+    /// Returns true if any content was appended.
+    #[inline]
+    pub fn append_text_to(&self, buffer: &mut String) -> bool {
+        match self {
+            MessageContent::Text(text) => {
+                if !text.is_empty() {
+                    buffer.push_str(text);
+                    true
+                } else {
+                    false
+                }
+            }
+            MessageContent::Parts(parts) => {
+                let mut appended = false;
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        if !text.is_empty() {
+                            if appended {
+                                buffer.push(' ');
+                            }
+                            buffer.push_str(text);
+                            appended = true;
+                        }
+                    }
+                }
+                appended
+            }
+        }
+    }
+
+    /// Returns true if this content contains any non-empty text.
+    #[inline]
+    pub fn has_text(&self) -> bool {
+        match self {
+            MessageContent::Text(text) => !text.is_empty(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::Text { text } if !text.is_empty())),
         }
     }
 }
@@ -581,33 +632,66 @@ impl GenerationRequest for ChatCompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         // Extract text from messages for routing decisions
-        self.messages
-            .iter()
-            .filter_map(|msg| match msg {
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                ChatMessage::User { content, .. } => Some(content.to_simple_string()),
+        // Use a single buffer to avoid intermediate Vec<String> allocations
+        let mut buffer = String::new();
+        let mut has_content = false;
+
+        for msg in &self.messages {
+            match msg {
+                ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                    if has_content && content.has_text() {
+                        buffer.push(' ');
+                    }
+                    if content.append_text_to(&mut buffer) {
+                        has_content = true;
+                    }
+                }
                 ChatMessage::Assistant {
                     content,
                     reasoning_content,
                     ..
                 } => {
-                    // Combine content and reasoning content for routing decisions
-                    let main_content = content
-                        .as_ref()
-                        .map(|c| c.to_simple_string())
-                        .unwrap_or_default();
-                    let reasoning = reasoning_content.clone().unwrap_or_default();
-                    if main_content.is_empty() && reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{} {}", main_content, reasoning).trim().to_string())
+                    // Append main content
+                    if let Some(c) = content {
+                        if has_content && c.has_text() {
+                            buffer.push(' ');
+                        }
+                        if c.append_text_to(&mut buffer) {
+                            has_content = true;
+                        }
+                    }
+                    // Append reasoning content
+                    if let Some(reasoning) = reasoning_content {
+                        if !reasoning.is_empty() {
+                            if has_content {
+                                buffer.push(' ');
+                            }
+                            buffer.push_str(reasoning);
+                            has_content = true;
+                        }
                     }
                 }
-                ChatMessage::Tool { content, .. } => Some(content.to_simple_string()),
-                ChatMessage::Function { content, .. } => Some(content.clone()),
-            })
-            .collect::<Vec<String>>()
-            .join(" ")
+                ChatMessage::Tool { content, .. } => {
+                    if has_content && content.has_text() {
+                        buffer.push(' ');
+                    }
+                    if content.append_text_to(&mut buffer) {
+                        has_content = true;
+                    }
+                }
+                ChatMessage::Function { content, .. } => {
+                    if !content.is_empty() {
+                        if has_content {
+                            buffer.push(' ');
+                        }
+                        buffer.push_str(content);
+                        has_content = true;
+                    }
+                }
+            }
+        }
+
+        buffer
     }
 }
 

@@ -6,6 +6,9 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=3, suite="stage-b-test-small-1-gpu")
 
 
 class TestBuildEagleTree(unittest.TestCase):
