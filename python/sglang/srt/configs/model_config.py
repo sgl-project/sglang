@@ -358,10 +358,9 @@ class ModelConfig:
                 mscale_all_dim = self.hf_config.rope_scaling.get(
                     "mscale_all_dim", False
                 )
-                scaling_factor = self.hf_config.rope_scaling.get("factor")
-                if scaling_factor is not None:
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -525,7 +524,8 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-                if envs.SGLANG_USE_MODELSCOPE is True:
+                if envs.SGLANG_USE_MODELSCOPE.get():
+
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
@@ -986,6 +986,7 @@ multimodal_model_archs = [
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
+    "PaddleOCRVLForConditionalGeneration",
 ]
 
 if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:

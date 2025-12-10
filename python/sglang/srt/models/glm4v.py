@@ -52,7 +52,7 @@ from sglang.srt.managers.mm_utils import (
     patch_conv3d,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
@@ -661,6 +661,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         """Run forward pass for GLM-4.1V.
 
@@ -693,6 +694,7 @@ class Glm4vForConditionalGeneration(nn.Module):
             language_model=self.model,
             multimodal_model=self,
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         aux_hidden_states = None
@@ -752,6 +754,17 @@ class Glm4vForConditionalGeneration(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        # For the PP case, we add special handling for lm_head.weight,
+        # - On non–last ranks: we continue, because this stage is supposed to
+        #   be just an empty PPMissingLayer shell.
+        # - On the last rank: params_dict is expected to contain lm_head.weight,
+        #   so it will never hit the branch "if name not in params_dict".
+        #
+        # For all other parameters, such like
+        # "model.visual.blocks.20.mlp.gate_proj.weight", the unified rule is:
+        # If this name does not exist in the current rank’s params_dict,
+        # it does not belong to this pipeline stage, thus we simply continue.
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -759,6 +772,8 @@ class Glm4vForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
+            if name.startswith("lm_head.") and not self.pp_group.is_last_rank:
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -768,6 +783,10 @@ class Glm4vForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
+                if name not in params_dict:
+                    continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -781,6 +800,10 @@ class Glm4vForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
+                    if name not in params_dict:
+                        continue
+
                     param = params_dict[name]
                 except KeyError:
                     print(params_dict.keys())
