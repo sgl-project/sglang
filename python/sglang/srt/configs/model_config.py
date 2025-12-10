@@ -519,7 +519,7 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-                if envs.SGLANG_USE_MODELSCOPE is True:
+                if envs.SGLANG_USE_MODELSCOPE.get():
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
