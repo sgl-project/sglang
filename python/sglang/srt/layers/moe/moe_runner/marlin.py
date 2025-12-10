@@ -8,7 +8,6 @@ import torch
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
-    MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
     register_fused_func,
@@ -72,28 +71,6 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
 
     # Optional
     expert_map: Optional[torch.Tensor] = None
-
-
-class MarlinRunnerCore(MoeRunnerCore):
-    def __init__(self, config: MoeRunnerConfig):
-        super().__init__(config)
-
-    def run(
-        self,
-        runner_input: RunnerInput,
-        quant_info: MoeQuantInfo,
-        running_state: dict,
-    ) -> RunnerOutput:
-        # Marlin backend always uses the fused path (fused_experts_none_to_marlin).
-        # This method should never be called directly.
-        raise NotImplementedError(
-            "MarlinRunnerCore.run() should not be called directly. "
-            "Use the fused path via fused_experts_none_to_marlin instead."
-        )
-
-    @property
-    def runner_backend(self) -> MoeRunnerBackend:
-        return MoeRunnerBackend.MARLIN
 
 
 @register_fused_func("none", "marlin")

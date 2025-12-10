@@ -10,7 +10,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
-from sglang.srt.layers.moe.moe_runner.marlin import MarlinRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -39,7 +38,7 @@ class MoeRunner:
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_marlin():
-            self.runner_core = MarlinRunnerCore(config)
+            self.runner_core = None  # Marlin only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
