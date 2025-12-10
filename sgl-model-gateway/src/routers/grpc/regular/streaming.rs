@@ -204,7 +204,7 @@ impl StreamingProcessor {
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_ref(),
+                self.configured_reasoning_parser.as_deref(),
                 model,
             );
 
@@ -222,7 +222,7 @@ impl StreamingProcessor {
         let tool_parser_available = tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_ref(),
+                self.configured_tool_parser.as_deref(),
                 model,
             );
 
@@ -300,7 +300,7 @@ impl StreamingProcessor {
                         let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                             .created(created)
                             .add_choice_role(index, "assistant")
-                            .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                            .maybe_system_fingerprint(system_fingerprint)
                             .build();
                         Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
@@ -419,9 +419,7 @@ impl StreamingProcessor {
                                     ChatCompletionStreamResponse::builder(request_id, model)
                                         .created(created)
                                         .add_choice_content(index, "assistant", text)
-                                        .maybe_system_fingerprint(
-                                            system_fingerprint.map(|s| s.to_string()),
-                                        )
+                                        .maybe_system_fingerprint(system_fingerprint)
                                         .build();
 
                                 let sse_chunk =
@@ -489,7 +487,7 @@ impl StreamingProcessor {
                     let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_call_delta(*index, tool_call_delta)
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .maybe_system_fingerprint(system_fingerprint)
                         .build();
 
                     let sse_chunk = serde_json::to_string(&tool_chunk)
@@ -514,7 +512,7 @@ impl StreamingProcessor {
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
-                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                .maybe_system_fingerprint(system_fingerprint)
                 .build();
 
             let sse_chunk = serde_json::to_string(&finish_chunk)
@@ -537,7 +535,7 @@ impl StreamingProcessor {
                         total_tokens: total_prompt + total_completion,
                         completion_tokens_details: None,
                     })
-                    .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                    .maybe_system_fingerprint(system_fingerprint)
                     .build();
 
                 let sse_chunk = serde_json::to_string(&usage_chunk)
@@ -1023,7 +1021,7 @@ impl StreamingProcessor {
         reasoning_parsers.entry(index).or_insert_with(|| {
             let parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_ref(),
+                self.configured_reasoning_parser.as_deref(),
                 model,
             )
             .expect("Parser should be available - checked upfront");
@@ -1048,7 +1046,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_reasoning(index, reasoning_text)
-                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         )
                     } else {
@@ -1098,7 +1096,7 @@ impl StreamingProcessor {
                     ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_name(index, tool_call_id, function.name.clone())
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .maybe_system_fingerprint(system_fingerprint)
                         .build(),
                 );
             }
@@ -1109,7 +1107,7 @@ impl StreamingProcessor {
                     ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_args(index, delta.to_string())
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .maybe_system_fingerprint(system_fingerprint)
                         .build(),
                 );
             }
@@ -1139,16 +1137,12 @@ impl StreamingProcessor {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
             let parser = if use_json_parser {
-                utils::create_tool_parser(
-                    &self.tool_parser_factory,
-                    Some(&"json".to_string()),
-                    model,
-                )
-                .expect("JSON parser should be available")
+                utils::create_tool_parser(&self.tool_parser_factory, Some("json"), model)
+                    .expect("JSON parser should be available")
             } else {
                 utils::create_tool_parser(
                     &self.tool_parser_factory,
-                    self.configured_tool_parser.as_ref(),
+                    self.configured_tool_parser.as_deref(),
                     model,
                 )
                 .expect("Parser should be available - checked upfront")
@@ -1167,7 +1161,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_content(index, "assistant", normal_text)
-                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         );
                     }
@@ -1209,7 +1203,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_tool_call_delta(index, tool_call_delta)
-                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         );
                     }

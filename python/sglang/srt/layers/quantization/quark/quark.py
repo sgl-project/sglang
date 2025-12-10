@@ -71,6 +71,8 @@ class QuarkConfig(QuantizationConfig):
         ):
             if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
+            elif isinstance(layer, RadixAttention):
+                return QuarkKVCacheMethod(self)
             return None
 
         if isinstance(layer, LinearBase):
