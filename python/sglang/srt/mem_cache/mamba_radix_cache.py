@@ -29,7 +29,10 @@ from numpy import float64
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
@@ -358,7 +361,9 @@ class LRUList:
 
 class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
-        assert isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
+        assert isinstance(
+            params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
+        ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 

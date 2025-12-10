@@ -1467,7 +1467,7 @@ class ModelRunner:
                 assert server_args.max_running_requests is not None
 
                 mamba_state_intermediate_size = (
-                    config.mamba_cache_per_req
+                    config.mamba2_cache_params.mamba_cache_per_req
                     * server_args.max_running_requests
                     * server_args.speculative_num_draft_tokens
                 )
