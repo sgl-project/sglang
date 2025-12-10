@@ -1558,6 +1558,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
         )
 
+    def _calculate_eagle_extra_tokens(
+        self, selected_indices: Optional[List[int]] = None
+    ) -> int:
+        """Calculate extra tokens required for EAGLE speculative decoding.
+
+        For speculative decoding (EAGLE), we need additional memory for:
+        1. Draft stage: num_seqs * speculative_num_steps * topk tokens
+        2. Verify stage: num_seqs * speculative_num_draft_tokens tokens
+
+        Args:
+            selected_indices: Optional list of selected request indices.
+
+        Returns:
+            Extra tokens required for EAGLE, or 0 if EAGLE is not enabled.
+        """
+        if not self.spec_algorithm.is_eagle():
+            return 0
+
+        server_args = get_global_server_args()
+        speculative_num_steps = server_args.speculative_num_steps
+        topk = server_args.speculative_eagle_topk
+        speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+
+        num_seqs = (
+            len(selected_indices) if selected_indices is not None else self.batch_size()
+        )
+        # Draft/Verify stage memory requirement
+        eagle_draft_tokens = num_seqs * speculative_num_steps * topk
+        eagle_verify_tokens = num_seqs * speculative_num_draft_tokens
+
+        return eagle_draft_tokens + eagle_verify_tokens
+
     def check_decode_mem(
         self, buf_multiplier=1, selected_indices: Optional[List[int]] = None
     ):
@@ -1567,25 +1599,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * self.token_to_kv_pool_allocator.page_size
         )
 
-        # For speculative decoding (EAGLE), we need additional memory for:
-        # 1. Draft stage: num_seqs * speculative_num_steps * topk tokens
-        # 2. Verify stage: num_seqs * speculative_num_draft_tokens tokens
         if self.spec_algorithm.is_eagle():
-            server_args = get_global_server_args()
-            speculative_num_steps = server_args.speculative_num_steps
-            topk = server_args.speculative_eagle_topk
-            speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-
-            num_seqs = (
-                len(selected_indices)
-                if selected_indices is not None
-                else self.batch_size()
-            )
-            # Draft/Verify stage memory requirement
-            eagle_draft_tokens = num_seqs * speculative_num_steps * topk
-            eagle_verify_tokens = num_seqs * speculative_num_draft_tokens
-
-            num_tokens += eagle_draft_tokens + eagle_verify_tokens
+            num_tokens += self._calculate_eagle_extra_tokens(selected_indices)
 
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
