@@ -168,8 +168,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
-MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
-
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 
@@ -397,7 +395,6 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
-    speculative_moe_a2a_backend: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3039,13 +3036,6 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
-        parser.add_argument(
-            "--speculative-moe-a2a-backend",
-            type=str,
-            choices=MOE_A2A_BACKEND_CHOICES,
-            default=ServerArgs.speculative_moe_a2a_backend,
-            help="Choose the backend for MoE A2A in speculative decoding",
-        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -3104,7 +3094,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=MOE_A2A_BACKEND_CHOICES,
+            choices=["none", "deepep", "mooncake", "ascend_fuseep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
