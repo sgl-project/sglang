@@ -225,6 +225,9 @@ class GenerateReqInput(BaseReq):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # For custom request attributes (logging only, separate from metrics)
+    custom_request_attributes: Optional[Dict[str, str]] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -701,6 +704,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
+    # For custom request attributes (logging only, separate from metrics)
+    custom_request_attributes: Optional[Dict[str, str]] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -757,6 +763,9 @@ class EmbeddingReqInput(BaseReq):
 
     # For background responses (OpenAI responses API)
     background: bool = False
+
+    # For custom request attributes (logging only, separate from metrics)
+    custom_request_attributes: Optional[Dict[str, str]] = None
 
     # tracing context
     trace_context: Optional[Dict] = None

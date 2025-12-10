@@ -55,9 +55,13 @@ class OpenAIServingRerank(OpenAIServingBase):
         for doc in request.documents:
             pairs.append([request.query, doc])
 
+        # Extract custom request attributes from raw request headers
+        custom_request_attributes = self.extract_custom_request_attributes(raw_request)
+
         adapted_request = EmbeddingReqInput(
             text=pairs,
             is_cross_encoder_request=True,
+            custom_request_attributes=custom_request_attributes,
         )
 
         return adapted_request, request

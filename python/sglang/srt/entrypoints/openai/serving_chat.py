@@ -183,6 +183,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
+        # Extract custom request attributes from raw request headers
+        custom_request_attributes = self.extract_custom_request_attributes(raw_request)
+
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
         if lora_path:
@@ -217,6 +220,7 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            custom_request_attributes=custom_request_attributes,
             custom_logit_processor=request.custom_logit_processor,
         )
 

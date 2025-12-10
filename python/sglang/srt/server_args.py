@@ -327,6 +327,8 @@ class ServerArgs:
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
+    log_requests_custom_attributes: bool = False
+    log_requests_custom_attributes_header: str = "x-request-custom-attributes"
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
@@ -2578,6 +2580,20 @@ class ServerArgs:
             default=ServerArgs.log_requests_level,
             help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
             choices=[0, 1, 2, 3],
+        )
+        parser.add_argument(
+            "--log-requests-custom-attributes",
+            action="store_true",
+            default=ServerArgs.log_requests_custom_attributes,
+            help="Include custom request attributes from configurable header "
+            "as top-level fields in request-level logs (Finish: ...). "
+            "This is separate from Prometheus metrics labels to avoid high cardinality issues.",
+        )
+        parser.add_argument(
+            "--log-requests-custom-attributes-header",
+            type=str,
+            default=ServerArgs.log_requests_custom_attributes_header,
+            help="Specify the HTTP header for passing custom request attributes for logging.",
         )
         parser.add_argument(
             "--crash-dump-folder",

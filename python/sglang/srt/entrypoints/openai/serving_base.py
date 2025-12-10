@@ -267,3 +267,26 @@ class OpenAIServingBase(ABC):
                 if label in self.allowed_custom_labels
             }
         return custom_labels
+
+    def extract_custom_request_attributes(self, raw_request):
+        """Extract custom request attributes from custom attributes header for request-level output logging."""
+        if not self.tokenizer_manager.server_args.log_requests_custom_attributes:
+            return None
+
+        custom_attributes = None
+        header = (
+            self.tokenizer_manager.server_args.log_requests_custom_attributes_header
+        )
+        try:
+            raw_attributes = (
+                json.loads(raw_request.headers.get(header))
+                if raw_request and raw_request.headers.get(header)
+                else None
+            )
+        except json.JSONDecodeError as e:
+            logger.exception(f"Error parsing custom request attributes: {e}")
+            raw_attributes = None
+
+        if isinstance(raw_attributes, dict):
+            custom_attributes = raw_attributes
+        return custom_attributes
