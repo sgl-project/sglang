@@ -80,16 +80,6 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
-def handle_rope_parameters(config: PretrainedConfig):
-    if hasattr(config, "rope_scaling"):
-        rope_scaling = config.rope_scaling
-        if isinstance(rope_scaling, dict):
-            for k, v in rope_scaling.items():
-                if not hasattr(config, k):
-                    setattr(config, k, v)
-    return
-
-
 class ModelConfig:
     def __init__(
         self,
@@ -137,8 +127,6 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        handle_rope_parameters(self.hf_text_config)
-        handle_rope_parameters(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -366,18 +354,11 @@ class ModelConfig:
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-
-            if (
-                "MistralLarge3ForCausalLM" in self.hf_config.architectures
-                or "PixtralForConditionalGeneration" in self.hf_config.architectures
-                or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
-            ):
-                rope_scaling = self.hf_text_config.rope_scaling
-            else:
-                rope_scaling = self.hf_config.rope_scaling
-            if rope_scaling:
-                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-                scaling_factor = rope_scaling["factor"]
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
 
@@ -543,7 +524,8 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-                if envs.SGLANG_USE_MODELSCOPE is True:
+                if envs.SGLANG_USE_MODELSCOPE.get():
+
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
