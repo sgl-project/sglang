@@ -12,6 +12,7 @@ import numpy as np
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
@@ -22,6 +23,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_logprob_check,
 )
+
+register_cuda_ci(est_time=473, suite="stage-b-test-small-1-gpu")
 
 
 class TestEAGLEServer(CustomTestCase):
@@ -144,7 +147,7 @@ class TestEAGLEServer(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.20)
 
-        server_info = requests.get(self.base_url + "/server_info").json()
+        server_info = requests.get(self.base_url + "/get_server_info").json()
         avg_spec_accept_length = server_info["internal_states"][0][
             "avg_spec_accept_length"
         ]
