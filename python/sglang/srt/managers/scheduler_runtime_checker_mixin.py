@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 
 class SchedulerRuntimeCheckerMixin:
     def _get_token_info(self: Scheduler):
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
+        available_size = (
+            self.token_to_kv_pool_allocator.available_size() // self.dcp_size
+        )
+        evictable_size = self.tree_cache.evictable_size() // self.dcp_size
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
