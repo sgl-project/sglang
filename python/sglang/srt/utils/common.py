@@ -1502,6 +1502,31 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter
+
+    http_response_status_counter = Counter(
+        name="sglang:http_responses_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        response = await call_next(request)
+
+        route = request.scope.get("route")
+        endpoint = route.path if route else "Unknown"
+
+        http_response_status_counter.labels(
+            endpoint=endpoint,
+            status_code=str(response.status_code),
+            method=request.method,
+        ).inc()
+
+        return response
+
+
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
