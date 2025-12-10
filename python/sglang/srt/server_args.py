@@ -1682,6 +1682,9 @@ class ServerArgs:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
+                elif self.speculative_algorithm == "EAGLE3":
+                    # Use EAGLE3 with model families that already support MTP requires setting speculative_draft_model_path.
+                    pass
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."

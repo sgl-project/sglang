@@ -98,12 +98,14 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        speculative_algorithm: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -131,6 +133,10 @@ class ModelConfig:
             revision=revision,
             **kwargs,
         )
+        
+        if is_draft_model and speculative_algorithm == "EAGLE3":
+            logger.info("Updating quantization config for draft model.")
+            self.quantization = getattr(self.hf_config, "quantization_config", None)
 
         # Set enable_multimodal
         if enable_multimodal is None:
@@ -253,6 +259,7 @@ class ModelConfig:
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
+            and self.speculative_algorithm != "EAGLE3"
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
