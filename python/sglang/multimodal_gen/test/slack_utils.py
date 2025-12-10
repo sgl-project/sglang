@@ -9,6 +9,8 @@ from datetime import datetime
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
+from sglang.multimodal_gen.runtime.utils.perf_logger import get_git_commit_hash
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,12 @@ except Exception as e:
 
 def _get_status_message(run_id, current_case_id, thread_messages=None):
     date_str = datetime.now().strftime("%d/%m")
-    base_header = f"*🧵 for nightly test of {date_str}*\n*GitHub Run ID:* {run_id}\n*Total Tasks:* {len(ALL_CASES)}"
+    base_header = f"""🧵 for nightly test of {date_str}*
+*Git Revision:* {get_git_commit_hash()}
+*GitHub Run ID:* {run_id}
+*Total Tasks:* {len(ALL_CASES)}
+
+"""
 
     if not ALL_CASES:
         return base_header

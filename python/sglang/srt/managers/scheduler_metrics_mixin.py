@@ -95,7 +95,7 @@ class SchedulerMetricsMixin:
         self.last_prefill_tokens = adder.log_input_tokens
 
         # TODO: generalize this for various memory pools
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             (
                 full_num_used,
                 swa_num_used,
@@ -112,7 +112,7 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_hybrid_gdn:
+        elif self.is_ssm_model:
             (
                 full_num_used,
                 _,
@@ -164,13 +164,15 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_gdn:
+            if self.is_ssm_model:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -217,7 +219,7 @@ class SchedulerMetricsMixin:
         num_running_reqs_offline_batch = 0
 
         # TODO: generalize this for various memory pools
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             (
                 full_num_used,
                 swa_num_used,
@@ -236,7 +238,7 @@ class SchedulerMetricsMixin:
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_hybrid_gdn:
+        elif self.is_ssm_model:
             (
                 full_num_used,
                 mamba_used,
@@ -311,14 +313,16 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_gdn:
+            if self.is_ssm_model:
                 self.stats.mamba_usage = mamba_usage
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
@@ -394,10 +398,10 @@ class SchedulerMetricsMixin:
                 )
 
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
             num_tokens = max(full_num_used, swa_num_used)
-        elif self.is_hybrid_gdn:
+        elif self.is_ssm_model:
             num_tokens = self._get_mamba_token_info()[0]
         else:
             num_tokens = self._get_token_info()[0]
