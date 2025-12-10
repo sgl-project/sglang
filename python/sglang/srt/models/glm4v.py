@@ -592,10 +592,12 @@ class Glm4vForConditionalGeneration(nn.Module):
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
 
-        if self.config.rope_parameters is None:
-            self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
-        else:
-            self.is_mrope_enabled = "mrope_section" in self.config.rope_parameters
+        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
+            self.config, "rope_scaling", None
+        )
+        self.is_mrope_enabled = (
+            rope_config is not None and "mrope_section" in rope_config
+        )
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
