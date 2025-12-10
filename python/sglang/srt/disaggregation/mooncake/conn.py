@@ -8,7 +8,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -227,7 +227,7 @@ class MooncakeKVManager(CommonKVManager):
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
-        self.transfer_contexts: Dict[int, TransferContext] = {}
+        self.transfer_contexts: Dict[int, deque[TransferContext]] = {}
 
     def init_engine(self):
         self.engine = MooncakeTransferEngine(
@@ -714,7 +714,8 @@ class MooncakeKVManager(CommonKVManager):
                 transfer_context = self.transfer_contexts.get(kv_chunk.room)
 
                 if transfer_context is not None:
-                    transfer_context.resolve()
+                    chunk_context = transfer_context.popleft()
+                    chunk_context.resolve()
 
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
@@ -848,7 +849,10 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
-                    if kv_chunk.room in self.transfer_contexts:
+                    if (
+                        kv_chunk.room in self.transfer_contexts
+                        and len(self.transfer_contexts[kv_chunk.room]) == 0
+                    ):
                         self.transfer_contexts.pop(kv_chunk.room)
 
             except Exception as e:
@@ -1017,7 +1021,7 @@ class MooncakeKVManager(CommonKVManager):
         shard_idx = session_port_sum % len(self.transfer_queues)
         # Store transfer_context if provided (shared across all chunks for the same room)
         if transfer_context is not None:
-            self.transfer_contexts[bootstrap_room] = transfer_context
+            self.transfer_contexts[bootstrap_room].append(transfer_context)
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
