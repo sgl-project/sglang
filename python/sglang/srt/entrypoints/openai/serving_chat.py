@@ -1065,8 +1065,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3"]:
-            # qwen3, glm45, and nano_v3 are reasoning by default
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3","interns1"]:
+            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking", True) is True
@@ -1083,7 +1083,7 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
     ):
         """Process tool calls in streaming response"""
-        if index not in parser_dict:
+        if index not in parser_dict:ß
             # Use JSON detector directly for required or named tool choice
             if request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
