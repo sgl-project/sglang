@@ -566,7 +566,8 @@ class Qwen2ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def _load_weights_impl(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Internal implementation of weight loading without reload scenario handling."""
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -577,6 +578,7 @@ class Qwen2ForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        updated_params = set()
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
@@ -620,6 +622,7 @@ class Qwen2ForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                updated_params.add(name)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -632,8 +635,40 @@ class Qwen2ForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    updated_params.add(name)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+        return updated_params
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """
+        Load weights into the model, with support for RL training reload scenarios.
+
+        Args:
+            weights: Iterator of (name, tensor) tuples with weights to load
+
+        Note: quantize_fn and quant_profile are stored on the model during initialization,
+              so they don't need to be passed as arguments.
+        """
+        import logging
+
+        from sglang.srt.model_loader.loader import QuantizedRLModelLoader
+
+        logger = logging.getLogger(__name__)
+
+        # Check if this is a reload scenario for RL training with quantized models
+        is_reload = QuantizedRLModelLoader.is_reload_scenario(self)
+        if is_reload:
+            logger.info("RELOAD SCENARIO - Using rebinding_and_load_weights")
+            # Use the fast path for RL training reloads
+            # quantize_fn and quant_profile are retrieved from model inside rebinding_and_load_weights
+            QuantizedRLModelLoader.rebinding_and_load_weights(
+                self, self._load_weights_impl, weights
+            )
+        else:
+            # Standard weight loading path
+            self._load_weights_impl(weights)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
