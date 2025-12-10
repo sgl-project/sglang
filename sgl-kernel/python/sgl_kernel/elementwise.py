@@ -406,7 +406,7 @@ def concat_mla_absorb_q(
     return out
 
 
-def device_layernorm_fuse_scale_shift(
+def fused_layernorm_scale_shift(
     x: torch.Tensor,
     gamma: torch.Tensor,
     beta: torch.Tensor,
@@ -420,12 +420,10 @@ def device_layernorm_fuse_scale_shift(
       - gamma/beta: [N]
       - scale/shift: [M, N] or [B, F, 1, N]
     """
-    return torch.ops.sgl_kernel.device_layernorm_fuse_scale_shift(
-        x, gamma, beta, scale, shift
-    )
+    return torch.ops.sgl_kernel.fused_layernorm_scale_shift(x, gamma, beta, scale, shift)
 
 
-def device_scale_residual_layernorm_fuse_scale_shift(
+def fused_scale_residual_layernorm_scale_shift(
     residual: torch.Tensor,
     x: torch.Tensor,
     gamma: torch.Tensor,
@@ -442,6 +440,4 @@ def device_scale_residual_layernorm_fuse_scale_shift(
       - scale/shift: [M, N] or [B, F, 1, N]
       - gate: None, [M, N], [B, 1, N], or [B, F, 1, N]
     """
-    return torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
-        residual, x, gamma, beta, scale, shift, gate
-    )
+    return torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(residual, x, gamma, beta, scale, shift, gate)

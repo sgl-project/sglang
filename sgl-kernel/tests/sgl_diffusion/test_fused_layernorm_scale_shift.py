@@ -16,7 +16,7 @@ def run_case_fused_accuracy(
     scale = torch.randn(M, N, device=device, dtype=dtype)
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
-    y_dev_fused = sgl_kernel.device_layernorm_fuse_scale_shift(x, weight, bias, scale, shift)
+    y_dev_fused = sgl_kernel.fused_layernorm_scale_shift(x, weight, bias, scale, shift)
 
     # Reference fused output: compute LN in fp32, then apply scale/shift in fp32, cast back
     x32 = x.float()
@@ -52,7 +52,7 @@ def run_case_fused_4d_scale_accuracy(
     shift4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
 
     # CUDA 4D scale/shift fused
-    y_dev_fused = sgl_kernel.device_layernorm_fuse_scale_shift(x, weight, bias, scale4d, shift4d)
+    y_dev_fused = sgl_kernel.fused_layernorm_scale_shift(x, weight, bias, scale4d, shift4d)
 
     # Reference in fp32
     x32 = x.float()
@@ -96,7 +96,7 @@ def run_case_residual_gate_int(
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
     # gate == 1 (no gate tensor)
-    y_dev, residual_out_dev = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev, residual_out_dev = torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
         residual, x, weight, bias, scale, shift, None
     )
 
@@ -131,7 +131,7 @@ def run_case_residual_gate_3d(
     scale = torch.randn(M, N, device=device, dtype=dtype)
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
-    y_dev, residual_out_dev = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev, residual_out_dev = torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
         residual, x, weight, bias, scale, shift, gate
     )
 
@@ -170,7 +170,7 @@ def run_case_residual_gate_4d(
     scale4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
     shift4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
 
-    y_dev, residual_out_dev = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev, residual_out_dev = torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
         residual, x, weight, bias, scale4d, shift4d, gate4d
     )
 
