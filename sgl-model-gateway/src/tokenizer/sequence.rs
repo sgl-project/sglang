@@ -86,11 +86,13 @@ impl Sequence {
     }
 
     /// Check if the sequence is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.token_ids.is_empty()
     }
 
     /// Get the length of the sequence
+    #[inline]
     pub fn len(&self) -> usize {
         self.token_ids.len()
     }
@@ -111,6 +113,7 @@ impl Sequence {
 
     /// Append a single token to the sequence and return newly decoded text
     /// Based on HuggingFace TGI incremental decoding
+    #[inline]
     pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
         // Store the old read offset before adding the new token
         let old_read_offset = self.read_offset;
@@ -165,11 +168,13 @@ impl Sequence {
     }
 
     /// Get a reference to the tokenizer
+    #[inline]
     pub fn tokenizer(&self) -> &Arc<dyn TokenizerTrait> {
         &self.tokenizer
     }
 
     /// Get the current token ids
+    #[inline]
     pub fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
     }
@@ -181,16 +186,19 @@ impl Sequence {
     }
 
     /// Get the prefix offset
+    #[inline]
     pub fn prefix_offset(&self) -> usize {
         self.prefix_offset
     }
 
     /// Get the read offset
+    #[inline]
     pub fn read_offset(&self) -> usize {
         self.read_offset
     }
 
     /// Get whether special tokens are skipped during decoding
+    #[inline]
     pub fn skip_special_tokens(&self) -> bool {
         self.skip_special_tokens
     }
