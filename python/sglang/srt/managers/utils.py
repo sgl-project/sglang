@@ -101,12 +101,28 @@ def validate_input_length(
     """
     if len(req.origin_input_ids) >= max_req_input_len:
         if allow_auto_truncate:
+            # logger.warning(
+            #     "Request length is longer than the KV cache pool size or "
+            #     "the max context length. Truncated. "
+            #     f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
+            # )
+            # req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+
+            max_new_tokens = req.sampling_params.max_new_tokens
+
+            # NOTE remove middle
+            assert max_req_input_len > max_new_tokens
+
+            prompt_len = max_req_input_len - max_new_tokens
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
+                f"{len(req.origin_input_ids)=}, {prompt_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            assert prompt_len >= 2
+
+            req.origin_input_ids = req.origin_input_ids[:prompt_len // 2] + req.origin_input_ids[-(prompt_len // 2):]
+
             return None
         else:
             error_msg = (
