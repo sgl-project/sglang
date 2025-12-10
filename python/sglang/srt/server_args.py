@@ -29,6 +29,7 @@ import orjson
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
@@ -1260,6 +1261,25 @@ class ServerArgs:
                         f"{model_arch}"
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
+            if not self.disable_radix_cache:
+                assert (
+                    self.mamba_track_interval >= self.speculative_num_draft_tokens
+                ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+
+                if self.page_size is not None:
+                    assert (
+                        self.mamba_track_interval % self.page_size == 0
+                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                    assert (
+                        FLA_CHUNK_SIZE % self.page_size == 0
+                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+
+            if self.speculative_algorithm is not None:
+                logger.info(
+                    f"Disable overlap schedule for {model_arch} model speculative decoding."
+                )
+                self.disable_overlap_schedule = True
+
             if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
