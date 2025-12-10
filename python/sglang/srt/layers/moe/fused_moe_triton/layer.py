@@ -43,6 +43,9 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.moe.token_dispatcher.mori import (
+    MoriDispatcher,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -51,6 +54,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     is_cpu,
     is_flashinfer_available,
     is_hip,
@@ -104,6 +108,18 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
+        )
+    elif a2a_backend.is_mori():
+        return MoriDispatcher(
+            group=get_tp_group(),
+            world_size=get_moe_expert_parallel_world_size(),
+            rank=get_moe_expert_parallel_rank(),
+            hidden_dim=moe_runner_config.hidden_size,
+            scale_dim=moe_runner_config.hidden_size // 128,
+            input_dtype=moe_runner_config.params_dtype,
+            max_num_token=get_int_env_var("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096),
+            num_local_experts=moe_runner_config.num_local_experts,
+            topk=moe_runner_config.top_k,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -179,6 +195,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
+        self.moe_ep_group = get_tp_group().device_group
         assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
         self.num_local_experts = (
             num_experts - num_fused_shared_experts
