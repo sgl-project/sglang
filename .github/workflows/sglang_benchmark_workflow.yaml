@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       model_list:
-        description: 'Model list to benchmark on MI355 (JSON array format, default: ["Qwen3-VL-235B","Qwen3-next"])'
+        description: 'Model list to benchmark on MI355 (JSON array format, default: ["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni"])'
         required: false
-        default: '["Qwen3-VL-235B","Qwen3-next"]'
+        default: '["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni"]'
       image:
         description: 'Image to use for the benchmark (default: "rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125")'
         required: true
@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3-VL-235B","Qwen3-next"]') }} 
+        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni"]') }} 
 
     steps:
       - name: Checkout code
@@ -125,6 +125,8 @@ jobs:
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/RedHatAI/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/ 8 8"
           elif [ "$model_name" == "Qwen3-next" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1"
+          elif [ "$model_name" == "Qwen3-Omni" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 2"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -139,6 +141,8 @@ jobs:
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/RedHatAI/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/ 8 8"
           elif [ "$model_name" == "Qwen3-next" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1"
+          elif [ "$model_name" == "Qwen3-Omni" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 2"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
