@@ -444,7 +444,7 @@ class TransferContext:
             ReqMetadataView.from_req(req) for req in self.batch.reqs
         ]  # Create read-only snapshots of reqs and populate metadata buffers
 
-    def resolve(self) -> None:
+    def resolve(self, is_last: bool) -> None:
         if self._resolved:
             return
 
@@ -480,7 +480,7 @@ class TransferContext:
         for i, (snapshot, next_token_id) in enumerate(
             zip(self.snapshots, next_token_ids_list, strict=True)
         ):
-            if snapshot.is_chunked <= 0:
+            if is_last:
                 snapshot.output_ids = [next_token_id]
 
                 if snapshot.return_logprob:

@@ -715,7 +715,7 @@ class MooncakeKVManager(CommonKVManager):
 
                 if transfer_context is not None and len(transfer_context) > 0:
                     chunk_context = transfer_context.popleft()
-                    chunk_context.resolve()
+                    chunk_context.resolve(kv_chunk.is_last)
 
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
@@ -799,6 +799,8 @@ class MooncakeKVManager(CommonKVManager):
                             )
                             break
 
+                        if self.attn_tp_rank == 0:
+                            logger.info(f"send request {req.room=} {kv_chunk.is_last=}")
                         if kv_chunk.is_last:
                             if kv_chunk.state_indices is not None:
                                 if not self.is_mla_backend and (
@@ -853,6 +855,10 @@ class MooncakeKVManager(CommonKVManager):
                         kv_chunk.room in self.transfer_contexts
                         and len(self.transfer_contexts[kv_chunk.room]) == 0
                     ):
+                        if self.attn_tp_rank == 0:
+                            logger.info(
+                                f"pop transfer context for room {kv_chunk.room=}"
+                            )
                         self.transfer_contexts.pop(kv_chunk.room)
 
             except Exception as e:
@@ -1023,6 +1029,10 @@ class MooncakeKVManager(CommonKVManager):
         if transfer_context is not None:
             if bootstrap_room not in self.transfer_contexts:
                 self.transfer_contexts[bootstrap_room] = deque()
+            if self.attn_tp_rank == 0:
+                logger.info(
+                    f"Adding transfer context for room {bootstrap_room=} {is_last=}"
+                )
             self.transfer_contexts[bootstrap_room].append(transfer_context)
 
         self.transfer_queues[shard_idx].put(
