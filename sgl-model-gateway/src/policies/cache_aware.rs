@@ -574,15 +574,15 @@ mod tests {
             tree.insert(&massive_prompt, "http://idle:8000");
         }
 
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(worker_overloaded),
-            Arc::new(worker_idle)
-        ];
+        let workers: Vec<Arc<dyn Worker>> =
+            vec![Arc::new(worker_overloaded), Arc::new(worker_idle)];
 
         // 5. The Trigger: A completely new request (Cache Miss)
         // Since it's a miss, the router falls back to "get_smallest_tenant()"
         println!("Sending Probe Request (Cache Miss)...");
-        let selected_idx = policy.select_worker(&workers, Some("new_unique_prompt")).unwrap();
+        let selected_idx = policy
+            .select_worker(&workers, Some("new_unique_prompt"))
+            .unwrap();
         let selected_url = workers[selected_idx].url();
 
         println!("Selected Worker: {}", selected_url);
@@ -590,13 +590,14 @@ mod tests {
         println!("Idle Load:       {}", workers[1].load());
 
         // 6. The corrected implementation should pick the IDLE worker
-        assert_eq!(selected_url, "http://idle:8000",
-            "SUCCESS: Router correctly prioritized the IDLE worker despite its larger cache usage.");
+        assert_eq!(
+            selected_url, "http://idle:8000",
+            "SUCCESS: Router correctly prioritized the IDLE worker despite its larger cache usage."
+        );
     }
 
     #[test]
     fn test_simulation_production_traffic() {
-
         let config = CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 1000,
@@ -607,33 +608,58 @@ mod tests {
         };
         let policy = CacheAwarePolicy::with_config(config);
 
-
         // Worker 0: The "Trap" - High Load, Small Cache (e.g., stuck decoding)
-        let w0 = BasicWorkerBuilder::new("http://w0:8000").worker_type(WorkerType::Regular).build();
+        let w0 = BasicWorkerBuilder::new("http://w0:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
         // Worker 1: Normal - Medium Load, Medium Cache
-        let w1 = BasicWorkerBuilder::new("http://w1:8000").worker_type(WorkerType::Regular).build();
+        let w1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
         // Worker 2: Idle, Large Cache (e.g., just finished a big job)
-        let w2 = BasicWorkerBuilder::new("http://w2:8000").worker_type(WorkerType::Regular).build();
+        let w2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
 
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w0), Arc::new(w1), Arc::new(w2)];
         policy.init_workers(&workers);
 
         // Initialize States
         // W0: Load 20, Cache Size 1 (Small)
-        for _ in 0..20 { workers[0].increment_load(); }
-        policy.trees.get("default").unwrap().insert("a", "http://w0:8000");
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+        policy
+            .trees
+            .get("default")
+            .unwrap()
+            .insert("a", "http://w0:8000");
 
         // W1: Load 5, Cache Size 10 (Medium)
-        for _ in 0..5 { workers[1].increment_load(); }
-        policy.trees.get("default").unwrap().insert("a".repeat(10).as_str(), "http://w1:8000");
+        for _ in 0..5 {
+            workers[1].increment_load();
+        }
+        policy
+            .trees
+            .get("default")
+            .unwrap()
+            .insert("a".repeat(10).as_str(), "http://w1:8000");
 
         // W2: Load 0, Cache Size 100 (Large)
         // Ideally this node should take new requests, but current logic shuns it due to cache size
-        policy.trees.get("default").unwrap().insert("a".repeat(100).as_str(), "http://w2:8000");
+        policy
+            .trees
+            .get("default")
+            .unwrap()
+            .insert("a".repeat(100).as_str(), "http://w2:8000");
 
         println!("\n--- STARTING SIMULATION (100 Requests) ---");
-        println!("Initial Loads -> W0: {}, W1: {}, W2: {}", workers[0].load(), workers[1].load(), workers[2].load());
-
+        println!(
+            "Initial Loads -> W0: {}, W1: {}, W2: {}",
+            workers[0].load(),
+            workers[1].load(),
+            workers[2].load()
+        );
 
         let mut distribution = [0; 3];
 
@@ -649,10 +675,16 @@ mod tests {
         }
 
         println!("\n--- RESULTS ---");
-        println!("Final Loads   -> W0: {}, W1: {}, W2: {}", workers[0].load(), workers[1].load(), workers[2].load());
-        println!("Requests Sent -> W0: {}, W1: {}, W2: {}", distribution[0], distribution[1], distribution[2]);
-
-
+        println!(
+            "Final Loads   -> W0: {}, W1: {}, W2: {}",
+            workers[0].load(),
+            workers[1].load(),
+            workers[2].load()
+        );
+        println!(
+            "Requests Sent -> W0: {}, W1: {}, W2: {}",
+            distribution[0], distribution[1], distribution[2]
+        );
 
         let w0_traffic = distribution[0];
         let w2_traffic = distribution[2];
