@@ -68,7 +68,7 @@ func main() {
 
 	// Initialize handlers
 	healthHandler := handlers.NewHealthHandler(appLogger)
-	modelsHandler := handlers.NewModelsHandler(appLogger)
+	modelsHandler := handlers.NewModelsHandler(appLogger, cfg.TokenizerPath)
 	chatHandler := handlers.NewChatHandler(appLogger, sglangService)
 
 	// Setup fasthttp router
@@ -81,6 +81,8 @@ func main() {
 			healthHandler.Check(ctx)
 		case method == "GET" && path == "/v1/models":
 			modelsHandler.List(ctx)
+		case method == "GET" && path == "/get_model_info":
+			modelsHandler.GetModelInfo(ctx)
 		case method == "POST" && path == "/v1/chat/completions":
 			chatHandler.HandleChatCompletion(ctx)
 		default:

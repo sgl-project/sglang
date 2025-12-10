@@ -9,13 +9,15 @@ import (
 
 // ModelsHandler handles model list requests
 type ModelsHandler struct {
-	logger *zap.Logger
+	logger        *zap.Logger
+	tokenizerPath string
 }
 
 // NewModelsHandler creates a new models handler
-func NewModelsHandler(logger *zap.Logger) *ModelsHandler {
+func NewModelsHandler(logger *zap.Logger, tokenizerPath string) *ModelsHandler {
 	return &ModelsHandler{
-		logger: logger,
+		logger:        logger,
+		tokenizerPath: tokenizerPath,
 	}
 }
 
@@ -35,6 +37,29 @@ func (h *ModelsHandler) List(ctx *fasthttp.RequestCtx) {
 				"owned_by": "sglang",
 			},
 		},
+	}
+
+	jsonData, _ := json.Marshal(response)
+	ctx.Write(jsonData)
+}
+
+// GetModelInfo handles GET /get_model_info
+// Returns model information compatible with SGLang RuntimeEndpoint
+func (h *ModelsHandler) GetModelInfo(ctx *fasthttp.RequestCtx) {
+	ctx.SetStatusCode(200)
+	ctx.SetContentType("application/json")
+
+	// Return model info compatible with SGLang RuntimeEndpoint expectations
+	response := map[string]interface{}{
+		"model_path": h.tokenizerPath, // Use tokenizer path as model path
+		"tokenizer_path": h.tokenizerPath,
+		"is_generation": true,
+		"preferred_sampling_params": "",
+		"weight_version": "",
+		"has_image_understanding": false,
+		"has_audio_understanding": false,
+		"model_type": "",
+		"architectures": nil,
 	}
 
 	jsonData, _ := json.Marshal(response)
