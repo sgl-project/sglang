@@ -458,7 +458,7 @@ def _validate_weights_after_download(
     hf_folder: str,
     allow_patterns: List[str],
     model_name_or_path: str,
-) -> None:
+) -> bool:
     """Validate downloaded weight files to catch corruption early.
 
     This function validates safetensors files after download to catch
@@ -470,8 +470,8 @@ def _validate_weights_after_download(
         allow_patterns: Patterns used to match weight files
         model_name_or_path: Model identifier for error messages
 
-    Raises:
-        RuntimeError: If any weight files are corrupted
+    Returns:
+        True if all files are valid, False if corrupted files were found and cleaned up
     """
     import glob as glob_module
 
@@ -481,7 +481,7 @@ def _validate_weights_after_download(
         weight_files.extend(glob_module.glob(os.path.join(hf_folder, pattern)))
 
     if not weight_files:
-        return  # No weight files to validate
+        return True  # No weight files to validate
 
     # Validate safetensors files
     corrupted_files = []
@@ -496,11 +496,15 @@ def _validate_weights_after_download(
             model_name_or_path,
             [os.path.join(hf_folder, f) for f in corrupted_files],
         )
-        raise RuntimeError(
+        log_info_on_rank0(
+            logger,
             f"Downloaded model files are corrupted for {model_name_or_path}: "
             f"{corrupted_files}. The corrupted files have been removed. "
-            "Please retry to re-download the model."
+            "Will retry download.",
         )
+        return False
+
+    return True
 
 
 def download_weights_from_hf(
@@ -509,6 +513,7 @@ def download_weights_from_hf(
     allow_patterns: List[str],
     revision: Optional[str] = None,
     ignore_patterns: Optional[Union[str, List[str]]] = None,
+    max_retries: int = 3,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -523,6 +528,8 @@ def download_weights_from_hf(
         ignore_patterns (Optional[Union[str, List[str]]]): The patterns to
             filter out the weight files. Files matched by any of the patterns
             will be ignored.
+        max_retries (int): Maximum number of download retries if corruption
+            is detected. Defaults to 3.
 
     Returns:
         str: The path to the downloaded model weights.
@@ -562,19 +569,42 @@ def download_weights_from_hf(
 
         log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        )
+        # Retry loop for handling corrupted downloads
+        for attempt in range(max_retries):
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
 
-        # Validate downloaded files to catch corruption early
-        _validate_weights_after_download(hf_folder, allow_patterns, model_name_or_path)
+            # Validate downloaded files to catch corruption early
+            is_valid = _validate_weights_after_download(
+                hf_folder, allow_patterns, model_name_or_path
+            )
 
+            if is_valid:
+                return hf_folder
+
+            # Validation failed, corrupted files were cleaned up
+            if attempt < max_retries - 1:
+                log_info_on_rank0(
+                    logger,
+                    f"Retrying download for {model_name_or_path} "
+                    f"(attempt {attempt + 2}/{max_retries})...",
+                )
+            else:
+                raise RuntimeError(
+                    f"Downloaded model files are still corrupted for "
+                    f"{model_name_or_path} after {max_retries} attempts. "
+                    "This may indicate a persistent issue with the model files "
+                    "on Hugging Face Hub or network problems."
+                )
+
+        # This should never be reached, but just in case
         return hf_folder
 
 
