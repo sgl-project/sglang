@@ -344,27 +344,57 @@ class DiffGenerator:
             )
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
-    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
-        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
+    def set_lora(
+        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+    ) -> None:
+        """
+        Set a LoRA adapter for the specified transformer(s).
+
+        Args:
+            lora_nickname: The nickname of the adapter.
+            lora_path: Path to the LoRA adapter.
+            target: Which transformer(s) to apply the LoRA to. One of:
+                - "all": Apply to all transformers (default)
+                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
+                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
+                - "critic": Apply only to the critic model
+        """
+        req = SetLoraReq(
+            lora_nickname=lora_nickname, lora_path=lora_path, target=target
+        )
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname}",
+            f"Successfully set LoRA adapter: {lora_nickname} (target: {target})",
             "Failed to set LoRA adapter",
         )
 
-    def unmerge_lora_weights(self) -> None:
-        req = UnmergeLoraWeightsReq()
+    def unmerge_lora_weights(self, target: str = "all") -> None:
+        """
+        Unmerge LoRA weights from the base model.
+
+        Args:
+            target: Which transformer(s) to unmerge.
+        """
+        req = UnmergeLoraWeightsReq(target=target)
         self._send_lora_request(
             req,
-            "Successfully unmerged LoRA weights",
+            f"Successfully unmerged LoRA weights (target: {target})",
             "Failed to unmerge LoRA weights",
         )
         self._is_lora_merged = False
 
-    def merge_lora_weights(self) -> None:
-        req = MergeLoraWeightsReq()
+    def merge_lora_weights(self, target: str = "all") -> None:
+        """
+        Merge LoRA weights into the base model.
+
+        Args:
+            target: Which transformer(s) to merge.
+        """
+        req = MergeLoraWeightsReq(target=target)
         self._send_lora_request(
-            req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
+            req,
+            f"Successfully merged LoRA weights (target: {target})",
+            "Failed to merge LoRA weights",
         )
         self._is_lora_merged = True
 

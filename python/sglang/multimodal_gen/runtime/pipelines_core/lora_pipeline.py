@@ -41,8 +41,9 @@ class LoRAPipeline(ComposedPipelineBase):
         dict
     )  # state dicts of loaded lora adapters
     loaded_adapter_paths: dict[str, str] = {}  # nickname -> lora_path
-    cur_adapter_name: str = ""
-    cur_adapter_path: str = ""
+    # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
+    cur_adapter_name: dict[str, str] = {}
+    cur_adapter_path: dict[str, str] = {}
     # [dit_layer_name] = wrapped_lora_layer
     lora_layers: dict[str, BaseLayerWithLoRA] = {}
     lora_layers_critic: dict[str, BaseLayerWithLoRA] = {}
@@ -56,7 +57,10 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_rank: int | None = None
     lora_alpha: int | None = None
     lora_initialized: bool = False
-    is_lora_merged: bool = False
+    # Track merge status per module: {"transformer": True, "transformer_2": False}
+    is_lora_merged: dict[str, bool] = {}
+    # Valid target values for set_lora
+    VALID_TARGETS: list[str] = ["all", "transformer", "transformer_2", "critic"]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -79,6 +83,55 @@ class LoRAPipeline(ComposedPipelineBase):
         return any(
             target_name in module_name for target_name in self.lora_target_modules
         )
+
+    def _get_target_lora_layers(
+        self, target: str, allow_empty: bool = False
+    ) -> list[tuple[str, dict[str, BaseLayerWithLoRA]]]:
+        """
+        Return a list of (module_name, lora_layers_dict) based on the target.
+
+        Args:
+            target: One of "all", "transformer", "transformer_2", "critic".
+            allow_empty: If True, return empty list instead of raising for non-existent modules.
+
+        Returns:
+            List of tuples (module_name, lora_layers_dict) to operate on.
+        """
+        if target == "all":
+            result: list[tuple[str, dict[str, BaseLayerWithLoRA]]] = [
+                ("transformer", self.lora_layers)
+            ]
+            if self.lora_layers_transformer_2:
+                result.append(("transformer_2", self.lora_layers_transformer_2))
+            if self.lora_layers_critic:
+                result.append(("critic", self.lora_layers_critic))
+            return result
+        elif target == "transformer":
+            return [("transformer", self.lora_layers)]
+        elif target == "transformer_2":
+            if not self.lora_layers_transformer_2:
+                if allow_empty:
+                    logger.warning(
+                        "transformer_2 does not exist in this pipeline, skipping"
+                    )
+                    return []
+                raise ValueError("transformer_2 does not exist in this pipeline")
+            return [("transformer_2", self.lora_layers_transformer_2)]
+        elif target == "critic":
+            if not self.lora_layers_critic:
+                if allow_empty:
+                    logger.warning(
+                        "critic (fake_score_transformer) does not exist in this pipeline, skipping"
+                    )
+                    return []
+                raise ValueError(
+                    "critic (fake_score_transformer) does not exist in this pipeline"
+                )
+            return [("critic", self.lora_layers_critic)]
+        else:
+            raise ValueError(
+                f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
+            )
 
     def convert_module_lora_layers(
         self,
@@ -210,11 +263,29 @@ class LoRAPipeline(ComposedPipelineBase):
                 layer.disable_lora = True
         return adapted_count
 
-    def is_lora_effective(self):
-        return self.is_lora_merged
+    def is_lora_effective(self, target: str = "all") -> bool:
+        """
+        Check if LoRA is currently effective (merged) for the specified target.
 
-    def is_lora_set(self):
-        return self.lora_initialized and self.cur_adapter_name is not None
+        Args:
+            target: Which transformer to check. "all" returns True if any is merged.
+        """
+        if target == "all":
+            return any(self.is_lora_merged.values())
+        return self.is_lora_merged.get(target, False)
+
+    def is_lora_set(self, target: str = "all") -> bool:
+        """
+        Check if LoRA has been set for the specified target.
+
+        Args:
+            target: Which transformer to check. "all" returns True if any is set.
+        """
+        if not self.lora_initialized:
+            return False
+        if target == "all":
+            return bool(self.cur_adapter_name)
+        return target in self.cur_adapter_name
 
     def load_lora_adapter(self, lora_path: str, lora_nickname: str, rank: int):
         """
@@ -261,30 +332,45 @@ class LoRAPipeline(ComposedPipelineBase):
                 else:
                     continue
 
-            print(f"{name} -> {target_name}")
             if target_name in self.lora_adapters[lora_nickname]:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
                 )
             self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
-        self.cur_adapter_path = lora_path
         self.loaded_adapter_paths[lora_nickname] = lora_path
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
     def set_lora(
-        self, lora_nickname: str, lora_path: str | None = None
+        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
     ):  # type: ignore
         """
-        Load a LoRA adapter into the pipeline and merge it into the transformer.
+        Load a LoRA adapter into the pipeline and apply it to the specified transformer(s).
+
         Args:
             lora_nickname: The "nick name" of the adapter when referenced in the pipeline.
             lora_path: The path to the adapter, either a local path or a Hugging Face repo id.
+            target: Which transformer(s) to apply the LoRA to. One of:
+                - "all": Apply to all transformers (default, backward compatible)
+                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
+                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
+                - "critic": Apply only to the critic model (fake_score_transformer)
         """
-        if self.is_lora_merged and self.cur_adapter_name != lora_nickname:
+        if target not in self.VALID_TARGETS:
             raise ValueError(
-                f"LoRA '{self.cur_adapter_name}' is currently merged. "
-                "Please call 'unmerge_lora_weights' before setting a new LoRA."
+                f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
             )
+
+        # Check if any target module has a different LoRA merged
+        target_modules = self._get_target_lora_layers(target)
+        for module_name, _ in target_modules:
+            if (
+                self.is_lora_merged.get(module_name, False)
+                and self.cur_adapter_name.get(module_name) != lora_nickname
+            ):
+                raise ValueError(
+                    f"LoRA '{self.cur_adapter_name.get(module_name)}' is currently merged in {module_name}. "
+                    "Please call 'unmerge_lora_weights' before setting a new LoRA."
+                )
 
         if lora_nickname not in self.lora_adapters and lora_path is None:
             raise ValueError(
@@ -292,6 +378,9 @@ class LoRAPipeline(ComposedPipelineBase):
             )
         if not self.lora_initialized:
             self.convert_to_lora_layers()
+
+        # Re-fetch target_modules after convert_to_lora_layers() to get populated dicts
+        target_modules = self._get_target_lora_layers(target)
 
         adapter_updated = False
         rank = dist.get_rank()
@@ -307,58 +396,113 @@ class LoRAPipeline(ComposedPipelineBase):
             adapter_updated = True
             self.load_lora_adapter(lora_path, lora_nickname, rank)
 
-        if (
+        # Check if we can skip (same adapter already applied to all target modules)
+        all_already_applied = all(
             not adapter_updated
-            and self.cur_adapter_name == lora_nickname
-            and self.is_lora_merged
-        ):
+            and self.cur_adapter_name.get(module_name) == lora_nickname
+            and self.is_lora_merged.get(module_name, False)
+            for module_name, _ in target_modules
+        )
+        if all_already_applied:
             return
-        self.cur_adapter_name = lora_nickname
 
-        # Merge the new adapter
-        adapted_count = self._apply_lora_to_layers(
-            self.lora_layers, lora_nickname, lora_path, rank
-        )
-        # Apply LoRA to transformer_2 if exists
-        adapted_count += self._apply_lora_to_layers(
-            self.lora_layers_transformer_2, lora_nickname, lora_path, rank
-        )
-        # Apply LoRA to fake_score_transformer (critic) if exists
-        adapted_count += self._apply_lora_to_layers(
-            self.lora_layers_critic, lora_nickname, lora_path, rank
-        )
+        # Apply LoRA to target modules
+        adapted_count = 0
+        for module_name, lora_layers_dict in target_modules:
+            count = self._apply_lora_to_layers(
+                lora_layers_dict, lora_nickname, lora_path, rank
+            )
+            adapted_count += count
+            self.cur_adapter_name[module_name] = lora_nickname
+            self.cur_adapter_path[module_name] = (
+                lora_path or self.loaded_adapter_paths.get(lora_nickname, "")
+            )
+            self.is_lora_merged[module_name] = True
 
-        self.is_lora_merged = True
         logger.info(
-            "Rank %d: LoRA adapter %s applied to %d layers",
+            "Rank %d: LoRA adapter %s applied to %d layers (target: %s)",
             rank,
             lora_path,
             adapted_count,
+            target,
         )
 
-    def merge_lora_weights(self) -> None:
-        if self.is_lora_merged:
-            logger.warning("LoRA weights are already merged")
+    def merge_lora_weights(self, target: str = "all") -> None:
+        """
+        Merge LoRA weights into the base model for the specified target.
+
+        This operation is idempotent - calling it when LoRA is already merged is safe.
+
+        Args:
+            target: Which transformer(s) to merge. One of "all", "transformer",
+                    "transformer_2", "critic".
+        """
+        # Use allow_empty=True so we don't fail on non-existent modules
+        target_modules = self._get_target_lora_layers(target, allow_empty=True)
+        if not target_modules:
+            logger.warning("No target modules found for merge (target=%s)", target)
             return
 
-        for name, layer in self.lora_layers.items():
-            layer.merge_lora_weights()
-        for name, layer in self.lora_layers_transformer_2.items():
-            layer.merge_lora_weights()
-        for name, layer in self.lora_layers_critic.items():
-            layer.merge_lora_weights()
-        logger.info("LoRA weights merged")
-        self.is_lora_merged = True
+        for module_name, lora_layers_dict in target_modules:
+            if self.is_lora_merged.get(module_name, False):
+                logger.warning("LoRA weights are already merged for %s", module_name)
+                continue
+            for name, layer in lora_layers_dict.items():
+                # Only re-enable LoRA for layers that actually have LoRA weights
+                has_lora_weights = hasattr(layer, "lora_A") and layer.lora_A is not None
+                if not has_lora_weights:
+                    continue
+                if hasattr(layer, "disable_lora"):
+                    layer.disable_lora = False
+                try:
+                    layer.merge_lora_weights()
+                except Exception as e:
+                    logger.warning("Could not merge layer %s: %s", name, e)
+                    continue
+            self.is_lora_merged[module_name] = True
+            logger.info("LoRA weights merged for %s", module_name)
 
-    def unmerge_lora_weights(self) -> None:
-        if not self.is_lora_merged:
-            logger.warning("LoRA weights are not merged.")
+    def unmerge_lora_weights(self, target: str = "all") -> None:
+        """
+        Unmerge LoRA weights from the base model for the specified target.
+        This also disables LoRA so it won't be computed on-the-fly.
+
+        This operation is idempotent - calling it when LoRA is not merged is safe.
+
+        Args:
+            target: Which transformer(s) to unmerge. One of "all", "transformer",
+                    "transformer_2", "critic".
+        """
+        # Use allow_empty=True so we don't fail on non-existent modules
+        target_modules = self._get_target_lora_layers(target, allow_empty=True)
+        if not target_modules:
+            logger.warning("No target modules found for unmerge (target=%s)", target)
             return
 
-        for name, layer in self.lora_layers.items():
-            layer.unmerge_lora_weights()
-        for name, layer in self.lora_layers_transformer_2.items():
-            layer.unmerge_lora_weights()
-        for name, layer in self.lora_layers_critic.items():
-            layer.unmerge_lora_weights()
-        self.is_lora_merged = False
+        for module_name, lora_layers_dict in target_modules:
+            if not self.is_lora_merged.get(module_name, False):
+                logger.warning(
+                    "LoRA weights are not merged for %s, skipping", module_name
+                )
+                continue
+            for name, layer in lora_layers_dict.items():
+                # Check layer-level state to avoid raising exception
+                if hasattr(layer, "merged") and not layer.merged:
+                    logger.warning("Layer %s is not merged, skipping", name)
+                    # Still disable LoRA to prevent on-the-fly computation
+                    if hasattr(layer, "disable_lora"):
+                        layer.disable_lora = True
+                    continue
+                try:
+                    layer.unmerge_lora_weights()
+                    # Disable LoRA after unmerge to prevent on-the-fly computation
+                    if hasattr(layer, "disable_lora"):
+                        layer.disable_lora = True
+                except ValueError as e:
+                    logger.warning("Could not unmerge layer %s: %s", name, e)
+                    # Still disable LoRA even if unmerge failed
+                    if hasattr(layer, "disable_lora"):
+                        layer.disable_lora = True
+                    continue
+            self.is_lora_merged[module_name] = False
+            logger.info("LoRA weights unmerged for %s", module_name)
