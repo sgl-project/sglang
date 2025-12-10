@@ -1983,6 +1983,9 @@ class ServerArgs:
                 "Enable deterministic inference because of rl_on_policy_target."
             )
             self.enable_deterministic_inference = True
+
+            # For VLM
+            os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
             # TODO remove this environment variable as a whole
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
