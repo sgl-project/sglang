@@ -125,7 +125,7 @@ def validate_input_length(
                 "size or the max context length. Truncated. "
                 f"{input_token_num=}, {max_req_input_len=}."
             )
-            input_ids = input_ids[:max_req_input_len]
+            del input_ids[max_req_input_len:]
             return None
         else:
             error_msg = (
