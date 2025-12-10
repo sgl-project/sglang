@@ -410,8 +410,11 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
 
                                 # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices", [])
+                                content = ""
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content", "")
 
                                 if content:
                                     timestamp = time.perf_counter()
