@@ -125,7 +125,7 @@ class DiffusionServerArgs:
 class DiffusionSamplingParams:
     """Configuration for a single model/scenario test case."""
 
-    output_size: str = "1024x1024"  # output image dimensions (or video resolution)
+    output_size: str = ""
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
@@ -242,19 +242,46 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             output_size="1024x1024",
         ),
     ),
+    DiffusionTestCase(
+        "flux_2_image_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+        ),
+        DiffusionSamplingParams(
+            prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+        ),
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki.",
+            output_size="1024x1024",
+        ),
+    ),
     # === Text and Image to Image (TI2I) ===
-    # TODO: Timeout with Torch2.9. Add back when it can pass CI
-    # DiffusionTestCase(
-    #     id="qwen_image_edit_ti2i",
-    #     model_path="Qwen/Qwen-Image-Edit",
-    #     modality="image",
-    #     prompt=None,  # not used for editing
-    #     output_size="1024x1536",
-    #     warmup_text=0,
-    #     warmup_edit=1,
-    #     edit_prompt="Convert 2D style to 3D style",
-    #     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-    # ),
+    DiffusionTestCase(
+        "qwen_image_edit_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        DiffusionSamplingParams(
+            prompt="Convert 2D style to 3D style",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
+    ),
 ]
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
@@ -284,6 +311,19 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     #     warmup_edit=0,
     #     custom_validator="video",
     # ),
+    DiffusionTestCase(
+        "flux_2_ti2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        DiffusionSamplingParams(
+            prompt="Convert 2D style to 3D style",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
+    ),
     DiffusionTestCase(
         "fast_hunyuan_video",
         DiffusionServerArgs(
