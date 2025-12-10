@@ -813,7 +813,7 @@ mod tests {
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
-                assert_eq!(load_aware_fallback_threshold, 10);
+                assert_eq!(load_aware_fallback_threshold, 5);
             }
             _ => panic!("Expected CacheAware"),
         }
