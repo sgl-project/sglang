@@ -217,7 +217,7 @@ class PiecewiseCudaGraphRunner:
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             self.out_cache_loc = torch.zeros(
-                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
+                (self.max_num_tokens,), dtype=self.get_cache_loc_dtype()
             )
             self.out_cache_loc_swa = (
                 torch.zeros((self.max_num_tokens,), dtype=torch.int64)
@@ -346,7 +346,7 @@ class PiecewiseCudaGraphRunner:
                 forward_batch,
             )
 
-    def _cache_loc_dtype(self):
+    def get_cache_loc_dtype(self):
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):

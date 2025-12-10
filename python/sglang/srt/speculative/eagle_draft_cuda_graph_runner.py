@@ -88,7 +88,8 @@ class EAGLEDraftCudaGraphRunner:
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros(
-                (self.max_num_token * self.speculative_num_steps,), dtype=self._cache_loc_dtype()
+                (self.max_num_token * self.speculative_num_steps,),
+                dtype=self.get_cache_loc_dtype(),
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros(
@@ -132,7 +133,7 @@ class EAGLEDraftCudaGraphRunner:
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _cache_loc_dtype(self):
+    def get_cache_loc_dtype(self):
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):

@@ -108,6 +108,11 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
 ]
 
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [
+    *QUANTIZATION_CHOICES,
+    "unquant"
+]
+
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
@@ -414,6 +419,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
+    speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3084,6 +3090,13 @@ class ServerArgs:
             choices=MOE_A2A_BACKEND_CHOICES,
             default=ServerArgs.speculative_moe_a2a_backend,
             help="Choose the backend for MoE A2A in speculative decoding",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-quantization",
+            type=str,
+            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+            default=ServerArgs.speculative_draft_model_quantization,
+            help="The quantization method for speculative model.",
         )
 
         # Speculative decoding (ngram)

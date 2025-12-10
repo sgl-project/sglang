@@ -337,7 +337,7 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
-            cache_loc_dtype=self._cache_loc_dtype(),
+            cache_loc_dtype=self.get_cache_loc_dtype(),
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -361,7 +361,7 @@ class CudaGraphRunner:
             for attn_backend in self.model_runner.decode_attn_backend_group:
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
-    def _cache_loc_dtype(self):
+    def get_cache_loc_dtype(self):
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):

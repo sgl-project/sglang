@@ -787,9 +787,11 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                layer.layer_id).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                layer.layer_id
+            ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                layer.layer_id).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                layer.layer_id
+            ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
@@ -835,7 +837,8 @@ class AscendAttnBackend(AttentionBackend):
                     [
                         attn_output,
                         attn_output.new_zeros(
-                            num_token_padding - forward_batch.num_token_non_padded_cpu, *attn_output.shape[1:]
+                            num_token_padding - forward_batch.num_token_non_padded_cpu,
+                            *attn_output.shape[1:],
                         ),
                     ],
                     dim=0,
@@ -924,7 +927,8 @@ class AscendAttnBackend(AttentionBackend):
                     [
                         attn_output,
                         attn_output.new_zeros(
-                            num_token_padding - attn_output.shape[0], *attn_output.shape[1:]
+                            num_token_padding - attn_output.shape[0],
+                            *attn_output.shape[1:],
                         ),
                     ],
                     dim=0,
