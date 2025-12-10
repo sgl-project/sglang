@@ -528,10 +528,42 @@ class TokenizerLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, module_name: str
     ) -> Any:
-        return AutoTokenizer.from_pretrained(
-            component_model_path,
-            padding_size="right",
-        )
+        # If loading from cache fails due to corrupted files, retry with force_download to bypass the cache
+        try:
+            return AutoTokenizer.from_pretrained(
+                component_model_path,
+                padding_size="right",
+            )
+        except (TypeError, OSError, FileNotFoundError) as e:
+            # Check if we're loading from a local HF cache path (contains 'snapshots')
+            if "snapshots" in component_model_path and isinstance(
+                e, (TypeError, OSError, FileNotFoundError)
+            ):
+                logger.warning(
+                    "Failed to load tokenizer from cached path %s: %s. "
+                    "Retrying with force_download to bypass potentially corrupted cache.",
+                    component_model_path,
+                    e,
+                )
+                # Extract the model name from the cache path
+                # Path format: /hf_home/hub/models--Org--ModelName/snapshots/.../tokenizer
+                # We need to reconstruct: Org/ModelName
+                try:
+                    parts = component_model_path.split("models--")[1].split(
+                        "/snapshots"
+                    )[0]
+                    model_name = parts.replace("--", "/")
+
+                    return AutoTokenizer.from_pretrained(
+                        model_name,
+                        padding_size="right",
+                        force_download=True,
+                    )
+                except Exception:
+                    # If we can't extract model name or force_download fails, re-raise original error
+                    raise e
+            else:
+                raise e
 
 
 class VAELoader(ComponentLoader):
