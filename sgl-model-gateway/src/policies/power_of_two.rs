@@ -270,4 +270,88 @@ mod tests {
         // Assert that the CORRECT worker (A, index 0) is selected
         assert_eq!(selected_idx, 0, "The policy failed to handle incompatible metrics. Should select idle Worker A.");
     }
+    #[test]
+    fn test_power_of_two_edge_cases() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use crate::core::{BasicWorkerBuilder, WorkerType};
+
+        let policy = PowerOfTwoPolicy::new();
+
+        // Helper to create a worker with specific request load
+        let create_worker = |url: &str, reqs: usize| {
+            let w = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .build();
+            for _ in 0..reqs { w.increment_load(); }
+            Arc::new(w)
+        };
+
+        //  Scenario 1: Happy Path (Both have Token Data)
+        // Worker A: 10 requests, but only 1,000 tokens (Light usage) -> Should be CHOSEN
+        // Worker B:  2 requests, but 100,000 tokens (Heavy usage) -> Should be AVOIDED
+        // This proves we use high-fidelity metrics when available, ignoring request counts.
+        let w_a = create_worker("http://a:8000", 10);
+        let w_b = create_worker("http://b:8000", 2);
+        let workers_1: Vec<Arc<dyn Worker>> = vec![w_a.clone(), w_b.clone()];
+
+        let mut loads_1 = HashMap::new();
+        loads_1.insert("http://a:8000".to_string(), 1_000);
+        loads_1.insert("http://b:8000".to_string(), 100_000);
+        policy.update_loads(&loads_1);
+
+        let idx_1 = policy.select_worker(&workers_1, None).unwrap();
+        assert_eq!(idx_1, 0, "Happy Path Failed: Should select Worker A (fewer tokens) despite higher request count");
+
+
+        // Scenario 2: Partial Failure (Worker A has tokens, Worker B is missing)
+        // Worker A: 10 requests, 1,000 tokens (Cached)
+        // Worker B:  2 requests, MISSING cache
+        // Logic: Fallback to requests -> Compare 10 (A) vs 2 (B) -> Select B
+        let w_c = create_worker("http://c:8000", 10);
+        let w_d = create_worker("http://d:8000", 2);
+        let workers_2: Vec<Arc<dyn Worker>> = vec![w_c.clone(), w_d.clone()];
+
+        let mut loads_2 = HashMap::new();
+        loads_2.insert("http://c:8000".to_string(), 1_000);
+        // http://d:8000 is MISSING
+        policy.update_loads(&loads_2);
+
+        let idx_2 = policy.select_worker(&workers_2, None).unwrap();
+        assert_eq!(idx_2, 1, "Partial Fail 1 Failed: Should fallback to requests and select Worker B (fewer requests)");
+
+
+        // Scenario 3: Partial Failure (Worker A is missing, Worker B has tokens)
+        // Worker A:  2 requests, MISSING cache
+        // Worker B: 10 requests, 1,000 tokens (Cached)
+        // Logic: Fallback to requests -> Compare 2 (A) vs 10 (B) -> Select A
+        let w_e = create_worker("http://e:8000", 2);
+        let w_f = create_worker("http://f:8000", 10);
+        let workers_3: Vec<Arc<dyn Worker>> = vec![w_e.clone(), w_f.clone()];
+
+        let mut loads_3 = HashMap::new();
+        // http://e:8000 is MISSING
+        loads_3.insert("http://f:8000".to_string(), 1_000);
+        policy.update_loads(&loads_3);
+
+        let idx_3 = policy.select_worker(&workers_3, None).unwrap();
+        assert_eq!(idx_3, 0, "Partial Fail 2 Failed: Should fallback to requests and select Worker A (fewer requests)");
+
+
+        // Scenario 4: Total Failure (Both missing)
+        // Worker A: 5 requests
+        // Worker B: 3 requests
+        // Logic: Requests vs Requests -> Select B
+        let w_g = create_worker("http://g:8000", 5);
+        let w_h = create_worker("http://h:8000", 3);
+        let workers_4: Vec<Arc<dyn Worker>> = vec![w_g.clone(), w_h.clone()];
+
+        let loads_4 = HashMap::new();
+        policy.update_loads(&loads_4);
+
+        let idx_4 = policy.select_worker(&workers_4, None).unwrap();
+        assert_eq!(idx_4, 1, "Total Fail Failed: Should select Worker B based on request count");
+
+        println!("All edge case tests passed successfully.");
+    }
 }
