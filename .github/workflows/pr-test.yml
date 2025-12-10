@@ -413,7 +413,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2, 3]
+        partition: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -434,7 +434,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]

@@ -79,6 +79,7 @@ LOAD_FORMAT_CHOICES = [
     "gguf",
     "bitsandbytes",
     "layered",
+    "flash_rl",
     "remote",
     "remote_instance",
 ]
@@ -250,6 +251,7 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
+    rl_quant_profile: Optional[str] = None  # For flash_rl load format
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
@@ -2168,6 +2170,12 @@ class ServerArgs:
             help="Extra config for model loader. "
             "This will be passed to the model loader corresponding to the chosen load_format.",
             default=ServerArgs.model_loader_extra_config,
+        )
+        parser.add_argument(
+            "--rl-quant-profile",
+            type=str,
+            default=ServerArgs.rl_quant_profile,
+            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -4288,6 +4296,17 @@ class ServerArgs:
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+                    # When using the chunked SGMV backend, skip embedding / lm_head layers for now,
+                    # since it does not support these yet (TODO: implement embedding / lm_head support)
+                    if self.lora_backend == "csgmv":
+                        logger.warning(
+                            "LoRA backend 'csgmv' does not yet support embedding or lm_head layers; "
+                            "dropping 'embed_tokens' and 'lm_head' from --lora-target-modules=all. "
+                            "To apply LoRA to these, use --lora-backend triton."
+                        )
+                        self.lora_target_modules.discard("embed_tokens")
+                        self.lora_target_modules.discard("lm_head")
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (

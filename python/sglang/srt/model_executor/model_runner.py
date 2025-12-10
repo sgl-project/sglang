@@ -765,6 +765,7 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             modelopt_config=modelopt_config,
+            rl_quant_profile=self.server_args.rl_quant_profile,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
