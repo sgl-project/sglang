@@ -352,7 +352,7 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def is_dllm(self):
-        return self.dllm_config is not None
+        return self.dllm_algorithm is not None
 
     def forward_batch_generation(
         self,
