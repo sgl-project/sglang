@@ -223,7 +223,7 @@ CASES = [
     (512, 3072),
     (1024, 3072),
     (2000, 3072),
-    (2048, 3072),
+    (2048, 3072)
 ]
 
 
@@ -246,7 +246,7 @@ def test_fused_layernorm_scale_shift_2d(dtype, M, N):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("B,F,S,N", [(2, 3, 4, 1024)])
+@pytest.mark.parametrize("B,F,S,N", [(2, 3, 4, 1024), (12, 24, 1, 2048)])
 def test_fused_layernorm_scale_shift_4d(dtype, B, F, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -260,7 +260,7 @@ def test_fused_layernorm_scale_shift_4d(dtype, B, F, S, N):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("B,S,N", [(2, 5, 1024)])
+@pytest.mark.parametrize("B,S,N", [(2, 5, 1024), (16, 32, 4096)])
 def test_residual_gate_int(dtype, B, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -277,7 +277,7 @@ def test_residual_gate_int(dtype, B, S, N):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("B,S,N", [(2, 5, 1024)])
+@pytest.mark.parametrize("B,S,N", [(2, 5, 1024), (12, 24, 2048)])
 def test_residual_gate_3d(dtype, B, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -294,7 +294,7 @@ def test_residual_gate_3d(dtype, B, S, N):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("B,F,S,N", [(2, 3, 4, 1024)])
+@pytest.mark.parametrize("B,F,S,N", [(2, 3, 4, 1024), (12, 24, 1, 2048)])
 def test_residual_gate_4d(dtype, B, F, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
