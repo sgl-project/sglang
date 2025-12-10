@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -427,7 +428,11 @@ def handle_attention_nsa(attn, forward_batch):
     Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
-    backend = forward_batch.attn_backend
+
+    attn_backend = forward_batch.attn_backend
+    if isinstance(attn_backend, TboAttnBackend):  # if enable tbo, get primary backend
+        attn_backend = attn_backend.primary
+    backend = attn_backend
     if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
