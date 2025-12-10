@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.5.post3"
+version = "0.5.6.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -84,7 +84,7 @@ srt_hip = [
   "wave-lang==3.8.2",
 ]
 
-# https://docs.sglang.ai/platforms/ascend_npu.html
+# https://docs.sglang.io/platforms/ascend_npu.html
 srt_npu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide

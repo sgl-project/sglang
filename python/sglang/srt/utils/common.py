@@ -122,6 +122,7 @@ HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
+@lru_cache(maxsize=1)
 def is_hip() -> bool:
     return torch.version.hip is not None
 
@@ -137,18 +138,22 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
+@lru_cache(maxsize=1)
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
 
+@lru_cache(maxsize=1)
 def is_cuda_alike():
     return is_cuda() or is_hip()
 
 
+@lru_cache(maxsize=1)
 def is_hpu() -> bool:
     return hasattr(torch, "hpu") and torch.hpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
@@ -158,6 +163,7 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
@@ -167,6 +173,7 @@ def is_host_cpu_x86() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
@@ -220,9 +227,7 @@ def is_blackwell():
 def is_blackwell_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
-    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
-        torch.version.cuda >= "12.8"
-    )
+    return is_sm100_supported(device) or is_sm120_supported(device)
 
 
 @lru_cache(maxsize=1)
@@ -236,7 +241,7 @@ def is_sm120_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
@@ -245,7 +250,7 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
@@ -284,6 +289,17 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
 
 
+def get_float_env_var(name: str, default: float = 0.0) -> float:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def support_triton(backend: str) -> bool:
     return backend not in ["torch_native", "intel_amx"]
 
@@ -296,7 +312,6 @@ try:
     )
 except:
     is_intel_amx_backend_available = False
-
 
 try:
     # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -625,60 +640,6 @@ def make_layers_non_pp(
         )
     )
     return layers
-
-
-cmo_stream = None
-
-
-def get_cmo_stream():
-    """
-    Cache Management Operation(CMO).
-    Launch a new stream to prefetch the weight of matmul when running other
-    AIV or communication kernels, aiming to overlap the memory access time.
-    """
-    global cmo_stream
-    return cmo_stream
-
-
-def set_cmo_stream(stream):
-    global cmo_stream
-    cmo_stream = stream
-
-
-def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
-    """
-    PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
-    This affects the time spent in prefetch:
-        time ≈ PREFETCH_MAX_SIZE / system_bandwidth
-    """
-    import torch_npu
-
-    stream = get_cmo_stream()
-    if stream is None:
-        stream = torch.get_device_module().Stream()
-        set_cmo_stream(stream)
-    stream.wait_stream(torch.get_device_module().current_stream())
-    with torch.get_device_module().stream(stream):
-        if isinstance(cache, list):
-            for weight in cache:
-                torch_npu.npu_prefetch(
-                    weight,
-                    handle,
-                    PREFETCH_MAX_SIZE,
-                )
-        else:
-            torch_npu.npu_prefetch(
-                cache,
-                handle,
-                PREFETCH_MAX_SIZE,
-            )
-
-
-def wait_cmo_stream():
-    stream = get_cmo_stream()
-    if stream is not None:
-        cur_stream = torch.get_device_module().current_stream()
-        cur_stream.wait_stream(stream)
 
 
 @lru_cache(maxsize=1)
@@ -1160,9 +1121,12 @@ def set_ulimit(target_soft_limit=65535):
 
 
 def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_rank,
+        model_parallel_is_initialized,
+    )
 
-    if get_tensor_model_parallel_rank() == 0:
+    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
 
 
@@ -1203,8 +1167,8 @@ def configure_logger(server_args, prefix: str = ""):
             custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
-    format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
+    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
@@ -1536,6 +1500,31 @@ def add_prometheus_middleware(app):
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
+
+
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter
+
+    http_response_status_counter = Counter(
+        name="sglang:http_responses_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        response = await call_next(request)
+
+        route = request.scope.get("route")
+        endpoint = route.path if route else "Unknown"
+
+        http_response_status_counter.labels(
+            endpoint=endpoint,
+            status_code=str(response.status_code),
+            method=request.method,
+        ).inc()
+
+        return response
 
 
 def bind_port(port):
@@ -1873,7 +1862,7 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2740,15 +2729,18 @@ def is_fa3_default_architecture(hf_config):
     if not isinstance(architectures, list) or not architectures:
         return False
     default_archs = {
-        "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
         "Glm4MoeForCausalLM",
+        "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
@@ -2830,6 +2822,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
@@ -2838,7 +2832,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend == "none":
+        elif get_moe_a2a_backend().is_none():
             return True
         else:
             return (
@@ -2853,8 +2847,10 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -3351,6 +3347,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
@@ -3690,6 +3688,12 @@ def cached_triton_kernel(key_fn=None):
     """
 
     def decorator(fn):
+        # Auto-enable the custom kernel cache for CUDA, where it is
+        # known to be compatible.
+        if is_cuda() and not envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.is_set():
+            logger.debug("Detected platform CUDA, using custom triton kernel cache.")
+            return CachedKernel(fn, key_fn)
+
         if envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.get():
             logger.debug(
                 f"{envs.SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE.name} = True. Using custom triton kernel cache."
