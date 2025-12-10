@@ -25,6 +25,9 @@ concurrency:
   group: pr-test-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
@@ -33,6 +36,7 @@ jobs:
       main_package: ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }}
+      max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -65,6 +69,17 @@ jobs:
           echo "sgl_kernel=false" >> $GITHUB_OUTPUT
           echo "multimodal_gen=true" >> $GITHUB_OUTPUT
 
+      - name: Set max-parallel based on high-priority label
+        id: set-parallel
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
+            echo "max_parallel=15" >> $GITHUB_OUTPUT
+            echo "High priority PR detected, setting max_parallel to 15"
+          else
+            echo "max_parallel=8" >> $GITHUB_OUTPUT
+            echo "Using default max_parallel of 8"
+          fi
+
       - name: Show filter results in summary (table)
         run: |
           {
@@ -75,6 +90,7 @@ jobs:
             echo "| main_package   | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }} |"
             echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }} |"
             echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
+            echo "| max_parallel   | ${{ steps.set-parallel.outputs.max_parallel }} |"
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== PR Gate ====================================================
@@ -379,6 +395,46 @@ jobs:
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default
 
+  stage-b-test-small-1-gpu:
+    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-small-1-gpu') ||
+        (
+          !inputs.target_stage &&
+          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 1-gpu-runner
+    env:
+      RUNNER_LABELS: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2, 3]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -400,11 +456,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -447,11 +498,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -501,8 +547,8 @@ jobs:
 
         - name: Install dependencies
           run: |
-            pip install "bitsandbytes>=0.44.0"
             CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
         - name: Run test
           timeout-minutes: 30
           run: |
@@ -526,7 +572,7 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
@@ -667,6 +713,12 @@ jobs:
       - name: Install dependencies
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Warmup Weights and JIT Compilation
+        timeout-minutes: 20
+        run: |
+          # An example command for testing the warmup. TODO: make this more general and move them to python scripts.
+          python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code
 
       - name: Run test
         timeout-minutes: 20
@@ -1140,7 +1192,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
 
     steps:
       - name: Checkout code
@@ -1162,7 +1214,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
+          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 3 --timeout-per-file 1800
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
@@ -1219,6 +1271,7 @@ jobs:
         multimodal-gen-test-2-gpu,
 
         stage-a-test-1,
+        stage-b-test-small-1-gpu,
         quantization-test,
         unit-test-backend-1-gpu,
         unit-test-backend-2-gpu,
@@ -1235,6 +1288,7 @@ jobs:
         unit-test-deepep-8-gpu,
         unit-test-backend-4-gpu-b200,
         unit-test-backend-4-gpu-gb200,
+        # unit-test-backend-8-gpu-b200,  # Moved to nightly - large models only
       ]
     if: always()
     runs-on: ubuntu-latest
