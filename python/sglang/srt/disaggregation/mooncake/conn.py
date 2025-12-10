@@ -9,16 +9,16 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    pass
 
 import numpy as np
 import numpy.typing as npt
 import requests
 import zmq
-import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -37,9 +37,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferContext
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address
-from sglang.srt.managers.scheduler import GenerationBatchResult
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 logger = logging.getLogger(__name__)
 
 
@@ -233,7 +231,6 @@ class MooncakeKVManager(CommonKVManager):
         self.failure_lock = threading.Lock()
 
         self.transfer_contexts: Dict[int, TransferContext] = {}
-        # Callback function to set metadata buffer, set by PrefillBootstrapQueue
 
     def init_engine(self):
         self.engine = MooncakeTransferEngine(
@@ -703,8 +700,6 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
-
-
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
@@ -723,7 +718,7 @@ class MooncakeKVManager(CommonKVManager):
 
                 if transfer_context is not None:
                     transfer_context.resolve()
-                
+
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -844,8 +839,6 @@ class MooncakeKVManager(CommonKVManager):
                                     self.sync_status_to_decode_endpoint(
                                         endpoint, dst_port, room, status, local_rank
                                     )
-                                # if self.attn_tp_rank == 0:
-                                #         gitf"sent_success to {req.room=}")
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint

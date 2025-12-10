@@ -1891,7 +1891,7 @@ class ServerArgs:
                 )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
-                self.disaggregation_decode_tp = self.tp_size
+                self.disaggrgite
             if self.disaggregation_decode_dp is None:
                 self.disaggregation_decode_dp = self.dp_size
 
@@ -1903,10 +1903,14 @@ class ServerArgs:
                 logger.warning(
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
                 )
-            
+
             if self.disaggregation_async_transfer:
-                assert self.disaggregation_transfer_backend == "mooncake", "Async KV transfer mode is only supported for mooncake backend."
-                assert not self.disable_overlap_schedule, "Async KV transfer mode requires overlap mode to be enabled."
+                assert (
+                    self.disaggregation_transfer_backend == "mooncake"
+                ), "Async KV transfer mode is only supported for mooncake backend."
+                assert (
+                    not self.disable_overlap_schedule
+                ), "Async KV transfer mode requires overlap mode to be enabled."
                 logger.info(
                     "Async KV transfer mode is enabled for disaggregation prefill."
                 )
