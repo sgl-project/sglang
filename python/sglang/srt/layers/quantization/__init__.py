@@ -79,7 +79,7 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
     )
 
 if is_npu():
-    from sglang.srt.hardware_backend.npu.quantization.modelslim import ModelSlimConfig
+    from sglang.srt.layers.quantization.msmodelslim.msmodelslim import ModelSlimConfig
 
     BASE_QUANTIZATION_METHODS.update(
         {

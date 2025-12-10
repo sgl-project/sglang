@@ -1,0 +1,95 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Callable, Optional
+
+import torch
+from torch.nn import Parameter
+
+from typing import Any, Dict, List
+
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    NPU_W4A4DynamicLinearMethod,
+)
+from sglang.srt.layers.parameter import (
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
+from sglang.srt.layers.quantization.msmodelslim.schemes import (
+    ModelSlimScheme,
+)
+
+from sglang.srt.utils import set_weight_attrs
+
+
+class ModelSlimW4A4Int4(ModelSlimScheme):
+
+    def __init__(
+        self, quant_config: Dict[str, any], prefix: str,
+    ):
+        self.quant_config = quant_config
+        self.transpose_weight = True
+        self.is_dynamic = (
+            self.quant_config[prefix + ".weight"]
+            == "W4A4_DYNAMIC"
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        weight_dict = self.quant_method.get_weight(
+            input_size_per_partition, output_size_per_partition, params_dtype
+        )
+        for weight_name, weight_param in weight_dict.items():
+            param = torch.nn.Parameter(weight_param, requires_grad=False)
+            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            layer.register_parameter(weight_name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+
+        pertensor_dict = self.quant_method.get_pertensor_param(params_dtype)
+        for pertensor_name, pertensor_param in pertensor_dict.items():
+            param = PerTensorScaleParameter(
+                data=pertensor_param, weight_loader=weight_loader
+            )
+            # disable warning
+            param.ignore_warning = True
+            layer.register_parameter(pertensor_name, param)
+
+        perchannel_dict = self.quant_method.get_perchannel_param(
+            output_size_per_partition, params_dtype
+        )
+        for perchannel_name, perchannel_param in perchannel_dict.items():
+            param = torch.nn.Parameter(perchannel_param, requires_grad=False)
+            set_weight_attrs(param, {"output_dim": 0})
+            layer.register_parameter(perchannel_name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer):
+        if self.transpose_weight:
+            layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        layer.weight_scale.data = layer.weight_scale.data.flatten()
+        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+        layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
+            layer.weight.data.to(torch.int32)
+        )
+    
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return NPU_W4A4DynamicLinearMethod.apply(layer, x, bias)

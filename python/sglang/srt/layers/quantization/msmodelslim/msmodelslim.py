@@ -25,6 +25,11 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.msmodelslim.msmodelslim_moe import (
     ModelSlimMoEMethod,
 )
+from sglang.srt.layers.quantization.msmodelslim.schemes import (
+    ModelSlimScheme,
+    ModelSlimW8A8Int8,
+    ModelSlimW4A4Int4,
+)
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
     is_activation_quantization_format,
@@ -130,7 +135,7 @@ class ModelSlimConfig(QuantizationConfig):
         return 0
 
     @classmethod
-    def get_name(self) -> str:
+    def get_name(cls) -> str:
         return "modelslim"
 
     @classmethod
@@ -188,8 +193,20 @@ class ModelSlimConfig(QuantizationConfig):
         return None
 
     def _get_scheme_from_parts(
-            self, weight_quant: BaseModel, input_quant: BaseModel
+            self, layer_name: str,
         ) -> ModelSlimScheme:
+
+        quant_type = self.quant_description[layer_name + '.weight']
+        if quant_type == "W8A8_DYNAMIC":
+            return ModelSlimW8A8Int8(
+                quant_config=self.quant_description,
+                prefix=layer_name
+            )
+        elif quant_type == "W4A4_DYNAMIC":
+            return ModelSlimW4A4Int4(
+                quant_config=self.quant_description,
+                prefix=layer_name
+            )
 
             # Detect If Mixed Precision
             # if self._is_wNa16_group_channel(weight_quant, input_quant):
@@ -208,7 +225,7 @@ class ModelSlimConfig(QuantizationConfig):
             #             "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
             #         )
 
-            if is_activation_quantization_format(self.quant_format):
+            #if is_activation_quantization_format(self.quant_format):
                 # if self._is_fp8_w8a8(weight_quant, input_quant):
                 #     is_fp8_w8a8_supported = self._check_scheme_supported(
                 #         CompressedTensorsW8A8Fp8.get_min_capability(), error=False
@@ -236,21 +253,7 @@ class ModelSlimConfig(QuantizationConfig):
                 #         is_static_input_scheme=is_static_input_scheme,
                 #     )
 
-                if self._is_static_tensor_w8a8(weight_quant, input_quant):
-                    return ModelSlimW8A8Int8(
-                        strategy=weight_quant.strategy,
-                        is_static_input_scheme=True,
-                        input_symmetric=input_quant.symmetric,
-                    )
-
-                if self._is_dynamic_token_w8a8(weight_quant, input_quant):
-                    return ModelSlimW8A8Int8(
-                        strategy=weight_quant.strategy,
-                        is_static_input_scheme=False,
-                        input_symmetric=input_quant.symmetric,
-                    )
-
-            raise NotImplementedError("No msmodelslim compatible scheme was found.")
+            #raise NotImplementedError("No msmodelslim compatible scheme was found.")
     
     def get_scheme(
             self, layer: torch.nn.Module, layer_name: Optional[str] = None
@@ -259,23 +262,24 @@ class ModelSlimConfig(QuantizationConfig):
             get_scheme method adjusted for modelslim, taken from
             python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
             """
-            if self.target_scheme_map:
-                matched_target = find_matched_target(
-                    layer_name=layer_name,
-                    module=layer,
-                    targets=self.target_scheme_map.keys(),
-                    fused_mapping=self.packed_modules_mapping,
-                )
+            # if self.target_scheme_map:
+            #     matched_target = find_matched_target(
+            #         layer_name=layer_name,
+            #         module=layer,
+            #         targets=self.target_scheme_map.keys(),
+            #         fused_mapping=self.packed_modules_mapping,
+            #     )
 
-                scheme_dict = self.target_scheme_map[matched_target]
-                weight_quant = scheme_dict.get("weights")
-                input_quant = scheme_dict.get("input_activations")
-            else:
+            #     scheme_dict = self.target_scheme_map[matched_target]
+            #     weight_quant = scheme_dict.get("weights")
+            #     input_quant = scheme_dict.get("input_activations")
+            # else:
                 # Find the quant_scheme
-                scheme = self._get_scheme_from_parts(  # type: ignore
-                    weight_quant=weight_quant,
-                    input_quant=input_quant,
-                )
+            scheme = self._get_scheme_from_parts(  # type: ignore
+                # weight_quant=weight_quant,
+                # input_quant=input_quant,
+                layer_name=layer_name,
+            )
 
             # Ascend doesn't support device capability
             # self._check_scheme_supported(scheme.get_min_capability())
@@ -316,61 +320,61 @@ class ModelSlimConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def is_dynamic_token_w4(self, weight_quant, input_quant) -> bool:
-        is_w4 = weight_quant.num_bits == 4
-        weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-            or weight_quant.strategy == QuantizationStrategy.GROUP.value
-        )
-        if input_quant is not None:
-            is_token = (
-                weight_strategy
-                and input_quant.strategy == QuantizationStrategy.TOKEN.value
-            )
-            is_dynamic = not weight_quant.dynamic and input_quant.dynamic
-        else:
-            is_token = weight_strategy
-            is_dynamic = not weight_quant.dynamic
+    # def is_dynamic_token_w4(self, weight_quant, input_quant) -> bool:
+    #     is_w4 = weight_quant.num_bits == 4
+    #     weight_strategy = (
+    #         weight_quant.strategy == QuantizationStrategy.TENSOR.value
+    #         or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+    #         or weight_quant.strategy == QuantizationStrategy.GROUP.value
+    #     )
+    #     if input_quant is not None:
+    #         is_token = (
+    #             weight_strategy
+    #             and input_quant.strategy == QuantizationStrategy.TOKEN.value
+    #         )
+    #         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+    #     else:
+    #         is_token = weight_strategy
+    #         is_dynamic = not weight_quant.dynamic
 
-        # Both symmetric and asymmetric input quantization supported.
-        # Only symmetric weight quantization supported.
-        return is_w4 and weight_quant.symmetric and is_token and is_dynamic
+    #     # Both symmetric and asymmetric input quantization supported.
+    #     # Only symmetric weight quantization supported.
+    #     return is_w4 and weight_quant.symmetric and is_token and is_dynamic
 
-    def _is_static_tensor_w8a8(
-        self, weight_quant: BaseModel, input_quant: BaseModel
-    ) -> bool:
-        is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
-        weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-        )
-        is_tensor = (
-            weight_strategy
-            and input_quant.strategy == QuantizationStrategy.TENSOR.value
-        )
-        is_static = not weight_quant.dynamic and not input_quant.dynamic
+    # def _is_static_tensor_w8a8(
+    #     self, weight_quant: BaseModel, input_quant: BaseModel
+    # ) -> bool:
+    #     is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
+    #     weight_strategy = (
+    #         weight_quant.strategy == QuantizationStrategy.TENSOR.value
+    #         or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+    #     )
+    #     is_tensor = (
+    #         weight_strategy
+    #         and input_quant.strategy == QuantizationStrategy.TENSOR.value
+    #     )
+    #     is_static = not weight_quant.dynamic and not input_quant.dynamic
 
-        # Both symmetric and asymmetric input quantization supported.
-        # Only symmetric weight quantization supported.
-        return is_8_bits and is_tensor and weight_quant.symmetric and is_static
+    #     # Both symmetric and asymmetric input quantization supported.
+    #     # Only symmetric weight quantization supported.
+    #     return is_8_bits and is_tensor and weight_quant.symmetric and is_static
 
-    def _is_dynamic_token_w8a8(
-        self, weight_quant: BaseModel, input_quant: BaseModel
-    ) -> bool:
-        is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
-        weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-        )
-        is_token = (
-            weight_strategy and input_quant.strategy == QuantizationStrategy.TOKEN.value
-        )
-        is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+    # def _is_dynamic_token_w8a8(
+    #     self, weight_quant: BaseModel, input_quant: BaseModel
+    # ) -> bool:
+    #     is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
+    #     weight_strategy = (
+    #         weight_quant.strategy == QuantizationStrategy.TENSOR.value
+    #         or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+    #     )
+    #     is_token = (
+    #         weight_strategy and input_quant.strategy == QuantizationStrategy.TOKEN.value
+    #     )
+    #     is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
-        # Both symmetric and asymmetric input quantization supported.
-        # Only symmetric weight quantization supported.
-        return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
+    #     # Both symmetric and asymmetric input quantization supported.
+    #     # Only symmetric weight quantization supported.
+    #     return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
 
 class ModelSlimLinearMethod(_NPULinearMethodBase):

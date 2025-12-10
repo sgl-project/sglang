@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, retry, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
