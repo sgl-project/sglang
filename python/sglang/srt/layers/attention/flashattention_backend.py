@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
 from sglang.srt.layers.attention.kernels.flatten_kv_cache import flatten_kv_cache_sglang
 
 
@@ -773,14 +774,16 @@ class FlashAttentionBackend(AttentionBackend):
         if not self.use_mla:
             # Do multi-head attention
             if self.kv_cache_dtype_str in ("int4", "int8"):
-                kv_data = forward_batch.token_to_kv_pool.get_raw_kv_buffer(layer.layer_id)
-                
+                kv_data = forward_batch.token_to_kv_pool.get_raw_kv_buffer(
+                    layer.layer_id
+                )
+
                 out_size = metadata.kv_flatten_size
                 flatten_k, flatten_v = flatten_kv_cache_sglang(
-                    k_cache=kv_data['k_buffer'],
-                    v_cache=kv_data['v_buffer'],
-                    k_scales_zeros=kv_data['k_scales_zeros'],
-                    v_scales_zeros=kv_data['v_scales_zeros'],
+                    k_cache=kv_data["k_buffer"],
+                    v_cache=kv_data["v_buffer"],
+                    k_scales_zeros=kv_data["k_scales_zeros"],
+                    v_scales_zeros=kv_data["v_scales_zeros"],
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_k=cu_seqlens_k if not use_local_attn else None,

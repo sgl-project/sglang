@@ -199,7 +199,7 @@ def _fwd_kernel_stage1_quant_int8(
     stride_buf_vbs,
     stride_buf_vh,
     stride_sz_kbs,  # scales_zeros stride for cache
-    stride_sz_kh,   # scales_zeros stride for head
+    stride_sz_kh,  # scales_zeros stride for head
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -255,7 +255,7 @@ def _fwd_kernel_stage1_quant_int8(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            
+
             # Load quantized K (uint8)
             offs_buf_k = (
                 kv_loc[:, None] * stride_buf_kbs
@@ -267,12 +267,9 @@ def _fwd_kernel_stage1_quant_int8(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0,
             )
-            
+
             # Load scales and zeros for K
-            offs_sz_k = (
-                kv_loc * stride_sz_kbs
-                + cur_kv_head * stride_sz_kh
-            )
+            offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
             k_scales = tl.load(
                 K_Scales_Zeros + offs_sz_k + 0,
                 mask=offs_n < split_kv_end,
@@ -283,11 +280,13 @@ def _fwd_kernel_stage1_quant_int8(
                 mask=offs_n < split_kv_end,
                 other=0.0,
             )
-            
+
             # Dequantize K: k = (k_quant - zeros) * scales
             # k_quant: [BLOCK_N, BLOCK_DMODEL], k_scales/k_zeros: [BLOCK_N]
-            k = ((k_quant.to(tl.float32) - k_zeros[:, None]) * k_scales[:, None]).to(q.dtype)
-            
+            k = ((k_quant.to(tl.float32) - k_zeros[:, None]) * k_scales[:, None]).to(
+                q.dtype
+            )
+
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale
 
@@ -310,12 +309,9 @@ def _fwd_kernel_stage1_quant_int8(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                 other=0,
             )
-            
+
             # Load scales and zeros for V
-            offs_sz_v = (
-                kv_loc * stride_sz_kbs
-                + cur_kv_head * stride_sz_kh
-            )
+            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
             v_scales = tl.load(
                 V_Scales_Zeros + offs_sz_v + 0,
                 mask=offs_n < split_kv_end,
@@ -326,10 +322,12 @@ def _fwd_kernel_stage1_quant_int8(
                 mask=offs_n < split_kv_end,
                 other=0.0,
             )
-            
+
             # Dequantize V inline: v = (v_quant - zeros) * scales
             # v_quant: [BLOCK_N, BLOCK_DV], v_scales/v_zeros: [BLOCK_N]
-            v = ((v_quant.to(tl.float32) - v_zeros[:, None]) * v_scales[:, None]).to(q.dtype)
+            v = ((v_quant.to(tl.float32) - v_zeros[:, None]) * v_scales[:, None]).to(
+                q.dtype
+            )
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -385,7 +383,7 @@ def _fwd_kernel_stage1_quant_int4(
     stride_buf_vbs,
     stride_buf_vh,
     stride_sz_kbs,  # scales_zeros stride for cache
-    stride_sz_kh,   # scales_zeros stride for head
+    stride_sz_kh,  # scales_zeros stride for head
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -440,13 +438,15 @@ def _fwd_kernel_stage1_quant_int4(
         offs_d_second = tl.arange(0, BLOCK_DMODEL // 2)
         mask_d_first = offs_d_first < (Lk // 2)
         mask_d_second = offs_d_second < (Lk - Lk // 2)
-        
+
         off_q_first = cur_batch * stride_qbs + cur_head * stride_qh + offs_d_first
-        off_q_second = cur_batch * stride_qbs + cur_head * stride_qh + (Lk // 2) + offs_d_second
-        
+        off_q_second = (
+            cur_batch * stride_qbs + cur_head * stride_qh + (Lk // 2) + offs_d_second
+        )
+
         q_first = tl.load(Q + off_q_first, mask=mask_d_first, other=0.0)
         q_second = tl.load(Q + off_q_second, mask=mask_d_second, other=0.0)
-        
+
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_loc = tl.load(
@@ -454,11 +454,11 @@ def _fwd_kernel_stage1_quant_int4(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            
+
             # Load packed INT4 K (uint8, 2 values per byte)
             offs_d_packed = tl.arange(0, BLOCK_DMODEL // 2)
             mask_d_packed = offs_d_packed < (Lk // 2)
-            
+
             offs_buf_k_packed = (
                 kv_loc[:, None] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
@@ -469,12 +469,9 @@ def _fwd_kernel_stage1_quant_int4(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d_packed[None, :]),
                 other=0,
             )
-            
+
             # Load scales and zeros for K
-            offs_sz_k = (
-                kv_loc * stride_sz_kbs
-                + cur_kv_head * stride_sz_kh
-            )
+            offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
             k_scales = tl.load(
                 K_Scales_Zeros + offs_sz_k + 0,
                 mask=offs_n < split_kv_end,
@@ -485,14 +482,22 @@ def _fwd_kernel_stage1_quant_int4(
                 mask=offs_n < split_kv_end,
                 other=0.0,
             )
-            
+
             # Dequantize INT4 K inline: unpack and dequantize
             # k_quant_packed: [BLOCK_N, BLOCK_DMODEL//2], k_scales/k_zeros: [BLOCK_N]
             # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
-            k_lower = (((k_quant_packed & 0x0F).to(tl.float32) - k_zeros[:, None]) * k_scales[:, None]).to(q_first.dtype)
-            k_upper = ((((k_quant_packed >> 4) & 0x0F).to(tl.float32) - k_zeros[:, None]) * k_scales[:, None]).to(q_first.dtype)
+            k_lower = (
+                ((k_quant_packed & 0x0F).to(tl.float32) - k_zeros[:, None])
+                * k_scales[:, None]
+            ).to(q_first.dtype)
+            k_upper = (
+                (((k_quant_packed >> 4) & 0x0F).to(tl.float32) - k_zeros[:, None])
+                * k_scales[:, None]
+            ).to(q_first.dtype)
             # Compute QK in q.dtype for efficiency, then convert to float32 for accumulation
-            qk = tl.sum(q_first[None, :] * k_lower, 1) + tl.sum(q_second[None, :] * k_upper, 1)
+            qk = tl.sum(q_first[None, :] * k_lower, 1) + tl.sum(
+                q_second[None, :] * k_upper, 1
+            )
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -506,7 +511,7 @@ def _fwd_kernel_stage1_quant_int4(
             # Load packed INT4 V
             offs_dv_packed = tl.arange(0, BLOCK_DV // 2)
             mask_dv_packed = offs_dv_packed < (Lv // 2)
-            
+
             offs_buf_v_packed = (
                 kv_loc[:, None] * stride_buf_vbs
                 + cur_kv_head * stride_buf_vh
@@ -517,12 +522,9 @@ def _fwd_kernel_stage1_quant_int4(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv_packed[None, :]),
                 other=0,
             )
-            
+
             # Load scales and zeros for V
-            offs_sz_v = (
-                kv_loc * stride_sz_kbs
-                + cur_kv_head * stride_sz_kh
-            )
+            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
             v_scales = tl.load(
                 V_Scales_Zeros + offs_sz_v + 0,
                 mask=offs_n < split_kv_end,
@@ -533,17 +535,23 @@ def _fwd_kernel_stage1_quant_int4(
                 mask=offs_n < split_kv_end,
                 other=0.0,
             )
-            
+
             # Dequantize INT4 V inline: unpack and dequantize
             # v_quant_packed: [BLOCK_N, BLOCK_DV//2], v_scales/v_zeros: [BLOCK_N]
             # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
-            v_lower = (((v_quant_packed & 0x0F).to(tl.float32) - v_zeros[:, None]) * v_scales[:, None]).to(q_first.dtype)
-            v_upper = ((((v_quant_packed >> 4) & 0x0F).to(tl.float32) - v_zeros[:, None]) * v_scales[:, None]).to(q_first.dtype)
+            v_lower = (
+                ((v_quant_packed & 0x0F).to(tl.float32) - v_zeros[:, None])
+                * v_scales[:, None]
+            ).to(q_first.dtype)
+            v_upper = (
+                (((v_quant_packed >> 4) & 0x0F).to(tl.float32) - v_zeros[:, None])
+                * v_scales[:, None]
+            ).to(q_first.dtype)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max)
-            
+
             # Accumulate separately for first half and second half
             # Convert p to q.dtype for efficient multiplication with v
             acc_first *= re_scale
@@ -553,7 +561,7 @@ def _fwd_kernel_stage1_quant_int4(
 
             e_sum = e_sum * re_scale + tl.sum(p, 0)
             e_max = n_e_max
-        
+
         # Store first half and second half separately
         # First half: indices [0, Lv//2)
         offs_dv_first = tl.arange(0, BLOCK_DV // 2)
@@ -569,7 +577,7 @@ def _fwd_kernel_stage1_quant_int4(
             acc_first / e_sum,
             mask=mask_dv_first,
         )
-        
+
         # Second half: indices [Lv//2, Lv)
         offs_dv_second = tl.arange(0, BLOCK_DV // 2)
         mask_dv_second = (offs_dv_second + Lv // 2) < Lv
@@ -577,7 +585,8 @@ def _fwd_kernel_stage1_quant_int4(
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
-            + offs_dv_second + Lv // 2
+            + offs_dv_second
+            + Lv // 2
         )
         tl.store(
             Att_Out + offs_mid_o_second,
@@ -617,7 +626,7 @@ def _fwd_grouped_kernel_stage1_quant_int8(
     stride_buf_vbs,
     stride_buf_vh,
     stride_sz_kbs,  # scales_zeros stride for cache
-    stride_sz_kh,   # scales_zeros stride for head
+    stride_sz_kh,  # scales_zeros stride for head
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -694,7 +703,7 @@ def _fwd_grouped_kernel_stage1_quant_int8(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            
+
             # Load quantized K and dequantize
             offs_buf_k = (
                 kv_loc[None, :] * stride_buf_kbs
@@ -706,16 +715,22 @@ def _fwd_grouped_kernel_stage1_quant_int8(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0,
             )
-            
+
             # Load K scales and zeros for dequantization
             offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
-            k_scale = tl.load(K_Scales_Zeros + offs_sz_k + 0, mask=offs_n < split_kv_end, other=1.0)
-            k_zero = tl.load(K_Scales_Zeros + offs_sz_k + 1, mask=offs_n < split_kv_end, other=0.0)
-            
+            k_scale = tl.load(
+                K_Scales_Zeros + offs_sz_k + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            k_zero = tl.load(
+                K_Scales_Zeros + offs_sz_k + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
             # Dequantize K: k = (k_quant - zero) * scale
             # k_quant shape: [BLOCK_DMODEL, BLOCK_N] (transposed), k_scale/k_zero: [BLOCK_N]
-            k = ((k_quant.to(tl.float32) - k_zero[None, :]) * k_scale[None, :]).to(q.dtype)
-            
+            k = ((k_quant.to(tl.float32) - k_zero[None, :]) * k_scale[None, :]).to(
+                q.dtype
+            )
+
             # q: [BLOCK_H, BLOCK_DMODEL], k: [BLOCK_DMODEL, BLOCK_N]
             # Compute qk = q @ k
             qk = tl.dot(q, k)
@@ -732,7 +747,9 @@ def _fwd_grouped_kernel_stage1_quant_int8(
                 )
                 # Dequantize DPE: kpe = (kpe_quant - zero) * scale
                 # kpe_quant shape: [BLOCK_N, BLOCK_DPE], k_scale/k_zero: [BLOCK_N]
-                kpe = ((kpe_quant.to(tl.float32) - k_zero[:, None]) * k_scale[:, None]).to(qpe.dtype)
+                kpe = (
+                    (kpe_quant.to(tl.float32) - k_zero[:, None]) * k_scale[:, None]
+                ).to(qpe.dtype)
                 qk += tl.dot(qpe, kpe)
             qk *= sm_scale
 
@@ -757,15 +774,21 @@ def _fwd_grouped_kernel_stage1_quant_int8(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                 other=0,
             )
-            
+
             # Load V scales and zeros for dequantization
             offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
-            v_scale = tl.load(V_Scales_Zeros + offs_sz_v + 0, mask=offs_n < split_kv_end, other=1.0)
-            v_zero = tl.load(V_Scales_Zeros + offs_sz_v + 1, mask=offs_n < split_kv_end, other=0.0)
-            
+            v_scale = tl.load(
+                V_Scales_Zeros + offs_sz_v + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            v_zero = tl.load(
+                V_Scales_Zeros + offs_sz_v + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
             # Dequantize V: v = (v_quant - zero) * scale
             # v_quant shape: [BLOCK_N, BLOCK_DV], v_scale/v_zero: [BLOCK_N]
-            v = ((v_quant.to(tl.float32) - v_zero[:, None]) * v_scale[:, None]).to(q.dtype)
+            v = ((v_quant.to(tl.float32) - v_zero[:, None]) * v_scale[:, None]).to(
+                q.dtype
+            )
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -822,7 +845,7 @@ def _fwd_grouped_kernel_stage1_quant_int4(
     stride_buf_vbs,
     stride_buf_vh,
     stride_sz_kbs,  # scales_zeros stride for cache
-    stride_sz_kh,   # scales_zeros stride for head
+    stride_sz_kh,  # scales_zeros stride for head
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -894,18 +917,34 @@ def _fwd_grouped_kernel_stage1_quant_int4(
         offs_d_second = tl.arange(BLOCK_DMODEL // 2, BLOCK_DMODEL)
         mask_d_first = offs_d_first < (Lk // 2)
         mask_d_second = offs_d_second < Lk
-        
-        offs_q_first = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d_first[None, :]
-        offs_q_second = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d_second[None, :]
-        
-        q_first = tl.load(Q + offs_q_first, mask=(mask_h[:, None]) & (mask_d_first[None, :]), other=0.0)
-        q_second = tl.load(Q + offs_q_second, mask=(mask_h[:, None]) & (mask_d_second[None, :]), other=0.0)
-        
+
+        offs_q_first = (
+            cur_batch * stride_qbs
+            + cur_head[:, None] * stride_qh
+            + offs_d_first[None, :]
+        )
+        offs_q_second = (
+            cur_batch * stride_qbs
+            + cur_head[:, None] * stride_qh
+            + offs_d_second[None, :]
+        )
+
+        q_first = tl.load(
+            Q + offs_q_first,
+            mask=(mask_h[:, None]) & (mask_d_first[None, :]),
+            other=0.0,
+        )
+        q_second = tl.load(
+            Q + offs_q_second,
+            mask=(mask_h[:, None]) & (mask_d_second[None, :]),
+            other=0.0,
+        )
+
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
             )
-            
+
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_loc = tl.load(
@@ -913,11 +952,11 @@ def _fwd_grouped_kernel_stage1_quant_int4(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            
+
             # Load packed INT4 K in transposed format for efficient dot product
             offs_d_packed = tl.arange(0, BLOCK_DMODEL // 2)
             mask_d_packed = offs_d_packed < (Lk // 2)
-            
+
             offs_buf_k_packed = (
                 kv_loc[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
@@ -928,23 +967,32 @@ def _fwd_grouped_kernel_stage1_quant_int4(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d_packed[:, None]),
                 other=0,
             )
-            
+
             # Load K scales and zeros for dequantization
             offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
-            k_scale = tl.load(K_Scales_Zeros + offs_sz_k + 0, mask=offs_n < split_kv_end, other=1.0)
-            k_zero = tl.load(K_Scales_Zeros + offs_sz_k + 1, mask=offs_n < split_kv_end, other=0.0)
-            
+            k_scale = tl.load(
+                K_Scales_Zeros + offs_sz_k + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            k_zero = tl.load(
+                K_Scales_Zeros + offs_sz_k + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
             # Dequantize INT4 K inline: unpack and dequantize
             # k_packed shape: [BLOCK_DMODEL//2, BLOCK_N] (transposed), k_scale/k_zero: [BLOCK_N]
             # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
-            k_lower = (((k_packed & 0x0F).to(tl.float32) - k_zero[None, :]) * k_scale[None, :]).to(q_first.dtype)
-            k_upper = ((((k_packed >> 4) & 0x0F).to(tl.float32) - k_zero[None, :]) * k_scale[None, :]).to(q_first.dtype)
-            
+            k_lower = (
+                ((k_packed & 0x0F).to(tl.float32) - k_zero[None, :]) * k_scale[None, :]
+            ).to(q_first.dtype)
+            k_upper = (
+                (((k_packed >> 4) & 0x0F).to(tl.float32) - k_zero[None, :])
+                * k_scale[None, :]
+            ).to(q_first.dtype)
+
             # Compute QK for both halves
             # q_first: [BLOCK_H, BLOCK_DMODEL//2], k_lower: [BLOCK_DMODEL//2, BLOCK_N]
             # qk = q_first @ k_lower + q_second @ k_upper
             qk = tl.dot(q_first, k_lower) + tl.dot(q_second, k_upper)
-            
+
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
                     kv_loc[None, :] * stride_buf_kbs
@@ -958,9 +1006,11 @@ def _fwd_grouped_kernel_stage1_quant_int4(
                 )
                 # Dequantize DPE: kpe = (kpe_quant - zero) * scale
                 # kpe_quant shape: [BLOCK_DPE, BLOCK_N] (transposed), k_scale/k_zero: [BLOCK_N]
-                kpe = ((kpe_quant.to(tl.float32) - k_zero[None, :]) * k_scale[None, :]).to(qpe.dtype)
+                kpe = (
+                    (kpe_quant.to(tl.float32) - k_zero[None, :]) * k_scale[None, :]
+                ).to(qpe.dtype)
                 qk += tl.dot(qpe, kpe)
-                
+
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -981,29 +1031,39 @@ def _fwd_grouped_kernel_stage1_quant_int4(
             )
             v_packed = tl.load(
                 V_Buffer + offs_buf_v_packed,
-                mask=(offs_n[:, None] < split_kv_end) & (tl.arange(0, BLOCK_DV // 2)[None, :] < (Lv // 2)),
+                mask=(offs_n[:, None] < split_kv_end)
+                & (tl.arange(0, BLOCK_DV // 2)[None, :] < (Lv // 2)),
                 other=0,
             )
-            
+
             # Load V scales and zeros for dequantization
             offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
-            v_scale = tl.load(V_Scales_Zeros + offs_sz_v + 0, mask=offs_n < split_kv_end, other=1.0)
-            v_zero = tl.load(V_Scales_Zeros + offs_sz_v + 1, mask=offs_n < split_kv_end, other=0.0)
-            
+            v_scale = tl.load(
+                V_Scales_Zeros + offs_sz_v + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            v_zero = tl.load(
+                V_Scales_Zeros + offs_sz_v + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
             # Dequantize INT4 V inline: unpack and dequantize
             # v_packed shape: [BLOCK_N, BLOCK_DV//2], v_scale/v_zero: [BLOCK_N]
             # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
-            v_lower = (((v_packed & 0x0F).to(tl.float32) - v_zero[:, None]) * v_scale[:, None]).to(q_first.dtype)
-            v_upper = ((((v_packed >> 4) & 0x0F).to(tl.float32) - v_zero[:, None]) * v_scale[:, None]).to(q_first.dtype)
-            
+            v_lower = (
+                ((v_packed & 0x0F).to(tl.float32) - v_zero[:, None]) * v_scale[:, None]
+            ).to(q_first.dtype)
+            v_upper = (
+                (((v_packed >> 4) & 0x0F).to(tl.float32) - v_zero[:, None])
+                * v_scale[:, None]
+            ).to(q_first.dtype)
+
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
-            
+
             # Scale existing accumulators
             acc_first *= re_scale[:, None]
             acc_second *= re_scale[:, None]
-            
+
             # Accumulate attention-weighted V for both halves
             acc_first += tl.dot(p.to(v_lower.dtype), v_lower)
             acc_second += tl.dot(p.to(v_upper.dtype), v_upper)
@@ -1026,7 +1086,7 @@ def _fwd_grouped_kernel_stage1_quant_int4(
             acc_first / e_sum[:, None],
             mask=(mask_h[:, None]) & (mask_dv_first[None, :]),
         )
-        
+
         # Second half: indices [Lv//2, Lv)
         offs_dv_second = tl.arange(0, BLOCK_DV // 2)
         mask_dv_second = (offs_dv_second + Lv // 2) < Lv
@@ -1963,7 +2023,7 @@ def decode_attention_fwd_normal_quant(
     """
     Normal (MHA) attention forward with quantized (INT4/INT8) KV cache.
     Dequantizes on-the-fly inside the kernel, avoiding global memory writes.
-    
+
     Args:
         kv_dtype: Type of quantization - "int4" or "int8"
     """
@@ -2009,7 +2069,7 @@ def decode_attention_fwd_normal_quant(
         v_buf_for_stage2 = o  # o has the correct output dimension
     else:
         raise ValueError(f"Unsupported kv_dtype: {kv_dtype}. Must be 'int4' or 'int8'.")
-    
+
     # Stage 2: Reduce across KV splits and compute final output
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -2046,7 +2106,7 @@ def decode_attention_fwd_grouped_quant(
     """
     Grouped (GQA/MQA) attention forward with quantized (INT4/INT8) KV cache.
     Dequantizes on-the-fly inside the kernel, avoiding global memory writes.
-    
+
     Args:
         kv_dtype: Type of quantization - "int4" or "int8"
     """
@@ -2092,7 +2152,7 @@ def decode_attention_fwd_grouped_quant(
         v_buf_for_stage2 = o  # o has the correct output dimension
     else:
         raise ValueError(f"Unsupported kv_dtype: {kv_dtype}. Must be 'int4' or 'int8'.")
-    
+
     # Stage 2: Reduce across KV splits and compute final output
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -2129,7 +2189,7 @@ def decode_attention_fwd_quantized(
     """
     Attention forward with quantized (INT4/INT8) KV cache.
     Dispatches to the appropriate kernel based on attention type (MHA vs GQA/MQA).
-    
+
     Args:
         kv_dtype: Type of quantization - "int4" or "int8"
     """

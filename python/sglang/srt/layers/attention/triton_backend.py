@@ -106,7 +106,10 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
-        if hasattr(model_runner.token_to_kv_pool, 'dtype') and model_runner.token_to_kv_pool.dtype == 'int4':
+        if (
+            hasattr(model_runner.token_to_kv_pool, "dtype")
+            and model_runner.token_to_kv_pool.dtype == "int4"
+        ):
             self.v_head_dim = self.v_head_dim * 2
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -1021,7 +1024,7 @@ class TritonAttnBackend(AttentionBackend):
 
         # Check if KV cache is quantized (INT4/INT8) for optimized attention
         kv_pool = forward_batch.token_to_kv_pool
-        if hasattr(kv_pool, 'dtype') and kv_pool.dtype in ("int4", "int8"):
+        if hasattr(kv_pool, "dtype") and kv_pool.dtype in ("int4", "int8"):
             # Use optimized quantized attention kernel
             # This dequantizes KV cache on-the-fly inside the kernel, avoiding global memory writes
             self.decode_attention_fwd_quantized(
