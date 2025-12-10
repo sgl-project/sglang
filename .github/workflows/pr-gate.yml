@@ -72,13 +72,6 @@ jobs:
             const curRun = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: context.runId
             });
-            let triggeringActor = curRun.data.triggering_actor?.login || context.actor;
-            if (triggeringActor === "github-actions[bot]") {
-              triggeringActor = `${{ steps.pr.outputs.user }}`;
-              core.info(
-                `triggering_actor is github-actions[bot]; substituting PR author '${triggeringActor}'.`
-              );
-            }
 
             let effectiveCooldownMinutes = DEFAULT_MINUTES;
             let perUserCooldownMinutes = null;
