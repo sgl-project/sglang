@@ -37,17 +37,16 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.server_args import get_global_server_args
 
 
 class NPUCompileModelRunner:
     def __init__(self, model_runner: ModelRunner):
-        print(f"NPUCompileModelRunner::__init__", flush=True)
         self.model_runner = model_runner
         _, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.capture()
 
     def capture(self) -> None:
-        print(f"NPUCompileModelRunner::capture", flush=True)
         # Reverse the order to enable better memory sharing across cuda graphs.
         compile_range = (
             tqdm.tqdm(list(reversed(self.compile_bs)))
@@ -55,7 +54,11 @@ class NPUCompileModelRunner:
             else reversed(self.compile_bs)
         )
 
-        backend = get_compiler_backend("reduce-overhead")
+        backend = get_compiler_backend(
+            mode="reduce-overhead",
+            compilation_config=get_global_server_args().compilation_config,
+        )
+
         compile_forward = torch.compile(
             torch.no_grad()(self.model_runner.model.forward),
             fullgraph=True,

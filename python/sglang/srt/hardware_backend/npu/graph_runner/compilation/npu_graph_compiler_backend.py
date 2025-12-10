@@ -16,9 +16,13 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.compilation.npu.pass_manager import PassManager
-from sglang.srt.compilation.npu.passes.fp16 import SplitQkvRmsnormRopeFuse
-from sglang.srt.compilation.npu.passes.w8a8_int8 import (
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.pass_manager import (
+    PassManager,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.passes.fp16 import (
+    SplitQkvRmsnormRopeFuse,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.passes.w8a8_int8 import (
     DivFuse,
     EraseCopy,
     NpuAddRmsNormDynamicQuantFuse,

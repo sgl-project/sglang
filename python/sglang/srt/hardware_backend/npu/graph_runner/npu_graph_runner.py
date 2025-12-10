@@ -48,7 +48,9 @@ from sglang.srt.compilation.custom_ops import (
     _set_dp_buffer_len,
     _set_is_extend_in_batch,
 )
-from sglang.srt.compilation.npu.npu_graph_compiler import NpuGraphCompiler
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.npu_graph_compiler import (
+    NpuGraphCompiler,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
@@ -108,9 +110,9 @@ class NPUGraphRunner(CudaGraphRunner):
         if self.enable_torch_compile and (not self.compile_bs or bs in self.compile_bs):
             self.model_runner.attn_backend.enable_torch_compile = True
             compiler = NpuGraphCompiler(
-                self.model_runner,
-                run_once_fn,
-                get_global_server_args().compilation_config,
+                model_runner=self.model_runner,
+                model=run_once_fn,
+                compilation_config=get_global_server_args().compilation_config,
             )
 
             # compilation

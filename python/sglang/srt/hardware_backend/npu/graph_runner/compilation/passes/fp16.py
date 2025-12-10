@@ -12,8 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-import sgl_kernel_npu
 import torch
+
+import sglang.srt.hardware_backend.npu.graph_runner.compilation.custom_ops  # noqa
 
 
 class SplitQkvRmsnormRopeFuse:
@@ -106,20 +107,18 @@ class SplitQkvRmsnormRopeFuse:
         sin_view = sin.view(-1, 1, 1, self.head_dim)
         sin_contiguous = sin_view.contiguous()
 
-        split_qkv_rmsnorm_rope_default = (
-            sgl_kernel_npu.norm.split_qkv_rmsnorm_rope.default(
-                output_parallel,
-                sin_contiguous,
-                cos_contiguous,
-                q_norm_parameters_weight,
-                k_norm_parameters_weight,
-                self.q_size,
-                self.kv_size,
-                self.head_dim,
-                self.variance_epsilon,
-                q_bias=None,
-                k_bias=None,
-            )
+        split_qkv_rmsnorm_rope_default = torch.ops.sglang.split_qkv_rmsnorm_rope(
+            output_parallel,
+            sin_contiguous,
+            cos_contiguous,
+            q_norm_parameters_weight,
+            k_norm_parameters_weight,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            self.variance_epsilon,
+            q_bias=None,
+            k_bias=None,
         )
 
         q = split_qkv_rmsnorm_rope_default[0]

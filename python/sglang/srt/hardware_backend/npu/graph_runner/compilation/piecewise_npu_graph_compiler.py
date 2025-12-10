@@ -18,7 +18,9 @@ import sys
 import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.compilation.npu.compilation_context import CompilationContext
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.compilation_context import (
+    CompilationContext,
+)
 from sglang.srt.utils.common import get_compiler_backend
 
 
@@ -30,15 +32,13 @@ class PiecewiseNpuGraphCompiler:
         compilation_config: CompilationConfig,
         compilation_context: CompilationContext,
     ):
+        if compilation_config is None:
+            compilation_config = CompilationConfig(compiler="piecewise")
+
         backend = get_compiler_backend(
-            (
-                "piecewise"
-                if compilation_config.compiler is None
-                else compilation_config.compiler
-            ),
-            model_runner,
-            compilation_config,
-            compilation_context,
+            model_runner=model_runner,
+            compilation_config=compilation_config,
+            compilation_context=compilation_context,
         )
         backend.init(model_runner.model_config)
 

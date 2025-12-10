@@ -17,7 +17,9 @@ from typing import Any
 import torch
 import torch_npu
 
-from sglang.srt.compilation.npu.compilation_context import CompilationContext
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.compilation_context import (
+    CompilationContext,
+)
 
 
 class NPUGraphBackend:

@@ -24,10 +24,12 @@ import torch._dynamo.config
 import tqdm
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.compilation.npu.compilation_context import CompilationContext
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.compilation_context import (
+    CompilationContext,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_graph_compiler import (
     PiecewiseNpuGraphCompiler,
 )
@@ -398,10 +400,10 @@ class PiecewiseNPUGraphRunnerDecode:
         self.model_runner.attn_backend.graph_mode = True
 
         compiler = PiecewiseNpuGraphCompiler(
-            self.model_runner,
-            self.model_runner.model,
-            self.compilation_config,
-            self.compilation_context,
+            model_runner=self.model_runner,
+            model=self.model_runner.model,
+            compilation_config=self.compilation_config,
+            compilation_context=self.compilation_context,
         )
 
         logits_output_or_pp_proxy_tensors = compiler.compiled_callable(

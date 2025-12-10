@@ -12,7 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class PassManager:
@@ -35,9 +39,15 @@ class PassManager:
                     results = torch.fx.replace_pattern(
                         self.graph_module, pass_.pattern, pass_.replacement
                     )
-            except:
+
+                logger.debug(
+                    f"PassManager::apply: pass_instance={type(pass_instance)}: results({len(results)})={results}"
+                )
+            except Exception as e:
                 # pass was not applied
-                pass
+                logger.debug(
+                    f"PassManager::apply: pass_instance={type(pass_instance)}: ignored={e}"
+                )
 
             if not updated:
                 updated = len(results) != 0

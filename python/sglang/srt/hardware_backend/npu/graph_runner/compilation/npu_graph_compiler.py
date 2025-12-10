@@ -27,15 +27,14 @@ class NpuGraphCompiler:
     ):
         torch._dynamo.reset()
 
+        if compilation_config is None:
+            compilation_config = CompilationConfig(compiler="npugraph")
+
         backend = get_compiler_backend(
-            (
-                "npugraph_fused"
-                if compilation_config is None or compilation_config.compiler is None
-                else compilation_config.compiler
-            ),
-            model_runner.model_config.dtype,
+            compilation_config=compilation_config, model_runner=model_runner
         )
         backend.init(model_runner.model_config)
+
         self.compiled_callable = torch.compile(
             model, fullgraph=True, dynamic=False, backend=backend
         )

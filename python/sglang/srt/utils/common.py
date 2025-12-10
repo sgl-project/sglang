@@ -1912,7 +1912,7 @@ def get_npu_compiler_config():
 
 
 def get_compiler_backend(
-    mode=None,
+    mode: str = None,
     model_runner=None,
     compilation_config: CompilationConfig = None,
     compilation_context=None,
@@ -1921,7 +1921,10 @@ def get_compiler_backend(
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        if mode == "piecewise":
+        if compilation_config is None:
+            compilation_config = CompilationConfig(compiler="torchair")
+
+        if compilation_config.compiler == "piecewise":
             from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_graph_compiler_backend import (
                 PiecewiseNpuGraphCompilerBackend,
             )
@@ -1930,27 +1933,38 @@ def get_compiler_backend(
                 model_runner, compilation_config, compilation_context
             )
 
-        if mode == "npugraph_fused":
-            from sglang.srt.compilation.npu.npu_graph_compiler_backend import (
+        if compilation_config.compiler == "npugraph":
+            from sglang.srt.hardware_backend.npu.graph_runner.compilation.npu_graph_compiler_backend import (
                 NpuGraphCompilerBackend,
             )
 
             return NpuGraphCompilerBackend(model_runner)
 
-        try:
-            import torchair
-            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
-            from torchair.configs.compiler_config import CompilerConfig
-        except ImportError as e:
-            raise ImportError(
-                "NPU detected, but torchair package is not installed. "
-                "Please install torchair for torch.compile support on NPU."
-            )
-        compiler_config = CompilerConfig()
-        # TODO(iforgetmyname): Change this default value once torch_npu version 7.2.0
-        compiler_config.mode = "max-autotune" if mode is None else mode
-        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
-        return npu_backend
+        if compilation_config.compiler == "torchair":
+            try:
+                import torchair
+                import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+                from torchair.configs.compiler_config import CompilerConfig
+            except ImportError as e:
+                raise ImportError(
+                    "NPU detected, but torchair package is not installed. "
+                    "Please install torchair for torch.compile support on NPU."
+                )
+            compiler_config = CompilerConfig()
+
+            # TODO(iforgetmyname): Change this default value once torch_npu version 7.2.0
+            # compiler_config.mode = "max-autotune" if mode is None else mode
+
+            predefined_config = get_npu_compiler_config()
+            for k, v in predefined_config.items():
+                setattr(compiler_config.experimental_config, k, v)
+
+            npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
+            return npu_backend
+
+        raise ValueError(
+            f"unrecognized compiler backend '{compilation_config.compiler}'"
+        )
 
     return "inductor"
 

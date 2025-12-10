@@ -2460,7 +2460,7 @@ class ModelRunner:
                     if self.server_args.enable_piecewise_npu_graph_decode
                     else (
                         NPUCompileModelRunner
-                        if self.server_args.disable_cuda_graph
+                        if self.server_args.enable_torch_air_compile
                         else NPUGraphRunner
                     )
                 ),

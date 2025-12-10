@@ -20,11 +20,13 @@ from typing import Any, Callable
 import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.compilation.npu.compilation_context import CompilationContext
-from sglang.srt.compilation.npu.npu_graph_compiler_backend import (
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.compilation_context import (
+    CompilationContext,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.npu_graph_compiler_backend import (
     NpuGraphCompilerBackend,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
 logger = logging.getLogger(__name__)
 
