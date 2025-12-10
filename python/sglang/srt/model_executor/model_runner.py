@@ -1462,7 +1462,7 @@ class ModelRunner:
         else:
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             # reserve the memory for the intermediate mamba states used for spec dec
-            if self.spec_algorithm.is_eagle():
+            if not self.spec_algorithm.is_none():
                 assert server_args.speculative_num_draft_tokens is not None
                 assert server_args.max_running_requests is not None
 
