@@ -476,7 +476,9 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process image stream - norm1 + modulation
         img_shift1, img_scale1, img_gate1_raw = img_mod1.chunk(3, dim=-1)
-        img_modulated = self.img_norm1(hidden_states, shift=img_shift1, scale=img_scale1)
+        img_modulated = self.img_norm1(
+            hidden_states, shift=img_shift1, scale=img_scale1
+        )
         img_gate1 = img_gate1_raw.unsqueeze(1)
 
         # Process text stream - norm1 + modulation
@@ -511,7 +513,9 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process image stream - norm2 + MLP
         img_shift2, img_scale2, img_gate2_raw = img_mod2.chunk(3, dim=-1)
-        img_modulated2 = self.img_norm2(hidden_states, shift=img_shift2, scale=img_scale2)
+        img_modulated2 = self.img_norm2(
+            hidden_states, shift=img_shift2, scale=img_scale2
+        )
         img_gate2 = img_gate2_raw.unsqueeze(1)
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output

@@ -330,9 +330,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
               but before normalization)
         """
         can_use_cuda = (
-            x.is_cuda
-            and (x.shape[-1] % 4 == 0)
-            and not isinstance(self.norm, RMSNorm)
+            x.is_cuda and (x.shape[-1] % 4 == 0) and not isinstance(self.norm, RMSNorm)
         )
         # can_use_cuda = False
         if can_use_cuda:
@@ -355,11 +353,18 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
                     return t.reshape(1).to(dtype=x.dtype, device=x.device)
                 elif t.dim() == 2 or t.dim() == 3:
-                    return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+                    return (
+                        t.expand(B, L, C)
+                        .contiguous()
+                        .view(M, C)
+                        .to(dtype=x.dtype, device=x.device)
+                    )
                 elif t.dim() == 4:
-                    return t.contiguous().to(dtype=x.dtype, device=x.device)                    
+                    return t.contiguous().to(dtype=x.dtype, device=x.device)
                 else:
-                    raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
+                    raise ValueError(
+                        f"Scale/shift tensor dimension {t.dim()} not supported"
+                    )
 
             scale_arg = get_arg(scale)
             shift_arg = get_arg(shift)
@@ -377,13 +382,20 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                     # gate.shape: [batch_size, 1, inner_dim]
                     gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
                 elif gate.dim() == 2:
-                    gate_opt = gate.expand(M, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+                    gate_opt = (
+                        gate.expand(M, C)
+                        .contiguous()
+                        .view(M, C)
+                        .to(dtype=x.dtype, device=x.device)
+                    )
             else:
-                raise ValueError(f"Gate type {type(gate)} not supported")    
-            
+                raise ValueError(f"Gate type {type(gate)} not supported")
+
             # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
-            y_2d, residual_output = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-                residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
+            y_2d, residual_output = (
+                sgl_kernel.fused_scale_residual_layernorm_scale_shift(
+                    residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
+                )
             )
             return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
@@ -456,7 +468,7 @@ class LayerNormScaleShift(nn.Module):
         can_use_cuda = (
             x.is_cuda
             and self.norm_type == "layer"
-            and (x.shape[-1] % 4 == 0) # x.shape[-1]: hidden_size
+            and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
         )
         # can_use_cuda = False
         if can_use_cuda:
@@ -477,16 +489,25 @@ class LayerNormScaleShift(nn.Module):
                 if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
                     return t.reshape(1).to(dtype=x.dtype, device=x.device)
                 elif t.dim() == 2 or t.dim() == 3:
-                    return t.expand(B, L, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+                    return (
+                        t.expand(B, L, C)
+                        .contiguous()
+                        .view(M, C)
+                        .to(dtype=x.dtype, device=x.device)
+                    )
                 elif t.dim() == 4:
-                    return t.contiguous().to(dtype=x.dtype, device=x.device)                    
+                    return t.contiguous().to(dtype=x.dtype, device=x.device)
                 else:
-                    raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
+                    raise ValueError(
+                        f"Scale/shift tensor dimension {t.dim()} not supported"
+                    )
 
             scale_arg = get_arg(scale)
             shift_arg = get_arg(shift)
 
-            y_2d = sgl_kernel.fused_layernorm_scale_shift(x_2d, gamma, beta, scale_arg, shift_arg)
+            y_2d = sgl_kernel.fused_layernorm_scale_shift(
+                x_2d, gamma, beta, scale_arg, shift_arg
+            )
             return y_2d.view(B, L, C)
 
         else:
