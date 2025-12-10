@@ -4,6 +4,7 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
+    embedding_lora_a_fwd,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -62,6 +63,28 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             slice_offsets=output_offset,
             max_slice_size=max_slice_size,
             base_output=base_output,
+        )
+
+    def run_lora_a_embedding(
+        self,
+        input_ids: torch.Tensor,
+        weights: torch.Tensor,
+        vocab_size: int,
+        extra_embeddings: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run LoRA A embedding lookup using Triton kernel.
+
+        Uses embedding_batch_info which maintains original sequence structure
+        (not the chunked/reordered structure used for linear layers).
+        """
+        return embedding_lora_a_fwd(
+            input_ids=input_ids,
+            weights=weights,
+            batch_info=self.embedding_batch_info,
+            vocab_size=vocab_size,
+            extra_embeddings=extra_embeddings,
         )
 
     def run_qkv_lora(
@@ -181,6 +204,30 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 max_len=None,  # Not used in CSGMV backend
             )
 
+            # Also create embedding-specific batch info (uses original sequence structure)
+            self.cuda_graph_embedding_batch_info = LoRABatchInfo(
+                bs=max_bs_in_cuda_graph,
+                use_cuda_graph=True,
+                num_segments=max_bs_in_cuda_graph,
+                seg_lens=torch.full(
+                    (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
+                ),
+                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                max_len=num_tokens_per_bs,
+                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                permutation=None,
+            )
+            # Initialize seg_indptr for embedding CUDA graph
+            torch.cumsum(
+                self.cuda_graph_embedding_batch_info.seg_lens[:max_bs_in_cuda_graph],
+                dim=0,
+                out=self.cuda_graph_embedding_batch_info.seg_indptr[
+                    1 : max_bs_in_cuda_graph + 1
+                ],
+            )
+
     def prepare_lora_batch(
         self,
         forward_batch: ForwardBatch,
@@ -253,6 +300,63 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
 
         self.batch_info = batch_info
+
+        # Setup embedding_batch_info (uses original sequence structure, not chunked)
+        bs = forward_batch.batch_size
+        if use_cuda_graph:
+            embedding_batch_info = self.cuda_graph_embedding_batch_info
+            embedding_batch_info.bs = bs
+            embedding_batch_info.num_segments = bs
+        else:
+            emb_max_len = (
+                max(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.forward_mode.is_extend()
+                else 1
+            )
+            emb_seg_lens = (
+                forward_batch.extend_seq_lens
+                if forward_batch.forward_mode.is_extend()
+                else torch.ones(bs, dtype=torch.int32, device=self.device)
+            )
+            emb_seg_indptr = torch.zeros(
+                (bs + 1,), dtype=torch.int32, device=self.device
+            )
+            emb_seg_indptr[1:] = torch.cumsum(emb_seg_lens, dim=0)
+
+            embedding_batch_info = LoRABatchInfo(
+                bs=bs,
+                num_segments=bs,
+                max_len=emb_max_len,
+                use_cuda_graph=False,
+                seg_lens=emb_seg_lens,
+                seg_indptr=emb_seg_indptr,
+                weight_indices=torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                ),
+                lora_ranks=torch.empty(
+                    (self.max_loras_per_batch,), dtype=torch.int32, device=self.device
+                ),
+                scalings=torch.empty(
+                    (self.max_loras_per_batch,), dtype=torch.float, device=self.device
+                ),
+                permutation=None,
+            )
+
+        # Copy common data to embedding_batch_info (reuse already-created tensors)
+        weight_indices_for_embedding = torch.tensor(
+            weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+        )
+        embedding_batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
+            lora_ranks_tensor, non_blocking=True
+        )
+        embedding_batch_info.scalings[: self.max_loras_per_batch].copy_(
+            scalings_tensor, non_blocking=True
+        )
+        embedding_batch_info.weight_indices[:bs].copy_(
+            weight_indices_for_embedding, non_blocking=True
+        )
+
+        self.embedding_batch_info = embedding_batch_info
 
     @staticmethod
     def _get_permutation(seq_weight_indices, forward_batch: ForwardBatch):
