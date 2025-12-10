@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import math
+from functools import partial
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -31,7 +32,7 @@ from sglang.srt.configs.qwen3_omni import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -43,8 +44,10 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix, logger, get_bool_env_var, is_hip
 
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
     def __init__(
@@ -321,8 +324,12 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = RMSNorm(
-            self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
+        if _use_aiter:
+            norm_layer = partial(LayerNorm, eps=1e-6)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        self.ln_q = norm_layer(
+             self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
         )
         self.mlp = nn.ModuleList(
             [
@@ -344,13 +351,27 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
             ]
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = (
-            x.view(-1, self.hidden_size)
-            if self.use_postshuffle_norm
-            else x.view(-1, x.shape[-1])
-        )
-        hidden = self.ln_q(x).view(-1, self.hidden_size)
+    def forward(
+            self,
+            x: torch.Tensor,
+            residual: Optional[torch.Tensor] = None,
+            ) -> torch.Tensor:
+        hidden = None
+        if self.use_postshuffle_norm:
+            if residual is not None:
+                hidden, _ = self.ln_q(
+                    x.view(-1, self.hidden_size),
+                    residual=residual.view(-1, self.hidden_size),
+                )
+            else:
+                hidden = self.ln_q(x.view(-1, self.hidden_size))
+        else:
+            if residual is not None:
+                hidden, _ = self.ln_q(x, residual=residual)
+                hidden = hidden.view(-1, self.hidden_size)
+            else:
+                hidden = self.ln_q(x).view(-1, self.hidden_size)
+
         for layer in self.mlp:
             if isinstance(hidden, tuple):
                 hidden = hidden[0]
