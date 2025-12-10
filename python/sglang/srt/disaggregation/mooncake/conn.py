@@ -719,9 +719,10 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
-                assert kv_chunk.room in self.transfer_contexts, f"kv_chunk.room {kv_chunk.room} not in transfer_contexts"
-                transfer_context = self.transfer_contexts[kv_chunk.room]
-                # Resolve the context once for all requests (thread-safe, only executes once)
+                transfer_context = self.transfer_contexts.get(kv_chunk.room)
+
+                if transfer_context is not None:
+                    transfer_context.resolve()
                 
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
@@ -759,8 +760,6 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-
-                        transfer_context.resolve()
 
                         if self.is_mla_backend or (
                             self.attn_tp_size
