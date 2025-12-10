@@ -17,7 +17,10 @@ from typing import Callable
 import torch
 
 from sglang.srt.compilation.npu.pass_manager import PassManager
-from sglang.srt.compilation.npu.passes.fp16 import SplitQkvRmsnormRopeFuse
+from sglang.srt.compilation.npu.passes.fp16 import (
+    SplitQkvRmsnormRopeFuse,
+    SplitQkvRmsnormRopeFuseMoe,
+)
 from sglang.srt.compilation.npu.passes.w8a8_int8 import (
     DivFuse,
     EraseCopy,
@@ -64,6 +67,15 @@ class NpuGraphCompilerBackend:
 
     def apply_passes(self, graph_module: torch.fx.GraphModule):
         passManager = PassManager(graph_module)
+        passManager.add(
+            SplitQkvRmsnormRopeFuseMoe,
+            q_size=self.q_size,
+            kv_size=self.kv_size,
+            head_dim=self.head_dim,
+            q_shape=self.q_shape,
+            k_shape=self.k_shape,
+            variance_epsilon=self.rms_norm_eps,
+        )
         passManager.add(
             SplitQkvRmsnormRopeFuse,
             q_size=self.q_size,

@@ -35,9 +35,22 @@ class PassManager:
                     results = torch.fx.replace_pattern(
                         self.graph_module, pass_.pattern, pass_.replacement
                     )
+
+                # TODO: use logging
+                print(
+                    f"INFO PassManager::apply: pass_instance={pass_instance}, results={results}",
+                    flush=True,
+                )
             except:
-                # pass was not applied
-                pass
+                # TODO: use logging
+                print(
+                    f"ERROR PassManager::apply: pass_instance={pass_instance}, results={results}",
+                    flush=True,
+                )
+
+                import traceback
+
+                traceback.print_exc()
 
             if not updated:
                 updated = len(results) != 0

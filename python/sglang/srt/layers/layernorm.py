@@ -92,7 +92,8 @@ class RMSNorm(CustomOp):
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
+        self.weight_data = torch.ones(hidden_size, dtype=weight_dtype)
+        self.weight = nn.Parameter(self.weight_data)
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
@@ -132,10 +133,10 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
             out, _, residual_out = torch_npu.npu_add_rms_norm(
-                residual, x, self.weight.data, self.variance_epsilon
+                residual, x, self.weight_data, self.variance_epsilon
             )
             return out, residual_out
-        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+        return torch_npu.npu_rms_norm(x, self.weight_data, self.variance_epsilon)[0]
 
     def forward_aiter(
         self,
