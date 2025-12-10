@@ -1259,34 +1259,35 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
-  unit-test-backend-8-gpu-b200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-8-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 8-gpu-b200
-    env:
-      RUNNER_LABELS: 8-gpu-b200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # Disabled: No jobs running, but still installing dependencies which holds up wait time
+  # unit-test-backend-8-gpu-b200:
+  #   needs: [check-changes, call-gate, unit-test-backend-2-gpu]
+  #   if: |
+  #     always() &&
+  #     (
+  #       (inputs.target_stage == 'unit-test-backend-8-gpu-b200') ||
+  #       (
+  #         !inputs.target_stage &&
+  #         (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  #       )
+  #     )
+  #   runs-on: 8-gpu-b200
+  #   env:
+  #     RUNNER_LABELS: 8-gpu-b200
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+  #     - name: Install dependencies
+  #       run: |
+  #         IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      # - name: Run test
-      #   timeout-minutes: 45
-      #   run: |
-      #     cd test/srt
-      #     python3 run_suite.py --suite per-commit-8-gpu-b200 --timeout-per-file 1800
+  #     # - name: Run test
+  #     #   timeout-minutes: 45
+  #     #   run: |
+  #     #     cd test/srt
+  #     #     python3 run_suite.py --suite per-commit-8-gpu-b200 --timeout-per-file 1800
 
   pr-test-finish:
     needs:
