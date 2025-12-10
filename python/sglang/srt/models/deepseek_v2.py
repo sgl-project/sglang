@@ -1286,6 +1286,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
+            if "factor" not in rope_scaling:
+                rope_scaling["factor"] = 40
+            if "original_max_position_embeddings" not in rope_scaling:
+                rope_scaling["original_max_position_embeddings"] = 4096
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
