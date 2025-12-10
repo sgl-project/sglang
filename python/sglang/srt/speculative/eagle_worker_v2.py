@@ -743,7 +743,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 all_verified_id,
                 accept_length,
                 verified_id,
-                self.speculative_num_draft_tokens,
+                self.speculative_num_steps + 1,
             )
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
