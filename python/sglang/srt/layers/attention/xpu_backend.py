@@ -19,20 +19,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-import logging
-
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_with_kvcache
-
-from sglang.srt.utils import get_compiler_backend
-
-logger = logging.getLogger(__name__)
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def extract_page_table(batch_size, req_to_token, req_pool_indices, seq_lens):
-    kv_indices = req_to_token[req_pool_indices, : seq_lens.max()]
-    return kv_indices.view(batch_size, -1)
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -64,7 +52,6 @@ class XPUAttentionBackend(AttentionBackend):
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
-        self.max_bs = model_runner.req_to_token_pool.size
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
@@ -72,11 +59,6 @@ class XPUAttentionBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
-        self.max_num_pages_per_req = self.max_context_len // self.page_size
-        self.kv_indptr = (
-            torch.arange(0, self.max_bs + 1, dtype=torch.int32, device=self.device)
-            * self.max_num_pages_per_req
-        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         assert (
             self.use_mla is False
@@ -118,10 +100,16 @@ class XPUAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
+                assert (
+                    False
+                ), "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
                     ).to(torch.int32)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                        self.speculative_step_id + 1
+                    )
                     metadata.cu_seqlens_q = torch.arange(
                         0, batch_size + 1, dtype=torch.int32, device=device
                     )
@@ -131,15 +119,13 @@ class XPUAttentionBackend(AttentionBackend):
                         ),
                         (1, 0),
                     )
-                    metadata.page_table = extract_page_table(
-                        batch_size,
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                    )
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                     metadata.cu_seqlens_q = torch.arange(
                         0,
                         batch_size * self.topk + 1,
@@ -153,12 +139,9 @@ class XPUAttentionBackend(AttentionBackend):
                         ),
                         (1, 0),
                     )
-                    metadata.page_table = extract_page_table(
-                        batch_size,
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                    )
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
 
                     metadata_expand = FlashAttentionMetadata()
                     decode_length = self.speculative_step_id + 1
@@ -193,10 +176,10 @@ class XPUAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
@@ -211,6 +194,10 @@ class XPUAttentionBackend(AttentionBackend):
                     forward_batch.seq_lens + self.speculative_num_draft_tokens
                 ).to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_k = (
+                    forward_batch.seq_lens_cpu.max().item()
+                    + self.speculative_num_draft_tokens
+                )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
                     batch_size * self.speculative_num_draft_tokens + 1,
@@ -224,17 +211,15 @@ class XPUAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = extract_page_table(
-                    batch_size,
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
 
                 self._init_local_attn_metadata(forward_batch, metadata, device)
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = torch.arange(
                     0,
                     batch_size * self.speculative_num_draft_tokens + 1,
@@ -248,12 +233,9 @@ class XPUAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                metadata.page_table = extract_page_table(
-                    batch_size,
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
 
                 metadata_expand = FlashAttentionMetadata()
 
@@ -335,10 +317,10 @@ class XPUAttentionBackend(AttentionBackend):
 
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
@@ -353,7 +335,7 @@ class XPUAttentionBackend(AttentionBackend):
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
-                metadata.max_seq_len_q = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
             # Setup local attention if enabled
@@ -362,17 +344,27 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
-            metadata.cache_seqlens_int32 = forward_batch.encoder_lens.to(torch.int32)
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
+            assert (
+                forward_batch.encoder_lens.numel() == 1
+            ), "Only encoder size 1 is supported for now"
+
+            metadata.encoder_lens_int32 = forward_batch.encoder_lens.to(torch.int32)
+            metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
-            metadata.page_table = extract_page_table(
-                batch_size,
-                self.req_to_token,
+            metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
+            metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
+            ]
+
+            # Currently only support forward_batch.encoder_lens.numel() == 1
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-            )
+                metadata.encoder_max_seq_len_k : (
+                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
+                ),
+            ]
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
@@ -500,6 +492,9 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
             if layer.is_cross_attention:
+                page_table = metadata.encoder_page_table
+                cache_seqlens = metadata.encoder_lens_int32
+                cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
             result = flash_attn_with_kvcache(
@@ -518,9 +513,9 @@ class XPUAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
-                sinks=sinks,
                 **kwargs,
             )
+
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
@@ -539,7 +534,6 @@ class XPUAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
-                    sinks=sinks,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -568,53 +562,31 @@ class XPUAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    assert (
-                        q.dtype == k.dtype and q.dtype == v.dtype
-                    ), "currently only support same dtype for q, k, v"
-                    output = flash_attn_with_kvcache(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(
-                            q.dtype
-                        ),
-                        v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(
-                            q.dtype
-                        ),
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k=torch.diff(
-                            forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
-                        ),
+                        cu_seqlens_k=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
                         max_seqlen_q=metadata.max_seq_len_q,
-                        # TODO: make it implemented at kernel side
-                        page_table=torch.arange(
-                            0, metadata.cu_seqlens_q.numel(), device=self.device
-                        ),
                         max_seqlen_k=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
-                        sinks=sinks,
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    output = flash_attn_with_kvcache(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(
-                            q.dtype
-                        ),
-                        v_cache=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(
-                            q.dtype
-                        ),
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k=torch.diff(metadata.cu_seqlens_q),
+                        cu_seqlens_k=metadata.cu_seqlens_q,
                         max_seqlen_q=metadata.max_seq_len_q,
                         max_seqlen_k=metadata.max_seq_len_q,
-                        page_table=torch.arange(
-                            0, metadata.cu_seqlens_q.numel(), device=self.device
-                        ),
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
-                        sinks=sinks,
                     )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
@@ -790,10 +762,10 @@ class XPUAttentionBackend(AttentionBackend):
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
-                    page_table=metadata.page_table,
-                    cache_seqlens=metadata.cache_seqlens_int32,
+                    page_table=metadata.encoder_page_table,
+                    cache_seqlens=metadata.encoder_lens_int32,
                     cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=metadata.cu_seqlens_k,
+                    cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
                     max_seqlen_q=1,
                     softmax_scale=layer.scaling,
                     causal=False,
@@ -1026,7 +998,9 @@ class XPUAttentionBackend(AttentionBackend):
         )
         bs = cache_seqlens_int32.shape[0]
         page_table = (
-            metadata.page_table.new_zeros((bs, self.max_num_pages_per_req))
+            metadata.page_table.new_zeros(
+                (bs, metadata.max_seq_len_k + metadata_expand.page_table.shape[1])
+            )
             if metadata_swa is None
             else metadata_swa.page_table
         )
