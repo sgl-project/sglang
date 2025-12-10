@@ -3151,7 +3151,7 @@ class DeepseekV2Model(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    if i > 3 and self.enable_a2a_moe:
+                    if self.enable_a2a_moe and i > 3:
                         aux_hidden_state = tensor_model_parallel_all_gather(
                             hidden_states + residual, dim=0
                         )
