@@ -27,4 +27,13 @@ def test_error_when_auto_truncate_disabled():
     err = validate_input_length(req, max_req_input_len=100, allow_auto_truncate=False, reserved_tokens=20)
 
     assert err is not None
-    assert len(req.origin_input_ids) == 120
+
+
+def test_error_when_prompt_too_long_for_reservation():
+    req = _make_req(90)
+
+    err = validate_input_length(req, max_req_input_len=100, allow_auto_truncate=False, reserved_tokens=30)
+
+    assert err is not None
+    assert "maximum allowed prompt length is 70" in err
+    assert len(req.origin_input_ids) == 90
