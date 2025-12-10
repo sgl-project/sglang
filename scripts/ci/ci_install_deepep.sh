@@ -66,6 +66,7 @@ fi
 
 cd ${DEEPEP_DIR}
 if [ "$GRACE_BLACKWELL" = "1" ]; then
+    # Current GB200: Driver 580.82.07, Cuda 13.0
     CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}')
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
