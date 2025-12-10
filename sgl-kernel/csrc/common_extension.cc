@@ -424,7 +424,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
   m.impl("store_kv_cache", &store_kv_cache);
-
+  m.def("allocate_decode(Tensor seq_lens, Tensor k_cache, Tensor free_page, Tensor! out_loc, int page_size) -> ()");
+  m.impl("allocate_decode", &allocate_decode);
+  m.def("allocate_extend(Tensor pre_lens, Tensor seq_lens, Tensor last_loc, Tensor free_page, Tensor! out_loc, int page_size) -> ()");
+  m.impl("allocate_extend", &allocate_extend);
   /*
    * From FlashInfer
    */
