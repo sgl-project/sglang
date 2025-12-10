@@ -428,10 +428,8 @@ void _da8w4_linear_impl(
     int64_t N,
     int64_t K,
     int64_t num_groups) {
-  // weight + compensation shape = [Nc, Kc, BLOCK_N * BLOCK_K / 2 + BLOCK_N*sizeof(int32_t)]
+  // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, BLOCK_N]
-  int64_t Kc = K / BLOCK_K;
-  int64_t Nc = N / BLOCK_N;
   const bool use_brgemm = can_use_brgemm<int8_t>(M);
   int64_t block_m = [&]() -> long {
     if (M <= 48) {
@@ -446,14 +444,17 @@ void _da8w4_linear_impl(
   }();
   int64_t Mc = div_up(M, block_m);
   bool parallel_on_M = M > 128;
+  int64_t Nc = N / BLOCK_N;
   int64_t num_blocks = parallel_on_M ? Mc * Nc : Nc;
   int64_t group_size = div_up(K, num_groups);
-  int64_t block_per_group = group_size / BLOCK_K;
+  int64_t _block_k = get_4bit_block_k_size(group_size);
+  int64_t Kc = K / _block_k;
+  int64_t block_per_group = group_size / _block_k;
 
   at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
     int tid = get_thread_num();
     float* C_tmp = output_temp + tid * block_m * BLOCK_N;
-    int8_t* dqB_tmp = dequant_weight_temp + tid * BLOCK_K * BLOCK_N;
+    int8_t* dqB_tmp = dequant_weight_temp + tid * _block_k * BLOCK_N;
     for (const auto i : c10::irange(begin, end)) {
       int64_t mc = parallel_on_M ? i / Nc : 0;
       int64_t nc = parallel_on_M ? i % Nc : i;
@@ -466,21 +467,22 @@ void _da8w4_linear_impl(
         copy_bias<BLOCK_N>(bias_data, C_tmp, m_size);
         for (int kci = 0; kci < Kc; ++kci) {
           int32_t* compensation_ptr =
-              sym_quant_act ? nullptr
-                            : (int32_t*)(void*)(weight + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))) +
-                                                BLOCK_K * BLOCK_N / 2) /*Bcomp*/;
+              sym_quant_act
+                  ? nullptr
+                  : (int32_t*)(void*)(weight + (nc * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))) +
+                                      _block_k * BLOCK_N / 2) /*Bcomp*/;
           _dequant_gemm_accum<BLOCK_N, BLOCK_N / 2, sym_quant_act>(
               /*C*/ C_tmp,
-              /*A*/ (uint8_t*)input + mci * block_m * K + kci * BLOCK_K,
+              /*A*/ (uint8_t*)input + mci * block_m * K + kci * _block_k,
               /*scales_a*/ input_scales + mci * block_m,
               /*qzeros_a*/ input_qzeros + mci * block_m,
-              /*B*/ weight + (nc * Kc + kci) * (BLOCK_N * (BLOCK_K / 2 + sizeof(int32_t))),
+              /*B*/ weight + (nc * Kc + kci) * (BLOCK_N * (_block_k / 2 + sizeof(int32_t))),
               /*scales_b*/ weight_scales + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
               /*qzeros_b*/ weight_qzeros + nc * BLOCK_N * num_groups + kci / block_per_group * BLOCK_N,
               /*Bcomp*/ compensation_ptr,
               /*dqB_tmp*/ dqB_tmp,
               /*M*/ m_size,
-              /*K*/ BLOCK_K,
+              /*K*/ _block_k,
               /*lda*/ K,
               /*ldc*/ BLOCK_N,
               /*use_brgemm*/ use_brgemm);
@@ -518,30 +520,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
     new_qzeros.unsqueeze_(1);
   }
   new_qzeros = new_qzeros.to(at::kChar);
-  int N = weight.size(0);
-  int K = weight.size(1);
-  int G = scales.size(1);
-  int group_size = K / G;
-  int block_k = group_size > 128 ? 128 : group_size;
+  int64_t N = weight.size(0);
+  int64_t K = weight.size(1);
+  int64_t G = scales.size(1);
+  int64_t group_size = K / G;
+  int64_t _block_k = get_4bit_block_k_size(group_size);
   constexpr int block_n = block_size_n();
-  int Nc = N / block_n;
-  int Kc = K / block_k;
+  int64_t Nc = N / block_n;
+  int64_t Kc = K / _block_k;
 
-  // Reorder weight to [N/block_n, K/block_k, block_k, block_n]
+  // Reorder weight to [N/block_n, K/_block_k, _block_k, block_n]
   // Reorder scales/qzeros to [N/block_n, G, block_n]
-  // weight + compensation shape = [Nc, Kc, block_n * block_k / 2 + block_n*sizeof(int32_t)]
+  // weight + compensation shape = [Nc, Kc, block_n * _block_k / 2 + block_n*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, block_n]
-  auto weight_view = weight.view({Nc, block_n, Kc, block_k});
+  auto weight_view = weight.view({Nc, block_n, Kc, _block_k});
   at::Tensor weight_reordered = weight_view.permute({0, 2, 3, 1}).contiguous();
   at::Tensor blocked_weight;
   at::Tensor blocked_scales = new_scales.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
   at::Tensor blocked_qzeros = new_qzeros.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
   // Compensation = Σ(k)(W[k][n] - ZP[n]) for each block.
   auto weight_sub_qzero = weight.view({Nc, block_n, G, -1}).to(at::kInt) - new_qzeros.view({Nc, block_n, G, -1});
-  weight_sub_qzero = weight_sub_qzero.view({Nc, block_n, Kc, block_k});
+  weight_sub_qzero = weight_sub_qzero.view({Nc, block_n, Kc, _block_k});
   at::Tensor compensation = weight_sub_qzero.sum(-1);
   compensation = compensation.permute({0, 2, 1}).contiguous().to(at::kInt);
-  int64_t buffer_size_nbytes = block_k * block_n / 2 + block_n * sizeof(int32_t);
+  int64_t buffer_size_nbytes = _block_k * block_n / 2 + block_n * sizeof(int32_t);
   blocked_weight = at::empty({Nc, Kc, buffer_size_nbytes}, weight.options());
 
   auto weight_ptr = weight_reordered.data_ptr<uint8_t>();
@@ -550,21 +552,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
   int64_t num_blocks = Nc * Kc;
   at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
     for (const auto i : c10::irange(begin, end)) {
-      auto in_ptr = weight_ptr + i * block_k * block_n;
-      auto out_ptr = blocked_weight_ptr + i * block_n * (block_k / 2 + sizeof(int32_t));
+      auto in_ptr = weight_ptr + i * _block_k * block_n;
+      auto out_ptr = blocked_weight_ptr + i * block_n * (_block_k / 2 + sizeof(int32_t));
       int32_t* comp_in_prt = compensation_ptr + i * block_n;
-      int32_t* comp_out_prt =
-          (int32_t*)(void*)(blocked_weight_ptr + i * block_n * (block_k / 2 + sizeof(int32_t)) + block_k * block_n / 2);
+      int32_t* comp_out_prt = (int32_t*)(void*)(blocked_weight_ptr + i * block_n * (_block_k / 2 + sizeof(int32_t)) +
+                                                _block_k * block_n / 2);
       // Reorder weight block to VNNI4 and pack two lanes along N
       // N=16 viewed as two lanes: a0, ...a7, b0, ...b7
       // pack two lanes: [a0, b0], ..., [a7, b7]
-      // plain shape = [block_k, block_n]
-      // packed shape = [block_k / 4, block_n / 2, 4] viewed as [block_k, block_n / 2]
+      // plain shape = [_block_k, block_n]
+      // packed shape = [_block_k / 4, block_n / 2, 4] viewed as [_block_k, block_n / 2]
       constexpr int n_group_size = 8;
       constexpr int vnni_size = 4;
       constexpr int n_group = block_n / n_group_size;  // 4
       for (int nb = 0; nb < n_group; nb += 2) {
-        for (int k = 0; k < block_k; k += vnni_size) {
+        for (int k = 0; k < _block_k; k += vnni_size) {
           for (int ni = 0; ni < n_group_size; ++ni) {
             for (int ki = 0; ki < vnni_size; ++ki) {
               int src_idx_1 = nb * n_group_size + ni + (k + ki) * block_n;
@@ -620,15 +622,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
   _qzeros = _qzeros.transpose(-2, -1).contiguous();  // .T
   _scales = _scales.transpose(-2, -1).contiguous();
   if (_qweight.dim() == 3) {  // Dim=3 for MOE packing, TODO: refine a unified loop
-    int E = _qweight.size(0);
-    int K = _qweight.size(2);
-    int G = _scales.size(2);
-    int group_size = K / G;
-    int block_k = group_size > 128 ? 128 : group_size;
-    int block_n = block_size_n();
-    int Nc = _qweight.size(1) / block_n;
-    int Kc = K / block_k;
-    int64_t buffer_size_nbytes = block_k * block_n / 2 + block_n * sizeof(int32_t);
+    int64_t E = _qweight.size(0);
+    int64_t K = _qweight.size(2);
+    int64_t G = _scales.size(2);
+    int64_t group_size = K / G;
+    int64_t _block_k = get_4bit_block_k_size(group_size);
+    int64_t block_n = block_size_n();
+    int64_t Nc = _qweight.size(1) / block_n;
+    int64_t Kc = K / _block_k;
+    int64_t buffer_size_nbytes = _block_k * block_n / 2 + block_n * sizeof(int32_t);
     auto blocked_weight = at::empty({E, Nc, Kc, buffer_size_nbytes}, _qweight.options());
     auto blocked_scales = at::empty({E, Nc, G, block_n}, _scales.options()).to(at::kFloat);
     auto blocked_qzeros = at::empty({E, Nc, G, block_n}, _qzeros.options()).to(at::kChar);
@@ -684,12 +686,12 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   int64_t N = weight_scales.size(0) * weight_scales.size(-1);
   out_sizes.back() = N;
   auto output = at::empty(out_sizes, input.options());
-  // weight + compensation shape = [Nc, Kc, BLOCK_N * BLOCK_K / 2 + BLOCK_N*sizeof(int32_t)]
+  // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, BLOCK_N]
   int64_t Nc = weight.size(0);
   int64_t Kc = weight.size(1);
+  int64_t _block_k = K_a / Kc;
   TORCH_CHECK(N == Nc * BLOCK_N, "DA8W4: weight and input shapes mismatch");
-  TORCH_CHECK(K_a == Kc * BLOCK_K, "DA8W4: weight and input shapes mismatch");
   // scales/qzeros shape = [Nc, G, BLOCK_N]
   int64_t num_groups = weight_scales.size(1);
 
@@ -699,7 +701,7 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
   int num_threads = at::get_num_threads();
   int64_t temp_buffer_size = /* output temp */ num_threads * BLOCK_M * BLOCK_N * sizeof(float) +
-                             /*  weight dequant temp */ num_threads * BLOCK_K * BLOCK_N;
+                             /*  weight dequant temp */ num_threads * _block_k * BLOCK_N;
   auto c_temp_buffer = at::empty({temp_buffer_size}, input.options().dtype(at::kChar));
   float* c_temp_ptr = (float*)((void*)(c_temp_buffer.data_ptr<int8_t>()));
   int8_t* dqB_temp_ptr = (int8_t*)((void*)(c_temp_ptr + num_threads * BLOCK_M * BLOCK_N));

@@ -66,6 +66,10 @@ constexpr bool operator==(int64_t a, CPUQuantMethod b) {
   return a == static_cast<int64_t>(b);
 }
 
+inline int64_t get_4bit_block_k_size(int64_t group_size) {
+  return group_size > 128 ? 128 : group_size;
+}
+
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
