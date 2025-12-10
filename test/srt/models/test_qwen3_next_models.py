@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kl_test_utils import (
@@ -17,6 +19,19 @@ from sglang.test.test_utils import (
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 ACC_THRESHOLDS = {QWEN3_NEXT_MODEL: {"kl_div": 0.01, "gsm8k": 0.93}}
+
+
+def send_request_helper(base_url: str, text: str):
+    response = requests.post(
+        base_url + "/generate",
+        json={
+            "text": text,
+            "sampling_params": {
+                "max_new_tokens": 1,
+            },
+        },
+    )
+    return response.json()
 
 
 class TestQwen3Next(CustomTestCase):
@@ -73,6 +88,27 @@ class TestQwen3Next(CustomTestCase):
             max_samples=16,
             max_new_tokens=256,
         )
+
+    def test_prefix_cache_branching(self):
+        print("running test_prefix_cache_branching")
+        requests.get(self.base_url + "/flush_cache")
+        branching_pos = 256
+        text_prefix = "hi" * branching_pos
+        suffix_list = ["this" * 256, "here" * 256, "that" * 256]
+        cache_hit_list = [False, False, True]
+
+        # First request only prefill the entire sequence
+        # Second request won't have cache hit, but will cache the branching point
+        # Third request will have cache hit on the branching point
+        for i, (suffix, cache_hit) in enumerate(
+            zip(suffix_list, cache_hit_list, strict=True)
+        ):
+            result = send_request_helper(self.base_url, text_prefix + suffix)
+            cached_tokens = result["meta_info"]["cached_tokens"]
+            assert cached_tokens == (
+                branching_pos if cache_hit else 0
+            ), f"{i=}, {cache_hit=}, {cached_tokens=} is not equal to {branching_pos if cache_hit else 0}"
+        print("test_prefix_cache_branching passed")
 
 
 class TestQwen3NextMTP(CustomTestCase):
