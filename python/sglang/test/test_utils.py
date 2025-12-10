@@ -768,6 +768,7 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
+        return_routed_experts=False,
         seed=seed,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
