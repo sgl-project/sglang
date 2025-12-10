@@ -1892,7 +1892,7 @@ class ServerArgs:
                 )
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
-                self.disaggrgite
+                self.disaggregation_decode_tp = self.tp_size
             if self.disaggregation_decode_dp is None:
                 self.disaggregation_decode_dp = self.dp_size
 
