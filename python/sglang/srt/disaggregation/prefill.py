@@ -24,7 +24,9 @@ import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
+import os
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
@@ -33,6 +35,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
+    NVSHMEM_PWRITE_MODE,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
@@ -136,6 +139,12 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.nvshmem_enabled = getattr(self.token_to_kv_pool, "uses_nvshmem", False)
+        kv_args.nvshmem_buffers = (
+            self.token_to_kv_pool.get_all_buffers()
+            if kv_args.nvshmem_enabled
+            else []
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -143,6 +152,14 @@ class PrefillBootstrapQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        kv_args.aux_nvshmem_enabled = getattr(
+            self.metadata_buffers, "uses_nvshmem", False
+        )
+        if kv_args.aux_nvshmem_enabled:
+            # Only expose the status tensor to NVSHMEM transfers to keep aux lean.
+            kv_args.aux_nvshmem_buffers = [self.metadata_buffers.transfer_status]
+        else:
+            kv_args.aux_nvshmem_buffers = []
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
@@ -177,7 +194,36 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        self._maybe_use_decode_peer_views(kv_manager)
         return kv_manager
+
+    def _maybe_use_decode_peer_views(self, kv_manager: BaseKVManager) -> None:
+        if not NVSHMEM_PWRITE_MODE:
+            return
+        peer_views = getattr(kv_manager, "peer_kv_views", None)
+        if not peer_views:
+            return
+        if not getattr(self.token_to_kv_pool, "uses_nvshmem", False):
+            return
+        num_layers = len(self.token_to_kv_pool.k_buffer)
+        if len(peer_views) < num_layers * 2:
+            logger.warning(
+                "NVSHMEM pwrite peer view count mismatch: expected %s, got %s",
+                num_layers * 2,
+                len(peer_views),
+            )
+            return
+        # Preserve local buffers in case we need to fall back.
+        self.token_to_kv_pool.local_k_buffer = self.token_to_kv_pool.k_buffer
+        self.token_to_kv_pool.local_v_buffer = self.token_to_kv_pool.v_buffer
+        # Replace with decode peer views so writes go directly to decode memory.
+        self.token_to_kv_pool.k_buffer = peer_views[:num_layers]
+        self.token_to_kv_pool.v_buffer = peer_views[num_layers : num_layers * 2]
+        if os.getenv("SGLANG_PWRITE_DEBUG", "0").lower() in ("1", "true"):
+            logger.info(
+                "NVSHMEM pwrite: using decode peer buffers for %s layers.",
+                num_layers,
+            )
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if self._check_if_req_exceed_kv_capacity(req):
@@ -277,12 +323,15 @@ class PrefillBootstrapQueue:
             # KV.WaitingForInput - init here
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                logger.warning(f"Request {req.rid} (room {req.bootstrap_room}) failed to allocate metadata buffer.")
                 break
 
             req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert req.metadata_buffer_index is not None
+            #if hasattr(self.metadata_buffers, "reset_transfer_status"):
+            #    self.metadata_buffers.reset_transfer_status(req.metadata_buffer_index)
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
@@ -652,11 +701,6 @@ class SchedulerDisaggregationPrefillMixin:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
@@ -702,7 +746,17 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
-
+        if NVSHMEM_PWRITE_MODE:
+            chunk_tokens = max(0, end_idx - start_idx)
+            chunk_pages = kv_to_page_num(chunk_tokens, page_size)
+            dummy_pages = np.empty((0,), dtype=np.int32)
+            req.disagg_kv_sender.send(dummy_pages, state_indices)
+            return
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
+            .cpu()
+            .numpy()
+        )
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(

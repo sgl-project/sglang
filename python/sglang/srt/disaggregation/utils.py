@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import os
 import random
+import logging
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Type
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -16,10 +25,15 @@ from sglang.srt.utils import is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+logger = logging.getLogger(__name__)
 #########################
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+NVSHMEM_PWRITE_MODE = os.getenv("SGLANG_NVSHMEM_PWRITE_MODE", "0").lower() in (
+    "1",
+    "true",
+)
 
 
 class DisaggregationMode(Enum):
@@ -36,6 +50,22 @@ class DisaggregationMode(Enum):
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
+_POLL_LOCAL_FIRST = os.getenv("SGLANG_DISAGG_LOCAL_POLL", "0").lower() in (
+    "1",
+    "true",
+)
+_POLL_LOCAL_CYCLES = max(1, int(os.getenv("SGLANG_DISAGG_LOCAL_POLL_CYCLES", "1")))
+_POLL_LOCAL_STATE = {"counter": 0}
+
+
+def _should_sync_collective() -> bool:
+    if not _POLL_LOCAL_FIRST:
+        return True
+    counter = (_POLL_LOCAL_STATE["counter"] + 1) % _POLL_LOCAL_CYCLES
+    _POLL_LOCAL_STATE["counter"] = counter
+    return counter == 0
+
+
 def poll_and_all_reduce(pollers, gloo_group):
     # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
@@ -47,9 +77,20 @@ def poll_and_all_reduce(pollers, gloo_group):
         ]
     else:
         polls = [int(poller.poll()) for poller in pollers]
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    if _should_sync_collective():
+        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+
+        #import time
+
+        #start_time = time.perf_counter()
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+        #duration = (time.perf_counter() - start_time) * 1000
+        #if duration > 0.5:
+        #    logger.warning(f"Slow poll_and_all_reduce: {duration:.2f} ms")
+        return tensor_to_reduce.tolist()
+
+    # Local-fast path: return per-rank polls without a collective to avoid blocking TTFT.
+    return polls
 
 
 #########################
@@ -88,15 +129,47 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        device: Optional[str] = None,
+        nvshmem_tensor_factory: Optional[
+            Callable[[Tuple[int, ...], torch.dtype], torch.Tensor]
+        ] = None,
+        require_nvshmem: bool = False,
+        nvshmem_use_peer_view: bool = False,
     ):
         self.custom_mem_pool = custom_mem_pool
-        device = "cpu"
+        self.nvshmem_tensor_factory = nvshmem_tensor_factory
+        self.require_nvshmem = require_nvshmem
+        self.uses_nvshmem = nvshmem_tensor_factory is not None
+        self.nvshmem_use_peer_view = nvshmem_use_peer_view
+        device = device or "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
+        elif self.uses_nvshmem:
+            device = "cuda"
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
+        self.device = device
+
+        def _alloc(shape: Tuple[int, ...], tensor_dtype: torch.dtype, peer_view: bool = False):
+            if self.uses_nvshmem and self.nvshmem_tensor_factory is not None:
+                try:
+                    tensor = self.nvshmem_tensor_factory(shape, tensor_dtype)
+                    if peer_view and self.nvshmem_use_peer_view:
+                        return self._peer_view(tensor)
+                    return tensor
+                except Exception as exc:  # pragma: no cover
+                    if self.require_nvshmem:
+                        raise
+                    logger.warning(
+                        "NVSHMEM metadata allocation failed (%s); falling back to %s tensors.",
+                        exc,
+                        device,
+                    )
+                    self.uses_nvshmem = False
+            return torch.zeros(shape, dtype=tensor_dtype, device=device)
+
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -106,21 +179,18 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            self.output_ids = _alloc((size, 16), torch.int32, peer_view=True)
+
             self.cached_tokens = torch.zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
-            self.output_token_logprobs_val = torch.zeros(
-                (size, 16), dtype=torch.float32, device=device
+            self.output_token_logprobs_val = _alloc((size, 16), torch.float32, peer_view=True)
+            self.output_token_logprobs_idx = _alloc((size, 16), torch.int32, peer_view=True)
+            self.output_top_logprobs_val = _alloc(
+                (size, max_top_logprobs_num), torch.float32, peer_view=True
             )
-            self.output_token_logprobs_idx = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
-            )
-            self.output_top_logprobs_val = torch.zeros(
-                (size, max_top_logprobs_num), dtype=torch.float32, device=device
-            )
-            self.output_top_logprobs_idx = torch.zeros(
-                (size, max_top_logprobs_num), dtype=torch.int32, device=device
+            self.output_top_logprobs_idx = _alloc(
+                (size, max_top_logprobs_num), torch.int32, peer_view=True
             )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
@@ -129,9 +199,8 @@ class MetadataBuffers:
             self.output_topk_index = torch.zeros(
                 (size, 16), dtype=torch.int64, device=device
             )
-            self.output_hidden_states = torch.zeros(
-                (size, hidden_size), dtype=hidden_states_dtype, device=device
-            )
+            self.output_hidden_states = _alloc((size, hidden_size), hidden_states_dtype)
+            self.transfer_status = _alloc((size,), torch.int32)
 
     def get_buf_infos(self):
         ptrs = [
@@ -183,31 +252,60 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
+        if self.uses_nvshmem:
+            self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+            self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
+            if req.return_logprob:
+                if req.output_token_logprobs_val:  # not none or empty list
+                    self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
+                        req.output_token_logprobs_val[0]
+                    )
+                if req.output_token_logprobs_idx:  # not none or empty list
+                    self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
+                        req.output_token_logprobs_idx[0]
+                    )
 
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
-        self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
-        if req.return_logprob:
-            if req.output_token_logprobs_val:  # not none or empty list
-                self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_val[0]
-                )
-            if req.output_token_logprobs_idx:  # not none or empty list
-                self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_idx[0]
-                )
+                if req.output_top_logprobs_val:  # not none or empty list
+                    self.output_top_logprobs_val[req.metadata_buffer_index][
+                        : len(req.output_top_logprobs_val[0])
+                    ] = torch.tensor(
+                        req.output_top_logprobs_val[0],
+                        dtype=torch.float32,
+                        device=self.output_top_logprobs_val.device,
+                    )
+                if req.output_top_logprobs_idx:  # not none or empty list
+                    self.output_top_logprobs_idx[req.metadata_buffer_index][
+                        : len(req.output_top_logprobs_idx[0])
+                    ] = torch.tensor(
+                        req.output_top_logprobs_idx[0],
+                        dtype=torch.int32,
+                        device=self.output_top_logprobs_idx.device,
+                    )
+        else:
+            self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+            self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
+            if req.return_logprob:
+                if req.output_token_logprobs_val:  # not none or empty list
+                    self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
+                        req.output_token_logprobs_val[0]
+                    )
+                if req.output_token_logprobs_idx:  # not none or empty list
+                    self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
+                        req.output_token_logprobs_idx[0]
+                    )
 
-            if req.output_top_logprobs_val:  # not none or empty list
-                self.output_top_logprobs_val[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_val[0])
-                ] = torch.tensor(
-                    req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
-                )
-            if req.output_top_logprobs_idx:  # not none or empty list
-                self.output_top_logprobs_idx[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_idx[0])
-                ] = torch.tensor(
-                    req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
-                )
+                if req.output_top_logprobs_val:  # not none or empty list
+                    self.output_top_logprobs_val[req.metadata_buffer_index][
+                        : len(req.output_top_logprobs_val[0])
+                    ] = torch.tensor(
+                        req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
+                    )
+                if req.output_top_logprobs_idx:  # not none or empty list
+                    self.output_top_logprobs_idx[req.metadata_buffer_index][
+                        : len(req.output_top_logprobs_idx[0])
+                    ] = torch.tensor(
+                        req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
+                    )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
@@ -223,6 +321,43 @@ class MetadataBuffers:
                 req.hidden_states_tensor
             )
 
+    def mark_transfer_done(self, idx: int):
+        if hasattr(self, "transfer_status"):
+            self.transfer_status[idx] = 1
+
+    def reset_transfer_status(self, idx: int):
+        if hasattr(self, "transfer_status"):
+            self.transfer_status[idx] = 0
+
+    def _peer_view(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return a view on the peer rank when NVSHMEM is active, else local tensor."""
+
+        if not self.uses_nvshmem:
+            return tensor
+        try:
+            from sglang.srt.disaggregation.nvshmem import nvshmem_utils
+
+            peer_fn = nvshmem_utils.get_peer_tensor_fn()
+            peer_rank = nvshmem_utils.get_peer_rank()
+            if peer_fn is not None and peer_rank is not None:
+                return peer_fn(tensor, peer_rank)
+        except Exception:
+            pass
+        return tensor
+
+    def get_all_tensors(self) -> List[torch.Tensor]:
+        tensors = [
+            self.output_ids,
+            self.output_token_logprobs_val,
+            self.output_token_logprobs_idx,
+            self.output_top_logprobs_val,
+            self.output_top_logprobs_idx,
+            self.output_hidden_states,
+        ]
+        if hasattr(self, "transfer_status"):
+            tensors.append(self.transfer_status)
+        return tensors
+
 
 #########################
 # Transfer Backend
@@ -232,6 +367,7 @@ class MetadataBuffers:
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
+    NVSHMEM = "nvshmem"
     ASCEND = "ascend"
     FAKE = "fake"
 
@@ -298,6 +434,23 @@ def get_kv_class(
             KVClassType.SENDER: NixlKVSender,
             KVClassType.RECEIVER: (NixlKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.NVSHMEM:
+        from sglang.srt.disaggregation.nvshmem.conn import (
+            NVSHMEMKVArgs,
+            NVSHMEMKVBootstrapServer,
+            NVSHMEMKVManager,
+            NVSHMEMKVReceiver,
+            NVSHMEMKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: NVSHMEMKVArgs,
+            KVClassType.MANAGER: NVSHMEMKVManager,
+            KVClassType.SENDER: NVSHMEMKVSender,
+            KVClassType.RECEIVER: (NVSHMEMKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: NVSHMEMKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:

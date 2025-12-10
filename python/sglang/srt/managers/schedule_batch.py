@@ -39,6 +39,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import os
 import re
 import time
 from enum import Enum, auto
@@ -97,7 +98,6 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 logger = logging.getLogger(__name__)
-
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
@@ -1337,6 +1337,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
             self
         )
+
 
         # Set fields
         input_embeds = []

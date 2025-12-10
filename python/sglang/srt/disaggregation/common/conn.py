@@ -470,6 +470,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
         ] = {}
+        self.nvshmem_uid: Optional[str] = None
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
@@ -481,6 +482,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_get("/health", self._handle_health_check)
+        self.app.router.add_route("*", "/nvshmem_uid", self._handle_nvshmem_uid)
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
@@ -491,6 +493,20 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             return await self._handle_route_put(request)
         elif method == "GET":
             return await self._handle_route_get(request)
+        else:
+            return web.Response(
+                text="Method not allowed", status=405, content_type="application/json"
+            )
+
+    async def _handle_nvshmem_uid(self, request: web.Request):
+        if request.method == "PUT":
+            data = await request.json()
+            self.nvshmem_uid = data.get("uid")
+            return web.Response(text="OK", status=200)
+        elif request.method == "GET":
+            if self.nvshmem_uid is None:
+                return web.Response(text="NVSHMEM UID not set", status=404)
+            return web.json_response({"uid": self.nvshmem_uid}, status=200)
         else:
             return web.Response(
                 text="Method not allowed", status=405, content_type="application/json"
@@ -519,7 +535,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.pp_size is None:
             self.pp_size = pp_size
 
-        if role == "Prefill":
+        if role == "NVSHMEM_UID":
+            self.nvshmem_uid = data.get("uid")
+            return web.Response(text="OK", status=200)
+        elif role == "Prefill":
             if system_dp_size == 1:
                 dp_group = attn_dp_rank
             else:
@@ -561,6 +580,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "prefill_pp_size": self.pp_size,
             }
             return web.json_response(prefill_parallel_info, status=200)
+        if int(engine_rank) == -2 and int(target_dp_group) == -2:
+            if self.nvshmem_uid is None:
+                return web.Response(text="NVSHMEM UID not set", status=404)
+            return web.json_response({"uid": self.nvshmem_uid}, status=200)
 
         # Find corresponding prefill info
         async with self.lock:

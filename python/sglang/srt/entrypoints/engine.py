@@ -717,6 +717,13 @@ def _set_envs_and_config(server_args: ServerArgs):
         f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
     )
 
+    if (
+        server_args.disaggregation_transfer_backend.lower() == "nvshmem"
+        and server_args.disaggregation_mode in {"prefill", "decode"}
+    ):
+        # Always align the runtime bootstrap address/role with the CLI arguments.
+        os.environ["SGLANG_NVSHMEM_ROLE"] = server_args.disaggregation_mode.lower()
+
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()

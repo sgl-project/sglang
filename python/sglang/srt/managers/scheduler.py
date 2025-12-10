@@ -815,6 +815,10 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        # Use a unified metadata buffer size across prefill and decode so NVSHMEM
+        # symmetric allocations stay aligned.
+        metadata_buffer_size = self.max_running_requests * 2
+
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
@@ -826,11 +830,25 @@ class Scheduler(
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
+        ):
+            buffer_size = metadata_buffer_size
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
+            nvshmem_tensor_factory = None
+            if self.transfer_backend == TransferBackend.NVSHMEM:
+                try:
+                    from sglang.srt.disaggregation.nvshmem import nvshmem_utils
+
+                    nvshmem_tensor_factory = nvshmem_utils.tensor_factory(self.device)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"NVSHMEM backend requires NVSHMEM tensor factory for metadata buffers: {exc}"
+                    )
+                if nvshmem_tensor_factory is None:
+                    raise RuntimeError(
+                        "NVSHMEM backend requires NVSHMEM tensor factory for metadata buffers."
+                    )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
@@ -844,6 +862,13 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                device=self.device,
+                nvshmem_tensor_factory=nvshmem_tensor_factory,
+                require_nvshmem=self.transfer_backend == TransferBackend.NVSHMEM,
+                nvshmem_use_peer_view=(
+                    self.transfer_backend == TransferBackend.NVSHMEM
+                    and self.disaggregation_mode == DisaggregationMode.PREFILL
+                ),
             )
 
             # The decode requests polling kv cache
@@ -879,11 +904,24 @@ class Scheduler(
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
+            buffer_size = metadata_buffer_size
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
+            nvshmem_tensor_factory = None
+            if self.transfer_backend == TransferBackend.NVSHMEM:
+                try:
+                    from sglang.srt.disaggregation.nvshmem import nvshmem_utils
+
+                    nvshmem_tensor_factory = nvshmem_utils.tensor_factory(self.device)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"NVSHMEM backend requires NVSHMEM tensor factory for metadata buffers: {exc}"
+                    )
+                if nvshmem_tensor_factory is None:
+                    raise RuntimeError(
+                        "NVSHMEM backend requires NVSHMEM tensor factory for metadata buffers."
+                    )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
@@ -897,6 +935,13 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                device=self.device,
+                nvshmem_tensor_factory=nvshmem_tensor_factory,
+                require_nvshmem=self.transfer_backend == TransferBackend.NVSHMEM,
+                nvshmem_use_peer_view=(
+                    self.transfer_backend == TransferBackend.NVSHMEM
+                    and self.disaggregation_mode == DisaggregationMode.PREFILL
+                ),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

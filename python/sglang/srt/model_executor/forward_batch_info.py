@@ -397,6 +397,7 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
         )
+
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:

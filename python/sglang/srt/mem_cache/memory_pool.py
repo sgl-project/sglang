@@ -50,7 +50,11 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+try:
+    from sglang.srt.disaggregation.nvshmem import nvshmem_utils as disagg_nv_utils
+except Exception:  # pragma: no cover - optional dependency
+    disagg_nv_utils = None  # type: ignore
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -551,6 +555,7 @@ class MHATokenToKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
 
+        self.uses_nvshmem = False
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -609,6 +614,18 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        nvshmem_tensor_factory = None
+        if get_bool_env_var("SGLANG_ENABLE_NVSHMEM_KV", "false"):
+            if disagg_nv_utils is not None:
+                nvshmem_tensor_factory = disagg_nv_utils.tensor_factory(self.device)
+                if nvshmem_tensor_factory is not None:
+                    self.uses_nvshmem = True
+            if nvshmem_tensor_factory is None:
+                logger.warning(
+                    "SGLANG_ENABLE_NVSHMEM_KV is set but NVSHMEM tensor factory "
+                    "is unavailable; falling back to regular CUDA tensors."
+                )
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -617,22 +634,23 @@ class MHATokenToKVPool(KVCache):
             ):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                shape = (self.size + self.page_size, self.head_num, self.head_dim)
+
+                def _alloc() -> torch.Tensor:
+                    if self.uses_nvshmem and nvshmem_tensor_factory is not None:
+                        try:
+                            return nvshmem_tensor_factory(shape, self.store_dtype)
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning(
+                                "NVSHMEM tensor allocation failed (%s); "
+                                "falling back to CUDA tensors.",
+                                exc,
+                            )
+                            self.uses_nvshmem = False
+                    return torch.zeros(shape, dtype=self.store_dtype, device=self.device)
+
+                self.k_buffer = [_alloc() for _ in range(self.layer_num)]
+                self.v_buffer = [_alloc() for _ in range(self.layer_num)]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -656,6 +674,9 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+
+    def get_all_buffers(self) -> List[torch.Tensor]:
+        return list(self.k_buffer) + list(self.v_buffer)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")

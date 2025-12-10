@@ -63,6 +63,10 @@ from sglang.srt.distributed import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+try:
+    from sglang.srt.disaggregation.nvshmem import nvshmem_utils as disagg_nv_utils
+except Exception:  # pragma: no cover - optional dependency
+    disagg_nv_utils = None  # type: ignore
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -324,6 +328,7 @@ class ModelRunner:
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+        self._maybe_init_nvshmem()
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -400,6 +405,28 @@ class ModelRunner:
                 local_rank=self.gpu_id,
                 server_args=self.server_args,
                 port=self.dist_port,
+            )
+
+    def _maybe_init_nvshmem(self):
+        """Initialize NVSHMEM runtime when KV cache sharing is enabled."""
+        if not get_bool_env_var("SGLANG_ENABLE_NVSHMEM_KV", "false") or self.device != "cuda":
+            return
+        if self.server_args.disaggregation_mode == 'prefill': 
+            rank = int(self.tp_rank)
+            tp_size_value = int(self.tp_size)
+            nranks = max(2, tp_size_value * 2)
+            local_rank = int(self.gpu_id)
+            peer_rank = (tp_size_value + rank) % nranks
+        else:
+            tp_size_value = int(self.tp_size)
+            nranks = max(2, tp_size_value * 2)
+            rank = int(self.tp_rank)+tp_size_value
+            local_rank = int(self.gpu_id)
+            peer_rank = (tp_size_value + rank) % nranks
+
+        if not disagg_nv_utils.init_nvshmem(rank=rank, nranks=nranks, local_rank=local_rank, peer_rank=peer_rank):
+            raise RuntimeError(
+                f"Failed to initialize NVSHMEM runtime for TP rank {self.tp_rank}."
             )
 
     def initialize(self, min_per_gpu_memory: float):

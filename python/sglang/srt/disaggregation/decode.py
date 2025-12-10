@@ -257,9 +257,25 @@ class DecodePreallocQueue:
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
 
+        kv_args.nvshmem_enabled = getattr(self.token_to_kv_pool, "uses_nvshmem", False)
+        kv_args.nvshmem_buffers = (
+            self.token_to_kv_pool.get_all_buffers()
+            if kv_args.nvshmem_enabled
+            else []
+        )
+
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+
+        kv_args.aux_nvshmem_enabled = getattr(
+            self.metadata_buffers, "uses_nvshmem", False
+        )
+        if kv_args.aux_nvshmem_enabled:
+            # Only expose the status tensor to NVSHMEM transfers to keep aux lean.
+            kv_args.aux_nvshmem_buffers = [self.metadata_buffers.transfer_status]
+        else:
+            kv_args.aux_nvshmem_buffers = []
 
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
