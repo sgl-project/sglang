@@ -85,8 +85,7 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",
-  # this is temporary
-  "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
+  "diffusers==0.36.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
@@ -105,6 +104,7 @@ vsa = ["torch", "setuptools"]
 
 test = [
   "accelerate",
+  "bitsandbytes",
   "expecttest",
   "jsonlines",
   "matplotlib",

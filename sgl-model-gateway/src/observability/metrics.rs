@@ -263,6 +263,11 @@ pub fn init_metrics() {
         "sgl_tokenizer_factory_load_duration_seconds",
         "Time to load and initialize tokenizer"
     );
+
+    describe_counter!(
+        "sgl_router_http_responses_total",
+        "Total number of HTTP responses by status code"
+    );
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -562,6 +567,13 @@ impl RouterMetrics {
 
     pub fn record_job_shutdown_rejected() {
         counter!("sgl_router_job_shutdown_rejected_total").increment(1);
+    }
+
+    pub fn record_http_status_code(status_code: u16) {
+        counter!("sgl_router_http_responses_total",
+            "status_code" => status_code.to_string()
+        )
+        .increment(1);
     }
 }
 
