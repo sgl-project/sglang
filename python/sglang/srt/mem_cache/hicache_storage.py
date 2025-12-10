@@ -589,6 +589,7 @@ class HiCacheFile(HiCacheStorage):
         """True batch set: merge multiple tensors into one file and use batch I/O.
         Reference implementation from mooncake_store to avoid contiguous() calls.
         Uses get_page_buffer_meta() to get memory pointers directly for zero-copy operations.
+        Completely avoids get_data_page() by using pointer-based writes.
         """
         if not keys or len(host_indices) == 0:
             return []
@@ -598,9 +599,12 @@ class HiCacheFile(HiCacheStorage):
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
 
         page_num = len(keys)
-        page_size = self.mem_pool_host.page_size
 
-        # Stage 1: Preprocess (check existence, prepare write operations)
+        # Stage 1: Preprocess to get buffer metadata (pointers and sizes)
+        # This uses get_page_buffer_meta() internally, avoiding get_data_page()
+        ptr_list, element_size_list = self._batch_preprocess(keys, host_indices)
+
+        # Stage 2: Check existence and prepare write operations
         exist_results = self._batch_exist(keys)
         write_keys = []
         write_indices = []
@@ -627,26 +631,35 @@ class HiCacheFile(HiCacheStorage):
         else:
             write_file_paths = []
 
-        # Pre-compute all host_indices offsets to avoid repeated calculations
-        if len(write_indices) > 0:
-            write_host_indices = [
-                host_indices[idx * page_size].item() for idx in write_indices
-            ]
+        # Stage 3: Sequential I/O operations using pointers directly
+        if self.is_mla_backend:
+            # MLA: one pointer per page
+            for file_path, idx in zip(write_file_paths, write_indices):
+                try:
+                    ptr = ptr_list[idx]
+                    size = element_size_list[idx]
+                    success = self._write_from_ptr(file_path, ptr, size)
+                    write_results[idx] = success
+                except Exception as e:
+                    logger.error(f"Failed to write batch for key {keys[idx]}: {e}")
+                    write_results[idx] = False
         else:
-            write_host_indices = []
-
-        # Stage 2: Sequential I/O operations
-        # Both MLA and MHA use the same path: get_data_page(flat=True) returns contiguous tensor
-        for file_path, actual_idx, idx in zip(
-            write_file_paths, write_host_indices, write_indices
-        ):
-            try:
-                # Fast path: get_data_page(flat=True) for page_first layout returns contiguous tensor
-                page_tensor = self.mem_pool_host.get_data_page(actual_idx, flat=True)
-                success = self._write_tensor_to_file_fast(file_path, page_tensor)
-                write_results[idx] = success
-            except Exception as e:
-                logger.error(f"Failed to write batch for key {keys[idx]}: {e}")
-                write_results[idx] = False
+            # MHA: K and V pointer pairs per page
+            # ptr_list structure: [K0, V0, K1, V1, ...]
+            for file_path, idx in zip(write_file_paths, write_indices):
+                try:
+                    k_idx = idx * 2
+                    v_idx = idx * 2 + 1
+                    k_ptr = ptr_list[k_idx]
+                    k_size = element_size_list[k_idx]
+                    v_ptr = ptr_list[v_idx]
+                    v_size = element_size_list[v_idx]
+                    success = self._write_kv_pair_from_ptrs(
+                        file_path, k_ptr, k_size, v_ptr, v_size
+                    )
+                    write_results[idx] = success
+                except Exception as e:
+                    logger.error(f"Failed to write batch for key {keys[idx]}: {e}")
+                    write_results[idx] = False
 
         return write_results
