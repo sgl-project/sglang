@@ -146,6 +146,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             bs,
         )
 
+        if batch.is_hybrid_gdn_cache:
+            batch.mamba_track_indices = torch.tensor(
+                [
+                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+                device=batch.device,
+            )
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,

@@ -316,6 +316,7 @@ class EAGLEWorker(TpModelWorker):
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
                 num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -669,6 +670,7 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.return_hidden_states = False
@@ -751,6 +753,25 @@ class EAGLEWorker(TpModelWorker):
                 )
                 + 1
             )
+            cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+            # prepend 0 to the cumulative_accepted_lengths
+            accepted_indices_start = torch.cat(
+                [
+                    torch.zeros(
+                        1,
+                        dtype=cumulative_accepted_lengths.dtype,
+                        device=cumulative_accepted_lengths.device,
+                    ),
+                    cumulative_accepted_lengths[:-1],
+                ]
+            )
+            accepted_indices_offset = torch.arange(
+                0,
+                len(batch.seq_lens) * batch.spec_info.draft_token_num,
+                step=batch.spec_info.draft_token_num,
+                dtype=accepted_indices_start.dtype,
+                device=accepted_indices_start.device,
+            )
 
             # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
             # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
@@ -759,28 +780,42 @@ class EAGLEWorker(TpModelWorker):
                 # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
                 # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
                 # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
-                cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
-                req_start_positions = torch.cat(
-                    [
-                        torch.zeros(
-                            1,
-                            dtype=cumulative_accepted_lengths.dtype,
-                            device=cumulative_accepted_lengths.device,
-                        ),
-                        cumulative_accepted_lengths[:-1],
-                    ]
-                )
-                first_token_indices_per_req = res.accepted_indices[req_start_positions]
-                last_token_indices_per_req = res.accepted_indices[
-                    cumulative_accepted_lengths - 1
-                ]
-                max_relative_indices_per_req = (
-                    last_token_indices_per_req - first_token_indices_per_req
+                # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
+                accepted_steps = (
+                    res.accepted_indices[cumulative_accepted_lengths - 1]
+                    - accepted_indices_offset
                 )
             else:
-                max_relative_indices_per_req = accepted_length - 1
+                accepted_steps = accepted_length - 1
+
+            if batch.mamba_track_indices is not None:
+                # If after verify, the request's seq_lens has crossed a mamba track interval,
+                # we need to update the mamba state for the request at the crossing point.
+                mamba_track_interval = self.server_args.mamba_track_interval
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != batch.seq_lens // mamba_track_interval
+                )
+                tracking_point = (
+                    batch.seq_lens // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                )
+                mamba_steps_to_track = torch.where(
+                    to_track_mask,
+                    res.accepted_indices[to_track_ith + accepted_indices_start]
+                    - accepted_indices_offset,
+                    -1,
+                )
+            else:
+                mamba_steps_to_track = None
+
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                max_relative_indices_per_req, self.target_worker.model_runner.model
+                accepted_steps=accepted_steps,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=self.target_worker.model_runner.model,
             )
 
         if batch.return_logprob:

@@ -268,6 +268,7 @@ class SchedulerOutputProcessorMixin:
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
+        result.accept_length_per_req_cpu = accept_lens - 1
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -371,7 +372,10 @@ class SchedulerOutputProcessorMixin:
                     # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
                     req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
                     req.mamba_last_track_seqlen = seq_len
-                elif batch.spec_algorithm.is_eagle():
+                elif (
+                    batch.spec_algorithm.is_eagle()
+                    and result.accept_length_per_req_cpu is not None
+                ):
                     # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
                     actual_seq_len = req.seqlen - 1
                     if (
