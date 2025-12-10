@@ -531,17 +531,21 @@ func (h *ChatHandler) HandleGenerate(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Convert to SGLang /generate response format
+	// meta_info must match SGLang's expected format with completion_tokens at top level
+	finishReason := resp.Choices[0].FinishReason
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+
 	response := map[string]interface{}{
 		"text": resp.Choices[0].Message.Content,
 		"meta_info": map[string]interface{}{
-			"id":      resp.ID,
-			"model":   resp.Model,
-			"created": resp.Created,
-			"usage": map[string]interface{}{
-				"prompt_tokens":     resp.Usage.PromptTokens,
-				"completion_tokens": resp.Usage.CompletionTokens,
-				"total_tokens":      resp.Usage.TotalTokens,
-			},
+			"id":                resp.ID,
+			"finish_reason":     finishReason,
+			"prompt_tokens":     resp.Usage.PromptTokens,
+			"completion_tokens": resp.Usage.CompletionTokens,
+			"cached_tokens":     0,  // Not available from chat completion API
+			"weight_version":    "", // Not available from chat completion API
 		},
 	}
 
