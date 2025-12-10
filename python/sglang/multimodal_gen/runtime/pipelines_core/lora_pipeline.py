@@ -85,17 +85,18 @@ class LoRAPipeline(ComposedPipelineBase):
         )
 
     def _get_target_lora_layers(
-        self, target: str, allow_empty: bool = False
-    ) -> list[tuple[str, dict[str, BaseLayerWithLoRA]]]:
+        self, target: str
+    ) -> tuple[list[tuple[str, dict[str, BaseLayerWithLoRA]]], str | None]:
         """
         Return a list of (module_name, lora_layers_dict) based on the target.
 
         Args:
             target: One of "all", "transformer", "transformer_2", "critic".
-            allow_empty: If True, return empty list instead of raising for non-existent modules.
 
         Returns:
-            List of tuples (module_name, lora_layers_dict) to operate on.
+            A tuple of (result, error_message):
+            - result: List of tuples (module_name, lora_layers_dict) to operate on.
+            - error_message: Error description if target is invalid or module doesn't exist, None otherwise.
         """
         if target == "all":
             result: list[tuple[str, dict[str, BaseLayerWithLoRA]]] = [
@@ -105,33 +106,22 @@ class LoRAPipeline(ComposedPipelineBase):
                 result.append(("transformer_2", self.lora_layers_transformer_2))
             if self.lora_layers_critic:
                 result.append(("critic", self.lora_layers_critic))
-            return result
+            return result, None
         elif target == "transformer":
-            return [("transformer", self.lora_layers)]
+            return [("transformer", self.lora_layers)], None
         elif target == "transformer_2":
             if not self.lora_layers_transformer_2:
-                if allow_empty:
-                    logger.warning(
-                        "transformer_2 does not exist in this pipeline, skipping"
-                    )
-                    return []
-                raise ValueError("transformer_2 does not exist in this pipeline")
-            return [("transformer_2", self.lora_layers_transformer_2)]
+                return [], "transformer_2 does not exist in this pipeline"
+            return [("transformer_2", self.lora_layers_transformer_2)], None
         elif target == "critic":
             if not self.lora_layers_critic:
-                if allow_empty:
-                    logger.warning(
-                        "critic (fake_score_transformer) does not exist in this pipeline, skipping"
-                    )
-                    return []
-                raise ValueError(
-                    "critic (fake_score_transformer) does not exist in this pipeline"
+                return (
+                    [],
+                    "critic (fake_score_transformer) does not exist in this pipeline",
                 )
-            return [("critic", self.lora_layers_critic)]
+            return [("critic", self.lora_layers_critic)], None
         else:
-            raise ValueError(
-                f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
-            )
+            return [], f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
 
     def convert_module_lora_layers(
         self,
@@ -361,7 +351,9 @@ class LoRAPipeline(ComposedPipelineBase):
             )
 
         # Check if any target module has a different LoRA merged
-        target_modules = self._get_target_lora_layers(target)
+        target_modules, error = self._get_target_lora_layers(target)
+        if error:
+            logger.warning("set_lora: %s", error)
         for module_name, _ in target_modules:
             if (
                 self.is_lora_merged.get(module_name, False)
@@ -380,7 +372,9 @@ class LoRAPipeline(ComposedPipelineBase):
             self.convert_to_lora_layers()
 
         # Re-fetch target_modules after convert_to_lora_layers() to get populated dicts
-        target_modules = self._get_target_lora_layers(target)
+        target_modules, error = self._get_target_lora_layers(target)
+        if error:
+            logger.warning("set_lora: %s", error)
 
         adapter_updated = False
         rank = dist.get_rank()
@@ -437,10 +431,10 @@ class LoRAPipeline(ComposedPipelineBase):
             target: Which transformer(s) to merge. One of "all", "transformer",
                     "transformer_2", "critic".
         """
-        # Use allow_empty=True so we don't fail on non-existent modules
-        target_modules = self._get_target_lora_layers(target, allow_empty=True)
+        target_modules, error = self._get_target_lora_layers(target)
+        if error:
+            logger.warning("merge_lora_weights: %s", error)
         if not target_modules:
-            logger.warning("No target modules found for merge (target=%s)", target)
             return
 
         for module_name, lora_layers_dict in target_modules:
@@ -473,10 +467,10 @@ class LoRAPipeline(ComposedPipelineBase):
             target: Which transformer(s) to unmerge. One of "all", "transformer",
                     "transformer_2", "critic".
         """
-        # Use allow_empty=True so we don't fail on non-existent modules
-        target_modules = self._get_target_lora_layers(target, allow_empty=True)
+        target_modules, error = self._get_target_lora_layers(target)
+        if error:
+            logger.warning("unmerge_lora_weights: %s", error)
         if not target_modules:
-            logger.warning("No target modules found for unmerge (target=%s)", target)
             return
 
         for module_name, lora_layers_dict in target_modules:
