@@ -12,27 +12,58 @@ else
 fi
 
 # Install the required dependencies in CI.
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache
+# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
+docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
+# Clear Python cache to ensure latest code is used
+docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
+docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
 docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+
+# Helper function to install with retries and fallback PyPI mirror
+install_with_retry() {
+  local max_attempts=3
+  local cmd="$@"
+
+  for attempt in $(seq 1 $max_attempts); do
+    echo "Attempt $attempt/$max_attempts: $cmd"
+    if eval "$cmd"; then
+      echo "Success!"
+      return 0
+    fi
+
+    if [ $attempt -lt $max_attempts ]; then
+      echo "Failed, retrying in 5 seconds..."
+      sleep 5
+      # Try with alternative PyPI index on retry
+      if [[ "$cmd" =~ "pip install" ]] && [ $attempt -eq 2 ]; then
+        cmd="$cmd --index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com"
+        echo "Using fallback PyPI mirror: $cmd"
+      fi
+    fi
+  done
+
+  echo "Failed after $max_attempts attempts"
+  return 1
+}
 
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-    docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]" --no-deps # TODO: only for mi35x
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]" --no-deps
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . --no-deps # TODO: only for mi35x
+    install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . --no-deps
     ;;
   mi30x|mi300|mi325)
     echo "Runner uses ${GPU_ARCH}; will fetch mi30x image."
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-    docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]"
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]"
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+    install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
     ;;
   *)
     echo "Runner architecture '${GPU_ARCH}' unrecognised;" >&2
@@ -40,7 +71,7 @@ case "${GPU_ARCH}" in
 esac
 
 docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
-docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
 docker exec -w / ci_sglang mkdir -p /dummy-grok
 mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json

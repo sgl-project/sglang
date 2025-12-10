@@ -133,14 +133,13 @@ python -m sglang_router.launch_router \
 > gRPC router supports both single-stage and PD serving. Provide `--tokenizer-path` or `--model-path` (HF repo or local directory) plus optional `--chat-template`.
 
 ### Prefill/Decode Disaggregation
-Split prefill and decode workers for PD-aware caching and balancing.
+Split prefill and decode workers for PD-aware caching and balancing. Specifying `--policy A` is equivalent to `--prefill-policy A --decode-policy A`.
 
 ```bash
 python -m sglang_router.launch_router \
   --pd-disaggregation \
   --prefill http://prefill1:30001 9001 \
   --decode http://decode1:30011 \
-  --policy cache_aware \
   --prefill-policy cache_aware \
   --decode-policy power_of_two
 ```
@@ -173,10 +172,10 @@ curl -X POST http://localhost:30000/workers \
 curl http://localhost:30000/workers
 
 # Remove a worker
-curl -X DELETE http://localhost:30000/workers/grpc://0.0.0.0:31000
+curl -X DELETE http://localhost:30000/workers/grpc%3A%2F%2F0.0.0.0%3A31000
 ```
 
-Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{url}` returns both registry data and queued job status.
+Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{url}` returns both registry data and queued job status. The worker url in the removal request should be escaped.
 
 ---
 
@@ -275,6 +274,7 @@ PD deployments can specify `--prefill-selector` and `--decode-selector` plus the
 | `memory` (default) | In-memory storage for quick prototyping. | `--history-backend memory` |
 | `none` | No persistence; APIs operate but store nothing. | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database-backed storage (pooled connections). | `--history-backend oracle` |
+| `postgres` | PostgreSQL Database-backed storage (pooled connections). | `--history-backend postgres` |
 
 Oracle configuration (choose DSN *or* TNS alias):
 Install the Oracle Instant Client and set `LD_LIBRARY_PATH` accordingly.
@@ -435,6 +435,14 @@ Enable request ID propagation:
 python -m sglang_router.launch_router \
   --worker-urls http://worker1:8000 \
   --request-id-headers x-request-id x-trace-id
+```
+
+Enable opentelmetry tracing:
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --enable-trace \
+  --otlp-traces-endpoint 0.0.0.0:4317
 ```
 
 ---

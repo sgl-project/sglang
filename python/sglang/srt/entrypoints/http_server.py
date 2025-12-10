@@ -72,10 +72,12 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
@@ -120,12 +122,12 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
-from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -496,14 +498,17 @@ async def get_model_info():
 @app.get("/model_info")
 async def model_info():
     """Get the model information."""
+    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
-        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
-        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "model_type": getattr(model_config.hf_config, "model_type", None),
+        "architectures": getattr(model_config.hf_config, "architectures", None),
     }
     return result
 
@@ -692,6 +697,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
         profile_prefix=obj.profile_prefix,
+        profile_stages=obj.profile_stages,
     )
     return Response(
         content="Start profiling.\n",
@@ -954,6 +960,15 @@ async def resume_memory_occupation(
         await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/weights_checker")
+async def check_weights(obj: CheckWeightsReqInput, request: Request):
+    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=200 if success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
@@ -1382,6 +1397,9 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
