@@ -218,6 +218,9 @@ struct CliArgs {
     prometheus_host: String,
 
     #[arg(long, num_args = 0..)]
+    prometheus_duration_buckets: Vec<f64>,
+
+    #[arg(long, num_args = 0..)]
     request_id_headers: Vec<String>,
 
     #[arg(long, default_value_t = 1800)]
@@ -685,6 +688,11 @@ impl CliArgs {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
+            duration_buckets: if self.prometheus_duration_buckets.is_empty() {
+                None
+            } else {
+                Some(self.prometheus_duration_buckets.clone())
+            },
         });
 
         ServerConfig {
