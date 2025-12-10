@@ -32,7 +32,3 @@ func BuildResponseBase(id string, created int64, model string) map[string]interf
 		"model":   model,
 	}
 }
-
-
-
-

@@ -65,8 +65,3 @@ func Init(logDir, logLevel string) (*zap.Logger, error) {
 
 	return logger, nil
 }
-
-
-
-
-

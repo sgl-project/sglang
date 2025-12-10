@@ -64,7 +64,7 @@ for i in $(seq 1 $NUM_REQUESTS); do
       \"stream\": true,
       \"max_tokens\": 200
     }" > /dev/null &
-  
+
   # Limit concurrency
   if [ $((i % 5)) -eq 0 ]; then
     wait

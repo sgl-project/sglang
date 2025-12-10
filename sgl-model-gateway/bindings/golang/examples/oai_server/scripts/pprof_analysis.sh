@@ -68,7 +68,7 @@ if ! check_server; then
         PPROF_ENABLED=true PPROF_PORT=$PPROF_PORT ./oai_server &
         SERVER_PID=$!
         echo "Server PID: $SERVER_PID"
-        
+
         # Wait for server to start
         echo "Waiting for server to start..."
         for i in {1..30}; do
@@ -78,7 +78,7 @@ if ! check_server; then
             fi
             sleep 1
         done
-        
+
         if ! check_server; then
             echo "Error: Server failed to start"
             kill $SERVER_PID 2>/dev/null || true

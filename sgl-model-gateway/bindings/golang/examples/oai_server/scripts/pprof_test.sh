@@ -39,12 +39,12 @@ echo ""
 send_stream_request() {
     local request_num=$1
     local start_time=$(date +%s.%N)
-    
+
     curl -s -N -X POST "${SERVER_URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "$TEST_REQUEST" \
         > /dev/null 2>&1
-    
+
     local end_time=$(date +%s.%N)
     local duration=$(echo "$end_time - $start_time" | bc)
     echo "Request $request_num completed, duration: ${duration}s"
@@ -55,33 +55,33 @@ if [ "$CONCURRENT" -eq 1 ]; then
     # Single-threaded mode: continuously send requests
     end_time=$(($(date +%s) + DURATION))
     request_count=0
-    
+
     while [ $(date +%s) -lt $end_time ]; do
         request_count=$((request_count + 1))
         send_stream_request $request_count
     done
-    
+
     echo ""
     echo "Test completed, sent $request_count requests"
 else
     # Multi-threaded mode: send requests concurrently
     end_time=$(($(date +%s) + DURATION))
     request_count=0
-    
+
     while [ $(date +%s) -lt $end_time ]; do
         # Start concurrent requests
         for i in $(seq 1 $CONCURRENT); do
             request_count=$((request_count + 1))
             send_stream_request $request_count &
         done
-        
+
         # Wait for all requests to complete
         wait
-        
+
         # Brief rest to avoid overload
         sleep 0.1
     done
-    
+
     echo ""
     echo "Test completed, sent $request_count requests"
 fi

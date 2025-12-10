@@ -2,7 +2,7 @@
 
 # TPOT performance bottleneck analysis script
 # Specifically designed to analyze why Go Router is twice as slow as Rust Router
-# 
+#
 # Usage:
 #   ./scripts/analyze_tpot.sh [options]
 #
@@ -158,7 +158,7 @@ run_streaming_request() {
     local request_id=$1
     local start_time=$(date +%s)
     local start_nanos=$(date +%N 2>/dev/null || echo "000000000")
-    
+
     curl -N -s -X POST "${SERVER_URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "{
@@ -168,7 +168,7 @@ run_streaming_request() {
             \"max_tokens\": 300,
             \"temperature\": 0.7
         }" > /dev/null
-    
+
     local end_time=$(date +%s)
     local end_nanos=$(date +%N 2>/dev/null || echo "000000000")
     local duration=$((end_time - start_time))
@@ -193,11 +193,11 @@ for i in $(seq 1 $NUM_REQUESTS); do
         done < "$JOB_PIDS_FILE"
         sleep 0.1
     done
-    
+
     # Start new request
     run_streaming_request $i &
     echo $! >> "$JOB_PIDS_FILE"
-    
+
     # Progress indicator
     if [ $((i % 10)) -eq 0 ]; then
         echo "  Progress: $i/$NUM_REQUESTS requests sent..."
@@ -552,4 +552,3 @@ if [ "$HAS_GRAPHVIZ" = "false" ]; then
 fi
 echo -e "${GREEN}All files saved to: ${OUTPUT_DIR}${NC}"
 echo ""
-

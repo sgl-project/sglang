@@ -197,7 +197,7 @@ pub unsafe extern "C" fn sgl_postprocess_stream_chunk(
             return SglErrorCode::MemoryError;
         }
     };
-    
+
     // Use the existing converter API
     let mut openai_json_ptr: *mut c_char = ptr::null_mut();
     let result = super::grpc_converter::sgl_grpc_response_converter_convert_chunk(
@@ -463,4 +463,3 @@ pub unsafe extern "C" fn sgl_postprocess_stream_chunks_batch(
 
     SglErrorCode::Success
 }
-

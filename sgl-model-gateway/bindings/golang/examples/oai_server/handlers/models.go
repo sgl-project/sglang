@@ -65,7 +65,3 @@ func (h *ModelsHandler) GetModelInfo(ctx *fasthttp.RequestCtx) {
 	jsonData, _ := json.Marshal(response)
 	ctx.Write(jsonData)
 }
-
-
-
-

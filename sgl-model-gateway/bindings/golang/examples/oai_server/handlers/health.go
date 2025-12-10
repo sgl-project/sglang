@@ -31,7 +31,3 @@ func (h *HealthHandler) Check(ctx *fasthttp.RequestCtx) {
 	jsonData, _ := json.Marshal(response)
 	ctx.Write(jsonData)
 }
-
-
-
-

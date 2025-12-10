@@ -370,4 +370,3 @@ pub unsafe extern "C" fn sgl_preprocessed_request_free(
         sgl_free_string(tool_constraints_json);
     }
 }
-

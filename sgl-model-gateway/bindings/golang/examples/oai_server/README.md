@@ -298,7 +298,7 @@ sgl-model-gateway/bindings/golang/
 - Send JSON to channel
 
 ### RecvJSON
-**Location**: 
+**Location**:
 - `internal/grpc/client_grpc.go:412`: gRPC layer implementation
 - `client.go:410`: Client wrapper layer
 - Read from `resultJSONChan`
