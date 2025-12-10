@@ -261,7 +261,6 @@ class LoRAPipeline(ComposedPipelineBase):
                 else:
                     continue
 
-            print(f"{name} -> {target_name}")
             if target_name in self.lora_adapters[lora_nickname]:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
