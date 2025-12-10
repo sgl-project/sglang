@@ -78,11 +78,24 @@ class PixtralForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         dataclass_fields = {field.name for field in fields(VisionEncoderArgs)}
+        vision_config_dict = self.config.vision_config.to_dict()
         vision_args = {
             key: value
-            for key, value in self.config.vision_config.to_dict().items()
+            for key, value in vision_config_dict.items()
             if key in dataclass_fields
         }
+
+        # Handle rope_theta compatibility with transformers 5.0+
+        # In newer transformers, rope_theta is inside rope_parameters dict
+        if "rope_theta" not in vision_args:
+            rope_params = vision_config_dict.get("rope_parameters")
+            if isinstance(rope_params, dict) and "rope_theta" in rope_params:
+                vision_args["rope_theta"] = float(rope_params["rope_theta"])
+            elif hasattr(self.config.vision_config, "rope_theta"):
+                vision_args["rope_theta"] = float(self.config.vision_config.rope_theta)
+            else:
+                # Default value matching PixtralVisionConfig default
+                vision_args["rope_theta"] = 10000.0
 
         self.vision_args = VisionEncoderArgs(**vision_args)
 
