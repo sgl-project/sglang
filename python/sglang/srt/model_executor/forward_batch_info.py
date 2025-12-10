@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
@@ -623,7 +624,10 @@ class ForwardBatch:
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if mm_input is None:
+                if (
+                    mm_input is None
+                    or get_global_server_args().rl_on_policy_target is not None
+                ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens[batch_idx] - 1,
@@ -640,7 +644,10 @@ class ForwardBatch:
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
                 )
-                if mm_input is None:
+                if (
+                    mm_input is None
+                    or get_global_server_args().rl_on_policy_target is not None
+                ):
                     # text only
                     mrope_positions = torch.tensor(
                         [

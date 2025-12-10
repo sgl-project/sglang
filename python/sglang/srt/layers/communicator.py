@@ -422,9 +422,7 @@ class LayerCommunicator:
                         )
 
                     else:
-                        hidden_states = self.input_layernorm(
-                            hidden_states, post_residual_addition=post_residual_addition
-                        )
+                        hidden_states = self.input_layernorm(hidden_states)
                 else:
 
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
@@ -458,7 +456,7 @@ class LayerCommunicator:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,
                             residual,
-                            post_residual_addition=post_residual_addition,
+                            post_residual_addition,
                         )
 
         hidden_states = self._communicate_simple_fn(
