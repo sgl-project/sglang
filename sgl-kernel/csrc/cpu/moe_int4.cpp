@@ -260,7 +260,7 @@ void fused_experts_int4_w4a8_kernel_impl(
   at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = at::get_thread_num();
-    int8_t* dqB_tmp1 = dqB_tmp + tid * BLOCK_K * BLOCK_N;
+    int8_t* dqB_tmp1 = dqB_tmp + tid * 2 * BLOCK_K * BLOCK_N;
     int8_t* dqB_tmp2 = dqB_tmp1 + BLOCK_K * BLOCK_N;
     alignas(64) float As[BLOCK_M];
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
@@ -375,7 +375,7 @@ void fused_experts_int4_w4a8_kernel_impl(
   // parallel on [MB2, NB2]
   at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
     int tid = at::get_thread_num();
-    int8_t* dqB_tmp1 = dqB_tmp + tid * BLOCK_K * BLOCK_N;
+    int8_t* dqB_tmp1 = dqB_tmp + tid * 2 * BLOCK_K * BLOCK_N;
     float* __restrict__ C2 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     bool is_brgemm_used = false;
     for (int64_t i = begin; i < end; ++i) {
