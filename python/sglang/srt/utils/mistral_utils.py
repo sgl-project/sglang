@@ -118,15 +118,20 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
         "alpha": "beta_slow",
         "apply_scale": None,
     }
+    # Fields that should be converted to float for transformers compatibility
+    float_fields = {"factor", "beta_fast", "beta_slow"}
     yarn_config = config.get("yarn") or {}
     config["rope_scaling"] = {
         "rope_type": "yarn",
-        "mscale_all_dim": 1,
+        "mscale_all_dim": 1.0,
     }
     for old_name, new_name in yarn_config_map.items():
         if old_name in yarn_config:
             value = yarn_config.pop(old_name)
             if new_name is not None:
+                # Convert to float if expected by transformers rope_parameters validation
+                if new_name in float_fields:
+                    value = float(value)
                 config["rope_scaling"][new_name] = value
 
     assert len(yarn_config) == 0, f"Unparsed yarn config: {yarn_config}"
