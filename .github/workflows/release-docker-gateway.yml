@@ -4,7 +4,7 @@ on:
     branches:
       - main
     paths:
-      - "sgl-model-gateway/bindings/python/sglang_router/version.py"
+      - sgl-model-gateway/bindings/python/pyproject.toml
   workflow_dispatch:
 
 jobs:
