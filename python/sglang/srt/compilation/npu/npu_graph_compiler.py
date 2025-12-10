@@ -37,5 +37,5 @@ class NpuGraphCompiler:
         )
         backend.init(model_runner.model_config)
         self.compiled_callable = torch.compile(
-            model, fullgraph=True, dynamic=False, backend=backend
+            torch.no_grad()(model), fullgraph=True, dynamic=False, backend=backend
         )

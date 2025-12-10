@@ -47,5 +47,5 @@ class PiecewiseNpuGraphCompiler:
         torch.compiler.allow_in_graph(pathlib.Path)
 
         self.compiled_callable = torch.compile(
-            model, fullgraph=True, dynamic=False, backend=backend
+            torch.no_grad()(model), fullgraph=True, dynamic=False, backend=backend
         )
