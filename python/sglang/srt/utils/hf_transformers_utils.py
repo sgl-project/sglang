@@ -408,43 +408,6 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
-def _validate_tokenizer_file(file_path: str) -> bool:
-    """
-    Validate that a tokenizer file is readable and not corrupted.
-
-    Args:
-        file_path: Path to the tokenizer file
-
-    Returns:
-        True if the file is valid, False if corrupted
-    """
-    try:
-        # For JSON files, validate they're parseable
-        if file_path.endswith(".json"):
-            with open(file_path, "r") as f:
-                json.load(f)
-            return True
-        # For .model files (SentencePiece), just check readability
-        elif file_path.endswith(".model"):
-            with open(file_path, "rb") as f:
-                # Read first few bytes to verify file is readable
-                _ = f.read(100)
-            return True
-        # For other files, just check they exist and are readable
-        else:
-            with open(file_path, "rb") as f:
-                _ = f.read(100)
-            return True
-    except Exception as e:
-        logger.warning(
-            "Corrupted tokenizer file detected: %s - %s: %s",
-            file_path,
-            type(e).__name__,
-            str(e),
-        )
-        return False
-
-
 def find_local_tokenizer_snapshot_dir(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -526,14 +489,6 @@ def find_local_tokenizer_snapshot_dir(
                 # Layer 1: Check symlink target exists (broken symlink check)
                 if not os.path.exists(f):
                     continue
-                # Layer 2: Validate file content is not corrupted
-                if not _validate_tokenizer_file(f):
-                    logger.info(
-                        "Found corrupted tokenizer file %s for %s. Will re-download.",
-                        f,
-                        model_name_or_path,
-                    )
-                    return None
                 local_tokenizer_files.append(f)
     except Exception as e:
         logger.warning(
@@ -670,7 +625,7 @@ def get_tokenizer(
         tokenizer_name, kwargs.get("cache_dir"), tokenizer_revision
     )
 
-    # Layer 3: Separate handling for cached vs non-cached paths
+    # Layer 2: Separate handling for cached vs non-cached paths
     if tokenizer_name != original_tokenizer_name:
         # We're using a cached path, try it but fallback to force_download if it fails
         try:
@@ -757,14 +712,6 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
-
-    # Check if processor/tokenizer files are already in local cache (CI only)
-    tokenizer_name = _check_tokenizer_cache(
-        tokenizer_name,
-        kwargs.get("cache_dir"),
-        revision,
-        include_processor_files=True,
-    )
 
     if "mistral-large-3" in str(tokenizer_name).lower():
         config = _load_mistral_large_3_for_causal_LM(
