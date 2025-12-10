@@ -2021,7 +2021,6 @@ class Scheduler(
                     ).Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
