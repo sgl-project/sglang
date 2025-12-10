@@ -4288,15 +4288,16 @@ class ServerArgs:
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
-                    # When using the chunked SGMV backend, skip embedding layers for now,
-                    # since it does not support embedding layers yet (TODO: implement `run_lora_a_embedding`)
+                    # When using the chunked SGMV backend, skip embedding / lm_head layers for now,
+                    # since it does not support these yet (TODO: implement embedding / lm_head support)
                     if self.lora_backend == "csgmv":
                         logger.warning(
-                            "LoRA backend 'csgmv' does not yet support embedding layers; "
-                            "dropping 'embed_tokens' from --lora-target-modules=all. "
-                            "To apply LoRA to embeddings, use --lora-backend triton."
+                            "LoRA backend 'csgmv' does not yet support embedding or lm_head layers; "
+                            "dropping 'embed_tokens' and 'lm_head' from --lora-target-modules=all. "
+                            "To apply LoRA to these, use --lora-backend triton."
                         )
                         self.lora_target_modules.discard("embed_tokens")
+                        self.lora_target_modules.discard("lm_head")
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
