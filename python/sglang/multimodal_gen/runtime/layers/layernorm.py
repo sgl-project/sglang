@@ -329,8 +329,6 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
-        # print(f"qwen, residual.shape, {residual.shape}, x.shape, {x.shape}, gate.shape, {gate if isinstance(gate, int) else gate.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
-
         can_use_cuda = (
             x.is_cuda
             and (x.shape[-1] % 4 == 0)
@@ -391,9 +389,11 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 if gate.dim() == 4:
                     # gate.shape: [batch_size, num_frames, 1, inner_dim]
                     gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
-                else:
+                elif gate.dim() == 3:
                     # gate.shape: [batch_size, 1, inner_dim]
                     gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
+                elif gate.dim() == 2:
+                    gate_opt = gate.expand(M, C).contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
             else:
                 raise ValueError(f"Gate type {type(gate)} not supported")    
             
@@ -468,7 +468,6 @@ class LayerNormScaleShift(nn.Module):
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-        # print(f"qwen, x.shape, {x.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
         can_use_cuda = (
             x.is_cuda
             and self.norm_type == "layer"
