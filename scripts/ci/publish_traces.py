@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -337,6 +338,15 @@ def publish_traces(traces_dir, run_id, run_number):
             if isinstance(e, HTTPError) and e.code in [422, 500, 502, 503, 504]:
                 is_retryable = True
                 error_type = f"HTTP {e.code}"
+
+            # Check for rate limit errors (non-fatal - just warn and skip)
+            if (
+                isinstance(e, HTTPError)
+                and e.code in [403, 429]
+                and "rate limit exceeded" in getattr(e, "error_body", "").lower()
+            ):
+                warnings.warn("GitHub API rate limit exceeded. Skipping trace upload.")
+                return
 
             if is_retryable and attempt < max_retries - 1:
                 print(
