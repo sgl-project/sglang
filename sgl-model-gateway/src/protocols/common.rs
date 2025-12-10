@@ -65,14 +65,79 @@ impl StringOrArray {
         }
     }
 
-    /// Convert to a vector of strings
+    /// Convert to a vector of strings (clones the data)
     pub fn to_vec(&self) -> Vec<String> {
         match self {
             StringOrArray::String(s) => vec![s.clone()],
             StringOrArray::Array(arr) => arr.clone(),
         }
     }
+
+    /// Returns an iterator over string references without cloning.
+    /// Use this instead of `to_vec()` when you only need to iterate.
+    pub fn iter(&self) -> StringOrArrayIter<'_> {
+        StringOrArrayIter {
+            inner: self,
+            index: 0,
+        }
+    }
+
+    /// Returns the first string, or None if empty
+    pub fn first(&self) -> Option<&str> {
+        match self {
+            StringOrArray::String(s) => {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            StringOrArray::Array(arr) => arr.first().map(|s| s.as_str()),
+        }
+    }
 }
+
+/// Iterator over StringOrArray that yields string references without cloning
+pub struct StringOrArrayIter<'a> {
+    inner: &'a StringOrArray,
+    index: usize,
+}
+
+impl<'a> Iterator for StringOrArrayIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner {
+            StringOrArray::String(s) => {
+                if self.index == 0 {
+                    self.index = 1;
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            }
+            StringOrArray::Array(arr) => {
+                if self.index < arr.len() {
+                    let item = &arr[self.index];
+                    self.index += 1;
+                    Some(item.as_str())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self.inner {
+            StringOrArray::String(_) => 1 - self.index,
+            StringOrArray::Array(arr) => arr.len() - self.index,
+        };
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest

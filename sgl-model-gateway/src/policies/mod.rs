@@ -14,7 +14,7 @@ mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
-mod tree;
+pub mod tree;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
@@ -38,22 +38,6 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
     ) -> Option<usize>;
-
-    /// Select a pair of workers (prefill and decode) for PD routing
-    ///
-    /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.
-    /// Default implementation uses select_worker for each array independently.
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        // Default implementation: independently select from each pool
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-        let decode_idx = self.select_worker(decode_workers, request_text)?;
-        Some((prefill_idx, decode_idx))
-    }
 
     /// Update policy state after request completion
     ///
