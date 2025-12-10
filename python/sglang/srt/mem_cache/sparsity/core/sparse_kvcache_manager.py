@@ -75,6 +75,7 @@ class SparseKVCacheManager:
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+            enable_sparse_attn=server_args.enable_sparse_attn,
         )
 
         self.sparse_decode_ongoing_offload = {}
@@ -143,6 +144,7 @@ class SparseKVCacheManager:
         host_indices = self.cache_controller.write(
             device_indices=out_alloc_len.long(),
             node_id=ack_id,
+            ack_type="sparse_decode",
         )
         assert host_indices is not None, "Host out of memory"
         self.sparse_decode_ongoing_offload[ack_id] = (
@@ -160,7 +162,7 @@ class SparseKVCacheManager:
         cc = self.cache_controller
         qsizes = torch.tensor(
             [
-                len(cc.ack_write_queue),
+                len(cc.sparse_decode_ack_write_queue),
             ],
             dtype=torch.int,
         )
@@ -171,7 +173,9 @@ class SparseKVCacheManager:
         finish_count = qsizes.tolist()[0]
         assert finish_count == 1
 
-        _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+        _, finish_event, ack_list = (
+            self.cache_controller.sparse_decode_ack_write_queue.pop(0)
+        )
         finish_event.synchronize()
 
         # update full_host_indices
@@ -191,8 +195,7 @@ class SparseKVCacheManager:
         self.request_counter += 1
         ack_id = self.request_counter
         host_indices = self.cache_controller.write(
-            device_indices=token_indices,
-            node_id=ack_id,
+            device_indices=token_indices, node_id=ack_id, ack_type="sparse_prefill"
         )
         assert host_indices is not None, "Host out of memory"
         self.sparse_prefill_ongoing_offload[ack_id] = (host_indices, req)
@@ -209,7 +212,7 @@ class SparseKVCacheManager:
         while True:
             qsizes = torch.tensor(
                 [
-                    len(cc.ack_write_queue),
+                    len(cc.sparse_prefill_ack_write_queue),
                 ],
                 dtype=torch.int,
             )
@@ -221,7 +224,9 @@ class SparseKVCacheManager:
             if finish_count > 0:
                 break
 
-        _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+        _, finish_event, ack_list = (
+            self.cache_controller.sparse_prefill_ack_write_queue.pop(0)
+        )
         finish_event.synchronize()
 
         (host_indices, req) = self.sparse_prefill_ongoing_offload.pop(ack_list[0])
