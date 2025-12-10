@@ -199,7 +199,6 @@ class NgramVerifyInput(SpecInput):
                             # ted_size=0
                             # ```
                             logger.error("Grammar rejected")
-                            # req.grammar.force_terminate = True
                             req.grammar.rollback(0)
                             self.accept_index[i, j + 1:] = -1
                             break
