@@ -536,6 +536,15 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    // TODO delete the metrics (instead of setting them to zero)
+    pub fn remove_worker_metrics(worker_url: &str) {
+        gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_worker_load","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_running_requests","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_tree_size","worker" => worker_url.to_string()).set(0.0);
+    }
+
     pub fn set_job_queue_depth(depth: usize) {
         gauge!("sgl_router_job_queue_depth").set(depth as f64);
     }
