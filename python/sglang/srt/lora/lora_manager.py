@@ -22,6 +22,10 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
@@ -37,15 +41,8 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_npu, replace_submodule
+from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
-
-if is_npu():
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
-
-    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
-    torch.cuda.is_available = lambda: False
-
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +71,7 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        self.lora_added_tokens_size: Optional[int] = None
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -129,16 +127,6 @@ class LoRAManager:
             lora_ref.lora_id not in self.loras
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
-        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
-            return self.create_lora_update_result(
-                success=False,
-                error_message=(
-                    f"Already have {self.num_pinned_loras} pinned adapters, "
-                    f"max allowed is {self.max_loras_per_batch - 1} (reserving 1 slot for dynamic use). "
-                    f"Please unpin some adapters or increase max_loras_per_batch."
-                ),
-            )
-
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
@@ -165,13 +153,17 @@ class LoRAManager:
         """
 
         # Check if this LoRA adapter is already loaded
-        if any(
-            lora_ref.lora_name == existing_lora_ref.lora_name
-            for existing_lora_ref in self.lora_refs.values()
-        ):
-            raise ValueError(
-                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-            )
+        for existing_lora_ref in self.lora_refs.values():
+            if lora_ref.lora_name == existing_lora_ref.lora_name:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                )
+
+            if lora_ref.lora_path == existing_lora_ref.lora_path:
+                logger.warning(
+                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
@@ -257,6 +249,8 @@ class LoRAManager:
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
+            lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
+            lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
         # set up batch info shared by all lora modules
@@ -308,6 +302,21 @@ class LoRAManager:
                         lora_type=LoRAType.LORA_B,
                     ),
                 )
+
+        # Update embedding layer if present - gotta merge (refer to PR codebase)
+        if self.embed_tokens_module is not None:
+            self.embed_tokens_module.set_lora_info(
+                self.memory_pool.get_embedding_tensor("added_tokens", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_B),
+            )
+
+        # Update lm_head layer if present
+        if self.lm_head_module is not None:
+            self.lm_head_module.set_lora_info(
+                self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_B),
+            )
 
     def init_state(
         self,
@@ -403,6 +412,24 @@ class LoRAManager:
                 default=0,
             )
 
+        # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
+        # This happens automatically without requiring user input
+        # if self.lora_added_vocab_size is None:
+        if self.lora_added_tokens_size is None:
+            inferred_extra_vocab_size = next(
+                (
+                    x.lora_added_tokens_size
+                    for x in self.configs.values()
+                    if x.lora_added_tokens_size > 0
+                ),
+                0,
+            )
+            if inferred_extra_vocab_size > 0:
+                logger.info(
+                    f"self.lora_added_tokens_size={inferred_extra_vocab_size} from LoRA adapters."
+                )
+            self.lora_added_tokens_size = inferred_extra_vocab_size
+
     def load_lora_weights(self, lora_ref: LoRARef):
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
@@ -429,6 +456,7 @@ class LoRAManager:
             target_modules=self.target_modules,
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
+            lora_added_tokens_size=self.lora_added_tokens_size,
         )
 
     def set_lora_module(self, module_name, module):
@@ -442,6 +470,9 @@ class LoRAManager:
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
 
+        self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
+        self.lm_head_module: Optional[BaseLayerWithLoRA] = None
+
         for module_name, module in self.base_model.named_modules():
             # TODO (lifuhuang): in the future, we should consider generalizing the
             # should_apply_lora function to support mapping by full module name instead
@@ -452,6 +483,24 @@ class LoRAManager:
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
+
+            # Handle embed_tokens
+            if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
+                if isinstance(module, VocabParallelEmbedding) and not isinstance(
+                    module, BaseLayerWithLoRA
+                ):
+                    lora_module = self.set_lora_module(module_name, module)
+                    self.embed_tokens_module = lora_module
+                    continue
+
+            # Handle lm_head
+            if "lm_head" in module_name and "lm_head" in self.target_modules:
+                if isinstance(module, ParallelLMHead) and not isinstance(
+                    module, BaseLayerWithLoRA
+                ):
+                    lora_module = self.set_lora_module(module_name, module)
+                    self.lm_head_module = lora_module
+                    continue
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:

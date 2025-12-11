@@ -170,7 +170,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 hidden_states=hidden_states,
                 verified_id=self.output_ids,
                 new_seq_lens=self.seq_lens,
-                allocate_lens=self.seq_lens,
             )
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST

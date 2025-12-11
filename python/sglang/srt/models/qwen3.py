@@ -30,19 +30,18 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    add_prefix,
-    get_cmo_stream,
-    is_cuda,
-    is_npu,
-    wait_cmo_stream,
-)
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+    from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
 
 class Qwen3Attention(nn.Module):
@@ -161,6 +160,33 @@ class Qwen3Attention(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def forward_prepare_native(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v
+
+    def forward_prepare_npu(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.attn.layer_id == 0:
+            self.rotary_emb.get_cos_sin_with_position(positions)
+        q, k, v = split_qkv_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            self.q_norm.variance_epsilon,
+            q_bias=getattr(self.q_norm, "bias", None),
+            k_bias=getattr(self.k_norm, "bias", None),
+        )
+        return q, k, v
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -170,10 +196,16 @@ class Qwen3Attention(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        if not _is_npu:
+            q, k, v = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            q, k, v = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
 
         if get_global_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
@@ -463,7 +495,8 @@ class Qwen3ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def _load_weights_impl(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Internal implementation of weight loading without reload scenario handling."""
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -474,6 +507,7 @@ class Qwen3ForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        updated_params = set()
         for name, loaded_weight in weights:
             if "Embedding" in self.config.name_or_path:
                 name = add_prefix(name, "model")
@@ -520,6 +554,7 @@ class Qwen3ForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                updated_params.add(name)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -532,8 +567,27 @@ class Qwen3ForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    updated_params.add(name)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+        return updated_params
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Load weights into the model, with support for RL training reload scenarios."""
+        from sglang.srt.model_loader.loader import QuantizedRLModelLoader
+
+        # Check if this is a reload scenario for RL training with quantized models
+        is_reload = QuantizedRLModelLoader.is_reload_scenario(self)
+        if is_reload:
+            # Use the fast path for RL training reloads
+            logger.info("[QuantizedRL] Using fast path reload in load_weights")
+            QuantizedRLModelLoader.rebinding_and_load_weights(
+                self, self._load_weights_impl, weights
+            )
+        else:
+            # Standard weight loading path
+            self._load_weights_impl(weights)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

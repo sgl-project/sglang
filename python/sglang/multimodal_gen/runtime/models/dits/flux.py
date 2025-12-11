@@ -32,7 +32,7 @@ from diffusers.models.normalization import (
 from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
 # from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
@@ -43,6 +43,10 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.utils import (
+    delete_projection_layers,
+    fuse_linear_projections,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -69,13 +73,13 @@ def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states
 def _get_fused_projections(
     attn: "FluxAttention", hidden_states, encoder_hidden_states=None
 ):
-    query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+    qkv, _ = attn.to_qkv(hidden_states)
+    query, key, value = qkv.chunk(3, dim=-1)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
-        encoder_query, encoder_key, encoder_value = attn.to_added_qkv(
-            encoder_hidden_states
-        ).chunk(3, dim=-1)
+        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -89,6 +93,7 @@ def _get_qkv_projections(
 
 
 class FluxAttention(torch.nn.Module, AttentionModuleMixin):
+    _supports_qkv_fusion = True
 
     def __init__(
         self,
@@ -148,19 +153,42 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             )
             self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
 
-        # Scaled dot product attention
-        self.attn = LocalAttention(
+        self.attn = USPAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends=(
+            supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
-            ),
+            },
         )
+
+        self.fused_projections = False
+
+    @torch.no_grad()
+    def fuse_projections(self):
+        if self.fused_projections:
+            return
+
+        self.to_qkv = fuse_linear_projections(
+            self.to_q, self.to_k, self.to_v, self.use_bias, ReplicatedLinear
+        )
+        delete_projection_layers(self, ["to_q", "to_k", "to_v"])
+
+        if self.added_kv_proj_dim is not None:
+            self.to_added_qkv = fuse_linear_projections(
+                self.add_q_proj,
+                self.add_k_proj,
+                self.add_v_proj,
+                self.added_proj_bias,
+                ReplicatedLinear,
+            )
+            delete_projection_layers(self, ["add_q_proj", "add_k_proj", "add_v_proj"])
+
+        self.fused_projections = True
 
     def forward(
         self,
@@ -473,6 +501,15 @@ class FluxTransformer2DModel(CachableDiT):
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
         )
+
+    def fuse_qkv_projections(self):
+        for block in list(self.transformer_blocks) + list(
+            self.single_transformer_blocks
+        ):
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
+                block.attn.fuse_projections()
 
     def forward(
         self,

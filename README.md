@@ -13,10 +13,10 @@
 --------------------------------------------------------------------------------
 
 | [**Blog**](https://lmsys.org/blog/)
-| [**Documentation**](https://docs.sglang.ai/)
-| [**Join Slack**](https://slack.sglang.ai/)
-| [**Join Bi-Weekly Development Meeting**](https://meeting.sglang.ai/)
-| [**Roadmap**](https://github.com/sgl-project/sglang/issues/12780)
+| [**Documentation**](https://docs.sglang.io/)
+| [**Roadmap**](https://roadmap.sglang.io/)
+| [**Join Slack**](https://slack.sglang.io/)
+| [**Weekly Dev Meeting**](https://meet.sglang.io/)
 | [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
 
 ## News
@@ -61,11 +61,11 @@ Its core features include:
 - **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
 
 ## Getting Started
-- [Install SGLang](https://docs.sglang.ai/get_started/install.html)
-- [Quick Start](https://docs.sglang.ai/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.ai/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.ai/developer_guide/contribution_guide.html)
+- [Install SGLang](https://docs.sglang.io/get_started/install.html)
+- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
+- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
+- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
+- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
 
 ## Benchmark and Performance
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/).

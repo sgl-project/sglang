@@ -8,7 +8,10 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "sgl-kernel"
-version = "0.3.17.post2"
+version = "0.3.19"
+authors = [
+  { name="Yineng Zhang", email="me@zhyncs.com" },
+]
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"

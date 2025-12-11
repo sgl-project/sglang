@@ -20,14 +20,14 @@ Hooks are configured via a `ServerArgs` field:
 class ServerArgs:
     ...
     # For forward hooks
-    hooks: Optional[List[dict[str, Any]]] = None
+    forward_hooks: Optional[List[dict[str, Any]]] = None
 ````
 
 In JSON form, a minimal configuration looks like:
 
 ```jsonc
 {
-  "hooks": [
+  "forward_hooks": [
     {
       "name": "outer_linear_hooks",
       "target_modules": ["outer.0", "outer.1"],
@@ -42,7 +42,7 @@ In JSON form, a minimal configuration looks like:
 
 #### Top-level fields
 
-* `hooks` (optional list of objects)
+* `forward_hooks` (optional list of objects)
   Each element is a hook spec describing:
 
   * Which modules to target
@@ -53,7 +53,7 @@ In JSON form, a minimal configuration looks like:
 
 ### Hook spec schema
 
-Each entry in `hooks` is a JSON object with the following shape:
+Each entry in `forward_hooks` is a JSON object with the following shape:
 
 ```jsonc
 {
@@ -149,16 +149,16 @@ The first two cause initialization to fail fast with a descriptive error; the la
 Hooks are registered in `ModelRunner.initialize()`:
 
 ```python
-if server_args.hooks:
-    register_hooks(self.model, server_args.hooks)
+if server_args.forward_hooks:
+    register_forward_hooks(self.model, server_args.forward_hooks)
 ```
 
-The actual registration logic is implemented by `register_hooks`:
+The actual registration logic is implemented by `register_forward_hooks`:
 
 ```python
-def register_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
+def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
-    hook_specs is a list of dicts from server_args.hooks.
+    hook_specs is a list of dicts from server_args.forward_hooks.
     Attaches forward hooks to the matching modules.
     """
     name_to_module = dict(model.named_modules())
@@ -255,7 +255,7 @@ In JSON:
 
 ```jsonc
 {
-  "hooks": [
+  "forward_hooks": [
     {
       "name": "capture_outer",
       "target_modules": ["outer.0", "outer.1"],
@@ -279,7 +279,7 @@ This will:
 
 ### Summary
 
-* Define `hooks` as a list of specs in `ServerArgs` to turn on the feature.
+* Define `forward_hooks` as a list of specs in `ServerArgs` to turn on the feature.
 
 * Each spec:
 

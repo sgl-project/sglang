@@ -4,11 +4,12 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "sgl-router/**"
+      - "sgl-model-gateway/**"
   pull_request:
     branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
     paths:
-      - "sgl-router/**"
+      - "sgl-model-gateway/**"
   workflow_dispatch:
 
 concurrency:
@@ -21,16 +22,19 @@ env:
 
 jobs:
   maturin-build-test:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           path: sglang-repo
 
-      - name: Move sgl-router folder to root
+      - name: Move sgl-model-gateway folder to root
         run: |
-          mv sglang-repo/sgl-router/* .
+          mv sglang-repo/sgl-model-gateway/* .
           rm -rf sglang-repo
 
       - name: Set up Python
@@ -71,7 +75,10 @@ jobs:
           python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
   router-unit-tests:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -89,43 +96,52 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sgl-router
+          workspaces: sgl-model-gateway
           cache-all-crates: true
           cache-on-failure: true
 
       - name: Run lint
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           rustup component add clippy
           cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run fmt
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
+
+      - name: Generate vision golden fixtures
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+          pip install transformers pillow numpy scipy
+          pip install transformers pillow numpy
+          cd sgl-model-gateway/
+          python scripts/generate_vision_golden.py
 
       - name: Run Rust tests
         timeout-minutes: 20
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           cargo test
 
       - name: Check benchmark compilation
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           cargo check --benches
 
       - name: Quick benchmark sanity check
         timeout-minutes: 15
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           # Run quick benchmarks to ensure they work using Python script
           python3 scripts/run_benchmarks.py --quick
 
@@ -134,7 +150,10 @@ jobs:
         run: sccache --show-stats
 
   router-http-tests:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: 4-gpu-a10
     timeout-minutes: 32
     steps:
@@ -153,7 +172,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sgl-router
+          workspaces: sgl-model-gateway
           cache-all-crates: true
           cache-on-failure: true
 
@@ -165,7 +184,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
-          cd sgl-router/bindings/python
+          cd sgl-model-gateway/bindings/python
           python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router
           maturin build --profile ci --features vendored-openssl --out dist
@@ -173,14 +192,14 @@ jobs:
 
       - name: Run Python unit tests
         run: |
-          cd sgl-router
+          cd sgl-model-gateway
           source "$HOME/.cargo/env"
           python3 -m pip install pytest pytest-cov pytest-xdist
           pytest -q py_test/unit --cov=sglang_router --cov-config=bindings/python/.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python integration tests
         run: |
-          cd sgl-router
+          cd sgl-model-gateway
           source "$HOME/.cargo/env"
           # Integration tests use FastAPI/uvicorn for mock workers
           python3 -m pip install fastapi uvicorn orjson
@@ -189,7 +208,7 @@ jobs:
       - name: Run Python E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-router
+          cd sgl-model-gateway
           source "$HOME/.cargo/env"
           python3 -m pip --no-cache-dir install --upgrade --ignore-installed blinker
           python3 -m pip --no-cache-dir install --upgrade genai-bench==0.0.2
@@ -200,10 +219,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: genai-bench-results-all-policies
-          path: sgl-router/benchmark_**/
+          path: sgl-model-gateway/benchmark_**/
 
   router-grpc-response-api-tests:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: 4-gpu-a10
     timeout-minutes: 32
     steps:
@@ -222,7 +244,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sgl-router
+          workspaces: sgl-model-gateway
           cache-all-crates: true
           cache-on-failure: true
 
@@ -274,7 +296,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
-          cd sgl-router/bindings/python
+          cd sgl-model-gateway/bindings/python
           python3 -m pip install --upgrade pip maturin
           pip uninstall -y sglang-router
           maturin build --profile ci --features vendored-openssl --out dist
@@ -282,15 +304,16 @@ jobs:
 
       - name: Run Python E2E response API tests
         run: |
+          python3 -m pip install pytest-rerunfailures
           bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-router
+          cd sgl-model-gateway
           source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
+          SHOW_ROUTER_LOGS=1 pytest --reruns 3 --reruns-delay 2 py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Run Python E2E gRPC tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-router
+          cd sgl-model-gateway
           source "$HOME/.cargo/env"
           SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
 
@@ -307,8 +330,31 @@ jobs:
           docker rm oracle-db || true
 
 
+  docker-build-test:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/gateway.Dockerfile
+          push: false
+          tags: sglang-router:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   finish:
-    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests]
+    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests, docker-build-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

@@ -1,15 +1,24 @@
 import abc
 import logging
 import threading
+from collections import defaultdict
 from functools import wraps
 from typing import Optional
 
 import psutil
 import torch
 
+from sglang.jit_kernel.hicache import can_use_hicache_jit_kernel
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
+)
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 if not (_is_npu or _is_xpu):
@@ -33,8 +42,6 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-SUPPORT_PIN_MEMORY = not _is_npu
-
 
 def synchronized(func):
     @wraps(func)
@@ -43,6 +50,45 @@ def synchronized(func):
             return func(self, *args, **kwargs)
 
     return wrapper
+
+
+def alloc_with_host_register(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+) -> torch.Tensor:
+    """
+    Allocate tensor and register host memory with cudaHostRegister.
+    CudaHostRegister only applies when pin_memory=True.
+    """
+    buffer = torch.empty(dims, dtype=dtype, device=device)
+    if pin_memory:
+        torch.cuda.cudart().cudaHostRegister(
+            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+        )
+    return buffer
+
+
+def alloc_with_pin_memory(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+) -> torch.Tensor:
+    """
+    Allocate tensor using PyTorch's built-in pin_memory flag.
+    """
+    buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    return buffer
+
+
+ALLOC_MEMORY_FUNCS = defaultdict(
+    lambda: alloc_with_host_register,
+    {
+        "npu": alloc_with_pin_memory,
+    },
+)
 
 
 class HostKVCache(abc.ABC):
@@ -60,7 +106,7 @@ class HostKVCache(abc.ABC):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
-        self.pin_memory = pin_memory and SUPPORT_PIN_MEMORY
+        self.pin_memory = pin_memory
         self.device = device
 
         self.dtype = device_pool.store_dtype
@@ -203,6 +249,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
         )
+        self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
+        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.element_dim * self.dtype.itemsize
+        )
+
         self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
@@ -253,15 +304,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        buffer = alloc_func(
+            dims, dtype=self.dtype, device=self.device, pin_memory=self.pin_memory
         )
-        if self.pin_memory:
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
         return buffer
 
     @property
@@ -282,15 +329,26 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_per_layer(
-                    src_k=self.k_buffer[layer_id],
-                    dst_k=device_pool.k_buffer[layer_id],
-                    src_v=self.v_buffer[layer_id],
-                    dst_v=device_pool.v_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    item_size=self.token_stride_size,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=device_pool.k_buffer[layer_id],
+                        v_cache_dst=device_pool.v_buffer[layer_id],
+                        k_cache_src=self.k_buffer[layer_id],
+                        v_cache_src=self.v_buffer[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer(
+                        src_k=self.k_buffer[layer_id],
+                        dst_k=device_pool.k_buffer[layer_id],
+                        src_v=self.v_buffer[layer_id],
+                        dst_v=device_pool.v_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        item_size=self.token_stride_size,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_pf_lf(
                     src_k=self.k_buffer,
@@ -369,16 +427,29 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_all_layer(
-                    src_k_layers=device_pool.k_data_ptrs,
-                    dst_k_layers=self.k_data_ptrs,
-                    src_v_layers=device_pool.v_data_ptrs,
-                    dst_v_layers=self.v_data_ptrs,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer(
+                        k_ptr_dst=self.k_data_ptrs,
+                        v_ptr_dst=self.v_data_ptrs,
+                        indices_dst=host_indices,
+                        k_ptr_src=device_pool.k_data_ptrs,
+                        v_ptr_src=device_pool.v_data_ptrs,
+                        indices_src=device_indices,
+                        kv_cache_dst_stride_bytes=self.token_stride_size,
+                        kv_cache_src_stride_bytes=self.token_stride_size,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer(
+                        src_k_layers=device_pool.k_data_ptrs,
+                        dst_k_layers=self.k_data_ptrs,
+                        src_v_layers=device_pool.v_data_ptrs,
+                        dst_v_layers=self.v_data_ptrs,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_all_layer_lf_pf(
                     src_k_layers=device_pool.k_data_ptrs,
@@ -629,7 +700,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             )
-        # Ascend-specific: Aligns with AscendMLAPagedTokenToKVPool layout
+        # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
         elif self.layout == "page_first_kv_split":
             base_dims = (
@@ -638,15 +709,18 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.page_size,
                 1,
             )
-            self.k_buffer = torch.empty(
+            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            self.k_buffer = alloc_func(
                 (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=self.pin_memory,
             )
-            self.v_buffer = torch.empty(
+            self.v_buffer = alloc_func(
                 (*base_dims, self.qk_rope_head_dim),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=self.pin_memory,
             )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
@@ -657,15 +731,11 @@ class MLATokenToKVPoolHost(HostKVCache):
             self.kv_lora_rank + self.qk_rope_head_dim
         ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        buffer = torch.empty(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        buffer = alloc_func(
+            dims, dtype=self.dtype, device=self.device, pin_memory=self.pin_memory
         )
-        if self.pin_memory:
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
         return buffer
 
     def load_to_device_per_layer(

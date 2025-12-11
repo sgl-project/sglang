@@ -7,17 +7,11 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
-try:
-    from sgl_kernel import fused_marlin_moe
-
-    FUSED_MARLIN_MOE_AVAILABLE = True
-except ImportError:
-    FUSED_MARLIN_MOE_AVAILABLE = False
-
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -56,15 +50,7 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
 
-if _is_cuda:
-    from sgl_kernel import fused_marlin_moe
-
 logger = logging.getLogger(__name__)
-
-
-def _mask_topk_ids_cpu_experts(topk_ids: torch.Tensor, num_gpu_experts: int):
-    """Mask topk_ids >= num_gpu_experts by setting them to -1."""
-    topk_ids[topk_ids >= num_gpu_experts] = -1
 
 
 class GPTQMarlinState(Enum):
@@ -96,8 +82,8 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
         weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
-        if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
 
+        if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
@@ -117,7 +103,28 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             "input_activations"
         )
 
+        per_tensor = (
+            self.weight_quant.strategy == QuantizationStrategy.TENSOR
+            and self.input_quant.strategy == QuantizationStrategy.TENSOR
+        )
+        per_channel = (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        )
+        if not (per_tensor or per_channel):
+            assert self.weight_quant.strategy == QuantizationStrategy.BLOCK
+            self.weight_block_size = self.weight_quant.block_structure
+            assert self.weight_quant.dynamic is not None
+        else:
+            self.weight_block_size = None
+        self.block_quant = self.weight_block_size is not None
+
         self.static_input_scales = not self.input_quant.dynamic
+        if self.static_input_scales and per_channel:
+            raise ValueError(
+                "For FP8 Fused MoE layer, we require either per tensor or "
+                "channelwise, dynamic per token quantization."
+            )
 
     def create_weights(
         self,
@@ -131,6 +138,32 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.float8_e4m3fn
+
+        if self.block_quant:
+            assert self.weight_block_size is not None
+            layer.weight_block_size = self.weight_block_size
+            tp_size = get_tensor_model_parallel_world_size()
+            block_n, block_k = (
+                self.weight_block_size[0],
+                self.weight_block_size[1],
+            )
+            # NOTE: To ensure proper alignment of the block-wise quantization
+            # scales, the output_size of the weights for both the gate and up
+            # layers must be divisible by block_n.
+            # Required by column parallel or enabling merged weights
+            if intermediate_size_per_partition % block_n != 0:
+                raise ValueError(
+                    f"The output_size of gate's and up's weight = "
+                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
+            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
+                # Required by row parallel
+                raise ValueError(
+                    f"The input_size of down's weight = "
+                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"weight quantization block_k = {block_k}."
+                )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -184,6 +217,26 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
             weight_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    (hidden_size + block_n - 1) // block_n,
+                    (intermediate_size_per_partition + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            weight_quant_method = FusedMoeWeightScaleSupported.BLOCK.value
         else:
             raise ValueError(
                 f"Unsupported weight quantization strategy: {self.weight_quant.strategy}"
@@ -358,6 +411,18 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
             )
             return StandardCombineInput(hidden_states=output)
+        elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8_w8a8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.weight_block_size,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -635,7 +700,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
@@ -647,6 +714,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         topk_weights, topk_ids, router_logits = topk_output
 
+        # Get expert_map for EP support
+        expert_map = None
+        global_num_experts = -1
+        if hasattr(layer, "dispatcher") and hasattr(
+            layer.dispatcher, "local_expert_mapping"
+        ):
+            expert_map = layer.dispatcher.local_expert_mapping
+            if expert_map is not None:
+                global_num_experts = self.moe_runner_config.num_experts
+
         output = fused_marlin_moe(
             x,
             layer.w13_weight_packed,
@@ -656,13 +733,14 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             router_logits,
             topk_weights,
             topk_ids,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
             g_idx1=layer.w13_weight_g_idx,
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
-            expert_map=torch.empty(1, device=x.device),
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)
