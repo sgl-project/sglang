@@ -94,7 +94,6 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -828,8 +827,6 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
-                final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
@@ -902,13 +899,6 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_output,
         )
-        if (
-            not _is_cuda
-            and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
-            # fused in biased_grouped_topk so we can skip here
-            final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states += shared_output
         if (
@@ -1129,15 +1119,7 @@ class DeepseekV2MoE(nn.Module):
         ):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
-            x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-                final_hidden_states *= self.routed_scaling_factor
+            final_hidden_states = shared_output + final_hidden_states
 
         return final_hidden_states
 
@@ -1228,11 +1210,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
         if (shared_output := state.pop("shared_output")) is not None:
-            x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            final_hidden_states *= self.routed_scaling_factor
+            final_hidden_states = shared_output + final_hidden_states
 
         state.hidden_states_mlp_output = final_hidden_states
 

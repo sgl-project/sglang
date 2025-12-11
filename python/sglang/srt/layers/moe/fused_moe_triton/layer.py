@@ -275,6 +275,41 @@ class FusedMoE(torch.nn.Module):
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
 
+    def _maybe_apply_routed_scaling_factor_to_output(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply routed scaling factor (if needed) inside the MoE module.
+
+        Historically, some call sites applied `routed_scaling_factor` outside the
+        MoE layer for specific backends (e.g. CPU paths or KT wrapper).
+        This helper centralizes that logic inside the MoE module.
+        """
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+        if routed_scaling_factor is None or routed_scaling_factor == 1.0:
+            return hidden_states
+
+        # If the scaling factor has already been fused into TopK weights for the
+        # current backend, do not apply it again here.
+        if self.should_fuse_routed_scaling_factor_in_topk:
+            return hidden_states
+
+        # If no_combine is enabled, this output may not be the final combined
+        # hidden states, so do not apply scaling here.
+        if self.moe_runner_config.no_combine:
+            return hidden_states
+
+        # NOTE: For most GPU runners, routed scaling is handled internally by
+        # the runner kernels. The remaining cases historically required the
+        # scaling to be applied at the Python layer.
+        if (
+            _is_cpu
+            or (_is_hip and not _use_aiter)
+            or isinstance(self.quant_method, KTEPWrapperMethod)
+        ):
+            return hidden_states * routed_scaling_factor
+
+        return hidden_states
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -914,6 +949,10 @@ class FusedMoE(torch.nn.Module):
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        final_hidden_states = self._maybe_apply_routed_scaling_factor_to_output(
+            final_hidden_states
+        )
 
         return final_hidden_states
 

@@ -168,6 +168,8 @@ class DeepEPMoE(FusedMoE):
             combine_input=combine_input,
         )
 
+        hidden_states = self._maybe_apply_routed_scaling_factor_to_output(hidden_states)
+
         return hidden_states
 
     def dispatch(

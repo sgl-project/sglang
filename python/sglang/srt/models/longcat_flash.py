@@ -256,6 +256,7 @@ class LongcatFlashMoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -279,7 +280,6 @@ class LongcatFlashMoE(nn.Module):
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        final_hidden_states *= self.routed_scaling_factor
 
         if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)

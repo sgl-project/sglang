@@ -172,6 +172,7 @@ class NemotronHMoE(nn.Module):
             activation=config.mlp_hidden_act,
             layer_id=layer_idx,
             is_gated=False,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -233,13 +234,6 @@ class NemotronHMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         final_hidden_states, shared_output = self._forward_core(hidden_states)
-
-        # Fix FP16 overflow
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states *= self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            assert shared_output is not None
-            shared_output *= 1.0 / self.routed_scaling_factor
 
         if shared_output is not None:
             final_hidden_states += shared_output
