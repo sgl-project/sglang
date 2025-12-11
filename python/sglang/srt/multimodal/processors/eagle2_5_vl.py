@@ -9,7 +9,6 @@ References:
 - Config: https://huggingface.co/nvidia/Eagle2.5-8B/blob/main/config.json
 """
 
-import os
 import re
 import time
 from typing import Any
@@ -31,9 +30,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import logger
 
 
-
 # Eagle2.5 video preprocessing (adapted from Qwen-VL)
-async def preprocess_eagle_video(vr, video_config: dict = {}) -> tuple[torch.Tensor, dict]:
+async def preprocess_eagle_video(
+    vr, video_config: dict = {}
+) -> tuple[torch.Tensor, dict]:
     """
     Preprocess video for Eagle2.5 model (adapted from Qwen-VL).
 
@@ -59,14 +59,13 @@ async def preprocess_eagle_video(vr, video_config: dict = {}) -> tuple[torch.Ten
     video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
 
-
     # Convert frame indices to time in seconds
     timestamps = (idx / video_fps).tolist()
 
     # Create metadata
     video_metadata = {
         "fps": video_fps,
-        "timestamps": timestamps,    
+        "timestamps": timestamps,
         "duration": total_frames / video_fps,
         "total_num_frames": total_frames,
         "video_backend": "torchvision",
@@ -169,7 +168,7 @@ class Eagle2_5_VLProcessor(BaseMultimodalProcessor):
                 for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
-            
+
             # Eagle2.5 specific kwargs
             videos_kwargs = {
                 "fps": [m["fps"] for m in video_metadata],
