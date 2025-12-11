@@ -566,7 +566,6 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             // Clone the worker Arc for the async block instead of looking it up again
             let stream_worker = worker.clone();
-            let worker_url_owned = worker_url.to_string();
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
