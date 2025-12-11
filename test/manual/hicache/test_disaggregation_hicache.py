@@ -4,7 +4,6 @@ import tempfile
 import time
 import unittest
 from typing import Dict
-from urllib.parse import urlparse
 
 import requests
 
@@ -13,7 +12,6 @@ from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     popen_launch_pd_server,
 )
 
