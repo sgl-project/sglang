@@ -189,7 +189,7 @@ class ModelSlimConfig(QuantizationConfig):
                 ModelSlimLinearMethod(self)
             )
         elif isinstance(layer, FusedMoE):
-            return ModelSlimMoeMethod.get_moe_method(self, layer, prefix)
+            return ModelSlimMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     def _get_scheme_from_parts(

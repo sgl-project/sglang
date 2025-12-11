@@ -107,26 +107,10 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
             layer.register_parameter("deq_scale", deq_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight.data = npu_format_cast(layer.weight.data)
-
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
-
-        if not self.is_dynamic:
-            expanding_factor = layer.weight.data.shape[0]
-            layer.aclnn_input_scale = torch.nn.Parameter(
-                layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
-                requires_grad=False,
-            )
-            layer.aclnn_input_scale_reciprocal = 1 / torch.nn.Parameter(
-                layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
-                requires_grad=False,
-            )
-            layer.aclnn_input_offset = torch.nn.Parameter(
-                layer.input_offset.data.repeat(expanding_factor).to(device="npu"),
-                requires_grad=False,
-            )
+        if self.is_dynamic:
+            NPUW8A8Int8DynamicLinearMethod.process_weights_after_loading(layer)
+        else:
+            NPUW8A8Int8LinearMethod.process_weights_after_loading(layer)
     
     def apply_weights(
         self,

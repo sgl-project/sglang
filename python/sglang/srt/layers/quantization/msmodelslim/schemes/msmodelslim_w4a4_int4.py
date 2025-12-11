@@ -30,7 +30,6 @@ class ModelSlimW4A4Int4(ModelSlimScheme):
         self, quant_config: Dict[str, any], prefix: str,
     ):
         self.quant_config = quant_config
-        self.transpose_weight = True
         self.is_dynamic = (
             self.quant_config[prefix + ".weight"]
             == "W4A4_DYNAMIC"
@@ -77,14 +76,7 @@ class ModelSlimW4A4Int4(ModelSlimScheme):
             set_weight_attrs(param, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if self.transpose_weight:
-            layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
-        layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
-            layer.weight.data.to(torch.int32)
-        )
+        NPU_W4A4DynamicLinearMethod.process_weights_after_loading(layer)
     
     def apply_weights(
         self,
