@@ -6,6 +6,8 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 QWEN3_235B_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 PROFILE_DIR = "performance_profiles_qwen3_235b"
+# Qwen3 uses the qwen parser for tool calling
+TOOL_CALL_PARSER = "qwen"
 
 
 class TestNightlyQwen3235BPerformance(unittest.TestCase):
@@ -28,18 +30,25 @@ class TestNightlyQwen3235BPerformance(unittest.TestCase):
         cls.runner.setup_profile_directory()
 
     def test_bench_one_batch(self):
-        results, success = self.runner.run_benchmark_for_model(
-            model_path=self.model,
-            batch_sizes=self.batch_sizes,
-            input_lens=self.input_lens,
-            output_lens=self.output_lens,
-            other_args=self.other_args,
+        # Run combined perf + tool call benchmark (single server launch)
+        perf_results, tool_results, perf_ok, tool_ok = (
+            self.runner.run_perf_and_tool_call_benchmark(
+                model_path=self.model,
+                batch_sizes=self.batch_sizes,
+                input_lens=self.input_lens,
+                output_lens=self.output_lens,
+                other_args=self.other_args,
+                tool_call_parser=TOOL_CALL_PARSER,
+            )
         )
 
-        self.runner.add_report(results)
+        self.runner.add_report(perf_results)
+        if tool_results:
+            self.runner.add_tool_call_report(tool_results)
         self.runner.write_final_report()
 
-        if not success:
+        # Fail at end if ANY test failed
+        if not perf_ok or not tool_ok:
             raise AssertionError(
                 f"Benchmark failed for {self.model}. Check the logs for details."
             )
