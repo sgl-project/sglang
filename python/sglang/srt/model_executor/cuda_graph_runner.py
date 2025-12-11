@@ -832,16 +832,18 @@ class CudaGraphRunner:
             graph_key = self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
+
         if isinstance(output, LogitsProcessorOutput):
+            if self.is_dllm:
+                next_token_logits = None
+                full_logits = output.full_logits[: self.raw_num_token]
+            else:
+                full_logits = None
+                next_token_logits = output.next_token_logits[: self.raw_num_token]
+
             return LogitsProcessorOutput(
-                next_token_logits=(
-                    output.next_token_logits[: self.raw_num_token]
-                    if not self.is_dllm
-                    else None
-                ),
-                full_logits=(
-                    output.full_logits[: self.raw_num_token] if self.is_dllm else None
-                ),
+                next_token_logits=next_token_logits,
+                full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
