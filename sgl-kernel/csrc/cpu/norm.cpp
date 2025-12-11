@@ -366,7 +366,7 @@ void fused_add_layernorm_kernel_impl(
           x_val += r_val;
           residual_ptr[d] = static_cast<scalar_t>(x_val);
         }
-        
+
         sum_val += x_val;
         sum_sq_val += x_val * x_val;
         buffer_ptr[d] = x_val;
