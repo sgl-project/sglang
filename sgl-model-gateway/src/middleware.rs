@@ -334,6 +334,7 @@ impl<B> OnResponse<B> for ResponseLogger {
         let status = response.status();
         let status_code = status.as_u16();
 
+        // TODO support `route` information
         RouterMetrics::record_http_status_code(status_code);
         RouterMetrics::record_request_duration(latency);
 
