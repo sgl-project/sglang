@@ -30,8 +30,6 @@ class TestFlashinferTrtllmGenMoeBackendFP8(CustomTestCase):
                 "triton",
                 "--moe-runner-backend",
                 "flashinfer_trtllm",
-                "--cuda-graph-max-bs",
-                "512",
                 "--tp-size",
                 "4",
                 "--ep-size",
@@ -40,8 +38,6 @@ class TestFlashinferTrtllmGenMoeBackendFP8(CustomTestCase):
                 "0.7",
                 "--mamba-ssm-dtype",
                 "bfloat16",
-                "--quantization",
-                "fp8",
             ],
         )
 

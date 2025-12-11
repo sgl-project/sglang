@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4DynamicMoEMethod,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -347,7 +350,9 @@ class DeepEPMoE(FusedMoE):
                 )
             else:
                 input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
-                if not input_quant and self.w13_weight.dtype != torch.int32:
+                if not input_quant and not isinstance(
+                    self.quant_method, NPUW4A16Int4DynamicMoEMethod
+                ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
                         hidden_states
                     )
