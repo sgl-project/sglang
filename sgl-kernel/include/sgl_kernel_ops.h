@@ -138,6 +138,8 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 // Device LayerNorm and fused LayerNorm+ScaleShift (CUTLASS-based)
 torch::Tensor fused_layernorm_scale_shift(
     torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, torch::Tensor scale, torch::Tensor shift);
+torch::Tensor fused_layernorm_scale_shift_no_affine(
+    torch::Tensor x, torch::Tensor scale, torch::Tensor shift);
 
 // LayerNorm fused with residual + gate (gate shapes: [M,N], [B,1,N], or [B,F,1,N]) and then scale/shift ([M,N] or
 // [B,F,1,N])

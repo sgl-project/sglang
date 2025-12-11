@@ -250,6 +250,95 @@ __global__ void layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
   }
 }
 
+// Fused LayerNorm + scale/shift without affine weights (gamma/beta).
+// This is equivalent to setting gamma = 1 and beta = 0 in the standard LayerNorm.
+template<typename T4, typename T, int ITEM_PER_THREAD>
+__global__ void layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine(
+                                                       T4* output,
+                                                       const T4* input,
+                                                       const T4* scale,
+                                                       const T4* shift,
+                                                       const int m,
+                                                       const int n)
+{
+  const int m_idx = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int bdimx = blockDim.x;
+  __shared__ float s_mean, s_variance;
+  float local_sums[1] = {0.0f};
+  T4 local_val[ITEM_PER_THREAD];
+  const int n_4 = n / 4;
+  int offset = m_idx * n_4;
+  input  += offset;
+  output += offset;
+  scale  += offset;
+  shift  += offset;
+
+  const T4 zero = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
+  #pragma unroll
+  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+    const int index = i * bdimx + tid;
+    local_val[i] = index < n_4 ? input[index] : zero;
+    local_sums[0] += static_cast<float>(local_val[i].x) + static_cast<float>(local_val[i].y) +
+                     static_cast<float>(local_val[i].z) + static_cast<float>(local_val[i].w);
+  }
+
+  if (blockDim.x <= 32) {
+    warpReduceSum<float, 1>(local_sums);
+  } else {
+    blockReduceSum<float, 1>(local_sums);
+  }
+  if (threadIdx.x == 0) {
+    s_mean = local_sums[0] / n;
+  }
+  __syncthreads();
+
+  local_sums[0] = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+    const int index = i * bdimx + tid;
+    if (index < n_4){
+      const float4 tmp = {static_cast<float>(local_val[i].x) - s_mean,
+                          static_cast<float>(local_val[i].y) - s_mean,
+                          static_cast<float>(local_val[i].z) - s_mean,
+                          static_cast<float>(local_val[i].w) - s_mean};
+      local_sums[0] += tmp.x * tmp.x + tmp.y * tmp.y + tmp.z * tmp.z + tmp.w * tmp.w;
+    }
+  }
+  if (blockDim.x <= 32) {
+    warpReduceSum<float, 1>(local_sums);
+  } else {
+    blockReduceSum<float, 1>(local_sums);
+  }
+  if (threadIdx.x == 0) {
+    s_variance = rsqrtf(local_sums[0] / n + 1e-5f);
+  }
+  __syncthreads();
+
+  #pragma unroll
+  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+    const int index = i * bdimx + tid;
+    if (index < n_4){
+      const T4 scale_val = scale[index];
+      const T4 shift_val = shift[index];
+      T4 tmp;
+      tmp.x = T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance) *
+                    (1.0f + static_cast<float>(scale_val.x)) +
+                static_cast<float>(shift_val.x));
+      tmp.y = T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance) *
+                    (1.0f + static_cast<float>(scale_val.y)) +
+                static_cast<float>(shift_val.y));
+      tmp.z = T(((static_cast<float>(local_val[i].z) - s_mean) * s_variance) *
+                    (1.0f + static_cast<float>(scale_val.z)) +
+                static_cast<float>(shift_val.z));
+      tmp.w = T(((static_cast<float>(local_val[i].w) - s_mean) * s_variance) *
+                    (1.0f + static_cast<float>(scale_val.w)) +
+                static_cast<float>(shift_val.w));
+      output[index] = tmp;
+    }
+  }
+}
+
 // 4D scale/shift variant: scale/shift shape [B, F, 1, N]
 template <typename T4, typename T, int ITEM_PER_THREAD>
 __global__ void layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
@@ -357,6 +446,7 @@ __global__ void layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
     }
   }
 }
+
 
 template <typename T>
 static void layernorm_fused_scale_shift_launch(
@@ -629,6 +719,183 @@ static void layernorm_fused_scale_shift_launch(
   }
 }
 
+template <typename T>
+static void layernorm_fused_scale_shift_no_affine_launch(
+    const torch::Tensor& x,
+    const torch::Tensor& scale,
+    const torch::Tensor& shift,
+    torch::Tensor& y) {
+  const int64_t M = x.size(0);
+  const int64_t N = x.size(1);
+  dim3 grid((unsigned)M);
+  TORCH_CHECK((N % 4) == 0, "N must be divisible by 4");
+  dim3 block(0);
+  const bool use_2d = (scale.dim() == 2 && shift.dim() == 2);
+  TORCH_CHECK(
+      use_2d,
+      "scale/shift must be 2D [M, N] for fused_layernorm_scale_shift_no_affine");
+
+  if (use_2d) {
+    if (N <= 4096) {
+      block.x = (int)((N / 4 + 31) / 32 * 32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<float4, float, 1>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (float4*)y.data_ptr(),
+                (const float4*)x.data_ptr(),
+                (const float4*)scale.data_ptr(),
+                (const float4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<bf16_4, cutlass::bfloat16_t, 1>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (bf16_4*)y.data_ptr(),
+                (const bf16_4*)x.data_ptr(),
+                (const bf16_4*)scale.data_ptr(),
+                (const bf16_4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<half4, half, 1>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (half4*)y.data_ptr(),
+                (const half4*)x.data_ptr(),
+                (const half4*)scale.data_ptr(),
+                (const half4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      }
+    } else if (N <= 8192) {
+      block.x = (int)(((N + 7) / 8 + 31) / 32 * 32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<float4, float, 8>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (float4*)y.data_ptr(),
+                (const float4*)x.data_ptr(),
+                (const float4*)scale.data_ptr(),
+                (const float4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<bf16_4, cutlass::bfloat16_t, 8>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (bf16_4*)y.data_ptr(),
+                (const bf16_4*)x.data_ptr(),
+                (const bf16_4*)scale.data_ptr(),
+                (const bf16_4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<half4, half, 8>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (half4*)y.data_ptr(),
+                (const half4*)x.data_ptr(),
+                (const half4*)scale.data_ptr(),
+                (const half4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      }
+    } else if (N <= 16384) {
+      block.x = (int)(((N + 15) / 16 + 31) / 32 * 32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<float4, float, 4>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (float4*)y.data_ptr(),
+                (const float4*)x.data_ptr(),
+                (const float4*)scale.data_ptr(),
+                (const float4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<bf16_4, cutlass::bfloat16_t, 4>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (bf16_4*)y.data_ptr(),
+                (const bf16_4*)x.data_ptr(),
+                (const bf16_4*)scale.data_ptr(),
+                (const bf16_4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<half4, half, 4>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (half4*)y.data_ptr(),
+                (const half4*)x.data_ptr(),
+                (const half4*)scale.data_ptr(),
+                (const half4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      }
+    } else if (N <= 32768) {
+      block.x = (int)(((N + 31) / 32 + 31) / 32 * 32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<float4, float, 8>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (float4*)y.data_ptr(),
+                (const float4*)x.data_ptr(),
+                (const float4*)scale.data_ptr(),
+                (const float4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<bf16_4, cutlass::bfloat16_t, 8>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (bf16_4*)y.data_ptr(),
+                (const bf16_4*)x.data_ptr(),
+                (const bf16_4*)scale.data_ptr(),
+                (const bf16_4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<half4, half, 8>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (half4*)y.data_ptr(),
+                (const half4*)x.data_ptr(),
+                (const half4*)scale.data_ptr(),
+                (const half4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      }
+    } else {
+      block.x = (int)(((N + 63) / 64 + 31) / 32 * 32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<float4, float, 16>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (float4*)y.data_ptr(),
+                (const float4*)x.data_ptr(),
+                (const float4*)scale.data_ptr(),
+                (const float4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<bf16_4, cutlass::bfloat16_t, 16>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (bf16_4*)y.data_ptr(),
+                (const bf16_4*)x.data_ptr(),
+                (const bf16_4*)scale.data_ptr(),
+                (const bf16_4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift_no_affine<half4, half, 16>
+            <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                (half4*)y.data_ptr(),
+                (const half4*)x.data_ptr(),
+                (const half4*)scale.data_ptr(),
+                (const half4*)shift.data_ptr(),
+                (int)M,
+                (int)N);
+      }
+    }
+    return;
+  }
+}
+
 torch::Tensor fused_layernorm_scale_shift(torch::Tensor x,
                                           torch::Tensor gamma,
                                           torch::Tensor beta,
@@ -673,6 +940,50 @@ torch::Tensor fused_layernorm_scale_shift(torch::Tensor x,
     layernorm_fused_scale_shift_launch<cutlass::half_t>(x, gamma, beta, scale, shift, y);
   } else if (x.dtype() == torch::kBFloat16) {
     layernorm_fused_scale_shift_launch<cutlass::bfloat16_t>(x, gamma, beta, scale, shift, y);
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
+  }
+  return y;
+}
+
+torch::Tensor fused_layernorm_scale_shift_no_affine(torch::Tensor x,
+                                                    torch::Tensor scale,
+                                                    torch::Tensor shift) {
+  CHECK_CUDA(x);
+  CHECK_CUDA(scale);
+  CHECK_CUDA(shift);
+  TORCH_CHECK(x.dim() == 2, "x must be 2D [M, N]");
+  TORCH_CHECK(x.stride(-1) == 1, "last dim of x must be contiguous (stride 1)");
+  TORCH_CHECK(
+      x.dtype() == scale.dtype() && x.dtype() == shift.dtype(),
+      "x, scale, shift must have same dtype");
+  const int64_t M = x.size(0);
+  const int64_t N = x.size(1);
+  if (scale.dim() == 2 && shift.dim() == 2) {
+    TORCH_CHECK(
+        scale.size(0) == M && scale.size(1) == N,
+        "scale must be shape [M, N]");
+    TORCH_CHECK(
+        shift.size(0) == M && shift.size(1) == N,
+        "shift must be shape [M, N]");
+    TORCH_CHECK(
+        scale.stride(-1) == 1 && shift.stride(-1) == 1,
+        "last dim of scale/shift must be contiguous (stride 1)");
+  } else {
+    TORCH_CHECK(
+        false,
+        "scale/shift must be 2D [M, N] for fused_layernorm_scale_shift_no_affine");
+  }
+
+  auto y = torch::empty_like(x);
+  if (x.dtype() == torch::kFloat32) {
+    layernorm_fused_scale_shift_no_affine_launch<float>(x, scale, shift, y);
+  } else if (x.dtype() == torch::kFloat16) {
+    layernorm_fused_scale_shift_no_affine_launch<cutlass::half_t>(
+        x, scale, shift, y);
+  } else if (x.dtype() == torch::kBFloat16) {
+    layernorm_fused_scale_shift_no_affine_launch<cutlass::bfloat16_t>(
+        x, scale, shift, y);
   } else {
     TORCH_CHECK(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
   }
