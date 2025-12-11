@@ -714,6 +714,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         topk_weights, topk_ids, router_logits = topk_output
 
+        # Get expert_map for EP support
+        expert_map = None
+        global_num_experts = -1
+        if hasattr(layer, "dispatcher") and hasattr(
+            layer.dispatcher, "local_expert_mapping"
+        ):
+            expert_map = layer.dispatcher.local_expert_mapping
+            if expert_map is not None:
+                global_num_experts = self.moe_runner_config.num_experts
+
         output = fused_marlin_moe(
             x,
             layer.w13_weight_packed,
@@ -723,6 +733,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             router_logits,
             topk_weights,
             topk_ids,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
             g_idx1=layer.w13_weight_g_idx,
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,

@@ -737,7 +737,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.18.post2",
+            "0.3.19",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -782,14 +782,14 @@ def _init_tokenizer_manager(
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+) -> Tuple[TokenizerManager, TemplateManager, Dict, PortArgs]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
     # Configure global environment
     configure_logger(server_args)
-    server_args.check_server_args()
     _set_envs_and_config(server_args)
+    server_args.check_server_args()
 
     # Allocate ports for inter-process communications
     if port_args is None:

@@ -146,7 +146,7 @@ class InputValidationStage(PipelineStage):
         elif isinstance(server_args.pipeline_config, WanI2V480PConfig):
             # TODO: could we merge with above?
             # resize image only, Wan2.1 I2V
-            max_area = 720 * 1280
+            max_area = server_args.pipeline_config.max_area
             aspect_ratio = condition_image_height / condition_image_width
             mod_value = (
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
@@ -219,6 +219,17 @@ class InputValidationStage(PipelineStage):
                 batch, server_args, condition_image_width, condition_image_height
             )
 
+        # if height or width is not specified at this point, set default to 720p
+        default_height = 720
+        default_width = 1080
+        if batch.height is None and batch.width is None:
+            batch.height = default_height
+            batch.width = default_width
+        elif batch.height is None:
+            batch.height = batch.width * default_height // default_width
+        elif batch.width is None:
+            batch.width = batch.height * default_width // default_height
+
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -251,6 +262,7 @@ class InputValidationStage(PipelineStage):
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
         # Validate height and width
+
         if batch.height % 8 != 0 or batch.width % 8 != 0:
             raise ValueError(
                 f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
