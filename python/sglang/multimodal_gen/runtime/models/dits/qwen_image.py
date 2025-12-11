@@ -452,11 +452,6 @@ class QwenImageTransformerBlock(nn.Module):
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
-    def _modulate(self, x, mod_params):
-        """Apply modulation to input tensor"""
-        shift, scale, gate = mod_params.chunk(3, dim=-1)
-        return fuse_scale_shift_kernel(x, scale, shift), gate.unsqueeze(1)
-
     def forward(
         self,
         hidden_states: torch.Tensor,

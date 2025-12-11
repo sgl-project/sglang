@@ -461,10 +461,36 @@ class LayerNormScaleShift(nn.Module):
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
+    def _get_arg(
+        self,
+        t: torch.Tensor,
+        x: torch.Tensor,
+        B: int,
+        L: int,
+        C: int,
+        M: int,
+    ) -> torch.Tensor:
+        if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
+            return t.reshape(1).to(dtype=x.dtype, device=x.device)
+        elif t.dim() == 2 or t.dim() == 3:
+            return (
+                t.expand(B, L, C)
+                .contiguous()
+                .view(M, C)
+                .to(dtype=x.dtype, device=x.device)
+            )
+        elif t.dim() == 4:
+            return t.contiguous().to(dtype=x.dtype, device=x.device)
+        else:
+            raise ValueError(
+                f"Scale/shift tensor dimension {t.dim()} not supported"
+            )
+
     def forward(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
+
         can_use_cuda = (
             x.is_cuda
             and self.norm_type == "layer"
@@ -476,34 +502,30 @@ class LayerNormScaleShift(nn.Module):
             M = B * L
             x_2d = x.contiguous().view(-1, C)
 
-            if self.norm.weight is not None:
-                gamma = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
-            else:
-                gamma = torch.ones(C, device=x.device, dtype=x.dtype)
-            if self.norm.bias is not None:
-                beta = self.norm.bias.contiguous().to(dtype=x.dtype, device=x.device)
-            else:
-                beta = torch.zeros(C, device=x.device, dtype=x.dtype)
 
-            def get_arg(t):
-                if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
-                    return t.reshape(1).to(dtype=x.dtype, device=x.device)
-                elif t.dim() == 2 or t.dim() == 3:
-                    return (
-                        t.expand(B, L, C)
-                        .contiguous()
-                        .view(M, C)
-                        .to(dtype=x.dtype, device=x.device)
-                    )
-                elif t.dim() == 4:
-                    return t.contiguous().to(dtype=x.dtype, device=x.device)
-                else:
-                    raise ValueError(
-                        f"Scale/shift tensor dimension {t.dim()} not supported"
-                    )
+            if getattr(self.norm, "weight", None) is None and getattr(self.norm, "bias", None) is None:
 
-            scale_arg = get_arg(scale)
-            shift_arg = get_arg(shift)
+                if scale.dim() == 4 or shift.dim() == 4:
+                    raise ValueError("Only 2D scale/shift are supported by the no_affine kernel. ")
+
+                scale_arg = self._get_arg(scale, x, B, L, C, M)
+                shift_arg = self._get_arg(shift, x, B, L, C, M)
+
+                y_2d = sgl_kernel.fused_layernorm_scale_shift_no_affine(
+                    x_2d, scale_arg, shift_arg
+                )
+                return y_2d.view(B, L, C)
+
+            # Standard path: use affine LayerNorm + fused scale/shift kernel.
+            gamma = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
+            beta = (
+                self.norm.bias.contiguous().to(dtype=x.dtype, device=x.device)
+                if self.norm.bias is not None
+                else torch.zeros(C, device=x.device, dtype=x.dtype)
+            )
+
+            scale_arg = self._get_arg(scale, x, B, L, C, M)
+            shift_arg = self._get_arg(shift, x, B, L, C, M)
 
             y_2d = sgl_kernel.fused_layernorm_scale_shift(
                 x_2d, gamma, beta, scale_arg, shift_arg
