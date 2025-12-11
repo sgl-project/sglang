@@ -19,12 +19,16 @@ class DraftBackendFactory:
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.speculative_draft_attention_backend = (
+            server_args.speculative_draft_attention_backend
+        )
 
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
     ):
-        draft_attn_backend_override = os.environ.get(
-            "SGLANG_DRAFTER_ATTN_BACKEND", None
+        draft_attn_backend_override = (
+            os.environ.get("SGLANG_SPEC_DRAFT_ATTN_BACKEND", None)
+            or self.speculative_draft_attention_backend
         )
         backend_type = (
             draft_attn_backend_override

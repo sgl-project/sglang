@@ -2062,8 +2062,9 @@ class ModelRunner:
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
-        draft_attn_backend_override = os.environ.get(
-            "SGLANG_DRAFTER_ATTN_BACKEND", None
+        draft_attn_backend_override = (
+            os.environ.get("SGLANG_SPEC_DRAFT_ATTN_BACKEND", None)
+            or self.server_args.speculative_draft_attention_backend
         )
         if self.is_draft_worker and draft_attn_backend_override:
             logger.warning(
