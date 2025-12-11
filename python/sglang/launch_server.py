@@ -15,6 +15,7 @@ def run_server(server_args):
 
         asyncio.run(serve_grpc(server_args))
     else:
+        # Default mode: HTTP mode.
         from sglang.srt.entrypoints.http_server import launch_server
 
         launch_server(server_args)

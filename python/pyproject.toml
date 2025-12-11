@@ -69,7 +69,7 @@ dependencies = [
   "torchvision",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==5.0.0rc0",
+  "transformers==4.57.1",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
@@ -104,6 +104,7 @@ vsa = ["torch", "setuptools"]
 
 test = [
   "accelerate",
+  "bitsandbytes",
   "expecttest",
   "jsonlines",
   "matplotlib",
