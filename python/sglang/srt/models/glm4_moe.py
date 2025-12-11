@@ -264,6 +264,8 @@ class Glm4MoeAttention(nn.Module):
             and self.head_dim in (64, 128, 256)
         )
         self._used_fused_qk_norm_rope_last_call = False
+        self.compatible_with_fused_kv_buffer = True
+
         if self.use_fused_qk_norm_rope:
             self.factor, self.low, self.high, self.attention_factor = (
                 compute_yarn_parameters(self.config)
