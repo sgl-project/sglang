@@ -45,6 +45,7 @@ import time
 import traceback
 import types
 import uuid
+import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1002,6 +1003,26 @@ def encode_video(video_path, frame_count_limit=None):
     frames = vr.get_batch(frame_indices).asnumpy()
     frames = [Image.fromarray(v.astype("uint8")) for v in frames]
     return frames
+
+
+def suppress_other_loggers():
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
+
+    try:
+        from vllm.logger import logger as vllm_default_logger
+    except ImportError:
+        return
+
+    vllm_default_logger.setLevel(logging.WARN)
+    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
+        logging.WARN
+    )
+    logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
+        logging.WARN
+    )
+    logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
