@@ -73,7 +73,7 @@ class TestEmbeddingModels(CustomTestCase):
         torch_dtype,
         prefill_tolerance,
         matryoshka_dim: Optional[int] = None,
-        enable_embedding_schedule_overlap: bool = False,
+        enable_non_generation_schedule_overlap: bool = False,
     ) -> None:
         truncated_prompts = self._truncate_prompts(prompts, model_path)
 
@@ -95,7 +95,7 @@ class TestEmbeddingModels(CustomTestCase):
             json_model_override_args=(
                 {"matryoshka_dimensions": [matryoshka_dim]} if matryoshka_dim else None
             ),
-            enable_embedding_schedule_overlap=enable_embedding_schedule_overlap,
+            enable_non_generation_schedule_overlap=enable_non_generation_schedule_overlap,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 truncated_prompts, dimensions=matryoshka_dim
@@ -157,7 +157,7 @@ class TestEmbeddingModels(CustomTestCase):
                     tp_size,
                     torch_dtype,
                     prefill_tolerance,
-                    enable_embedding_schedule_overlap=True,
+                    enable_non_generation_schedule_overlap=True,
                 )
 
 

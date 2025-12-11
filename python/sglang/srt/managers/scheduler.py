@@ -330,9 +330,11 @@ class Scheduler(
 
         # Check whether overlap can be enabled
         if not self.is_generation:
-            self.enable_overlap = self.server_args.enable_embedding_schedule_overlap
+            self.enable_overlap = (
+                self.server_args.enable_non_generation_schedule_overlap
+            )
             logger.info(
-                f"Overlap scheduler is {'disabled' if not self.enable_overlap else 'enabled'} for embedding models."
+                f"Overlap scheduler is {'disabled' if not self.enable_overlap else 'enabled'} for non-generation models."
             )
 
         # Launch a tensor parallel worker

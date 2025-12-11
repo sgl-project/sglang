@@ -551,7 +551,7 @@ class SRTRunner:
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
-        enable_embedding_schedule_overlap: bool = False,
+        enable_non_generation_schedule_overlap: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -616,7 +616,7 @@ class SRTRunner:
             ),
             lora_eviction_policy=lora_eviction_policy,
             enable_deterministic_inference=enable_deterministic_inference,
-            enable_embedding_schedule_overlap=enable_embedding_schedule_overlap,
+            enable_non_generation_schedule_overlap=enable_non_generation_schedule_overlap,
             **spec_kwargs,
         )
 

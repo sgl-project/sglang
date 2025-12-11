@@ -519,7 +519,7 @@ class ServerArgs:
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     disable_overlap_schedule: bool = False
-    enable_embedding_schedule_overlap: bool = False
+    enable_non_generation_schedule_overlap: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
@@ -2118,17 +2118,20 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
-        if self.enable_embedding_schedule_overlap and self.disable_overlap_schedule:
+        if (
+            self.enable_non_generation_schedule_overlap
+            and self.disable_overlap_schedule
+        ):
             raise ValueError(
-                "Cannot enable both --enable-embedding-schedule-overlap and --disable-overlap-schedule."
+                "Cannot enable both --enable-non-generation-schedule-overlap and --disable-overlap-schedule."
             )
 
         if (
-            self.enable_embedding_schedule_overlap
+            self.enable_non_generation_schedule_overlap
             and envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
         ):
             raise ValueError(
-                "--enable-embedding-schedule-overlap is not supported with sparse heads. Please disable one of them."
+                "--enable-non-generation-schedule-overlap is not supported with sparse heads. Please disable one of them."
             )
 
     @staticmethod
@@ -3607,7 +3610,7 @@ class ServerArgs:
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
-            "--enable-embedding-schedule-overlap",
+            "--enable-non-generation-schedule-overlap",
             action="store_true",
             help="Enable overlap scheduling for non-generation models to improve throughput. By default, overlap scheduling is only enabled for generation models.",
         )
