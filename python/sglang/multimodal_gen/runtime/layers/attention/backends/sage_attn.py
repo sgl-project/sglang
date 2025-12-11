@@ -1,5 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-from typing import Type
+
+# SPDX-License-Identifier: Apache-2.0
+
 
 import torch
 from sageattention import sageattn
@@ -29,10 +31,6 @@ class SageAttentionBackend(AttentionBackend):
     def get_impl_cls() -> type["SageAttentionImpl"]:
         return SageAttentionImpl
 
-    @staticmethod
-    def get_metadata_cls() -> Type["AttentionMetadata"]:
-        raise NotImplementedError
-
 
 class SageAttentionImpl(AttentionImpl):
 
@@ -56,6 +54,8 @@ class SageAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        *,
+        return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         output = sageattn(
             query,
@@ -64,5 +64,7 @@ class SageAttentionImpl(AttentionImpl):
             # since input is (batch_size, seq_len, head_num, head_dim)
             tensor_layout="NHD",
             is_causal=self.causal,
+            sm_scale=self.softmax_scale,
+            return_lse=return_softmax_lse,
         )
         return output
