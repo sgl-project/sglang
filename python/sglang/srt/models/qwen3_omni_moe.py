@@ -49,6 +49,7 @@ from sglang.srt.models.qwen3_vl_moe import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, logger
 
+
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
     def __init__(
         self,
