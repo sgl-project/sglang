@@ -571,44 +571,4 @@ mod tests {
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
     }
-    #[tokio::test]
-    async fn test_reproduce_load_reset_bug() {
-        // 1. Setup Registry and Worker
-        let registry = WorkerRegistry::new();
-        let worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://fake-worker:8080")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        );
-        let worker_id = registry.register(Arc::from(worker));
-        let worker = registry.get(&worker_id).unwrap();
-
-        // 2. Simulate active load (e.g., 5 concurrent requests)
-        for _ in 0..5 {
-            worker.increment_load();
-        }
-        assert_eq!(worker.load(), 5, "Initial load should be 5");
-
-        // 3. Start Health Checker with the minimum allowed interval (1 second)
-        // The reset logic triggers every 10 cycles (approx 10 seconds).
-        let check_interval_secs = 1;
-        let health_checker = registry.start_health_checker(check_interval_secs);
-
-        // 4. Wait for > 10 cycles to pass to ensure the reset triggers
-        // We wait 12 seconds to be safe (1st tick is immediate + 10 intervals).
-        println!("Waiting for health checker cycles (approx 12s)...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
-
-        // 5. Verification
-        let current_load = worker.load();
-
-        println!("Load after health check cycles: {}", current_load);
-
-        // This assertion confirms the bug exists.
-        // We expect the load to be reset to 0, causing a mismatch with the actual active requests (5).
-        assert_eq!(current_load, 0, "Bug reproduced: Load was reset to 0 despite active requests!");
-
-        // Cleanup
-        health_checker.shutdown().await;
-    }
 }

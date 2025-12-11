@@ -140,11 +140,16 @@ npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files i
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
+tokio = { version = "1", features = ["full"] }
 
 [[bench]]
 name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
+
+[[bench]]
+name = "router_registry_bench"
+harness = false
 
 [[bench]]
 name = "tokenizer_benchmark"
