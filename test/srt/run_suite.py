@@ -352,6 +352,7 @@ suite_xeon = {
 suite_xpu = {
     "per-commit-xpu": [
         TestFile("xpu/test_intel_xpu_backend.py"),
+        TestFile("xpu/test_deepseek_ocr.py"),
     ],
 }
 
