@@ -30,6 +30,10 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -42,12 +46,8 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, logger
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.utils import add_prefix, logger
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
     def __init__(
@@ -69,7 +69,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
-            use_data_parallel=use_data_parallel
+            use_data_parallel=use_data_parallel,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -157,7 +157,9 @@ def _get_feat_extract_output_lengths(input_lengths):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, use_data_parallel: bool = False):
+    def __init__(
+        self, config: Qwen3OmniMoeAudioEncoderConfig, use_data_parallel: bool = False
+    ):
         super().__init__(config)
         self.dropout = config.dropout
 
@@ -171,7 +173,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3OmniMoeAudioEncoderLayer(config=config, use_data_parallel=use_data_parallel)
+                Qwen3OmniMoeAudioEncoderLayer(
+                    config=config, use_data_parallel=use_data_parallel
+                )
                 for _ in range(config.encoder_layers)
             ]
         )
@@ -442,13 +446,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, self.use_data_parallel)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(
+            config.audio_config, self.use_data_parallel
+        )
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
             quant_config=quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel
+            use_data_parallel=self.use_data_parallel,
         )
         self.pad_token_id = (
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
