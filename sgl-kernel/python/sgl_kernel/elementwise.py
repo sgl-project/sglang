@@ -420,7 +420,7 @@ def fused_layernorm_scale_shift(
       - gamma/beta: [N]
       - scale/shift: [M, N] or [B, F, 1, N]
     """
-    return torch.ops.sgl_kernel.fused_layernorm_scale_shift(
+    return torch.ops.sgl_kernel.fused_layernorm_scale_shift.default(
         x, gamma, beta, scale, shift
     )
 
@@ -458,6 +458,6 @@ def fused_scale_residual_layernorm_scale_shift(
       - scale/shift: [M, N] or [B, F, 1, N]
       - gate: None, [M, N], [B, 1, N], or [B, F, 1, N]
     """
-    return torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
+    return torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift.default(
         residual, x, gamma, beta, scale, shift, gate
     )

@@ -328,6 +328,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
+        # print(f"wan, residual.shape, {residual.shape}, x.shape, {x.shape}, gate.shape, {gate if isinstance(gate, int) else gate.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
         can_use_cuda = (
             x.is_cuda and (x.shape[-1] % 4 == 0) and not isinstance(self.norm, RMSNorm)
         )
@@ -464,6 +465,7 @@ class LayerNormScaleShift(nn.Module):
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
+        # print(f"wan, x.shape, {x.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
         can_use_cuda = (
             x.is_cuda
             and self.norm_type == "layer"
@@ -474,7 +476,8 @@ class LayerNormScaleShift(nn.Module):
             B, L, C = x.shape
             M = B * L
             x_2d = x.contiguous().view(-1, C)
-
+            
+            print(f"{self.norm.weight is not None, self.norm.bias is not None}") # False False
             if self.norm.weight is not None:
                 gamma = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
             else:
