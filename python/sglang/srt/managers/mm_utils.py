@@ -426,9 +426,15 @@ def _get_chunked_prefill_embedding(
             embedding_list.append(embedding_per_req)
             if embedding_per_req is None:
                 embedding_items_uncached.append(embedding_items[i])
-                embedding_items_feature_num.append(
-                    embedding_items[i].image_grid_thw.shape[0]
-                )
+                if embedding_items[i].modality == Modality.AUDIO:
+                    embedding_items_feature_num.append(1) # audio always has 1 object
+                elif embedding_items[i].modality == Modality.IMAGE:
+                    embedding_items_feature_num.append(
+                        embedding_items[i].image_grid_thw.shape[0]
+                    )
+                else:
+                    # TODO: Handle the case where embedding_items[i].modality is VIDEO.
+                    print_warning_once(f"Cannot handel type { embedding_items[i].modality}")
                 embedding_items_hash_list_uncached.append(embedding_items_hash_list[i])
 
         if None in embedding_list:
@@ -436,11 +442,17 @@ def _get_chunked_prefill_embedding(
             embeddings_merged = []
             embeddings_idx = 0
             for feature_num in embedding_items_feature_num:
-                embeddings_merged.append(
-                    torch.cat(
-                        embeddings[embeddings_idx : embeddings_idx + feature_num], dim=0
+                if embedding_items[i].modality == Modality.AUDIO:
+                    embeddings_merged.append(embeddings)
+                elif embedding_items[i].modality == Modality.IMAGE:
+                    embeddings_merged.append(
+                        torch.cat(
+                            embeddings[embeddings_idx : embeddings_idx + feature_num], dim=0
+                        )
                     )
-                )
+                else:
+                    # TODO: Handle the case where embedding_items[i].modality is VIDEO.
+                    print_warning_once(f"Cannot handel type { embedding_items[i].modality}")
                 embeddings_idx += feature_num
 
             for embedding_items_hash, embedding_per_req in zip(
