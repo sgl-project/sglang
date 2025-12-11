@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import dataclasses
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -225,8 +224,7 @@ class PerformanceLogger:
                 json.dump(report, f, indent=2)
             logger.info(f"[Performance] Metrics dumped to: {abs_path}")
         except IOError as e:
-            logger.info(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
-            logging.getLogger(__name__).error(f"Dump failed: {e}")
+            logger.error(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(
