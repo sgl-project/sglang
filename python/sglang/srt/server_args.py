@@ -83,6 +83,7 @@ LOAD_FORMAT_CHOICES = [
     "flash_rl",
     "remote",
     "remote_instance",
+    "private",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -642,6 +643,9 @@ class ServerArgs:
         self._handle_cpu_backends()
         self._handle_npu_backends()
 
+        # Handle compilation config
+        self._handle_compilation_cfg()
+
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
@@ -953,6 +957,15 @@ class ServerArgs:
             if self.attention_backend is None:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
+
+    def _handle_compilation_cfg(self):
+        # NPU platform
+        if is_npu() and self.piecewise_cuda_graph_compiler != "eager":
+            logger.warning(
+                "At this moment Ascend platform only support prefill graph compilation with "
+                "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
+            )
+            self.piecewise_cuda_graph_compiler = "eager"
 
     def _handle_npu_backends(self):
         if self.device == "npu":
