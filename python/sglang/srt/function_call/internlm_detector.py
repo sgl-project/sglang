@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import List
 
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -31,18 +32,18 @@ class InternlmDetector(BaseFormatDetector):
 
     Format Structure:
     ```
-    text<|action_start|><|plugin|>
+    text<|action_start|> <|plugin|>
     {json}<|action_end|>
     ```
 
     Examples:
     ```
-    What's the weather like?<|action_start|><|plugin|>
+    What's the weather like?<|action_start|> <|plugin|>
     {"name": "get_weather", "parameters": {"location": "Tokyo"}}<|action_end|>
     ```
 
     Key Components:
-    - Tool Call Start: `<|action_start|><|plugin|>\n`
+    - Tool Call Start: `<|action_start|> <|plugin|>`
     - Tool Call End: `<|action_end|>`
     - Arguments: JSON object with `name` and `parameters`/`arguments`
     - Only supports single tool call at a time (no parallel tool calls)
@@ -52,13 +53,14 @@ class InternlmDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<|action_start|><|plugin|>\n"
+        self.bot_token = "<|action_start|> <|plugin|>"
         self.eot_token = "<|action_end|>"
         self.position = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains an InternLM format tool call."""
-        return "<|action_start|>" in text
+        has_call = self.bot_token in text
+        return has_call
 
     def get_arguments(self, obj):
         """Extract arguments from object, supporting both 'parameters' and 'arguments' keys."""
@@ -71,55 +73,83 @@ class InternlmDetector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
+        Supports multiple tool calls in the format:
+        <|action_start|> <|plugin|>\n{JSON}<|action_end|>
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
         :return: StreamingParseResult with normal text and parsed tool calls.
         """
-        if "<|action_start|><|plugin|>" not in text:
-            return StreamingParseResult(normal_text=text, calls=[])
 
+        # Find the first occurrence of tool call marker to extract normal text
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        
+        if self.bot_token not in text:
+            logger.warning("[InternLM Tool Call] No tool call markers found in text")
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        # Use regex to find all tool call blocks
+        # Pattern matches: {self.bot_token}{...}{self.eot_token}
+        tool_call_pattern = rf'{re.escape(self.bot_token)}\s*(.*?){re.escape(self.eot_token)}'
+        matches = re.findall(tool_call_pattern, text, re.DOTALL)
+        
+        if not matches:
+            logger.warning("[InternLM Tool Call] No complete tool call blocks found")
+            return StreamingParseResult(normal_text=text, calls=[])
+        
+        logger.info(f"[InternLM Tool Call] Found {len(matches)} tool call(s)")
+        
+        calls = []
+        tool_indices = self._get_tool_indices(tools)
+        
         try:
-            # Split text into content and action
-            parts = text.split("<|action_start|><|plugin|>")
-            normal_text = parts[0].strip()
+            for idx, action_json in enumerate(matches):
+                action_json = action_json.strip()
+                
+                try:
+                    # Parse the JSON
+                    action_dict = json.loads(action_json)
+                    name = action_dict.get("name")
+                    parameters = self.get_arguments(action_dict)
+                    
+                    if not parameters:
+                        parameters = {}
+                    
+                    logger.info(
+                        f"[InternLM Tool Call] Parsed tool call #{idx+1}: name={name}, "
+                        f"parameters={json.dumps(parameters, ensure_ascii=False)}"
+                    )
+                    
+                    # Validate tool name
+                    if not (name and name in tool_indices):
+                        logger.warning(
+                            f"[InternLM Tool Call] Model attempted to call undefined function: {name}, "
+                            f"available_tools={list(tool_indices.keys())}"
+                        )
+                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                            continue  # Skip this tool call
+                    
+                    # Create tool call item and add to list
+                    tool_call = ToolCallItem(
+                        tool_index=idx,
+                        name=name,
+                        parameters=json.dumps(parameters, ensure_ascii=False),
+                    )
+                    calls.append(tool_call)
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"[InternLM Tool Call] Failed to parse JSON for tool call #{idx+1}: {e}")
+                    continue
             
-            if len(parts) < 2:
-                return StreamingParseResult(normal_text=text, calls=[])
-            
-            action_part = parts[1]
-            
-            # Extract action JSON (remove end token if present)
-            action = action_part.split("<|action_end|>")[0].strip()
-            
-            # Parse the JSON
-            action_dict = json.loads(action)
-            name = action_dict.get("name")
-            parameters = self.get_arguments(action_dict)
-            
-            if not parameters:
-                parameters = {}
-            
-            # Build tool indices for validation
-            tool_indices = self._get_tool_indices(tools)
-            
-            # Validate tool name
-            if not (name and name in tool_indices):
-                logger.warning(f"Model attempted to call undefined function: {name}")
-                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                    return StreamingParseResult(normal_text=text, calls=[])
-            
-            # Create tool call item
-            tool_call = ToolCallItem(
-                tool_index=0,
-                name=name,
-                parameters=json.dumps(parameters, ensure_ascii=False),
+            logger.info(
+                f"[InternLM Tool Call] Successfully parsed {len(calls)} tool call(s), "
+                f"normal_text_length={len(normal_text)}"
             )
-            
-            return StreamingParseResult(normal_text=normal_text, calls=[tool_call])
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
             
         except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
+            logger.error(f"[InternLM Tool Call] Error in detect_and_parse: {e}", exc_info=True)
             return StreamingParseResult(normal_text=text, calls=[])
 
     def parse_streaming_increment(
@@ -130,13 +160,14 @@ class InternlmDetector(BaseFormatDetector):
         
         Handles the special case where InternLM only generates one tool call at a time.
         """
+
         self._buffer += new_text
         current_text = self._buffer
         
         # If no tool call marker, return as normal text
-        if "<|action_start|>" not in current_text:
+        if self.bot_token not in current_text:
             # Only clear buffer if we're sure no tool call is starting
-            if not self._ends_with_partial_token(self._buffer, "<|action_start|>"):
+            if not self._ends_with_partial_token(self._buffer, self.bot_token):
                 normal_text = self._buffer
                 self._buffer = ""
                 if self.eot_token in normal_text:
@@ -152,11 +183,11 @@ class InternlmDetector(BaseFormatDetector):
             return StreamingParseResult(content="")
         
         # Check if we have the full plugin marker
-        if "<|action_start|><|plugin|>\n" not in current_text:
+        if self.bot_token not in current_text:
             return StreamingParseResult()
         
         # Split into text and action
-        parts = current_text.split("<|action_start|><|plugin|>\n")
+        parts = current_text.split(self.bot_token)
         text_part = parts[0]
         
         # If we have text before the action, send it
@@ -170,7 +201,7 @@ class InternlmDetector(BaseFormatDetector):
             return StreamingParseResult()
         
         action = parts[1].strip()
-        action = action.split("<|action_end|>")[0]
+        action = action.split(self.eot_token)[0]
         
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
@@ -197,7 +228,10 @@ class InternlmDetector(BaseFormatDetector):
                 if function_name:
                     # Validate tool name
                     if function_name not in self._tool_indices:
-                        logger.warning(f"Model attempted to call undefined function: {function_name}")
+                        logger.warning(
+                            f"[InternLM Tool Call Stream] Model attempted to call undefined function: {function_name}, "
+                            f"available_tools={list(self._tool_indices.keys())}"
+                        )
                         if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                             return StreamingParseResult()
                     
@@ -218,6 +252,7 @@ class InternlmDetector(BaseFormatDetector):
                         ]
                     )
                 else:
+                    logger.debug("[InternLM Tool Call Stream] No function name yet")
                     return StreamingParseResult()
             
             # Case 2: Stream arguments
@@ -266,6 +301,7 @@ class InternlmDetector(BaseFormatDetector):
                     
                     if argument_diff:
                         self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+
                         
                         # Update prev_tool_call_arr
                         tool_call_obj["arguments"] = cur_arguments
@@ -283,8 +319,8 @@ class InternlmDetector(BaseFormatDetector):
                 return StreamingParseResult()
                 
         except Exception as e:
-            logger.exception(f"Error trying to handle streaming tool call: {e}")
-            logger.debug("Skipping chunk as a result of tool streaming extraction error")
+            logger.error(f"[InternLM Tool Call Stream] Error in streaming: {e}", exc_info=True)
+            logger.debug("[InternLM Tool Call Stream] Skipping chunk as a result of tool streaming extraction error")
             return StreamingParseResult()
 
     def structure_info(self) -> _GetInfoFunc:
@@ -292,13 +328,13 @@ class InternlmDetector(BaseFormatDetector):
         Return structure information for constrained generation.
         
         For InternLM format, the structure is:
-        - begin: <|action_start|><|plugin|>\n
+        - begin: <|action_start|> <|plugin|>\n
         - end: <|action_end|>
         - trigger: the begin token
         """
         return lambda name: StructureInfo(
-            begin='<|action_start|><|plugin|>\n{"name": "' + name + '", "parameters": ',
+            begin='<|action_start|> <|plugin|>\n{"name": "' + name + '", "parameters": ',
             end="}<|action_end|>",
-            trigger="<|action_start|><|plugin|>",
+            trigger="<|action_start|> <|plugin|>",
         )
 
