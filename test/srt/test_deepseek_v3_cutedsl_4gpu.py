@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
 )
 
 
-@unittest.skip("See https://github.com/sgl-project/sglang/issues/12533")
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -8,8 +8,18 @@ import json
 import os
 import sys
 import time
+import warnings
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+
+def is_rate_limit_error(e):
+    """Check if an exception is a rate limit error"""
+    return (
+        isinstance(e, HTTPError)
+        and e.code in [403, 429]
+        and "rate limit exceeded" in getattr(e, "error_body", "").lower()
+    )
 
 
 def make_github_request(url, token, method="GET", data=None):
@@ -55,6 +65,9 @@ def verify_token_permissions(repo_owner, repo_name, token):
         repo_data = json.loads(response)
         print(f"Repository access verified: {repo_data['full_name']}")
     except Exception as e:
+        if is_rate_limit_error(e):
+            warnings.warn("GitHub API rate limit exceeded during token verification.")
+            return "rate_limited"
         print(f"Failed to access repository: {e}")
         return False
 
@@ -64,6 +77,9 @@ def verify_token_permissions(repo_owner, repo_name, token):
         response = make_github_request(url, token)
         print("Repository contents access verified")
     except Exception as e:
+        if is_rate_limit_error(e):
+            warnings.warn("GitHub API rate limit exceeded during token verification.")
+            return "rate_limited"
         print(f"Failed to access repository contents: {e}")
         return False
 
@@ -276,7 +292,14 @@ def publish_traces(traces_dir, run_id, run_number):
     print(f"Found {len(files_to_upload)} files to upload")
 
     # Verify token permissions before proceeding
-    if not verify_token_permissions(repo_owner, repo_name, token):
+    permission_check = verify_token_permissions(repo_owner, repo_name, token)
+    if permission_check == "rate_limited":
+        warnings.warn(
+            "Skipping trace upload due to GitHub API rate limit. "
+            "This is expected during high CI activity and does not indicate a test failure."
+        )
+        return
+    elif not permission_check:
         print(
             "Token permission verification failed. Please check the token permissions."
         )
@@ -337,6 +360,11 @@ def publish_traces(traces_dir, run_id, run_number):
             if isinstance(e, HTTPError) and e.code in [422, 500, 502, 503, 504]:
                 is_retryable = True
                 error_type = f"HTTP {e.code}"
+
+            # Check for rate limit errors (non-fatal - just warn and skip)
+            if is_rate_limit_error(e):
+                warnings.warn("GitHub API rate limit exceeded. Skipping trace upload.")
+                return
 
             if is_retryable and attempt < max_retries - 1:
                 print(

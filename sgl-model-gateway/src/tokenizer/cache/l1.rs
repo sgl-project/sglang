@@ -80,10 +80,11 @@ fn find_special_token_boundaries(text: &str, special_tokens: &[&str]) -> Vec<usi
 }
 
 /// A cached prefix entry
+/// Uses Arc<[TokenIdType]> for zero-copy access to tokens
 #[derive(Debug, Clone)]
 struct CachedPrefix {
-    /// The pre-computed token IDs for this prefix
-    tokens: Vec<TokenIdType>,
+    /// The pre-computed token IDs for this prefix (Arc for zero-copy cloning)
+    tokens: Arc<[TokenIdType]>,
     /// Last access timestamp (for LRU eviction)
     last_accessed: Arc<AtomicU64>,
     /// Size in bytes (for memory tracking during eviction)
@@ -127,6 +128,7 @@ impl L1Cache {
     /// Returns (cached_tokens, byte_offset) if found
     ///
     /// Uses pre-computed tokens cached during insertion.
+    /// Returns Vec<TokenIdType> as the caller needs to extend it with suffix tokens.
     pub fn longest_prefix_match(
         &self,
         input: &str,
@@ -154,7 +156,8 @@ impl L1Cache {
                 entry.last_accessed.store(timestamp, Ordering::Relaxed);
 
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some((entry.tokens.clone(), boundary_pos));
+                // Convert Arc<[T]> to Vec<T> - caller will extend with suffix tokens
+                return Some((entry.tokens.to_vec(), boundary_pos));
             }
         }
 
@@ -181,7 +184,7 @@ impl L1Cache {
         }
 
         // Calculate how much memory we need and tokenize each prefix
-        let mut entries_to_insert = Vec::new();
+        let mut entries_to_insert = Vec::with_capacity(boundaries.len());
         for &boundary_pos in &boundaries {
             // Extract prefix up to this special token boundary
             let prefix = &input[0..boundary_pos];
@@ -192,7 +195,8 @@ impl L1Cache {
             // Re-tokenize the prefix for guaranteed correctness
             // This is the only way to know the exact token boundaries
             let prefix_encoding = tokenizer.encode(prefix)?;
-            let prefix_tokens = prefix_encoding.token_ids().to_vec();
+            // Convert to Arc<[TokenIdType]> for zero-copy sharing
+            let prefix_tokens: Arc<[TokenIdType]> = prefix_encoding.token_ids().into();
 
             // Size = text bytes + token storage
             let size_bytes = boundary_pos + prefix_tokens.len() * size_of::<TokenIdType>();
@@ -213,14 +217,13 @@ impl L1Cache {
         }
 
         // Insert all entries
+        let current_timestamp = self.access_counter.load(Ordering::Relaxed);
         for (hash_bytes, prefix_tokens, size_bytes) in entries_to_insert {
             let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
 
             let cached = CachedPrefix {
-                tokens: prefix_tokens,
-                last_accessed: Arc::new(AtomicU64::new(
-                    self.access_counter.load(Ordering::Relaxed),
-                )),
+                tokens: prefix_tokens, // Already Arc<[TokenIdType]>
+                last_accessed: Arc::new(AtomicU64::new(current_timestamp)),
                 size_bytes,
             };
 

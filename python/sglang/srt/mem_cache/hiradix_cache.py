@@ -399,10 +399,9 @@ class HiRadixCache(RadixCache):
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
-            for k, v in x.parent.children.items():
-                if v == x:
-                    break
-            del x.parent.children[k]
+            key = self.get_child_key_fn(x.key)
+            v = x.parent.children.pop(key, None)
+            assert v == x, f"parent does not have child key, {key}"
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
