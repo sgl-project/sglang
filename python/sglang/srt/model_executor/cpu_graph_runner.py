@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import psutil
 import torch
 import tqdm
+from torch._dynamo import mark_dynamic
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -33,9 +35,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    get_bool_env_var,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -54,8 +58,8 @@ if TYPE_CHECKING:
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
-    num_tokens: int,
     tp_group: GroupCoordinator,
+    dynamic: bool = False,
 ):
     """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
@@ -69,7 +73,7 @@ def patch_model(
             # tp_group.ca_comm = None
             yield torch.compile(
                 torch.no_grad()(model.forward),
-                dynamic=False,
+                dynamic=dynamic,
             )
         else:
             yield model.forward
@@ -90,11 +94,22 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
+def get_batch_sizes_to_capture(
+    model_runner: ModelRunner, enable_dynamic_shape: bool = False
+):
+    # cpu torch compile speeds up decoding by reducing python overhead
     server_args = model_runner.server_args
-    # cpu torch compile only speeds up decoding by
-    # reducing python overhead when bs is small
-    capture_bs = list(range(1, 17))
+    capture_bs = server_args.cpu_graph_bs
+    if capture_bs is None:
+        if enable_dynamic_shape:
+            # set one batch to capture dynamic graph
+            capture_bs = [
+                server_args.torch_compile_max_bs,
+            ]
+        else:
+            capture_bs = (
+                list(range(1, 16)) + list(range(18, 31, 2)) + list(range(32, 81, 4))
+            )
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
@@ -348,6 +363,9 @@ class CPUGraphRunner:
         self.model_runner = model_runner
         self.device = model_runner.device
         self.graphs = {}
+        # Use dynamic graph to avoid excessive compilation time
+        self.dynamic_graph = None
+        self.enable_dynamic_graph = get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE")
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -401,8 +419,11 @@ class CPUGraphRunner:
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
         # Batch sizes to capture
-        self.capture_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs = get_batch_sizes_to_capture(
+            model_runner, self.enable_dynamic_graph
+        )
         log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
+        self.captured_forward_batches = {}
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
@@ -444,7 +465,11 @@ class CPUGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        is_bs_supported = forward_batch.batch_size in self.graphs
+        is_bs_supported = (
+            forward_batch.batch_size in self.graphs
+            if self.disable_padding and not self.enable_dynamic_graph
+            else forward_batch.batch_size <= self.max_bs
+        )
 
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
@@ -463,6 +488,16 @@ class CPUGraphRunner:
         return is_bs_supported and capture_hidden_mode_matches
 
     def capture(self) -> None:
+        if self.enable_dynamic_graph:
+            with patch_model(
+                self.model_runner.model,
+                True,
+                tp_group=self.model_runner.tp_group,
+                dynamic=True,
+            ) as forward:
+                self.dynamic_graph, _ = self.capture_one_batch_size(None, forward)
+            return
+
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
             if get_tensor_model_parallel_rank() == 0
@@ -478,7 +513,6 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 bs in self.capture_bs,
-                num_tokens=bs * self.num_tokens_per_bs,
                 tp_group=self.model_runner.tp_group,
             ) as forward:
                 (
@@ -488,16 +522,16 @@ class CPUGraphRunner:
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def make_graph_inputs(self, bs, dynamic: bool = False):
+        if bs is None:
+            bs = self.max_bs
         num_tokens = bs * self.num_tokens_per_bs
-
-        # Graph inputs
         input_ids = self.input_ids[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :bs]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         self.num_token_non_padded[...] = num_tokens
 
         spec_info = self.get_spec_info(num_tokens)
@@ -505,6 +539,15 @@ class CPUGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
+
+        if dynamic:
+            mark_dynamic(input_ids, 0)
+            mark_dynamic(positions, 0)
+            mark_dynamic(out_cache_loc, 0)
+            mark_dynamic(req_pool_indices, 0)
+            mark_dynamic(seq_lens, 0)
+            mark_dynamic(mrope_positions, 0)
+            mark_dynamic(mrope_positions, 1)
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -526,32 +569,51 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
+        return forward_batch
 
-        # Attention backend
+    def capture_one_batch_size(self, bs: int, forward: Callable):
+        # Graph inputs
+        forward_batch = self.make_graph_inputs(bs, self.enable_dynamic_graph)
+
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Do infernence to avoid setting attr at runtime, e.g.,
         # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
-        self.model_runner.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-        )
+        with torch.no_grad():
+            self.model_runner.tp_group.barrier()
+            self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
 
         # Run and capture
-        def run_once():
+        def run_once(forward_batch):
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
+                forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
             )
             return logits_output_or_pp_proxy_tensors
 
+        if self.enable_dynamic_graph:
+            # Warmup dynamic graph
+            # for bs in self.capture_bs:
+            #     forward_batch = self.make_graph_inputs(bs)
+            with torch.no_grad():
+                for _ in range(2):
+                    self.model_runner.tp_group.barrier()
+                    out = run_once(forward_batch)
+
+            return forward, out
+
         with torch.no_grad():
             for _ in range(2):
                 self.model_runner.tp_group.barrier()
-                out = run_once()
+                out = run_once(forward_batch)
+            # Save the captured forward_batches
+            self.captured_forward_batches[bs] = forward_batch
             return forward, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -585,7 +647,54 @@ class CPUGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
-    # TODO add padding support for CPUGraphRunner
+    def prepare_replay(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        self.recapture_if_needed(forward_batch)
+
+        raw_bs = forward_batch.batch_size
+
+        if self.enable_dynamic_graph or raw_bs in self.graphs:
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            return forward_batch
+
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
+        assert bs > raw_bs
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+
+        captured_forward_batch = self.captured_forward_batches[bs]
+        assert captured_forward_batch is not None
+        captured_forward_batch.seq_lens.fill_(self.seq_len_fill_value)
+        captured_forward_batch.out_cache_loc.zero_()
+        captured_forward_batch.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        captured_forward_batch.req_pool_indices[:raw_bs].copy_(
+            forward_batch.req_pool_indices
+        )
+        captured_forward_batch.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        captured_forward_batch.out_cache_loc[:raw_num_token].copy_(
+            forward_batch.out_cache_loc
+        )
+        captured_forward_batch.positions[:raw_num_token].copy_(forward_batch.positions)
+        if forward_batch.mrope_positions is not None:
+            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+
+        if self.is_encoder_decoder:
+            captured_forward_batch.encoder_lens[:raw_bs].copy_(
+                forward_batch.encoder_lens
+            )
+        if enable_num_token_non_padded(self.model_runner.server_args):
+            captured_forward_batch.num_token_non_padded.copy_(
+                forward_batch.num_token_non_padded
+            )
+
+        self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
+        return captured_forward_batch
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -595,14 +704,37 @@ class CPUGraphRunner:
         assert (
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
-        self.recapture_if_needed(forward_batch)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        output = self.graphs[forward_batch.batch_size](
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
+
+        prepared_forward_batch = self.prepare_replay(forward_batch)
+        if self.enable_dynamic_graph:
+            output = self.dynamic_graph(
+                prepared_forward_batch.input_ids,
+                prepared_forward_batch.positions,
+                prepared_forward_batch,
+            )
+            return output
+
+        # static graphs
+        output = self.graphs[prepared_forward_batch.batch_size](
+            prepared_forward_batch.input_ids,
+            prepared_forward_batch.positions,
+            prepared_forward_batch,
         )
-        return output
+        if forward_batch.batch_size in self.graphs:
+            return output
+
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.hidden_states[: self.raw_num_token]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
+        else:
+            assert isinstance(output, PPProxyTensors)
+            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
