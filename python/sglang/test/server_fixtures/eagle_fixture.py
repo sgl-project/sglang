@@ -31,12 +31,12 @@ PROMPTS = [
 
 
 class EagleServerBase(CustomTestCase):
-    tager_model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
+    target_model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
     draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
-    spec_aglo = "EAGLE"
+    spec_algo = "EAGLE"
     spec_steps = 5
     spec_topk = 8
-    sepc_tokens = 64
+    spec_tokens = 64
     mem_fraction_static = 0.7
     extra_args = []
 
@@ -44,15 +44,15 @@ class EagleServerBase(CustomTestCase):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            cls.tager_model,
+            cls.target_model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                f"--speculative-algorithm={cls.spec_aglo}",
+                f"--speculative-algorithm={cls.spec_algo}",
                 f"--speculative-draft-model-path={cls.draft_model}",
                 f"--speculative-num-steps={cls.spec_steps}",
                 f"--speculative-eagle-topk={cls.spec_topk}",
-                f"--speculative-num-draft-tokens={cls.sepc_tokens}",
+                f"--speculative-num-draft-tokens={cls.spec_tokens}",
                 f"--mem-fraction-static={cls.mem_fraction_static}",
             ]
             + cls.extra_args,
