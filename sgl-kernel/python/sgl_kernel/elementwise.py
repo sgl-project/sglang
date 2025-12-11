@@ -425,6 +425,22 @@ def fused_layernorm_scale_shift(
     )
 
 
+def fused_layernorm_scale_shift_no_affine(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    LayerNorm(x; gamma=1, beta=0) followed by fused scale/shift.
+    Expects:
+      - x: [M, N], contiguous on last dim
+      - scale/shift: [M, N] or [B, F, 1, N]
+    """
+    return torch.ops.sgl_kernel.fused_layernorm_scale_shift_no_affine(
+        x, scale, shift
+    )
+
+
 def fused_scale_residual_layernorm_scale_shift(
     residual: torch.Tensor,
     x: torch.Tensor,
