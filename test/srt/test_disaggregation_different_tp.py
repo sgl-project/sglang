@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.server_fixtures.disaggreation_fixture import PDDisaggregationServerBase
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
