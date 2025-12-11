@@ -46,12 +46,8 @@ pub struct ConnectMcpServerStep;
 #[async_trait]
 impl StepExecutor for ConnectMcpServerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!("Connecting to MCP server: {}", config_request.name);
 
@@ -102,15 +98,9 @@ impl StepExecutor for DiscoverMcpInventoryStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         use rmcp::{service::RunningService, RoleClient};
 
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let mcp_client: Arc<RunningService<RoleClient, ()>> = context
-            .get("mcp_client")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_client".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let mcp_client: Arc<RunningService<RoleClient, ()>> = context.get_or_err("mcp_client")?;
 
         debug!(
             "Discovering inventory for MCP server: {}",
@@ -153,15 +143,9 @@ impl StepExecutor for RegisterMcpServerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         use rmcp::{service::RunningService, RoleClient};
 
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let mcp_client: Arc<RunningService<RoleClient, ()>> = context
-            .get("mcp_client")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_client".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let mcp_client: Arc<RunningService<RoleClient, ()>> = context.get_or_err("mcp_client")?;
 
         debug!("Registering MCP server: {}", config_request.name);
 
@@ -199,9 +183,7 @@ pub struct ValidateRegistrationStep;
 #[async_trait]
 impl StepExecutor for ValidateRegistrationStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
 
         let client_registered = context
             .get::<RunningService<RoleClient, ()>>("mcp_client")
