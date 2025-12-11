@@ -1009,6 +1009,12 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def combine_b(self, **kwargs):
         return self._execute("combine_b", **kwargs)
 
+    def register_deepep_dispatch_hook(self, hook):
+        handle_list = []
+        for inner in self._inners:
+            handle_list.append(inner.register_deepep_dispatch_hook(hook))
+        return handle_list
+
     def set_quant_config(self, quant_config: dict):
         super().set_quant_config(quant_config)
         for inner in self._inners:
