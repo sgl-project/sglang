@@ -1933,7 +1933,7 @@ def get_compiler_backend(mode=None) -> str:
                 "Please install torchair for torch.compile support on NPU."
             )
         compiler_config = CompilerConfig()
-        compiler_config.mode = "max-autotune"
+        compiler_config.mode = "max-autotune" if mode is None else mode
         if mode == "npugraph_ex":
             compiler_config.mode = "reduce-overhead"
             compiler_config.debug.run_eagerly = True
