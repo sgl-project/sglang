@@ -155,8 +155,14 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             pre_alloc_size=pre_alloc_size,
         )
         self.enable_memory_saver = enable_memory_saver
+        self.enable_mamba_radix_cache_v2 = False
         self._init_mamba_pool(
-            size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
+            size + pre_alloc_size,
+            size + pre_alloc_size,
+            cache_params,
+            device,
+            self.enable_mamba_radix_cache_v2,
+            speculative_num_draft_tokens,
         )
 
     def clear(self):
