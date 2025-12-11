@@ -67,7 +67,7 @@ jobs:
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
 
           RUN echo "=== Prebuilt Aiter kernel with op test ==="
-          RUN cd /aiter && \
+          RUN cd /aiter/op_tests/ && \
             python3 test_rope.py && \
             python3 test_rmsnorm2d.py && \
             python3 test_rmsnorm2dFusedAddQuant.py && \
