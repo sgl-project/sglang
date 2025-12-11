@@ -6,10 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -386,7 +383,12 @@ class StepAudio2ForCausalLM(nn.Module):
         wavs = wavs.to(torch.bfloat16)
         out, feat_lens = self.encoder(wavs, wav_lens)
         out = self.adapter(out)
-        return out
+        audio_feature_lens = (feat_lens - 1) // 2 + 1
+
+        audio_feature_list = [
+            out[i, : audio_feature_lens[i]] for i in range(out.size(0))
+        ]
+        return torch.cat(audio_feature_list, dim=0)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
