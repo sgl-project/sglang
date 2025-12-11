@@ -36,6 +36,34 @@ def run_case_fused_accuracy(
 
 
 @torch.no_grad()
+def run_case_fused_no_affine_accuracy(
+    dtype=torch.float32,
+    M: int = 128,
+    N: int = 1024,
+    eps: float = 1e-5,
+):
+    device = "cuda"
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    scale = torch.randn(M, N, device=device, dtype=dtype)
+    shift = torch.randn(M, N, device=device, dtype=dtype)
+
+    # CUDA fused LayerNorm without affine weights (gamma=1, beta=0) + scale/shift
+    y_dev_fused = sgl_kernel.fused_layernorm_scale_shift_no_affine(x, scale, shift)
+
+    # Reference fused output: compute LN (gamma=1, beta=0) in fp32, then apply scale/shift in fp32, cast back
+    x32 = x.float()
+    s32 = scale.float()
+    sh32 = shift.float()
+    mean = x32.mean(dim=1, keepdim=True)
+    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
+    inv_std = (var + eps).sqrt().reciprocal()
+    y_ln32 = (x32 - mean) * inv_std  # no affine weights
+    y_gt_fused = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
+
+    return y_dev_fused, y_gt_fused
+
+
+@torch.no_grad()
 def run_case_fused_4d_scale_accuracy(
     dtype=torch.float32,
     B: int = 2,
@@ -338,6 +366,20 @@ def test_fused_layernorm_scale_shift_2d(dtype, M, N):
     if (N % 4) != 0:
         pytest.skip("Vectorized kernel requires N % 4 == 0")
     y_dev, y_ref = run_case_fused_accuracy(dtype=dtype, M=M, N=N, eps=1e-5)
+    torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("M,N", CASES)
+def test_fused_layernorm_scale_shift_no_affine_2d(dtype, M, N):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.cuda.manual_seed(0)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if (N % 4) != 0:
+        pytest.skip("Vectorized kernel requires N % 4 == 0")
+    y_dev, y_ref = run_case_fused_no_affine_accuracy(dtype=dtype, M=M, N=N, eps=1e-5)
     torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
 
 
