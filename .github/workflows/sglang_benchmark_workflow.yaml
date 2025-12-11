@@ -54,6 +54,7 @@ jobs:
           RUN pip uninstall -y aiter
           RUN rm -rf /opt/aiter/aiter/jit/build
           RUN rm -rf /opt/aiter/aiter/jit/*.so
+          RUN rm -rf ~/.aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 

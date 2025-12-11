@@ -36,7 +36,8 @@ if [[ "${TYPE}" == "launch" ]]; then
             --mem-fraction-static 0.6 \
             --disable-radix-cache \
             --max-prefill-tokens 32768 \
-            --cuda-graph-max-bs 128 &
+            --cuda-graph-max-bs 128 \
+            --page-size 16 &
         sglang_pid=$!
     elif [[ "${model_name}" == "Qwen3-next" ]]; then
         export SGLANG_USE_AITER=1
