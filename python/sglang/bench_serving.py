@@ -771,7 +771,7 @@ def get_processor(
     )
 
 
-def get_dataset(args, tokenizer, model_id=None):
+def get_dataset(args, tokenizer, model_id=None, processor=None):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
@@ -796,7 +796,9 @@ def get_dataset(args, tokenizer, model_id=None):
             return_text=not tokenize_prompt,
         )
     elif args.dataset_name == "image":
-        processor = get_processor(model_id)
+        if processor is None:
+            processor = get_processor(model_id)
+        image_lazy = getattr(args, "image_lazy_generate", False)
         input_requests = sample_image_requests(
             num_requests=args.num_prompts,
             image_count=args.image_count,
@@ -808,6 +810,7 @@ def get_dataset(args, tokenizer, model_id=None):
             image_format=args.image_format,
             image_resolution=args.image_resolution,
             backend=args.backend,
+            lazy=image_lazy,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -1338,6 +1341,28 @@ def sample_random_requests(
     return input_requests
 
 
+def _gen_random_image_data_uri(
+    width: int,
+    height: int,
+    image_format: str,
+    image_content: str,
+) -> Tuple[Image.Image, str, int]:
+    """Generate a single random or blank image and return PIL image, data URI and byte size."""
+    if image_content == "blank":
+        # Generate blank white image
+        arr = np.full((height, width, 3), 255, dtype=np.uint8)
+    else:
+        # Generate random colored image
+        arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+    img = Image.fromarray(arr)
+    buf = io.BytesIO()
+    img.save(buf, format=image_format, quality=85)
+    encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
+    image_data = f"data:image/{image_format};base64,{encoded}"
+    image_bytes = len(image_data.encode("utf-8"))
+    return img, image_data, image_bytes
+
+
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     """Parse image resolution into (width, height).
 
@@ -1453,16 +1478,57 @@ def sample_image_requests(
     image_format: str,
     image_resolution: str,
     backend: str,
+    lazy: bool = False,
 ) -> List[DatasetRow]:
-    """Generate requests with images.
+    """Generate requests with text and optional image payloads.
 
-    - Each request includes ``image_count`` images.
+    - Each request includes ``image_count`` images when ``lazy`` is False.
     - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
-      or custom 'heightxwidth' (e.g., 1080x1920).
-    - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
-      only counts text tokens and excludes image data.
+      or custom 'heightxwidth' (e.g., 1080x1920) when images are generated eagerly.
+    - Text lengths follow the 'random' dataset sampling rule. ``prompt_len`` counts text tokens
+      and excludes image data.
+    - When ``lazy`` is True, image data is generated later during benchmarking to reduce peak
+      memory usage. Token statistics are recalculated before each request is sent.
     """
+    # Sample text lengths shared by both eager and lazy paths
+    input_lens = np.random.randint(
+        max(int(input_len * range_ratio), 1), input_len + 1, size=num_requests
+    )
+    output_lens = np.random.randint(
+        int(output_len * range_ratio), output_len + 1, size=num_requests
+    )
 
+    if lazy:
+        dataset: List[DatasetRow] = []
+        for i in range(num_requests):
+            text_prompt = gen_mm_prompt(
+                processor.tokenizer,
+                (
+                    processor.image_token_id
+                    if hasattr(processor, "image_token_id")
+                    else None
+                ),
+                int(input_lens[i]),
+            )
+            dataset.append(
+                DatasetRow(
+                    prompt=text_prompt,
+                    # Placeholder; updated once images are attached lazily.
+                    prompt_len=0,
+                    output_len=int(output_lens[i]),
+                )
+            )
+
+        print(
+            f"#Input tokens (text only, before image tokens added lazily): {np.sum(input_lens)}"
+        )
+        print(f"#Output tokens: {np.sum(output_lens)}")
+        print(
+            "\nImage data will be generated lazily per request to reduce peak memory usage."
+        )
+        return dataset
+
+    # Eager image generation path
     # Parse resolution (supports presets and 'heightxwidth')
     width, height = parse_image_resolution(image_resolution)
 
@@ -1474,31 +1540,6 @@ def sample_image_requests(
             UserWarning,
             stacklevel=2,
         )
-
-    # Sample text lengths
-    input_lens = np.random.randint(
-        max(int(input_len * range_ratio), 1), input_len + 1, size=num_requests
-    )
-    output_lens = np.random.randint(
-        int(output_len * range_ratio), output_len + 1, size=num_requests
-    )
-
-    def _gen_random_image_data_uri(
-        width: int = width, height: int = height
-    ) -> (Image, str, int):
-        if image_content == "blank":
-            # Generate blank white image
-            arr = np.full((height, width, 3), 255, dtype=np.uint8)
-        else:
-            # Generate random colored image
-            arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
-        img = Image.fromarray(arr)
-        buf = io.BytesIO()
-        img.save(buf, format=image_format, quality=85)
-        encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
-        image_data = f"data:image/{image_format};base64,{encoded}"
-        image_bytes = len(image_data.encode("utf-8"))
-        return img, image_data, image_bytes
 
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
@@ -1512,7 +1553,15 @@ def sample_image_requests(
 
         # Generate image list
         images, images_base64, images_bytes = zip(
-            *[_gen_random_image_data_uri() for _ in range(image_count)]
+            *[
+                _gen_random_image_data_uri(
+                    width=width,
+                    height=height,
+                    image_format=image_format,
+                    image_content=image_content,
+                )
+                for _ in range(image_count)
+            ]
         )
         total_image_bytes += sum(list(images_bytes))
 
@@ -1888,6 +1937,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    processor: Optional[AutoProcessor] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -2000,6 +2050,15 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    # Precompute image resolution once for lazy image generation mode
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    lazy_image_mode = args.dataset_name == "image" and getattr(
+        args, "image_lazy_generate", False
+    )
+    if lazy_image_mode:
+        image_width, image_height = parse_image_resolution(args.image_resolution)
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
@@ -2045,6 +2104,45 @@ async def benchmark(
         else:
             lora_name = None
 
+        # Lazily generate image data per request (to reduce peak memory usage)
+        if lazy_image_mode:
+            assert (
+                processor is not None
+                and image_width is not None
+                and image_height is not None
+            ), "`processor` and image resolution must be provided for lazy image generation mode."
+
+            # Generate images for this single request
+            images, images_base64, _images_bytes = zip(
+                *[
+                    _gen_random_image_data_uri(
+                        width=image_width,
+                        height=image_height,
+                        image_format=args.image_format,
+                        image_content=args.image_content,
+                    )
+                    for _ in range(args.image_count)
+                ]
+            )
+
+            # Recompute prompt_len / text_prompt_len / vision_prompt_len with images
+            data_row = create_mm_data_row(
+                request.prompt,
+                list(images),
+                list(images_base64),
+                request.output_len,
+                processor,
+                backend,
+            )
+
+            # Update DatasetRow so that later metrics use accurate token counts
+            request.prompt_len = data_row.prompt_len
+            request.text_prompt_len = data_row.text_prompt_len
+            request.vision_prompt_len = data_row.vision_prompt_len
+            current_image_data = data_row.image_data
+        else:
+            current_image_data = request.image_data
+
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=request.prompt,
@@ -2052,7 +2150,7 @@ async def benchmark(
             prompt_len=request.prompt_len,
             output_len=request.output_len,
             lora_name=lora_name,
-            image_data=request.image_data,
+            image_data=current_image_data,
             extra_request_body=extra_request_body,
             timestamp=request.timestamp,
         )
@@ -2476,7 +2574,13 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer, model_id)
+
+    processor = None
+    if args.dataset_name in ["image", "mmmu"]:
+        # Pre-build the processor for image/mmmu datasets to facilitate reuse in subsequent lazy generation mode
+        processor = get_processor(model_id)
+
+    input_requests = get_dataset(args, tokenizer, model_id, processor=processor)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -2517,6 +2621,7 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            processor=processor,
         )
     )
 
@@ -2659,6 +2764,14 @@ if __name__ == "__main__":
         type=str,
         default="random",
         help=("Content for images for image dataset. " "Supports random and blank."),
+    )
+    parser.add_argument(
+        "--image-lazy-generate",
+        action="store_true",
+        help=(
+            "Generate images lazily per request instead of precomputing all image data at dataset "
+            "construction time. This lowers peak memory usage by generating images while sending."
+        ),
     )
     parser.add_argument(
         "--request-rate",
