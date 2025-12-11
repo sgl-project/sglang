@@ -19,9 +19,10 @@ use crate::{
         ConversationId, ConversationItemId, ConversationItemStorage, ConversationStorage,
         NewConversationItem, ResponseId, ResponseStorage,
     },
-    protocols::responses::{generate_id, ResponseInput, ResponsesRequest},
+    protocols::responses::{
+        generate_id, ResponseInput, ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+    },
 };
-
 /// Persist conversation items to storage
 ///
 /// This function:
@@ -110,8 +111,6 @@ pub async fn persist_conversation_items(
 
 /// Extract and normalize input items from ResponseInput
 fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
-    use crate::protocols::responses::{ResponseInputOutputItem, StringOrContentParts};
-
     let items = match input {
         ResponseInput::Text(text) => {
             // Convert simple text to message item

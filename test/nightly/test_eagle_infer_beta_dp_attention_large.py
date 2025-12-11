@@ -98,11 +98,4 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
 
 
 if __name__ == "__main__":
-    s = unittest.TestSuite()
-    large_test = unittest.defaultTestLoader.loadTestsFromTestCase(
-        TestEagleDPAttnServerLarge
-    )
-    s.addTest(large_test)
-
-    runner = unittest.TextTestRunner()
-    runner.run(s)
+    unittest.main()

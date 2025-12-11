@@ -523,12 +523,18 @@ class ModelConfig:
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             if not is_local:
-                import huggingface_hub
+                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+                if envs.SGLANG_USE_MODELSCOPE.get():
 
-                try:
+                    from modelscope import HubApi, model_file_download
+
+                    hf_api = HubApi()
+                else:
+                    import huggingface_hub
                     from huggingface_hub import HfApi, hf_hub_download
 
                     hf_api = HfApi()
+                try:
                     # Retry HF API call up to 3 times
                     file_exists = retry(
                         lambda: hf_api.file_exists(
@@ -540,11 +546,18 @@ class ModelConfig:
                     )
                     if file_exists:
                         # Download and parse the quantization config for remote models
-                        quant_config_file = hf_hub_download(
-                            repo_id=self.model_path,
-                            filename="hf_quant_config.json",
-                            revision=self.revision,
-                        )
+                        if envs.SGLANG_USE_MODELSCOPE.get():
+                            quant_config_file = model_file_download(
+                                model_id=self.model_path,
+                                file_path="hf_quant_config.json",
+                                revision=self.revision,
+                            )
+                        else:
+                            quant_config_file = hf_hub_download(
+                                repo_id=self.model_path,
+                                filename="hf_quant_config.json",
+                                revision=self.revision,
+                            )
                         with open(quant_config_file) as f:
                             quant_config_dict = json.load(f)
                         quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
@@ -973,6 +986,7 @@ multimodal_model_archs = [
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
+    "PaddleOCRVLForConditionalGeneration",
 ]
 
 if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:

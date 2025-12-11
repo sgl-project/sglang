@@ -531,6 +531,8 @@ impl Router {
             }
         };
 
+        RouterMetrics::record_upstream_http_response(route, res.status().as_u16());
+
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 

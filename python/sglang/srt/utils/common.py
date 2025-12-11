@@ -71,6 +71,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from unittest import SkipTest
 from urllib.parse import urlparse
 
 import numpy as np
@@ -227,9 +228,7 @@ def is_blackwell():
 def is_blackwell_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
-    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
-        torch.version.cuda >= "12.8"
-    )
+    return is_sm100_supported(device) or is_sm120_supported(device)
 
 
 @lru_cache(maxsize=1)
@@ -243,7 +242,7 @@ def is_sm120_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
@@ -252,7 +251,7 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
@@ -1504,6 +1503,31 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter
+
+    http_response_status_counter = Counter(
+        name="sglang:http_responses_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        response = await call_next(request)
+
+        route = request.scope.get("route")
+        endpoint = route.path if route else "Unknown"
+
+        http_response_status_counter.labels(
+            endpoint=endpoint,
+            status_code=str(response.status_code),
+            method=request.method,
+        ).inc()
+
+        return response
+
+
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2517,6 +2541,9 @@ def retry(
     for try_index in itertools.count():
         try:
             return fn()
+        except SkipTest:
+            # Do NOT retry skipped tests - used in CI and unittest
+            raise
         except Exception as e:
             traceback.print_exc()
 
@@ -3324,6 +3351,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
