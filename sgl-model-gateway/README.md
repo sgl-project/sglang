@@ -9,7 +9,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Multi-model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
 - Conversation, response, and chat-history connectors that centralize state at the router, enabling compliant sharing across models/MCP loops with in-memory, no-op, or Oracle ATP storage options.
 - Built-in reliability primitives: retries with exponential backoff, circuit breakers, token-bucket rate limiting, and queuing.
-- First-class observability with structured logging and Prometheus metrics.
+- First-class observability with structured logging, OpenTelemetry trace and Prometheus metrics.
 
 ### Architecture at a Glance
 **Control Plane**
@@ -27,7 +27,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Advanced load balancing with cache-aware request reuse, load-aware (power-of-two) selection, and per-model policy overrides.
 
 ## Feature Highlights
-- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`) with DP-aware scheduling.
+- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`, `bucket`) with DP-aware scheduling.
 - Multi-model HTTP serving and inference gateway routing with model-specific policies.
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
 - gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, and other reasoning-capable models.
@@ -562,6 +562,7 @@ Only one of `--oracle-dsn` or `--oracle-tns-alias` should be supplied.
 - **Prometheus Metrics**: Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`). Metrics cover request latency, retry behavior, circuit breaker states, worker health/load, queue depth, PD pipeline stats, tokenizer timings, and MCP activity.
 - **Request IDs**: Configurable headers via `--request-id-headers`; responses include `x-request-id`.
 - **CORS**: Set `--cors-allowed-origins` for browser access.
+- **Request Tracing via OpenTelemetry**: Enable with `--enable-trace` and set opentelemetry collector endpoint with `--otlp-traces-endpoint <ip>:<port>`.
 
 ## Security
 

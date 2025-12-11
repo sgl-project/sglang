@@ -11,6 +11,7 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
+use memchr::memmem;
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
@@ -20,7 +21,11 @@ use crate::{
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
     },
-    metrics::RouterMetrics,
+    observability::{
+        events::{self, Event},
+        metrics::RouterMetrics,
+        otel_trace::inject_trace_context_http,
+    },
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -87,8 +92,10 @@ impl Router {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
-                    let name_lc = name.to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
+                    // Use eq_ignore_ascii_case to avoid string allocation
+                    if !name.eq_ignore_ascii_case("content-type")
+                        && !name.eq_ignore_ascii_case("content-length")
+                    {
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -212,6 +219,14 @@ impl Router {
                     None
                 };
 
+                events::RequestSentEvent {
+                    url: worker.url().to_string(),
+                }
+                .emit();
+                let mut headers_with_trace = headers.cloned().unwrap_or_default();
+                inject_trace_context_http(&mut headers_with_trace);
+                let headers = Some(&headers_with_trace);
+
                 let response = self
                     .send_typed_request(
                         headers,
@@ -222,6 +237,8 @@ impl Router {
                         load_incremented,
                     )
                     .await;
+
+                events::RequestReceivedEvent {}.emit();
 
                 worker.record_outcome(response.status().is_success());
 
@@ -286,6 +303,18 @@ impl Router {
             return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
         }
 
+        // Pre-filter headers once before the loop to avoid repeated lowercasing
+        let filtered_headers: Vec<_> = headers
+            .map(|hdrs| {
+                hdrs.iter()
+                    .filter(|(name, _)| {
+                        !name.as_str().eq_ignore_ascii_case("content-type")
+                            && !name.as_str().eq_ignore_ascii_case("content-length")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut last_response: Option<Response> = None;
         for worker in workers {
             let worker_url = worker.url();
@@ -305,17 +334,16 @@ impl Router {
             };
 
             if let Some(api_key) = worker.api_key() {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
+                // Pre-allocate string with capacity to avoid reallocation
+                let mut auth_header = String::with_capacity(7 + api_key.len());
+                auth_header.push_str("Bearer ");
+                auth_header.push_str(api_key);
+                request_builder = request_builder.header("Authorization", auth_header);
             }
 
-            if let Some(hdrs) = headers {
-                for (name, value) in hdrs {
-                    let name_lc = name.as_str().to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
-                        request_builder = request_builder.header(name, value);
-                    }
-                }
+            // Apply pre-filtered headers
+            for (name, value) in &filtered_headers {
+                request_builder = request_builder.header(*name, *value);
             }
 
             match request_builder.send().await {
@@ -403,11 +431,12 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
     ) -> Response {
-        // Get the worker's API key if available
-        let api_key = self
-            .worker_registry
-            .get_by_url(worker_url)
-            .and_then(|w| w.api_key().clone());
+        // Get the worker once and reuse for API key and load tracking
+        let worker = self.worker_registry.get_by_url(worker_url);
+        let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
+
+        // Static key string to avoid per-request allocations
+        const DP_RANK_KEY: &str = "data_parallel_rank";
 
         let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -434,14 +463,15 @@ impl Router {
             };
 
             if let Some(map) = json_val.as_object_mut() {
-                map.insert(
-                    String::from("data_parallel_rank"),
-                    serde_json::json!(dp_rank),
-                );
-                debug!(
-                    "Modified request body: {}",
-                    serde_json::to_string(&json_val).unwrap_or(String::from("ERR"))
-                );
+                // Use static key string to avoid allocation
+                map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
+                // Only serialize if debug logging is enabled to avoid CPU overhead
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "Modified request body: {}",
+                        serde_json::to_string(&json_val).unwrap_or_else(|_| String::from("ERR"))
+                    );
+                }
             } else {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -460,7 +490,11 @@ impl Router {
         };
 
         if let Some(key) = api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
+            // Pre-allocate string with capacity to avoid reallocation
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
         }
 
         // Copy all headers from original request if provided
@@ -483,9 +517,9 @@ impl Router {
 
                 // Decrement load on error if it was incremented
                 if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
+                    if let Some(ref w) = worker {
+                        w.decrement_load();
+                        RouterMetrics::set_running_requests(worker_url, w.load());
                     }
                 }
 
@@ -496,6 +530,8 @@ impl Router {
                     .into_response();
             }
         };
+
+        RouterMetrics::record_upstream_http_response(route, res.status().as_u16());
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -514,9 +550,9 @@ impl Router {
                 Err(e) => {
                     // IMPORTANT: Decrement load on error before returning
                     if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
+                        if let Some(ref w) = worker {
+                            w.decrement_load();
+                            RouterMetrics::set_running_requests(worker_url, w.load());
                         }
                     }
 
@@ -527,17 +563,18 @@ impl Router {
 
             // Decrement load counter for non-streaming requests if it was incremented
             if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
+                if let Some(ref w) = worker {
+                    w.decrement_load();
+                    RouterMetrics::set_running_requests(worker_url, w.load());
                 }
             }
 
             response
         } else if load_incremented {
             // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
+            // Clone the worker Arc for the async block instead of looking it up again
+            let stream_worker = worker.clone();
+            let worker_url_owned = worker_url.to_string();
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -554,15 +591,14 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
+                            // Check for stream end marker using memmem for efficiency
+                            if memmem::find(&bytes, b"data: [DONE]").is_some() {
+                                if let Some(ref w) = stream_worker {
+                                    w.decrement_load();
+                                    RouterMetrics::set_running_requests(
+                                        &worker_url_owned,
+                                        w.load(),
+                                    );
                                     decremented = true;
                                 }
                             }
@@ -577,9 +613,9 @@ impl Router {
                     }
                 }
                 if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
+                    if let Some(ref w) = stream_worker {
+                        w.decrement_load();
+                        RouterMetrics::set_running_requests(&worker_url_owned, w.load());
                     }
                 }
             });

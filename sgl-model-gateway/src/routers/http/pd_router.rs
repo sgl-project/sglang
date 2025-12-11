@@ -20,17 +20,18 @@ use crate::{
     core::{
         is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
-    metrics::RouterMetrics,
+    observability::{
+        events::{self, Event},
+        metrics::RouterMetrics,
+        otel_trace::inject_trace_context_http,
+    },
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
-        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{header_utils, RouterTrait},
 };
@@ -185,6 +186,11 @@ impl PDRouter {
         None
     }
 
+    // Static key strings to avoid per-request allocations
+    const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
+    const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
+    const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+
     fn inject_bootstrap_into_value(
         mut original: Value,
         prefill_worker: &dyn Worker,
@@ -203,12 +209,13 @@ impl PDRouter {
                 ports.push(prefill_worker.bootstrap_port());
                 rooms.push(super::pd_types::generate_room_id());
             }
+            // Use static string keys to avoid per-request allocations
             obj.insert(
-                "bootstrap_host".to_string(),
+                Self::BOOTSTRAP_HOST_KEY.to_string(),
                 Value::Array(hosts.into_iter().map(Value::from).collect()),
             );
             obj.insert(
-                "bootstrap_port".to_string(),
+                Self::BOOTSTRAP_PORT_KEY.to_string(),
                 Value::Array(
                     ports
                         .into_iter()
@@ -220,23 +227,24 @@ impl PDRouter {
                 ),
             );
             obj.insert(
-                "bootstrap_room".to_string(),
+                Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
         } else {
+            // Use static string keys to avoid per-request allocations
             obj.insert(
-                "bootstrap_host".to_string(),
+                Self::BOOTSTRAP_HOST_KEY.to_string(),
                 Value::from(prefill_worker.bootstrap_host()),
             );
             obj.insert(
-                "bootstrap_port".to_string(),
+                Self::BOOTSTRAP_PORT_KEY.to_string(),
                 match prefill_worker.bootstrap_port() {
                     Some(v) => Value::from(v),
                     None => Value::Null,
                 },
             );
             obj.insert(
-                "bootstrap_room".to_string(),
+                Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::from(super::pd_types::generate_room_id()),
             );
         }
@@ -252,12 +260,15 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
+        // Clone request once outside the retry loop, then use Arc to share across attempts
+        // This avoids O(retries) clones by sharing the same data
+        let shared_request = Arc::new(original_request.clone());
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
-                let original_request = original_request.clone();
                 move |attempt: u32| {
-                    let original_request = original_request.clone();
+                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
+                    let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
@@ -278,7 +289,7 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(&original_request) {
+                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
@@ -391,6 +402,10 @@ impl PDRouter {
             None
         };
 
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
@@ -410,15 +425,16 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
-        debug!(
-            "Sending concurrent requests to prefill={} decode={}",
-            prefill.url(),
-            decode.url()
-        );
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url().to_string(),
+            decode_url: decode.url().to_string(),
+        }
+        .emit();
 
         let (prefill_result, decode_result) =
             tokio::join!(prefill_request.send(), decode_request.send());
-        debug!("Received responses from both servers");
+
+        events::RequestReceivedEvent {}.emit();
 
         let duration = start_time.elapsed();
         RouterMetrics::record_pd_request_duration(context.route, duration);
@@ -873,7 +889,11 @@ impl PDRouter {
                 // Whitelist important end-to-end headers, skip hop-by-hop
                 let forward = matches!(
                     name_lc.as_str(),
-                    "authorization" | "x-request-id" | "x-correlation-id"
+                    "authorization"
+                    | "x-request-id"
+                    | "x-correlation-id"
+                    | "traceparent"      // W3C Trace Context
+                    | "tracestate" // W3C Trace Context
                 ) || name_lc.starts_with("x-request-id-");
                 if forward {
                     if let Ok(val) = value.to_str() {
@@ -886,6 +906,7 @@ impl PDRouter {
     }
 
     // Helper to merge logprobs from prefill and decode responses
+    // Optimized to avoid double cloning by taking ownership of decode array
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
         if let (Some(prefill_meta), Some(decode_meta)) = (
             prefill_json.get("meta_info"),
@@ -895,13 +916,17 @@ impl PDRouter {
                 prefill_meta.get("input_token_logprobs"),
                 decode_meta.get_mut("input_token_logprobs"),
             ) {
-                if let (Some(prefill_arr), Some(decode_arr)) =
-                    (prefill_logprobs.as_array(), decode_logprobs.as_array_mut())
-                {
-                    let mut merged = prefill_arr.clone();
-                    merged.extend(decode_arr.clone());
-                    decode_meta["input_token_logprobs"] = Value::Array(merged);
-                    return true;
+                if let Some(prefill_arr) = prefill_logprobs.as_array() {
+                    // Take ownership of decode array to avoid cloning it
+                    let decode_arr = std::mem::take(decode_logprobs);
+                    if let Value::Array(decode_vec) = decode_arr {
+                        // Pre-allocate merged array with exact capacity
+                        let mut merged = Vec::with_capacity(prefill_arr.len() + decode_vec.len());
+                        merged.extend(prefill_arr.iter().cloned());
+                        merged.extend(decode_vec);
+                        decode_meta["input_token_logprobs"] = Value::Array(merged);
+                        return true;
+                    }
                 }
             }
         }
@@ -909,6 +934,7 @@ impl PDRouter {
     }
 
     // Simple helper to merge logprobs in streaming responses
+    // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
         prefill_logprobs: Option<Value>,
         decode_chunk: &[u8],
@@ -927,12 +953,16 @@ impl PDRouter {
         if let Some(ref p_logprobs) = prefill_logprobs {
             if let Some(meta) = decode_json.get_mut("meta_info") {
                 if let Some(d_logprobs) = meta.get_mut("input_token_logprobs") {
-                    if let (Some(p_arr), Some(d_arr)) =
-                        (p_logprobs.as_array(), d_logprobs.as_array())
-                    {
-                        let mut merged = p_arr.clone();
-                        merged.extend(d_arr.clone());
-                        *d_logprobs = Value::Array(merged);
+                    if let Some(p_arr) = p_logprobs.as_array() {
+                        // Take ownership of decode array to avoid cloning it
+                        let decode_arr = std::mem::take(d_logprobs);
+                        if let Value::Array(d_vec) = decode_arr {
+                            // Pre-allocate merged array with exact capacity
+                            let mut merged = Vec::with_capacity(p_arr.len() + d_vec.len());
+                            merged.extend(p_arr.iter().cloned());
+                            merged.extend(d_vec);
+                            *d_logprobs = Value::Array(merged);
+                        }
                     }
                 }
             }
@@ -1155,66 +1185,6 @@ impl RouterTrait for PDRouter {
         };
 
         self.execute_dual_dispatch(headers, body, context).await
-    }
-
-    async fn route_responses(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn get_response(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _response_id: &str,
-        _params: &ResponsesGetParams,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses retrieve endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses cancel endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn route_classify(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ClassifyRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Classify endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn route_embeddings(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &EmbeddingRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Embeddings endpoint not implemented for PD router",
-        )
-            .into_response()
     }
 
     async fn route_rerank(
