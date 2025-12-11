@@ -271,6 +271,10 @@ pub fn init_metrics() {
     );
 
     describe_counter!(
+        "sgl_router_http_requests_total",
+        "Total number of HTTP requests"
+    );
+    describe_counter!(
         "sgl_router_http_responses_total",
         "Total number of HTTP responses by status code"
     );
@@ -596,10 +600,11 @@ impl RouterMetrics {
     }
 
     // This is different from the following:
-    // * sgl_router_requests_total: bump when a request is handled and response is to be returned.
+    // * sgl_router_requests_total: bump when a request is handled and response is to be returned, thus very different from this.
     // * sgl_router_processed_requests_total: bump when routing decision is made.
     // Here we want a metric to directly reflect user's experience ("I am sending a request")
-    // when viewing the router as a blackbox.
+    // when viewing the router as a blackbox, and is bumped immediately when the request arrives.
+    // TODO: add route name
     pub fn record_http_request() {
         counter!("sgl_router_http_requests_total").increment(1);
     }
