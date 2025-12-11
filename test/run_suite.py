@@ -105,8 +105,19 @@ def run_a_suite(args):
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
-    files = glob.glob("registered/**/*.py", recursive=True)
-    ci_tests = filter_tests(collect_tests(files, sanity_check=True), hw, suite, nightly)
+    # Temporary: search broadly for nightly tests during migration to registered/
+    if nightly:
+        files = glob.glob("**/*.py", recursive=True)
+        sanity_check = False  # Allow files without registration during migration
+    else:
+        files = glob.glob("registered/**/*.py", recursive=True)
+        sanity_check = (
+            True  # Strict: all registered files must have proper registration
+        )
+
+    ci_tests = filter_tests(
+        collect_tests(files, sanity_check=sanity_check), hw, suite, nightly
+    )
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
     if not test_files:
