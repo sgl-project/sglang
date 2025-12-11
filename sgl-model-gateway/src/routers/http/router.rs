@@ -602,7 +602,7 @@ impl Router {
                 }
                 if !decremented {
                     if let Some(ref w) = stream_worker {
-                        Self::dec_load(&worker_url_owned, w);
+                        decrement_load(w);
                     }
                 }
             });
