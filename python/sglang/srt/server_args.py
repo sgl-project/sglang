@@ -1315,10 +1315,8 @@ class ServerArgs:
                     self.disable_overlap_schedule = False
 
             # Mamba radix cache v2
-            self.enable_mamba_radix_cache_v2 = (
-                not self.disable_radix_cache and is_cuda()
-            )
             if self.enable_mamba_radix_cache_v2:
+                assert is_cuda(), "MambaRadixCache v2 is only supported on CUDA devices"
                 if self.speculative_num_draft_tokens is not None:
                     assert (
                         self.mamba_track_interval >= self.speculative_num_draft_tokens

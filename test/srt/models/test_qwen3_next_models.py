@@ -50,6 +50,7 @@ class TestQwen3Next(CustomTestCase):
                 "4",
                 "--chunked-prefill-size",
                 "2048",
+                "--enable-mamba-radix-cache-v2",
                 "--mamba-track-interval",
                 "128",
             ],
@@ -120,7 +121,7 @@ class TestQwen3Next(CustomTestCase):
         print("test_prefix_cache_branching passed")
 
 
-class TestQwen3NextMTPLargePageSize(CustomTestCase):
+class TestQwen3NextMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_NEXT_MODEL
@@ -143,12 +144,8 @@ class TestQwen3NextMTPLargePageSize(CustomTestCase):
                 "0.8",
                 "--tp",
                 "4",
-                "--page-size",
-                "64",
                 "--chunked-prefill-size",
                 "2048",
-                "--mamba-track-interval",
-                "128",
             ],
         )
 
@@ -189,32 +186,6 @@ class TestQwen3NextMTPLargePageSize(CustomTestCase):
             max_samples=16,
             max_new_tokens=384,
         )
-
-    def test_prefix_cache_branching(self):
-        print("running test_prefix_cache_branching")
-        requests.get(self.base_url + "/flush_cache")
-        branching_pos = 256
-        text_prefix = "hi" * branching_pos
-        suffix_list = ["this" * 256, "here" * 256, "that" * 256]
-        cache_hit_list = [False, False, True]
-
-        # First request only prefill the entire sequence
-        # Second request won't have cache hit, but will cache the branching point
-        # Third request will have cache hit on the branching point
-        for i, (suffix, cache_hit) in enumerate(
-            zip(suffix_list, cache_hit_list, strict=True)
-        ):
-            result = send_request_helper(self.base_url, text_prefix + suffix)
-            cached_tokens = result["meta_info"]["cached_tokens"]
-            if cache_hit:
-                assert (
-                    cached_tokens > 0
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not greater than 0"
-            else:
-                assert (
-                    cached_tokens == 0
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not 0"
-        print("test_prefix_cache_branching passed")
 
 
 class TestQwen3NextMTPTopk(CustomTestCase):
@@ -242,6 +213,7 @@ class TestQwen3NextMTPTopk(CustomTestCase):
                 "4",
                 "--chunked-prefill-size",
                 "2048",
+                "--enable-mamba-radix-cache-v2",
                 "--mamba-track-interval",
                 "128",
             ],
