@@ -223,6 +223,14 @@ class SamplingParams:
                 f"num_frames={self.num_frames}"
             )
 
+        # Validate resolution against pipeline-specific supported resolutions
+        if self.height is not None and self.width is not None:
+            try:
+                pipeline_config.validate_resolution(self.width, self.height)
+            except ValueError as e:
+                logger.error(str(e))
+                raise
+
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             logger.debug(f"Setting num_frames to 1 because this is an image-gen model")
