@@ -28,13 +28,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
-        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{header_utils, RouterTrait},
 };
@@ -1188,66 +1185,6 @@ impl RouterTrait for PDRouter {
         };
 
         self.execute_dual_dispatch(headers, body, context).await
-    }
-
-    async fn route_responses(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn get_response(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _response_id: &str,
-        _params: &ResponsesGetParams,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses retrieve endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Responses cancel endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn route_classify(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ClassifyRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Classify endpoint not implemented for PD router",
-        )
-            .into_response()
-    }
-
-    async fn route_embeddings(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &EmbeddingRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Embeddings endpoint not implemented for PD router",
-        )
-            .into_response()
     }
 
     async fn route_rerank(
