@@ -429,10 +429,9 @@ def handle_attention_nsa(attn, forward_batch):
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
 
-    attn_backend = forward_batch.attn_backend
-    if isinstance(attn_backend, TboAttnBackend):  # if enable tbo, get primary backend
-        attn_backend = attn_backend.primary
-    backend = attn_backend
+    backend = forward_batch.attn_backend
+    if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
+        backend = backend.primary
     if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
