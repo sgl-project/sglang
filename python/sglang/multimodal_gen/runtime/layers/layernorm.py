@@ -353,6 +353,10 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             def get_arg(t):
                 if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
                     return t.reshape(1).to(dtype=x.dtype, device=x.device)
+                elif (t.dim() == 2 and t.shape[0] == 1) or (
+                    t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1
+                ):
+                    return t.contiguous().to(dtype=x.dtype, device=x.device)
                 elif t.dim() == 2 or t.dim() == 3:
                     return (
                         t.expand(B, L, C)
@@ -376,7 +380,11 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 assert gate == 1
                 gate_opt = torch.ones(M, C, device=x.device, dtype=x.dtype)
             elif isinstance(gate, torch.Tensor):
-                if gate.dim() == 4:
+                if (gate.dim() == 2 and gate.shape[0] == 1) or (
+                    gate.dim() == 3 and gate.shape[0] == 1 and gate.shape[1] == 1
+                ):
+                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
+                elif gate.dim() == 4:
                     # gate.shape: [batch_size, num_frames, 1, inner_dim]
                     gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
                 elif gate.dim() == 3:
@@ -473,6 +481,10 @@ class LayerNormScaleShift(nn.Module):
     ) -> torch.Tensor:
         if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
             return t.reshape(1).to(dtype=x.dtype, device=x.device)
+        elif (t.dim() == 2 and t.shape[0] == 1) or (
+            t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1
+        ):
+            return t.contiguous().to(dtype=x.dtype, device=x.device)
         elif t.dim() == 2 or t.dim() == 3:
             return (
                 t.expand(B, L, C)
