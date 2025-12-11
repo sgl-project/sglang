@@ -518,10 +518,10 @@ def main():
         help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
     )
     arg_parser.add_argument(
-        "--max-retry-attempts",
+        "--max-attempts",
         type=int,
-        default=3,
-        help="Maximum number of retry attempts per file (default: 3)",
+        default=2,
+        help="Maximum number of retry attempts per file (default: 2)",
     )
     arg_parser.add_argument(
         "--retry-wait-seconds",
