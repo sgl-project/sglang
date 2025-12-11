@@ -86,6 +86,7 @@ Image dataset flags (for `image`):
 - `--image-resolution`: Image resolution; supports presets (4k, 1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
 - `--image-format`: Image format (jpeg or png)
 - `--image-content`: Image content type (random or blank)
+- `--image-lazy-generate`: Generate images lazily per request instead of precomputing all image data during dataset construction. This reduces peak memory usage and is especially useful for long-running stability tests that send a large number of image requests.
 
 ### Examples
 
