@@ -1153,6 +1153,8 @@ def _triton_mrope_forward_fused(
     k_ptr,
     cos_sin_cache_ptr,
     positions_ptr,
+    q_stride,
+    k_stride,
     positions_stride,
     n_qh: tl.constexpr,
     n_kh: tl.constexpr,
@@ -1174,8 +1176,8 @@ def _triton_mrope_forward_fused(
     # instead of (3, bsz, seq_len, head_dim), also supports interleaved rotary
     pid = tl.program_id(0)
     # locate start address
-    q_ptr = q_ptr + pid * (n_qh * hd)
-    k_ptr = k_ptr + pid * (n_kh * hd)
+    q_ptr = q_ptr + pid * q_stride
+    k_ptr = k_ptr + pid * k_stride
 
     half_rd = rd // 2
     t = tl.load(positions_ptr + 0 * positions_stride + pid)
@@ -1334,39 +1336,40 @@ def triton_mrope_fused(
     """
     num_tokens, n_q_dim = q.shape
     k_first_dim, n_k_dim = k.shape
-    rd = rotary_dim
-    hd = head_size
 
-    positions_stride, last_positions_stride = positions.stride()
-
+    assert rotary_dim % 2 == 0
+    assert rotary_dim <= head_size
+    assert k_first_dim == num_tokens
+    assert n_q_dim % head_size == 0
+    assert n_k_dim % head_size == 0
+    assert len(mrope_section) == 3
+    assert list(positions.shape) == [3, num_tokens]
     assert (
-        rotary_dim % 2 == 0
-        and rotary_dim <= head_size
-        and k_first_dim == num_tokens
-        and n_q_dim % head_size == 0
-        and n_k_dim % head_size == 0
-        and list(positions.shape) == [3, num_tokens]
-        and len(mrope_section) == 3
-        and all(t.is_contiguous() and t.dim() == 2 for t in [q, k, cos_sin_cache])
-        and last_positions_stride == 1
+        q.stride(1) == 1
+        and k.stride(1) == 1
+        and positions.stride(1) == 1
+        and cos_sin_cache.dim() == 2
+        and cos_sin_cache.is_contiguous()
     )
 
     n_qh = n_q_dim // head_size
     n_kh = n_k_dim // head_size
     pad_n_qh = triton.next_power_of_2(n_qh)
     pad_n_kh = triton.next_power_of_2(n_kh)
-    pad_hd = triton.next_power_of_2(hd)
+    pad_hd = triton.next_power_of_2(head_size)
 
     _triton_mrope_forward_fused[(num_tokens,)](
         q,
         k,
         cos_sin_cache,
         positions,
-        positions_stride,
+        q.stride(0),
+        k.stride(0),
+        positions.stride(0),
         n_qh,
         n_kh,
-        hd,
-        rd,
+        head_size,
+        rotary_dim,
         pad_n_qh,
         pad_n_kh,
         pad_hd,
