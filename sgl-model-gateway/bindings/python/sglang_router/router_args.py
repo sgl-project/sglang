@@ -54,6 +54,7 @@ class RouterArgs:
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
+    prometheus_duration_buckets: Optional[List[float]] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
@@ -341,6 +342,12 @@ class RouterArgs:
             type=str,
             default="0.0.0.0",
             help="Host address to bind the Prometheus metrics server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
+        )
+        parser.add_argument(
+            f"--{prefix}prometheus-duration-buckets",
+            type=float,
+            nargs="+",
+            help="Buckets for Prometheus duration metrics",
         )
         parser.add_argument(
             f"--{prefix}request-id-headers",
