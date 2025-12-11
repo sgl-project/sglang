@@ -11,6 +11,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -42,6 +43,7 @@ class ForwardMetadata:
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
+    actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
@@ -267,7 +269,6 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        tp_size = get_attention_tp_size()
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
@@ -411,6 +412,72 @@ class AscendAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
 
+    def do_cp_balance_attn(
+        self,
+        q_nope,
+        k_nope,
+        q_pe,
+        k_pe,
+        topk_indices,
+        layer,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        seq_len = q_nope.shape[0]
+        split_len = (seq_len + 1) // 2
+        q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
+        q_rope_prev, q_rope_next = torch.split(q_pe, split_len, dim=0)
+        q_nope_prev = q_nope_prev.contiguous()
+        q_nope_next = q_nope_next.contiguous()
+        q_rope_prev = q_rope_prev.contiguous()
+        q_rope_next = q_rope_next.contiguous()
+        topk_indices_prev, topk_indices_next = topk_indices
+
+        actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
+        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+
+        attn_out_prev = torch.ops.custom.npu_sparse_flash_attention(
+            query=q_nope_prev,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_rope_prev,
+            key_rope=k_pe,
+            sparse_indices=topk_indices_prev,
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen_prev.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+        )
+        attn_out_next = torch.ops.custom.npu_sparse_flash_attention(
+            query=q_nope_next,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_rope_next,
+            key_rope=k_pe,
+            sparse_indices=topk_indices_next,
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen_next.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+        )
+        return torch.cat([attn_out_prev, attn_out_next], dim=0)
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -440,9 +507,12 @@ class AscendAttnBackend(AttentionBackend):
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        block_table = self.forward_metadata.block_tables
+
         if is_prefill:
-            actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
+            if self.forward_metadata.actual_seq_lengths_q is not None:
+                actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
+            else:
+                actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
         else:
             if self.forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -471,27 +541,46 @@ class AscendAttnBackend(AttentionBackend):
                     )
             else:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
-        if self.forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = self.forward_metadata.seq_lens
-        else:
-            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
 
-        attn_out = torch.ops.custom.npu_sparse_flash_attention(
-            query=q_nope,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_pe,
-            key_rope=k_pe,
-            sparse_indices=topk_indices,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen.to(torch.int32),
-            actual_seq_lengths_kv=actual_seq_lengths_kv.to(q.device),
-            block_table=block_table,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-        )
+        if self.forward_metadata.actual_seq_lengths_kv is not None:
+            actual_seq_lengths_kv = self.forward_metadata.actual_seq_lengths_kv
+        elif self.forward_metadata.seq_lens_cpu_int is not None:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
+        else:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens
+
+        if (
+            is_prefill
+            and is_nsa_enable_prefill_cp()
+            and forward_batch.nsa_cp_metadata is not None
+        ):
+            attn_out = self.do_cp_balance_attn(
+                q_nope,
+                k_nope,
+                q_pe,
+                k_pe,
+                topk_indices,
+                layer,
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+            )
+        else:
+            attn_out = torch.ops.custom.npu_sparse_flash_attention(
+                query=q_nope,
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_pe,
+                key_rope=k_pe,
+                sparse_indices=topk_indices,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=actual_seq_qlen,
+                actual_seq_lengths_kv=actual_seq_lengths_kv.to(q.device),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+            )
 
         return attn_out
 
