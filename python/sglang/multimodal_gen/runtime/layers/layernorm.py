@@ -328,6 +328,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
+        # print(f"wan, residual.shape, {residual.shape}, x.shape, {x.shape}, gate.shape, {gate if isinstance(gate, int) else gate.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
         can_use_cuda = (
             x.is_cuda and (x.shape[-1] % 4 == 0) and not isinstance(self.norm, RMSNorm)
         )
