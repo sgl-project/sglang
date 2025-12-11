@@ -784,6 +784,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         logger.info("[QuantizedRL] Initial load with FP8 quantization")
 
         original_load_weights = model.load_weights
+
         def load_weights_proxy(weights):
             if QuantizedRLModelLoader.is_reload_scenario(model):
                 logger.info("[QuantizedRL] Using fast path reload in load_weights")
@@ -794,7 +795,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 original_load_weights(weights)
 
         model.load_weights = load_weights_proxy
-    
+
         model.load_weights(weights)
         original_weights = dict(model.named_parameters())
 
