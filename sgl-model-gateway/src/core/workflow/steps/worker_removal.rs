@@ -32,12 +32,8 @@ pub struct FindWorkersToRemoveStep;
 #[async_trait]
 impl StepExecutor for FindWorkersToRemoveStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let request: Arc<WorkerRemovalRequest> = context
-            .get("removal_request")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("removal_request".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let request: Arc<WorkerRemovalRequest> = context.get_or_err("removal_request")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!(
             "Finding workers to remove for {} (dp_aware: {})",
@@ -109,12 +105,8 @@ pub struct RemoveFromPolicyRegistryStep;
 #[async_trait]
 impl StepExecutor for RemoveFromPolicyRegistryStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let workers_to_remove: Arc<Vec<Arc<dyn Worker>>> = context
-            .get("workers_to_remove")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers_to_remove".to_string()))?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let workers_to_remove: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers_to_remove")?;
 
         debug!(
             "Removing {} worker(s) from policy registry",
@@ -153,12 +145,8 @@ pub struct RemoveFromWorkerRegistryStep;
 #[async_trait]
 impl StepExecutor for RemoveFromWorkerRegistryStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let worker_urls: Arc<Vec<String>> = context
-            .get("worker_urls")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_urls".to_string()))?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let worker_urls: Arc<Vec<String>> = context.get_or_err("worker_urls")?;
 
         debug!(
             "Removing {} worker(s) from worker registry",
@@ -202,15 +190,9 @@ pub struct UpdateRemainingPoliciesStep;
 #[async_trait]
 impl StepExecutor for UpdateRemainingPoliciesStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let affected_models: Arc<HashSet<String>> = context
-            .get("affected_models")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("affected_models".to_string()))?;
-        let worker_urls: Arc<Vec<String>> = context
-            .get("worker_urls")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_urls".to_string()))?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let affected_models: Arc<HashSet<String>> = context.get_or_err("affected_models")?;
+        let worker_urls: Arc<Vec<String>> = context.get_or_err("worker_urls")?;
 
         debug!(
             "Updating cache-aware policies for {} affected model(s)",
