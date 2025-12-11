@@ -269,9 +269,6 @@ pub enum WorkflowError {
 
     #[error("Context value not found: {0}")]
     ContextValueNotFound(String),
-
-    #[error("Context value type mismatch: {0}")]
-    ContextTypeMismatch(String),
 }
 
 pub type WorkflowResult<T> = Result<T, WorkflowError>;
