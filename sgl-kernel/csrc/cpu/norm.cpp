@@ -303,90 +303,6 @@ void fused_rmsnorm_gated_kernel_impl(
 }  // anonymous namespace
 
 template <typename scalar_t>
-void layernorm_kernel_impl(
-    scalar_t* __restrict__ input,
-    const scalar_t* __restrict__ weight,
-    float* __restrict__ buffer,
-    int64_t batch_size,
-    int64_t hidden_size,
-    int64_t input_strideN,
-    float eps = 1e-5) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
-    int tid = at::get_thread_num();
-    float* __restrict__ buffer_ptr = buffer + tid * hidden_size;
-
-    for (int64_t i = begin; i < end; ++i) {
-      scalar_t* __restrict__ input_ptr = input + i * input_strideN;
-      fVec sum_fvec{fVec(0.0)}, sum_sq_fvec{fVec(0.0)};
-      float sum_val{0.0}, sum_sq_val{0.0};
-      int64_t d{0};
-
-#pragma GCC unroll 4
-      for (; d <= hidden_size - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(input_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
-        sum_fvec += x_fvec0;
-        sum_fvec += x_fvec1;
-        sum_sq_fvec += x_fvec0 * x_fvec0;
-        sum_sq_fvec += x_fvec1 * x_fvec1;
-
-        x_fvec0.store(buffer_ptr + d);
-        x_fvec1.store(buffer_ptr + d + fVec::size());
-      }
-#pragma GCC unroll 4
-      for (; d < hidden_size; ++d) {
-        float x_val = static_cast<float>(input_ptr[d]);
-        sum_val += x_val;
-        sum_sq_val += x_val * x_val;
-        buffer_ptr[d] = x_val;
-      }
-
-      // Var(X) = E(X^2) - (E(X))^2
-      // Refer to FlashInfer impl: https://github.com/flashinfer-ai/flashinfer/blob/6bb01d19c2d9ab3b6a3a5e9e97448891a5ed2844/include/flashinfer/norm.cuh#L554
-      sum_val += vec_reduce_sum(sum_fvec);
-      sum_sq_val += vec_reduce_sum(sum_sq_fvec);
-
-      float mean = sum_val / hidden_size;
-      float mean_sq = sum_sq_val / hidden_size;
-      float variance = mean_sq - (mean * mean);
-      float rsqrt_var = float(1) / std::sqrt(variance + eps);
-
-      const fVec mean_fvec = fVec(mean);
-      const fVec scale_fvec = fVec(rsqrt_var);
-
-      // Second pass: apply normalization
-#pragma GCC unroll 4
-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
-        fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
-
-        bVec w_bvec = bVec::loadu(weight + d);
-        fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
-
-        x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
-        x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
-
-        bVec x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        x_bvec.store(input_ptr + d);
-      }
-#pragma GCC unroll 4
-      for (; d < hidden_size; ++d) {
-        float normalized = (buffer_ptr[d] - mean) * rsqrt_var;
-        float x_val = normalized * static_cast<float>(weight[d]);
-        input_ptr[d] = static_cast<scalar_t>(x_val);
-      }
-    }
-  });
-}  // anonymous namespace
-
-template <typename scalar_t>
 void fused_add_layernorm_kernel_impl(
     scalar_t* __restrict__ input,
     scalar_t* __restrict__ residual,
@@ -405,33 +321,39 @@ void fused_add_layernorm_kernel_impl(
     float* __restrict__ buffer_ptr = buffer + tid * hidden_size;
 
     for (int64_t i = begin; i < end; ++i) {
-      // local ptrs
       scalar_t* __restrict__ input_ptr = input + i * input_strideN;
-      scalar_t* __restrict__ residual_ptr = residual + i * hidden_size;
+      scalar_t* __restrict__ residual_ptr;
+      if (residual != nullptr) {
+        residual_ptr = residual + i * hidden_size;
+      }
 
-      // First pass: compute sum for mean
-      fVec sum_fvec = fVec(float(0));
-      float sum_val = float(0);
+      // First pass: compute mean and var
+      fVec sum_fvec{fVec(0.0)}, sum_sq_fvec{fVec(0.0)};
+      float sum_val{0.0}, sum_sq_val{0.0};
+      int64_t d{0};
 
-      int64_t d;
 #pragma GCC unroll 4
-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+      for (; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
         std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-        bVec r_bvec = bVec::loadu(residual_ptr + d);
-        fVec r_fvec0, r_fvec1;
-        std::tie(r_fvec0, r_fvec1) = at::vec::convert_to_float(r_bvec);
+        if (residual != nullptr) {
+          bVec r_bvec = bVec::loadu(residual_ptr + d);
+          fVec r_fvec0, r_fvec1;
+          std::tie(r_fvec0, r_fvec1) = at::vec::convert_to_float(r_bvec);
 
-        x_fvec0 += r_fvec0;
-        x_fvec1 += r_fvec1;
+          x_fvec0 += r_fvec0;
+          x_fvec1 += r_fvec1;
 
-        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        out_bvec.store(residual_ptr + d);
+          bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+          out_bvec.store(residual_ptr + d);
+        }
 
         sum_fvec += x_fvec0;
         sum_fvec += x_fvec1;
+        sum_sq_fvec += x_fvec0 * x_fvec0;
+        sum_sq_fvec += x_fvec1 * x_fvec1;
 
         x_fvec0.store(buffer_ptr + d);
         x_fvec1.store(buffer_ptr + d + fVec::size());
@@ -439,48 +361,32 @@ void fused_add_layernorm_kernel_impl(
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
-        float r_val = static_cast<float>(residual_ptr[d]);
-
-        x_val += r_val;
-        residual_ptr[d] = static_cast<scalar_t>(x_val);
-
+        if (residual != nullptr) {
+          float r_val = static_cast<float>(residual_ptr[d]);
+          x_val += r_val;
+          residual_ptr[d] = static_cast<scalar_t>(x_val);
+        }
+        
         sum_val += x_val;
+        sum_sq_val += x_val * x_val;
         buffer_ptr[d] = x_val;
       }
 
-      // Compute mean
+      // Var(X) = E(X^2) - (E(X))^2
+      // Refer to FlashInfer impl:
+      // https://github.com/flashinfer-ai/flashinfer/blob/6bb01d19c2d9ab3b6a3a5e9e97448891a5ed2844/include/flashinfer/norm.cuh#L554
       sum_val += vec_reduce_sum(sum_fvec);
-      float mean = sum_val / hidden_size;
+      sum_sq_val += vec_reduce_sum(sum_sq_fvec);
+
+      float mean{sum_val / hidden_size};
+      float mean_sq{sum_sq_val / hidden_size};
+      float variance{mean_sq - (mean * mean)};
+      float rsqrt_var{float(1) / std::sqrt(variance + eps)};
+
       const fVec mean_fvec = fVec(mean);
-
-      // Second pass: compute variance
-      fVec var_sum_fvec = fVec(float(0));
-      float var_sum_val = float(0);
-
-#pragma GCC unroll 4
-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
-        fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
-
-        fVec diff0 = x_fvec0 - mean_fvec;
-        fVec diff1 = x_fvec1 - mean_fvec;
-
-        var_sum_fvec += diff0 * diff0;
-        var_sum_fvec += diff1 * diff1;
-      }
-#pragma GCC unroll 4
-      for (; d < hidden_size; ++d) {
-        float diff = buffer_ptr[d] - mean;
-        var_sum_val += diff * diff;
-      }
-
-      // Compute normalization factor
-      var_sum_val += vec_reduce_sum(var_sum_fvec);
-      float variance = var_sum_val / hidden_size;
-      float rsqrt_var = float(1) / std::sqrt(variance + eps);
       const fVec scale_fvec = fVec(rsqrt_var);
 
-      // Third pass: apply normalization
+      // Second pass: apply normalization
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
@@ -567,8 +473,9 @@ void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   int64_t num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "layernorm_kernel", [&] {
-    layernorm_kernel_impl<scalar_t>(
+    fused_add_layernorm_kernel_impl<scalar_t>(
         input.data_ptr<scalar_t>(),
+        nullptr,
         weight.data_ptr<scalar_t>(),
         buffer.data_ptr<float>(),
         batch_size,
