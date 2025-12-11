@@ -35,35 +35,50 @@ class LoRAPipeline(ComposedPipelineBase):
     Pipeline that supports injecting LoRA adapters into the diffusion transformer.
     """
 
+    # Type annotations for instance attributes (initialized in __init__)
     # [lora_nickname][target_LoRA_weight_name_in_SGLang_dit] = weight
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
-    lora_adapters: dict[str, dict[str, torch.Tensor]] = defaultdict(
-        dict
-    )  # state dicts of loaded lora adapters
-    loaded_adapter_paths: dict[str, str] = {}  # nickname -> lora_path
+    lora_adapters: dict[str, dict[str, torch.Tensor]]
+    loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
-    cur_adapter_name: dict[str, str] = {}
-    cur_adapter_path: dict[str, str] = {}
+    cur_adapter_name: dict[str, str]
+    cur_adapter_path: dict[str, str]
     # [dit_layer_name] = wrapped_lora_layer
-    lora_layers: dict[str, BaseLayerWithLoRA] = {}
-    lora_layers_critic: dict[str, BaseLayerWithLoRA] = {}
-    lora_layers_transformer_2: dict[str, BaseLayerWithLoRA] = {}
+    lora_layers: dict[str, BaseLayerWithLoRA]
+    lora_layers_critic: dict[str, BaseLayerWithLoRA]
+    lora_layers_transformer_2: dict[str, BaseLayerWithLoRA]
     server_args: ServerArgs
-    exclude_lora_layers: list[str] = []
-    device: torch.device = get_local_torch_device()
-    lora_target_modules: list[str] | None = None
-    lora_path: str | None = None
-    lora_nickname: str = "default"
-    lora_rank: int | None = None
-    lora_alpha: int | None = None
-    lora_initialized: bool = False
+    exclude_lora_layers: list[str]
+    device: torch.device
+    lora_target_modules: list[str] | None
+    lora_path: str | None
+    lora_nickname: str
+    lora_rank: int | None
+    lora_alpha: int | None
+    lora_initialized: bool
     # Track merge status per module: {"transformer": True, "transformer_2": False}
-    is_lora_merged: dict[str, bool] = {}
-    # Valid target values for set_lora
+    is_lora_merged: dict[str, bool]
+    # Valid target values for set_lora (class constant, immutable)
     VALID_TARGETS: list[str] = ["all", "transformer", "transformer_2", "critic"]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # Initialize all mutable instance attributes to avoid sharing across instances
+        self.lora_adapters = defaultdict(dict)
+        self.loaded_adapter_paths = {}
+        self.cur_adapter_name = {}
+        self.cur_adapter_path = {}
+        self.lora_layers = {}
+        self.lora_layers_critic = {}
+        self.lora_layers_transformer_2 = {}
+        self.is_lora_merged = {}
+        self.lora_initialized = False
+        self.lora_rank = None
+        self.lora_alpha = None
+        self.lora_path = None
+        self.lora_nickname = "default"
+
+        # Initialize from server_args
         self.device = get_local_torch_device()
         self.exclude_lora_layers = (
             self.server_args.pipeline_config.dit_config.arch_config.exclude_lora_layers

@@ -82,9 +82,6 @@ class DiffGenerator:
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
-        self._current_lora_path: str | None = None
-        self._current_lora_nickname: str | None = None
-        self._is_lora_merged: bool = False
 
     @classmethod
     def from_pretrained(
@@ -381,7 +378,6 @@ class DiffGenerator:
             f"Successfully unmerged LoRA weights (target: {target})",
             "Failed to unmerge LoRA weights",
         )
-        self._is_lora_merged = False
 
     def merge_lora_weights(self, target: str = "all") -> None:
         """
@@ -396,7 +392,6 @@ class DiffGenerator:
             f"Successfully merged LoRA weights (target: {target})",
             "Failed to merge LoRA weights",
         )
-        self._is_lora_merged = True
 
     def _ensure_lora_state(
         self,
@@ -404,29 +399,27 @@ class DiffGenerator:
         lora_nickname: str | None = None,
         merge_lora: bool = True,
     ) -> None:
+        """
+        Ensure the LoRA state matches the desired configuration.
+
+        Note: This method does not cache client-side state. The server handles
+        idempotent operations, so redundant calls are safe but may have minor overhead.
+        """
         if lora_path is None:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-            self._current_lora_path = None
-            self._current_lora_nickname = None
-            self._is_lora_merged = False
+            # Unmerge all LoRA weights when no lora_path is provided
+            self.unmerge_lora_weights()
             return
 
         lora_nickname = lora_nickname or self.server_args.lora_nickname
 
-        if self._current_lora_path != lora_path:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-                self._is_lora_merged = False
-            self.set_lora(lora_nickname, lora_path)
-            self._current_lora_path = lora_path
-            self._current_lora_nickname = lora_nickname
-            self._is_lora_merged = False
+        # Set the LoRA adapter (server handles idempotent logic)
+        self.set_lora(lora_nickname, lora_path)
 
-        if merge_lora and not self._is_lora_merged:
+        # Merge or unmerge based on the merge_lora flag
+        if merge_lora:
             self.merge_lora_weights()
-        elif not merge_lora:
-            self._is_lora_merged = False
+        else:
+            self.unmerge_lora_weights()
 
     def generate_with_lora(
         self,
