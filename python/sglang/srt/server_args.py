@@ -37,6 +37,7 @@ from sglang.srt.utils.common import (
     configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -167,17 +168,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
-]
-
-MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
-
-FP8_GEMM_RUNNER_BACKEND_CHOICES = [
-    "auto",
-    "deep_gemm",
-    "flashinfer_trtllm",
-    "cutlass",
-    "triton",
-    "aiter",
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
@@ -413,7 +403,6 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
-    speculative_moe_a2a_backend: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -426,7 +415,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep", "mori"] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -829,6 +818,10 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
             if self.cuda_graph_max_bs is None:
                 self.cuda_graph_max_bs = 160
+
+        # assert (
+        #     self.chunked_prefill_size <= get_int_env_var("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096)
+        # ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
         # Set cuda graph batch sizes
         if self.cuda_graph_bs is None:
@@ -3078,13 +3071,6 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
-        parser.add_argument(
-            "--speculative-moe-a2a-backend",
-            type=str,
-            choices=MOE_A2A_BACKEND_CHOICES,
-            default=ServerArgs.speculative_moe_a2a_backend,
-            help="Choose the backend for MoE A2A in speculative decoding",
-        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -3143,7 +3129,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=MOE_A2A_BACKEND_CHOICES,
+            choices=["none", "deepep", "mooncake", "ascend_fuseep", "mori"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )

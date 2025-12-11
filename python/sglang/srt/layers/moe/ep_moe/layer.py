@@ -23,9 +23,9 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, fp8_dtype
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -39,8 +39,9 @@ _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+
 if _use_aiter:
-    from aiter import ActivationType, QuantType
+    from aiter import ActivationType, QuantType, get_hip_quant
     from aiter.fused_moe import fused_moe
 elif _is_npu:
     import torch_npu
@@ -530,7 +531,116 @@ class NpuFuseEPMoE(DeepEPMoE):
             )
 
 
+class MoriEPMoE(FusedMoE):
+    _has_printed = False
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
+        )
+
+        assert _use_aiter, "Mori need to be used together with aiter as of now"
+        self.expert_mask = torch.zeros(
+            (self.num_experts),
+            device=torch.cuda.current_device(),
+            dtype=torch.int32,
+        )
+        expert_start_idx = self.moe_ep_rank * self.num_local_experts
+        expert_end_idx = expert_start_idx + self.num_local_experts
+        self.expert_mask[expert_start_idx : expert_end_idx] = 1
+
+        self.quant_func = get_hip_quant(QuantType.per_1x128)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        forward_shared_experts=None,
+        alt_stream=None,
+        disable_sbo=False,
+    ):
+        num_token = hidden_states.shape[0]
+        output_dtype = hidden_states.dtype
+        scale = None
+
+        enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+
+        if enable_fp8:
+            # FP8 quant
+            if num_token > 0:
+                # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
+                hidden_states, scale = self.quant_func(hidden_states, quant_dtype=fp8_dtype)
+            else:
+                hidden_states = torch.empty(hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device)
+                scale = torch.empty((0, self.hidden_size // 128), dtype=torch.float32, device=hidden_states.device)
+
+        # dispatch
+        (
+            dispatch_a1,
+            dispatch_weights,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_recv_token_num,
+        ) = self.dispatcher.dispatch(hidden_states, topk_output, scale=scale)
+        #assert dispatch_scale is not None
+        # fused moe
+        hidden_states = fused_moe(
+            hidden_states=dispatch_a1,
+            w1=self.w13_weight,
+            w2=self.w2_weight,
+            w1_scale=self.w13_weight_scale_inv,
+            w2_scale=self.w2_weight_scale_inv,
+            a1_scale=dispatch_scale,
+            topk_weight=dispatch_weights,
+            topk_ids=dispatch_ids,
+            quant_type=QuantType.per_128x128,
+            activation=(
+                ActivationType.Silu
+                if self.moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
+            ),
+            expert_mask=self.expert_mask,
+            num_local_tokens=dispatch_recv_token_num,
+            dtype=output_dtype,
+        )
+
+        # combine
+        result = self.dispatcher.combine(
+            hidden_states,
+            topk_output.topk_ids,
+        )[0]
+        return result[:num_token]
+
+
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    if get_moe_a2a_backend().is_mori():
+        return MoriEPMoE
+
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
