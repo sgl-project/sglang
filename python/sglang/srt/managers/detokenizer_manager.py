@@ -80,9 +80,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-        )
+        if server_args.tokenizer_worker_num > 1:
+            self.tokenizer_num = (
+                server_args.tokenizer_worker_num // server_args.detokenizer_worker_num
+            )
+        else:
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
 
         # Init tokenizer
         if server_args.skip_tokenizer_init:
@@ -334,7 +339,7 @@ def run_detokenizer_process(
     try:
         manager = detokenizer_manager_class(server_args, port_args)
         if server_args.tokenizer_worker_num > 1:
-            manager.multi_http_worker_event_loop()
+            manager.multi_http_worker_event_loop(server_args.detokenizer_worker_num)
         else:
             manager.event_loop()
     except Exception:
