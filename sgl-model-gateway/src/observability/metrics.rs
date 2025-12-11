@@ -921,7 +921,6 @@ mod tests {
 
         RouterMetrics::set_active_workers(5);
         RouterMetrics::set_worker_health("http://worker1", true);
-        RouterMetrics::set_worker_load("http://worker1", 10);
         RouterMetrics::record_processed_request("http://worker1");
 
         RouterMetrics::record_policy_decision("random", "http://worker1");
@@ -1023,7 +1022,6 @@ mod tests {
             let handle = thread::spawn(move || {
                 let worker = format!("http://worker{}", i);
                 while !done_clone.load(Ordering::Relaxed) {
-                    RouterMetrics::set_worker_load(&worker, i * 10);
                     RouterMetrics::record_processed_request(&worker);
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -1074,9 +1072,6 @@ mod tests {
     fn test_extreme_metric_values() {
         RouterMetrics::set_active_workers(0);
         RouterMetrics::set_active_workers(usize::MAX);
-
-        RouterMetrics::set_worker_load("worker", 0);
-        RouterMetrics::set_worker_load("worker", usize::MAX);
 
         RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
         RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
