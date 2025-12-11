@@ -109,7 +109,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         --url "http://localhost:9000/v1/chat/completions" \
         --header "Content-Type: application/json" \
         --data '{
-            "model": "${model}",
+            "model": "${model_path}",
             "messages": [
                 {
                 "role": "user",
@@ -117,7 +117,7 @@ if [[ "${TYPE}" == "launch" ]]; then
                     {
                     "type": "image_url",
                     "image_url": {
-                        "url": "dog.png"
+                        "url": "https://sf-maas-uat-prod.oss-cn-shanghai.aliyuncs.com/dog.png"
                     }
                     },
                     {
