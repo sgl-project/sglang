@@ -8,7 +8,7 @@ that loads and prepares control images for ControlNet conditioning.
 
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 import numpy as np
 import torch
@@ -136,14 +136,18 @@ class ControlEncodingStage(PipelineStage):
 
         # Cast back to the target dtype for the rest of the pipeline
         dit_precision = server_args.pipeline_config.dit_precision
-        target_dtype = torch.bfloat16 if dit_precision in ("bf16", "bfloat16") else torch.float16
+        target_dtype = (
+            torch.bfloat16 if dit_precision in ("bf16", "bfloat16") else torch.float16
+        )
         latent = latent.to(dtype=target_dtype)
 
         # Apply VAE normalization using pre-computed shift_factor and scaling_factor
         # QwenImage VAE stores these as tensors: shift_factor (latents_mean) and scaling_factor (1/latents_std)
-        if hasattr(self.vae, 'shift_factor') and self.vae.shift_factor is not None:
+        if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
             shift_factor = self.vae.shift_factor.to(device=device, dtype=latent.dtype)
-            scaling_factor = self.vae.scaling_factor.to(device=device, dtype=latent.dtype)
+            scaling_factor = self.vae.scaling_factor.to(
+                device=device, dtype=latent.dtype
+            )
             latent = (latent - shift_factor) * scaling_factor
 
         # Permute: [1, C, 1, H/8, W/8] -> [1, 1, C, H/8, W/8]
@@ -182,16 +186,12 @@ class ControlEncodingStage(PipelineStage):
 
         # Flatten patches: [B, T*(H/2)*(W/2), C*4]
         latents = latents.reshape(
-            batch_size,
-            num_frames * (height // 2) * (width // 2),
-            num_channels * 4
+            batch_size, num_frames * (height // 2) * (width // 2), num_channels * 4
         )
 
         return latents
 
-    def _load_control_image(
-        self, image_path: Union[str, Path]
-    ) -> Image.Image:
+    def _load_control_image(self, image_path: Union[str, Path]) -> Image.Image:
         """
         Load control image from file path or URL.
 
@@ -210,8 +210,9 @@ class ControlEncodingStage(PipelineStage):
         # Handle URLs
         if image_path.startswith("http://") or image_path.startswith("https://"):
             try:
-                import requests
                 from io import BytesIO
+
+                import requests
 
                 logger.info(f"Downloading control image from {image_path}")
                 response = requests.get(image_path, timeout=30)
@@ -230,9 +231,7 @@ class ControlEncodingStage(PipelineStage):
             try:
                 image = Image.open(image_path)
             except Exception as e:
-                raise ValueError(
-                    f"Failed to load control image from {image_path}: {e}"
-                )
+                raise ValueError(f"Failed to load control image from {image_path}: {e}")
 
         # Ensure RGB format
         if image.mode != "RGB":
@@ -270,7 +269,9 @@ class ControlEncodingStage(PipelineStage):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Get dtype from pipeline config (dit_precision: "bf16" or "fp16")
         dit_precision = server_args.pipeline_config.dit_precision
-        dtype = torch.bfloat16 if dit_precision in ("bf16", "bfloat16") else torch.float16
+        dtype = (
+            torch.bfloat16 if dit_precision in ("bf16", "bfloat16") else torch.float16
+        )
 
         image_tensor = image_tensor.to(device=device, dtype=dtype)
 

@@ -18,12 +18,12 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenEmbedRope,
     QwenImageTransformerBlock,
     QwenTimestepProjEmbeddings,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -42,6 +42,7 @@ def zero_module(module: nn.Module) -> nn.Module:
 @dataclass
 class QwenImageControlNetOutput:
     """Output class for QwenImageControlNetModel"""
+
     controlnet_block_samples: Tuple[torch.Tensor, ...]
 
 
@@ -85,10 +86,18 @@ class QwenImageControlNetModel(nn.Module):
         in_channels = hf_config.get("in_channels", config.arch_config.in_channels)
         out_channels = hf_config.get("out_channels", config.arch_config.out_channels)
         num_layers = hf_config.get("num_layers", 5)  # ControlNet-Union uses 5 blocks
-        attention_head_dim = hf_config.get("attention_head_dim", config.arch_config.attention_head_dim)
-        num_attention_heads = hf_config.get("num_attention_heads", config.arch_config.num_attention_heads)
-        joint_attention_dim = hf_config.get("joint_attention_dim", config.arch_config.joint_attention_dim)
-        axes_dims_rope = hf_config.get("axes_dims_rope", config.arch_config.axes_dims_rope)
+        attention_head_dim = hf_config.get(
+            "attention_head_dim", config.arch_config.attention_head_dim
+        )
+        num_attention_heads = hf_config.get(
+            "num_attention_heads", config.arch_config.num_attention_heads
+        )
+        joint_attention_dim = hf_config.get(
+            "joint_attention_dim", config.arch_config.joint_attention_dim
+        )
+        axes_dims_rope = hf_config.get(
+            "axes_dims_rope", config.arch_config.axes_dims_rope
+        )
         extra_condition_channels = hf_config.get("extra_condition_channels", 0)
 
         self.out_channels = out_channels or in_channels
@@ -104,15 +113,11 @@ class QwenImageControlNetModel(nn.Module):
 
         # Position embeddings - matches transformer architecture
         self.pos_embed = QwenEmbedRope(
-            theta=10000,
-            axes_dim=list(axes_dims_rope),
-            scale_rope=True
+            theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
         )
 
         # Timestep embeddings
-        self.time_text_embed = QwenTimestepProjEmbeddings(
-            embedding_dim=self.inner_dim
-        )
+        self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
 
         # Text processing
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
@@ -122,20 +127,24 @@ class QwenImageControlNetModel(nn.Module):
         self.img_in = nn.Linear(in_channels, self.inner_dim)
 
         # Transformer blocks - reuse SGLang's optimized implementation
-        self.transformer_blocks = nn.ModuleList([
-            QwenImageTransformerBlock(
-                dim=self.inner_dim,
-                num_attention_heads=num_attention_heads,
-                attention_head_dim=attention_head_dim,
-            )
-            for _ in range(num_layers)
-        ])
+        self.transformer_blocks = nn.ModuleList(
+            [
+                QwenImageTransformerBlock(
+                    dim=self.inner_dim,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=attention_head_dim,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         # ControlNet output blocks - zero-initialized for stable training
-        self.controlnet_blocks = nn.ModuleList([
-            zero_module(nn.Linear(self.inner_dim, self.inner_dim))
-            for _ in range(num_layers)
-        ])
+        self.controlnet_blocks = nn.ModuleList(
+            [
+                zero_module(nn.Linear(self.inner_dim, self.inner_dim))
+                for _ in range(num_layers)
+            ]
+        )
 
         # ControlNet condition embedder - zero-initialized
         self.controlnet_x_embedder = zero_module(
@@ -200,9 +209,7 @@ class QwenImageControlNetModel(nn.Module):
             image_rotary_emb = freqs_cis
         else:
             image_rotary_emb = self.pos_embed(
-                img_shapes,
-                txt_seq_lens,
-                device=hidden_states.device
+                img_shapes, txt_seq_lens, device=hidden_states.device
             )
 
         # Process text embeddings
@@ -224,7 +231,9 @@ class QwenImageControlNetModel(nn.Module):
 
         # Apply controlnet output projections with zero-init
         controlnet_block_samples = []
-        for block_sample, controlnet_block in zip(block_samples, self.controlnet_blocks):
+        for block_sample, controlnet_block in zip(
+            block_samples, self.controlnet_blocks
+        ):
             controlnet_block_samples.append(
                 controlnet_block(block_sample) * conditioning_scale
             )
@@ -298,11 +307,15 @@ class QwenImageMultiControlNetModel(nn.Module):
 
             if return_dict:
                 return QwenImageControlNetOutput(
-                    controlnet_block_samples=tuple(control_block_samples) if control_block_samples else ()
+                    controlnet_block_samples=(
+                        tuple(control_block_samples) if control_block_samples else ()
+                    )
                 )
             return tuple(control_block_samples) if control_block_samples else ()
         else:
-            raise ValueError("QwenImageMultiControlNetModel only supports controlnet-union (single net) for now.")
+            raise ValueError(
+                "QwenImageMultiControlNetModel only supports controlnet-union (single net) for now."
+            )
 
 
 # Register as EntryClass for automatic discovery by ModelRegistry

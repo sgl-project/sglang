@@ -118,7 +118,9 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         # Get controlnet if available (optional)
-        controlnet = self.get_module("controlnet") if self.has_module("controlnet") else None
+        controlnet = (
+            self.get_module("controlnet") if self.has_module("controlnet") else None
+        )
 
         self.add_stage(
             stage_name="denoising_stage",
@@ -195,7 +197,9 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
         # Get controlnet if available (optional)
-        controlnet = self.get_module("controlnet") if self.has_module("controlnet") else None
+        controlnet = (
+            self.get_module("controlnet") if self.has_module("controlnet") else None
+        )
 
         self.add_stage(
             stage_name="denoising_stage",
