@@ -82,6 +82,7 @@ LOAD_FORMAT_CHOICES = [
     "flash_rl",
     "remote",
     "remote_instance",
+    "private",
 ]
 
 QUANTIZATION_CHOICES = [
