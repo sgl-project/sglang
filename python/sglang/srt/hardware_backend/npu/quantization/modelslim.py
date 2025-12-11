@@ -94,8 +94,25 @@ class ModelSlimConfig(QuantizationConfig):
         else:
             weight_quant = target_scheme.get("weights")
             input_quant = target_scheme.get("input_activations")
-            self.is_moe_w4_dynamic = self.is_dynamic_token_w4(weight_quant, input_quant)
+            is_dynamic_token, is_w8, is_w4 = self.is_dynamic_token(
+                weight_quant, input_quant
+            )
+            self.is_moe_w4_dynamic = is_dynamic_token and is_w4
             self.is_moe_input_quant = input_quant
+
+        if target == "Linear":
+            if target_scheme is not None:
+                self.is_dynamic = is_dynamic_token
+        else:
+            target_scheme = self.target_scheme_map.get("Linear", None)
+            if target_scheme is not None:
+                input_quant = target_scheme.get("input_activations")
+                if (
+                    input_quant is not None
+                    and input_quant.dynamic
+                    and input_quant.strategy == QuantizationStrategy.TOKEN.value
+                ):
+                    self.is_dynamic = True
 
         for name in self.quant_description.keys():
             if "norm.bias" in name:
@@ -158,15 +175,15 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
-            self.is_dynamic = (
-                self.quant_description[prefix_in_quant_config + ".weight"]
+            is_dynamic = self.is_dynamic or (
+                self.quant_description.get(prefix_in_quant_config + ".weight", "")
                 == "W8A8_DYNAMIC"
             )
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             return (
                 NPUW8A8Int8DynamicLinearMethod(self)
-                if self.is_dynamic
+                if is_dynamic
                 else NPUW8A8Int8LinearMethod(self)
             )
         elif isinstance(layer, FusedMoE):
@@ -199,7 +216,7 @@ class ModelSlimConfig(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -211,7 +228,7 @@ class ModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
 
         assert is_skipped is not None
         return is_skipped
@@ -219,8 +236,9 @@ class ModelSlimConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def is_dynamic_token_w4(self, weight_quant, input_quant) -> bool:
+    def is_dynamic_token(self, weight_quant, input_quant) -> bool:
         is_w4 = weight_quant.num_bits == 4
+        is_w8 = weight_quant.num_bits == 8
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
             or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
@@ -238,4 +256,4 @@ class ModelSlimConfig(QuantizationConfig):
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w4 and weight_quant.symmetric and is_token and is_dynamic
+        return weight_quant.symmetric and is_token and is_dynamic, is_w8, is_w4

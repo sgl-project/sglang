@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Union
 
 import torch
@@ -35,6 +36,8 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 
+logger = logging.getLogger(__name__)
+
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
@@ -51,6 +54,9 @@ elif is_npu():
         causal_conv1d_update_npu,
     )
 
+    from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating_v3
+
+    fused_gdn_gating = fused_gdn_gating_v3
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
@@ -83,7 +89,7 @@ class MambaAttnBackendBase(AttentionBackend):
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
-        elif forward_batch.forward_mode.is_extend():
+        elif forward_batch.forward_mode.is_extend(True):
             if forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
@@ -999,3 +1005,16 @@ class HybridLinearAttnBackend(AttentionBackend):
         conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
             :, valid_state_indices, last_steps
         ].to(conv_states.dtype, copy=False)
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        """
+        Return buffers for verify attention kernels that needs to be filled after draft.
+
+        Typically, these are tree mask and position buffers.
+        """
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        pass
