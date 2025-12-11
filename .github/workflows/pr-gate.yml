@@ -80,6 +80,22 @@ jobs:
               );
             }
 
+            async function hasHighPermission(username) {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
+                const perm = data.permission || 'none';
+                return perm === 'write' || perm === 'maintain' || perm === 'admin';
+              } catch (e) {
+                if (e.status === 404 || e.status === 403) return false;
+                throw e;
+              }
+            }
+
+            if (await hasHighPermission(triggeringActor)) {
+              core.info(`Triggering user '${triggeringActor}' has high permission. No rate limit applied.`);
+              return;
+            }
+
             let effectiveCooldownMinutes = DEFAULT_MINUTES;
             let perUserCooldownMinutes = null;
 
