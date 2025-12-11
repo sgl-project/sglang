@@ -121,10 +121,6 @@ class EagleServerBase(CustomTestCase):
         print(json.dumps(response.json()))
         print("=" * 100)
 
-
-class TestEAGLEServer(EagleServerBase):
-    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
-
     def test_request_abort(self):
         concurrency = 4
         threads = [
@@ -381,3 +377,7 @@ class TestEAGLEServer(EagleServerBase):
             print(f"parse JSON failed: {content_json}")
             is_valid_json = False
         self.assertTrue(is_valid_json)
+
+
+class TestEAGLEServer(EagleServerBase):
+    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
