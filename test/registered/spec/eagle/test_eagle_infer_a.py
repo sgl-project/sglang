@@ -116,7 +116,7 @@ class TestEAGLEEngine(CustomTestCase):
             for i in range(8)
         ]
         params = [
-            {"temperature": 0, "max_new_tokens": random.randint(1, 2)} for _ in range(8)
+            {"temperature": 0, "max_new_tokens": random.randint(1, 3)} for _ in range(8)
         ]
         outputs = engine.generate(prompt, params)
         for i, output in enumerate(outputs):
