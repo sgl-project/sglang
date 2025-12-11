@@ -1201,21 +1201,20 @@ def run_bench_one_batch(model, other_args):
 
     try:
         stdout, stderr = process.communicate()
-        output = stdout.decode()
-        error = stderr.decode()
+        output = stdout.decode(errors="backslashreplace")
+        error = stderr.decode(errors="backslashreplace")
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
         # Return prefill_latency, decode_throughput, decode_latency
-        prefill_line = output.split("\n")[-9]
-        decode_line = output.split("\n")[-3]
-        pattern = (
-            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
-        )
-        match = re.search(pattern, prefill_line)
+        pattern = r"Benchmark[\s\S]*Total"
+        match = re.search(pattern, output)
+        bench_output = match[0] if match else ""
+        pattern = r".*?latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        match = re.search(r"Prefill." + pattern, bench_output)
         if match:
             prefill_latency = float(match.group("latency"))
-        match = re.search(pattern, decode_line)
+        match = re.search(r"Decode." + pattern, bench_output)
         if match:
             decode_latency = float(match.group("latency"))
             decode_throughput = float(match.group("throughput"))
