@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
@@ -390,29 +391,30 @@ class TestEAGLERetract(TestEAGLEServer):
         # These config helps find a leak.
         os.environ["SGLANG_CI_SMALL_KV_SIZE"] = "4500"
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                8,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                64,
-            ],
-        )
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            cls.process = popen_launch_server(
+                DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                    "--speculative-num-steps",
+                    5,
+                    "--speculative-eagle-topk",
+                    8,
+                    "--speculative-num-draft-tokens",
+                    64,
+                    "--mem-fraction-static",
+                    0.7,
+                    "--chunked-prefill-size",
+                    128,
+                    "--max-running-requests",
+                    64,
+                ],
+            )
 
 
 class TestEAGLEServerTriton(TestEAGLEServer):
