@@ -10,7 +10,7 @@ import numpy as np
 import requests
 
 from sglang.srt.utils.common import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -148,7 +148,7 @@ class EagleServerBase(CustomTestCase):
         )
 
         # Just run and check it does not hang
-        metrics = run_eval(args)
+        metrics = run_gsm8k_eval(args)
         self.assertGreater(metrics["output_throughput"], 50)
 
     def test_gsm8k(self):
@@ -164,7 +164,7 @@ class EagleServerBase(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
 
-        metrics = run_eval(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.20)
 
