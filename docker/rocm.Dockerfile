@@ -1,13 +1,17 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.6.post1-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6.post1-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.6.post1-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.6-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx942-rocm710 -t v0.5.6-rocm710-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.6-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6.post1 --build-arg GPU_ARCH=gfx950-rocm710 -t v0.5.6-rocm710-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_942_ROCM710="rocm/vllm-dev:ROCm_7.1_1020_rc3_20251105"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_950_ROCM710="rocm/vllm-dev:ROCm_7.1_1020_rc3_20251105"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -21,11 +25,13 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
+ENV TRITON_COMMIT="improve_fa_decode_3.0.0"
 ENV NO_DEPS_FLAG=""
 
 # ===============================
-# Base image 942 and args
+# Base image 942 with rocm700/710 and args
 FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700
+FROM $BASE_IMAGE_942_ROCM710 AS gfx942-rocm710
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -44,6 +50,19 @@ ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.7.post5"
 ENV NO_DEPS_FLAG=""
+
+# ===============================
+# Base image 950 with rocm710 and args
+FROM $BASE_IMAGE_950_ROCM710 AS gfx950-rocm710
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="0"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.7.post5"
+ENV TRITON_COMMIT="02502c86"
+ENV NO_DEPS_FLAG=""
+
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -57,7 +76,6 @@ ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
@@ -120,7 +138,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && git clone ${TRITON_REPO} \
      && cd triton \
      && git checkout ${TRITON_COMMIT} \
-     && cd python \
+     && if [ ! -f setup.py ]; then cd python; fi \
      && python setup.py install; \
     fi
 
@@ -218,8 +236,13 @@ ENV LIBGL_ALWAYS_INDIRECT=1
 RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
 
 RUN /bin/bash -lc 'set -euo pipefail; \
+  # The base images contains multiple python versions
+  if [ "${GPU_ARCH}" == "gfx950-rocm710" ]; then \
+    rm -f /etc/alternatives/python3 && ln -s /usr/bin/python3.10 /etc/alternatives/python3; \
+    curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3.10 get-pip.py --force-reinstall && /usr/local/bin/pip3.10 install six; \
+  fi; \
   # Build TileLang only for gfx950
-  if [ "${GPU_ARCH:-}" != "gfx950" ]; then \
+  if [ "${GPU_ARCH%-*}" != "gfx950" ]; then \
     echo "[TileLang] Skipping (GPU_ARCH=${GPU_ARCH:-unset})"; \
     exit 0; \
   fi; \
@@ -277,8 +300,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git checkout -f "${TILELANG_COMMIT}" && \
   git submodule update --init --recursive && \
   export CMAKE_ARGS="-DLLVM_CONFIG=${LLVM_CONFIG} ${CMAKE_ARGS:-}" && \
-  bash ./install_rocm.sh'
-
+  bash ./install_rocm.sh; \
+  if [ "${GPU_ARCH}" == "gfx950-rocm710" ]; then \
+    rm -f /etc/alternatives/python3 && ln -s /usr/bin/python3.12 /etc/alternatives/python3; \
+    cp /usr/local/bin/pip3.12 /usr/local/bin/pip; \
+    cp /usr/local/bin/pip3.12 /usr/local/bin/pip3; \
+  fi;'
 # -----------------------
 # Hadamard-transform (HIP build)
 RUN /bin/bash -lc 'set -euo pipefail; \
