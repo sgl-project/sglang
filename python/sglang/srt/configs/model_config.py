@@ -80,16 +80,6 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
-def handle_rope_parameters(config: PretrainedConfig):
-    if hasattr(config, "rope_scaling"):
-        rope_scaling = config.rope_scaling
-        if isinstance(rope_scaling, dict):
-            for k, v in rope_scaling.items():
-                if not hasattr(config, k):
-                    setattr(config, k, v)
-    return
-
-
 class ModelConfig:
     def __init__(
         self,
@@ -139,8 +129,6 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        handle_rope_parameters(self.hf_text_config)
-        handle_rope_parameters(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -377,10 +365,9 @@ class ModelConfig:
                 mscale_all_dim = self.hf_config.rope_scaling.get(
                     "mscale_all_dim", False
                 )
-                scaling_factor = self.hf_config.rope_scaling.get("factor")
-                if scaling_factor is not None:
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -544,7 +531,8 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-                if envs.SGLANG_USE_MODELSCOPE is True:
+                if envs.SGLANG_USE_MODELSCOPE.get():
+
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
