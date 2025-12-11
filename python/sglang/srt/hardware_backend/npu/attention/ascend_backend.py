@@ -577,6 +577,9 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        if is_mla_preprocess_enabled():
+            # MLAPO and MLAPROLOG does saving kv_cache
+            save_kv_cache = False
         if topk_indices is not None:
             return self.forward_sparse(
                 q,
@@ -594,9 +597,6 @@ class AscendAttnBackend(AttentionBackend):
             or forward_batch.forward_mode.is_draft_extend()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-
-            if is_mla_preprocess_enabled():
-                save_kv_cache = False
             return self.forward_mtp(
                 q,
                 k,
