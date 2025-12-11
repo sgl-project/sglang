@@ -184,6 +184,7 @@ class Glm4MoeAttention(nn.Module):
         use_qk_norm: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        config: Optional[PretrainedConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -212,6 +213,7 @@ class Glm4MoeAttention(nn.Module):
         self.use_qk_norm = use_qk_norm
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
+        self.config = config
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -787,6 +789,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             use_qk_norm=config.use_qk_norm,
             alt_stream=alt_stream,
+            config=config,
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
