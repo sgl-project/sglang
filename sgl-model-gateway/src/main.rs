@@ -19,6 +19,7 @@ use sgl_model_gateway::{
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut prefill_entries = Vec::new();
+    // dummy comment
     let mut i = 0;
 
     while i < args.len() {
