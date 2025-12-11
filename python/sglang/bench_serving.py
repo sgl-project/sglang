@@ -772,33 +772,64 @@ def get_processor(
 
 
 def get_dataset(args, tokenizer, model_id=None):
+    """Get dataset and optional warmup requests.
+
+    Returns:
+        tuple: (input_requests, warmup_requests) where warmup_requests is None
+               if use_separate_warmup_request is False.
+    """
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
+    use_separate_warmup = getattr(args, "use_separate_warmup_request", False)
+
+    # Check if mooncake is used with separate warmup (not supported)
+    if use_separate_warmup and args.dataset_name == "mooncake":
+        raise ValueError(
+            "The --use-separate-warmup-request option is not supported with the 'mooncake' dataset."
+        )
+
+    warmup_requests = None
+
+    # Datasets that use simple pop-based warmup
+    is_random_dataset = args.dataset_name.startswith("random")
+    use_simple_warmup = (
+        args.dataset_name in ["sharegpt", "image", "mmmu"] or is_random_dataset
+    )
+
+    # Sample one extra request for warmup if using simple warmup logic
+    num_to_sample = (
+        args.num_prompts + 1
+        if (use_separate_warmup and use_simple_warmup)
+        else args.num_prompts
+    )
+
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
+            num_requests=num_to_sample,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
-    elif args.dataset_name.startswith("random"):
+
+    elif is_random_dataset:
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
+            num_prompts=num_to_sample,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
         )
+
     elif args.dataset_name == "image":
         processor = get_processor(model_id)
         input_requests = sample_image_requests(
-            num_requests=args.num_prompts,
+            num_requests=num_to_sample,
             image_count=args.image_count,
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -809,6 +840,7 @@ def get_dataset(args, tokenizer, model_id=None):
             image_resolution=args.image_resolution,
             backend=args.backend,
         )
+
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
@@ -817,18 +849,24 @@ def get_dataset(args, tokenizer, model_id=None):
             system_prompt_len=args.gsp_system_prompt_len,
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,
+            use_separate_warmup=use_separate_warmup,
             tokenizer=tokenizer,
             args=args,
         )
+        # For generated-shared-prefix, warmup requests are stored in args.gsp_warmup_requests
+        if use_separate_warmup:
+            warmup_requests = getattr(args, "gsp_warmup_requests", None)
+
     elif args.dataset_name == "mmmu":
         processor = get_processor(model_id)
         input_requests = sample_mmmu_requests(
-            num_requests=args.num_prompts,
+            num_requests=num_to_sample,
             processor=processor,
             backend=args.backend,
             fixed_output_len=args.random_output_len,
             random_sample=True,
         )
+
     elif args.dataset_name == "mooncake":
         # For mooncake, we don't generate the prompts here.
         # We just load the raw trace data. The async generator will handle the rest.
@@ -849,7 +887,12 @@ def get_dataset(args, tokenizer, model_id=None):
         input_requests = all_requests_data[: args.num_prompts]
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
-    return input_requests
+
+    # Extract warmup request from input_requests for datasets using simple warmup
+    if use_separate_warmup and use_simple_warmup:
+        warmup_requests = [input_requests.pop()]
+
+    return input_requests, warmup_requests
 
 
 ASYNC_REQUEST_FUNCS = {
@@ -1562,10 +1605,12 @@ def get_gen_prefix_cache_path(args, tokenizer):
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
     # Create a unique cache filename based on the generation parameters
+    use_separate_warmup = getattr(args, "use_separate_warmup_request", False)
+    warmup_suffix = "_separate_warmup" if use_separate_warmup else ""
     cache_key = (
         f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
-        f"{tokenizer.__class__.__name__}.pkl"
+        f"{tokenizer.__class__.__name__}{warmup_suffix}.pkl"
     )
     return cache_dir / cache_key
 
@@ -1576,17 +1621,32 @@ def sample_generated_shared_prefix_requests(
     system_prompt_len: int,
     question_len: int,
     output_len: int,
+    use_separate_warmup: bool,
     tokenizer: PreTrainedTokenizerBase,
     args: argparse.Namespace,
 ) -> List[DatasetRow]:
-    """Generate benchmark requests with shared system prompts using random tokens and caching."""
+    """Generate benchmark requests with shared system prompts using random tokens and caching.
+
+    Returns:
+        List[DatasetRow]: The input requests. For warmup requests when use_separate_warmup_request is True,
+                          they are stored in args.gsp_warmup_requests.
+    """
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
 
     # Try to load from cache first
     if cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
+            cached_data = pickle.load(f)
+            # Handle both old format (list) and new format (tuple)
+            if isinstance(cached_data, tuple):
+                input_requests, warmup_requests = cached_data
+                if use_separate_warmup:
+                    args.gsp_warmup_requests = warmup_requests
+                return input_requests
+            else:
+                # Old cache format, just return the list
+                return cached_data
 
     print("\nGenerating new input data...")
 
@@ -1595,6 +1655,19 @@ def sample_generated_shared_prefix_requests(
     for _ in range(num_groups):
         system_prompt = gen_prompt(tokenizer, system_prompt_len)
         system_prompts.append(system_prompt)
+
+    # Generate warmup requests (one per group, system prompt only)
+    warmup_requests = []
+    if use_separate_warmup:
+        for system_prompt in system_prompts:
+            prompt_len = len(tokenizer.encode(system_prompt))
+            warmup_requests.append(
+                DatasetRow(
+                    prompt=system_prompt,
+                    prompt_len=prompt_len,
+                    output_len=min(output_len, 32),  # Short output for warmup
+                )
+            )
 
     # Generate questions
     questions = []
@@ -1640,14 +1713,27 @@ def sample_generated_shared_prefix_requests(
         f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
     )
     print(
-        f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
+        f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens"
     )
+    if use_separate_warmup:
+        print(
+            f"Warmup requests: {len(warmup_requests)} (one per group, system prompt only)\n"
+        )
+    else:
+        print()
 
     # Save to cache
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Caching generated input data to {cache_path}")
     with open(cache_path, "wb") as f:
-        pickle.dump(input_requests, f)
+        if use_separate_warmup:
+            # Save both input_requests and warmup_requests
+            pickle.dump((input_requests, warmup_requests), f)
+            # Store warmup requests in args for later use
+            args.gsp_warmup_requests = warmup_requests
+        else:
+            # Save only input_requests for backward compatibility
+            pickle.dump(input_requests, f)
 
     return input_requests
 
@@ -1883,6 +1969,7 @@ async def benchmark(
     pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
+    separate_warmup_requests: Optional[List[DatasetRow]] = None,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
     mooncake_num_rounds=1,
@@ -1905,7 +1992,7 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print(f"Starting warmup with {warmup_requests} sequences...")
+    print(f"Starting warmup...")
 
     # Handle the data structure difference for the warmup request
     if args.dataset_name == "mooncake":
@@ -1930,45 +2017,49 @@ async def benchmark(
             output_len=output_len,
             image_data=None,  # Mooncake doesn't have image data
         )
+        warmup_request_list = [test_request]
     else:
-        # For all other datasets, input_requests is a list of DatasetRow objects
-        test_request = input_requests[0]
+        # For all other datasets, use separate warmup requests if provided, otherwise use input_requests[0]
+        if separate_warmup_requests is not None and len(separate_warmup_requests) > 0:
+            warmup_request_list = separate_warmup_requests
+        else:
+            warmup_request_list = [input_requests[0]]
 
+    # Unified warmup logic for both single and multiple warmup requests
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
     else:
         lora_name = None
 
-    # Create the test input once
-    test_input = RequestFuncInput(
-        model=model_id,
-        prompt=test_request.prompt,
-        api_url=api_url,
-        prompt_len=test_request.prompt_len,
-        output_len=min(test_request.output_len, 32),
-        lora_name=lora_name,
-        image_data=test_request.image_data,
-        extra_request_body=extra_request_body,
-    )
-
-    # Run warmup requests
     warmup_tasks = []
-    for _ in range(warmup_requests):
-        warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
+    for warmup_req in warmup_request_list:
+        test_input = RequestFuncInput(
+            model=model_id,
+            prompt=warmup_req.prompt,
+            api_url=api_url,
+            prompt_len=warmup_req.prompt_len,
+            output_len=min(warmup_req.output_len, 32),
+            lora_name=lora_name,
+            image_data=warmup_req.image_data,
+            extra_request_body=extra_request_body,
         )
+        # Run each warmup request warmup_requests times
+        for _ in range(warmup_requests):
+            warmup_tasks.append(
+                asyncio.create_task(request_func(request_func_input=test_input))
+            )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
     # Check if at least one warmup request succeeded
-    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
+    if len(warmup_outputs) > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"
         )
     else:
         print(
-            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+            f"Warmup completed with {len(warmup_outputs)} sequences. Starting main benchmark run..."
         )
 
     # Flush cache
@@ -2476,7 +2567,7 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer, model_id)
+    input_requests, warmup_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -2512,6 +2603,7 @@ def run_benchmark(args_: argparse.Namespace):
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
             warmup_requests=args.warmup_requests,
+            separate_warmup_requests=warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
             mooncake_num_rounds=args.mooncake_num_rounds,
@@ -2823,6 +2915,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--use-separate-warmup-request",
+        action="store_true",
+        help="Use separate warmup requests that are not part of the main benchmark. "
+        "This prevents the first request from hitting the cache during benchmarking.",
     )
     parser.add_argument(
         "--tokenize-prompt",

@@ -354,7 +354,7 @@ def throughput_test(
         extra_request_body = json.loads(args.extra_request_body)
 
     # Read dataset
-    input_requests = get_dataset(bench_args, tokenizer)
+    input_requests, _ = get_dataset(bench_args, tokenizer)
 
     warmup_requests = sample_random_requests(
         input_len=256,
