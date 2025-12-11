@@ -2512,7 +2512,8 @@ def update_draft_decode_set_expand_metadata_with_page_size(
     last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(-1).expand(
         -1, expand_page_table.shape[1]
     )
-    expand_page_table -= last_page_lens_broadcast
+    num_seqs = expand_page_table.shape[0]
+    expand_page_table -= last_page_lens_broadcast[:num_seqs]
     expand_page_table = (
         expand_page_table[
             :, strided_indices_expand[: (decode_length + page_size - 1) // page_size]
@@ -2520,4 +2521,4 @@ def update_draft_decode_set_expand_metadata_with_page_size(
         // page_size
     )
     max_seq_pages_expand = (decode_length + page_size - 1) // page_size
-    page_table[:, :max_seq_pages_expand].copy_(expand_page_table)
+    page_table[:num_seqs, :max_seq_pages_expand].copy_(expand_page_table)
