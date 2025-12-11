@@ -97,8 +97,6 @@ pub struct DiscoverMcpInventoryStep;
 #[async_trait]
 impl StepExecutor for DiscoverMcpInventoryStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        use rmcp::{service::RunningService, RoleClient};
-
         let config_request: Arc<McpServerConfigRequest> =
             context.get_or_err("mcp_server_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
@@ -143,8 +141,6 @@ pub struct RegisterMcpServerStep;
 #[async_trait]
 impl StepExecutor for RegisterMcpServerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        use rmcp::{service::RunningService, RoleClient};
-
         let config_request: Arc<McpServerConfigRequest> =
             context.get_or_err("mcp_server_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
