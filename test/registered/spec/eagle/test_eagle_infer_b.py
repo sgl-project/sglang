@@ -2,7 +2,7 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.eagle_fixture import EagleServerBase, TestEAGLEServer
+from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -14,11 +14,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=473, suite="stage-b-test-small-1-gpu")
 
 
-class TestEAGLEServer(EagleServerBase):
+class TestEAGLEServerBasic(EagleServerBase):
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
 
-class TestEAGLERetract(TestEAGLEServer):
+class TestEAGLERetract(TestEAGLEServerBasic):
     @classmethod
     def setUpClass(cls):
         # These config helps find a leak.
@@ -49,7 +49,7 @@ class TestEAGLERetract(TestEAGLEServer):
         )
 
 
-class TestEAGLEServerTriton(TestEAGLEServer):
+class TestEAGLEServerTriton(TestEAGLEServerBasic):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -78,7 +78,7 @@ class TestEAGLEServerTriton(TestEAGLEServer):
         )
 
 
-class TestEAGLEServerPageSize(TestEAGLEServer):
+class TestEAGLEServerPageSize(TestEAGLEServerBasic):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -111,7 +111,7 @@ class TestEAGLEServerPageSize(TestEAGLEServer):
         )
 
 
-class TestEAGLEServerPageSizeTopk(TestEAGLEServer):
+class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
