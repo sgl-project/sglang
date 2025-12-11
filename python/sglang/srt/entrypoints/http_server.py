@@ -232,7 +232,6 @@ async def lifespan(fast_api_app: FastAPI):
     # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
-        add_prometheus_track_response_middleware(app)
         enable_func_timer()
 
     # Init tracing
@@ -1627,6 +1626,9 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
