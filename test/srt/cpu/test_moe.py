@@ -1,4 +1,3 @@
-import itertools
 import math
 import unittest
 
@@ -16,6 +15,7 @@ from utils import (
     fp8_max,
     fp8_min,
     native_fp8_fused_moe,
+    parametrize,
     precision,
     scaled_weight,
     torch_naive_fused_moe,
@@ -60,26 +60,9 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
 
 
 class TestFusedExperts(CustomTestCase):
-    M = [2, 114]
-    N = [32]
-    K = [32]
-    E = [4]
-    topk = [2]
-    renormalize = [False, True]
 
-    M_int8 = [1, 39]
-    N_int8 = [128]
-    K_int8 = [256]
-    E_int8 = [8]
-    topk_int8 = [3]
-
-    M_fp8 = [2, 121]
-    N_fp8 = [352, 512]
-    K_fp8 = [256, 320]
-    E_fp8 = [8]
-    topk_fp8 = [4]
-
-    def _bf16_moe(self, m, n, k, e, topk, renormalize):
+    @parametrize(m=[2, 114], n=[32], k=[32], e=[4], topk=[2], renormalize=[False, True])
+    def test_bf16_moe(self, m, n, k, e, topk, renormalize):
         dtype = torch.bfloat16
         prepack = True
 
@@ -94,26 +77,8 @@ class TestFusedExperts(CustomTestCase):
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
 
-    def test_bf16_moe(self):
-        for params in itertools.product(
-            self.M,
-            self.N,
-            self.K,
-            self.E,
-            self.topk,
-            self.renormalize,
-        ):
-            with self.subTest(
-                m=params[0],
-                n=params[1],
-                k=params[2],
-                e=params[3],
-                topk=params[4],
-                renormalize=params[5],
-            ):
-                self._bf16_moe(*params)
-
-    def _int8_moe(self, M, N, K, E, topk):
+    @parametrize(M=[1, 39], N=[128], K=[256], E=[8], topk=[3])
+    def test_int8_moe(self, M, N, K, E, topk):
         dtype = torch.bfloat16
         prepack = True
 
@@ -172,24 +137,8 @@ class TestFusedExperts(CustomTestCase):
             atol = rtol = 0.02
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
-    def test_int8_moe(self):
-        for params in itertools.product(
-            self.M_int8,
-            self.N_int8,
-            self.K_int8,
-            self.E_int8,
-            self.topk_int8,
-        ):
-            with self.subTest(
-                M=params[0],
-                N=params[1],
-                K=params[2],
-                E=params[3],
-                topk=params[4],
-            ):
-                self._int8_moe(*params)
-
-    def _fp8_moe(self, M, N, K, E, topk):
+    @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
+    def test_fp8_moe(self, M, N, K, E, topk):
         dtype = torch.bfloat16
 
         a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
@@ -241,23 +190,6 @@ class TestFusedExperts(CustomTestCase):
 
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
-
-    def test_fp8_moe(self):
-        for params in itertools.product(
-            self.M_fp8,
-            self.N_fp8,
-            self.K_fp8,
-            self.E_fp8,
-            self.topk_fp8,
-        ):
-            with self.subTest(
-                M=params[0],
-                N=params[1],
-                K=params[2],
-                E=params[3],
-                topk=params[4],
-            ):
-                self._fp8_moe(*params)
 
 
 if __name__ == "__main__":
