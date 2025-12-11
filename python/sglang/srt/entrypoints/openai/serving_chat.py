@@ -285,18 +285,13 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         if self.use_dpsk_v32_encoding:
-            if request.chat_template_kwargs and request.chat_template_kwargs.get(
+            thinking_mode = (
                 "thinking"
-            ):
-                thinking_mode = "thinking"
-            else:
-                thinking_mode = "chat"
+                if (request.chat_template_kwargs or {}).get("thinking")
+                else "chat"
+            )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
-            if messages[0]["role"] != "system":
-                messages.insert(
-                    0, {"role": "system", "content": "You are a helpful Assistant."}
-                )
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
             real_input = encode_messages(
