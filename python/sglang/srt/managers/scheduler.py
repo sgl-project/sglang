@@ -1314,7 +1314,7 @@ class Scheduler(
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
-                reasoning=recv_req.reasoning,
+                require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -1443,7 +1443,7 @@ class Scheduler(
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                    key, req.reasoning
+                    key, req.require_reasoning
                 )
                 req.grammar = value
 
