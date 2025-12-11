@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Dict, List, Optional
 
+from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +54,7 @@ class RouterArgs:
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
+    prometheus_duration_buckets: Optional[List[float]] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
@@ -341,6 +344,12 @@ class RouterArgs:
             help="Host address to bind the Prometheus metrics server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
         )
         parser.add_argument(
+            f"--{prefix}prometheus-duration-buckets",
+            type=float,
+            nargs="+",
+            help="Buckets for Prometheus duration metrics",
+        )
+        parser.add_argument(
             f"--{prefix}request-id-headers",
             type=str,
             nargs="*",
@@ -520,11 +529,13 @@ class RouterArgs:
             default=None,
             help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
         )
+        tool_call_parser_choices = get_available_tool_call_parsers()
         parser.add_argument(
             f"--{prefix}tool-call-parser",
             type=str,
             default=None,
-            help="Specify the parser for handling tool-call interactions",
+            choices=tool_call_parser_choices,
+            help=f"Specify the parser for tool-call interactions (e.g., json, qwen)",
         )
         # MCP server configuration
         parser.add_argument(

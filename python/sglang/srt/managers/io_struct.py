@@ -110,6 +110,23 @@ class SpeculativeDecodingMetricsMixin:
     spec_accepted_tokens: List[int]
 
 
+@dataclass
+class APIServingTimingMixin:
+    # Validation step duration
+    validation_time: Optional[float] = None
+
+    # For metrics
+    received_time: Optional[float] = None
+
+    # Perf_counter equivalents for accurate time calculations
+    received_time_perf: Optional[float] = None
+
+
+_API_SERVING_TIMING_MIXIN_FIELDS = tuple(
+    APIServingTimingMixin.__dataclass_fields__.keys()
+)
+
+
 # Parameters for a session
 @dataclass
 class SessionParams:
@@ -138,7 +155,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq):
+class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -200,9 +217,6 @@ class GenerateReqInput(BaseReq):
 
     # For reasoning
     reasoning: bool = False
-
-    # Validation step duration
-    validation_time: Optional[float] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -623,7 +637,6 @@ class GenerateReqInput(BaseReq):
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            validation_time=self.validation_time,
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -635,6 +648,10 @@ class GenerateReqInput(BaseReq):
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -724,7 +741,7 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq):
+class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -840,9 +857,12 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
-            validation_time=self.validation_time,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 

@@ -1,27 +1,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::{
-    body::Body,
-    extract::Request,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-};
+use axum::{http::HeaderMap, response::Response};
 use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
     app_context::AppContext,
     core::{ConnectionMode, WorkerRegistry, WorkerType},
-    protocols::{
-        chat::ChatCompletionRequest,
-        classify::ClassifyRequest,
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        generate::GenerateRequest,
-        rerank::RerankRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
-    },
+    protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
     routers::RouterTrait,
 };
 
@@ -160,26 +147,6 @@ impl RouterTrait for GrpcPDRouter {
         self
     }
 
-    async fn health_generate(&self, _req: Request<Body>) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Health generate not yet implemented for gRPC PD",
-        )
-            .into_response()
-    }
-
-    async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn get_models(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
@@ -196,64 +163,6 @@ impl RouterTrait for GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await
-    }
-
-    async fn route_completion(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &CompletionRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn route_responses(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn get_response(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _response_id: &str,
-        _params: &ResponsesGetParams,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn route_embeddings(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &EmbeddingRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn route_classify(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ClassifyRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
-    }
-
-    async fn route_rerank(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &RerankRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 
     fn router_type(&self) -> &'static str {
