@@ -10,7 +10,7 @@ import numpy as np
 import requests
 
 from sglang.srt.utils.common import kill_process_tree
-from sglang.test import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -64,7 +64,7 @@ class EagleServerBase(CustomTestCase):
 
     def send_request(self):
         time.sleep(random.uniform(0, 2))
-        for prompt in self.PROMPTS:
+        for prompt in PROMPTS:
             url = self.base_url + "/generate"
             data = {
                 "text": prompt,
@@ -77,7 +77,7 @@ class EagleServerBase(CustomTestCase):
             assert response.status_code == 200
 
     def send_requests_abort(self):
-        for prompt in self.PROMPTS:
+        for prompt in PROMPTS:
             try:
                 time.sleep(random.uniform(0, 2))
                 url = self.base_url + "/generate"
