@@ -58,7 +58,10 @@ class OllamaServing:
                 if ollama_param in options:
                     sampling_params[sglang_param] = options[ollama_param]
 
-        # If max_new_tokens not specified, SGLang will use its default (128)
+        # Set a reasonable default for max_new_tokens if not specified
+        # Ollama users typically expect longer responses than SGLang's default (128)
+        if "max_new_tokens" not in sampling_params:
+            sampling_params["max_new_tokens"] = 2048
 
         return sampling_params
 
@@ -286,7 +289,6 @@ class OllamaServing:
     def get_tags(self) -> OllamaTagsResponse:
         """Handle /api/tags endpoint - list available models."""
         model_name = self.tokenizer_manager.served_model_name
-        model_path = self.tokenizer_manager.model_path
 
         model_info = OllamaModelInfo(
             name=model_name,
