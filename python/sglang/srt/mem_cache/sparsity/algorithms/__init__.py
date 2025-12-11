@@ -4,12 +4,14 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
 )
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.page_wise_algorithm import (
+    BasePageWiseAlgorithm,
     KnormPageAlgorithm,
 )
 
 __all__ = [
     "BaseSparseAlgorithm",
     "SparseMode",
+    "BasePageWiseAlgorithm",
     "KnormPageAlgorithm",
     "DeepSeekNSAAlgorithm",
 ]
