@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -161,6 +162,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.total_req_num = 0
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -478,10 +480,20 @@ class DataParallelController:
                 self.workers
             )
         else:
-            assert (
-                req.bootstrap_room is not None
-            ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            dp_round_robin = os.getenv("SGLANG_DP_ROUND_ROBIN", "0") == "1"
+            if dp_round_robin and self.server_args.disaggregation_mode == "decode":
+                self.total_req_num = (
+                    1
+                    if self.total_req_num == len(self.workers)
+                    else self.total_req_num + 1
+                )
+                select_result = (self.total_req_num - 1) % len(self.workers)
+            else:
+                assert (
+                    req.bootstrap_room is not None
+                ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
+                select_result = req.bootstrap_room % len(self.workers)
+            self.workers[select_result].send_pyobj(req)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
