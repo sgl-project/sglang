@@ -72,6 +72,7 @@ class TestEAGLEEngine(CustomTestCase):
                 engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
                 try:
                     self._test_single_generation(engine)
+                    self._test_first_token_finish(engine)
                     self._test_batch_generation(engine)
                     self._test_eos_token(engine)
                     self._test_acc_length(engine)
