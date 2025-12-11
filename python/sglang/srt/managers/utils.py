@@ -40,6 +40,13 @@ class GenerationBatchResult:
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
 
+    # For EAGLE3 tree repacking: indices of accepted tokens in the flattened draft tree
+    # Shape: [bs, spec_steps + 1], values in [0, bs * num_draft_tokens) or -1 for invalid
+    accept_index: Optional[torch.Tensor] = None
+
+    # Original sparse predict tensor for draft extend (next_token_ids is repacked for scheduler)
+    sparse_predict: Optional[torch.Tensor] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
