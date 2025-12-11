@@ -439,6 +439,7 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
 ///
 /// Supports format: `data:<mediatype>;base64,<data>`
 /// Example: `data:image/jpeg;base64,/9j/4AAQ...`
+const MAX_DATA_URI_DECODED_SIZE: usize = 10 * 1024 * 1024; // 10 MiB guard for inline payloads
 fn parse_data_uri(url: &str) -> Option<Vec<u8>> {
     if !url.starts_with("data:") {
         return None;
@@ -448,10 +449,35 @@ fn parse_data_uri(url: &str) -> Option<Vec<u8>> {
     let base64_marker = ";base64,";
     let base64_start = url.find(base64_marker)?;
     let data_start = base64_start + base64_marker.len();
+    let encoded = &url[data_start..];
+
+    // Rough pre-check so base64 decode never allocates an enormous buffer
+    let chunks = (encoded.len().saturating_add(3)) / 4;
+    let estimated_decoded_len = chunks.saturating_mul(3);
+    if estimated_decoded_len > MAX_DATA_URI_DECODED_SIZE {
+        warn!(
+            function = "parse_data_uri",
+            estimated_decoded_len,
+            limit = MAX_DATA_URI_DECODED_SIZE,
+            "Data URI payload exceeds allowed size"
+        );
+        return None;
+    }
 
     // Decode base64 data
     use base64::{engine::general_purpose::STANDARD, Engine};
-    STANDARD.decode(&url[data_start..]).ok()
+    let decoded = STANDARD.decode(encoded).ok()?;
+    if decoded.len() > MAX_DATA_URI_DECODED_SIZE {
+        warn!(
+            function = "parse_data_uri",
+            decoded_len = decoded.len(),
+            limit = MAX_DATA_URI_DECODED_SIZE,
+            "Data URI payload exceeds allowed size after decoding"
+        );
+        return None;
+    }
+
+    Some(decoded)
 }
 
 /// Process chat messages and apply template (shared by both routers)
@@ -1498,6 +1524,17 @@ mod tests {
     fn test_parse_data_uri_invalid_base64() {
         let url = "data:image/jpeg;base64,!!!invalid!!!";
         let result = parse_data_uri(url);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_data_uri_too_large() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let oversized_bytes = vec![0u8; MAX_DATA_URI_DECODED_SIZE + 1];
+        let encoded = STANDARD.encode(&oversized_bytes);
+        let data_uri = format!("data:image/png;base64,{}", encoded);
+        let result = parse_data_uri(&data_uri);
         assert!(result.is_none());
     }
 }

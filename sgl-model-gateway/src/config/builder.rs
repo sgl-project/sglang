@@ -79,7 +79,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    // TODO: sperate the policies
     pub fn encode_prefill_decode_mode(
         mut self,
         encode_urls: Vec<(String, Option<u16>)>,

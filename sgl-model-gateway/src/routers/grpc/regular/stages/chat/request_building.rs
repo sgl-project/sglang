@@ -56,7 +56,7 @@ impl PipelineStage for ChatRequestBuildingStage {
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
-            // ToDo: Consider which woker to use for building in Triple case (encode or prefill)
+            // ToDo: Consider which worker to use for building in Triple case (encode or prefill)
             ClientSelection::Triple { encode, .. } => encode,
         };
 
