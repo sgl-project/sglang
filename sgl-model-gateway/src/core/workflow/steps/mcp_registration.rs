@@ -46,7 +46,8 @@ pub struct ConnectMcpServerStep;
 #[async_trait]
 impl StepExecutor for ConnectMcpServerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!("Connecting to MCP server: {}", config_request.name);
@@ -98,7 +99,8 @@ impl StepExecutor for DiscoverMcpInventoryStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         use rmcp::{service::RunningService, RoleClient};
 
-        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
         let mcp_client: Arc<RunningService<RoleClient, ()>> = context.get_or_err("mcp_client")?;
 
@@ -143,7 +145,8 @@ impl StepExecutor for RegisterMcpServerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         use rmcp::{service::RunningService, RoleClient};
 
-        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
         let mcp_client: Arc<RunningService<RoleClient, ()>> = context.get_or_err("mcp_client")?;
 
@@ -183,7 +186,8 @@ pub struct ValidateRegistrationStep;
 #[async_trait]
 impl StepExecutor for ValidateRegistrationStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<McpServerConfigRequest> = context.get_or_err("mcp_server_config")?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
 
         let client_registered = context
             .get::<RunningService<RoleClient, ()>>("mcp_client")

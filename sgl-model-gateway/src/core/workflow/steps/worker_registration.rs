@@ -464,7 +464,8 @@ impl StepExecutor for CreateWorkerStep {
         let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
         let connection_mode: Arc<ConnectionMode> = context.get_or_err("connection_mode")?;
-        let discovered_labels: Arc<HashMap<String, String>> = context.get_or_err("discovered_labels")?;
+        let discovered_labels: Arc<HashMap<String, String>> =
+            context.get_or_err("discovered_labels")?;
 
         // Check if worker already exists
         if app_context
