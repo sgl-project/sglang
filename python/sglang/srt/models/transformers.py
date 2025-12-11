@@ -175,9 +175,10 @@ class TransformersForCausalLM(nn.Module):
         )
         # FIX: Handle models (like CLIP) that do not have num_key_value_heads.
         # Fallback to num_attention_heads (Standard Multi-Head Attention).
-        num_kv_heads = getattr(
-            config, "num_key_value_heads", config.num_attention_heads
-        )
+        if hasattr(config, "num_key_value_heads"):
+            num_kv_heads = config.num_key_value_heads
+        else:
+            num_kv_heads = config.num_attention_heads
 
         self.attention_instances = [
             RadixAttention(
@@ -246,30 +247,24 @@ class TransformersForCausalLM(nn.Module):
         # FIX: Wrap the entire replacement logic in try-except.
         # CLIPVisionModel might return valid embeddings via get_input_embeddings
         # but raises NotImplementedError on set_input_embeddings.
-        try:
-            if (
-                not hasattr(module, "get_input_embeddings")
-                or module.get_input_embeddings() is None
-            ):
-                return
+        if (
+            not hasattr(module, "get_input_embeddings")
+            or module.get_input_embeddings() is None
+        ):
+            return
 
-            # Use native set input embeddings
+        try:
             new_module = VocabParallelEmbedding(
                 self.vocab_size,
                 self.config.hidden_size,
                 org_num_embeddings=self.config.vocab_size,
                 quant_config=None,
             )
-
             self.log_replacement(
                 "input embedding", self.model.get_input_embeddings(), new_module
             )
-
-            # This line raises NotImplementedError for CLIP, which we now catch.
             self.model.set_input_embeddings(new_module)
-
         except (NotImplementedError, AttributeError):
-            # Gracefully skip if the model doesn't support embedding replacement
             return
 
     @torch.no_grad()

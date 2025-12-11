@@ -342,9 +342,11 @@ class BaseMultimodalProcessor(ABC):
         Static method that can be pickled for multiprocessing"""
         if isinstance(data, dict):
             data_format = data.get("format")
-            if (
-                data_format == "processor_output"
-                or data_format == "precomputed_embedding"
+            if data_format in (
+                MultimodalInputFormat.PROCESSOR_OUTPUT.name,
+                MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
+                "processor_output",
+                "precomputed_embedding",
             ):
                 return data
         try:
@@ -477,6 +479,34 @@ class BaseMultimodalProcessor(ABC):
         BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
         BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
+    def _process_loaded_mm_data(self, modality, raw_data, result):
+        """处理单个加载完成的模态数据，返回标准化的列表和是否预计算的标志。"""
+        images, videos, audios = [], [], []
+
+        is_precomputed = isinstance(raw_data, dict) and raw_data.get("format") in [
+            MultimodalInputFormat.PROCESSOR_OUTPUT.name,
+            MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
+            "processor_output",
+            "precomputed_embedding",
+        ]
+
+        if modality == Modality.IMAGE:
+            if is_precomputed:
+                images.append(result)
+            else:
+                # FIX: 恢复处理多帧（list）的情况 (e.g. for minicpmv)
+                if isinstance(result, list):
+                    images.extend(result)
+                else:
+                    images.append(result)
+        elif modality == Modality.VIDEO:
+            # Simplify: 预计算和普通视频目前处理方式一致，直接 append
+            videos.append(result)
+        elif modality == Modality.AUDIO:
+            audios.append(result)
+
+        return is_precomputed, images, videos, audios
+
     def load_mm_data(
         self,
         prompt: str,
@@ -539,28 +569,26 @@ class BaseMultimodalProcessor(ABC):
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
-                    is_precomputed = isinstance(raw_data, dict) and (
-                        raw_data.get("format") == "processor_output"
-                        or raw_data.get("format") == "precomputed_embedding"
-                    )
-                    has_precomputed_input |= is_precomputed
                     result = next(futures_iter).result()
+
+                    is_precomputed, new_imgs, new_vids, new_auds = (
+                        self._process_loaded_mm_data(modality, raw_data, result)
+                    )
+
+                    has_precomputed_input |= is_precomputed
+                    images.extend(new_imgs)
+                    videos.extend(new_vids)
+                    audios.extend(new_auds)
+
                     if modality == Modality.IMAGE:
-                        # If data is already processed or embedded, it will be a
-                        # dictionary(processed, or precomputed). In this case we want to keep the
-                        # expanded tokens in text_part. Otherwise, we will
-                        # call the processor code, so keep only a single image
-                        # token.
-                        mm_tokens = (
-                            text_part
-                            if is_precomputed
-                            else multimodal_tokens.image_token
-                        )
-                        frames = [result] if not isinstance(result, list) else result
-                        if frames:
-                            # only for minicpmv
-                            images += frames
-                            new_text_parts += mm_tokens * len(frames)
+                        if is_precomputed:
+                            new_text_parts += [text_part]
+                        else:
+                            count = len(new_imgs)
+                            if count > 0:
+                                new_text_parts += [
+                                    multimodal_tokens.image_token
+                                ] * count
                     elif modality == Modality.VIDEO:
                         # load as video
                         mm_tokens = (

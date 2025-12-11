@@ -1,5 +1,5 @@
 import asyncio
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 from transformers.models.auto.processing_auto import (
@@ -106,6 +106,32 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 self._processor.image_processor,
             )
 
+    def _process_precomputed_image_data(self, image_data: List[Dict]) -> Dict:
+        mm_items = []
+        for item in image_data:
+            # Infer size logic...
+            if "image_sizes" not in item:
+                if "pixel_values" in item:
+                    pv = item["pixel_values"]
+                    # Handle simplified if/else
+                    h, w = (
+                        (pv.shape[2], pv.shape[3])
+                        if len(pv.shape) == 4
+                        else (pv.shape[1], pv.shape[2])
+                    )
+                    item["image_sizes"] = [(w, h)]
+                else:
+                    item["image_sizes"] = [(336, 336)]
+
+            mm_items.append(
+                MultimodalDataItem(
+                    feature=item["feature"],
+                    modality=Modality.IMAGE,
+                    model_specific_data=item,
+                )
+            )
+        return {"mm_items": mm_items}
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes, ImageData]],
@@ -123,31 +149,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             and len(image_data) > 0
             and isinstance(image_data[0], dict)
         ):
-            mm_items = []
-            for item in image_data:
-                # Ensure image_sizes exists in model_specific_data
-                if "image_sizes" not in item:
-                    # Infer size from pixel_values (B, C, H, W) or (C, H, W)
-                    if "pixel_values" in item:
-                        pv = item["pixel_values"]
-                        if len(pv.shape) == 4:
-                            h, w = pv.shape[2], pv.shape[3]
-                        else:
-                            h, w = pv.shape[1], pv.shape[2]
-                        # SGLang expects a list of sizes [(W, H)]
-                        item["image_sizes"] = [(w, h)]
-                    else:
-                        # Fallback default if no pixel_values (unlikely in this test)
-                        item["image_sizes"] = [(336, 336)]
-
-                mm_items.append(
-                    MultimodalDataItem(
-                        feature=item["feature"],
-                        modality=Modality.IMAGE,
-                        model_specific_data=item,
-                    )
-                )
-            return {"mm_items": mm_items}
+            return self._process_precomputed_image_data(image_data)
 
         modalities = request_obj.modalities or ["image"]
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
