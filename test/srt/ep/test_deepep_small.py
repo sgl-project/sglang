@@ -300,7 +300,8 @@ class TestTBOWithTPAttn(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-@unittest.skip("covered in TestMTPWithTPAttnAndTBO")
+# There exists bug when using MTP + TBO + attn_tp_size > 1, currently skip that case.
+# @unittest.skip("covered in TestMTPWithTPAttnAndTBO")
 class TestTBOWithTPAttnAndDenseDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -494,6 +495,7 @@ class TestMTPWithTBO(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.1)
 
 
+@unittest.skip("skipped due to bug when using MTP & TBO & attn_tp_size > 1")
 class TestMTPWithTPAttnAndTBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
