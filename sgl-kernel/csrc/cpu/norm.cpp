@@ -321,17 +321,20 @@ void layernorm_kernel_impl(
 
     for (int64_t i = begin; i < end; ++i) {
       scalar_t* __restrict__ input_ptr = input + i * input_strideN;
-      fVec sum_fvec = fVec(float(0));
-      float sum_val = float(0);
-      int64_t d;
+      fVec sum_fvec{fVec(0.0)}, sum_sq_fvec{fVec(0.0)};
+      float sum_val{0.0}, sum_sq_val{0.0};
+      int64_t d{0};
+
 #pragma GCC unroll 4
-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+      for (; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
         std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
         sum_fvec += x_fvec0;
         sum_fvec += x_fvec1;
+        sum_sq_fvec += x_fvec0 * x_fvec0;
+        sum_sq_fvec += x_fvec1 * x_fvec1;
 
         x_fvec0.store(buffer_ptr + d);
         x_fvec1.store(buffer_ptr + d + fVec::size());
@@ -340,42 +343,24 @@ void layernorm_kernel_impl(
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
         sum_val += x_val;
+        sum_sq_val += x_val * x_val;
         buffer_ptr[d] = x_val;
       }
 
-      // Compute mean
+      // Var(X) = E(X^2) - (E(X))^2
+      // Refer to FlashInfer impl: https://github.com/flashinfer-ai/flashinfer/blob/6bb01d19c2d9ab3b6a3a5e9e97448891a5ed2844/include/flashinfer/norm.cuh#L554
       sum_val += vec_reduce_sum(sum_fvec);
+      sum_sq_val += vec_reduce_sum(sum_sq_fvec);
+
       float mean = sum_val / hidden_size;
-      const fVec mean_fvec = fVec(mean);
-
-      // Second pass: compute variance
-      fVec var_sum_fvec = fVec(float(0));
-      float var_sum_val = float(0);
-
-#pragma GCC unroll 4
-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
-        fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
-
-        fVec diff0 = x_fvec0 - mean_fvec;
-        fVec diff1 = x_fvec1 - mean_fvec;
-
-        var_sum_fvec += diff0 * diff0;
-        var_sum_fvec += diff1 * diff1;
-      }
-#pragma GCC unroll 4
-      for (; d < hidden_size; ++d) {
-        float diff = buffer_ptr[d] - mean;
-        var_sum_val += diff * diff;
-      }
-
-      // Compute normalization factor
-      var_sum_val += vec_reduce_sum(var_sum_fvec);
-      float variance = var_sum_val / hidden_size;
+      float mean_sq = sum_sq_val / hidden_size;
+      float variance = mean_sq - (mean * mean);
       float rsqrt_var = float(1) / std::sqrt(variance + eps);
+
+      const fVec mean_fvec = fVec(mean);
       const fVec scale_fvec = fVec(rsqrt_var);
 
-      // Third pass: apply normalization
+      // Second pass: apply normalization
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
