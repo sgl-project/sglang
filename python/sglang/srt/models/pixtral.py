@@ -83,10 +83,6 @@ class PixtralForConditionalGeneration(nn.Module):
             for key, value in self.config.vision_config.to_dict().items()
             if key in dataclass_fields
         }
-        if "rope_theta" not in vision_args:
-            vision_args["rope_theta"] = self.config.vision_config.rope_scaling[
-                "rope_theta"
-            ]
 
         self.vision_args = VisionEncoderArgs(**vision_args)
 
