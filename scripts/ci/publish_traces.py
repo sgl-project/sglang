@@ -121,6 +121,10 @@ def create_blob(repo_owner, repo_name, content, token, max_retries=3):
             response = make_github_request(url, token, method="POST", data=data)
             return json.loads(response)["sha"]
         except Exception as e:
+            # Don't retry on rate limit errors - fail fast
+            if is_rate_limit_error(e):
+                raise
+
             if attempt < max_retries - 1:
                 wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
                 print(
@@ -162,6 +166,10 @@ def create_tree(repo_owner, repo_name, base_tree_sha, tree_items, token, max_ret
             response = make_github_request(url, token, method="POST", data=data)
             return json.loads(response)["sha"]
         except Exception as e:
+            # Don't retry on rate limit errors - fail fast
+            if is_rate_limit_error(e):
+                raise
+
             if attempt < max_retries - 1:
                 wait_time = 2**attempt
                 print(
@@ -196,6 +204,10 @@ def create_commit(
 
             return commit_sha
         except Exception as e:
+            # Don't retry on rate limit errors - fail fast
+            if is_rate_limit_error(e):
+                raise
+
             if attempt < max_retries - 1:
                 wait_time = 2**attempt
                 print(
@@ -219,6 +231,10 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
             make_github_request(url, token, method="PATCH", data=data)
             return
         except HTTPError as e:
+            # Don't retry on rate limit errors - fail fast
+            if is_rate_limit_error(e):
+                raise
+
             # Check if this is an "Object does not exist" error
             is_object_not_exist = False
             if hasattr(e, "error_body"):
@@ -239,6 +255,10 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
             else:
                 raise
         except Exception as e:
+            # Don't retry on rate limit errors - fail fast
+            if is_rate_limit_error(e):
+                raise
+
             if attempt < max_retries - 1:
                 wait_time = 2**attempt
                 print(
