@@ -65,6 +65,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -233,9 +234,6 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
             f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
         )
 
-
-# Use a small KV cache pool size for tests in CI
-SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
@@ -1666,8 +1664,10 @@ class ModelRunner:
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        if SGLANG_CI_SMALL_KV_SIZE:
-            self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
+
+        if envs.SGLANG_CI_SMALL_KV_SIZE.get() > 0:
+            # Use a small KV cache pool size for tests in CI
+            self.max_total_num_tokens = envs.SGLANG_CI_SMALL_KV_SIZE.get()
 
         if max_num_reqs is None:
             max_num_reqs = min(

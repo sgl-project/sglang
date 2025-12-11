@@ -1,6 +1,6 @@
-import os
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
@@ -22,7 +22,7 @@ class TestEAGLERetract(TestEAGLEServerBasic):
     @classmethod
     def setUpClass(cls):
         # These config helps find a leak.
-        os.environ["SGLANG_CI_SMALL_KV_SIZE"] = "4500"
+        envs.SGLANG_CI_SMALL_KV_SIZE.set(4500)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
