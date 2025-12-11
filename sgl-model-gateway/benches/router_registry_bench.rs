@@ -2,10 +2,11 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::sync::Arc;
 use std::collections::HashMap;
 use sgl_model_gateway::core::{WorkerRegistry, BasicWorkerBuilder, WorkerType, CircuitBreakerConfig};
-use sgl_model_gateway::routers::RouterManager;
-use sgl_model_gateway::routers::router_manager::RouterId;
+// Fix 1: Correct import paths for RouterManager and RouterId
+use sgl_model_gateway::routers::router_manager::{RouterManager, RouterId};
 use sgl_model_gateway::routers::RouterTrait;
-use sgl_model_gateway::protocols::GenerateRequest;
+// Fix 2: Import GenerateRequest from its submodule
+use sgl_model_gateway::protocols::generate::GenerateRequest;
 use axum::http::HeaderMap;
 use axum::extract::Request;
 use axum::response::Response;
@@ -13,11 +14,15 @@ use async_trait::async_trait;
 
 // --- Mocks for Benchmark ---
 
+// Fix 3: Add #[derive(Debug)] as required by RouterTrait
+#[derive(Debug)]
 struct MockRouter;
+
 #[async_trait]
 impl RouterTrait for MockRouter {
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn router_type(&self) -> &'static str { "mock" }
+
     // Implement minimal stubs for required methods
     async fn health_generate(&self, _req: Request<axum::body::Body>) -> Response { unimplemented!() }
     async fn get_server_info(&self, _req: Request<axum::body::Body>) -> Response { unimplemented!() }
@@ -34,8 +39,10 @@ impl RouterTrait for MockRouter {
     async fn route_embeddings(&self, _h: Option<&HeaderMap>, _b: &sgl_model_gateway::protocols::embedding::EmbeddingRequest, _m: Option<&str>) -> Response { unimplemented!() }
     async fn route_classify(&self, _h: Option<&HeaderMap>, _b: &sgl_model_gateway::protocols::classify::ClassifyRequest, _m: Option<&str>) -> Response { unimplemented!() }
     async fn route_rerank(&self, _h: Option<&HeaderMap>, _b: &sgl_model_gateway::protocols::rerank::RerankRequest, _m: Option<&str>) -> Response { unimplemented!() }
+    // Add is_pd_mode implementation to the trait block if required, otherwise it might be a separate impl
 }
 
+// Separate impl block for methods not in the trait (if any specific ones are called)
 impl MockRouter {
     fn is_pd_mode(&self) -> bool { false }
 }
@@ -65,14 +72,11 @@ fn bench_worker_registry(c: &mut Criterion) {
     let mut group = c.benchmark_group("WorkerRegistry Allocations");
 
     // Benchmark 1: Direct cost of get_all()
-    // This measures the allocation overhead isolated from router logic
     for size in [100, 1000, 5000].iter() {
         let registry = setup_registry(*size);
 
         group.bench_with_input(BenchmarkId::new("get_all", size), size, |b, &_s| {
             b.iter(|| {
-                // This is the problematic line in src/core/worker_registry.rs
-                // It allocates a Vec<Arc<dyn Worker>> every time
                 black_box(registry.get_all());
             });
         });
@@ -84,12 +88,10 @@ fn bench_router_manager(c: &mut Criterion) {
     let mut group = c.benchmark_group("RouterManager Hot Path");
 
     // Benchmark 2: Full path impact on request routing
-    // This calls select_router_for_request which calls get_all()
     for size in [100, 1000, 5000].iter() {
         let registry = setup_registry(*size);
         let manager = RouterManager::new(registry.clone());
 
-        // Register a mock router so selection logic runs
         manager.register_router(
             RouterId::new("http-regular".to_string()),
             Arc::new(MockRouter)
@@ -97,7 +99,6 @@ fn bench_router_manager(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("select_router", size), size, |b, &_s| {
             b.iter(|| {
-                // This is the hot path in src/routers/router_manager.rs
                 let _ = black_box(manager.select_router_for_request(None, None));
             });
         });
