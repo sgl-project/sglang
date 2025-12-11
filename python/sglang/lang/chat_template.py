@@ -522,6 +522,21 @@ register_chat_template(
 )
 
 
+register_chat_template(
+    ChatTemplate(
+        name="ernie45-vl",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("<|begin_of_sentence|>", ""),
+            "User": ("User: ", ""),
+            "assistant": ("Assistant: ", ""),
+        },
+        stop_str=("<|end_of_sentence|>",),
+        image_token="<|image@placeholder|>",
+    )
+)
+
+
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
     if re.search(r"deepseek-(v3|r1)", model_path, re.IGNORECASE) and not re.search(
@@ -646,6 +661,12 @@ def match_interns1_chat(model_path: str):
         return "interns1"
     if re.search(r"interns1", model_path, re.IGNORECASE):
         return "interns1"
+
+
+@register_chat_template_matching_function
+def match_ernie45vl(model_path: str):
+    if re.search(r"ernie4*vl", model_path, re.IGNORECASE):
+        return "ernie45-vl"
 
 
 if __name__ == "__main__":

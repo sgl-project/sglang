@@ -9,6 +9,7 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers import BaseImageProcessorFast
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -17,11 +18,17 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-from sglang.utils import logger
+from sglang.srt.utils import get_bool_env_var, is_npu, logger
+
+_is_npu = is_npu()
+
+SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
+# MAX_PIXELS = envs.SGLANG_IMAGE_MAX_PIXELS.get()
+MAX_PIXELS = 16384 * 28 * 28
 MAX_RATIO = 200
 RESIZE_RESAMPLE = getattr(Image, envs.SGLANG_RESIZE_RESAMPLE.get(), None)
 if envs.SGLANG_RESIZE_RESAMPLE.is_set() and RESIZE_RESAMPLE is None:
@@ -47,20 +54,18 @@ def smart_resize(
     factor: int = IMAGE_FACTOR,
     min_pixels: int = MIN_PIXELS,
     max_pixels: int = MAX_PIXELS,
-) -> tuple[int, int]:
-    """
-    Rescales the image so that the following conditions are met:
-
-    1. Both dimensions (height and width) are divisible by 'factor'.
-
-    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
-
-    3. The aspect ratio of the image is maintained as closely as possible.
-    """
+):
     if max(height, width) / min(height, width) > MAX_RATIO:
-        raise ValueError(
-            f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}"
-        )
+        if height > width:
+            new_width = max(factor, round_by_factor(width, factor))
+            new_height = floor_by_factor(new_width * MAX_RATIO, factor)
+        else:
+            new_height = max(factor, round_by_factor(height, factor))
+            new_width = floor_by_factor(new_height * MAX_RATIO, factor)
+
+        height = new_height
+        width = new_width
+
     h_bar = max(factor, round_by_factor(height, factor))
     w_bar = max(factor, round_by_factor(width, factor))
     if h_bar * w_bar > max_pixels:
@@ -71,6 +76,10 @@ def smart_resize(
         beta = math.sqrt(min_pixels / (height * width))
         h_bar = ceil_by_factor(height * beta, factor)
         w_bar = ceil_by_factor(width * beta, factor)
+
+    if min_pixels > h_bar * w_bar or h_bar * w_bar > max_pixels:
+        raise ValueError(f"encounter invalid h_bar: {h_bar}, w_bar: {w_bar}")
+
     return h_bar, w_bar
 
 
@@ -239,19 +248,136 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self.hf_config = hf_config
         self.model_type = hf_config.model_type
-        self.vision_start_token_id = hf_config.vision_start_token_id
-        self.vision_end_token_id = hf_config.vision_end_token_id
+        self.image_start_token_id = hf_config.image_start_token_id
+        self.image_end_token_id = hf_config.image_end_token_id
+        self.video_start_token_id = hf_config.video_start_token_id
+        self.video_end_token_id = hf_config.video_end_token_id
 
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>",
-            image_token_id=hf_config.image_token_id,
-            video_token_id=hf_config.video_token_id,
+            image_token="<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>",
+            image_token_id=hf_config.im_patch_id,
+            video_token_id=hf_config.im_patch_id,  # image and video use the same token_id
         ).build(_processor)
+        # self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.IMAGE})
+
+        self.tokenizer = self._processor.tokenizer
+        self.image_processor = self._processor.image_processor
+
+    def _pixel_values_norm(
+        self,
+        pixel_values: torch.Tensor,
+        mm_kwargs: object,
+    ) -> torch.Tensor:
+        hf_config = self.hf_config
+        vision_config = hf_config.vision_config
+        image_processor = self.image_processor
+        image_mean_tensor = torch.tensor(
+            image_processor.image_mean, dtype=torch.float32
+        ).reshape([1, 3, 1, 1])
+        image_std_tensor = torch.tensor(
+            image_processor.image_std, dtype=torch.float32
+        ).reshape([1, 3, 1, 1])
+        rescale_factor = torch.tensor(
+            image_processor.rescale_factor, dtype=torch.float32
+        )
+        patch_size_squared = vision_config.patch_size**2
+
+        image_mean_tensor = image_mean_tensor.squeeze([-2, -1]).repeat_interleave(
+            patch_size_squared, -1
+        )
+        image_std_tensor = image_std_tensor.squeeze([-2, -1]).repeat_interleave(
+            patch_size_squared, -1
+        )
+
+        if not image_mean_tensor.is_contiguous():
+            image_mean_tensor = image_mean_tensor.contiguous()
+        if not image_std_tensor.is_contiguous():
+            image_std_tensor = image_std_tensor.contiguous()
+
+        pixel_values = (
+            rescale_factor * pixel_values.to(torch.float32) - image_mean_tensor
+        ) / image_std_tensor
+        pixel_values = pixel_values.to(hf_config.dtype)
+        return pixel_values
+
+    def process_mm_data(
+        self, input_text, images=None, videos=None, audios=None, **kwargs
+    ) -> dict:
+        """
+        process multimodal data with transformers AutoProcessor
+        """
+        if images:
+            kwargs["images"] = images
+        if videos:
+            kwargs["videos"] = videos
+
+        processor = self._processor
+        if (
+            hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and not self.server_args.disable_fast_image_processor
+        ):
+            if not _is_npu:
+                kwargs["device"] = "cuda"
+
+        result = processor.__call__(
+            text=[input_text],
+            padding=True,
+            return_tensors="pt",
+            **kwargs,
+        )
+
+        # Divide the processor_output into two modalities: image and video.
+        if result is not None:
+            pixel_values = result["images"]
+            if pixel_values is not None:
+                result["images"] = self._pixel_values_norm(pixel_values, kwargs)
+            for key in list(result.keys()):
+                if result[key] is None:
+                    del result[key]
+                    continue
+                if key == "grid_thw":
+                    grid_thw = result["grid_thw"]
+                    pixel_values_all = result["images"]
+                    # Identify elements where the first
+                    # dimension is greater than 1 and
+                    # treat them as the video modality
+                    mask = grid_thw[:, 0] > 1
+                    result["video_grid_thw"] = grid_thw[mask]
+                    result["image_grid_thw"] = grid_thw[~mask]
+                    image_patch_num = result["image_grid_thw"].prod(dim=1).sum()
+                    result["pixel_values"] = pixel_values_all[:image_patch_num]
+                    result["pixel_values_videos"] = pixel_values_all[image_patch_num:]
+                    del result["images"]
+
+                    # del empty result
+                    if result["image_grid_thw"].numel() == 0:
+                        del result["image_grid_thw"]
+                    if result["pixel_values"].numel() == 0:
+                        del result["pixel_values"]
+                    if result["video_grid_thw"].numel() == 0:
+                        del result["video_grid_thw"]
+                    if result["pixel_values_videos"].numel() == 0:
+                        del result["pixel_values_videos"]
+
+        if not self.server_args.keep_mm_feature_on_device:
+            # move feature tensors to cpu
+            for feature_name in self.FEATURE_NAMES:
+                if SGL_USE_CUDA_IPC:
+                    pass
+                else:
+                    if feature_name in result and isinstance(
+                        result[feature_name], torch.Tensor
+                    ):
+                        result[feature_name] = result[feature_name].to("cpu")
+
+        return result
 
     async def process_mm_data_async(
         self,
@@ -314,8 +440,8 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         mm_inputs = {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_start_id": self.image_start_token_id,
+            "im_end_id": self.image_end_token_id,
             "im_token_id": self.mm_tokens.image_token_id,
             "video_token_id": self.mm_tokens.video_token_id,
             "mrope_positions": mrope_positions,

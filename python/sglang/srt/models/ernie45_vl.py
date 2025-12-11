@@ -524,7 +524,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
             ]
         )
 
-        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.ln = nn.LayerNorm(hidden_size, eps=1e-6)
 
         # self.resampler_model = VariableResolutionResamplerModel(
         #     self.config.pixel_hidden_size,
@@ -809,9 +809,23 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 device=input_ids.device,
                 dtype=input_ids.dtype,
             )
-            visual_token_mask = torch.isin(input_ids, visual_token_ids_tensor).reshape(
-                -1, 1
+            pad_values = []
+            if hasattr(forward_batch, "mm_inputs"):
+                for mm_input in forward_batch.mm_inputs:
+                    if mm_input is None:
+                        continue
+                    for item in mm_input.mm_items:
+                        pad_values.append(item.pad_value)
+            placeholder_tensor = torch.as_tensor(
+                pad_values,
+                device=input_ids.device,
             )
+            pad_visual_token_ids_tensor = torch.cat(
+                [visual_token_ids_tensor, placeholder_tensor], dim=0
+            )
+            visual_token_mask = torch.isin(
+                input_ids, pad_visual_token_ids_tensor
+            ).reshape(-1, 1)
 
         if visual_token_mask is not None:
             if visual_token_mask.shape[0] != input_ids.shape[0]:
@@ -853,6 +867,16 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
         ]
 
+        # resampler_weight_mappings
+        resampler_weight_mapping = {
+            "spatial_linear.0.": "spatial_linear1.",
+            "spatial_linear.2.": "spatial_linear2.",
+            "spatial_linear.3.": "spatial_norm.",
+            "temporal_linear.0.": "temporal_linear1.",
+            "temporal_linear.2.": "temporal_linear2.",
+            "temporal_linear.3.": "temporal_norm.",
+        }
+
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -885,6 +909,16 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 if "vision_model" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                if name.startswith("model.resampler_model"):
+                    name = name.replace("model.resampler_model", "resampler_model")
+
+                for (
+                    old_weight_name,
+                    new_weight_name,
+                ) in resampler_weight_mapping.items():
+                    if old_weight_name in name:
+                        name = name.replace(old_weight_name, new_weight_name, 1)
+                        break
 
                 # Distinguish between vision experts and text experts
                 if "mlp.experts" in name:
@@ -964,4 +998,4 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
 
-EntryClass = Ernie4_5_VLMoeForConditionalGeneration
+EntryClass = [Ernie4_5_VLMoeForConditionalGeneration]

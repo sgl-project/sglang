@@ -365,30 +365,63 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             # Compute both experts on the full hidden_states and then select per-token results with torch.where.
             # This avoids hidden_states[mask] style indexing which may not be allowed in CUDA Graph capture.
             # Make sure mask has shape [N, 1] for broadcasting
-            mask = visual_token_mask.view(-1).bool().unsqueeze(-1)  # [N, 1]
+            # mask = visual_token_mask.view(-1).bool().unsqueeze(-1)  # [N, 1]
 
-            # Text branch computed on full sequence
-            text_router_logits, _ = self.text_experts_gate(
-                hidden_states.to(dtype=torch.float32)
+            # # Text branch computed on full sequence
+            # text_router_logits, _ = self.text_experts_gate(
+            #     hidden_states.to(dtype=torch.float32)
+            # )
+            # text_topk_output = self.text_experts_topk(hidden_states, text_router_logits)
+            # text_out = self.text_experts(
+            #     hidden_states=hidden_states, topk_output=text_topk_output
+            # )  # [N, H]
+
+            # # Vision branch computed on full sequence
+            # vision_router_logits, _ = self.vision_experts_gate(
+            #     hidden_states.to(dtype=torch.float32)
+            # )
+            # vision_topk_output = self.vision_experts_topk(
+            #     hidden_states, vision_router_logits
+            # )
+            # vision_out = self.vision_experts(
+            #     hidden_states=hidden_states, topk_output=vision_topk_output
+            # )  # [N, H]
+
+            # # Merge per-token outputs: for visual tokens take vision_out, else text_out
+            # final_hidden_states = torch.where(mask, vision_out, text_out)
+
+            # assert visual_token_mask.shape[0] != hidden_states.shape[0]
+            visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
+            text_token_mask = ~visual_token_mask
+            final_hidden_states = torch.zeros_like(hidden_states)
+
+            text_hidden_states = hidden_states[text_token_mask].reshape(
+                -1, self.hidden_size
             )
-            text_topk_output = self.text_experts_topk(hidden_states, text_router_logits)
-            text_out = self.text_experts(
-                hidden_states=hidden_states, topk_output=text_topk_output
-            )  # [N, H]
+            vision_hidden_states = hidden_states[visual_token_mask].reshape(
+                -1, self.hidden_size
+            )
 
-            # Vision branch computed on full sequence
+            text_router_logits, _ = self.text_experts_gate(
+                text_hidden_states.to(dtype=torch.float32)
+            )
+            text_topk_output = self.text_experts_topk(
+                text_hidden_states, text_router_logits
+            )
+            final_hidden_states[text_token_mask] = self.text_experts(
+                hidden_states=text_hidden_states, topk_output=text_topk_output
+            ).flatten()
+
             vision_router_logits, _ = self.vision_experts_gate(
-                hidden_states.to(dtype=torch.float32)
+                vision_hidden_states.to(dtype=torch.float32)
             )
             vision_topk_output = self.vision_experts_topk(
-                hidden_states, vision_router_logits
+                vision_hidden_states, vision_router_logits
             )
-            vision_out = self.vision_experts(
-                hidden_states=hidden_states, topk_output=vision_topk_output
-            )  # [N, H]
+            final_hidden_states[visual_token_mask] = self.vision_experts(
+                hidden_states=vision_hidden_states, topk_output=vision_topk_output
+            ).flatten()
 
-            # Merge per-token outputs: for visual tokens take vision_out, else text_out
-            final_hidden_states = torch.where(mask, vision_out, text_out)
         else:
             # text modal input processing directly
             text_router_logits, _ = self.text_experts_gate(
