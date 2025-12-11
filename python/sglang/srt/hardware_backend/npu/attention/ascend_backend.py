@@ -297,6 +297,8 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.use_mla
             and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            and not forward_batch.forward_mode.is_target_verify()
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         ):
             self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
