@@ -723,6 +723,7 @@ class AscendAttnBackend(AttentionBackend):
                         causal=causal,
                     )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
+            num_token_padding = q.shape[0]
             q, k, v = [
                 data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
             ]
@@ -810,6 +811,17 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.reshape(
                 [-1, layer.tp_q_head_num, layer.v_head_dim]
             )
+            if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                attn_output = torch.cat(
+                    [
+                        attn_output,
+                        attn_output.new_zeros(
+                            num_token_padding - attn_output.shape[0],
+                            *attn_output.shape[1:],
+                        ),
+                    ],
+                    dim=0,
+                )
         else:
             assert (
                 layer.qk_head_dim != layer.v_head_dim
