@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
@@ -12,6 +13,10 @@ use crate::{
         types::{FunctionCall, StreamingParseResult, ToolCall},
     },
 };
+
+/// Static regex for extracting Qwen tool calls - compiled once at startup
+static QWEN_EXTRACTOR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)<tool_call>\n(.*?)\n</tool_call>").expect("Valid regex pattern"));
 
 /// Qwen format parser for tool calls
 ///
@@ -27,9 +32,6 @@ use crate::{
 pub struct QwenParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
-
-    /// Regex for extracting tool calls in parse_complete
-    extractor: Regex,
 
     /// Buffer for accumulating incomplete patterns across chunks
     buffer: String,
@@ -59,13 +61,8 @@ pub struct QwenParser {
 impl QwenParser {
     /// Create a new Qwen parser
     pub fn new() -> Self {
-        // Use (?s) flag for DOTALL mode to handle newlines
-        let pattern = r"(?s)<tool_call>\n(.*?)\n</tool_call>";
-        let extractor = Regex::new(pattern).expect("Valid regex pattern");
-
         Self {
             partial_json: PartialJson::default(),
-            extractor,
             buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
@@ -121,9 +118,9 @@ impl ToolParser for QwenParser {
         let idx = text.find("<tool_call>").unwrap(); // Safe because has_tool_markers checked
         let normal_text = text[..idx].to_string();
 
-        // Extract tool calls
+        // Extract tool calls using static regex
         let mut tools = Vec::new();
-        for captures in self.extractor.captures_iter(text) {
+        for captures in QWEN_EXTRACTOR.captures_iter(text) {
             if let Some(json_str) = captures.get(1) {
                 let parsed = serde_json::from_str::<Value>(json_str.as_str().trim())
                     .map_err(|e| ParserError::ParsingFailed(e.to_string()))
@@ -155,22 +152,21 @@ impl ToolParser for QwenParser {
     ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
-        let current_text = &self.buffer.clone();
+        let current_text = self.buffer.clone();
 
         // Check if current_text has tool_call
-        let has_tool_start = self.has_tool_markers(current_text)
+        let has_tool_start = self.has_tool_markers(&current_text)
             || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
-            if helpers::ends_with_partial_token(&self.buffer, self.individual_tool_start_token)
+            if helpers::ends_with_partial_token(&current_text, self.individual_tool_start_token)
                 .is_none()
             {
-                let normal_text = self.buffer.clone();
                 self.buffer.clear();
-
+                // Return the text as normal text
                 return Ok(StreamingParseResult {
-                    normal_text,
+                    normal_text: current_text,
                     calls: vec![],
                 });
             } else {
@@ -192,7 +188,7 @@ impl ToolParser for QwenParser {
         };
 
         let mut result = helpers::handle_json_tool_streaming(
-            current_text,
+            &current_text,
             start_idx,
             &mut self.partial_json,
             &tool_indices,

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
@@ -12,6 +13,28 @@ use crate::{
     },
 };
 
+/// Static regex for extracting complete tool calls
+static DEEPSEEK_TOOL_CALL_EXTRACTOR: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>").expect("Valid regex pattern")
+});
+
+/// Static regex for extracting function details from tool calls
+static DEEPSEEK_FUNC_DETAIL_EXTRACTOR: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```<｜tool▁call▁end｜>")
+        .expect("Valid regex pattern")
+});
+
+/// Static regex for partial tool call matching during streaming
+static DEEPSEEK_PARTIAL_TOOL_CALL: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)")
+        .expect("Valid regex pattern")
+});
+
+/// Static regex for removing completed tool calls from buffer
+static DEEPSEEK_TOOL_CALL_END: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>").expect("Valid regex pattern")
+});
+
 /// DeepSeek V3 format parser for tool calls
 ///
 /// Handles the DeepSeek V3 specific format that uses Unicode tokens:
@@ -24,15 +47,6 @@ use crate::{
 ///
 /// Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3-0324?chat_template=default
 pub struct DeepSeekParser {
-    /// Regex for extracting complete tool calls
-    tool_call_extractor: Regex,
-    /// Regex for extracting function details
-    func_detail_extractor: Regex,
-    /// Regex for matching partial tool calls during streaming
-    partial_tool_call_regex: Regex,
-    /// Regex pattern for removing completed tool calls from buffer
-    tool_call_end_pattern: Regex,
-
     /// Buffer for accumulating incomplete patterns across chunks
     buffer: String,
 
@@ -52,26 +66,7 @@ pub struct DeepSeekParser {
 impl DeepSeekParser {
     /// Create a new DeepSeek parser
     pub fn new() -> Self {
-        // Use (?s) flag for DOTALL mode to handle newlines
-        let tool_call_pattern = r"(?s)<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>";
-        let tool_call_extractor = Regex::new(tool_call_pattern).expect("Valid regex pattern");
-
-        let func_detail_pattern = r"(?s)<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```<｜tool▁call▁end｜>";
-        let func_detail_extractor = Regex::new(func_detail_pattern).expect("Valid regex pattern");
-
-        // Partial pattern for streaming - uses .* (greedy) not .*? to match all partial content
-        let partial_pattern = r"(?s)<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)";
-        let partial_tool_call_regex = Regex::new(partial_pattern).expect("Valid regex pattern");
-
-        // Pattern for removing completed tool calls
-        let end_pattern = r"(?s)<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>";
-        let tool_call_end_pattern = Regex::new(end_pattern).expect("Valid regex pattern");
-
         Self {
-            tool_call_extractor,
-            func_detail_extractor,
-            partial_tool_call_regex,
-            tool_call_end_pattern,
             buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
@@ -82,9 +77,11 @@ impl DeepSeekParser {
 
     /// Parse a single tool call block - throws error if parsing fails
     fn parse_tool_call(&self, block: &str) -> ParserResult<ToolCall> {
-        let captures = self.func_detail_extractor.captures(block).ok_or_else(|| {
-            ParserError::ParsingFailed("Failed to match tool call pattern".to_string())
-        })?;
+        let captures = DEEPSEEK_FUNC_DETAIL_EXTRACTOR
+            .captures(block)
+            .ok_or_else(|| {
+                ParserError::ParsingFailed("Failed to match tool call pattern".to_string())
+            })?;
 
         // Get function type (should be "function")
         let func_type = captures.get(1).map_or("", |m| m.as_str());
@@ -149,7 +146,7 @@ impl ToolParser for DeepSeekParser {
 
         // Try to extract tool calls, log warnings for failures
         let mut tools = Vec::new();
-        for mat in self.tool_call_extractor.find_iter(text) {
+        for mat in DEEPSEEK_TOOL_CALL_EXTRACTOR.find_iter(text) {
             match self.parse_tool_call(mat.as_str()) {
                 Ok(tool) => tools.push(tool),
                 Err(e) => {
@@ -173,16 +170,17 @@ impl ToolParser for DeepSeekParser {
         tools: &[Tool],
     ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
-        let current_text = &self.buffer.clone();
+        let current_text = self.buffer.clone();
 
         // Check if we have a tool call (either the start token or individual tool call)
         let has_tool_call =
-            self.has_tool_markers(current_text) || current_text.contains("<｜tool▁call▁begin｜>");
+            self.has_tool_markers(&current_text) || current_text.contains("<｜tool▁call▁begin｜>");
 
         if !has_tool_call {
             // No tool markers detected - return all buffered content as normal text
             // Strip out end tokens if present
-            let mut normal_text = std::mem::take(&mut self.buffer);
+            self.buffer.clear();
+            let mut normal_text = current_text;
             for e_token in ["<｜tool▁calls▁end｜>", "```", "<｜tool▁call▁end｜>"] {
                 normal_text = normal_text.replace(e_token, "");
             }
@@ -198,7 +196,7 @@ impl ToolParser for DeepSeekParser {
         let mut calls: Vec<ToolCallItem> = Vec::new();
 
         // Try to match the partial tool call pattern
-        if let Some(captures) = self.partial_tool_call_regex.captures(current_text) {
+        if let Some(captures) = DEEPSEEK_PARTIAL_TOOL_CALL.captures(&current_text) {
             let func_name = captures.get(2).map_or("", |m| m.as_str()).trim();
             let func_args_raw = captures.get(3).map_or("", |m| m.as_str()).trim();
 
@@ -285,7 +283,7 @@ impl ToolParser for DeepSeekParser {
                     }
 
                     // Find the end of the current tool call and remove only that part from buffer
-                    if let Some(mat) = self.tool_call_end_pattern.find(current_text) {
+                    if let Some(mat) = DEEPSEEK_TOOL_CALL_END.find(&current_text) {
                         // Remove the completed tool call from buffer, keep any remaining content
                         self.buffer = current_text[mat.end()..].to_string();
                     } else {

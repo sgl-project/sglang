@@ -217,30 +217,30 @@ impl ToolParser for JsonParser {
     ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
-        let current_text = &self.buffer.clone();
+        let current_text = self.buffer.clone();
 
         // Determine format on first parse (array vs single object)
-        if self.current_tool_id == -1 && self.has_tool_markers(current_text) {
+        if self.current_tool_id == -1 && self.has_tool_markers(&current_text) {
             self.is_array_format = current_text.trim().starts_with('[');
         }
 
         // Check if current_text has tool_call
         // Once array is closed, don't treat [ or { as tool markers
-        let has_tool_start = (!self.array_closed && self.has_tool_markers(current_text))
+        let has_tool_start = (!self.array_closed && self.has_tool_markers(&current_text))
             || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
-            let mut normal_text = self.buffer.clone();
             self.buffer.clear();
+            let mut normal_text = current_text;
 
             // Strip ] only once (the closing bracket of JSON array format)
             // Only for array format and only if we haven't already closed it
             if self.is_array_format
                 && !self.array_closed
                 && self.current_tool_id > 0
-                && normal_text.starts_with("]")
+                && normal_text.starts_with(']')
             {
-                normal_text = normal_text.strip_prefix("]").unwrap().to_string();
+                normal_text = normal_text.strip_prefix(']').unwrap().to_string();
                 self.array_closed = true;
             }
 
@@ -270,7 +270,7 @@ impl ToolParser for JsonParser {
         };
 
         helpers::handle_json_tool_streaming(
-            current_text,
+            &current_text,
             start_idx,
             &mut self.partial_json,
             &tool_indices,

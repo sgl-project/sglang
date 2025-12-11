@@ -1,7 +1,7 @@
 use super::*;
 use crate::tool_parser::{
     parsers::JsonParser,
-    partial_json::{compute_diff, find_common_prefix, is_complete_json, PartialJson},
+    partial_json::{compute_diff, find_common_prefix_bytes, is_complete_json, PartialJson},
     traits::ToolParser,
 };
 
@@ -112,12 +112,12 @@ fn test_is_complete_json() {
 }
 
 #[test]
-fn test_find_common_prefix() {
-    assert_eq!(find_common_prefix("hello", "hello"), 5);
-    assert_eq!(find_common_prefix("hello", "help"), 3);
-    assert_eq!(find_common_prefix("hello", "world"), 0);
-    assert_eq!(find_common_prefix("", "hello"), 0);
-    assert_eq!(find_common_prefix("hello", ""), 0);
+fn test_find_common_prefix_bytes() {
+    assert_eq!(find_common_prefix_bytes("hello", "hello"), 5);
+    assert_eq!(find_common_prefix_bytes("hello", "help"), 3);
+    assert_eq!(find_common_prefix_bytes("hello", "world"), 0);
+    assert_eq!(find_common_prefix_bytes("", "hello"), 0);
+    assert_eq!(find_common_prefix_bytes("hello", ""), 0);
 }
 
 #[test]

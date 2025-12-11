@@ -66,9 +66,9 @@ impl PartialJsonParser for PartialJson {
     }
 }
 
-/// Internal parser state
+/// Internal parser state - uses byte-based iteration for performance
 struct Parser<'a> {
-    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    input: &'a [u8],
     position: usize,
     max_depth: usize,
     allow_incomplete: bool,
@@ -83,7 +83,7 @@ impl<'a> Parser<'a> {
         allow_partial_strings: bool,
     ) -> Self {
         Self {
-            chars: input.chars().peekable(),
+            input: input.as_bytes(),
             position: 0,
             max_depth,
             allow_incomplete,
@@ -91,22 +91,24 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn peek(&mut self) -> Option<char> {
-        self.chars.peek().copied()
+    #[inline]
+    fn peek(&self) -> Option<char> {
+        self.input.get(self.position).map(|&b| b as char)
     }
 
+    #[inline]
     fn advance(&mut self) {
-        if self.chars.next().is_some() {
+        if self.position < self.input.len() {
             self.position += 1;
         }
     }
 
+    #[inline]
     fn skip_whitespace(&mut self) {
-        while let Some(ch) = self.peek() {
-            if ch.is_whitespace() {
-                self.advance();
-            } else {
-                break;
+        while self.position < self.input.len() {
+            match self.input[self.position] {
+                b' ' | b'\t' | b'\n' | b'\r' => self.position += 1,
+                _ => break,
             }
         }
     }
@@ -441,41 +443,33 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_bool(&mut self) -> ParserResult<Value> {
-        let mut word = String::new();
-
         // Peek at upcoming characters to validate it looks like a boolean
-        let mut temp_chars = self.chars.clone();
-        while let Some(&ch) = temp_chars.peek() {
-            if ch.is_alphabetic() && word.len() < 5 {
-                // "false" is 5 chars
-                word.push(ch);
-                temp_chars.next();
+        let start = self.position;
+        let mut len = 0;
+        while self.position + len < self.input.len() && len < 5 {
+            let ch = self.input[self.position + len];
+            if ch.is_ascii_alphabetic() {
+                len += 1;
             } else {
                 break;
             }
         }
 
+        let word = std::str::from_utf8(&self.input[start..start + len]).unwrap_or("");
+
         // Check if it's a valid boolean prefix
         let is_valid = word == "true"
             || word == "false"
-            || (self.allow_incomplete && ("true".starts_with(&word) || "false".starts_with(&word)));
+            || (self.allow_incomplete && ("true".starts_with(word) || "false".starts_with(word)));
 
         if !is_valid {
             return Err(ParserError::ParsingFailed("Invalid boolean".into()));
         }
 
         // Now actually consume the characters
-        word.clear();
-        while let Some(ch) = self.peek() {
-            if ch.is_alphabetic() {
-                word.push(ch);
-                self.advance();
-            } else {
-                break;
-            }
-        }
+        self.position += len;
 
-        match word.as_str() {
+        match word {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             partial if self.allow_incomplete => {
@@ -492,39 +486,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_null(&mut self) -> ParserResult<Value> {
-        let mut word = String::new();
-
         // Peek at upcoming characters to validate it looks like "null"
-        let mut temp_chars = self.chars.clone();
-        while let Some(&ch) = temp_chars.peek() {
-            if ch.is_alphabetic() && word.len() < 4 {
-                // "null" is 4 chars
-                word.push(ch);
-                temp_chars.next();
+        let start = self.position;
+        let mut len = 0;
+        while self.position + len < self.input.len() && len < 4 {
+            let ch = self.input[self.position + len];
+            if ch.is_ascii_alphabetic() {
+                len += 1;
             } else {
                 break;
             }
         }
 
+        let word = std::str::from_utf8(&self.input[start..start + len]).unwrap_or("");
+
         // Check if it's a valid null prefix
-        let is_valid = word == "null" || (self.allow_incomplete && "null".starts_with(&word));
+        let is_valid = word == "null" || (self.allow_incomplete && "null".starts_with(word));
 
         if !is_valid {
             return Err(ParserError::ParsingFailed("Invalid null".into()));
         }
 
         // Now actually consume the characters
-        word.clear();
-        while let Some(ch) = self.peek() {
-            if ch.is_alphabetic() {
-                word.push(ch);
-                self.advance();
-            } else {
-                break;
-            }
-        }
+        self.position += len;
 
-        if word == "null" || (self.allow_incomplete && "null".starts_with(&word)) {
+        if word == "null" || (self.allow_incomplete && "null".starts_with(word)) {
             Ok(Value::Null)
         } else {
             Err(ParserError::ParsingFailed("Invalid null".into()))
@@ -537,17 +523,20 @@ pub fn is_complete_json(input: &str) -> bool {
     serde_json::from_str::<Value>(input).is_ok()
 }
 
-/// Utility function to find common prefix between two strings
-pub fn find_common_prefix(s1: &str, s2: &str) -> usize {
-    s1.chars()
-        .zip(s2.chars())
+/// Utility function to find common prefix length (in bytes) between two strings
+#[inline]
+pub fn find_common_prefix_bytes(s1: &str, s2: &str) -> usize {
+    s1.as_bytes()
+        .iter()
+        .zip(s2.as_bytes())
         .take_while(|(a, b)| a == b)
         .count()
 }
 
 /// Utility function to compute diff between old and new strings
-pub fn compute_diff(old: &str, new: &str) -> String {
-    let common_len = find_common_prefix(old, new);
-    // Convert character count to byte offset
-    new.chars().skip(common_len).collect()
+/// Returns a slice into `new` containing the differing suffix
+#[inline]
+pub fn compute_diff<'a>(old: &str, new: &'a str) -> &'a str {
+    let common_len = find_common_prefix_bytes(old, new);
+    &new[common_len..]
 }

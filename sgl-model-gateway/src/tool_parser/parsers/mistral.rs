@@ -206,17 +206,17 @@ impl ToolParser for MistralParser {
     ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
-        let current_text = &self.buffer.clone();
+        let current_text = self.buffer.clone();
 
         // Check if current_text has tool_call
-        let has_tool_start = self.has_tool_markers(current_text)
+        let has_tool_start = self.has_tool_markers(&current_text)
             || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
-            if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_none() {
-                let mut normal_text = self.buffer.clone();
+            if helpers::ends_with_partial_token(&current_text, self.bot_token).is_none() {
                 self.buffer.clear();
+                let mut normal_text = current_text;
 
                 // Strip ] only once (the closing bracket of [TOOL_CALLS] array)
                 // current_tool_id > 0 means we've parsed at least one tool
@@ -254,7 +254,7 @@ impl ToolParser for MistralParser {
         };
 
         helpers::handle_json_tool_streaming(
-            current_text,
+            &current_text,
             start_idx,
             &mut self.partial_json,
             &tool_indices,
