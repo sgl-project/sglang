@@ -456,8 +456,8 @@ class TestMistralDetector(unittest.TestCase):
         self.assertEqual(params["decision"], "ANSWER")
         self.assertEqual(params["content"], "The answer is 42")
 
-    def test_detect_and_parse_legacy_args_format(self):
-        """Test parsing legacy compact format: [TOOL_CALLS]name[ARGS]{...}."""
+    def test_detect_and_parse_compact_args_format(self):
+        """Test parsing compact format: [TOOL_CALLS]name[ARGS]{...}."""
         test_text = '[TOOL_CALLS]make_next_step_decision[ARGS]{"decision":"TOOL", "content":"Use weather API"}'
 
         result = self.detector.detect_and_parse(test_text, self.tools)
@@ -467,19 +467,8 @@ class TestMistralDetector(unittest.TestCase):
         self.assertEqual(params["decision"], "TOOL")
         self.assertEqual(params["content"], "Use weather API")
 
-    def test_detect_and_parse_legacy_args_format_missing_brackets(self):
-        """Test parsing legacy compact format tolerating missing `]` in streaming-like outputs."""
-        test_text = '[TOOL_CALLSmake_next_step_decision[ARGS{"decision":"TOOL", "content":"Use weather API"}'
-
-        result = self.detector.detect_and_parse(test_text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "make_next_step_decision")
-        params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["decision"], "TOOL")
-        self.assertEqual(params["content"], "Use weather API")
-
-    def test_streaming_legacy_args_format_emits_tool_calls(self):
-        """Test streaming chunks for legacy compact format produce tool_calls items."""
+    def test_streaming_compact_args_format_emits_tool_calls(self):
+        """Test streaming chunks for compact format produce tool_calls items."""
         chunks = [
             "[TOOL_CALLS]make_next_step_decision[ARGS]",
             '{"decision":"TOOL", ',

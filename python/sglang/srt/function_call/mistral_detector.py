@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 from typing import Any, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -18,38 +17,32 @@ logger = logging.getLogger(__name__)
 
 class MistralDetector(BaseFormatDetector):
     """
-    Detector for Mistral model function call format.
+    Detector for Mistral tool/function call formats.
 
-    The Mistral format uses a simple bracket-delimited structure with JSON arrays
-    containing function call objects.
+    Supported formats:
 
-    Format Structure:
-    ```
-    [TOOL_CALLS] [{"name": "function_name", "arguments": {json_args}}, ...]
-    ```
+    1) JSON-array format:
+       `[TOOL_CALLS] [{"name": "...", "arguments": {...}}, ...]`
+
+    2) Compact format (common in newer templates/models, especially in streaming):
+       `[TOOL_CALLS]tool_name[ARGS]{...}`
+       (also tolerates missing delimiters like `]` after `[TOOL_CALLS` and/or `[ARGS]` while streaming)
 
     Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
     """
 
     def __init__(self):
-        """
-        Initializes the detector with necessary state variables.
-        """
+        """Initialize tokens and streaming state."""
         super().__init__()
-        # NOTE:
-        # - Canonical Mistral format: `[TOOL_CALLS] [{...}, {...}]`
-        # - Some templates/models emit a legacy compact format:
-        #   `[TOOL_CALLS]tool_name[ARGS]{...}` (sometimes missing `]` in streaming)
-        # We support both.
+        # Canonical Mistral prefix for JSON-array tool calls.
         self.bot_token = "[TOOL_CALLS] ["
+        # Common marker shared by both JSON-array and compact formats.
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
-        self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
         self.tool_call_separator = ", "
 
     def has_tool_call(self, text: str) -> bool:
-        """Check if the text contains a Mistral format tool call."""
-        # Accept both canonical and legacy marker variants.
+        """Return True if the text contains either supported tool-call marker."""
         return self._tool_calls_marker in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -67,7 +60,7 @@ class MistralDetector(BaseFormatDetector):
         normal_text = text[:marker_idx].strip()
         tool_part = text[marker_idx:]
 
-        # Case 1: Canonical Mistral JSON-array format: `[TOOL_CALLS] [{...}, ...]`
+        # Canonical: `[TOOL_CALLS] [{...}, ...]`
         if self.bot_token in tool_part:
             json_array_str = self._extract_json_array(tool_part)
             if not json_array_str:
@@ -96,8 +89,8 @@ class MistralDetector(BaseFormatDetector):
             )
             return StreamingParseResult(normal_text=combined_normal, calls=calls)
 
-        # Case 2: Legacy compact format: `[TOOL_CALLS]tool_name[ARGS]{...}`
-        parsed = self._try_parse_legacy_args_format(tool_part)
+        # Compact: `[TOOL_CALLS]tool_name[ARGS]{...}`
+        parsed = self._try_parse_compact_args_format(tool_part)
         if not parsed:
             return StreamingParseResult(normal_text=normal_text, calls=[])
         func_name, args_obj, consumed = parsed
@@ -115,16 +108,16 @@ class MistralDetector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
-        Streaming parsing for both canonical and legacy compact formats.
+        Streaming parsing for both JSON-array and compact formats.
 
-        For the legacy compact format, we buffer until we can parse a complete JSON arguments
-        payload, then emit two ToolCallItems (name chunk + full args chunk), matching the
-        OpenAI streaming semantics expected by `serving_chat.py`.
+        For the compact format, this buffers until the JSON arguments payload is complete,
+        then emits two items: tool name (with empty parameters) and a full arguments JSON
+        chunk (OpenAI streaming semantics).
         """
         self._buffer += new_text
         current_text = self._buffer
 
-        # If no marker and not a partial marker, flush as normal text.
+        # No marker: either flush as normal text or keep buffering a partial marker.
         if self._tool_calls_marker not in current_text:
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
                 normal_text = self._buffer
@@ -134,28 +127,28 @@ class MistralDetector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
-        # If there is leading normal text before the marker, stream it out first.
+        # If there's leading normal text before the marker, stream it out first.
         marker_pos = current_text.find(self._tool_calls_marker)
         if marker_pos > 0:
             normal_text = current_text[:marker_pos]
             self._buffer = current_text[marker_pos:]
             return StreamingParseResult(normal_text=normal_text)
 
-        # Build tool indices if not already built
+        # Build tool indices if not already built.
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        # Try legacy compact format first (since canonical requires `] [` which often arrives later).
-        legacy = self._try_parse_legacy_args_format(current_text)
-        if legacy:
-            func_name, args_obj, consumed = legacy
+        # Try compact first; JSON-array requires `] [` and often arrives later in streaming.
+        compact = self._try_parse_compact_args_format(current_text)
+        if compact:
+            func_name, args_obj, consumed = compact
             if func_name not in self._tool_indices:
-                # Unknown tool: treat as normal text and reset.
+                # Unknown tool: treat as normal text and reset state.
                 normal_text = self._buffer
                 self._buffer = ""
                 return StreamingParseResult(normal_text=normal_text)
 
-            # Initialize state if this is the first tool call
+            # Initialize state if this is the first tool call.
             if self.current_tool_id == -1:
                 self.current_tool_id = 0
                 self.prev_tool_call_arr = []
@@ -164,7 +157,7 @@ class MistralDetector(BaseFormatDetector):
             args_json = json.dumps(args_obj, ensure_ascii=False)
             tool_id = self.current_tool_id
 
-            # Ensure arrays are large enough
+            # Ensure arrays are large enough.
             while len(self.prev_tool_call_arr) <= tool_id:
                 self.prev_tool_call_arr.append({})
             while len(self.streamed_args_for_tool) <= tool_id:
@@ -181,28 +174,28 @@ class MistralDetector(BaseFormatDetector):
                 ToolCallItem(tool_index=tool_id, name=None, parameters=args_json),
             ]
 
-            # Consume parsed content from buffer
+            # Consume parsed content from buffer.
             self._buffer = current_text[consumed:]
             self.current_tool_id += 1
             self.current_tool_name_sent = False
             return StreamingParseResult(normal_text="", calls=calls)
 
-        # Fall back to canonical JSON-object streaming by delegating to BaseFormatDetector.
-        # (Canonical Mistral emits `{...}` objects after `[TOOL_CALLS] [`.)
+        # Canonical format delegates to the BaseFormatDetector JSON streaming logic.
         if self.bot_token in current_text:
             return super().parse_streaming_increment(new_text="", tools=tools)
 
         # Otherwise, keep buffering.
         return StreamingParseResult()
 
-    def _try_parse_legacy_args_format(
+    def _try_parse_compact_args_format(
         self, text: str
     ) -> Optional[Tuple[str, Any, int]]:
         """
-        Parse legacy compact tool call format:
-            [TOOL_CALLS]tool_name[ARGS]{...}
-        Also tolerates missing closing brackets in streaming:
-            [TOOL_CALLStool_name[ARGS{...}
+        Parse the compact tool call format:
+            `[TOOL_CALLS]tool_name[ARGS]{...}`
+
+        Tolerates common streaming variants where delimiters are missing:
+            `[TOOL_CALLStool_name[ARGS{...}`
 
         Returns:
             (tool_name, arguments_obj, consumed_end_index) if a complete JSON arguments
@@ -212,7 +205,7 @@ class MistralDetector(BaseFormatDetector):
         if start == -1:
             return None
 
-        i = start + len(self._tool_calls_marker)  # points after "[TOOL_CALLS"
+        i = start + len(self._tool_calls_marker)  # position after "[TOOL_CALLS"
         if i < len(text) and text[i] == "]":
             i += 1
         while i < len(text) and text[i].isspace():
