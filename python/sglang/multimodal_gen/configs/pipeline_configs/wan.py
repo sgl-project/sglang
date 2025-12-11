@@ -91,16 +91,6 @@ class WanT2V480PConfig(PipelineConfig):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
 
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Wan T2V 1.3B (480P) supports 480p resolutions.
-        Based on Wan2.1 't2v-1.3B' specification.
-        """
-        return [
-            (832, 480),   # 16:9
-            (480, 832),   # 9:16
-        ]
-
 
 @dataclass
 class WanT2V720PConfig(WanT2V480PConfig):
@@ -110,18 +100,6 @@ class WanT2V720PConfig(WanT2V480PConfig):
 
     # Denoising stage
     flow_shift: float | None = 5.0
-
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Wan T2V 14B (720P) supports both 480p and 720p resolutions.
-        Based on Wan2.1 't2v-14B' and Wan2.2 't2v-A14B' specifications.
-        """
-        return [
-            (1280, 720),  # 16:9
-            (720, 1280),  # 9:16
-            (832, 480),   # 16:9
-            (480, 832),   # 9:16
-        ]
 
 
 @dataclass
@@ -148,16 +126,6 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Wan I2V 14B (480P) supports 480p resolutions.
-        Based on Wan2.1 'i2v-14B' specification.
-        """
-        return [
-            (832, 480),   # 16:9
-            (480, 832),   # 9:16
-        ]
-
 
 @dataclass
 class WanI2V720PConfig(WanI2V480PConfig):
@@ -168,18 +136,6 @@ class WanI2V720PConfig(WanI2V480PConfig):
 
     # Denoising stage
     flow_shift: float | None = 5.0
-
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Wan I2V 14B (720P) supports both 480p and 720p resolutions.
-        Based on Wan2.1 'i2v-14B' and Wan2.2 'i2v-A14B' specifications.
-        """
-        return [
-            (1280, 720),  # 16:9
-            (720, 1280),  # 9:16
-            (832, 480),   # 16:9
-            (480, 832),   # 9:16
-        ]
 
 
 @dataclass
@@ -217,16 +173,6 @@ class Wan2_2_TI2V_5B_Config(WanT2V480PConfig, WanI2VCommonConfig):
         self.vae_config.load_decoder = True
         self.dit_config.expand_timesteps = self.expand_timesteps
 
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Wan2.2 TI2V 5B supports specific resolutions.
-        Based on Wan2.2 'ti2v-5B' specification.
-        """
-        return [
-            (1280, 704),  # 16:9-ish
-            (704, 1280),  # 9:16-ish
-        ]
-
 
 @dataclass
 class FastWan2_2_TI2V_5B_Config(Wan2_2_TI2V_5B_Config):
@@ -244,18 +190,6 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
     def __post_init__(self) -> None:
         self.dit_config.boundary_ratio = self.boundary_ratio
 
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Wan2.2 T2V A14B supports both 480p and 720p resolutions.
-        Based on Wan2.2 't2v-A14B' specification.
-        """
-        return [
-            (1280, 720),  # 16:9
-            (720, 1280),  # 9:16
-            (832, 480),   # 16:9
-            (480, 832),   # 9:16
-        ]
-
 
 @dataclass
 class Wan2_2_I2V_A14B_Config(WanI2V480PConfig):
@@ -265,18 +199,6 @@ class Wan2_2_I2V_A14B_Config(WanI2V480PConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.dit_config.boundary_ratio = self.boundary_ratio
-
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Wan2.2 I2V A14B supports both 480p and 720p resolutions.
-        Based on Wan2.2 'i2v-A14B' specification.
-        """
-        return [
-            (1280, 720),  # 16:9
-            (720, 1280),  # 9:16
-            (832, 480),   # 16:9
-            (480, 832),   # 9:16
-        ]
 
 
 # =============================================

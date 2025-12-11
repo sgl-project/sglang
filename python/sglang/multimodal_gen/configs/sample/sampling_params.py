@@ -115,6 +115,9 @@ class SamplingParams:
     width_not_provided: bool = False
     fps: int = 24
 
+    # Resolution validation
+    supported_resolutions: list[tuple[int, int]] | None = None  # None means all resolutions allowed
+
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = None
@@ -225,11 +228,17 @@ class SamplingParams:
 
         # Validate resolution against pipeline-specific supported resolutions
         if self.height is not None and self.width is not None:
-            try:
-                pipeline_config.validate_resolution(self.width, self.height)
-            except ValueError as e:
-                logger.error(str(e))
-                raise
+            if self.supported_resolutions is not None:
+                if (self.width, self.height) not in self.supported_resolutions:
+                    supported_str = ", ".join(
+                        [f"{w}x{h}" for w, h in self.supported_resolutions]
+                    )
+                    error_msg = (
+                        f"Unsupported resolution {self.width}x{self.height}. "
+                        f"Supported resolutions: {supported_str}"
+                    )
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames

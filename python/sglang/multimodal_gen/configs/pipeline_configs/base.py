@@ -247,43 +247,6 @@ class PipelineConfig:
     def adjust_num_frames(self, num_frames):
         return num_frames
 
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        Get the list of supported (width, height) resolutions for this pipeline.
-
-        Returns:
-            A list of (width, height) tuples, or None if all resolutions are supported.
-
-        Example:
-            return [(832, 480), (1280, 720), (1920, 1080)]
-        """
-        return None  # Default: no restrictions
-
-    def validate_resolution(self, width: int, height: int) -> None:
-        """
-        Validate if the given width and height are supported by this pipeline.
-
-        Args:
-            width: The width to validate
-            height: The height to validate
-
-        Raises:
-            ValueError: If the resolution is not supported
-        """
-        supported_resolutions = self.get_supported_resolutions()
-        if supported_resolutions is None:
-            # No restrictions
-            return
-
-        if (width, height) not in supported_resolutions:
-            supported_str = ", ".join(
-                [f"{w}x{h}" for w, h in supported_resolutions]
-            )
-            raise ValueError(
-                f"Unsupported resolution {width}x{height}. "
-                f"Supported resolutions: {supported_str}"
-            )
-
     # tokenize the prompt
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
