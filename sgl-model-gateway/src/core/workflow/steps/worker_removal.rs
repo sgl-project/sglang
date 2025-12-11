@@ -106,7 +106,8 @@ pub struct RemoveFromPolicyRegistryStep;
 impl StepExecutor for RemoveFromPolicyRegistryStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let workers_to_remove: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers_to_remove")?;
+        let workers_to_remove: Arc<Vec<Arc<dyn Worker>>> =
+            context.get_or_err("workers_to_remove")?;
 
         debug!(
             "Removing {} worker(s) from policy registry",

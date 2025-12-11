@@ -75,7 +75,8 @@ pub struct ValidateDescriptorStep;
 #[async_trait]
 impl StepExecutor for ValidateDescriptorStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context.get_or_err("wasm_module_config")?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let descriptor = &config_request.descriptor;
 
@@ -233,7 +234,8 @@ pub struct CalculateHashStep;
 #[async_trait]
 impl StepExecutor for CalculateHashStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context.get_or_err("wasm_module_config")?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let file_path = &config_request.descriptor.file_path;
 
@@ -291,7 +293,8 @@ pub struct CheckDuplicateStep;
 #[async_trait]
 impl StepExecutor for CheckDuplicateStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context.get_or_err("wasm_module_config")?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
         let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
 
@@ -339,7 +342,8 @@ pub struct LoadWasmBytesStep;
 #[async_trait]
 impl StepExecutor for LoadWasmBytesStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context.get_or_err("wasm_module_config")?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let file_path = &config_request.descriptor.file_path;
 
@@ -374,7 +378,8 @@ pub struct ValidateWasmComponentStep;
 #[async_trait]
 impl StepExecutor for ValidateWasmComponentStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context.get_or_err("wasm_module_config")?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
         let wasm_bytes: Arc<Vec<u8>> = context.get_or_err("wasm_bytes")?;
 
         debug!(
@@ -425,7 +430,8 @@ pub struct RegisterModuleStep;
 #[async_trait]
 impl StepExecutor for RegisterModuleStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context.get_or_err("wasm_module_config")?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
         let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
         let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
         let file_size_bytes: Arc<u64> = context.get_or_err("file_size_bytes")?;
