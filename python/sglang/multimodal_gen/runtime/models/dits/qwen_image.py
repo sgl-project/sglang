@@ -26,7 +26,6 @@ from sglang.multimodal_gen.runtime.models.dits.utils import (
     delete_projection_layers,
     fuse_linear_projections,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
