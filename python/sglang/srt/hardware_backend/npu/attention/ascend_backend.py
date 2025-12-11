@@ -257,8 +257,7 @@ class AscendAttnBackend(AttentionBackend):
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
         self.enable_torch_air_compile = (
-            model_runner.server_args.disable_cuda_graph
-            and model_runner.server_args.enable_torch_compile
+            model_runner.server_args.enable_torch_air_compile
         )
         if self.enable_torch_air_compile:
             max_total_tokens = model_runner.max_total_num_tokens
