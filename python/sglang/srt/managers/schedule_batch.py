@@ -1813,10 +1813,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
                 self.seq_lens, self.seq_lens_cpu, last_loc
             )
-
+        locs = self.seq_lens - 1
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
+
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
             draft_input: EagleDraftInput = self.spec_info
