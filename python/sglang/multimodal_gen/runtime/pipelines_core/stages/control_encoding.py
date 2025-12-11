@@ -27,18 +27,22 @@ class ControlEncodingStage(PipelineStage):
     Stage for loading and encoding control images for ControlNet.
 
     This stage handles loading control images from disk or URLs, resizing them
-    to match the generation dimensions, and converting them to tensors.
+    to match the generation dimensions, VAE encoding, and patchification.
 
-    Note: This stage does NOT perform control-specific preprocessing (e.g., canny
-    edge detection, depth estimation). Users are expected to provide pre-processed
-    control images, following the diffusers pattern.
+    The control image is processed to match the latent space format expected
+    by the ControlNet, following the InstantX/diffusers pattern.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, vae=None) -> None:
         """
         Initialize the control encoding stage.
+
+        Args:
+            vae: VAE model for encoding control images to latent space.
+                 If None, control images will be passed as raw tensors.
         """
         super().__init__()
+        self.vae = vae
 
     @torch.no_grad()
     def forward(
@@ -75,14 +79,115 @@ class ControlEncodingStage(PipelineStage):
         # Convert to tensor [1, 3, H, W] in range [0, 1]
         control_tensor = self._image_to_tensor(control_image, server_args)
 
+        # If VAE is available, encode to latent space and patchify
+        if self.vae is not None:
+            control_tensor = self._encode_and_patchify(control_tensor, server_args)
+            logger.info(
+                f"Control image VAE-encoded and patchified: shape={control_tensor.shape}, "
+                f"dtype={control_tensor.dtype}, device={control_tensor.device}"
+            )
+        else:
+            logger.info(
+                f"Control image loaded (no VAE encoding): shape={control_tensor.shape}, "
+                f"dtype={control_tensor.dtype}, device={control_tensor.device}"
+            )
+
         # Store in batch
         batch.control_image = control_tensor
-        logger.info(
-            f"Control image loaded and encoded: shape={control_tensor.shape}, "
-            f"dtype={control_tensor.dtype}, device={control_tensor.device}"
-        )
 
         return batch
+
+    def _encode_and_patchify(
+        self, control_tensor: torch.Tensor, server_args: ServerArgs
+    ) -> torch.Tensor:
+        """
+        Encode control image with VAE and patchify to match latent format.
+
+        Args:
+            control_tensor: Control image tensor [1, 3, H, W] in range [0, 1]
+            server_args: Server arguments
+
+        Returns:
+            Encoded and patchified tensor [1, num_patches, channels*4]
+        """
+        # Move VAE to correct device if needed
+        device = control_tensor.device
+        vae_device = next(self.vae.parameters()).device
+        vae_dtype = next(self.vae.parameters()).dtype
+
+        if vae_device != device:
+            # Temporarily move VAE to the control tensor device
+            self.vae = self.vae.to(device)
+
+        # Add temporal dimension [1, 3, H, W] -> [1, 3, 1, H, W]
+        if control_tensor.ndim == 4:
+            control_tensor = control_tensor.unsqueeze(2)
+
+        # Convert from [0, 1] to [-1, 1] range expected by VAE
+        control_tensor = (control_tensor * 2.0 - 1.0).clamp(-1, 1)
+
+        # Cast input to match VAE dtype (VAE may be in float32)
+        control_tensor = control_tensor.to(dtype=vae_dtype)
+
+        # VAE encode: [1, 3, 1, H, W] -> [1, C, 1, H/8, W/8]
+        # QwenImage VAE's encode() returns DiagonalGaussianDistribution directly
+        posterior = self.vae.encode(control_tensor)
+        latent = posterior.sample()
+
+        # Cast back to the target dtype for the rest of the pipeline
+        dit_precision = server_args.pipeline_config.dit_precision
+        target_dtype = torch.bfloat16 if dit_precision in ("bf16", "bfloat16") else torch.float16
+        latent = latent.to(dtype=target_dtype)
+
+        # Apply VAE normalization using pre-computed shift_factor and scaling_factor
+        # QwenImage VAE stores these as tensors: shift_factor (latents_mean) and scaling_factor (1/latents_std)
+        if hasattr(self.vae, 'shift_factor') and self.vae.shift_factor is not None:
+            shift_factor = self.vae.shift_factor.to(device=device, dtype=latent.dtype)
+            scaling_factor = self.vae.scaling_factor.to(device=device, dtype=latent.dtype)
+            latent = (latent - shift_factor) * scaling_factor
+
+        # Permute: [1, C, 1, H/8, W/8] -> [1, 1, C, H/8, W/8]
+        latent = latent.permute(0, 2, 1, 3, 4)
+
+        # Patchify (pack 2x2 patches into sequence)
+        # [1, 1, C, H/8, W/8] -> [1, num_patches, C*4]
+        latent = self._pack_latents(latent)
+
+        # Move VAE back to CPU if offloading is enabled
+        if server_args.vae_cpu_offload and vae_device.type == "cpu":
+            self.vae = self.vae.to("cpu")
+
+        return latent
+
+    def _pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Pack latents by combining 2x2 spatial patches into the channel dimension.
+
+        Args:
+            latents: Tensor of shape [B, T, C, H, W]
+
+        Returns:
+            Packed tensor of shape [B, (H/2)*(W/2), C*4]
+        """
+        batch_size, num_frames, num_channels, height, width = latents.shape
+
+        # Reshape to extract 2x2 patches
+        # [B, T, C, H, W] -> [B, T, C, H/2, 2, W/2, 2]
+        latents = latents.view(
+            batch_size, num_frames, num_channels, height // 2, 2, width // 2, 2
+        )
+
+        # Permute to group patches: [B, T, H/2, W/2, C, 2, 2]
+        latents = latents.permute(0, 1, 3, 5, 2, 4, 6)
+
+        # Flatten patches: [B, T*(H/2)*(W/2), C*4]
+        latents = latents.reshape(
+            batch_size,
+            num_frames * (height // 2) * (width // 2),
+            num_channels * 4
+        )
+
+        return latents
 
     def _load_control_image(
         self, image_path: Union[str, Path]
@@ -163,7 +268,9 @@ class ControlEncodingStage(PipelineStage):
 
         # Move to appropriate device and dtype
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16 if server_args.dtype == "bfloat16" else torch.float16
+        # Get dtype from pipeline config (dit_precision: "bf16" or "fp16")
+        dit_precision = server_args.pipeline_config.dit_precision
+        dtype = torch.bfloat16 if dit_precision in ("bf16", "bfloat16") else torch.float16
 
         image_tensor = image_tensor.to(device=device, dtype=dtype)
 

@@ -1,19 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Black Forest Labs, The HuggingFace Team and The InstantX Team. All rights reserved.
+# Adapted for SGLang from InstantX/Qwen-Image-ControlNet-Union
 """
 QwenImage ControlNet Model
 
 This module implements the ControlNet adapter for QwenImage, enabling
 precise spatial control over image generation.
 
-Based on: InstantX/Qwen-Image-ControlNet-Union
+The architecture mirrors InstantX/Qwen-Image-ControlNet-Union to ensure
+weight compatibility when loading from HuggingFace.
 """
 
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.models.dits import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenEmbedRope,
+    QwenImageTransformerBlock,
+    QwenTimestepProjEmbeddings,
+)
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -29,142 +39,271 @@ def zero_module(module: nn.Module) -> nn.Module:
     return module
 
 
+@dataclass
+class QwenImageControlNetOutput:
+    """Output class for QwenImageControlNetModel"""
+    controlnet_block_samples: Tuple[torch.Tensor, ...]
+
+
 class QwenImageControlNetModel(nn.Module):
     """
-    ControlNet for QwenImage - adapts the base transformer to enable
-    spatial control via control images (canny, depth, pose, etc.).
+    ControlNet for QwenImage - mirrors InstantX/Qwen-Image-ControlNet-Union architecture.
+
+    This implementation reuses SGLang's optimized QwenImageTransformerBlock and related
+    components to ensure compatibility with the loading system while maintaining
+    performance optimizations.
 
     Architecture:
-    - Copies encoder blocks from base QwenImageTransformer2DModel
-    - Processes control images through convolutional layers
-    - Outputs residuals injected into transformer blocks
-    - Uses zero-initialization for stable training
+    - pos_embed: QwenEmbedRope for rotary position embeddings
+    - time_text_embed: QwenTimestepProjEmbeddings for timestep conditioning
+    - txt_norm, txt_in: Text processing layers
+    - img_in: Image input projection
+    - transformer_blocks: N transformer blocks (typically 5 for ControlNet-Union)
+    - controlnet_blocks: Zero-initialized output projections
+    - controlnet_x_embedder: Zero-initialized condition embedding
     """
+
+    # Required class attributes for SGLang's FSDP loading system
+    _fsdp_shard_conditions = [
+        lambda n, m: isinstance(m, QwenImageTransformerBlock),
+    ]
+
+    # Parameter name mapping - identity mapping since we match InstantX architecture
+    param_names_mapping = {}
+    reverse_param_names_mapping = {}
 
     def __init__(
         self,
         config: QwenImageDitConfig,
-        hf_config: dict[str, Any],
-        conditioning_channels: int = 3,  # Control image channels (RGB)
+        hf_config: Dict[str, Any],
     ):
         super().__init__()
 
-        # Load architecture parameters from config
-        self.patch_size = config.arch_config.patch_size
-        self.in_channels = config.arch_config.in_channels
-        self.num_layers = hf_config.get("num_layers", 5)  # ControlNet-Union has 5 blocks
-        self.attention_head_dim = config.arch_config.attention_head_dim
-        self.num_attention_heads = config.arch_config.num_attention_heads
-        self.joint_attention_dim = config.arch_config.joint_attention_dim
-        self.inner_dim = self.num_attention_heads * self.attention_head_dim
+        # Extract config parameters
+        # Use hf_config values if available (from InstantX config.json), else fall back to dit_config
+        patch_size = hf_config.get("patch_size", config.arch_config.patch_size)
+        in_channels = hf_config.get("in_channels", config.arch_config.in_channels)
+        out_channels = hf_config.get("out_channels", config.arch_config.out_channels)
+        num_layers = hf_config.get("num_layers", 5)  # ControlNet-Union uses 5 blocks
+        attention_head_dim = hf_config.get("attention_head_dim", config.arch_config.attention_head_dim)
+        num_attention_heads = hf_config.get("num_attention_heads", config.arch_config.num_attention_heads)
+        joint_attention_dim = hf_config.get("joint_attention_dim", config.arch_config.joint_attention_dim)
+        axes_dims_rope = hf_config.get("axes_dims_rope", config.arch_config.axes_dims_rope)
+        extra_condition_channels = hf_config.get("extra_condition_channels", 0)
 
-        logger.info(f"Initializing QwenImageControlNet with {self.num_layers} blocks")
+        self.out_channels = out_channels or in_channels
+        self.inner_dim = num_attention_heads * attention_head_dim
+        self.num_layers = num_layers
+        self.in_channels = in_channels
+        self.extra_condition_channels = extra_condition_channels
 
-        # Param names mapping for FSDP/LoRA loading (same pattern as base model)
-        self.param_names_mapping = config.arch_config.param_names_mapping
-
-        # ===== CONTROL IMAGE PROCESSING =====
-        # Convert control image to latent space (8x downsampling to match VAE)
-        self.controlnet_cond_embedding = nn.Sequential(
-            nn.Conv2d(conditioning_channels, 16, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(16, 16, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2),  # 2x downsample
-            nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),  # 4x downsample
-            nn.SiLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(64, self.in_channels, kernel_size=3, padding=1, stride=2),  # 8x downsample
+        logger.info(
+            f"Initializing QwenImageControlNet with {num_layers} blocks, "
+            f"inner_dim={self.inner_dim}, in_channels={in_channels}"
         )
 
-        # ===== ZERO CONVOLUTIONS =====
-        # Zero-initialized output layers for stable training
-        self.controlnet_cond_embedding_out_zero = zero_module(
-            nn.Linear(self.in_channels, self.inner_dim)
+        # Position embeddings - matches transformer architecture
+        self.pos_embed = QwenEmbedRope(
+            theta=10000,
+            axes_dim=list(axes_dims_rope),
+            scale_rope=True
         )
 
-        # Zero-initialized block outputs
-        self.controlnet_blocks = nn.ModuleList(
-            [
-                zero_module(nn.Linear(self.inner_dim, self.inner_dim))
-                for _ in range(self.num_layers)
-            ]
+        # Timestep embeddings
+        self.time_text_embed = QwenTimestepProjEmbeddings(
+            embedding_dim=self.inner_dim
         )
+
+        # Text processing
+        self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
+        self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
+
+        # Image input projection
+        self.img_in = nn.Linear(in_channels, self.inner_dim)
+
+        # Transformer blocks - reuse SGLang's optimized implementation
+        self.transformer_blocks = nn.ModuleList([
+            QwenImageTransformerBlock(
+                dim=self.inner_dim,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # ControlNet output blocks - zero-initialized for stable training
+        self.controlnet_blocks = nn.ModuleList([
+            zero_module(nn.Linear(self.inner_dim, self.inner_dim))
+            for _ in range(num_layers)
+        ])
+
+        # ControlNet condition embedder - zero-initialized
+        self.controlnet_x_embedder = zero_module(
+            nn.Linear(in_channels + extra_condition_channels, self.inner_dim)
+        )
+
+        # Gradient checkpointing flag
+        self.gradient_checkpointing = False
 
     def forward(
         self,
-        hidden_states: torch.Tensor,  # Noisy latents [B, N_tokens, C]
-        controlnet_cond: torch.Tensor,  # Control image [B, 3, H, W]
-        encoder_hidden_states: torch.Tensor,  # Text embeddings
-        encoder_hidden_states_mask: Optional[torch.Tensor] = None,
-        timestep: torch.LongTensor = None,
-        txt_seq_lens: Optional[list[int]] = None,
-        freqs_cis: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        hidden_states: torch.Tensor,
+        controlnet_cond: torch.Tensor,
         conditioning_scale: float = 1.0,
-        return_dict: bool = False,
-    ) -> list[torch.Tensor]:
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
+        txt_seq_lens: Optional[List[int]] = None,
+        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        return_dict: bool = True,
+    ) -> Union[QwenImageControlNetOutput, Tuple[torch.Tensor, ...]]:
         """
         Forward pass through ControlNet.
 
         Args:
-            hidden_states: Noisy latents from diffusion process
-            controlnet_cond: Pre-processed control image
-            encoder_hidden_states: Text embeddings
+            hidden_states: Input hidden states [batch, seq_len, in_channels]
+            controlnet_cond: Control condition tensor [batch, seq_len, in_channels]
+            conditioning_scale: Scale factor for ControlNet outputs
+            encoder_hidden_states: Text embeddings [batch, text_seq_len, joint_attention_dim]
+            encoder_hidden_states_mask: Attention mask for text
             timestep: Current denoising timestep
-            conditioning_scale: Scaling factor for control influence
+            img_shapes: List of (frame, height, width) tuples for RoPE
+            txt_seq_lens: List of text sequence lengths
+            freqs_cis: Pre-computed rotary position embeddings (if available)
+            joint_attention_kwargs: Additional kwargs for attention
+            return_dict: Whether to return QwenImageControlNetOutput
 
         Returns:
-            List of residuals (one per block) to inject into base transformer
+            ControlNet block samples to be added to transformer hidden states
         """
-        batch_size = hidden_states.shape[0]
+        # Handle list input for encoder_hidden_states (same as transformer)
+        if isinstance(encoder_hidden_states, list):
+            encoder_hidden_states = encoder_hidden_states[0]
 
-        # 1. Process control image → latent space
-        # Input: [B, 3, H, W] (e.g., [1, 3, 1024, 1024])
-        # Output: [B, in_channels, H/8, W/8] (e.g., [1, 64, 128, 128])
-        controlnet_cond_latents = self.controlnet_cond_embedding(controlnet_cond)
+        # Project image input
+        hidden_states = self.img_in(hidden_states)
 
-        # 2. Pack control latents to token sequence format
-        # [B, C, H, W] → [B, (H/2)*(W/2), C*4]
-        # This matches how QwenImage packs latents
-        channels, height, width = (
-            controlnet_cond_latents.shape[1],
-            controlnet_cond_latents.shape[2],
-            controlnet_cond_latents.shape[3],
+        # Add control condition embedding
+        hidden_states = hidden_states + self.controlnet_x_embedder(controlnet_cond)
+
+        # Normalize timestep (same as transformer: timestep / 1000)
+        timestep = (timestep / 1000).to(hidden_states.dtype)
+
+        # Compute timestep embedding
+        temb = self.time_text_embed(timestep, hidden_states)
+
+        # Compute rotary position embeddings
+        # Use pre-computed freqs_cis if available, otherwise compute from pos_embed
+        if freqs_cis is not None:
+            image_rotary_emb = freqs_cis
+        else:
+            image_rotary_emb = self.pos_embed(
+                img_shapes,
+                txt_seq_lens,
+                device=hidden_states.device
+            )
+
+        # Process text embeddings
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        # Process through transformer blocks
+        block_samples = []
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+            block_samples.append(hidden_states)
+
+        # Apply controlnet output projections with zero-init
+        controlnet_block_samples = []
+        for block_sample, controlnet_block in zip(block_samples, self.controlnet_blocks):
+            controlnet_block_samples.append(
+                controlnet_block(block_sample) * conditioning_scale
+            )
+
+        controlnet_block_samples = tuple(controlnet_block_samples)
+
+        if not return_dict:
+            return controlnet_block_samples
+
+        return QwenImageControlNetOutput(
+            controlnet_block_samples=controlnet_block_samples
         )
-        controlnet_cond_latents = controlnet_cond_latents.reshape(
-            batch_size, channels, height // 2, 2, width // 2, 2
-        )
-        controlnet_cond_latents = controlnet_cond_latents.permute(0, 2, 4, 1, 3, 5)
-        controlnet_cond_latents = controlnet_cond_latents.reshape(
-            batch_size, (height // 2) * (width // 2), channels * 4
-        )
-
-        # 3. Apply zero-initialized projection
-        controlnet_cond_latents = self.controlnet_cond_embedding_out_zero(
-            controlnet_cond_latents
-        )
-
-        # 4. For now, create dummy block residuals
-        # In a full implementation, we'd pass through actual ControlNet encoder blocks
-        # Here we just create scaled versions of the control conditioning
-        block_residuals = []
-        for i in range(self.num_layers):
-            # Apply zero-conv and scale
-            residual = self.controlnet_blocks[i](controlnet_cond_latents)
-            residual = residual * conditioning_scale
-            block_residuals.append(residual)
-
-        logger.debug(
-            f"ControlNet produced {len(block_residuals)} residuals, "
-            f"each with shape {block_residuals[0].shape}"
-        )
-
-        return block_residuals
 
 
-# Register as EntryClass for automatic discovery
+class QwenImageMultiControlNetModel(nn.Module):
+    """
+    Wrapper class for multiple QwenImageControlNetModel instances.
+
+    Supports ControlNet-Union style multi-condition control where
+    multiple control signals are combined.
+    """
+
+    def __init__(self, controlnets: List[QwenImageControlNetModel]):
+        super().__init__()
+        self.nets = nn.ModuleList(controlnets)
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        controlnet_cond: List[torch.Tensor],
+        conditioning_scale: List[float],
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
+        txt_seq_lens: Optional[List[int]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        return_dict: bool = True,
+    ) -> Union[QwenImageControlNetOutput, Tuple]:
+        """
+        Forward pass through multiple ControlNets.
+
+        For ControlNet-Union, we use a single ControlNet and iterate over conditions.
+        """
+        if len(self.nets) == 1:
+            # ControlNet-Union mode: single network, multiple conditions
+            controlnet = self.nets[0]
+            control_block_samples = None
+
+            for i, (cond, scale) in enumerate(zip(controlnet_cond, conditioning_scale)):
+                block_samples = controlnet(
+                    hidden_states=hidden_states,
+                    controlnet_cond=cond,
+                    conditioning_scale=scale,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    timestep=timestep,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=txt_seq_lens,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    return_dict=False,
+                )
+
+                if control_block_samples is None:
+                    control_block_samples = list(block_samples)
+                else:
+                    control_block_samples = [
+                        prev + curr
+                        for prev, curr in zip(control_block_samples, block_samples)
+                    ]
+
+            if return_dict:
+                return QwenImageControlNetOutput(
+                    controlnet_block_samples=tuple(control_block_samples) if control_block_samples else ()
+                )
+            return tuple(control_block_samples) if control_block_samples else ()
+        else:
+            raise ValueError("QwenImageMultiControlNetModel only supports controlnet-union (single net) for now.")
+
+
+# Register as EntryClass for automatic discovery by ModelRegistry
 EntryClass = QwenImageControlNetModel

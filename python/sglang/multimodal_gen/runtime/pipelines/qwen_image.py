@@ -96,7 +96,7 @@ class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
             logger.info("ControlNet detected, adding control encoding stage")
             self.add_stage(
                 stage_name="control_encoding_stage",
-                stage=ControlEncodingStage(),
+                stage=ControlEncodingStage(vae=self.get_module("vae")),
             )
 
         self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
@@ -173,7 +173,7 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
             logger.info("ControlNet detected, adding control encoding stage")
             self.add_stage(
                 stage_name="control_encoding_stage",
-                stage=ControlEncodingStage(),
+                stage=ControlEncodingStage(vae=self.get_module("vae")),
             )
 
         self.add_stage(
