@@ -269,7 +269,7 @@ impl RouterManager {
         let mut best_router = None;
         let mut best_score = 0.0;
 
-        // Optimized: Uses O(1) lookups instead of allocating a full vector of workers via get_all()
+        //  Uses O(1) lookups instead of allocating a full vector of workers via get_all()
         let (num_regular_workers, num_pd_workers) = self.worker_registry.get_worker_distribution();
 
         for router in candidate_routers {
