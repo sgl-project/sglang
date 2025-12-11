@@ -269,13 +269,20 @@ class SchedulerOutputProcessorMixin:
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
-        stride = self.draft_worker.speculative_num_draft_tokens
 
+        # Dense extraction: repacked tensor is contiguous [req0_tokens..., req1_tokens..., ...]
+        offset = 0
         for i, req in enumerate(batch.reqs):
             req.kv_committed_len += accept_lens[i]
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+
+            # NOTE: Do NOT reset kv_allocated_len for tree mode!
+            # The over-allocated slots are still valid and will be reused.
+            # Rejected tree slots become "dead space" until request ends.
+
+            # Extract from dense repacked tensor using cumulative offset
+            predict_tokens.append(next_token_ids[offset : offset + accept_lens[i]])
+            offset += accept_lens[i]
+
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_lens[i] - 1
 
