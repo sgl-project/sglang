@@ -9,7 +9,7 @@
 //! 3. RemoveFromWorkerRegistry - Remove workers from worker registry
 //! 4. UpdateRemainingPolicies - Update cache-aware policies for remaining workers
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
@@ -239,8 +239,6 @@ impl StepExecutor for UpdateRemainingPoliciesStep {
 
 /// Create a worker removal workflow definition
 pub fn create_worker_removal_workflow() -> WorkflowDefinition {
-    use std::time::Duration;
-
     WorkflowDefinition::new("worker_removal", "Remove worker from router")
         .add_step(
             StepDefinition::new(
