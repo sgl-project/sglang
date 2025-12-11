@@ -478,25 +478,106 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
-        # Batch 2: Draft extend
+        accept_index = batch_result.accept_index
+        accept_lens = batch_result.accept_lens
+
+        if accept_index is None:
+            # Fallback to original dense behavior if accept_index is missing
+            draft_input = EagleDraftInput(
+                hidden_states=batch_result.logits_output.hidden_states,
+                num_tokens_per_batch=self.speculative_num_steps + 1,
+                num_tokens_for_logprob_per_batch=1,
+            )
+            select_index = (
+                torch.arange(len(batch.seq_lens), device=self.device)
+                * self.speculative_num_draft_tokens
+                + batch_result.accept_lens
+                - 1
+            )
+            with self.plan_stream_ctx:
+                forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+                    batch,
+                    batch_result.next_token_ids,
+                    self.speculative_num_draft_tokens,
+                    self.draft_runner,
+                    self.cuda_graph_runner_for_draft_extend,
+                )
+            if self.plan_stream:
+                torch.get_device_module(self.device).current_stream().wait_stream(
+                    self.plan_stream
+                )
+            can_cuda_graph = (
+                self.cuda_graph_runner_for_draft_extend
+                and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            )
+            if can_cuda_graph:
+                draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                    forward_batch
+                )
+            else:
+                draft_logits_output, _ = self.draft_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                )
+            draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+                select_index
+            ]
+            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                select_index
+            ]
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret_hidden_states = draft_logits_output.hidden_states
+            next_draft_input = batch_result.next_draft_input
+            (
+                next_draft_input.topk_p,
+                next_draft_input.topk_index,
+                next_draft_input.hidden_states,
+            ) = (
+                ret_topk_p,
+                ret_topk_index,
+                ret_hidden_states,
+            )
+            return
+
+        # FULL FIX: Repack ALL tensors for draft extend to match accept_lens
+        # This ensures seq_lens grows by accept_lens, not num_draft_tokens
+
+        # Get accept_index for repacking all tensors
+        flat_accept_index = accept_index.flatten()
+        valid_mask = flat_accept_index != -1
+        valid_indices = flat_accept_index[valid_mask]
+
+        # Repack accepted tokens for draft extend
+
+        # Repack hidden_states to only accepted positions
+        full_hidden_states = batch_result.logits_output.hidden_states  # [bs * num_draft_tokens, H]
+        repacked_hidden_states = full_hidden_states[valid_indices]  # [sum(accept_lens), H]
+
+        # Repack input_ids (predict) - use sparse_predict + accept_index
+        repacked_input_ids = batch_result.sparse_predict[valid_indices]  # [sum(accept_lens)]
+
+        # Repack out_cache_loc to match repacked input_ids
+        repacked_out_cache_loc = batch.out_cache_loc[valid_indices]
+        batch.out_cache_loc = repacked_out_cache_loc
+
         draft_input = EagleDraftInput(
-            hidden_states=batch_result.logits_output.hidden_states,
+            hidden_states=repacked_hidden_states,  # Repacked [sum(accept_lens), H]
             num_tokens_per_batch=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_batch=1,
         )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
-        )
 
-        # Prepare for draft extend in a separate stream
+        # select_index: For repacked tensor, pick the LAST token per request
+        # With repacked layout: [req0_tok0, req0_tok1, req1_tok0, req1_tok1, req1_tok2, ...]
+        # Last token for req i is at cumsum(accept_lens[:i+1]) - 1
+        accept_lens_cumsum = torch.cumsum(accept_lens, dim=0)
+        select_index = accept_lens_cumsum - 1  # Last accepted position per request
+
+        # Prepare for draft extend using REPACKED tensors
         with self.plan_stream_ctx:
-            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache_repacked(
                 batch,
-                batch_result.next_token_ids,
-                self.speculative_num_draft_tokens,
+                repacked_input_ids,  # Repacked [sum(accept_lens)]
+                accept_lens,         # Per-request accept lengths
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
             )
@@ -506,19 +587,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
-        # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+        # Run draft extend batch (CUDA graphs disabled for variable sizes)
+        draft_logits_output, _ = self.draft_runner.forward(
+            forward_batch, skip_attn_backend_init=True
         )
-        if can_cuda_graph:
-            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
-            )
-        else:
-            draft_logits_output, _ = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            )
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -639,6 +711,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
+
+            # FIX: Update req_to_token mapping to only include accepted slots
+            # This is the V1 approach - update mapping instead of moving KV data
+            if not model_worker_batch.forward_mode.is_idle():
+                self._update_req_to_token_for_accepted(
+                    model_worker_batch,
+                    batch_output.accept_index,
+                    batch_output.accept_lens,
+                )
+
             with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
@@ -745,8 +827,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verified_id,
                 self.speculative_num_steps + 1,
             )
+
+            # Repack next_token_ids to only include accepted tokens
+            # This ensures the scheduler receives a dense tensor of valid tokens
+            flat_accept_index = accept_index.flatten()
+            valid_mask = flat_accept_index != -1
+            valid_indices = flat_accept_index[valid_mask]
+            repacked_next_token_ids = predict[valid_indices]
+
+            # Debug: Check if tree mode (scattered indices) or chain mode (contiguous indices)
+            expected_chain_indices = []
+            for i, acc_len in enumerate(accept_length.tolist()):
+                expected_chain_indices.extend(range(i * self.speculative_num_draft_tokens,
+                                                     i * self.speculative_num_draft_tokens + acc_len))
+            is_tree_mode = set(valid_indices.tolist()) != set(expected_chain_indices)
+            if is_tree_mode:
+                print(f"[EAGLE3_DEBUG] Tree mode: accept_index={accept_index[0].tolist()[:5]}..., accept_len={accept_length.tolist()}")
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            repacked_next_token_ids = predict
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
@@ -757,11 +856,164 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=repacked_next_token_ids,  # Repacked for scheduler
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
+            accept_index=accept_index,
+            sparse_predict=predict,  # Original sparse predict for draft extend
         )
+
+    def _update_req_to_token_for_accepted(
+        self,
+        batch: ModelWorkerBatch,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+    ):
+        """
+        Update req_to_token mapping for tree mode with slot shifting.
+
+        For tree mode, we need to:
+        1. Update req_to_token[kv_committed:kv_committed+accept_len] = accepted slots
+        2. Shift pre-allocated slots to fill the gap created by rejected tree slots
+        3. NO freeing needed - rejected slots become "dead space" until request ends
+
+        The key issue is slot DUPLICATION: after accepting scattered tree positions,
+        the pre-alloc region still contains copies of some accepted slots. We must
+        shift the pre-alloc slots to start right after accepted positions.
+
+        Example:
+          Before: req_to_token[100:126] = [A,B,C,D,...,M, N,O,P,...,Z]
+                                           ↑-tree (13)-↑  ↑-prealloc-↑
+          Accept positions [0, 2] → slots [A, C]
+          After step 1: req_to_token[100:102] = [A, C]  ← correct
+          BUT: req_to_token[102] still = C (unchanged!) ← DUPLICATE
+
+          Step 2 shifts pre-alloc: req_to_token[102:115] = [N,O,P,...,Z]
+          Now: no duplicates, next tree reads fresh slots
+        """
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+        bs = len(batch.seq_lens)
+        is_tree_mode = self.topk > 1
+        tree_size = self.speculative_num_draft_tokens  # topk * num_steps + 1
+
+        # accept_index already contains FLAT indices into batch tensors
+        # e.g., [0, 2, 13, 14] for bs=2 where req 0 accepts tree positions 0,2
+        #       and req 1 accepts tree positions 0,1 (flat indices 13, 14)
+        flat_accept_index = accept_index.flatten()
+        valid_mask = flat_accept_index != -1
+        valid_indices = flat_accept_index[valid_mask]
+
+        # Get the KV slots for accepted positions only
+        accepted_out_cache_loc = batch.out_cache_loc[valid_indices]
+
+        # For tree mode: FREE rejected slots (required to avoid memory leak)
+        # In chain mode, rejected slots are naturally reused as pre-alloc
+        # In tree mode, scattered acceptance leaves orphaned slots that must be freed
+        if is_tree_mode:
+            total_tree_slots = bs * tree_size
+            all_indices = set(range(total_tree_slots))
+            accepted_indices_set = set(valid_indices.tolist())
+            rejected_indices = list(all_indices - accepted_indices_set)
+            if rejected_indices:
+                rejected_slots = batch.out_cache_loc[rejected_indices]
+                self.token_to_kv_pool_allocator.free(rejected_slots)
+                print(f"[EAGLE3_DEBUG tree_mode] bs={bs}, accept_lens={accept_length.tolist()}, freed={len(rejected_indices)} rejected slots")
+
+        # Calculate new seq_lens after accepting tokens
+        new_seq_lens = batch.seq_lens + accept_length
+
+        # Step 1: Update req_to_token for accepted positions
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            self.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            new_seq_lens,
+            accepted_out_cache_loc,
+            bs,
+        )
+
+        # Step 2: For tree mode, shift pre-allocated slots to avoid duplication
+        if is_tree_mode and batch.reqs is not None:
+            self._shift_prealloc_slots(batch, accept_length, tree_size, new_seq_lens)
+
+    def _shift_prealloc_slots(
+        self,
+        batch: ModelWorkerBatch,
+        accept_length: torch.Tensor,
+        tree_size: int,
+        new_seq_lens: torch.Tensor,
+    ):
+        """
+        Shift pre-allocated slots to fill the gap left by rejected tree slots.
+
+        This prevents slot duplication where the same physical slot appears at
+        multiple logical positions in req_to_token.
+
+        Note: This currently uses CPU indexing which may cause a sync.
+        TODO: Implement GPU-only version using Triton kernel for perf.
+        """
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+        bs = len(batch.seq_lens)
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = batch.req_pool_indices
+
+        # Collect all pre-alloc slots across requests
+        all_prealloc_slots = []
+        prealloc_lengths = []
+
+        for i in range(bs):
+            req = batch.reqs[i]
+            req_idx = req_pool_indices[i].item()
+            seq_len = batch.seq_lens[i].item()
+            kv_allocated = req.kv_allocated_len
+
+            # Pre-alloc region: [seq_lens + tree_size : kv_allocated]
+            prealloc_start = seq_len + tree_size
+            prealloc_end = kv_allocated
+
+            if prealloc_end > prealloc_start:
+                # Read pre-alloc slots from req_to_token
+                prealloc_slots = req_to_token[req_idx, prealloc_start:prealloc_end].clone()
+                all_prealloc_slots.append(prealloc_slots)
+                prealloc_lengths.append(len(prealloc_slots))
+            else:
+                prealloc_lengths.append(0)
+
+        # Now write shifted pre-alloc slots
+        if any(plen > 0 for plen in prealloc_lengths):
+            # Flatten all pre-alloc slots
+            if all_prealloc_slots:
+                flat_prealloc = torch.cat(all_prealloc_slots)
+
+                # Calculate destination positions: new_seq_lens[i] : new_seq_lens[i] + prealloc_len[i]
+                dest_starts = new_seq_lens.clone()
+                dest_ends = new_seq_lens + torch.tensor(
+                    prealloc_lengths, device=new_seq_lens.device, dtype=new_seq_lens.dtype
+                )
+
+                # Write using the Triton kernel
+                assign_req_to_token_pool_func(
+                    req_pool_indices,
+                    req_to_token,
+                    dest_starts,
+                    dest_ends,
+                    flat_prealloc,
+                    bs,
+                )
+
+                # Update kv_allocated_len on requests
+                for i in range(bs):
+                    accept_len = accept_length[i].item()
+                    # New kv_allocated = old - (tree_size - accept_len)
+                    # = old - tree_size + accept_len
+                    # This shrinks kv_allocated by the number of rejected slots
+                    rejected_count = tree_size - accept_len
+                    batch.reqs[i].kv_allocated_len -= rejected_count
+
+                print(f"[EAGLE3_DEBUG tree_mode] Shifted {sum(prealloc_lengths)} pre-alloc slots")
 
     def move_accepted_tokens_to_target_kvcache(
         self,
@@ -770,7 +1022,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         accept_length: torch.Tensor,
     ):
         """
-        Move accepted tokens to the target KV cache.
+        [DEPRECATED - BUGGY] Move accepted tokens to the target KV cache.
 
         Args:
             batch: The batch to run.
