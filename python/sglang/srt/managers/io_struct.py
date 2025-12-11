@@ -1616,6 +1616,9 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    # KV cache available tokens for decode capacity-aware routing
+    kv_available_tokens: int = -1
+    kv_total_tokens: int = -1
 
 
 @dataclass

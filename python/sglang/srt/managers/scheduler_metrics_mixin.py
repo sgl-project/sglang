@@ -398,13 +398,24 @@ class SchedulerMetricsMixin:
                 )
 
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
+        # Get KV cache availability info for capacity-aware routing
+        kv_available_tokens = -1
+        kv_total_tokens = -1
         if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
             num_tokens = max(full_num_used, swa_num_used)
+            # For hybrid SWA, use full tokens as the bottleneck
+            kv_available_tokens = self.token_to_kv_pool_allocator.full_available_size()
+            kv_total_tokens = self.full_tokens_per_layer
         elif self.is_ssm_model:
             num_tokens = self._get_mamba_token_info()[0]
+            kv_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            kv_total_tokens = self.token_to_kv_pool_allocator.size
         else:
-            num_tokens = self._get_token_info()[0]
+            num_tokens, _, available_size, evictable_size = self._get_token_info()
+            # `available_size` refers to free tokens, and `evictable_size` to tokens that can be reclaimed.
+            kv_available_tokens = available_size + evictable_size
+            kv_total_tokens = self.max_total_num_tokens
 
         # Tokens in waiting queue, bootstrap queue, prealloc queue
         waiting_queues = [self.waiting_queue]
@@ -423,4 +434,6 @@ class SchedulerMetricsMixin:
             num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
+            kv_available_tokens=kv_available_tokens,
+            kv_total_tokens=kv_total_tokens,
         )

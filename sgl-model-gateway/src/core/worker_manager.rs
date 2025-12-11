@@ -187,6 +187,89 @@ impl WorkerManager {
         }
     }
 
+    /// Extended load info including KV cache availability
+    #[derive(Debug, Clone)]
+    pub struct ExtendedLoadInfo {
+        pub load: isize,
+        pub kv_available_tokens: Option<isize>,
+        pub kv_total_tokens: Option<isize>,
+    }
+
+    /// Get extended worker load information including KV cache availability
+    pub async fn get_worker_load_extended(
+        url: &str,
+        api_key: Option<&str>,
+        client: &reqwest::Client,
+    ) -> Option<ExtendedLoadInfo> {
+        let load_url = format!("{}/get_load", url);
+        let mut request = client.get(&load_url);
+
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Value>().await {
+                    Ok(json) => {
+                        // The /get_load endpoint returns an array of load info objects (one per DP rank)
+                        // Each object has: {dp_rank, num_reqs, num_waiting_reqs, num_tokens, kv_available_tokens, kv_total_tokens}
+                        if let Some(array) = json.as_array() {
+                            let total_tokens: i64 = array
+                                .iter()
+                                .filter_map(|entry| entry.get("num_tokens").and_then(|v| v.as_i64()))
+                                .sum();
+
+                            // Helper to sum a JSON array field across all DP ranks
+                            let sum_json_array_field = |arr: &[Value], field_name: &str| -> Option<i64> {
+                                let mut iter = arr.iter().filter_map(|entry| {
+                                    entry
+                                        .get(field_name)
+                                        .and_then(|v| v.as_i64())
+                                        .filter(|&v| v >= 0)
+                                });
+
+                                iter.next().map(|first| first + iter.sum::<i64>())
+                            };
+
+                            let kv_available = sum_json_array_field(array, "kv_available_tokens");
+                            let kv_total = sum_json_array_field(array, "kv_total_tokens");
+
+                            debug!(
+                                "Worker {} load: tokens={}, kv_available={:?}, kv_total={:?}",
+                                url, total_tokens, kv_available, kv_total
+                            );
+
+                            Some(ExtendedLoadInfo {
+                                load: total_tokens as isize,
+                                kv_available_tokens: kv_available.map(|v| v as isize),
+                                kv_total_tokens: kv_total.map(|v| v as isize),
+                            })
+                        } else {
+                            warn!(
+                                "Invalid load response from {}: expected array, got {:?}",
+                                url, json
+                            );
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse load response from {}: {}", url, e);
+                        None
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!("Failed to get load from {}: HTTP {}", url, response.status());
+                None
+            }
+            Err(e) => {
+                warn!("Failed to connect to {} for load check: {}", url, e);
+                None
+            }
+        }
+    }
+
     pub async fn get_all_worker_loads(
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
@@ -208,18 +291,23 @@ impl WorkerManager {
             let client = client.clone();
 
             tasks.push(async move {
-                let load = if is_http {
-                    Self::get_worker_load(&url, api_key.as_deref(), &client)
-                        .await
-                        .unwrap_or(-1)
+                let info = if is_http {
+                    Self::get_worker_load_extended(&url, api_key.as_deref(), &client).await
                 } else {
-                    -1
+                    None
                 };
+
+                let (load, kv_available_tokens, kv_total_tokens) =
+                    info.map_or((-1, None, None), |i| {
+                        (i.load, i.kv_available_tokens, i.kv_total_tokens)
+                    });
 
                 WorkerLoadInfo {
                     worker: url,
                     worker_type,
                     load,
+                    kv_available_tokens,
+                    kv_total_tokens,
                 }
             });
         }

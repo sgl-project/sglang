@@ -312,4 +312,10 @@ pub struct WorkerLoadInfo {
     pub worker_type: Option<String>,
     /// Current load (-1 indicates failure to fetch)
     pub load: isize,
+    /// KV cache available tokens (-1 indicates not available or failure to fetch)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_available_tokens: Option<isize>,
+    /// KV cache total capacity (-1 indicates not available or failure to fetch)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_total_tokens: Option<isize>,
 }
