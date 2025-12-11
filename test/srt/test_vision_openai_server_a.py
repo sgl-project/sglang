@@ -96,7 +96,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
         assert (
             "Multimodal prompt is too long after expanding multimodal tokens."
             in str(cm.exception)
-            or "is longer than the model's context length" in str(cm.exception)
+            or "exceeds the model's context length" in str(cm.exception)
         )
 
 
