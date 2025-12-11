@@ -218,6 +218,12 @@ impl WorkflowContext {
             .and_then(|v| v.clone().downcast::<T>().ok())
     }
 
+    /// Retrieve a value from the context, returning an error if not found
+    pub fn get_or_err<T: Send + Sync + 'static>(&self, key: &str) -> Result<Arc<T>, WorkflowError> {
+        self.get::<T>(key)
+            .ok_or_else(|| WorkflowError::ContextValueNotFound(key.to_string()))
+    }
+
     /// Check if the context has any data that would be lost during serialization
     pub fn has_unserializable_data(&self) -> bool {
         !self.data.is_empty()
@@ -263,9 +269,6 @@ pub enum WorkflowError {
 
     #[error("Context value not found: {0}")]
     ContextValueNotFound(String),
-
-    #[error("Context value type mismatch: {0}")]
-    ContextTypeMismatch(String),
 }
 
 pub type WorkflowResult<T> = Result<T, WorkflowError>;
