@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import nvtx
 import torch
@@ -25,10 +25,7 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithm):
         logger.info(f"DeepSeekNSAAlgorithm initialized: index_topk={self.index_topk}")
 
     def get_sparse_mode(self) -> SparseMode:
-        return SparseMode.ORIGINAL_WISE
-
-    def get_representation_storage_shape(self, token_to_kv_pool) -> Dict[str, tuple]:
-        return {}
+        return SparseMode.DEEPSEEK_TOKEN_WISE
 
     @nvtx.annotate("DeepSeekNSAAlgorithm.retrieve_topk", color="green")
     def retrieve_topk(

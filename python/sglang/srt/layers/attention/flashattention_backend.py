@@ -368,7 +368,7 @@ class FlashAttentionBackend(AttentionBackend):
         if self.sparse_coordinator is not None:
             if (
                 self.sparse_coordinator.algorithm.get_sparse_mode()
-                == SparseMode.ORIGINAL_WISE
+                == SparseMode.DEEPSEEK_TOKEN_WISE
             ):
                 self.sparse_coordinator = None
 

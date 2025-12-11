@@ -183,10 +183,10 @@ class FlashAttentionAdaptor(BackendAdaptor):
         diff = page_size - positions_in_page - 1
         sparse_seq_lens = (valid_lengths * page_size - diff).to(torch.int32)
 
-        if layer_id == 0 and sparse_mask.any():
-            logger.info(
-                f"[DEBUG] adapt_for_page_wise called: layer_id={layer_id}, original_seq={seq_lens}, sparse_seq={sparse_seq_lens}, page_table={current_metadata.page_table}"
-            )
+        # if layer_id == 0 and sparse_mask.any():
+        #     logger.info(
+        #         f"Adapt_for_page_wise called: layer_id={layer_id}, original_seq={seq_lens}, sparse_seq={sparse_seq_lens}, page_table={current_metadata.page_table}"
+        #     )
 
         current_metadata.cache_seqlens_int32 = torch.where(
             sparse_mask, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]

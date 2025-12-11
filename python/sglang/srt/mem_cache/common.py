@@ -261,7 +261,6 @@ def truncate_kv_cache_after_prefill(req: "Req", req_to_token_pool, tree_cache):
     if req.is_chunked > 0:
         return
 
-
     current_len = len(req.origin_input_ids)
     page_size = tree_cache.page_size
     kv_keep_len = ceil_align(HIERARCHICAL_NSA_DECODE_MAX_TOKENS, page_size)
@@ -715,7 +714,10 @@ def _alloc_decode_nsa(batch: ScheduleBatch, token_per_req: int) -> tuple:
 
         out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
         batch.req_to_token_pool.write(
-            (batch.req_pool_indices[non_truncated_indices], locs[non_truncated_indices]),
+            (
+                batch.req_pool_indices[non_truncated_indices],
+                locs[non_truncated_indices],
+            ),
             out_cache_loc[non_truncated_indices],
         )
 

@@ -6,9 +6,9 @@ import nvtx
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.mem_cache.sparsity.algorithms import SparseMode
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
-from sglang.srt.mem_cache.sparsity.core.representation_pool import RepresentationPool
 from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
     SparseKVCacheManager,
 )
@@ -40,7 +40,6 @@ class RequestTrackers:
             max_pool_size, dtype=torch.bool, device=device
         )
         self.prompt_lens = torch.zeros(max_pool_size, dtype=torch.int64, device=device)
-        self.decode_steps = torch.zeros(max_pool_size, dtype=torch.int32, device=device)
         self.last_extracted_token = torch.zeros(
             max_pool_size, dtype=torch.int64, device=device
         )
@@ -88,7 +87,6 @@ class RequestTrackers:
     def register(self, idx: int, prompt_len: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
-        self.decode_steps[idx] = 0
         self.last_extracted_token[idx] = 0
         self.full_host_indices[idx].fill_(-1)
         self.curr_device_indices[idx].fill_(-1)
@@ -100,7 +98,6 @@ class RequestTrackers:
     def clear(self, idx: int) -> torch.Tensor:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
-        self.decode_steps[idx] = 0
         self.last_extracted_token[idx] = 0
         host_indices = self.full_host_indices[idx][self.full_host_indices[idx] != -1]
         self.full_host_indices[idx].fill_(-1)
@@ -120,7 +117,7 @@ class SparseConfig:
     backend: str = "flashattention"
     algorithm: str = "fake_random"
     page_size: int = 64
-    sparse_ratio: float = 0.9
+    sparse_ratio: float = 0.5
     min_sparse_prompt_len: int = 2048
 
 
@@ -138,7 +135,6 @@ class SparseCoordinator:
         start_layer: int,
         end_layer: int,
         device: torch.device,
-        total_num_pages: int,
     ):
         self.config = config
         self.algorithm = algorithm
@@ -162,23 +158,19 @@ class SparseCoordinator:
         if self.sparse_kv_cache_manager is not None:
             self.sparse_kv_cache_manager.req_states = self.states
 
-        self.repr_pool = RepresentationPool(
-            total_num_pages, start_layer, end_layer, device
+        # Initialize algorithm representation pool and context
+        self.algorithm.initialize_representation_pool(
+            start_layer,
+            end_layer,
+            self.token_to_kv_pool,
+            self.req_to_token_pool,
+            self.states,
         )
-        self._register_representation_storage()
 
         logger.info(
             f"SparseCoordinator initialized: algorithm={type(algorithm).__name__}, "
-            f"mode={algorithm.get_sparse_mode().value}, storage_slots={self.repr_pool.get_storage_names()}"
+            f"mode={algorithm.get_sparse_mode().value}"
         )
-
-    def _register_representation_storage(self) -> None:
-        storage_specs = self.algorithm.get_representation_storage_shape(
-            self.token_to_kv_pool
-        )
-        for storage_name, (shape, dtype) in storage_specs.items():
-            self.repr_pool.register_storage(storage_name, shape, dtype)
-        self.algorithm.set_pools(self.repr_pool, self.req_to_token_pool)
 
     def on_request_begin(self, req: "Req") -> None:
         """Handle request begin."""
@@ -266,8 +258,11 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[Any]:
         """Handle attention begin."""
-        # if layer.layer_id == self.start_layer and self.backend_adaptor is not None:
-        #     self.backend_adaptor.save_original_metadata(attn_metadata)
+        if layer.layer_id == self.start_layer and self.backend_adaptor is not None:
+            self.backend_adaptor.save_original_metadata(attn_metadata)
+
+        if forward_batch.forward_mode.is_extend():
+            return attn_metadata
 
         return self._handle_sparse_retrieve(
             query, layer, forward_batch, attn_metadata, **kwargs
@@ -281,15 +276,24 @@ class SparseCoordinator:
     ) -> None:
         """Handle attention end."""
         layer_id = layer.layer_id
-        self._maybe_construct_representations(layer_id, forward_batch)
 
-        if (
-            layer_id == self.start_layer
-            and forward_batch.forward_mode.is_decode_or_idle()
-        ):
-            self.states.decode_steps[forward_batch.req_pool_indices] += 1
+        # Maybe construct representations
+        self.algorithm.construct_representations(
+            layer_id=layer_id,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+            forward_batch=forward_batch,
+        )
 
-        self._maybe_incremental_update_representations(layer_id, forward_batch)
+        # Maybe update representations
+        self.algorithm.update_representations(
+            layer_id=layer_id,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+            forward_batch=forward_batch,
+        )
 
     def _handle_sparse_retrieve(
         self,
@@ -331,76 +335,7 @@ class SparseCoordinator:
             self.states.prompt_lens[req_pool_indices]
             >= self.config.min_sparse_prompt_len
         )
-        # if sparse_mode != SparseMode.ORIGINAL_WISE:
-        #     mask &= self.states.repr_constructed[req_pool_indices]
+
+        if sparse_mode != SparseMode.DEEPSEEK_TOKEN_WISE:
+            mask &= self.states.repr_constructed[req_pool_indices]
         return mask
-
-    def _maybe_construct_representations(
-        self, layer_id: int, forward_batch: "ForwardBatch"
-    ) -> None:
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
-
-        construct_mask = self.algorithm.should_construct_representations(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            repr_constructed=self.states.repr_constructed,
-            prompt_lens=self.states.prompt_lens,
-        )
-
-        if not construct_mask.any():
-            return
-
-        success_mask = self.algorithm.construct_representations(
-            layer_id=layer_id,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            construct_mask=construct_mask,
-            k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-        )
-
-        if layer_id == self.end_layer - 1:
-            construct_indices = req_pool_indices[construct_mask & success_mask]
-            self.states.repr_constructed[construct_indices] = True
-            updated_seq_lens = seq_lens[construct_mask & success_mask]
-            self.states.last_extracted_token[construct_indices] = (
-                updated_seq_lens // self.page_size * self.page_size
-            )
-            logger.info(f"Constructed representations for {construct_indices.tolist()}")
-
-    def _maybe_incremental_update_representations(
-        self, layer_id: int, forward_batch: "ForwardBatch"
-    ) -> None:
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
-
-        update_mask = self.algorithm.should_update_represetations(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            req_pool_indices=req_pool_indices,
-            is_decode=forward_batch.forward_mode.is_decode_or_idle(),
-            repr_constructed=self.states.repr_constructed,
-            decode_steps=self.states.decode_steps,
-        )
-
-        if not update_mask.any():
-            return
-
-        success_mask = self.algorithm.update_representations(
-            layer_id=layer_id,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            update_mask=update_mask,
-            k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-            last_extracted_tokens=self.states.last_extracted_token,
-        )
-
-        if layer_id == self.end_layer - 1 and success_mask.any():
-            update_indices = req_pool_indices[success_mask]
-            updated_seq_lens = seq_lens[success_mask]
-            self.states.last_extracted_token[update_indices] = (
-                updated_seq_lens // self.page_size * self.page_size
-            )
-            self.states.decode_steps[update_indices] = 0

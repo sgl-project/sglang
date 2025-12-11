@@ -5,10 +5,12 @@ import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
-    PageMeanPoolingAlgorithm,
     SparseMode,
 )
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
+from sglang.srt.mem_cache.sparsity.algorithms.page_wise_algorithm import (
+    KnormPageAlgorithm,
+)
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
     NSABackendAdaptor,
@@ -26,9 +28,7 @@ logger = logging.getLogger(__name__)
 _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
 _ALGORITHM_REGISTRY = {
-    "page_mean_pooling": lambda config, device, start_layer, end_layer, **kw: PageMeanPoolingAlgorithm(
-        config, device, start_layer, end_layer, **kw
-    ),
+    "knorm_page": lambda config, device, **kw: KnormPageAlgorithm(config, device, **kw),
     "deepseek_nsa": lambda config, device, **kw: DeepSeekNSAAlgorithm(
         config, device, **kw
     ),
@@ -38,8 +38,6 @@ _ALGORITHM_REGISTRY = {
 def _create_sparse_algorithm(
     config: SparseConfig,
     device: torch.device,
-    start_layer: int,
-    end_layer: int,
     **kwargs,
 ) -> BaseSparseAlgorithm:
     algorithm_name = config.algorithm.lower()
@@ -49,9 +47,7 @@ def _create_sparse_algorithm(
         raise ValueError(f"Unknown algorithm: {algorithm_name}")
 
     logger.info(f"Creating {algorithm_name} algorithm")
-    return factory(
-        config, device, start_layer=start_layer, end_layer=end_layer, **kwargs
-    )
+    return factory(config, device, **kwargs)
 
 
 def _create_backend_adaptor(
@@ -76,11 +72,6 @@ def _create_backend_adaptor(
     raise ValueError(f"Unknown backend: {backend}")
 
 
-def _calculate_total_pages(token_to_kv_pool, start_layer: int, page_size: int) -> int:
-    kv_cache_capacity = token_to_kv_pool.get_key_buffer(start_layer).shape[0]
-    return kv_cache_capacity // page_size
-
-
 def create_sparse_coordinator(
     device: torch.device,
     page_size: int,
@@ -94,9 +85,7 @@ def create_sparse_coordinator(
     **kwargs,
 ) -> SparseCoordinator:
     config = SparseConfig(page_size=page_size, algorithm="deepseek_nsa")
-    algorithm = _create_sparse_algorithm(
-        config, device, start_layer, end_layer, **kwargs
-    )
+    algorithm = _create_sparse_algorithm(config, device, **kwargs)
     sparse_mode = algorithm.get_sparse_mode()
 
     if sparse_mode == SparseMode.TOKEN_WISE:
@@ -112,9 +101,6 @@ def create_sparse_coordinator(
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool, sparse_kv_cache_manager
     )
-    total_num_pages = _calculate_total_pages(
-        token_to_kv_pool, start_layer, config.page_size
-    )
 
     coordinator = SparseCoordinator(
         config=config,
@@ -126,10 +112,7 @@ def create_sparse_coordinator(
         start_layer=start_layer,
         end_layer=end_layer,
         device=device,
-        total_num_pages=total_num_pages,
     )
-    sparse_kv_cache_manager.req_states = coordinator.states
-
     register_sparse_coordinator(coordinator)
     logger.info(
         f"SparseCoordinator created: algorithm={config.algorithm}, mode={sparse_mode.value}"
