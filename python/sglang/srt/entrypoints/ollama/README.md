@@ -14,12 +14,17 @@ Ollama API compatibility for SGLang, plus a Smart Router for intelligent routing
 ### 1. Start SGLang Server (GPU)
 
 ```bash
+# Install sglang (if not already installed)
+pip install -e "python[all]"
+
 # Start with any HuggingFace model
 python -m sglang.launch_server \
     --model <YOUR_MODEL> \
     --port 30001 \
     --host 0.0.0.0
 ```
+
+> **Note**: The model name used with `ollama run` must match exactly what you passed to `--model`.
 
 ### 2. Connect from Local Machine
 
