@@ -828,6 +828,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let epd_mode = wants_disaggregation && encode_configured;
     let pd_mode = wants_disaggregation && !epd_mode;
 
+    // Warn if EPD was explicitly requested but no encode workers configured
+    if cli_args.epd_disaggregation && !encode_configured {
+        eprintln!(
+            "WARNING: --epd-disaggregation specified but no encode workers configured. \
+Falling back to PD mode. To use EPD mode, provide encode workers via --encode or \
+--encode-selector (with --service-discovery)."
+        );
+    }
+
     println!("SGLang Router starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     let mode_str = if cli_args.enable_igw {
