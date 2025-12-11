@@ -71,6 +71,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from unittest import SkipTest
 from urllib.parse import urlparse
 
 import numpy as np
@@ -1502,6 +1503,31 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter
+
+    http_response_status_counter = Counter(
+        name="sglang:http_responses_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        response = await call_next(request)
+
+        route = request.scope.get("route")
+        endpoint = route.path if route else "Unknown"
+
+        http_response_status_counter.labels(
+            endpoint=endpoint,
+            status_code=str(response.status_code),
+            method=request.method,
+        ).inc()
+
+        return response
+
+
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1996,7 +2022,7 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA")
+        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
@@ -2515,6 +2541,9 @@ def retry(
     for try_index in itertools.count():
         try:
             return fn()
+        except SkipTest:
+            # Do NOT retry skipped tests - used in CI and unittest
+            raise
         except Exception as e:
             traceback.print_exc()
 

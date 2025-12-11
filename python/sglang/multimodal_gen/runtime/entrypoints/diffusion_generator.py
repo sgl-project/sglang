@@ -4,7 +4,7 @@
 """
 DiffGenerator module for sglang-diffusion.
 
-This module provides a consolidated interface for generating videos using
+This module provides a consolidated interface for generating images/videos using
 diffusion models.
 """
 
