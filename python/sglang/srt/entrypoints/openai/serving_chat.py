@@ -363,14 +363,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         else {}
                     ),
                 )
-            except jinja2.TemplateError as e:
-                # Template errors (e.g., from raise_exception in Jinja templates)
-                # should be treated as client errors (400 BadRequest)
-                raise ValueError(str(e)) from e
-            except Exception:
-                # This except branch will be triggered when the chosen model
-                # has a different tools input format that is not compatible
-                # with openAI's apply_chat_template tool_call format, like Mistral.
+            except Exception as e:
+                # If the first attempt fails, try transforming the tools format
+                # This handles models like Mistral that have a different tools input format
+                # that is not compatible with OpenAI's apply_chat_template tool_call format
                 tools = (
                     [t if "function" in t else {"function": t} for t in tools]
                     if tools
@@ -389,9 +385,10 @@ class OpenAIServingChat(OpenAIServingBase):
                             else {}
                         ),
                     )
-                except jinja2.TemplateError as e:
-                    # Template errors should be treated as client errors
-                    raise ValueError(str(e)) from e
+                except jinja2.TemplateError as template_error:
+                    # Template errors (e.g., from raise_exception in Jinja templates)
+                    # should be treated as client errors (400 BadRequest)
+                    raise ValueError(str(template_error)) from template_error
 
             if assistant_prefix:
                 encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
