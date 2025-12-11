@@ -429,37 +429,6 @@ class Scheduler(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
 
-<<<<<<< HEAD
-=======
-    def init_deterministic_inference_config(self):
-        """Initialize deterministic inference configuration for different attention backends."""
-        if not self.server_args.enable_deterministic_inference:
-            self.truncation_align_size = None
-            return
-
-        backend_sizes = {
-            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
-            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
-        }
-        env_var, default_size = backend_sizes.get(
-            self.server_args.attention_backend, (None, None)
-        )
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
-
-    def init_truncation_align_size_for_dcp(self):
-        if get_dcp_world_size() > 1:
-            if self.truncation_align_size is None:
-                self.truncation_align_size = get_dcp_world_size()
-            else:
-                import math
-
-                self.truncation_align_size = (
-                    self.truncation_align_size * get_dcp_world_size()
-                ) // (math.gcd(self.truncation_align_size, get_dcp_world_size()))
-
->>>>>>> e94a5ad22 (make chunked req extend_seq_lens align to dcp world size)
     def init_truncation_align_size_for_dcp(self):
         if get_dcp_world_size() > 1:
             if self.truncation_align_size is None:

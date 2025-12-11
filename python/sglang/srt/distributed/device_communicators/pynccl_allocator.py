@@ -182,9 +182,10 @@ class SymmetricMemoryContext:
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
-    disabled = (
-        not is_symmetric_memory_enabled()
-        or disabled
+    if (
+        disabled
+        or not getattr(group_coordinator, "symm_mem_enabled_for_group", False)
         or group_coordinator.world_size == 1
-    )
-    return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()
+    ):
+        return nullcontext()
+    return SymmetricMemoryContext(group_coordinator)

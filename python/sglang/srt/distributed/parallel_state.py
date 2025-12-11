@@ -270,6 +270,24 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # Cache symmetric memory policy for this group.
+        # - When enable_symm_mem is on and DCP is enabled (SGLANG_DCP > 1),
+        #   only the DCP group should use SymmetricMemoryContext.
+        # - When DCP is disabled, keep the original behavior.
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            enable_symm_mem = bool(get_global_server_args().enable_symm_mem)
+        except Exception:
+            enable_symm_mem = False
+        try:
+            dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
+        except Exception:
+            dcp_size = 1
+        self.symm_mem_enabled_for_group = bool(
+            enable_symm_mem and (group_name == "dcp" if dcp_size > 1 else True)
+        )
+
         # Import communicators
         self.use_pynccl = use_pynccl
         self.pynccl_use_current_stream = pynccl_use_current_stream
@@ -653,14 +671,12 @@ class GroupCoordinator:
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output_tensor = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
 
-        # Perform reduce-scatter operation
-        torch.distributed.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
+        self.reduce_scatter_tensor(output_tensor, input_tensor)
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
@@ -1476,9 +1492,11 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture(
-        stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    with (
+        get_tp_group().graph_capture(stream=stream) as context,
+        get_pp_group().graph_capture(context),
+        get_dcp_group().graph_capture(context),
+    ):
         yield context
 
 

@@ -458,14 +458,9 @@ def cp_lse_ag_out_rs(
     if ctx is None:
         ctx = CPTritonContext()
 
-    lses = torch.empty(
-        (cp_group.world_size,) + cp_attn_lse.shape,
-        dtype=cp_attn_lse.dtype,
-        device=cp_attn_lse.device,
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (cp_group.world_size,) + cp_attn_lse.shape
     )
-
-    cp_attn_lse = cp_attn_lse.contiguous()
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).view_as(lses)
     out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
     assert out.is_contiguous()
     out = cp_group.reduce_scatter_along_dim(out, dim=1)

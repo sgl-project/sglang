@@ -53,6 +53,9 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -1898,7 +1901,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 # gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
                 # q_pe = gathered_q_pe
                 # q_nope_out = gathered_q_nope_out
-                combined = torch.cat([q_pe, q_nope_out], dim=-1)
+                with use_symmetric_memory(get_dcp_group()):
+                    combined = torch.cat([q_pe, q_nope_out], dim=-1)
                 gathered = get_dcp_group().all_gather(combined, dim=-2)
                 d_pe = q_pe.size(-1)
                 d_nope = q_nope_out.size(-1)
@@ -2043,6 +2047,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             attn_output = attn_output.view(
                 -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
             )
+            if get_global_server_args().enable_symm_mem:
+                # Note(wh): make sure input tensors use nccl allocator
+                with use_symmetric_memory(get_dcp_group()):
+                    attn_output = attn_output.clone(
+                        memory_format=torch.contiguous_format
+                    )
+                    lse = lse.clone(memory_format=torch.contiguous_format)
             attn_output = attn_output.contiguous()
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -2433,11 +2444,12 @@ class DeepseekV2AttentionMLA(nn.Module):
     def _all_gather_dcp_kv_cache(self, kv_a):
         dcp_world_size = get_dcp_world_size()
         dcp_rank = get_dcp_rank()
-        gathered_kv_a = torch.zeros(
-            (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
-            dtype=kv_a.dtype,
-            device=kv_a.device,
-        )
+        with use_symmetric_memory(get_dcp_group()):
+            gathered_kv_a = torch.zeros(
+                (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
+                dtype=kv_a.dtype,
+                device=kv_a.device,
+            )
         idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
         mask = idxs % dcp_world_size == dcp_rank
         gathered_kv_a[mask] = kv_a
