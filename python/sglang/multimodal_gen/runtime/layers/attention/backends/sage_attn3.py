@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+from sageattn3 import sageattn3_blackwell
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -10,8 +11,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-
-from sageattn3 import sageattn3_blackwell
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
