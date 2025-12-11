@@ -44,7 +44,7 @@ fn bench_optimizations(c: &mut Criterion) {
         });
     });
 
-    //  The NEW wamethod (Fast: O(1) Lookup, Zero Allocation)
+    //  The NEW method (Fast: O(1) Lookup, Zero Allocation)
     group.bench_function(
         BenchmarkId::new("New: get_worker_distribution()", size),
         |b| {
