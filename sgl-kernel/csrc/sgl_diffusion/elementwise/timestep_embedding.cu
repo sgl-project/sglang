@@ -14,16 +14,17 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cassert>
-#include <cmath>
-#include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <torch/all.h>
-#include <torch/extension.h>
 
-template <typename T> __device__ float convert_to_float(T x) {
+#include <cassert>
+#include <cmath>
+
+template <typename T>
+__device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -36,7 +37,8 @@ template <typename T> __device__ float convert_to_float(T x) {
   }
 }
 
-template <typename T> __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
+template <typename T>
+__device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   if constexpr (std::is_same_v<T, __nv_bfloat16>) {
     return x;
   } else if constexpr (std::is_same_v<T, __half>) {
@@ -48,7 +50,8 @@ template <typename T> __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   }
 }
 
-template <typename T> __device__ __half convert_to_float16(T x) {
+template <typename T>
+__device__ __half convert_to_float16(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return x;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -60,7 +63,8 @@ template <typename T> __device__ __half convert_to_float16(T x) {
   }
 }
 
-template <typename O, typename T> __device__ O cast_to(T x) {
+template <typename O, typename T>
+__device__ O cast_to(T x) {
   if constexpr (std::is_same_v<O, float>) {
     return convert_to_float(x);
   } else if constexpr (std::is_same_v<O, __half>) {
@@ -73,8 +77,7 @@ template <typename O, typename T> __device__ O cast_to(T x) {
 }
 
 template <typename T_IN>
-__global__ void
-timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log_max_period) {
+__global__ void timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log_max_period) {
   // Get the timestep for this batch
   float t_val = cast_to<float>(__ldg(&t_ptr[blockIdx.x]));
   float* output_batch_base_ptr = output_ptr + blockIdx.x * dim;
@@ -98,7 +101,7 @@ timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log
     sin_vals.y = cosf(vals.y);
     sin_vals.z = cosf(vals.z);
     sin_vals.w = cosf(vals.w);
-    *top_half = sin_vals; // STG.128
+    *top_half = sin_vals;  // STG.128
 
     float4 cos_vals;
     cos_vals.x = sinf(vals.x);
@@ -111,11 +114,7 @@ timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log
   }
 }
 
-// NOTE: output always be float32 now. According to python code:
-// timestep_embedding
-torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
-                                             torch::Tensor &output, int dim,
-                                             int max_period) {
+torch::Tensor timestep_embedding(const torch::Tensor& t, torch::Tensor& output, int64_t dim, int64_t max_period) {
   TORCH_CHECK(t.dim() == 1 and t.stride(0) == 1, "t should be 1D");
   TORCH_CHECK(output.dim() == 2 and output.is_contiguous(), "output should be a contiguous 2D tensor.");
 
@@ -125,48 +124,36 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
 
   TORCH_CHECK(t.device().is_cuda(), "t must be a CUDA tensor");
   TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
-  TORCH_CHECK(t.device() == output.device(),
-              "t and output must be on the same device");
+  TORCH_CHECK(t.device() == output.device(), "t and output must be on the same device");
 
   // To align with timestep_embedding python code.
-  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float,
-              "Output buffer should be float32.");
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float, "Output buffer should be float32.");
 
   TORCH_CHECK(dim % 2 == 0 && (dim / 2) % 4 == 0, "dim should align to 8");
   auto stream = at::cuda::getCurrentCUDAStream();
-  
+
   constexpr int MAX_THREADS_PER_BLOCK = 1024;
   int half_dim = dim / 2;
 
   dim3 grid(B, 1, 1);
+  // assert float4 vectorize output
   dim3 block(min(MAX_THREADS_PER_BLOCK, half_dim / 4), 1, 1);
   float neg_log_max_period = std::log(static_cast<float>(max_period)) * (-1.0f);
 
   if (t.dtype() == torch::kBFloat16) {
     timestep_embedding_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(t.data_ptr()),
-      reinterpret_cast<float*>(output.data_ptr()),
-      dim,
-      neg_log_max_period);
+        reinterpret_cast<__nv_bfloat16*>(t.data_ptr()),
+        reinterpret_cast<float*>(output.data_ptr()),
+        dim,
+        neg_log_max_period);
   } else if (t.dtype() == torch::kFloat16) {
     timestep_embedding_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<__half*>(t.data_ptr()),
-      reinterpret_cast<float*>(output.data_ptr()),
-      dim,
-      neg_log_max_period);
+        reinterpret_cast<__half*>(t.data_ptr()), reinterpret_cast<float*>(output.data_ptr()), dim, neg_log_max_period);
   } else if (t.dtype() == torch::kFloat) {
     timestep_embedding_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<float*>(t.data_ptr()),
-      reinterpret_cast<float*>(output.data_ptr()),
-      dim,
-      neg_log_max_period);
+        reinterpret_cast<float*>(t.data_ptr()), reinterpret_cast<float*>(output.data_ptr()), dim, neg_log_max_period);
   } else {
     TORCH_CHECK(false, "Unsupported dtype.");
   }
   return output;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("timestep_embedding_kernel_cuda", &timestep_embedding_kernel_cuda,
-        "timestep_embedding_kernel_cuda");
 }

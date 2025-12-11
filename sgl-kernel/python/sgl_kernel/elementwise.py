@@ -418,4 +418,4 @@ def timestep_embedding(
 
     B = t.shape[0]
     output = torch.empty((B, dim), dtype=dtype, device=t.device)
-    return torch.ops.sgl_kernel.timestep_embedding_kernel(t, output, dim, max_period)
+    return torch.ops.sgl_kernel.timestep_embedding(t, output, dim, max_period)
