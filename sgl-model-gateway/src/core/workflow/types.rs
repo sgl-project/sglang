@@ -220,7 +220,7 @@ impl WorkflowContext {
 
     /// Retrieve a value from the context, returning an error if not found
     pub fn get_or_err<T: Send + Sync + 'static>(&self, key: &str) -> Result<Arc<T>, WorkflowError> {
-        self.get(key)
+        self.get::<T>(key)
             .ok_or_else(|| WorkflowError::ContextValueNotFound(key.to_string()))
     }
 
