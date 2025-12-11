@@ -106,7 +106,7 @@ jobs:
 
           echo "Starting container: sglang_test:ci"
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
-          --ipc=host --network=host --group-add video \
+          --ipc=host --group-add video \
           --shm-size 16g \
           --network=host \
           --privileged \
