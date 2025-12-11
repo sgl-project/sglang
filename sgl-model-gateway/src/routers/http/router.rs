@@ -62,8 +62,6 @@ impl Router {
             false, // include all workers
         );
 
-        RouterMetrics::set_active_workers(workers.len());
-
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
