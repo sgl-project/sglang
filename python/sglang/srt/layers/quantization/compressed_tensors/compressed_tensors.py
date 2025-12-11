@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
+    CompressedTensorsW4A16Fp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
@@ -389,9 +390,33 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_channel_group and input_quant_none and is_symmetric and is_static
 
+    def _is_fp4a16_nvfp4(self, weight_quant: BaseModel, input_quant: BaseModel):
+        is_weight_only = weight_quant is not None and input_quant is None
+        is_tensor_group_quant = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+        )
+        is_symmetric = weight_quant.symmetric
+
+        is_group_size_16 = weight_quant.group_size == 16
+        is_float_type = weight_quant.type == QuantizationType.FLOAT
+        is_4_bits = weight_quant.num_bits == 4
+
+        return (
+            is_weight_only
+            and is_tensor_group_quant
+            and is_float_type
+            and is_4_bits
+            and is_group_size_16
+            and is_symmetric
+        )
+
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> CompressedTensorsScheme:
+
+        # Detect If Mixed Precision
+        if self._is_fp4a16_nvfp4(weight_quant, input_quant):
+            return CompressedTensorsW4A16Fp4()
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
