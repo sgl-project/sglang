@@ -299,8 +299,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+    
+            # Historical reasoning content is discarded when a new user message is introduced
+            drop_thinking = messages[-1]["role"] == "user"
+
             real_input = encode_messages(
-                messages, thinking_mode=thinking_mode, drop_thinking=False
+                messages, thinking_mode=thinking_mode, drop_thinking=drop_thinking
             )
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
         else:
