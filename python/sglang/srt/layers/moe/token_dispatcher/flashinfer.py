@@ -83,6 +83,7 @@ class FlashinferDispatcher(BaseDispatcher):
         hidden_size: int = None,
         params_dtype: torch.dtype = None,  # Unused
     ):
+        super().__init__()
         try:
             from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
             from flashinfer.comm.mapping import Mapping
@@ -92,7 +93,8 @@ class FlashinferDispatcher(BaseDispatcher):
                 "Flashinfer is not installed or does not support A2A. "
                 "Please install the appropriate version of Flashinfer."
             )
-        self.group = group
+        self.ep_size = group.size()
+        self.ep_rank = group.rank()
         self.router_topk = router_topk
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -104,7 +106,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (
             get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024)
-            * self.group.size()
+            * self.ep_size
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
@@ -126,17 +128,17 @@ class FlashinferDispatcher(BaseDispatcher):
             )
         combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
         self.workspace_size = moe_a2a_get_workspace_size_per_rank(
-            ep_size=self.group.size(),
+            ep_size=self.ep_size,
             max_num_tokens=self.max_num_tokens,
             total_dispatch_payload_size_per_token=total_dispatch_payload_size_per_token,
             combine_payload_size_per_token=combine_payload_size_per_token,
         )
 
         self.mapping = Mapping(
-            rank=self.group.rank(),
-            tp_size=self.group.size(),
-            moe_ep_size=self.group.size(),
-            world_size=self.group.size(),
+            rank=self.ep_rank,
+            tp_size=self.ep_size,
+            moe_ep_size=self.ep_size,
+            world_size=self.ep_size,
             gpus_per_node=torch.cuda.device_count(),
             pp_size=1,
             cp_size=1,
@@ -147,9 +149,7 @@ class FlashinferDispatcher(BaseDispatcher):
             top_k=self.router_topk,
             num_experts=self.num_experts,
             workspace_size_per_rank=self.workspace_size,
-            mnnvl_config=MnnvlConfig(
-                comm_backend=TorchDistributedCommBackend(self.group)
-            ),
+            mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
     def dispatch(
@@ -181,7 +181,7 @@ class FlashinferDispatcher(BaseDispatcher):
             # Dispatch doesn't handle -1 topk id properly. Hack for dispatch with dummy token - will route the dummy token to this rank and requires no transfer.
             topk_ids_current_rank = torch.full(
                 (1, topk_ids.shape[1]),
-                self.group.rank() * self.num_local_experts,
+                self.ep_rank * self.num_local_experts,
                 dtype=topk_ids.dtype,
                 device=topk_ids.device,
             )
@@ -245,7 +245,7 @@ class FlashinferDispatcher(BaseDispatcher):
         output_hidden_size = hidden_states.shape[-1]
         hidden_states = self.moe_a2a.combine(
             hidden_states.view(
-                self.group.size(), self.runtime_max_tokens_per_rank, output_hidden_size
+                self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
             ),
             self.runtime_max_tokens_per_rank,
             payload_in_workspace=self.payload_in_workspace,
