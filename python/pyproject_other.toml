@@ -103,6 +103,8 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
+checkpoint-engine = ["checkpoint-engine==0.2.1"]
+
 all_hip = ["sglang[srt_hip]"]
 all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]

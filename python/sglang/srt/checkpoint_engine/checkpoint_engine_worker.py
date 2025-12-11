@@ -21,6 +21,8 @@ from typing import Callable, Dict, Optional
 import torch
 import zmq
 
+from sglang.srt.utils import is_npu
+
 try:
     from checkpoint_engine.worker import update_weights_from_ipc
 except ImportError:
@@ -28,6 +30,8 @@ except ImportError:
         "checkpoint-engine is not installed. "
         "Please install it with: pip install sglang[checkpoint-engine]"
     )
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -101,15 +105,20 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
     def get_device_uuid(self) -> str:
         """Get the UUID of current device."""
         # Get device UUID for current device
-        device_id = torch.cuda.current_device()
         try:
-            return f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
+            if _is_npu:
+                from checkpoint_engine.device_utils import npu_generate_uuid
+
+                return f"NPU-{npu_generate_uuid()}"
+            else:
+                device_id = torch.cuda.current_device()
+                return f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
         except AssertionError as e:
             raise ValueError(f"Failed to get GPU UUID for device {device_id}") from e
 
     def get_device_id(self) -> int:
         """Get the device ID."""
-        return torch.cuda.current_device()
+        return torch.get_device_module().current_device()
 
     def get_model_loader(self) -> Callable:
         """Get the model weight loader function."""
@@ -129,7 +138,8 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
                     if quant_method is not None:
                         # Move parameters to device if needed for quantization processing
                         target_device = torch.device(
-                            "cuda", torch.cuda.current_device()
+                            "npu" if _is_npu else "cuda",
+                            torch.get_device_module().current_device(),
                         )
                         with device_loading_context(module, target_device):
                             quant_method.process_weights_after_loading(module)
