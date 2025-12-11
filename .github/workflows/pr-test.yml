@@ -413,7 +413,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2, 3]
+        partition: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -434,7 +434,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -1254,35 +1254,6 @@ jobs:
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
-
-  unit-test-backend-8-gpu-b200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-8-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 8-gpu-b200
-    env:
-      RUNNER_LABELS: 8-gpu-b200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
-
-      # - name: Run test
-      #   timeout-minutes: 45
-      #   run: |
-      #     cd test/srt
-      #     python3 run_suite.py --suite per-commit-8-gpu-b200 --timeout-per-file 1800
 
   pr-test-finish:
     needs:

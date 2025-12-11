@@ -1,10 +1,10 @@
-# Makefile for sglang-router golang bindings
+# Makefile for sgl-model-gateway golang bindings
 # This builds the Rust FFI library and provides convenience targets for Go development
 
 # Configuration
 CARGO_BUILD_DIR ?= $(shell pwd)/target
 BUILD_MODE ?= release
-LIB_NAME = libsglang_router_rs
+LIB_NAME = libsgl_model_gateway_go
 
 # Detect OS
 UNAME_S := $(shell uname -s)
@@ -30,7 +30,7 @@ PYTHON_LDFLAGS := $(shell python3-config --ldflags --embed 2>/dev/null || python
 
 # CGO flags - use exported lib directory if available, otherwise build directory
 LIB_DIR := $(if $(wildcard $(LIB_EXPORT_PATH)),$(LIB_EXPORT_DIR),$(LIB_BUILD_DIR))
-export CGO_LDFLAGS = -L$(LIB_DIR) -lsglang_router_rs $(PYTHON_LDFLAGS) -ldl
+export CGO_LDFLAGS = -L$(LIB_DIR) -lsgl_model_gateway_go $(PYTHON_LDFLAGS) -ldl
 export $(LD_LIBRARY_PATH_VAR) := $(LIB_DIR):$($(LD_LIBRARY_PATH_VAR))
 
 .PHONY: all build build-dev lib lib-clean clean test examples help run-simple run-streaming check-lib
