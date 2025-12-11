@@ -595,6 +595,15 @@ impl RouterMetrics {
         counter!("sgl_router_job_shutdown_rejected_total").increment(1);
     }
 
+    // This is different from the following:
+    // * sgl_router_requests_total: bump when a request is handled and response is to be returned.
+    // * sgl_router_processed_requests_total: bump when routing decision is made.
+    // Here we want a metric to directly reflect user's experience ("I am sending a request")
+    // when viewing the router as a blackbox.
+    pub fn record_http_request() {
+        counter!("sgl_router_http_requests_total").increment(1);
+    }
+
     pub fn record_http_status_code(status_code: u16) {
         counter!("sgl_router_http_responses_total",
             "status_code" => status_code.to_string()
