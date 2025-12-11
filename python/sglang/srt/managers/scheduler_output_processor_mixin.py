@@ -429,6 +429,31 @@ class SchedulerOutputProcessorMixin:
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
+    def _mamba_prefix_cache_update(
+        self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
+    ) -> None:
+        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        if req.mamba_ping_pong_track_buffer is not None:
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
+                # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
+                req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
+                req.mamba_last_track_seqlen = seq_len
+            elif (
+                not batch.spec_algorithm.is_none()
+                and result.accept_length_per_req_cpu is not None
+            ):
+                # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
+                actual_seq_len = req.seqlen - 1
+                if (
+                    actual_seq_len // mamba_track_interval
+                    != (actual_seq_len - result.accept_length_per_req_cpu[i])
+                    // mamba_track_interval
+                ):
+                    req.mamba_last_track_seqlen = (
+                        actual_seq_len // mamba_track_interval * mamba_track_interval
+                    )
+
     def _process_input_token_logprobs(
         self, req: Req, input_token_logprobs: List
     ) -> None:
@@ -575,31 +600,6 @@ class SchedulerOutputProcessorMixin:
         delimiter token receive logprobs.
         """
         return req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
-
-    def _mamba_prefix_cache_update(
-        self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
-    ) -> None:
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        if req.mamba_ping_pong_track_buffer is not None:
-            mamba_track_interval = get_global_server_args().mamba_track_interval
-            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
-                # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
-                req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
-                req.mamba_last_track_seqlen = seq_len
-            elif (
-                not batch.spec_algorithm.is_none()
-                and result.accept_length_per_req_cpu is not None
-            ):
-                # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
-                actual_seq_len = req.seqlen - 1
-                if (
-                    actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.accept_length_per_req_cpu[i])
-                    // mamba_track_interval
-                ):
-                    req.mamba_last_track_seqlen = (
-                        actual_seq_len // mamba_track_interval * mamba_track_interval
-                    )
 
     def add_input_logprob_return_values(
         self: Scheduler,
