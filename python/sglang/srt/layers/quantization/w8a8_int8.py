@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
@@ -39,7 +40,7 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
-    @torch.library.register_fake("sgl_kernel::int8_scaled_mm")
+    @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
     def _int8_scaled_mm_abstract(
         mat_a,
         mat_b,
