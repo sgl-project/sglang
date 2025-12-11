@@ -4,6 +4,7 @@ from typing import Type
 import torch
 from sageattention import sageattn
 
+from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadataBuilder
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -31,10 +32,6 @@ class SageAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_metadata_cls() -> Type["AttentionMetadata"]:
-        raise NotImplementedError
-
-    @staticmethod
-    def get_builder_cls() -> type["AttentionMetadataBuilder[]"]:
         raise NotImplementedError
 
 

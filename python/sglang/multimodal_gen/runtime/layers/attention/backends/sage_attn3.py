@@ -36,14 +36,6 @@ class SageAttention3Backend(AttentionBackend):
     def get_metadata_cls() -> type["AttentionMetadata"]:
         raise NotImplementedError
 
-    @staticmethod
-    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        raise NotImplementedError
-
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
-
 
 class SageAttention3Impl(AttentionImpl):
 
