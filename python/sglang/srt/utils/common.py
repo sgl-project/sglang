@@ -71,6 +71,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from unittest import SkipTest
 from urllib.parse import urlparse
 
 import numpy as np
@@ -2540,6 +2541,9 @@ def retry(
     for try_index in itertools.count():
         try:
             return fn()
+        except SkipTest:
+            # Do NOT retry skipped tests - used in CI and unittest
+            raise
         except Exception as e:
             traceback.print_exc()
 
