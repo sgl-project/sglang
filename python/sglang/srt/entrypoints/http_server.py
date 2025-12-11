@@ -122,6 +122,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
@@ -1397,6 +1398,9 @@ def launch_server(
         )
     )
 
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
+
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
     if server_args.tokenizer_worker_num == 1:
@@ -1480,7 +1484,7 @@ def _execute_server_warmup(
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break

@@ -53,7 +53,7 @@ class MMMUVLMMixin(ABC):
         model = "openai_compatible"
         tp = 1
         tasks = "mmmu_val"
-        batch_size = 32
+        batch_size = 64
         log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
@@ -137,7 +137,7 @@ class MMMUVLMMixin(ABC):
                 other_args=[
                     "--trust-remote-code",
                     "--cuda-graph-max-bs",
-                    "32",
+                    "64",
                     "--enable-multimodal",
                     "--mem-fraction-static",
                     str(self.parsed_args.mem_fraction_static),  # Use class variable

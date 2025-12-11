@@ -241,7 +241,7 @@ compile_commands.json
 Cargo.lock
 
 # Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
-sgl-router/tests/fixtures/golden/
+sgl-model-gateway/tests/fixtures/golden/
 
 lmms-eval
 
@@ -249,3 +249,6 @@ lmms-eval
 **/.serena/
 ctags/
 outputs/
+
+# Eval Cache
+.longbench_cache/
