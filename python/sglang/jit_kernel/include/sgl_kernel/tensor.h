@@ -13,7 +13,6 @@
 #include <initializer_list>
 #include <optional>
 #include <ranges>
-#include <source_location>
 #include <span>
 #include <sstream>
 #include <string>
@@ -21,10 +20,12 @@
 #include <type_traits>
 #include <utility>
 
-namespace host {
+#ifdef __CUDACC__
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#endif
 
-namespace stdr = std::ranges;
-namespace stdv = std::views;
+namespace host {
 
 namespace details {
 
@@ -37,7 +38,7 @@ struct dtype_trait {};
 
 template <std::integral T>
 struct dtype_trait<T> {
-  inline static constexpr auto value = DLDataType{
+  inline static constexpr DLDataType value = {
       .code = std::is_signed_v<T> ? DLDataTypeCode::kDLInt : DLDataTypeCode::kDLUInt,
       .bits = static_cast<std::uint8_t>(sizeof(T) * 8),
       .lanes = 1};
@@ -45,9 +46,20 @@ struct dtype_trait<T> {
 
 template <std::floating_point T>
 struct dtype_trait<T> {
-  inline static constexpr auto value =
-      DLDataType{.code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
+  inline static constexpr DLDataType value = {
+      .code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
 };
+
+#ifdef __CUDACC__
+template <>
+struct dtype_trait<__half> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct dtype_trait<__nv_bfloat16> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+#endif
 
 inline constexpr auto kAnyDeviceID = -1;
 inline constexpr auto kAnySize = static_cast<int64_t>(-1);
@@ -118,7 +130,7 @@ inline auto& operator<<(std::ostream& os, PrintableDevice pd) {
 template <typename T>
 inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
   os << "[";
-  for (const auto i : stdv::iota(std::size_t{0}, span.data.size())) {
+  for (const auto i : irange(span.data.size())) {
     if (i > 0) {
       os << ", ";
     }
@@ -133,27 +145,30 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
 struct SymbolicSize {
  public:
   SymbolicSize(std::string_view annotation = {}) : m_value(details::kNullSize), m_annotation(annotation) {}
+  SymbolicSize(const SymbolicSize&) = delete;
+  SymbolicSize& operator=(const SymbolicSize&) = delete;
 
   auto get_name() const -> std::string_view {
     return m_annotation;
   }
+
   auto set_value(int64_t value) -> void {
     RuntimeCheck(!this->has_value(), "Size value already set");
     m_value = value;
   }
+
   auto has_value() const -> bool {
     return m_value != details::kNullSize;
   }
+
   auto get_value() const -> std::optional<int64_t> {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
   }
-  auto unwrap() const -> int64_t {
-    RuntimeCheck(this->has_value(), "Size value is not set");
+
+  auto unwrap(DebugInfo info = {}) const -> int64_t {
+    RuntimeCheck(info, this->has_value(), "Size value is not set");
     return m_value;
   }
-
-  SymbolicSize(const SymbolicSize&) = delete;
-  SymbolicSize& operator=(const SymbolicSize&) = delete;
 
   auto verify(int64_t value, const char* prefix, int64_t dim) -> void {
     if (this->has_value()) {
@@ -193,6 +208,8 @@ inline auto operator==(DLDevice lhs, DLDevice rhs) -> bool {
 struct SymbolicDType {
  public:
   SymbolicDType() : m_value({details::kNullDType, 0, 0}) {}
+  SymbolicDType(const SymbolicDType&) = delete;
+  SymbolicDType& operator=(const SymbolicDType&) = delete;
 
   auto set_value(DLDataType value) -> void {
     RuntimeCheck(!this->has_value(), "Dtype value already set");
@@ -200,20 +217,24 @@ struct SymbolicDType {
         m_check(value), "Dtype value [", value, "] not in the allowed options: ", details::PrintAbleSpan{m_options});
     m_value = value;
   }
+
   auto has_value() const -> bool {
     return m_value.code != details::kNullDType;
   }
+
   auto get_value() const -> std::optional<DLDataType> {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
   }
-  auto unwrap() const -> DLDataType {
-    RuntimeCheck(this->has_value(), "Dtype value is not set");
+
+  auto unwrap(DebugInfo info = {}) const -> DLDataType {
+    RuntimeCheck(info, this->has_value(), "Dtype value is not set");
     return m_value;
   }
 
   auto set_options(std::span<const DLDataType> options) -> void {
     m_options = options;
   }
+
   template <typename... Ts>
   auto set_options() -> void {
     m_options = details::kDTypeList<Ts...>;
@@ -239,6 +260,8 @@ struct SymbolicDType {
 struct SymbolicDevice {
  public:
   SymbolicDevice() : m_value({details::kNullDevice, details::kAnyDeviceID}) {}
+  SymbolicDevice(const SymbolicDevice&) = delete;
+  SymbolicDevice& operator=(const SymbolicDevice&) = delete;
 
   auto set_value(DLDevice value) -> void {
     RuntimeCheck(!this->has_value(), "Device value already set");
@@ -250,20 +273,24 @@ struct SymbolicDevice {
         details::PrintAbleSpan{m_options});
     m_value = value;
   }
+
   auto has_value() const -> bool {
     return m_value.device_type != details::kNullDevice;
   }
+
   auto get_value() const -> std::optional<DLDevice> {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
   }
-  auto unwrap() const -> DLDevice {
-    RuntimeCheck(this->has_value(), "Device value is not set");
+
+  auto unwrap(DebugInfo info = {}) const -> DLDevice {
+    RuntimeCheck(info, this->has_value(), "Device value is not set");
     return m_value;
   }
 
   auto set_options(std::span<const DLDevice> options) -> void {
     m_options = options;
   }
+
   template <DLDeviceType... Codes>
   auto set_options() -> void {
     m_options = details::kDeviceList<Codes...>;
@@ -366,7 +393,6 @@ struct TensorMatcher {
   using SizeRef = details::SizeRef;
   using DTypeRef = details::DTypeRef;
   using DeviceRef = details::DeviceRef;
-  using Loc_t = std::source_location;
 
  public:
   TensorMatcher(const TensorMatcher&) = delete;
@@ -413,21 +439,21 @@ struct TensorMatcher {
   }
 
   // once we start verification, we cannot modify anymore
-  auto verify(tvm::ffi::TensorView view, Loc_t loc = Loc_t::current()) const&& -> const TensorMatcher&& {
+  auto verify(tvm::ffi::TensorView view, DebugInfo info = {}) const&& -> const TensorMatcher&& {
     try {
       m_verify_impl(view);
     } catch (PanicError& e) {
       auto oss = std::ostringstream{};
       oss << "Tensor match failed for ";
-      s_print_debug_str(oss, view);
-      oss << " at " << loc.file_name() << ":" << loc.line() << "\n- Root cause: " << e.root_cause();
+      s_print_tensor(oss, view);
+      oss << " at " << info.file_name() << ":" << info.line() << "\n- Root cause: " << e.root_cause();
       throw PanicError(std::move(oss).str());
     }
     return std::move(*this);
   }
 
  private:
-  static auto s_print_debug_str(std::ostringstream& oss, tvm::ffi::TensorView view) -> void {
+  static auto s_print_tensor(std::ostringstream& oss, tvm::ffi::TensorView view) -> void {
     oss << "Tensor<";
     int64_t dim = 0;
     for (const auto& size : view.shape()) {
@@ -449,11 +475,11 @@ struct TensorMatcher {
   auto m_verify_impl(tvm::ffi::TensorView view) const -> void {
     const auto dim = static_cast<std::size_t>(view.dim());
     RuntimeCheck(dim == m_shape.size(), "Tensor dimension mismatch: expected ", m_shape.size(), " but got ", dim);
-    for (const auto i : stdv::iota(std::size_t{0}, dim)) {
+    for (const auto i : irange(dim)) {
       m_shape[i]->verify(view.size(i), "shape", i);
     }
     if (m_has_strides()) {
-      for (const auto i : stdv::iota(std::size_t{0}, dim)) {
+      for (const auto i : irange(dim)) {
         if (view.size(i) != 1 || !m_strides[i]->has_value()) {
           // skip stride check for size 1 dimension
           m_strides[i]->verify(view.stride(i), "stride", i);
@@ -471,10 +497,12 @@ struct TensorMatcher {
     RuntimeCheck(!m_has_dtype, "DType already specified");
     m_has_dtype = true;
   }
+
   auto m_init_device() -> void {
     RuntimeCheck(!m_has_device, "Device already specified");
     m_has_device = true;
   }
+
   auto m_has_strides() const -> bool {
     return !m_strides.empty();
   }

@@ -34,6 +34,24 @@ The function can then be called in Python as `module.func`.
 
 The following C++ utilities are available:
 
+#### Integer Range
+
+Similar to PyTorch, we provide an `irange` function to represent an integer range.
+
+```C++
+#include <sgl_kernel/utils.h>
+
+void test() {
+  for (auto i : host::irange(100)) { // [0, 100)
+    // do something
+  }
+  for (auto i : host::irange(0, 100)) { // [0, 100)
+    // do something
+  }
+}
+
+```
+
 #### Runtime Checking
 
 `RuntimeCheck` validates conditions at runtime. It accepts optional arguments for error reporting.
@@ -88,12 +106,13 @@ A `Symbolic` variable must resolve to the same value across all verifications.
 Use `.unwrap()` to retrieve the matched value after verification.
 
 > Note: `TensorMatcher` is a temporary expression and should not be stored in a variable.
+
 > Tip: Add `//` at the end of the `TensorMatcher` chain to enforce proper indentation.
 
 #### Kernel Launching
 
 `LaunchKernel::resolve_device` retrieves the current `cudaStream` from PyTorch.
-Kernels can be launched directly using `LaunchKernel`.
+Kernels can also be launched directly using `LaunchKernel`.
 
 ```cpp
 #include <sgl_kernel/utils.cuh>
