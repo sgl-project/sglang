@@ -360,7 +360,9 @@ def run_case_broadcast(
 
     # Test pure fused_layernorm_scale_shift (only valid if gate is None)
     if gate is None:
-        y_dev_fused = sgl_kernel.fused_layernorm_scale_shift(x, weight, bias, scale, shift)
+        y_dev_fused = sgl_kernel.fused_layernorm_scale_shift(
+            x, weight, bias, scale, shift
+        )
 
         # Reference
         x32 = x.float()
@@ -378,15 +380,21 @@ def run_case_broadcast(
             s32 = s32.view(1, N)
         if sh32.ndim == 3 and sh32.size(0) == 1 and sh32.size(1) == 1:
             sh32 = sh32.view(1, N)
-        
+
         y_gt_fused = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
-        torch.testing.assert_close(y_dev_fused, y_gt_fused, atol=_tol(dtype), rtol=_tol(dtype))
+        torch.testing.assert_close(
+            y_dev_fused, y_gt_fused, atol=_tol(dtype), rtol=_tol(dtype)
+        )
 
         # Test no-affine variant
-        y_dev_no_affine = sgl_kernel.fused_layernorm_scale_shift_no_affine(x, scale, shift)
+        y_dev_no_affine = sgl_kernel.fused_layernorm_scale_shift_no_affine(
+            x, scale, shift
+        )
         y_ln32_no_affine = (x32 - mean) * inv_std
         y_gt_no_affine = (y_ln32_no_affine * (1.0 + s32) + sh32).to(dtype)
-        torch.testing.assert_close(y_dev_no_affine, y_gt_no_affine, atol=_tol(dtype), rtol=_tol(dtype))
+        torch.testing.assert_close(
+            y_dev_no_affine, y_gt_no_affine, atol=_tol(dtype), rtol=_tol(dtype)
+        )
 
     # Test residual + gate + fused
     y_dev_res, res_out_dev = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
@@ -405,7 +413,7 @@ def run_case_broadcast(
         g32 = gate.float()
         # Broadcast gate if needed
         if g32.ndim == 3 and g32.size(0) == 1 and g32.size(1) == 1:
-             g32 = g32.view(1, N)
+            g32 = g32.view(1, N)
         out32 = r32 + x32 * g32
     else:
         out32 = r32 + x32
@@ -415,18 +423,20 @@ def run_case_broadcast(
     inv_std = (var + eps).sqrt().reciprocal()
     y_ln32 = (out32 - mean) * inv_std
     y_ln32 = y_ln32 * w32 + b32
-    
+
     # Broadcast scale/shift if needed
     if s32.ndim == 3 and s32.size(0) == 1 and s32.size(1) == 1:
         s32 = s32.view(1, N)
     if sh32.ndim == 3 and sh32.size(0) == 1 and sh32.size(1) == 1:
         sh32 = sh32.view(1, N)
-        
+
     y_ref = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
     residual_ref = out32.to(dtype)
 
     torch.testing.assert_close(y_dev_res, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
-    torch.testing.assert_close(res_out_dev, residual_ref, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(
+        res_out_dev, residual_ref, atol=_tol(dtype), rtol=_tol(dtype)
+    )
 
 
 # -------------------------
@@ -541,8 +551,8 @@ def test_residual_gate_fully_expanded(dtype, B, S, N):
     torch.cuda.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    y_dev, residual_out_dev, y_ref, residual_ref = run_case_residual_gate_fully_expanded(
-        dtype=dtype, B=B, S=S, N=N, eps=1e-5
+    y_dev, residual_out_dev, y_ref, residual_ref = (
+        run_case_residual_gate_fully_expanded(dtype=dtype, B=B, S=S, N=N, eps=1e-5)
     )
     torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
     torch.testing.assert_close(
@@ -586,29 +596,34 @@ def test_residual_gate_4d(dtype, B, F, S, N):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("M,N", [(128, 1024)])
-@pytest.mark.parametrize("broadcast_dims", [
-    ([1, 1024], [1, 1024], None),          # scale/shift 1xN, no gate
-    ([1, 1, 1024], [1, 1, 1024], None),    # scale/shift 1x1xN, no gate
-    ([1, 1024], [1, 1024], [1, 1024]),     # all 1xN
-    ([1, 1, 1024], [1, 1, 1024], [1, 1, 1024]), # all 1x1xN    
-    ([128, 1024], [128, 1024], [1, 1024]), # gate broadcast only
-    ([1, 1024], [1, 1024], [128, 1024]),   # scale/shift broadcast only
-    ([1, 1, 1024], [1, 1, 1024], [128, 1024]), # scale/shift 3d broadcast
-])
+@pytest.mark.parametrize(
+    "broadcast_dims",
+    [
+        ([1, 1024], [1, 1024], None),  # scale/shift 1xN, no gate
+        ([1, 1, 1024], [1, 1, 1024], None),  # scale/shift 1x1xN, no gate
+        ([1, 1024], [1, 1024], [1, 1024]),  # all 1xN
+        ([1, 1, 1024], [1, 1, 1024], [1, 1, 1024]),  # all 1x1xN
+        ([128, 1024], [128, 1024], [1, 1024]),  # gate broadcast only
+        ([1, 1024], [1, 1024], [128, 1024]),  # scale/shift broadcast only
+        ([1, 1, 1024], [1, 1, 1024], [128, 1024]),  # scale/shift 3d broadcast
+    ],
+)
 def test_broadcast(dtype, M, N, broadcast_dims):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.cuda.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
+
     scale_shape, shift_shape, gate_shape = broadcast_dims
     run_case_broadcast(
-        dtype=dtype, M=M, N=N, 
-        scale_shape=scale_shape, 
-        shift_shape=shift_shape, 
-        gate_shape=gate_shape, 
-        eps=1e-5
+        dtype=dtype,
+        M=M,
+        N=N,
+        scale_shape=scale_shape,
+        shift_shape=shift_shape,
+        gate_shape=gate_shape,
+        eps=1e-5,
     )
 
 
