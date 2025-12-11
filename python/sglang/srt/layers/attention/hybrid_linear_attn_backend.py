@@ -69,8 +69,8 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
-        self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
-        self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.cached_graph_decode_query_start_loc: torch.Tensor = None
+        self.cached_graph_verify_query_start_loc: torch.Tensor = None
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -153,6 +153,20 @@ class MambaAttnBackendBase(AttentionBackend):
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
 
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        self.forward_metadata = self._capture_metadata(
+            bs, req_pool_indices, forward_mode, spec_info
+        )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
@@ -182,10 +196,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+        self.cached_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
-        self.cached_cuda_graph_verify_query_start_loc = torch.arange(
+        self.cached_graph_verify_query_start_loc = torch.arange(
             0,
             max_bs * draft_token_num + 1,
             step=draft_token_num,
@@ -194,13 +208,21 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        assert (
+            max_num_tokens % max_bs == 0
+        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         for i in range(max_bs):
             self.state_indices_list.append(
-                torch.arange(0, i + 1, dtype=torch.int32, device="cpu")
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
             )
             self.query_start_loc_list.append(
-                torch.empty((i + 2,), dtype=torch.int32, device="cpu")
+                torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
+        self.cached_graph_decode_query_start_loc = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=self.device
+        )
 
     def _capture_metadata(
         self,
@@ -211,11 +233,11 @@ class MambaAttnBackendBase(AttentionBackend):
     ):
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
+                self.cached_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
             self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                self.cached_graph_verify_query_start_loc[: bs + 1]
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -259,11 +281,11 @@ class MambaAttnBackendBase(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
+                    self.cached_graph_decode_query_start_loc[: bs + 1]
                 )
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
+                    self.cached_graph_decode_query_start_loc[: bs - num_padding]
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
                     bs - num_padding
@@ -271,11 +293,11 @@ class MambaAttnBackendBase(AttentionBackend):
         elif forward_mode.is_target_verify():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                    self.cached_graph_verify_query_start_loc[: bs + 1]
                 )
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                    self.cached_graph_verify_query_start_loc[: bs - num_padding]
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
                     (bs - num_padding) * spec_info.draft_token_num
@@ -781,25 +803,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             draft_token_num=draft_token_num,
         )
 
-    def init_forward_metadata_capture_cpu_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        if forward_mode.is_decode_or_idle():
-            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cpu"))
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_mode=}")
-        self.forward_metadata = ForwardMetadata(
-            query_start_loc=self.query_start_loc_list[bs - 1],
-            mamba_cache_indices=self.state_indices_list[bs - 1],
-        )
-
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -948,7 +951,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
 
     def get_cpu_graph_seq_len_fill_value(self):
-        return 1
+        return self.full_attn_backend.get_cpu_graph_seq_len_fill_value()
 
     def forward_decode(
         self,

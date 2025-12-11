@@ -114,7 +114,6 @@ def register_fake_ops():
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",
-        "gemma_fused_add_rmsnorm_cpu",
     ]
     for op in none_return_ops:
 
@@ -126,10 +125,10 @@ def register_fake_ops():
         "rmsnorm_cpu",
         "l2norm_cpu",
         "fused_experts_cpu",
+        "fused_rmsnorm_gated_cpu",
         "shared_expert_cpu",
-        "gemma_rmsnorm_cpu",
-        "causal_conv1d_update_cpu_ori",
-        "qwen3_next_rmsnorm_gated_cpu",
+        "causal_conv1d_update_cpu",
+        "causal_conv1d_fwd_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -229,9 +228,19 @@ def register_fake_ops():
         v_input = k_input.narrow(-1, 0, kv_lora_rank)
         return q_input, k_input, v_input
 
+    def get_n_size(mat2, is_vnni):
+        tile_n = 16
+        if mat2.dtype == torch.float32:
+            return mat2.shape[1]
+        if not is_vnni and mat2.dim() == 2 and mat2.shape[0] < tile_n:
+            return mat2.shape[1]
+        return mat2.shape[0]
+
     @torch.library.register_fake("sgl_kernel::weight_packed_linear")
-    def _(x, weight, bias, is_vnni):
-        return x.new_empty(x.shape[0], weight.shape[0])
+    def _(mat1, mat2, bias, is_vnni):
+        M = mat1.shape[0]
+        N = get_n_size(mat2, is_vnni)
+        return mat1.new_empty(M, N)
 
     @torch.library.register_fake("sgl_kernel::per_token_quant_int8_cpu")
     def _(input):
@@ -310,9 +319,19 @@ def register_fake_ops():
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
         )
 
-    @torch.library.register_fake("sgl_kernel::silu_and_mul_cpu")
-    def _(input):
-        return input.new_empty(input.shape[0], input.shape[1] // 2)
+    for act_op in [
+        "silu_and_mul_cpu",
+        "gelu_tanh_and_mul_cpu",
+        "gelu_and_mul_cpu",
+    ]:
+
+        @torch.library.register_fake(f"sgl_kernel::{act_op}")
+        def _(input):
+            sizes = list(input.shape)
+            last_dim = input.dim() - 1
+            d = sizes[last_dim] // 2
+            sizes[last_dim] = d
+            return input.new_empty(sizes)
 
     @torch.library.register_fake("sgl_kernel::int8_scaled_mm_with_quant")
     def _(
@@ -341,6 +360,18 @@ def register_fake_ops():
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
+    @torch.library.register_fake("sgl_kernel::fused_linear_sigmoid_mul")
+    def _(
+        mat1,
+        mat2,
+        bias,
+        is_vnni,
+        post_mul_mat,
+    ):
+        M = mat1.shape[0]
+        N = post_mul_mat.shape[1]
+        return mat1.new_empty(M, N)
+
     @torch.library.register_fake("sgl_kernel::fused_qkvzba_split_reshape_cat_cpu")
     def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
         batch = mixed_qkvz.shape[0]
@@ -355,58 +386,55 @@ def register_fake_ops():
         "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
     )
     def _(
-        mixed_qkv,
         A_log,
-        a,
         dt_bias,
+        q,
+        k,
+        v,
+        a,
         b,
-        cache_indices,
-        initial_state,
+        initial_state_source,
+        initial_state_indices,
+        cu_seqlens,
         use_qk_l2norm_in_kernel,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
     ):
-        batch_size = mixed_qkv.shape[0]
-        seq_len = 1
-        v_num_heads = initial_state.shape[1]
-        v_head_dim = initial_state.shape[3]
-        return mixed_qkv.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
+        assert q.dim() == 4
+        assert v.dim() == 4
+        batch_size = q.shape[1]
+        seq_len = q.shape[0]
+        v_num_heads = v.shape[2]
+        v_head_dim = v.shape[3]
+        return q.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
 
-    @torch.library.register_fake("sgl_kernel::fma_linear")
-    def _(mat1, mat2, bias, post_mul):
-        M = mat1.shape[0]
-        N = mat2.shape[1]
-        K = mat1.shape[1]
-        if post_mul is not None:
-            return mat1.new_empty(M, K)
-        else:
-            return mat1.new_empty(M, N)
+    @torch.library.register_fake("sgl_kernel::fused_gdn_gating_cpu")
+    def _(A_log, a, b, dt_bias):
+        batch = a.shape[0]
+        num_heads = a.shape[1]
+        out = a.new_empty(1, batch, num_heads, dtype=torch.float)
+        beta = b.new_empty(1, batch, num_heads)
+        return out, beta
 
     @torch.library.register_fake("sgl_kernel::chunk_gated_delta_rule_cpu")
-    def _(
-        query, key, value, g, beta, cu_seqlens, initial_state, use_qk_l2norm_in_kernel
-    ):
-        output = torch.empty_like(value)
-        assert initial_state is not None
-        final_state = initial_state.to(torch.float32)
-
-        return output, final_state
-
-    @torch.library.register_fake("sgl_kernel::fused_recurrent_gated_delta_rule_cpu")
     def _(
         query,
         key,
         value,
         g,
         beta,
-        cache_indices,
         initial_state,
+        output_final_state,
+        cu_seqlens,
+        head_first,
         use_qk_l2norm_in_kernel,
+        eps,
     ):
-        batch_size = query.shape[1]
-        seq_len = query.shape[0]
-        v_num_heads = value.shape[2]
-        v_head_dim = value.shape[3]
-        output = query.new_empty(batch_size, seq_len, v_num_heads, v_head_dim)
-        return output
+        output = torch.empty_like(value)
+        assert initial_state is not None
+        final_state = initial_state.to(torch.float32)
+
+        return output, final_state
 
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
@@ -562,6 +590,29 @@ class CPUGraphRunner:
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
 
+        # Re-init states for qwen3-next as
+        # torch.compile may change the states
+        self._reset_mamba_cache_if_needed()
+
+    def _reset_mamba_cache_if_needed(self) -> None:
+
+        mamba_pool = getattr(self.model_runner.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return
+        mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+        if mamba_cache is None:
+            return
+
+        def _zero_nested(obj):
+            if isinstance(obj, torch.Tensor):
+                obj.zero_()
+            elif isinstance(obj, (list, tuple)):
+                for it in obj:
+                    _zero_nested(it)
+
+        for v in vars(mamba_cache).values():
+            _zero_nested(v)
+
     def capture_one_batch_size(self, bs: int, forward: Callable):
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -626,7 +677,7 @@ class CPUGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
+                forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
             )
