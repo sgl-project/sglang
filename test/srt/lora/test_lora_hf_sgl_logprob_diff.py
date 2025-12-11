@@ -543,6 +543,27 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             max_new_tokens=32,
         )
 
+    def test_lora_embedding_logprob_comparison(self):
+        """
+        Test embedding LoRA (embed_tokens/lm_head) with ChunkedSgmvLoRABackend.
+
+        Adapter must have embed_tokens in target_modules (not modules_to_save).
+        """
+        if is_in_ci():
+            self.skipTest("Skipping in CI environment - requires large models")
+
+        model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        lora_paths = ["ash256/sglang_embedding_lora_test_adapter"]
+        prompts = DEFAULT_TEST_PROMPTS[:2]
+
+        self._run_comparison_test(
+            model_path=model_path,
+            lora_paths=lora_paths,
+            prompts=prompts,
+            max_new_tokens=32,
+            lora_backend="csgmv",
+        )
+
 
 if __name__ == "__main__":
     try:
