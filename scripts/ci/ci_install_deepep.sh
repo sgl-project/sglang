@@ -74,7 +74,7 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
         # CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
         #
         # However, our CI machine has a weird setup and nvidia-smi reports wrong CUDA version in the container.
-        # The container is actually cuda 12.8, but nvidia-smi reports 13.0, leading to compilation errors. so we 
+        # The container is actually cuda 12.8, but nvidia-smi reports 13.0, leading to compilation errors. so we
         # drop 10.3.
         CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
     else
