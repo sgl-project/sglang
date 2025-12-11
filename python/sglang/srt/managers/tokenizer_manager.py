@@ -408,7 +408,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        created_time = time.time()
+        created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
@@ -1209,16 +1209,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
-            if self.is_pause:
-                return await self._wait_for_model_update_from_disk(obj)
+            is_paused = self.is_pause
 
-        if True:  # Keep this redundant check to simplify some internal code sync
-            # Hold the lock if it is not async. This means that weight sync
-            # cannot run while requests are in progress.
-            async with self.model_update_lock.writer_lock:
-                success, message, num_paused_requests = (
-                    await self._wait_for_model_update_from_disk(obj)
-                )
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
+            success, message, num_paused_requests = (
+                await self._wait_for_model_update_from_disk(obj)
+            )
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
