@@ -328,11 +328,9 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
-        # print(f"wan, residual.shape, {residual.shape}, x.shape, {x.shape}, gate.shape, {gate if isinstance(gate, int) else gate.shape}, scale.shape, {scale.shape}, shift.shape, {shift.shape}")
         can_use_cuda = (
             x.is_cuda and (x.shape[-1] % 4 == 0) and not isinstance(self.norm, RMSNorm)
         )
-        # can_use_cuda = False
         if can_use_cuda:
             B, L, C = x.shape
             M = B * L
@@ -494,31 +492,31 @@ class LayerNormScaleShift(nn.Module):
         elif t.dim() == 4:
             return t.contiguous().to(dtype=x.dtype, device=x.device)
         else:
-            raise ValueError(
-                f"Scale/shift tensor dimension {t.dim()} not supported"
-            )
+            raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
 
     def forward(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-
         can_use_cuda = (
             x.is_cuda
             and self.norm_type == "layer"
             and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
         )
-        # can_use_cuda = False
         if can_use_cuda:
             B, L, C = x.shape
             M = B * L
             x_2d = x.contiguous().view(-1, C)
 
-
-            if getattr(self.norm, "weight", None) is None and getattr(self.norm, "bias", None) is None:
+            if (
+                getattr(self.norm, "weight", None) is None
+                and getattr(self.norm, "bias", None) is None
+            ):
 
                 if scale.dim() == 4 or shift.dim() == 4:
-                    raise ValueError("Only 2D scale/shift are supported by the no_affine kernel. ")
+                    raise ValueError(
+                        "Only 2D scale/shift are supported by the no_affine kernel. "
+                    )
 
                 scale_arg = self._get_arg(scale, x, B, L, C, M)
                 shift_arg = self._get_arg(shift, x, B, L, C, M)
