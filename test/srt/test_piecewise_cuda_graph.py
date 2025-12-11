@@ -4,7 +4,7 @@ import torch
 
 from sglang import Engine
 from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.utils import get_device_sm, kill_process_tree
+from sglang.srt.utils import get_device_count, get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -413,6 +413,10 @@ class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.70)
 
 
+@unittest.skipIf(
+    get_device_count() < 2,
+    f"Test requires at least 2 GPUs, but only {get_device_count()} GPU(s) available",
+)
 class TestPiecewiseCudaGraphWithPP(CustomTestCase):
     """Test piecewise CUDA graph with Pipeline Parallelism (PP) support"""
 
@@ -456,26 +460,41 @@ class TestPiecewiseCudaGraphWithPP(CustomTestCase):
         # Verify accuracy is reasonable (should be similar to non-PP case)
         self.assertGreater(metrics["accuracy"], 0.74)
 
-    def test_basic_generation(self):
-        """Test basic text generation with PP and piecewise CUDA graph"""
+    def test_verify_pp_configuration(self):
+        """Verify that PP is actually enabled by checking server info"""
         import requests
 
-        response = requests.post(
-            f"{self.base_url}/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 16,
-                },
-            },
-        )
+        # Check server info to verify PP configuration
+        response = requests.get(f"{self.base_url}/get_server_info")
         self.assertEqual(response.status_code, 200)
-        response_json = response.json()
-        self.assertIn("text", response_json)
-        self.assertGreater(len(response_json["text"]), 0)
+        server_info = response.json()
 
+        # Verify PP is enabled
+        self.assertIn("pp_size", server_info)
+        self.assertEqual(
+            server_info["pp_size"],
+            2,
+            f"Expected pp_size=2, but got {server_info.get('pp_size')}. "
+            "Pipeline parallelism may not be enabled correctly.",
+        )
 
+        # Verify piecewise CUDA graph is enabled
+        self.assertIn("enable_piecewise_cuda_graph", server_info)
+        self.assertTrue(
+            server_info["enable_piecewise_cuda_graph"],
+            "Piecewise CUDA graph should be enabled",
+        )
+
+        print(
+            f"✓ Verified PP configuration: pp_size={server_info['pp_size']}, "
+            f"tp_size={server_info.get('tp_size', 'N/A')}, "
+            f"piecewise_cuda_graph={server_info.get('enable_piecewise_cuda_graph', False)}"
+        )
+
+@unittest.skipIf(
+    get_device_count() < 2,
+    f"Test requires at least 2 GPUs, but only {get_device_count()} GPU(s) available",
+)
 class TestPiecewiseCudaGraphPPConsistency(CustomTestCase):
     """Test consistency between PP with and without piecewise CUDA graph"""
 
@@ -541,7 +560,9 @@ class TestPiecewiseCudaGraphPPConsistency(CustomTestCase):
         self.assertGreaterEqual(pp_pcg_metrics["accuracy"], 0.70)
 
         # Accuracy difference should be small (within 3%)
-        accuracy_diff = abs(pp_only_metrics["accuracy"] - pp_pcg_metrics["accuracy"])
+        accuracy_diff = abs(
+            pp_only_metrics["accuracy"] - pp_pcg_metrics["accuracy"]
+        )
         self.assertLess(
             accuracy_diff,
             0.03,
