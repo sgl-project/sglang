@@ -58,3 +58,11 @@ register_cuda_ci(est_time=80, suite="stage-a-test-1")
 ## Adding New Models to Nightly CI
 - **For text models**: extend [global model lists variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`, or add more model lists
 - **For vlms**: extend the `MODEL_THRESHOLDS` global dictionary in `test/srt/nightly/test_vlms_mmmu_eval.py`
+
+For diffusion, it's been a month since released, we'are near the end of settup things up, building a team mostly with enthusiasts from community. 
+
+
+
+Hopefully, we could move much faster from now on
+
+

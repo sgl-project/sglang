@@ -141,7 +141,7 @@ class DenoisingStage(PipelineStage):
                 AttentionBackendEnum.VMOBA_ATTN,
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN_THREE,
+                AttentionBackendEnum.SAGE_ATTN_3,
             },  # hack
         )
 

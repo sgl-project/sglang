@@ -10,9 +10,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sageattn.api import (
-    sageattn_blackwell,
-)
+
+from sageattn3 import sageattn3_blackwell
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -28,7 +27,7 @@ class SageAttention3Backend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "SAGE_ATTN_THREE"
+        return "SAGE_ATTN_3"
 
     @staticmethod
     def get_impl_cls() -> type["SageAttention3Impl"]:
@@ -73,6 +72,6 @@ class SageAttention3Impl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-        output = sageattn_blackwell(query, key, value, is_causal=self.causal)
+        output = sageattn3_blackwell(query, key, value, is_causal=self.causal)
         output = output.transpose(1, 2)
         return output

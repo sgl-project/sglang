@@ -1,10 +1,10 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
-# SPDX-License-Identifier: Apache-2.0
+from typing import Type
 
 import torch
 from sageattention import sageattn
 
+from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadataBuilder
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -16,7 +16,6 @@ logger = init_logger(__name__)
 
 
 class SageAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -31,9 +30,13 @@ class SageAttentionBackend(AttentionBackend):
     def get_impl_cls() -> type["SageAttentionImpl"]:
         return SageAttentionImpl
 
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
+    @staticmethod
+    def get_metadata_cls() -> Type["AttentionMetadata"]:
+        raise NotImplementedError
+
+    @staticmethod
+    def get_builder_cls() -> type["AttentionMetadataBuilder[]"]:
+        raise NotImplementedError
 
 
 class SageAttentionImpl(AttentionImpl):
