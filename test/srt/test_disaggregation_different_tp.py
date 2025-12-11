@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.server_fixtures.disaggreation_fixture import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggreation_fixture import PDDisaggregationServerBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -84,7 +84,7 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -155,7 +155,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -226,7 +226,7 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

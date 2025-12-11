@@ -2,14 +2,14 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.server_fixtures.disaggreation_fixture import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggreation_fixture import PDDisaggregationServerBase
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
 
-class TestDisaggregationHybridAttentionMamba(TestDisaggregationBase):
+class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

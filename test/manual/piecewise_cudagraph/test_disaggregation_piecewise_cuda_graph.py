@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.server_fixtures.disaggreation_fixture import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggreation_fixture import PDDisaggregationServerBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDisaggregationPiecewiseCudaGraph(TestDisaggregationBase):
+class TestDisaggregationPiecewiseCudaGraph(PDDisaggregationServerBase):
     """Test piecewise CUDA graph support in disaggregation prefill server"""
 
     @classmethod
