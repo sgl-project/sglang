@@ -106,7 +106,7 @@ jobs:
 
           echo "Starting container: sglang_test:ci"
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
-          --ipc=host --group-add video \
+          --ipc=host --network=host --group-add video \
           --shm-size 16g \
           --network=host \
           --privileged \
@@ -135,7 +135,7 @@ jobs:
           elif [ "$model_name" == "Qwen3-next" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1"
           elif [ "$model_name" == "Qwen3-Omni" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 2"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 1"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
@@ -151,7 +151,7 @@ jobs:
           elif [ "$model_name" == "Qwen3-next" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1"
           elif [ "$model_name" == "Qwen3-Omni" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 2"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Omni-30B-A3B-Instruct/ 4 1"
           else
             echo "Unknown model_name: ${model_name}"
             exit 1
