@@ -1,6 +1,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
+"""Rotary Positinal Embeddings."""
+from __future__ import annotations
 
-"""Rotary Positional Embeddings."""
 import itertools
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1147,12 +1148,12 @@ def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.T
 
 
 @triton.jit
-def _triton_mrope_forward(
+def _triton_mrope_forward_fused(
     q_ptr,
     k_ptr,
-    cos,
-    sin,
-    num_tokens,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    positions_stride,
     n_qh: tl.constexpr,
     n_kh: tl.constexpr,
     hd: tl.constexpr,
@@ -1176,20 +1177,17 @@ def _triton_mrope_forward(
     q_ptr = q_ptr + pid * (n_qh * hd)
     k_ptr = k_ptr + pid * (n_kh * hd)
 
-    # ####################################################################
-    # get the cos(mθ_{i...d/2}) and sin(mθ_{i...d/2}) for token position
-    # m of this program instance
-    # ####################################################################
-    # Note: cos and sin now have shape (3, num_tokens, head_dim // 2)
-
-    # Updated stride calculation for half head_dim
     half_rd = rd // 2
-    t_cos = cos + pid * half_rd
-    h_cos = t_cos + num_tokens * half_rd
-    w_cos = h_cos + num_tokens * half_rd
-    t_sin = sin + pid * half_rd
-    h_sin = t_sin + num_tokens * half_rd
-    w_sin = h_sin + num_tokens * half_rd
+    t = tl.load(positions_ptr + 0 * positions_stride + pid)
+    h = tl.load(positions_ptr + 1 * positions_stride + pid)
+    w = tl.load(positions_ptr + 2 * positions_stride + pid)
+
+    t_cos = cos_sin_cache_ptr + t * rd
+    h_cos = cos_sin_cache_ptr + h * rd
+    w_cos = cos_sin_cache_ptr + w * rd
+    t_sin = t_cos + half_rd
+    h_sin = h_cos + half_rd
+    w_sin = w_cos + half_rd
 
     # Updated offsets for half head_dim
     cos_offsets = tl.arange(0, pad_hd // 2)
@@ -1205,10 +1203,10 @@ def _triton_mrope_forward(
         w_mask = (h_end <= cos_offsets) & (cos_offsets < half_rd)
 
     t_cos_row = tl.load(t_cos + cos_offsets, mask=t_mask, other=0)
-    h_cos_row = tl.load(h_cos + cos_offsets, mask=h_mask, other=0)
-    w_cos_row = tl.load(w_cos + cos_offsets, mask=w_mask, other=0)
     t_sin_row = tl.load(t_sin + cos_offsets, mask=t_mask, other=0)
+    h_cos_row = tl.load(h_cos + cos_offsets, mask=h_mask, other=0)
     h_sin_row = tl.load(h_sin + cos_offsets, mask=h_mask, other=0)
+    w_cos_row = tl.load(w_cos + cos_offsets, mask=w_mask, other=0)
     w_sin_row = tl.load(w_sin + cos_offsets, mask=w_mask, other=0)
 
     cos_row = t_cos_row + h_cos_row + w_cos_row
@@ -1314,90 +1312,67 @@ def _triton_mrope_forward(
         tl.store(k_ptr + odd_k_offsets, new_k_tile_2, mask=odd_k_mask)
 
 
-def triton_mrope(
+def triton_mrope_fused(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    mrope_section: list[int],
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    mrope_section: List[int],
     head_size: int,
     rotary_dim: int,
     mrope_interleaved: bool,
     is_neox_style: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     """The mrope triton kernel.
 
     Args:
         q: [num_tokens, num_heads * head_size]
         k: [num_tokens, num_kv_heads * head_size]
-        cos: [3, num_tokens, head_size //2 ]
-            (T/H/W positions with multimodal inputs)
-        sin: [3, num_tokens, head_size //2 ]
-            (T/H/W positions with multimodal inputs)
+        cos_sin_cache: [max_position_embeddings, head_size]
+        positions: [3, num_tokens]
         mrope_section: [t, h, w]
-        head_size: int
     """
-    n_row, n_q_head_head_dim = q.shape
-    assert (
-        n_q_head_head_dim % head_size == 0
-    ), f"q shape {n_q_head_head_dim} must be divisible by head_size {head_size}"
-    n_q_head = n_q_head_head_dim // head_size
-    assert (
-        k.shape[1] % head_size == 0
-    ), f"k shape {k.shape[1]} must be divisible by head_size {head_size}"
-    n_kv_head = k.shape[1] // head_size
-    pad_hd = triton.next_power_of_2(head_size)
-    pad_n_q_head = triton.next_power_of_2(n_q_head)
-    pad_n_kv_head = triton.next_power_of_2(n_kv_head)
+    num_tokens, n_q_dim = q.shape
+    k_first_dim, n_k_dim = k.shape
+    rd = rotary_dim
+    hd = head_size
 
-    # ensure tensors passed into the kernel are contiguous.
-    # It will be no-op if they are already contiguous
-    q = q.contiguous()
-    k = k.contiguous()
-    cos = cos.contiguous()
-    sin = sin.contiguous()
+    positions_stride, last_positions_stride = positions.stride()
 
-    _triton_mrope_forward[(n_row,)](
+    assert (
+        rotary_dim % 2 == 0
+        and rotary_dim <= head_size
+        and k_first_dim == num_tokens
+        and n_q_dim % head_size == 0
+        and n_k_dim % head_size == 0
+        and list(positions.shape) == [3, num_tokens]
+        and len(mrope_section) == 3
+        and all(t.is_contiguous() and t.dim() == 2 for t in [q, k, cos_sin_cache])
+        and last_positions_stride == 1
+    )
+
+    n_qh = n_q_dim // head_size
+    n_kh = n_k_dim // head_size
+    pad_n_qh = triton.next_power_of_2(n_qh)
+    pad_n_kh = triton.next_power_of_2(n_kh)
+    pad_hd = triton.next_power_of_2(hd)
+
+    _triton_mrope_forward_fused[(num_tokens,)](
         q,
         k,
-        cos,
-        sin,
-        n_row,
-        n_q_head,
-        n_kv_head,
-        head_size,
-        rotary_dim,
-        pad_n_q_head,
-        pad_n_kv_head,
+        cos_sin_cache,
+        positions,
+        positions_stride,
+        n_qh,
+        n_kh,
+        hd,
+        rd,
+        pad_n_qh,
+        pad_n_kh,
         pad_hd,
         mrope_section[0],
         mrope_section[1],
         mrope_section[2],
-        mrope_interleaved,
-        is_neox_style,
-    )
-    return q, k
-
-
-def triton_mrope_wrapper(
-    query,
-    key,
-    cos,
-    sin,
-    mrope_section,
-    head_size,
-    rotary_dim,
-    mrope_interleaved,
-    is_neox_style,
-):
-    return triton_mrope(
-        query,
-        key,
-        cos,
-        sin,
-        mrope_section,
-        head_size,
-        rotary_dim,
         mrope_interleaved,
         is_neox_style,
     )
@@ -1553,47 +1528,19 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert positions.ndim == 1 or positions.ndim == 2
-        assert key is not None
-
+        assert self.mrope_section
         self._match_cos_sin_cache_dtype(query)
-        num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.contiguous()
-        sin = sin.contiguous()
-        query_shape = query.shape
-        key_shape = key.shape
-        if positions.ndim == 2:
-            assert self.mrope_section
-
-            q, k = triton_mrope_wrapper(
-                query,
-                key,
-                cos,
-                sin,
-                self.mrope_section,
-                self.head_size,
-                self.rotary_dim,
-                self.mrope_interleaved,
-                self.is_neox_style,
-            )
-
-            return q.reshape(query_shape), k.reshape(key_shape)
-
-        seq_len_q = query.shape[0]
-        query = query.view(seq_len_q, -1, self.head_size)
-
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-        key = key.view(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        triton_mrope_fused(
+            query,
+            key,
+            self.cos_sin_cache,
+            positions,
+            self.mrope_section,
+            self.head_size,
+            self.rotary_dim,
+            self.mrope_interleaved,
+            self.is_neox_style,
+        )
         return query, key
 
     def _forward_npu(
