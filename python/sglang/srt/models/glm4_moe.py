@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -75,7 +76,6 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -361,6 +361,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             if get_global_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
+
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -682,7 +683,9 @@ class Glm4MoeDecoderLayer(nn.Module):
         self.config = config
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        partial_rotary_factor = getattr(
+            getattr(config, "rope_parameters", None), "partial_rotary_factor", None
+        ) or getattr(config, "partial_rotary_factor", 0.5)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads

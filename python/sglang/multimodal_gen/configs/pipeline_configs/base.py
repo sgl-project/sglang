@@ -102,6 +102,14 @@ def shard_rotary_emb_for_sp(emb):
         return emb
 
 
+def maybe_unpad_latents(latents, batch):
+    # If SP padding was applied, remove extra tokens before reshaping
+    target_tokens = batch.raw_latent_shape[-1] * batch.raw_latent_shape[-2]
+    if latents.shape[1] > target_tokens:
+        latents = latents[:, :target_tokens, :]
+    return latents
+
+
 # config for a single pipeline
 @dataclass
 class PipelineConfig:
@@ -190,8 +198,15 @@ class PipelineConfig:
         return sigmas
 
     ## For ImageVAEEncodingStage
-    def resize_condition_image(self, image, target_width, target_height):
-        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+    def preprocess_condition_image(
+        self, image, target_width, target_height, _vae_image_processor
+    ):
+        """
+        preprocess the condition image, returns (image, final_image_width, final_image_height)
+        """
+        return image.resize(
+            (target_width, target_height), PIL.Image.Resampling.LANCZOS
+        ), (target_width, target_height)
 
     def prepare_image_processor_kwargs(self, batch):
         return {}
@@ -274,7 +289,7 @@ class PipelineConfig:
         return image_latents
 
     # called after scale_and_shift, before vae decoding
-    def preprocess_decoding(self, latents):
+    def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
     def gather_latents_for_sp(self, latents):
@@ -303,6 +318,7 @@ class PipelineConfig:
         return batch.negative_prompt_embeds
 
     def post_denoising_loop(self, latents, batch):
+        latents = maybe_unpad_latents(latents, batch)
         return latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -480,20 +496,32 @@ class PipelineConfig:
             raise ValueError("model_path is required in kwargs")
 
         # 1. Get the pipeline config class from the registry
+        from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+            Flux2PipelineConfig,
+        )
+
         model_info = get_model_info(model_path)
 
-        # 2. Instantiate PipelineConfig
-        if model_info is None:
-            # The error is already logged in get_model_info.
-            # We raise an exception here to stop the execution.
-            raise ValueError(
-                f"Failed to get model info for '{model_path}'. "
-                "Please check the model path and ensure it is registered correctly."
+        # 1.5. Adjust pipeline config for fine-tuned VAE if needed
+        pipeline_config_cls = model_info.pipeline_config_cls
+        vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+
+        # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
+        if (
+            isinstance(pipeline_config_cls, type)
+            and issubclass(pipeline_config_cls, Flux2PipelineConfig)
+            and vae_path is not None
+            and "FLUX.2-Tiny-AutoEncoder" in vae_path
+        ):
+            from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
+                Flux2FinetunedPipelineConfig,
             )
 
-        pipeline_config = model_info.pipeline_config_cls()
+            pipeline_config_cls = Flux2FinetunedPipelineConfig
 
-        # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
+        pipeline_config = pipeline_config_cls()
+
+        # 2. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
             pipeline_config.load_from_json(pipeline_config_or_path)
             kwargs[prefix_with_dot + "pipeline_config_path"] = pipeline_config_or_path
@@ -502,7 +530,7 @@ class PipelineConfig:
         elif isinstance(pipeline_config_or_path, dict):
             pipeline_config.update_pipeline_config(pipeline_config_or_path)
 
-        # 4. Update PipelineConfig from CLI arguments if provided
+        # 3. Update PipelineConfig from CLI arguments if provided
         kwargs[prefix_with_dot + "model_path"] = model_path
         pipeline_config.update_config_from_dict(kwargs, config_cli_prefix)
         return pipeline_config
@@ -636,10 +664,7 @@ class ImagePipelineConfig(PipelineConfig):
         height = 2 * (int(batch.height) // (vae_scale_factor * 2))
         width = 2 * (int(batch.width) // (vae_scale_factor * 2))
 
-        # If SP padding was applied, remove extra tokens before reshaping
-        target_tokens = (height // 2) * (width // 2)
-        if latents.shape[1] > target_tokens:
-            latents = latents[:, :target_tokens, :]
+        latents = maybe_unpad_latents(latents, batch)
 
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
