@@ -75,6 +75,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen3_moe import compute_yarn_parameters
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -96,6 +101,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
+
+if _is_cuda:
+    from sgl_kernel import fused_qk_norm_rope
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +257,61 @@ class Glm4MoeAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        self.use_fused_qk_norm_rope = (
+            get_global_server_args().enable_fused_qk_norm_rope
+            and self.head_dim in (64, 128, 256)
+        )
+        self._used_fused_qk_norm_rope_last_call = False
+        if self.use_fused_qk_norm_rope:
+            self.factor, self.low, self.high, self.attention_factor = (
+                compute_yarn_parameters(self.config)
+            )
+
+    def apply_qk_norm_rope(self, qkv, positions, forward_batch):
+        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        if use_fused:
+            positions = (
+                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
+            )
+            fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rope_theta,
+                self.rotary_emb.is_neox_style,
+                positions,
+                self.factor,
+                self.low,
+                self.high,
+                self.attention_factor,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            self._used_fused_qk_norm_rope_last_call = True
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    and self.compatible_with_fused_kv_buffer
+                    else None
+                ),
+            )
+            self._used_fused_qk_norm_rope_last_call = False
+        return q, k, v
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -293,10 +356,9 @@ class Glm4MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+
+        q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -304,7 +366,22 @@ class Glm4MoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state)
+
+        q, k, v, fb = inner_state
+
+        must_save_kv = self._used_fused_qk_norm_rope_last_call
+        save_kv_cache = must_save_kv or not (
+            enable_fused_set_kv_buffer(forward_batch)
+            and self.compatible_with_fused_kv_buffer
+        )
+
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            fb,
+            save_kv_cache=save_kv_cache,
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
