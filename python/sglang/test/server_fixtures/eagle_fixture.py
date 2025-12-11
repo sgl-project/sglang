@@ -30,32 +30,32 @@ PROMPTS = [
 ]
 
 
-class TestEAGLEServer(CustomTestCase):
+class EagleServerBase(CustomTestCase):
+    tager_model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
+    draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
+    spec_aglo = "EAGLE"
+    spec_steps = 5
+    spec_topk = 8
+    sepc_tokens = 64
+    mem_fraction_static = 0.7
+    extra_args = []
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.tager_model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                8,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                8,
-            ],
+                f"--speculative-algorithm={cls.spec_aglo}",
+                f"--speculative-draft-model-path={cls.draft_model}",
+                f"--speculative-num-steps={cls.spec_steps}",
+                f"--speculative-eagle-topk={cls.spec_topk}",
+                f"--speculative-num-draft-tokens={cls.sepc_tokens}",
+                f"--mem-fraction-static={cls.mem_fraction_static}",
+            ]
+            + cls.extra_args,
         )
 
     @classmethod
@@ -94,6 +94,36 @@ class TestEAGLEServer(CustomTestCase):
             except Exception as e:
                 print(e)
                 pass
+
+    def run_decode(self, sampling_params):
+        return_logprob = True
+        top_logprobs_num = 5
+        return_text = True
+        n = 1
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
+                "sampling_params": {
+                    "max_new_tokens": 48,
+                    "n": n,
+                    "temperature": 0.7,
+                    **sampling_params,
+                },
+                "return_logprob": return_logprob,
+                "top_logprobs_num": top_logprobs_num,
+                "return_text_in_logprobs": return_text,
+                "logprob_start_len": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        print(json.dumps(response.json()))
+        print("=" * 100)
+
+
+class TestEAGLEServer(EagleServerBase):
+    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
     def test_request_abort(self):
         concurrency = 4
@@ -295,32 +325,6 @@ class TestEAGLEServer(CustomTestCase):
         func = partial(run_logprob_check, self)
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
-
-    def run_decode(self, sampling_params):
-        return_logprob = True
-        top_logprobs_num = 5
-        return_text = True
-        n = 1
-
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
-                "sampling_params": {
-                    "max_new_tokens": 48,
-                    "n": n,
-                    "temperature": 0.7,
-                    **sampling_params,
-                },
-                "return_logprob": return_logprob,
-                "top_logprobs_num": top_logprobs_num,
-                "return_text_in_logprobs": return_text,
-                "logprob_start_len": 0,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        print(json.dumps(response.json()))
-        print("=" * 100)
 
     def test_penalty_mixed(self):
         args = [
