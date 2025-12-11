@@ -57,6 +57,3 @@ else
 fi
 
 rm -rf "nvidia-mathdx-$VERSION"
-
-
-

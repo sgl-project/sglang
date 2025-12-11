@@ -2,11 +2,11 @@
 #define __CUDA_ARCH__ 900
 #endif
 
-#include <cublasdx.hpp>
-#include <cusolverdx.hpp>
-
 #include <cooperative_groups.h>
+
+#include <cublasdx.hpp>
 #include <cuda/atomic>
+#include <cusolverdx.hpp>
 
 #ifdef WITH_NVSHMEM
 #undef uint64_t
@@ -26,33 +26,19 @@ namespace cg = cooperative_groups;
 template <int N>
 __device__ void gaussian_elimination_solve(float a[N][N], float b[N]) {
   int status;
-  decltype(cusolverdx::Size<N>() +
-           cusolverdx::Function<cusolverdx::function::posv>() +
-           cusolverdx::Arrangement<cusolverdx::row_major,
-                                   cusolverdx::row_major>() +
-           cusolverdx::SM<SM_Ver>() + cusolverdx::Block() +
-           cusolverdx::FillMode<cusolverdx::lower>() +
-           cusolverdx::BlockDim<BLOCK_DIM>())()
+  decltype(cusolverdx::Size<N>() + cusolverdx::Function<cusolverdx::function::posv>() + cusolverdx::Arrangement<cusolverdx::row_major, cusolverdx::row_major>() + cusolverdx::SM<SM_Ver>() + cusolverdx::Block() + cusolverdx::FillMode<cusolverdx::lower>() + cusolverdx::BlockDim<BLOCK_DIM>())()
       .execute(a[0], b, &status);
 }
 
 template <int M, int N, int K>
-__device__ void matmulNT(float *a, float *b, float *c) {
-  decltype(cublasdx::Size<M, N, K>() +
-           cublasdx::Function<cublasdx::function::MM>() +
-           cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major>() +
-           cublasdx::SM<SM_Ver>() + cublasdx::Block() +
-           cublasdx::BlockDim<BLOCK_DIM>())()
+__device__ void matmulNT(float* a, float* b, float* c) {
+  decltype(cublasdx::Size<M, N, K>() + cublasdx::Function<cublasdx::function::MM>() + cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major>() + cublasdx::SM<SM_Ver>() + cublasdx::Block() + cublasdx::BlockDim<BLOCK_DIM>())()
       .execute(1.f, a, b, 0.f, c);
 }
 
 template <int M, int N, int K>
-__device__ void matmulNN(float *a, float *b, float *c) {
-  decltype(cublasdx::Size<M, N, K>() +
-           cublasdx::Function<cublasdx::function::MM>() +
-           cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>() +
-           cublasdx::SM<SM_Ver>() + cublasdx::Block() +
-           cublasdx::BlockDim<BLOCK_DIM>())()
+__device__ void matmulNN(float* a, float* b, float* c) {
+  decltype(cublasdx::Size<M, N, K>() + cublasdx::Function<cublasdx::function::MM>() + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>() + cublasdx::SM<SM_Ver>() + cublasdx::Block() + cublasdx::BlockDim<BLOCK_DIM>())()
       .execute(1.f, a, b, 0.f, c);
 }
 
@@ -70,13 +56,11 @@ struct smem_variables {
   bool avail_flag;
 };
 
-extern "C" __global__ void get_smem_size(int *size_output) {
+extern "C" __global__ void get_smem_size(int* size_output) {
   *size_output = sizeof(smem_variables);
 }
 
-extern "C" __global__ void
-kernel_solve(int *avail_num, float *result, 
-             float *input_a, float *input_b, float *input_c) {
+extern "C" __global__ void kernel_solve(int* avail_num, float* result, float* input_a, float* input_b, float* input_c) {
   extern __shared__ smem_variables smem[];
 
   const int pid = blockIdx.x;
@@ -84,9 +68,9 @@ kernel_solve(int *avail_num, float *result,
   const int dim = blockDim.x;
 
   // Load matrices from input into shared memory
-  auto &&a = smem->a;
-  auto &&b = smem->b;
-  auto &&c = smem->c;
+  auto&& a = smem->a;
+  auto&& b = smem->b;
+  auto&& c = smem->c;
 
   // Copy matrix a from input
   for (int i = tid; i < NC * NV; i += dim) {
@@ -95,7 +79,7 @@ kernel_solve(int *avail_num, float *result,
   }
   __syncthreads();
 
-  // Copy matrix b from input  
+  // Copy matrix b from input
   for (int i = tid; i < NC; i += dim) {
     b[i] = input_b[pid * NC + i];
   }
@@ -107,14 +91,14 @@ kernel_solve(int *avail_num, float *result,
   }
   __syncthreads();
 
-  auto &&ax2 = smem->ax2;
-  auto &&ax2a = smem->ax2a;
-  auto &&x = smem->x;
-  auto &&ax2c = smem->ax2c;
-  auto &&r = smem->r;
-  auto &&d = smem->d;
-  auto &&alpha = smem->alpha;
-  float d_max, max_residual; // 在第一个 warp 可用
+  auto&& ax2 = smem->ax2;
+  auto&& ax2a = smem->ax2a;
+  auto&& x = smem->x;
+  auto&& ax2c = smem->ax2c;
+  auto&& r = smem->r;
+  auto&& d = smem->d;
+  auto&& alpha = smem->alpha;
+  float d_max, max_residual;  // 在第一个 warp 可用
   for (int j = tid; j < NV; j += dim)
     x[j] = 1;
   __syncthreads();
@@ -144,8 +128,7 @@ kernel_solve(int *avail_num, float *result,
         d_max = d[j] = x[j] * (c[j] - r[j]);
       for (int offset = 16; offset > 0; offset >>= 1)
         d_max = fmaxf(d_max, __shfl_xor_sync(0xffffffff, d_max, offset));
-      if (tid == 0)
-        alpha = 0.999 / d_max;
+      if (tid == 0) alpha = 0.999 / d_max;
     }
     __syncthreads();
     for (int j = tid; j < NV; j += dim)
@@ -160,13 +143,11 @@ kernel_solve(int *avail_num, float *result,
     for (int i = tid; i < NC; i += 32)
       max_residual = fmaxf(max_residual, fabsf(ax2c[i] - b[i]));
     for (int offset = 16; offset > 0; offset >>= 1)
-      max_residual = fmaxf(max_residual,
-                           __shfl_down_sync(0xffffffff, max_residual, offset));
+      max_residual = fmaxf(max_residual, __shfl_down_sync(0xffffffff, max_residual, offset));
   }
-  auto &&avail_flag = smem->avail_flag;
+  auto&& avail_flag = smem->avail_flag;
   if (tid == 0) {
-    avail_flag = (d_max < 0.1 && 0 <= x[NV - 1] && x[NV - 1] < 1e-4 &&
-                  max_residual < 0.05);
+    avail_flag = (d_max < 0.1 && 0 <= x[NV - 1] && x[NV - 1] < 1e-4 && max_residual < 0.05);
     atomicAdd(avail_num, (int)avail_flag);
   }
   __syncthreads();

@@ -1,72 +1,71 @@
-#include <torch/extension.h>
-#include <c10/cuda/CUDAFunctions.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <nvJitLink.h>
 #include <nvrtc.h>
-#include <vector>
-#include <string>
+#include <pybind11/pybind11.h>
+#include <torch/extension.h>
+
 #include <fstream>
 #include <iostream>
-#include <sstream>
-#include <dlfcn.h>
 #include <map>
-#include <pybind11/pybind11.h>
-#include <c10/cuda/CUDAStream.h>
+#include <sstream>
+#include <string>
+#include <vector>
 
-#define NVRTC_SAFE_CALL(x)                                                     \
-  do {                                                                         \
-    nvrtcResult result = x;                                                    \
-    if (result != NVRTC_SUCCESS) {                                             \
-      std::ostringstream oss;                                                  \
-      oss << "\nerror: " #x " failed with error "                              \
-          << nvrtcGetErrorString(result) << '\n';                              \
-      throw std::runtime_error(oss.str());                                     \
-    }                                                                          \
+#define NVRTC_SAFE_CALL(x)                                                                \
+  do {                                                                                    \
+    nvrtcResult result = x;                                                               \
+    if (result != NVRTC_SUCCESS) {                                                        \
+      std::ostringstream oss;                                                             \
+      oss << "\nerror: " #x " failed with error " << nvrtcGetErrorString(result) << '\n'; \
+      throw std::runtime_error(oss.str());                                                \
+    }                                                                                     \
   } while (0)
 
-#define CU_SAFE_CALL(x)                                                        \
-  do {                                                                         \
-    CUresult result = x;                                                       \
-    if (result != CUDA_SUCCESS) {                                              \
-      std::ostringstream oss;                                                  \
-      const char *msg;                                                         \
-      cuGetErrorName(result, &msg);                                            \
-      oss << "\nerror: " #x " failed with error " << msg << '\n';              \
-      throw std::runtime_error(oss.str());                                     \
-    }                                                                          \
+#define CU_SAFE_CALL(x)                                           \
+  do {                                                            \
+    CUresult result = x;                                          \
+    if (result != CUDA_SUCCESS) {                                 \
+      std::ostringstream oss;                                     \
+      const char* msg;                                            \
+      cuGetErrorName(result, &msg);                               \
+      oss << "\nerror: " #x " failed with error " << msg << '\n'; \
+      throw std::runtime_error(oss.str());                        \
+    }                                                             \
   } while (0)
 
-#define CUDA_SAFE_CALL(x)                                                      \
-  do {                                                                         \
-    cudaError_t result = x;                                                    \
-    if (result != cudaSuccess) {                                               \
-      std::ostringstream oss;                                                  \
-      oss << "\nerror: " #x " failed with error " << cudaGetErrorName(result)  \
-          << '\n';                                                             \
-      throw std::runtime_error(oss.str());                                     \
-    }                                                                          \
+#define CUDA_SAFE_CALL(x)                                                              \
+  do {                                                                                 \
+    cudaError_t result = x;                                                            \
+    if (result != cudaSuccess) {                                                       \
+      std::ostringstream oss;                                                          \
+      oss << "\nerror: " #x " failed with error " << cudaGetErrorName(result) << '\n'; \
+      throw std::runtime_error(oss.str());                                             \
+    }                                                                                  \
   } while (0)
 
-#define NVJITLINK_SAFE_CALL(h, x)                                              \
-  do {                                                                         \
-    nvJitLinkResult result = x;                                                \
-    if (result != NVJITLINK_SUCCESS) {                                         \
-      std::ostringstream oss;                                                  \
-      oss << "\nerror: " #x " failed with error " << result << '\n';           \
-      size_t lsize;                                                            \
-      result = nvJitLinkGetErrorLogSize(h, &lsize);                            \
-      if (result == NVJITLINK_SUCCESS && lsize > 0) {                          \
-        char *log = (char *)malloc(lsize);                                     \
-        result = nvJitLinkGetErrorLog(h, log);                                 \
-        if (result == NVJITLINK_SUCCESS) {                                     \
-          oss << "error: " << log << '\n';                                     \
-          free(log);                                                           \
-        }                                                                      \
-      }                                                                        \
-      throw std::runtime_error(oss.str());                                     \
-    }                                                                          \
+#define NVJITLINK_SAFE_CALL(h, x)                                    \
+  do {                                                               \
+    nvJitLinkResult result = x;                                      \
+    if (result != NVJITLINK_SUCCESS) {                               \
+      std::ostringstream oss;                                        \
+      oss << "\nerror: " #x " failed with error " << result << '\n'; \
+      size_t lsize;                                                  \
+      result = nvJitLinkGetErrorLogSize(h, &lsize);                  \
+      if (result == NVJITLINK_SUCCESS && lsize > 0) {                \
+        char* log = (char*)malloc(lsize);                            \
+        result = nvJitLinkGetErrorLog(h, log);                       \
+        if (result == NVJITLINK_SUCCESS) {                           \
+          oss << "error: " << log << '\n';                           \
+          free(log);                                                 \
+        }                                                            \
+      }                                                              \
+      throw std::runtime_error(oss.str());                           \
+    }                                                                \
   } while (0)
 
 struct compiled_solver {
@@ -77,11 +76,8 @@ struct compiled_solver {
   int block_dim;
   int smem_size;
 
-  compiled_solver(const std::string &resource_path, int NC,
-                  int NV, int block_dim)
-      : kernel_ipm(nullptr), module(nullptr), NC(NC),
-        NV(NV), block_dim(block_dim), smem_size(-1) {
-    
+  compiled_solver(const std::string& resource_path, int NC, int NV, int block_dim)
+      : kernel_ipm(nullptr), module(nullptr), NC(NC), NV(NV), block_dim(block_dim), smem_size(-1) {
     // 1. Get Device Architecture
     CUdevice cuDevice = c10::cuda::current_device();
     int major = 0, minor = 0;
@@ -95,10 +91,9 @@ struct compiled_solver {
     std::string source_path = resource_path + "/templates/ipm.cu";
     std::ifstream kernel_file(source_path);
     if (!kernel_file.good()) {
-        throw std::runtime_error("Cannot find templates/ipm.cu at " + source_path);
+      throw std::runtime_error("Cannot find templates/ipm.cu at " + source_path);
     }
-    std::string kernel_source((std::istreambuf_iterator<char>(kernel_file)),
-                              std::istreambuf_iterator<char>());
+    std::string kernel_source((std::istreambuf_iterator<char>(kernel_file)), std::istreambuf_iterator<char>());
     kernel_file.close();
 
     // 3. Create NVRTC Program
@@ -115,8 +110,8 @@ struct compiled_solver {
     std::string inc_mathdx = "-I" + mathdx_path + "include";
     std::string inc_cublasdx = "-I" + mathdx_path + "include/cublasdx";
     std::string inc_cutlass = "-I" + mathdx_path + "external/cutlass/include";
-    
-    std::vector<const char *> opts = {
+
+    std::vector<const char*> opts = {
         "-dlto",
         "--relocatable-device-code=true",
         "-default-device",
@@ -128,7 +123,7 @@ struct compiled_solver {
         inc_mathdx.c_str(),
         inc_cublasdx.c_str(),
         inc_cutlass.c_str(),
-        "-I/usr/local/cuda/include" // Fallback
+        "-I/usr/local/cuda/include"  // Fallback
     };
 
     // // Debug: Print compilation options
@@ -143,12 +138,12 @@ struct compiled_solver {
     size_t logSize;
     NVRTC_SAFE_CALL(nvrtcGetProgramLogSize(prog, &logSize));
     if (logSize > 1) {
-        std::vector<char> log(logSize);
-        NVRTC_SAFE_CALL(nvrtcGetProgramLog(prog, log.data()));
-        if (compileResult != NVRTC_SUCCESS) {
-             std::cerr << log.data() << std::endl;
-             throw std::runtime_error("NVRTC Compilation failed");
-        }
+      std::vector<char> log(logSize);
+      NVRTC_SAFE_CALL(nvrtcGetProgramLog(prog, log.data()));
+      if (compileResult != NVRTC_SUCCESS) {
+        std::cerr << log.data() << std::endl;
+        throw std::runtime_error("NVRTC Compilation failed");
+      }
     }
 
     // Get LTO IR
@@ -162,13 +157,13 @@ struct compiled_solver {
     nvJitLinkHandle handle;
     char smbuf[16];
     sprintf(smbuf, "-arch=sm_%d", arch);
-    const char *lopts[] = {"-lto", smbuf};
+    const char* lopts[] = {"-lto", smbuf};
     NVJITLINK_SAFE_CALL(handle, nvJitLinkCreate(&handle, 2, lopts));
 
     // Add MathDx Fatbin
     std::string lib_path = mathdx_path + "/lib/libcusolverdx.fatbin";
     NVJITLINK_SAFE_CALL(handle, nvJitLinkAddFile(handle, NVJITLINK_INPUT_FATBIN, lib_path.c_str()));
-    
+
     // Add our LTO IR
     NVJITLINK_SAFE_CALL(handle, nvJitLinkAddData(handle, NVJITLINK_INPUT_LTOIR, LTOIR.data(), LTOIRSize, "ipm_lto"));
 
@@ -176,7 +171,7 @@ struct compiled_solver {
     NVJITLINK_SAFE_CALL(handle, nvJitLinkComplete(handle));
     size_t cubinSize;
     NVJITLINK_SAFE_CALL(handle, nvJitLinkGetLinkedCubinSize(handle, &cubinSize));
-    void *cubin = malloc(cubinSize);
+    void* cubin = malloc(cubinSize);
     NVJITLINK_SAFE_CALL(handle, nvJitLinkGetLinkedCubin(handle, cubin));
     NVJITLINK_SAFE_CALL(handle, nvJitLinkDestroy(&handle));
 
@@ -188,16 +183,16 @@ struct compiled_solver {
     // 7. Calculate Shared Memory Size
     CUfunction get_smem_size;
     CU_SAFE_CALL(cuModuleGetFunction(&get_smem_size, module, "get_smem_size"));
-    
+
     int h_smem_size = 0;
-    int *d_smem_size;
+    int* d_smem_size;
     CUDA_SAFE_CALL(cudaMalloc(&d_smem_size, sizeof(int)));
-    
-    void *args[] = {&d_smem_size};
+
+    void* args[] = {&d_smem_size};
     CU_SAFE_CALL(cuLaunchKernel(get_smem_size, 1, 1, 1, 1, 1, 1, 0, nullptr, args, nullptr));
     CUDA_SAFE_CALL(cudaMemcpy(&h_smem_size, d_smem_size, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaFree(d_smem_size));
-    
+
     this->smem_size = h_smem_size;
     // std::cout << "Smem size: " << smem_size << std::endl;
 
@@ -207,36 +202,31 @@ struct compiled_solver {
   at::Tensor operator()(at::Tensor A, at::Tensor b, at::Tensor c, at::Tensor avail_num) {
     // Input Validation
     TORCH_CHECK(avail_num.scalar_type() == torch::kInt32, "avail_num must be int32");
-    
+
     // Pointers
-    void *p_avail_num = avail_num.data_ptr();
-    void *p_A = A.data_ptr();
-    void *p_b = b.data_ptr();
-    void *p_c = c.data_ptr();
+    void* p_avail_num = avail_num.data_ptr();
+    void* p_A = A.data_ptr();
+    void* p_b = b.data_ptr();
+    void* p_c = c.data_ptr();
 
     // Create Result Tensor
     long result_size = NV;
-    at::Tensor result = at::empty({result_size}, A.options()); 
-    void *p_result = result.data_ptr();
+    at::Tensor result = at::empty({result_size}, A.options());
+    void* p_result = result.data_ptr();
 
-    void *args[] = {&p_avail_num, &p_result, &p_A, &p_b, &p_c};
+    void* args[] = {&p_avail_num, &p_result, &p_A, &p_b, &p_c};
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    
+
     // Cooperative Launch
     // Grid (1,1,1), Block (block_dim, 1, 1)
-    CU_SAFE_CALL(cuLaunchCooperativeKernel(kernel_ipm, 
-                                           1, 1, 1, 
-                                           block_dim, 1, 1, 
-                                           smem_size, 
-                                           stream, args));
+    CU_SAFE_CALL(cuLaunchCooperativeKernel(kernel_ipm, 1, 1, 1, block_dim, 1, 1, smem_size, stream, args));
     return result;
   }
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<compiled_solver>(m, "CompiledSolver")
-      .def(py::init<const std::string &, int, int, int>())
-      .def("solve", &compiled_solver::operator(),
-           py::arg("A"), py::arg("b"), py::arg("c"), py::arg("avail_num"));
+      .def(py::init<const std::string&, int, int, int>())
+      .def("solve", &compiled_solver::operator(), py::arg("A"), py::arg("b"), py::arg("c"), py::arg("avail_num"));
 }
