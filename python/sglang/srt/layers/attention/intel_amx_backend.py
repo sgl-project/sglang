@@ -77,44 +77,34 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         key_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        if isinstance(key_buffer, tuple):
-            self.extend_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k,
-                v,
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                key_buffer[0],
-                value_buffer[0],
-                key_buffer[1],
-                value_buffer[1],
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.extend_seq_lens,
-                forward_batch.extend_start_loc,
-                max_extend_len,
-                layer.scaling,
-                layer.logit_cap,
-            )
-        else:
-            self.extend_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k,
-                v,
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                key_buffer,
-                value_buffer,
-                None,
-                None,
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.extend_seq_lens,
-                forward_batch.extend_start_loc,
-                max_extend_len,
-                layer.scaling,
-                layer.logit_cap,
-            )
+        key_buf1, value_buf1 = (
+            (key_buffer[1], value_buffer[1])
+            if isinstance(key_buffer, tuple)
+            else (None, None)
+        )
+        key_buf0, value_buf0 = (
+            (key_buffer[0], value_buffer[0])
+            if isinstance(key_buffer, tuple)
+            else (key_buffer, value_buffer)
+        )
+        self.extend_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k,
+            v,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            key_buf0,
+            value_buf0,
+            key_buf1,
+            value_buf1,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_start_loc,
+            max_extend_len,
+            layer.scaling,
+            layer.logit_cap,
+        )
         return o
 
     def forward_decode(
@@ -136,42 +126,33 @@ class IntelAMXAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
         key_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        if isinstance(key_buffer, tuple):
-            self.decode_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                key_buffer[0],
-                value_buffer[0],
-                key_buffer[1],
-                value_buffer[1],
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                k,
-                v,
-                forward_batch.out_cache_loc,
-                attn_logits,
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                layer.scaling,
-                layer.logit_cap,
-            )
-        else:
-            self.decode_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                key_buffer,
-                value_buffer,
-                None,
-                None,
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                k,
-                v,
-                forward_batch.out_cache_loc,
-                attn_logits,
-                forward_batch.req_to_token_pool.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                layer.scaling,
-                layer.logit_cap,
-            )
+        key_buf1, value_buf1 = (
+            (key_buffer[1], value_buffer[1])
+            if isinstance(key_buffer, tuple)
+            else (None, None)
+        )
+        key_buf0, value_buf0 = (
+            (key_buffer[0], value_buffer[0])
+            if isinstance(key_buffer, tuple)
+            else (key_buffer, value_buffer)
+        )
+        self.decode_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            key_buf0,
+            value_buf0,
+            key_buf1,
+            value_buf1,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k,
+            v,
+            forward_batch.out_cache_loc,
+            attn_logits,
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            layer.scaling,
+            layer.logit_cap,
+        )
 
         return o
 

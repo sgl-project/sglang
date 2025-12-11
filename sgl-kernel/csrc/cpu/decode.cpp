@@ -273,20 +273,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
 }
 
 template <typename scalar_t>
-inline void
-copy_stub(at::Float8_e4m3fn* __restrict__ out, const scalar_t* __restrict__ src, int64_t size, float scale) {
-  for (int64_t d = 0; d < size; ++d) {
-    float scaled_src = static_cast<float>(src[d]) * scale;
-    if (scaled_src < FP8_MIN) {
-      scaled_src = FP8_MIN;
-    } else if (scaled_src > FP8_MAX) {
-      scaled_src = FP8_MAX;
-    }
-    out[d] = static_cast<at::Float8_e4m3fn>(scaled_src);
-  }
-}
-
-template <typename scalar_t>
 inline void copy_stub(at::Float8_e5m2* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
   for (int64_t d = 0; d < size; ++d) {
     out[d] = static_cast<at::Float8_e5m2>(src[d]);
@@ -296,23 +282,9 @@ inline void copy_stub(at::Float8_e5m2* __restrict__ out, const scalar_t* __restr
 template <>
 inline void copy_stub(at::Float8_e5m2* __restrict__ out, const at::BFloat16* __restrict__ src, int64_t size) {
   int64_t i = 0;
-  const __m512i vnaninf = _mm512_set1_epi16(0x7c00);
-  const __m512i vrneadd = _mm512_set1_epi16(0x007f);
-  const __m512i vfixup = _mm512_set1_epi16(0x0001);
-  const __m512i vfixupmask = _mm512_set1_epi16(0x0100);
   for (; i < size - 31; i += 32) {
-    __m512i x0 = _mm512_loadu_si512(&src[i]);
-    __m512 b = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(x0, 0));
-    __m512 a = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(x0, 1));
-
-    __m256i ah_ = _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-    __m256i bh_ = _mm512_cvtps_ph(b, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-    const __m512i a_ = _mm512_inserti64x4(_mm512_inserti64x4(_mm512_setzero_si512(), bh_, 0), ah_, 1);
-    const __mmask32 maska1_ = _mm512_cmp_epi16_mask(_mm512_and_si512(a_, vnaninf), vnaninf, _MM_CMPINT_NE);
-    const __mmask32 maska2_ = _mm512_cmp_epi16_mask(_mm512_and_si512(a_, vfixupmask), vfixupmask, _MM_CMPINT_EQ);
-    __m512i a_rne_ = _mm512_mask_add_epi16(a_, maska1_, a_, _mm512_mask_add_epi16(vrneadd, maska2_, vrneadd, vfixup));
-    a_rne_ = _mm512_srli_epi16(a_rne_, 8);
-    _mm256_storeu_epi8(&out[i], _mm512_cvtepi16_epi8(a_rne_));
+    __m256i a_rne = CVT_BF16_TO_FP8(_mm512_loadu_si512(&src[i]));
+    _mm256_storeu_epi8(&out[i], a_rne);
   }
 
   for (; i < size; i++) {
@@ -1120,10 +1092,10 @@ void index_gemm_kernel_nn(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename kvcache_t>
 void decode_set_kv_buffer(
-    scalar_t* __restrict__ k_buffer,
-    scalar_t* __restrict__ v_buffer,
+    kvcache_t* __restrict__ k_buffer,
+    kvcache_t* __restrict__ v_buffer,
     float* __restrict__ k_scale,
     float* __restrict__ v_scale,
     const scalar_t* __restrict__ key,
@@ -1148,11 +1120,11 @@ void decode_set_kv_buffer(
 
     for (int64_t i = begin; i < end; i++) {
       int64_t loc_val = loc[bs];
-      scalar_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
+      kvcache_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
       const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
       copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
       if (!is_mla) {
-        scalar_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
+        kvcache_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
         const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
         copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
       }
@@ -1161,29 +1133,6 @@ void decode_set_kv_buffer(
       data_index_step(bs, batches, head_kv_id, num_heads_kv);
     }
   });
-}
-
-template <typename scalar_t>
-float find_max_abs(const scalar_t* __restrict__ data, int64_t size, float max_val) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-  auto vec_size = Vec::size();
-  int64_t i = 0;
-  for (; i <= size - vec_size; i += vec_size) {
-    Vec vec_data = Vec::loadu(data + i);
-    Vec vec_abs = vec_data.abs();
-    scalar_t vec_max =
-        at::vec::vec_reduce_all<scalar_t>([](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, vec_abs);
-    if (vec_max > max_val) {
-      max_val = vec_max;
-    }
-  }
-  for (; i < size; i++) {
-    scalar_t abs_val = std::abs(data[i]);
-    if (abs_val > max_val) {
-      max_val = abs_val;
-    }
-  }
-  return max_val;
 }
 
 template <typename scalar_t>
@@ -1214,83 +1163,25 @@ void decode_set_kv_buffer(
     data_index_init(begin, bs, batches);
     for (int64_t i = begin; i < end; i++) {
       int64_t loc_val = loc[bs];
-      float max_abs = 0;
-      for (int64_t hi = 0; hi < num_heads_kv; hi++) {
-        const scalar_t* key_ptr = key + bs * nk_strideN + hi * nk_strideH;
-        max_abs = find_max_abs<scalar_t>(key_ptr, head_size, max_abs);
-      }
-      k_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
+      quantize_tensor_fp8<scalar_t>(
+          k_buffer + loc_val * k_strideN,
+          k_scale[loc_val],
+          key + bs * nk_strideN,
+          num_heads_kv,
+          head_size,
+          k_strideH,
+          nk_strideH);
       if (!is_mla) {
-        max_abs = 0;
-        for (int64_t hi = 0; hi < num_heads_kv; hi++) {
-          const scalar_t* value_ptr = value + bs * nv_strideN + hi * nv_strideH;
-          max_abs = find_max_abs<scalar_t>(value_ptr, head_size_v, max_abs);
-        }
-        v_scale[loc_val] = std::max(max_abs / FP8_MAX, eps);
+        quantize_tensor_fp8<scalar_t>(
+            v_buffer + loc_val * v_strideN,
+            v_scale[loc_val],
+            value + bs * nv_strideN,
+            num_heads_kv,
+            head_size_v,
+            v_strideH,
+            nv_strideH);
       }
       data_index_step(bs, batches);
-    }
-  });
-  at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
-    int64_t bs{0}, head_kv_id{0};
-    data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
-
-    for (int64_t i = begin; i < end; i++) {
-      int64_t loc_val = loc[bs];
-      at::Float8_e4m3fn* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
-      const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
-      copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size, 1 / k_scale[loc_val]);
-      if (!is_mla) {
-        at::Float8_e4m3fn* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
-        const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-        copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v, 1 / v_scale[loc_val]);
-      }
-
-      // move to the next index
-      data_index_step(bs, batches, head_kv_id, num_heads_kv);
-    }
-  });
-}
-
-template <typename scalar_t>
-void decode_set_kv_buffer(
-    at::Float8_e5m2* __restrict__ k_buffer,
-    at::Float8_e5m2* __restrict__ v_buffer,
-    float* __restrict__ k_scale,
-    float* __restrict__ v_scale,
-    const scalar_t* __restrict__ key,
-    const scalar_t* __restrict__ value,
-    const int64_t* __restrict__ loc,
-    int64_t batches,
-    int64_t num_heads_kv,
-    int64_t head_size,
-    int64_t head_size_v,
-    int64_t k_strideN,
-    int64_t k_strideH,
-    int64_t v_strideN,
-    int64_t v_strideH,
-    int64_t nk_strideN,
-    int64_t nk_strideH,
-    int64_t nv_strideN,
-    int64_t nv_strideH,
-    bool is_mla) {
-  at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
-    int64_t bs{0}, head_kv_id{0};
-    data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
-
-    for (int64_t i = begin; i < end; i++) {
-      int64_t loc_val = loc[bs];
-      at::Float8_e5m2* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
-      const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
-      copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
-      if (!is_mla) {
-        at::Float8_e5m2* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
-        const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-        copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
-      }
-
-      // move to the next index
-      data_index_step(bs, batches, head_kv_id, num_heads_kv);
     }
   });
 }
