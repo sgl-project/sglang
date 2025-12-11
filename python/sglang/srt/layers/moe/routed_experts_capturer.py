@@ -1,6 +1,5 @@
 import logging
 from abc import ABC
-from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -13,6 +12,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -122,6 +122,14 @@ class RoutedExpertsCapturer(ABC):
         else:
             return _RoutedExpertsCapturerNoop()
 
+    def _sync_fwd_experts_buffer_DtoH(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+    ):
+        raise NotImplementedError
+
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
 
@@ -133,18 +141,8 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
-    def sync_fwd_experts_buffer_DtoH(
-        self,
-        device_loc: torch.Tensor,
-        cpu_loc: torch.Tensor,
-        can_run_graph: bool,
-        cuda_graph_batch: int,
-    ):
+    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
         raise NotImplementedError
-
-    @contextmanager
-    def with_forward(self, forward_batch):
-        yield
 
     def get_host_cache(self):
         raise NotImplementedError
@@ -164,7 +162,6 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         num_fused_shared_experts: int,
         device: str,
     ):
-        self.forward_batch = None
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
@@ -183,18 +180,14 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             device=device,
         )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
-        self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
-
-    def sync_fwd_experts_buffer_DtoH(
+    def _sync_fwd_experts_buffer_DtoH(
         self,
-        device_loc: torch.Tensor,
-        cpu_loc: torch.Tensor,
+        forward_batch: ForwardBatch,
         can_run_graph: bool,
         cuda_graph_batch: int,
     ):
         if is_dp_attention_enabled():
-            local_start_pos, local_num_tokens = get_dp_local_info(self.forward_batch)
+            local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
             # handle with cuda graph padding
             if can_run_graph:
                 local_start_pos = get_attention_dp_rank() * cuda_graph_batch
@@ -203,11 +196,16 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 local_end_pos = local_start_pos + local_num_tokens
         else:
             local_start_pos = 0
-            local_end_pos = device_loc.shape[0]
+            local_end_pos = forward_batch.out_cache_loc.shape[0]
 
-        self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[
-            local_start_pos:local_end_pos, :, : self.num_experts_per_tok
-        ].cpu()
+        self.host_cache.buffer[forward_batch.out_cache_loc_cpu] = (
+            self.device_cache.buffer[
+                local_start_pos:local_end_pos, :, : self.num_experts_per_tok
+            ].cpu()
+        )
+
+    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+        self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
 
     def get_routed_experts(
         self,
@@ -220,10 +218,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         )
         return self.get_host_cache().buffer[cache_pool_idx]
 
-    @contextmanager
-    def with_forward(self, forward_batch):
-        self.forward_batch = forward_batch
-        yield
+    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
+        self._sync_fwd_experts_buffer_DtoH(
+            forward_batch=forward_batch,
+            can_run_graph=can_run_graph,
+            cuda_graph_batch=cuda_graph_batch,
+        )
 
     def get_host_cache(self):
         return self.host_cache
@@ -234,6 +234,14 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
 class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def __init__(self):
+        pass
+
+    def _sync_fwd_experts_buffer_DtoH(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+    ):
         pass
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
@@ -247,18 +255,8 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def sync_fwd_experts_buffer_DtoH(
-        self,
-        device_loc: torch.Tensor,
-        cpu_loc: torch.Tensor,
-        can_run_graph: bool,
-        cuda_graph_batch: int,
-    ):
+    def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
         pass
-
-    @contextmanager
-    def with_forward(self, forward_batch):
-        yield
 
     def get_host_cache(self):
         pass

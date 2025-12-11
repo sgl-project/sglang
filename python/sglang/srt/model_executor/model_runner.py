@@ -2689,12 +2689,9 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
-        with (
-            get_global_expert_distribution_recorder().with_forward_pass(
-                self.forward_pass_id,
-                forward_batch,
-            ),
-            get_global_experts_capturer().with_forward(forward_batch),
+        with get_global_expert_distribution_recorder().with_forward_pass(
+            self.forward_pass_id,
+            forward_batch,
         ):
             output = self._forward_raw(
                 forward_batch,
@@ -2703,13 +2700,13 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
-            # Copy cached routing experts' buffers back to CPU cache
-            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
-                device_loc=forward_batch.out_cache_loc,
-                cpu_loc=forward_batch.out_cache_loc_cpu,
-                can_run_graph=output[1],
-                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-            )
+
+        # Copy cached routing experts' buffers back to CPU cache
+        get_global_experts_capturer().on_forward_end(
+            forward_batch=forward_batch,
+            can_run_graph=output[1],
+            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+        )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
