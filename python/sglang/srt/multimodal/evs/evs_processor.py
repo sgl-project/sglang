@@ -115,7 +115,7 @@ class EVSProcessor:
                     feature=video,
                     offsets=video_offsets,
                     thw_grids=video_thw_grids,
-                    pre_evs_input_ids=input_ids_list,
+                    pre_chunked_input_ids=input_ids_list,
                 )
                 items.append(item)
             return items

@@ -36,7 +36,7 @@ class EVSDataItem(MultimodalDataItem):
 
 @dataclasses.dataclass(kw_only=True)
 class VideoEVSDataItem(EVSDataItem):
-    pre_evs_input_ids: torch.Tensor
+    pre_chunked_input_ids: torch.Tensor
 
     def __post_init__(self):
         assert self.is_video()
@@ -59,7 +59,7 @@ class EVSEmbeddingResult(EmbeddingResult):
     """
 
     num_tokens_per_frame: list[int]
-    pre_evs_input_ids: list[int]
+    pre_chunked_input_ids: list[int]
 
     def redistribute_pruned_frames_placeholders(
         self,
@@ -70,8 +70,9 @@ class EVSEmbeddingResult(EmbeddingResult):
         extend_seq_len: int,
         filler_token_id: int,
     ) -> torch.Tensor:
+        assert len(input_ids) == extend_seq_len
         input_ids_list = replace_offsets_with_tokens_per_frame(
-            pre_evs_input_ids=self.pre_evs_input_ids,
+            pre_chunked_input_ids=self.pre_chunked_input_ids,
             num_tokens_per_frame=self.num_tokens_per_frame,
             frame_offsets_inclusive=offsets,
             filler_token_id=filler_token_id,
@@ -190,5 +191,5 @@ class EVS(torch.nn.Module, ABC):
         return EVSEmbeddingResult(
             embedding=final_embeddings_tensor,
             num_tokens_per_frame=num_tokens_per_frame,
-            pre_evs_input_ids=item.pre_evs_input_ids,
+            pre_chunked_input_ids=item.pre_chunked_input_ids,
         )

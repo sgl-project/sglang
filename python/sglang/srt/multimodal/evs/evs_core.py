@@ -121,7 +121,7 @@ def tokens_per_frame(
 
 def replace_offsets_with_tokens_per_frame(
     *,
-    pre_evs_input_ids: list[int],
+    pre_chunked_input_ids: list[int],
     num_tokens_per_frame: list[int],
     frame_offsets_inclusive: list[tuple[int, int]],
     filler_token_id: int,
@@ -134,27 +134,29 @@ def replace_offsets_with_tokens_per_frame(
         Modified input_ids with offsets replaced with new offsets.
 
     Examples:
-    >>> IMG = 0
     >>> assert replace_offsets_with_tokens_per_frame(
-    ...     [1, IMG, IMG, 4, 5, IMG, IMG, IMG, 9, 10, IMG, IMG, 12, 13],
+    ...     pre_chunked_input_ids=[1, 0, 0, 4, 5, 0, 0, 0, 9, 10, 0, 0, 12, 13],
     ...     frame_offsets_inclusive=[(1, 2), (5, 7), (10, 11)],
     ...     num_tokens_per_frame=[1, 4, 2],
-    ... ) == [1, IMG, 4, 5, IMG, IMG, IMG, IMG, 9, 10, IMG, IMG, 12, 13]
+    ...     filler_token_id=0,
+    ... ) ==                      [1, 0, 4, 5, 0, 0, 0, 0, 9, 10, 0, 0, 12, 13]
 
     >>> assert replace_offsets_with_tokens_per_frame(
-    ...     [1, IMG, IMG, 4, 5, 9, 10, IMG, IMG, 0],
+    ...     pre_chunked_input_ids=[1, 0, 0, 4, 5, 9, 10, 0, 0, 0],
     ...     frame_offsets_inclusive=[(1, 2), (7, 9)],
     ...     num_tokens_per_frame=[1, 4],
-    ... ) ==[1, IMG, 4, 5, 9, 10, IMG, IMG, IMG, 0]
+    ...     filler_token_id=0,
+    ... ) ==                      [1, 0, 4, 5, 9, 10, 0, 0, 0, 0]
 
     >>> assert replace_offsets_with_tokens_per_frame(
-    ...     [IMG, IMG, 1, 4, IMG, IMG, IMG, 5, 9, 10],
-    ...     frame_offsets_inclusive=[(IMG, 1), (4, 6)],
+    ...     pre_chunked_input_ids=[0, 0, 1, 4, 0, 0, 0, 5, 9, 10],
+    ...     frame_offsets_inclusive=[(0, 1), (4, 6)],
     ...     num_tokens_per_frame=[1, 4],
-    ... ) ==[IMG, 1, 4, IMG, IMG, IMG, IMG, 5, 9, 10]
+    ...     filler_token_id=0,
+    ... ) ==                      [0, 1, 4, 0, 0, 0, 0, 5, 9, 10]
     """
-    assert isinstance(pre_evs_input_ids, list)
-    ids = pre_evs_input_ids
+    assert isinstance(pre_chunked_input_ids, list)
+    ids = pre_chunked_input_ids
 
     if len(frame_offsets_inclusive) == 1:
         """There might be no frame separators, in which case there will be one contiguous span of tokens"""
