@@ -1023,7 +1023,8 @@ class Indexer(CustomOp):
         indexer_weight_stream = get_indexer_weight_stream()
         indexer_weight_stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(indexer_weight_stream):
-            weights = self.weights_proj(x)[0]
+            x = x.view(-1, self.hidden_size)
+            weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
             weights.record_stream(indexer_weight_stream)
             weights_event = indexer_weight_stream.record_event()
 
