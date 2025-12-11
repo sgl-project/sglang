@@ -1946,7 +1946,9 @@ class ServerArgs:
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
-            assert self.moe_runner_backend in ["flashinfer_cutlass", "flashinfer_cutedsl"], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+            assert self.moe_runner_backend in [
+                "flashinfer_cutlass"
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
