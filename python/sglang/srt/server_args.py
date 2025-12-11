@@ -1836,18 +1836,6 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
-        if self.speculative_moe_a2a_backend is not None:
-            if (
-                self.speculative_moe_a2a_backend == "none"
-                and self.moe_a2a_backend != "none"
-            ) or (
-                self.speculative_moe_a2a_backend != "none"
-                and self.moe_a2a_backend == "none"
-            ):
-                raise ValueError(
-                    "Speculative moe a2a backend and moe a2a backend must be either both none or both not none."
-                )
-
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
