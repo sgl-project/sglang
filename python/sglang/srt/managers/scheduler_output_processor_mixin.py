@@ -260,31 +260,118 @@ class SchedulerOutputProcessorMixin:
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """
+        Extract per-request accepted tokens from repacked dense tensor.
+
+        ============================================================================
+        CONTEXT: Worker-Scheduler Communication for Tree Mode
+        ============================================================================
+
+        The worker (eagle_worker_v2.py) sends us a GenerationBatchResult containing:
+
+          - next_token_ids: DENSE repacked tensor, shape [sum(accept_lens)]
+            NOT the original sparse tensor [bs * tree_size]!
+
+          - accept_lens: [bs] number of accepted tokens per request
+
+        ============================================================================
+        DATA FLOW FROM WORKER
+        ============================================================================
+
+        In verify() (eagle_worker_v2.py), the worker repacks tokens:
+
+          # Worker code:
+          flat_accept_index = accept_index.flatten()
+          valid_mask = flat_accept_index != -1
+          valid_indices = flat_accept_index[valid_mask]
+          repacked_next_token_ids = predict[valid_indices]  # [sum(accept_lens)]
+
+          return GenerationBatchResult(next_token_ids=repacked_next_token_ids, ...)
+
+        ============================================================================
+        EXTRACTION: Cumulative Offset (NOT stride-based!)
+        ============================================================================
+
+        Example (bs=2, num_steps=5, topk=10, tree_size=32, accept_lens=[4, 3]):
+
+          Worker repacks scattered accepts into dense tensor:
+            req 0 accepts flat positions [0, 2, 7, 15] → token_ids [tok_A, tok_B, tok_C, tok_D]
+            req 1 accepts flat positions [32, 34, 39] → token_ids [tok_E, tok_F, tok_G]
+
+          repacked: [tok_A, tok_B, tok_C, tok_D, tok_E, tok_F, tok_G]
+                    ↑──────── req 0 ────────↑  ↑───── req 1 ─────↑
+                    offset 0                   offset 4
+
+          Extraction:
+            req 0: tokens[0:4]  = [tok_A, tok_B, tok_C, tok_D]
+            req 1: tokens[4:7]  = [tok_E, tok_F, tok_G]
+
+        NOTE: This is DIFFERENT from stride-based extraction which would use:
+            req i: tokens[i * stride : i * stride + accept_lens[i]]
+            For stride=32 (tree_size), req 1 would start at 32, not 4!
+
+        The repacked tensor is DENSE and CONTIGUOUS - no padding between requests.
+
+        ============================================================================
+        CONNECTION TO WORKER CHANGES
+        ============================================================================
+
+        1. Worker's _update_req_to_token_for_accepted():
+           - Frees rejected tree slots (returns to allocator)
+           - Updates req_to_token mapping with only accepted slots
+           - Shifts pre-alloc slots and updates kv_allocated_len
+
+        2. Worker modifies batch.reqs[i].kv_allocated_len:
+           - This is the SAME object as our req (shared reference)
+           - We see the updated value in next iteration's prepare_for_decode()
+
+        3. We DO NOT reset kv_allocated_len here:
+           - Worker already adjusted it in _shift_prealloc_slots()
+           - Resetting would cause double-adjustment and memory leak
+
+        ============================================================================
+        """
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
-        next_token_ids = result.next_token_ids.tolist()
-        accept_lens = result.accept_lens.tolist()
+        next_token_ids = result.next_token_ids.tolist()  # [sum(accept_lens)]
+        accept_lens = result.accept_lens.tolist()  # [bs]
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
 
-        # Dense extraction: repacked tensor is contiguous [req0_tokens..., req1_tokens..., ...]
+        # ========================================================================
+        # CUMULATIVE OFFSET EXTRACTION from repacked dense tensor
+        # ========================================================================
+        # The worker repacked tokens into contiguous layout:
+        #   [req0_tok0, req0_tok1, ..., req1_tok0, req1_tok1, ..., req2_tok0, ...]
+        #
+        # We extract using cumulative offset (NOT stride * i):
+        #   req 0: [0 : accept_lens[0]]
+        #   req 1: [accept_lens[0] : accept_lens[0] + accept_lens[1]]
+        #   req 2: [sum(accept_lens[0:2]) : sum(accept_lens[0:3])]
         offset = 0
         for i, req in enumerate(batch.reqs):
+            # Update committed length (tokens verified and output)
             req.kv_committed_len += accept_lens[i]
 
-            # NOTE: Do NOT reset kv_allocated_len for tree mode!
-            # The over-allocated slots are still valid and will be reused.
-            # Rejected tree slots become "dead space" until request ends.
+            # ====================================================================
+            # IMPORTANT: Do NOT reset kv_allocated_len!
+            # ====================================================================
+            # The worker's _shift_prealloc_slots() already adjusted kv_allocated_len:
+            #   kv_allocated_len -= (tree_size - accept_len)
+            #
+            # If we reset it here, we'd double-adjust and cause memory leak.
+            # The pre-allocated slots are still valid for next iteration.
+            # ====================================================================
 
-            # Extract from dense repacked tensor using cumulative offset
+            # Extract this request's tokens from dense repacked tensor
             predict_tokens.append(next_token_ids[offset : offset + accept_lens[i]])
             offset += accept_lens[i]
 
+            # Update speculative decoding statistics
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i] - 1
+            req.spec_accepted_tokens += accept_lens[i] - 1  # -1 for bonus token
 
         return predict_tokens
 

@@ -215,7 +215,36 @@ class EagleDraftInputV2Mixin:
         """
         Prepare batch for draft extend using repacked (variable-length) tensors.
 
-        This is the repacking-aware version that only commits accepted tokens to KV cache.
+        ============================================================================
+        PURPOSE: Tree Mode Draft KV Cache Update
+        ============================================================================
+
+        This function is used after tree verification when we need to commit
+        ONLY the accepted tokens (not the entire tree) to the draft model's KV cache.
+
+        Standard (non-repacked) version assumes all tree tokens are committed,
+        but tree mode has scattered acceptance, so we use this repacked version.
+
+        ============================================================================
+        TENSOR SHAPES (Example: bs=2, num_steps=5, topk=10, tree_size=32)
+        ============================================================================
+
+        Input:
+          - repacked_input_ids: [sum(accept_lens)], e.g., [7] for accept_lens=[4, 3]
+            Contains only the accepted token IDs, NOT the full tree
+          - accept_lens: [bs] = [2], e.g., [4, 3]
+
+        The key insight is that seq_lens grows by accept_lens, NOT by tree_size.
+
+        ============================================================================
+        CONNECTION TO eagle_worker_v2.py
+        ============================================================================
+
+        Called from EAGLEWorkerV2._draft_extend_for_decode() when using repacked
+        tensors for tree mode. The worker repacks the accepted tokens using
+        repack_for_draft_extend() and passes them here.
+
+        ============================================================================
         """
         seq_lens_cpu_ = batch.seq_lens_cpu
 
@@ -261,31 +290,76 @@ def repack_for_draft_extend(
     """
     Repack sparse tensors to contain only accepted tokens for draft extend.
 
-    In V2, predict/hidden_states/out_cache_loc all have shape [bs * num_draft_tokens, ...].
-    accept_index contains valid indices in range [0, bs * num_draft_tokens).
+    ============================================================================
+    PURPOSE
+    ============================================================================
 
-    Args:
-        predict: [bs * num_draft_tokens], sparse (only accept_index positions have valid tokens)
-        hidden_states: [bs * num_draft_tokens, hidden_size], dense from verify
-        out_cache_loc: [bs * num_draft_tokens], KV cache location indices
-        accept_index: [bs, spec_steps + 1], indices per request, -1 = invalid
-        accept_lens: [bs], number of accepted tokens per request (includes bonus)
-        num_draft_tokens: speculative_num_draft_tokens config value
+    In tree mode (topk > 1), the target model verifies a tree of draft tokens
+    but only SOME paths are accepted (scattered acceptance). This function
+    extracts only the accepted tokens for committing to the draft KV cache.
 
-    Returns:
-        repacked_input_ids:    [sum(accept_lens)]
-        repacked_hidden:       [sum(accept_lens), hidden_size]
-        repacked_cache_loc:    [sum(accept_lens)]
+    ============================================================================
+    TENSOR SHAPES (Example: bs=2, num_steps=5, topk=10, tree_size=32)
+    ============================================================================
+
+    Input tensors (SPARSE, from verification):
+      - predict: [bs * tree_size] = [64]
+        SPARSE: only accept_index positions contain valid token IDs
+        Other positions may contain garbage/uninitialized memory
+
+      - hidden_states: [bs * tree_size, hidden_size] = [64, hidden_size]
+        DENSE: all positions filled during verify forward pass
+
+      - out_cache_loc: [bs * tree_size] = [64]
+        Contains KV cache slot IDs allocated for the tree
+
+      - accept_index: [bs, num_steps + 1] = [2, 6]
+        FLAT indices into predict/hidden_states/out_cache_loc
+        Example: [[0, 2, 7, 15, -1, -1],    # req 0: positions 0, 2, 7, 15
+                  [32, 34, 39, -1, -1, -1]] # req 1: positions 32, 34, 39
+        Value -1 = unused slot (fewer than max accepted)
+
+      - accept_lens: [bs] = [2], e.g., [4, 3]
+        Number of accepted tokens per request (including bonus token)
+
+    Output tensors (DENSE, for draft extend):
+      - repacked_input_ids: [sum(accept_lens)] = [7]
+        Contains ONLY accepted token IDs
+
+      - repacked_hidden: [sum(accept_lens), hidden_size] = [7, hidden_size]
+        Contains ONLY accepted hidden states
+
+      - repacked_cache_loc: [sum(accept_lens)] = [7]
+        Contains ONLY accepted KV cache slot IDs
+
+    ============================================================================
+    EXAMPLE
+    ============================================================================
+
+    For accept_index = [[0, 2, 7, 15, -1, -1], [32, 34, 39, -1, -1, -1]]:
+      flat_accept_index = [0, 2, 7, 15, -1, -1, 32, 34, 39, -1, -1, -1]
+      valid_mask = [T, T, T, T, F, F, T, T, T, F, F, F]
+      valid_indices = [0, 2, 7, 15, 32, 34, 39]  # 7 elements = sum([4, 3])
+
+    Then gather from sparse tensors:
+      repacked_input_ids = predict[[0, 2, 7, 15, 32, 34, 39]]  # [7]
+      repacked_hidden = hidden_states[[0, 2, 7, 15, 32, 34, 39]]  # [7, hidden]
+      repacked_cache_loc = out_cache_loc[[0, 2, 7, 15, 32, 34, 39]]  # [7]
+
+    ============================================================================
     """
     # Flatten accept_index and filter out -1 (unused slots)
+    # flat_accept_index shape: [bs * (num_steps + 1)] = [12]
     flat_accept_index = accept_index.flatten()
     valid_mask = flat_accept_index != -1
+    # valid_indices shape: [sum(accept_lens)] = [7] in the example
     valid_indices = flat_accept_index[valid_mask]
 
-    # Gather from predict, hidden_states, and out_cache_loc
-    repacked_input_ids = predict[valid_indices]
-    repacked_hidden = hidden_states[valid_indices]
-    repacked_cache_loc = out_cache_loc[valid_indices]
+    # Gather from predict, hidden_states, and out_cache_loc using valid_indices
+    # This extracts only the accepted positions, creating dense output tensors
+    repacked_input_ids = predict[valid_indices]      # [sum(accept_lens)]
+    repacked_hidden = hidden_states[valid_indices]   # [sum(accept_lens), hidden_size]
+    repacked_cache_loc = out_cache_loc[valid_indices]  # [sum(accept_lens)]
 
     return repacked_input_ids, repacked_hidden, repacked_cache_loc
 
