@@ -62,9 +62,16 @@ jobs:
             cd /aiter && \
             git checkout caa3a9b404b757f15effb7acfafb1bfa7573ecac && \
             git submodule sync && git submodule update --init --recursive && \
-            python3 setup.py develop
+            PYTORCH_ROCM_ARCH="gfx942" python3 setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+
+          RUN echo "=== Prebuilt Aiter kernel with op test ==="
+          RUN cd /aiter && \
+            python3 test_rope.py && \
+            python3 test_rmsnorm2d.py && \
+            python3 test_rmsnorm2dFusedAddQuant.py && \
+            python3 test_trtllm_all_reduce_fusion.py
 
           RUN echo "=== sgl-kernel version before installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version before installation ===" && pip show sglang || true
