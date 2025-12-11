@@ -67,7 +67,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -2105,6 +2104,7 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
+    # The current code does not support the `action="store_false"` parameter type. see #14085 for more details.
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
@@ -4464,15 +4464,14 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
-        # Get boolean action destinations
-        boolean_actions = []
-        for action in parser._actions:
-            if hasattr(action, "dest") and hasattr(action, "action"):
-                if action.action in ["store_true", "store_false"]:
-                    boolean_actions.append(action.dest)
-
         # Merge config file arguments with CLI arguments
-        config_merger = ConfigArgumentMerger(boolean_actions=boolean_actions)
+        config_merger = ConfigArgumentMerger(
+            boolean_actions=[
+                action.dest
+                for action in parser._actions
+                if isinstance(action, argparse._StoreTrueAction)
+            ]
+        )
         argv = config_merger.merge_config_with_args(argv)
 
     parser = argparse.ArgumentParser()
