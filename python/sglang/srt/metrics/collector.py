@@ -63,6 +63,7 @@ class TimeStats:
     alloc_waiting_duration: float = 0.0
     prefill_start_time_host: float = 0.0
     prefill_end_time_host: float = 0.0
+    prefill_finished_ts: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
@@ -75,6 +76,11 @@ class TimeStats:
     def get_prefill_launch_latency(self) -> Optional[float]:
         if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
             return self.prefill_end_time_host - self.prefill_start_time_host
+        return None
+
+    def get_prefill_finished_ts(self) -> Optional[float]:
+        if self.prefill_finished_ts > 0.0:
+            return self.prefill_finished_ts
         return None
 
     def convert_to_duration(self) -> str:
