@@ -27,27 +27,35 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -73,14 +81,21 @@ class Glm4vVisionMLP(nn.Module):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -88,6 +103,8 @@ class Glm4vVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.act_fn = SiluAndMul()
 
@@ -106,8 +123,10 @@ class Glm4vVisionBlock(nn.Module):
         num_heads: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        attn_qkv_bias: bool = True,
         num_dummy_heads: int = 0,
         rms_norm_eps: float = 1e-5,
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
@@ -118,17 +137,20 @@ class Glm4vVisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            proj_bias=True,
+            proj_bias=False,
+            qkv_bias=attn_qkv_bias,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
+            use_data_parallel=use_data_parallel,
         )
         self.mlp = Glm4vVisionMLP(
             dim,
             intermediate_dim,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -206,24 +228,28 @@ class Glm4vPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
-        self.proj = ColumnParallelLinear(
+        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
-            gather_output=True,
         )
-        self.post_projection_norm = nn.LayerNorm(self.hidden_size)
+        self.post_projection_norm = LayerNorm(self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[context_dim] * 2,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -231,6 +257,8 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.extra_activation_func = nn.GELU()
 
@@ -379,6 +407,7 @@ class Glm4vVisionModel(nn.Module):
         vision_config: Glm4vVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -392,6 +421,7 @@ class Glm4vVisionModel(nn.Module):
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
+        self.use_data_parallel = use_data_parallel
 
         self.patch_embed = Glm4vVisionPatchEmbed(
             patch_size=patch_size,
@@ -412,6 +442,8 @@ class Glm4vVisionModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
+                    attn_qkv_bias=vision_config.attention_bias,
+                    use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)
             ]
@@ -423,6 +455,7 @@ class Glm4vVisionModel(nn.Module):
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
         self.embeddings = Glm4vVisionEmbeddings(vision_config)
@@ -527,11 +560,14 @@ class Glm4vForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.pp_group = get_pp_group()
         self.config = config
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.visual = Glm4vVisionModel(
             config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
 
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
@@ -542,15 +578,19 @@ class Glm4vForConditionalGeneration(nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -565,28 +605,27 @@ class Glm4vForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat(
-            [item.feature.squeeze(0) for item in items], dim=0
-        ).type(self.visual.dtype)
+        # in GLM-V, last dim is the same
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        # For multi-image, pixel_values is [num_of_images, L, C] shape
-        # assert pixel_values.dim() == 2, pixel_values.dim()
+        assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
-        ).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
-        return torch.cat(image_embeds)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        else:
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values_videos = torch.cat(
-            [item.feature.squeeze(0) for item in items], dim=0
-        ).type(self.visual.dtype)
+        # in GLM-V, last dim is the same
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        # For multi-video, pixel_values_videos is [num_of_videos, L, C] shape
-        # assert pixel_values_videos.dim() == 2, pixel_values_videos.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
 
         # reshape video_grid_thw -> [b, 3] -> [1, h, w] * frames
         temp_frames_hw = []
@@ -596,14 +635,19 @@ class Glm4vForConditionalGeneration(nn.Module):
             )
             temp_frames_hw.append(repeated_row)
         flattened_video_grid_thw = torch.cat(temp_frames_hw, dim=0)
-        video_embeds = self.visual(
-            pixel_values_videos, grid_thw=flattened_video_grid_thw
-        )
-        split_sizes = (
-            video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
-        ).tolist()
-        video_embeds = torch.split(video_embeds, split_sizes)
-        return torch.cat(video_embeds)
+
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                flattened_video_grid_thw.tolist(),
+                rope_type="rope_3d",
+            )
+        else:
+            video_embeds = self.visual(pixel_values, grid_thw=flattened_video_grid_thw)
+        return video_embeds
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -615,6 +659,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         """Run forward pass for GLM-4.1V.
 
@@ -647,18 +692,25 @@ class Glm4vForConditionalGeneration(nn.Module):
             language_model=self.model,
             multimodal_model=self,
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, forward_batch)
+            return hidden_states
 
     def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
         """pad attn qkv weights for dummy heads"""
@@ -700,6 +752,17 @@ class Glm4vForConditionalGeneration(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        # For the PP case, we add special handling for lm_head.weight,
+        # - On non–last ranks: we continue, because this stage is supposed to
+        #   be just an empty PPMissingLayer shell.
+        # - On the last rank: params_dict is expected to contain lm_head.weight,
+        #   so it will never hit the branch "if name not in params_dict".
+        #
+        # For all other parameters, such like
+        # "model.visual.blocks.20.mlp.gate_proj.weight", the unified rule is:
+        # If this name does not exist in the current rank’s params_dict,
+        # it does not belong to this pipeline stage, thus we simply continue.
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -707,6 +770,8 @@ class Glm4vForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
+            if name.startswith("lm_head.") and not self.pp_group.is_last_rank:
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -716,6 +781,10 @@ class Glm4vForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
+                if name not in params_dict:
+                    continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -729,6 +798,10 @@ class Glm4vForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
+                    if name not in params_dict:
+                        continue
+
                     param = params_dict[name]
                 except KeyError:
                     print(params_dict.keys())
