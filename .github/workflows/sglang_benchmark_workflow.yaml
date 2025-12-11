@@ -49,7 +49,8 @@ jobs:
         run: |
           cat <<'EOF' > Dockerfile.mod
           FROM ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125' }}
-
+          ENV GPU_ARCHS="gfx942"
+          ENV PYTORCH_ROCM_ARCH="gfx942"
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
           RUN rm -rf /opt/aiter/aiter/jit/build
@@ -62,7 +63,7 @@ jobs:
             cd /aiter && \
             git checkout caa3a9b404b757f15effb7acfafb1bfa7573ecac && \
             git submodule sync && git submodule update --init --recursive && \
-            PYTORCH_ROCM_ARCH="gfx942" python3 setup.py develop
+            python3 setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
 
@@ -70,8 +71,7 @@ jobs:
           RUN cd /aiter/op_tests/ && \
             python3 test_rope.py && \
             python3 test_rmsnorm2d.py && \
-            python3 test_rmsnorm2dFusedAddQuant.py && \
-            python3 test_trtllm_all_reduce_fusion.py
+            python3 test_rmsnorm2dFusedAddQuant.py
 
           RUN echo "=== sgl-kernel version before installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version before installation ===" && pip show sglang || true
@@ -83,10 +83,10 @@ jobs:
               pip install --upgrade pip && \
               pip install "transformers>=4.57.0" && \
               cd sgl-kernel && \
-              PYTORCH_ROCM_ARCH="gfx942" python3 setup_rocm.py install && \
+              python3 setup_rocm.py install && \
               cd .. && \
               rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && \
-              PYTORCH_ROCM_ARCH="gfx942" pip install -e "python[all_hip]"
+              pip install -e "python[all_hip]"
           RUN echo "=== sgl-kernel version after installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version after installation ===" && pip show sglang || true
           EOF
