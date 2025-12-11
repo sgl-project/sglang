@@ -116,7 +116,9 @@ class SamplingParams:
     fps: int = 24
 
     # Resolution validation
-    supported_resolutions: list[tuple[int, int]] | None = None  # None means all resolutions allowed
+    supported_resolutions: list[tuple[int, int]] | None = (
+        None  # None means all resolutions allowed
+    )
 
     # Denoising parameters
     num_inference_steps: int = None
@@ -575,7 +577,9 @@ class SamplingParams:
             args.width = 1280
             args.height = 720
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
+        args_attrs = set(vars(args).keys())
+        attrs = sampling_params_fields & args_attrs
         args.height_not_provided = False
         args.width_not_provided = False
         return {attr: getattr(args, attr) for attr in attrs}
