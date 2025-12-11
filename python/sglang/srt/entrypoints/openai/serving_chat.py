@@ -299,7 +299,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-    
+
             # Historical reasoning content is discarded when a new user message is introduced
             drop_thinking = messages[-1]["role"] == "user"
 
