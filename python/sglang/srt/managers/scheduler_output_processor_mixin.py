@@ -1020,6 +1020,7 @@ class SchedulerOutputProcessorMixin:
         forward_entry_times = []
         prefill_launch_delays = []
         prefill_launch_latencies = []
+        prefill_finished_timestamps = []
         retraction_counts = []
         for req in reqs:
             if req.finished():
@@ -1037,6 +1038,9 @@ class SchedulerOutputProcessorMixin:
                 prefill_launch_latencies.append(
                     req.time_stats.get_prefill_launch_latency()
                 )
+                prefill_finished_timestamps.append(
+                    req.time_stats.get_prefill_finished_ts()
+                )
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
@@ -1046,6 +1050,7 @@ class SchedulerOutputProcessorMixin:
                 forward_entry_time=forward_entry_times,
                 prefill_launch_delay=prefill_launch_delays,
                 prefill_launch_latency=prefill_launch_latencies,
+                prefill_finished_ts=prefill_finished_timestamps,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
