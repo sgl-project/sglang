@@ -79,6 +79,7 @@ LOAD_FORMAT_CHOICES = [
     "gguf",
     "bitsandbytes",
     "layered",
+    "flash_rl",
     "remote",
     "remote_instance",
 ]
@@ -170,6 +171,15 @@ MOE_RUNNER_BACKEND_CHOICES = [
 
 MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
 
+FP8_GEMM_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "deep_gemm",
+    "flashinfer_trtllm",
+    "cutlass",
+    "triton",
+    "aiter",
+]
+
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 
@@ -196,6 +206,10 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_fp8_gemm_runner_backend_choices(choices):
+    FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -237,6 +251,7 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
+    rl_quant_profile: Optional[str] = None  # For flash_rl load format
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
@@ -380,6 +395,7 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
+    fp8_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
     enable_flashinfer_autotune: bool = False
@@ -1219,21 +1235,22 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
-            if self.model_config.quantization in [
+            model_config = self.get_model_config()
+            if model_config.quantization in [
                 "modelopt",
                 "modelopt_fp8",
                 "modelopt_fp4",
             ]:
-                assert self.model_config.hf_config.mlp_hidden_act == "relu2"
-                if self.model_config.quantization == "modelopt":
+                assert model_config.hf_config.mlp_hidden_act == "relu2"
+                if model_config.quantization == "modelopt":
                     self.quantization = (
                         "modelopt_fp4"
-                        if self.model_config.hf_config.quantization_config["quant_algo"]
+                        if model_config.hf_config.quantization_config["quant_algo"]
                         == "NVFP4"
                         else "modelopt_fp8"
                     )
                 else:
-                    self.quantization = self.model_config.quantization
+                    self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
         elif model_arch in [
             "Qwen3MoeForCausalLM",
@@ -1668,7 +1685,10 @@ class ServerArgs:
                     "Page first direct layout only support direct io backend"
                 )
 
-        if self.enable_hierarchical_cache and self.hicache_io_backend == "kernel":
+        if (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ) and self.hicache_io_backend == "kernel":
             # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
             if self.decode_attention_backend is None:
                 if not self.use_mla_backend():
@@ -2150,6 +2170,12 @@ class ServerArgs:
             help="Extra config for model loader. "
             "This will be passed to the model loader corresponding to the chosen load_format.",
             default=ServerArgs.model_loader_extra_config,
+        )
+        parser.add_argument(
+            "--rl-quant-profile",
+            type=str,
+            default=ServerArgs.rl_quant_profile,
+            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -2948,6 +2974,22 @@ class ServerArgs:
             default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
+        )
+        parser.add_argument(
+            "--fp8-gemm-backend",
+            type=str,
+            choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp8_gemm_runner_backend,
+            dest="fp8_gemm_runner_backend",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. "
+            "Options: 'auto' (default, auto-selects based on hardware), "
+            "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
+            "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
+            "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
+            "'triton' (fallback, widely compatible), "
+            "'aiter' (ROCm only). "
+            "NOTE: This replaces the deprecated environment variables "
+            "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
         )
         parser.add_argument(
             "--enable-flashinfer-autotune",
@@ -4138,6 +4180,9 @@ class ServerArgs:
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 
     def check_torch_2_9_1_cudnn_compatibility(self):
+        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
+            return
+
         if self.get_model_config().is_multimodal:
             import torch
 
@@ -4165,7 +4210,8 @@ class ServerArgs:
                             "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
                             "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
                             "Run the following command immediately to fix:\n"
-                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n"
+                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
+                            "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
                             "--------------------------------------------------------------------------------\n"
                             f"{RESET}"
                         )
@@ -4250,6 +4296,17 @@ class ServerArgs:
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+                    # When using the chunked SGMV backend, skip embedding / lm_head layers for now,
+                    # since it does not support these yet (TODO: implement embedding / lm_head support)
+                    if self.lora_backend == "csgmv":
+                        logger.warning(
+                            "LoRA backend 'csgmv' does not yet support embedding or lm_head layers; "
+                            "dropping 'embed_tokens' and 'lm_head' from --lora-target-modules=all. "
+                            "To apply LoRA to these, use --lora-backend triton."
+                        )
+                        self.lora_target_modules.discard("embed_tokens")
+                        self.lora_target_modules.discard("lm_head")
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
@@ -4595,6 +4652,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
+        "Glm4MoeForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
