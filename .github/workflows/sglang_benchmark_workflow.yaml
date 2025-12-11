@@ -65,6 +65,9 @@ jobs:
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
 
+          RUN echo "=== sgl-kernel version before installation ===" && pip show sgl-kernel || true
+          RUN echo "=== sglang version before installation ===" && pip show sglang || true
+          RUN pip uninstall -y sgl-kernel sglang
           RUN git clone ${{ env.SGLANG_GITHUB_REPO_URL }} /sglang-checkout && \
               cd /sglang-checkout && \
               git checkout ${{ env.SGLANG_GITHUB_COMMIT_SHA }} && \
@@ -72,7 +75,12 @@ jobs:
               pip install --upgrade pip && \
               pip install "transformers>=4.57.0" && \
               cd sgl-kernel && \
-              python3 setup_rocm.py install
+              PYTORCH_ROCM_ARCH="gfx942" python3 setup_rocm.py install && \
+              cd .. && \
+              rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && \
+              PYTORCH_ROCM_ARCH="gfx942" pip install -e "python[all_hip]"
+          RUN echo "=== sgl-kernel version after installation ===" && pip show sgl-kernel || true
+          RUN echo "=== sglang version after installation ===" && pip show sglang || true
           EOF
 
       - name: Show dockerfile
@@ -151,4 +159,4 @@ jobs:
       - name: Clean Up
         if: always()
         run:
-          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout/sgl-kernel; rm -rf /sglang-checkout/python"
+          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout"
