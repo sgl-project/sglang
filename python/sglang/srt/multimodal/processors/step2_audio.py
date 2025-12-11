@@ -1,18 +1,15 @@
+import json
+import math
 import re
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchaudio
-from torch.nn.utils.rnn import pad_sequence
-from transformers import BatchFeature
-from transformers.audio_utils import mel_filter_bank, spectrogram, window_function
-from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
+from transformers import BatchFeature, Qwen2TokenizerFast
+from transformers.audio_utils import mel_filter_bank
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
-from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-from transformers.utils import TensorType, logging
+from transformers.utils import TensorType
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.step2_audio import StepAudio2ForCausalLM
@@ -21,9 +18,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 
-from transformers import Qwen2TokenizerFast
-import json
-import math
 
 def _mel_filters(sr, n_mels: int, n_fft: int) -> torch.Tensor:
     """Load the mel filterbank matrix for projecting STFT into a Mel spectrogram,
@@ -41,7 +35,8 @@ def _mel_filters(sr, n_mels: int, n_fft: int) -> torch.Tensor:
     )
     return torch.from_numpy(mel_filters.astype(np.float32)).T
 
-stepaudio2_chat_template= """
+
+stepaudio2_chat_template = """
 {# ---------- tools & 首条 system ---------- #}
 {% if tools %}
 <|BOT|>system
@@ -142,10 +137,11 @@ function_output
 {% endif %}
 """
 
+
 class StepAudio2Tokenizer(Qwen2TokenizerFast):
 
-    _tts_start_token: str = "<tts_start>"  #151693
-    _tts_end_token: str = "<tts_end>"  #151694
+    _tts_start_token: str = "<tts_start>"  # 151693
+    _tts_end_token: str = "<tts_end>"  # 151694
     _first_audio_token: str = "<audio_0>"
     _tts_pad_token: str = "<tts_pad>"
     _audio_pad_token: str = "<audio_6561>"
@@ -172,28 +168,28 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
         return token_id >= self.first_audio_token_id
 
     def apply_chat_template_no_trans(
-            self,
-            conversation: Union[list[dict[str, str]], list[list[dict[str,
-                                                                     str]]]],
-            tools: Optional[list[dict]] = None,
-            documents: Optional[list[dict[str, str]]] = None,
-            chat_template: Optional[str] = None,
-            add_generation_prompt: bool = False,
-            continue_final_message: bool = False,
-            tokenize: bool = True,
-            padding: bool = False,
-            truncation: bool = False,
-            max_length: Optional[int] = None,
-            return_dict: bool = False,
-            return_assistant_tokens_mask: bool = False,
-            tokenizer_kwargs: Optional[dict[str]] = None,
-            **kwargs) -> list[int]:
+        self,
+        conversation: Union[list[dict[str, str]], list[list[dict[str, str]]]],
+        tools: Optional[list[dict]] = None,
+        documents: Optional[list[dict[str, str]]] = None,
+        chat_template: Optional[str] = None,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool = False,
+        tokenize: bool = True,
+        padding: bool = False,
+        truncation: bool = False,
+        max_length: Optional[int] = None,
+        return_dict: bool = False,
+        return_assistant_tokens_mask: bool = False,
+        tokenizer_kwargs: Optional[dict[str]] = None,
+        **kwargs,
+    ) -> list[int]:
         """Convert chat messages to token IDs sequence.
-        
+
         Args:
             conversation: list of chat messages
             tools: Tool configurations (optional)
-            
+
         Returns:
             list[int]: Sequence of token IDs
         """
@@ -205,63 +201,63 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
             )
 
         if tools:
-            result.append('<|BOT|>system\n')
-            if messages and messages[0]['role'] == 'system':
-                result.append(messages[0]['content'] + '<|EOT|>')
-            result.append('<|BOT|>')
+            result.append("<|BOT|>system\n")
+            if messages and messages[0]["role"] == "system":
+                result.append(messages[0]["content"] + "<|EOT|>")
+            result.append("<|BOT|>")
             result.append("tool_json_schemas\n")
-            result.append(json.dumps(tools, ensure_ascii=False) + '<|EOT|>')
-        elif messages and messages[0]['role'] == 'system':
-            result.append('<|BOT|>system\n' + messages[0]['content'] +
-                          '<|EOT|>')
+            result.append(json.dumps(tools, ensure_ascii=False) + "<|EOT|>")
+        elif messages and messages[0]["role"] == "system":
+            result.append("<|BOT|>system\n" + messages[0]["content"] + "<|EOT|>")
 
         for i, message in enumerate(messages):
             if message["role"] == "user":
-                result.append('<|BOT|>human\n' + message["content"] +
-                              '<|EOT|>')
+                result.append("<|BOT|>human\n" + message["content"] + "<|EOT|>")
             elif message["role"] == "system":
                 if i != 0:
-                    result.append('<|BOT|>system\n' + message["content"] +
-                                  '<|EOT|>')
+                    result.append("<|BOT|>system\n" + message["content"] + "<|EOT|>")
             elif message["role"] == "assistant":
-                result.append('<|BOT|>' + message["role"] + '\n')
+                result.append("<|BOT|>" + message["role"] + "\n")
                 if message["content"]:
                     result.append(message["content"])
                 if message.get("tool_calls"):
                     for tool_call in message["tool_calls"]:
                         if "function" in tool_call:
                             tool_call = tool_call["function"]
-                        result.append('<tool_call>' + 'function\n' +
-                                      tool_call["name"] + '\n')
                         result.append(
-                            json.dumps(tool_call["arguments"],
-                                       ensure_ascii=False))
-                        result.append('</tool_call>')
-                result.append('<|EOT|>')
+                            "<tool_call>" + "function\n" + tool_call["name"] + "\n"
+                        )
+                        result.append(
+                            json.dumps(tool_call["arguments"], ensure_ascii=False)
+                        )
+                        result.append("</tool_call>")
+                result.append("<|EOT|>")
             elif message["role"] == "tool":
-                result.append('<|BOT|>')
+                result.append("<|BOT|>")
                 function_name = "tool"
                 if message.get("tool_call_id"):
                     for prev_msg in messages:
                         if prev_msg["role"] == "assistant" and prev_msg.get(
-                                "tool_calls"):
+                            "tool_calls"
+                        ):
                             for tool_call in prev_msg["tool_calls"]:
-                                if tool_call["id"] == message[
-                                        "tool_call_id"] and "function" in tool_call:  # noqa: E501
-                                    function_name = tool_call["function"][
-                                        "name"]
-                result.append('function_output\n' + function_name + '\n')
+                                if (
+                                    tool_call["id"] == message["tool_call_id"]
+                                    and "function" in tool_call
+                                ):  # noqa: E501
+                                    function_name = tool_call["function"]["name"]
+                result.append("function_output\n" + function_name + "\n")
                 result.append(message["content"])
-                result.append('<|EOT|>')
+                result.append("<|EOT|>")
             elif message["role"] == "function_output":
-                result.append('<|BOT|>' + 'input\n' + message["content"] +
-                              '<|EOT|>')
+                result.append("<|BOT|>" + "input\n" + message["content"] + "<|EOT|>")
             else:
-                result.append('<|BOT|>' + message["role"] + '\n' +
-                              message["content"] + '<|EOT|>')
+                result.append(
+                    "<|BOT|>" + message["role"] + "\n" + message["content"] + "<|EOT|>"
+                )
 
         if add_generation_prompt:
-            result.append('<|BOT|>assistant\n')
+            result.append("<|BOT|>assistant\n")
 
         if continue_final_message:
             final_message = message["content"]
@@ -273,38 +269,37 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
                 if final_message in result[i]:
                     last_index = i
                     break  # 找到后立即退出循环
-            result = result[:last_index + 1]
+            result = result[: last_index + 1]
 
-        return ''.join(result)
+        return "".join(result)
 
     def apply_chat_template_trans_ta4(
-            self,
-            conversation: Union[list[dict[str, str]], list[list[dict[str,
-                                                                     str]]]],
-            tools: Optional[list[dict]] = None,
-            documents: Optional[list[dict[str, str]]] = None,
-            chat_template: Optional[str] = None,
-            add_generation_prompt: bool = False,
-            continue_final_message: bool = False,
-            tokenize: bool = True,
-            padding: bool = False,
-            truncation: bool = False,
-            max_length: Optional[int] = None,
-            return_dict: bool = False,
-            return_assistant_tokens_mask: bool = False,
-            tokenizer_kwargs: Optional[dict[str]] = None,
-            tts_content: Optional[list[dict]] = None,
-            **kwargs) -> list[int]:
+        self,
+        conversation: Union[list[dict[str, str]], list[list[dict[str, str]]]],
+        tools: Optional[list[dict]] = None,
+        documents: Optional[list[dict[str, str]]] = None,
+        chat_template: Optional[str] = None,
+        add_generation_prompt: bool = False,
+        continue_final_message: bool = False,
+        tokenize: bool = True,
+        padding: bool = False,
+        truncation: bool = False,
+        max_length: Optional[int] = None,
+        return_dict: bool = False,
+        return_assistant_tokens_mask: bool = False,
+        tokenizer_kwargs: Optional[dict[str]] = None,
+        tts_content: Optional[list[dict]] = None,
+        **kwargs,
+    ) -> list[int]:
         """Convert chat messages to token IDs sequence.
-        
+
         Args:
             conversation: list of chat messages
             tools: Tool configurations (optional)
-            
+
         Returns:
             list[int]: Sequence of token IDs
         """
-
 
         result = []
         messages = conversation
@@ -314,15 +309,14 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
                 "continue_final_message and add_generation_prompt are not compatible. Use continue_final_message when you want the model to continue the final message, and add_generation_prompt when you want to add a header that will prompt it to start a new assistant message instead."  # noqa: E501
             )
         if tools:
-            result.append('<|BOT|>system\n')
-            if messages and messages[0]['role'] == 'system':
-                result.append(messages[0]['content'] + '<|EOT|>')
-            result.append('<|BOT|>')
+            result.append("<|BOT|>system\n")
+            if messages and messages[0]["role"] == "system":
+                result.append(messages[0]["content"] + "<|EOT|>")
+            result.append("<|BOT|>")
             result.append("tool_json_schemas\n")
-            result.append(json.dumps(tools, ensure_ascii=False) + '<|EOT|>')
-        elif messages and messages[0]['role'] == 'system':
-            result.append('<|BOT|>system\n' + messages[0]['content'] +
-                          '<|EOT|>')
+            result.append(json.dumps(tools, ensure_ascii=False) + "<|EOT|>")
+        elif messages and messages[0]["role"] == "system":
+            result.append("<|BOT|>system\n" + messages[0]["content"] + "<|EOT|>")
 
         for i, message in enumerate(messages):
             message_content = message["content"]
@@ -330,61 +324,70 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
                 if isinstance(message_content, list):
                     for content in message_content:
                         if content["type"] == "text":
-                            result.append('<|BOT|>human\n' + content["text"] + '<|EOT|>')
+                            result.append(
+                                "<|BOT|>human\n" + content["text"] + "<|EOT|>"
+                            )
                         elif content["type"] == "audio":
-                            result.append('<|BOT|>human\n' + '<audio_start><audio_patch><audio_end>' + '<|EOT|>')
+                            result.append(
+                                "<|BOT|>human\n"
+                                + "<audio_start><audio_patch><audio_end>"
+                                + "<|EOT|>"
+                            )
                 else:
-                    result.append('<|BOT|>human\n' + message_content + '<|EOT|>')
+                    result.append("<|BOT|>human\n" + message_content + "<|EOT|>")
             elif message["role"] == "system":
                 if i != 0:
-                    result.append('<|BOT|>system\n' + message_content +
-                                  '<|EOT|>')
+                    result.append("<|BOT|>system\n" + message_content + "<|EOT|>")
             elif message["role"] == "assistant":
-                result.append('<|BOT|>' + message["role"] + '\n')
-                if 'tts_content' not in message:
+                result.append("<|BOT|>" + message["role"] + "\n")
+                if "tts_content" not in message:
                     result.append(message_content)
                 else:
-                    tts_content = message['tts_content']
-                    if "tts_text" not in tts_content or "tts_audio" not in tts_content:  # noqa: E501
-                        raise ValueError(
-                            "tts_text/tts_audio must in tts_content keys.")
-                    tts_content['text'] = message_content
+                    tts_content = message["tts_content"]
+                    if (
+                        "tts_text" not in tts_content or "tts_audio" not in tts_content
+                    ):  # noqa: E501
+                        raise ValueError("tts_text/tts_audio must in tts_content keys.")
+                    tts_content["text"] = message_content
                     result.append(tts_content)
                 if message.get("tool_calls"):
                     for tool_call in message["tool_calls"]:
                         if "function" in tool_call:
                             tool_call = tool_call["function"]
-                        result.append('<tool_call>' + 'function\n' +
-                                      tool_call["name"] + '\n')
                         result.append(
-                            json.dumps(tool_call["arguments"],
-                                       ensure_ascii=False))
-                        result.append('</tool_call>')
-                result.append('<|EOT|>')
+                            "<tool_call>" + "function\n" + tool_call["name"] + "\n"
+                        )
+                        result.append(
+                            json.dumps(tool_call["arguments"], ensure_ascii=False)
+                        )
+                        result.append("</tool_call>")
+                result.append("<|EOT|>")
             elif message["role"] == "tool":
-                result.append('<|BOT|>')
+                result.append("<|BOT|>")
                 function_name = "tool"
                 if message.get("tool_call_id"):
                     for prev_msg in messages:
                         if prev_msg["role"] == "assistant" and prev_msg.get(
-                                "tool_calls"):
+                            "tool_calls"
+                        ):
                             for tool_call in prev_msg["tool_calls"]:
-                                if tool_call["id"] == message[
-                                        "tool_call_id"] and "function" in tool_call:  # noqa: E501
-                                    function_name = tool_call["function"][
-                                        "name"]
-                result.append('function_output\n' + function_name + '\n')
+                                if (
+                                    tool_call["id"] == message["tool_call_id"]
+                                    and "function" in tool_call
+                                ):  # noqa: E501
+                                    function_name = tool_call["function"]["name"]
+                result.append("function_output\n" + function_name + "\n")
                 result.append(message_content)
-                result.append('<|EOT|>')
+                result.append("<|EOT|>")
             elif message["role"] == "function_output":
-                result.append('<|BOT|>' + 'input\n' + message["content"] +
-                              '<|EOT|>')
+                result.append("<|BOT|>" + "input\n" + message["content"] + "<|EOT|>")
             else:
-                result.append('<|BOT|>' + message["role"] + '\n' +
-                              message_content + '<|EOT|>')
+                result.append(
+                    "<|BOT|>" + message["role"] + "\n" + message_content + "<|EOT|>"
+                )
 
         if add_generation_prompt:
-            result.append('<|BOT|>assistant\n')
+            result.append("<|BOT|>assistant\n")
 
         if continue_final_message:
             final_message = message_content
@@ -396,29 +399,28 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
                 if final_message in result[i]:
                     last_index = i
                     break  # 找到后立即退出循环
-            result = result[:last_index + 1]
+            result = result[: last_index + 1]
         trans_token_ids = self.trans_text_audio_to_ta4(result)
         return trans_token_ids
 
-    def build_tts_interleave_data(self,
-                                  text_token_ids,
-                                  audio_token_ids,
-                                  chunk=4):
+    def build_tts_interleave_data(self, text_token_ids, audio_token_ids, chunk=4):
 
         text_token_ids_pad = text_token_ids
-        chunk_nums = max(math.ceil(len(audio_token_ids) / chunk),
-                         len(text_token_ids))
+        chunk_nums = max(math.ceil(len(audio_token_ids) / chunk), len(text_token_ids))
         ta4_content = []
         text_token_ids_pad = text_token_ids + [self.tts_pad_token_id] * (
-            chunk_nums - len(text_token_ids))
+            chunk_nums - len(text_token_ids)
+        )
         audio_token_ids_pad = audio_token_ids + [self.audio_pad_token_id] * (
-            chunk_nums - len(audio_token_ids))
+            chunk_nums - len(audio_token_ids)
+        )
         for idx in range(chunk_nums):
-            ta4_content += text_token_ids_pad[idx:(idx + 1)]
-            ta4_content += audio_token_ids_pad[idx * chunk:(idx + 1) * chunk]
+            ta4_content += text_token_ids_pad[idx : (idx + 1)]
+            ta4_content += audio_token_ids_pad[idx * chunk : (idx + 1) * chunk]
 
-        all_token_ids = [self.tts_start_token_id
-                         ] + ta4_content + [self.tts_end_token_id]
+        all_token_ids = (
+            [self.tts_start_token_id] + ta4_content + [self.tts_end_token_id]
+        )
         return all_token_ids
 
     def trans_text_audio_to_ta4(self, content_list: list[str]):
@@ -430,20 +432,20 @@ class StepAudio2Tokenizer(Qwen2TokenizerFast):
                 result += content_token_ids
 
             elif isinstance(content, dict):
-                tts_text_tokens = self.tokenize(content['tts_text'])
-                tts_audio_tokens = self.tokenize(content['tts_audio'])
-                text_tokens = self.tokenize(content['text'])
+                tts_text_tokens = self.tokenize(content["tts_text"])
+                tts_audio_tokens = self.tokenize(content["tts_audio"])
+                text_tokens = self.tokenize(content["text"])
 
-                tts_text_tokens_ids = self.convert_tokens_to_ids(
-                    tts_text_tokens)
-                tts_audio_tokens_ids = self.convert_tokens_to_ids(
-                    tts_audio_tokens)
+                tts_text_tokens_ids = self.convert_tokens_to_ids(tts_text_tokens)
+                tts_audio_tokens_ids = self.convert_tokens_to_ids(tts_audio_tokens)
                 text_tokens_ids = self.convert_tokens_to_ids(text_tokens)
                 trans_token_ids = self.build_tts_interleave_data(
-                    tts_text_tokens_ids, tts_audio_tokens_ids)
+                    tts_text_tokens_ids, tts_audio_tokens_ids
+                )
                 result += trans_token_ids + text_tokens_ids
 
         return result
+
 
 class StepAudio2Processor:
 
@@ -458,11 +460,13 @@ class StepAudio2Processor:
 
         self.config = config
         # self.tokenizer = tokenizer
-        self.tokenizer  = StepAudio2Tokenizer.from_pretrained(
+        self.tokenizer = StepAudio2Tokenizer.from_pretrained(
             "stepfun-ai/Step-Audio-2-mini",
         )
-        self.tokenizer.apply_chat_template = self.tokenizer.apply_chat_template_trans_ta4
-        self.tokenizer.chat_template=stepaudio2_chat_template
+        self.tokenizer.apply_chat_template = (
+            self.tokenizer.apply_chat_template_trans_ta4
+        )
+        self.tokenizer.chat_template = stepaudio2_chat_template
         self.audio_token = "<audio_patch>"
         self.n_mels = 128
         self.max_chunk_size = 29  # from audio encoder position embedding length equals 1500, means 29.98s audio # noqa: E501
