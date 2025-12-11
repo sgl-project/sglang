@@ -11,9 +11,45 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
+_ENABLE_MLA_PREPROCESS_FLAG = get_bool_env_var("SGLANG_NPU_USE_MLAPO")
+_ENABLE_MLA_PROLOG_FLAG = get_bool_env_var("SGLANG_NPU_USE_MLAPROLOG")
+_NPU_FORMAT_NZ = 29
+
+
+def _mlaprolog_process_weight_after_loading(layer):
+    if is_mla_prolog_enabled() and "fused_qkv_a_proj_with_mqa" in layer.prefix:
+        layer.weight.data = layer.weight.data.transpose(0, 1)
+        fused_qkv_a_proj_with_mqa_weight_q = layer.weight.data[
+            :, : layer.q_lora_rank
+        ].clone()
+        fused_qkv_a_proj_with_mqa_weight_kv = layer.weight.data[
+            :, layer.q_lora_rank :
+        ].clone()
+        del layer.weight
+        layer.weight_q = torch_npu.npu_format_cast(
+            fused_qkv_a_proj_with_mqa_weight_q, _NPU_FORMAT_NZ
+        )
+        layer.weight_kv = torch_npu.npu_format_cast(
+            fused_qkv_a_proj_with_mqa_weight_kv, _NPU_FORMAT_NZ
+        )
+
+
 @lru_cache(maxsize=1)
 def is_mla_preprocess_enabled() -> bool:
-    return get_bool_env_var("SGLANG_NPU_USE_MLAPO")
+    return _ENABLE_MLA_PREPROCESS_FLAG or _ENABLE_MLA_PROLOG_FLAG
+
+
+@lru_cache(maxsize=1)
+def is_mla_prolog_enabled() -> bool:
+    return _ENABLE_MLA_PROLOG_FLAG
+
+
+if is_mla_preprocess_enabled():
+    import sgl_kernel_npu  # noqa: F401
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
+    torch.npu.set_compile_mode(jit_compile=False)
 
 
 @lru_cache(maxsize=1)
@@ -414,3 +450,96 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             return self.forward_absorb_prepare_npu_rms_norm_cache(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+
+
+class NPUMLAProlog:
+    def __init__(
+        self,
+        fused_qkv_a_proj_with_mqa_weight_q,
+        fused_qkv_a_proj_with_mqa_weight_kv,
+        q_a_layernorm,
+        kv_a_layernorm,
+        q_b_proj,
+        w_kc,
+        rotary_emb,
+        layer_id,
+        num_local_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+    ):
+        super().__init__()
+        self.fused_qkv_a_proj_with_mqa_weight_q = fused_qkv_a_proj_with_mqa_weight_q
+        self.fused_qkv_a_proj_with_mqa_weight_kv = fused_qkv_a_proj_with_mqa_weight_kv
+        self.q_a_layernorm = q_a_layernorm
+        self.kv_a_layernorm = kv_a_layernorm
+        self.q_b_proj = q_b_proj
+        self.w_kc = w_kc
+        self.rotary_emb = rotary_emb
+        self.layer_id = layer_id
+        self.has_preprocess_weights = False
+        self.dtype = None
+        self.q_lora_rank = self.q_b_proj.input_size
+        self.kv_lora_rank = self.kv_a_layernorm.hidden_size
+        self.num_local_heads = num_local_heads
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.dequant_scale_w_uq_qr = self.q_b_proj.weight_scale.view(1, -1).to(
+            torch.float
+        )
+
+    def get_kv_cache_and_cache_idx(self, forward_batch):
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+        slot_mapping = forward_batch.out_cache_loc.to(torch.int64)
+        return (
+            k_cache,
+            v_cache,
+            slot_mapping,
+        )
+
+    def get_sin_cos(self, positions):
+        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.repeat(1, 2)
+        sin = sin.repeat(1, 2)
+        return cos, sin
+
+    def forward(self, positions, hidden_states, forward_batch):
+        self.cos, self.sin = self.get_sin_cos(positions)
+        k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
+        mla_prolog_input_args = {
+            "token_x": hidden_states,
+            "weight_dq": self.fused_qkv_a_proj_with_mqa_weight_q,
+            "weight_uq_qr": self.q_b_proj.weight,
+            "weight_uk": self.w_kc,
+            "weight_dkv_kr": self.fused_qkv_a_proj_with_mqa_weight_kv,
+            "rmsnorm_gamma_cq": self.q_a_layernorm.weight,
+            "rmsnorm_gamma_ckv": self.kv_a_layernorm.weight,
+            "rope_sin": self.sin,
+            "rope_cos": self.cos,
+            "kv_cache": k_cache,
+            "kr_cache": v_cache,
+            "cache_index": slot_mapping,
+            "dequant_scale_w_uq_qr": self.dequant_scale_w_uq_qr,
+            "rmsnorm_epsilon_cq": self.q_a_layernorm.variance_epsilon,
+            "rmsnorm_epsilon_ckv": self.kv_a_layernorm.variance_epsilon,
+            "cache_mode": "PA_BSND",
+            "query_norm_flag": True,
+            "weight_quant_mode": 1,  # 0:no quant; 1:uq_qr: quant; 2: weight_dq,weight_uq_qr,weight_dkv_kr: quant
+        }
+        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
+            torch.ops.custom.npu_mla_prolog_v3(**mla_prolog_input_args)
+        )
+        dequant_q_norm = dequant_q_norm.view(hidden_states.shape[0])
+        return (
+            q_pe,
+            v_cache,
+            q_nope,
+            k_cache,
+            qr,
+            forward_batch,
+            positions,
+            dequant_q_norm,
+        )
