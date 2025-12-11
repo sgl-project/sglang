@@ -335,6 +335,7 @@ impl<B> OnResponse<B> for ResponseLogger {
         let status_code = status.as_u16();
 
         RouterMetrics::record_http_status_code(status_code);
+        RouterMetrics::record_request_duration(latency);
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status_code);
