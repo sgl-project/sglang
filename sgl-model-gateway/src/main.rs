@@ -8,8 +8,10 @@ use sgl_model_gateway::{
         RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
-    metrics::PrometheusConfig,
-    otel_trace::{is_otel_enabled, shutdown_otel},
+    observability::{
+        metrics::PrometheusConfig,
+        otel_trace::{is_otel_enabled, shutdown_otel},
+    },
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
     version,
@@ -211,6 +213,9 @@ struct CliArgs {
 
     #[arg(long, default_value = "0.0.0.0")]
     prometheus_host: String,
+
+    #[arg(long, num_args = 0..)]
+    prometheus_duration_buckets: Vec<f64>,
 
     #[arg(long, num_args = 0..)]
     request_id_headers: Vec<String>,
@@ -679,6 +684,11 @@ impl CliArgs {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
+            duration_buckets: if self.prometheus_duration_buckets.is_empty() {
+                None
+            } else {
+                Some(self.prometheus_duration_buckets.clone())
+            },
         });
 
         ServerConfig {
