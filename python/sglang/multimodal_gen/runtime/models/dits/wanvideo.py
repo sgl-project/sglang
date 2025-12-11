@@ -150,6 +150,9 @@ class WanSelfAttention(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
+            seq_lens(Tensor): Shape [B]
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         pass
 
