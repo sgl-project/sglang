@@ -446,7 +446,12 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt = conv.get_prompt()
             if self._get_reasoning_from_request(
                 request
-            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4", "interns1"]:
+            ) and self.reasoning_parser not in [
+                "qwen3",
+                "qwen3-thinking",
+                "glm4",
+                "interns1",
+            ]:
                 # qwen3 and glm4 think internally without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 

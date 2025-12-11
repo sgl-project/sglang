@@ -172,6 +172,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
         )
 
+
 class InternS1Detector(BaseReasoningFormatDetector):
     """
     Detector for InternS1 models (e.g., InternS1/InternS1-235B-A22B).
@@ -191,6 +192,7 @@ class InternS1Detector(BaseReasoningFormatDetector):
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
+
 
 class KimiDetector(BaseReasoningFormatDetector):
     """
