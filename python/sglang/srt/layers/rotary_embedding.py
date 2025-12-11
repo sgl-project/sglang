@@ -1,5 +1,5 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
-"""Rotary Positinal Embeddings."""
+"""Rotary Positional Embeddings."""
 from __future__ import annotations
 
 import itertools
