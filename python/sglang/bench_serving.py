@@ -187,7 +187,9 @@ async def async_request_trt_llm(
                     output.output_len = request_func_input.output_len
 
                 else:
-                    output.error = response.reason or ""
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
                     output.success = False
         except Exception:
             output.success = False
@@ -286,7 +288,9 @@ async def async_request_openai_completions(
                     output.latency = latency
                     output.output_len = output_len
                 else:
-                    output.error = response.reason or ""
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
                     output.success = False
         except Exception:
             output.success = False
@@ -440,7 +444,9 @@ async def async_request_openai_chat_completions(
                         output.latency = latency
                         output.output_len = output_len
                 else:
-                    output.error = response.reason or ""
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
                     output.success = False
         except Exception:
             output.success = False
@@ -527,7 +533,9 @@ async def async_request_truss(
                     output.latency = latency
                     output.output_len = request_func_input.output_len
                 else:
-                    output.error = response.reason or ""
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
                     output.success = False
         except Exception:
             output.success = False
@@ -623,7 +631,9 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.output_len = output_len
                 else:
-                    output.error = response.reason or ""
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
                     output.success = False
         except Exception:
             output.success = False
@@ -658,7 +668,9 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 if response.status == 200:
                     output.success = True
                 else:
-                    output.error = response.reason or ""
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
                     output.success = False
         except Exception:
             output.success = False
