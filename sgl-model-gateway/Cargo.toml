@@ -1,6 +1,6 @@
 [package]
 name = "sgl-model-gateway"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 
 [features]
@@ -155,6 +155,11 @@ path = "benches/tokenizer_benchmark.rs"
 name = "tool_parser_benchmark"
 harness = false
 path = "benches/tool_parser_benchmark.rs"
+
+[[bench]]
+name = "tree_benchmark"
+harness = false
+path = "benches/tree_benchmark.rs"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

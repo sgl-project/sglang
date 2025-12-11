@@ -12,7 +12,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -103,13 +103,11 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
-            if hasattr(adapted_request, "validation_time"):
+
+            if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
+                # Only set timing fields if adapted_request supports them
                 adapted_request.validation_time = validation_time
-
-            if hasattr(adapted_request, "received_time"):
                 adapted_request.received_time = received_time
-
-            if hasattr(adapted_request, "received_time_perf"):
                 adapted_request.received_time_perf = received_time_perf
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
