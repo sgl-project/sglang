@@ -10,10 +10,7 @@ from typing import cast
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    SamplingParams,
-    generate_request_id,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
@@ -89,8 +86,7 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
 
 def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
-    # FIXME(mick): do not hard code
-    args.request_id = generate_request_id()
+    args.request_id = "mocked_fake_id_for_offline_generate"
 
     # Auto-enable stage logging if dump path is provided
     if args.perf_dump_path:
