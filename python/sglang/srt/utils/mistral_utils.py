@@ -127,7 +127,7 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
         if old_name in yarn_config:
             value = yarn_config.pop(old_name)
             if new_name is not None:
-                config["rope_scaling"][new_name] = float(value)
+                config["rope_scaling"][new_name] = value
 
     assert len(yarn_config) == 0, f"Unparsed yarn config: {yarn_config}"
 
