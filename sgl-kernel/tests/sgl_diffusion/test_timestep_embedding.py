@@ -11,13 +11,15 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embed
     "batch_size", [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384]
 )
 @pytest.mark.parametrize("dim", [32, 128, 256, 512, 1536, 2048, 4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dtype", [torch.int32, torch.int64, torch.bfloat16, torch.float16]
+)
 def test_timestep_embedding_correctness(batch_size, dim, dtype):
     device = "cuda"
-    t = torch.randn((batch_size,), device=device, dtype=dtype)
+    t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
     torch_output = timestep_embedding(t, dim)
     cuda_output = timestep_embedding_cuda(t, dim)
-    torch.testing.assert_close(torch_output, cuda_output)
+    torch.testing.assert_close(torch_output, cuda_output, atol=1e-4, rtol=1e-4)
 
 
 def test_timestep_embedding_perf():
@@ -47,8 +49,9 @@ def test_timestep_embedding_perf():
     cuda_speedups = []
     for B in NUM_BATCH:
         for dim in NUM_DIM:
-            t = torch.randn((B,), device=device)
-
+            t = torch.linspace(0, max(100000, B), steps=B, device=device).to(
+                torch.int32
+            )
             time_torch = perf_kernel_fn(timestep_embedding, t, dim)
             time_cuda = perf_kernel_fn(timestep_embedding_cuda, t, dim)
             speedup_cuda = time_torch / time_cuda

@@ -412,8 +412,20 @@ def timestep_embedding(
     max_period: int = 10000,
     dtype: torch.dtype = torch.float32,
 ):
+    """
+    Create sinusoidal timestep embeddings.
+
     # TODO: review, output dtype always be float32. According to python code:
     #  sglang/python/sglang/multimodal_gen/runtime/layers/visual_embedding.py
+
+    Args:
+        t: Tensor of shape [B] with timesteps
+        dim: Embedding dimension
+        max_period: Controls the minimum frequency of the embeddings
+
+    Returns:
+        Tensor of shape [B, dim] with embeddings
+    """
     dtype = torch.float32
 
     B = t.shape[0]
