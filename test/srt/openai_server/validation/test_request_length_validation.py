@@ -45,7 +45,7 @@ class TestRequestLengthValidation(CustomTestCase):
                 temperature=0,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn("exceeds the model's context length", str(cm.exception))
 
     def test_input_length_longer_than_maximum_allowed_length(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
@@ -61,7 +61,7 @@ class TestRequestLengthValidation(CustomTestCase):
                 temperature=0,
             )
 
-        self.assertIn("is longer than the model's context length", str(cm.exception))
+        self.assertIn("exceeds the model's context length", str(cm.exception))
 
     def test_max_tokens_validation(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
