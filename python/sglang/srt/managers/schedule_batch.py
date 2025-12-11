@@ -1662,7 +1662,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     "Failed to retract any request. No space left for only one request."
                 )
 
-        self.filter_batch(keep_indices=sorted_indices)
+        self.filter_batch(keep_indices=sorted_indices, chunked_req_to_exclude=[])
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
