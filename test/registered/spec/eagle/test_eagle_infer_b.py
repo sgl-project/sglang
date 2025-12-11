@@ -2,7 +2,7 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.eagle_fixture import TestEAGLEServer
+from sglang.test.server_fixtures.eagle_fixture import EagleServerBase, TestEAGLEServer
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -12,6 +12,10 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=473, suite="stage-b-test-small-1-gpu")
+
+
+class TestEAGLEServer(EagleServerBase):
+    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
 
 class TestEAGLERetract(TestEAGLEServer):
