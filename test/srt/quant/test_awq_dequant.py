@@ -17,8 +17,9 @@ from sglang.srt.layers.quantization.awq_triton import (
     awq_gemm_triton,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.srt.utils import get_device
 
-device = "cuda"
+device = get_device()
 
 
 def reverse_awq_order(t: torch.Tensor) -> torch.Tensor:
