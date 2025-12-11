@@ -4,7 +4,6 @@ from typing import Type
 import torch
 from sageattention import sageattn
 
-from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadataBuilder
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
