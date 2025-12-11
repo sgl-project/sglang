@@ -1428,52 +1428,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.is_retracted = False
 
             if get_global_server_args().enable_mamba_radix_cache_v2:
-                mask = (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE > 0
-                mamba_track_mask_cpu.append(mask)
-                mamba_track_indices_cpu.append(
-                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+                self._mamba_radix_cache_v2_prepare_for_extend(
+                    req,
+                    mamba_track_mask_cpu,
+                    mamba_track_indices_cpu,
+                    mamba_track_seqlens_cpu,
                 )
-                mamba_track_seqlen = -1
-                if mask:
-                    # mamba_track_seqlen is used to calculate the indices to track in
-                    # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
-                    # fact that the ssm state between aligned and non-aligned are retrieved differently,
-                    # if 1) last pos and 2) is aligned, then retrieved from the last_recurrent_state,
-                    # otherwise retrieved from h (i.e. unaligned).
-                    # We need to pass the non-aligned seqlen to the calculation. Even though
-                    # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-                    mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
-                    # mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-                    # mamba radix cache to track which seqlen this mamba state should store at.
-                    mamba_track_seqlen_aligned = (
-                        len(req.prefix_indices)
-                        + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
-                    )
-                    req.mamba_next_track_idx = (
-                        self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
-                    )
-                    if req.mamba_branching_seqlen is not None:
-                        # track branching point in this forward if the branching point
-                        # is within the current extend batch.
-                        branching_seqlen_aligned_mask = (
-                            req.mamba_branching_seqlen - len(req.prefix_indices)
-                        ) % FLA_CHUNK_SIZE == 0
-                        if (
-                            req.mamba_branching_seqlen > len(req.prefix_indices)
-                            and req.mamba_branching_seqlen < mamba_track_seqlen
-                            and branching_seqlen_aligned_mask
-                        ):
-                            # NOTE: See the comment above for mamba_track_seqlen, the +1 is necessary
-                            # because the branching point is not the last aligned position, so we need
-                            # to retrieve its state from h. Adding 1 will give us the correct index in h,
-                            # otherwise the calculation will retrieve the state from the last_recurrent_state,
-                            # which is not correct.
-                            mamba_track_seqlen = req.mamba_branching_seqlen + 1
-                            mamba_track_seqlen_aligned = req.mamba_branching_seqlen
-                    req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
-                mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
             # Compute the relative logprob_start_len in an extend batch
             #
@@ -1609,6 +1569,60 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+    def _mamba_radix_cache_v2_prepare_for_extend(
+        self,
+        req: Req,
+        mamba_track_mask_cpu: List[bool],
+        mamba_track_indices_cpu: List[int],
+        mamba_track_seqlens_cpu: List[int],
+    ):
+        mask = (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE > 0
+        mamba_track_mask_cpu.append(mask)
+        mamba_track_indices_cpu.append(
+            req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+        )
+        mamba_track_seqlen = -1
+        if mask:
+            # mamba_track_seqlen is used to calculate the indices to track in
+            # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
+            # fact that the ssm state between aligned and non-aligned are retrieved differently,
+            # if 1) last pos and 2) is aligned, then retrieved from the last_recurrent_state,
+            # otherwise retrieved from h (i.e. unaligned).
+            # We need to pass the non-aligned seqlen to the calculation. Even though
+            # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
+            mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
+            # mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+            # mamba radix cache to track which seqlen this mamba state should store at.
+            mamba_track_seqlen_aligned = (
+                len(req.prefix_indices)
+                + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+            )
+            req.mamba_next_track_idx = (
+                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    req.mamba_next_track_idx
+                )
+            )
+            if req.mamba_branching_seqlen is not None:
+                # track branching point in this forward if the branching point
+                # is within the current extend batch.
+                branching_seqlen_aligned_mask = (
+                    req.mamba_branching_seqlen - len(req.prefix_indices)
+                ) % FLA_CHUNK_SIZE == 0
+                if (
+                    req.mamba_branching_seqlen > len(req.prefix_indices)
+                    and req.mamba_branching_seqlen < mamba_track_seqlen
+                    and branching_seqlen_aligned_mask
+                ):
+                    # NOTE: See the comment above for mamba_track_seqlen, the +1 is necessary
+                    # because the branching point is not the last aligned position, so we need
+                    # to retrieve its state from h. Adding 1 will give us the correct index in h,
+                    # otherwise the calculation will retrieve the state from the last_recurrent_state,
+                    # which is not correct.
+                    mamba_track_seqlen = req.mamba_branching_seqlen + 1
+                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+        mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()

@@ -17,11 +17,9 @@ from sglang.test.test_utils import (
 )
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
-JET_NEMOTRON_MODEL = "jet-ai/Jet-Nemotron-2B"
 
 ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.01, "gsm8k": 0.93},
-    JET_NEMOTRON_MODEL: {"kl_div": 0.01, "gsm8k": 0.1},
 }
 
 
@@ -52,6 +50,8 @@ class TestQwen3Next(CustomTestCase):
                 "4",
                 "--chunked-prefill-size",
                 "2048",
+                "--mamba-track-interval",
+                "128",
             ],
         )
 
@@ -147,6 +147,8 @@ class TestQwen3NextMTPLargePageSize(CustomTestCase):
                 "64",
                 "--chunked-prefill-size",
                 "2048",
+                "--mamba-track-interval",
+                "128",
             ],
         )
 
@@ -240,6 +242,8 @@ class TestQwen3NextMTPTopk(CustomTestCase):
                 "4",
                 "--chunked-prefill-size",
                 "2048",
+                "--mamba-track-interval",
+                "128",
             ],
         )
 
