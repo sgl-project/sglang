@@ -521,7 +521,7 @@ def main():
         "--max-attempts",
         type=int,
         default=2,
-        help="Maximum number of retry attempts per file (default: 2)",
+        help="Maximum number of attempts per file including initial run (default: 2)",
     )
     arg_parser.add_argument(
         "--retry-wait-seconds",
@@ -549,7 +549,7 @@ def main():
         args.timeout_per_file,
         args.continue_on_error,
         enable_retry=args.enable_retry,
-        max_retry_attempts=args.max_retry_attempts,
+        max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
     )
     exit(exit_code)

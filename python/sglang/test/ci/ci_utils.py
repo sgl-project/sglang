@@ -107,7 +107,7 @@ def run_unittest_files(
     timeout_per_file: float,
     continue_on_error: bool = False,
     enable_retry: bool = False,
-    max_retry_attempts: int = 3,
+    max_attempts: int = 2,
     retry_wait_seconds: int = 60,
 ):
     """
@@ -120,7 +120,7 @@ def run_unittest_files(
                           If False, stop at first failure (default behavior for PR tests).
         enable_retry: If True, retry failed tests that appear to be accuracy/performance
                      assertion failures (not code errors).
-        max_retry_attempts: Maximum number of retry attempts per file (default: 3).
+        max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
     """
     tic = time.perf_counter()
@@ -177,10 +177,10 @@ def run_unittest_files(
         file_passed = False
         was_retried = False
 
-        while attempt <= (max_retry_attempts if enable_retry else 1):
+        while attempt <= (max_attempts if enable_retry else 1):
             if attempt > 1:
                 print(
-                    f"\n[CI Retry] Attempt {attempt}/{max_retry_attempts} for {filename}\n",
+                    f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n",
                     flush=True,
                 )
                 was_retried = True
@@ -205,7 +205,7 @@ def run_unittest_files(
                     break
                 else:
                     # Check if we should retry
-                    if enable_retry and attempt < max_retry_attempts:
+                    if enable_retry and attempt < max_attempts:
                         output = "".join(output_lines)
                         is_retriable, reason = is_retriable_failure(output)
 
