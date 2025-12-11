@@ -7,6 +7,7 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
+import os
 import time
 import weakref
 from collections.abc import Iterable
