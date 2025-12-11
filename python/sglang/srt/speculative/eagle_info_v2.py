@@ -204,6 +204,91 @@ class EagleDraftInputV2Mixin:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
+    def prepare_for_extend_to_fill_draft_kvcache_repacked(
+        self,
+        batch: ModelWorkerBatch,
+        repacked_input_ids: torch.Tensor,
+        accept_lens: torch.Tensor,
+        draft_model_runner: Any,
+        cuda_graph_runner: Any,
+    ):
+        """
+        Prepare batch for draft extend using repacked (variable-length) tensors.
+
+        This is the repacking-aware version that only commits accepted tokens to KV cache.
+        """
+        seq_lens_cpu_ = batch.seq_lens_cpu
+
+        # Calculate true extend amount per request
+        accept_lens_cpu = accept_lens.cpu()
+        extend_num_tokens = accept_lens.sum().item()
+
+        batch.spec_info = self
+        batch.input_ids = repacked_input_ids
+        batch.seq_lens = batch.seq_lens + accept_lens
+        batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
+        batch.seq_lens_sum += extend_num_tokens
+        batch.extend_seq_lens = accept_lens_cpu.tolist()
+        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        batch.extend_num_tokens = extend_num_tokens
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.DRAFT_EXTEND_V2
+        )
+
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+
+        # CRITICAL: Disable CUDA graphs for variable-length batches
+        # Variable sum(accept_lens) breaks fixed-shape CUDA graphs
+        can_cuda_graph = False
+
+        if not batch.forward_mode.is_idle() and not can_cuda_graph:
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        return forward_batch
+
+
+def repack_for_draft_extend(
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    num_draft_tokens: int,
+):
+    """
+    Repack sparse tensors to contain only accepted tokens for draft extend.
+
+    In V2, predict/hidden_states/out_cache_loc all have shape [bs * num_draft_tokens, ...].
+    accept_index contains valid indices in range [0, bs * num_draft_tokens).
+
+    Args:
+        predict: [bs * num_draft_tokens], sparse (only accept_index positions have valid tokens)
+        hidden_states: [bs * num_draft_tokens, hidden_size], dense from verify
+        out_cache_loc: [bs * num_draft_tokens], KV cache location indices
+        accept_index: [bs, spec_steps + 1], indices per request, -1 = invalid
+        accept_lens: [bs], number of accepted tokens per request (includes bonus)
+        num_draft_tokens: speculative_num_draft_tokens config value
+
+    Returns:
+        repacked_input_ids:    [sum(accept_lens)]
+        repacked_hidden:       [sum(accept_lens), hidden_size]
+        repacked_cache_loc:    [sum(accept_lens)]
+    """
+    # Flatten accept_index and filter out -1 (unused slots)
+    flat_accept_index = accept_index.flatten()
+    valid_mask = flat_accept_index != -1
+    valid_indices = flat_accept_index[valid_mask]
+
+    # Gather from predict, hidden_states, and out_cache_loc
+    repacked_input_ids = predict[valid_indices]
+    repacked_hidden = hidden_states[valid_indices]
+    repacked_cache_loc = out_cache_loc[valid_indices]
+
+    return repacked_input_ids, repacked_hidden, repacked_cache_loc
+
 
 @dataclass
 class EagleVerifyInputV2Mixin:
