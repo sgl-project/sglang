@@ -129,6 +129,7 @@ from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
@@ -231,6 +232,7 @@ async def lifespan(fast_api_app: FastAPI):
     # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
+        add_prometheus_track_response_middleware(app)
         enable_func_timer()
 
     # Init tracing

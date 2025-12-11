@@ -97,8 +97,8 @@ def _launch_subprocesses(
     """
     # Configure global environment
     configure_logger(server_args)
-    server_args.check_server_args()
     _set_envs_and_config(server_args)
+    server_args.check_server_args()
 
     # Allocate ports for inter-process communications
     if port_args is None:
