@@ -15,12 +15,13 @@ except ImportError:
     HAS_PYTEST = False
 
 try:
-    from sgl_kernel.rotary_embedding import rotary_embedding as rotary_emb_module
+    # Cos/sin-based rotary kernel from sgl_diffusion
+    from sgl_kernel.rotary_embedding import rotary_embedding_cos_sin as rotary_emb_module
     HAS_ROTARY_EMBEDDING = True
 except ImportError:
     rotary_emb_module = None
     HAS_ROTARY_EMBEDDING = False
-    print("sgl_kernel.rotary_embedding not available")
+    print("sgl_kernel.rotary_embedding_cos_sin not available")
 
 
 @dataclass

@@ -22,10 +22,11 @@
 #include <torch/all.h>
 
 #include <cmath>
+#include <vector>
 
 #include "utils.h"
 
-template <typename scalar_t, bool IS_NEOX>
+template <typename scalar_t, bool interleaved>
 inline __device__ void apply_token_rotary_embedding(
     scalar_t* __restrict__ arr,
     const scalar_t* __restrict__ cos_ptr,
@@ -34,7 +35,7 @@ inline __device__ void apply_token_rotary_embedding(
     int embed_dim) {
   int x_index, y_index;
 
-  if (IS_NEOX) {
+  if (interleaved) {
     // NeoX-style: interleaved layout [x0, y0, x1, y1, ...].
     // For NeoX, cos/sin have shape [..., rotary_dim/2]; 
     // each index corresponds to one (x,y) pair.
@@ -67,7 +68,7 @@ inline __device__ void apply_token_rotary_embedding(
   }
 }
 
-template <typename scalar_t, bool IS_NEOX>
+template <typename scalar_t, bool interleaved>
 inline __device__ void apply_rotary_embedding(
     scalar_t* __restrict__ query,                        // [num_heads, head_size]
     scalar_t* __restrict__ key,                          // [num_kv_heads, head_size]
@@ -79,7 +80,7 @@ inline __device__ void apply_rotary_embedding(
     const int rot_dim,
     const int64_t head_stride_query,
     const int64_t head_stride_key) {
-  const int embed_dim_for_rotation = IS_NEOX ? rot_dim : (rot_dim / 2);
+  const int embed_dim_for_rotation = interleaved ? rot_dim : (rot_dim / 2);
 
   const int nq_pairs = num_heads * embed_dim_for_rotation;
   for (int i = threadIdx.x; i < nq_pairs; i += blockDim.x) {
@@ -88,7 +89,7 @@ inline __device__ void apply_rotary_embedding(
 
     scalar_t* query_for_token_head = query + head_idx * (int)head_stride_query;
 
-    apply_token_rotary_embedding<scalar_t, IS_NEOX>(
+    apply_token_rotary_embedding<scalar_t, interleaved>(
         query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
   }
 
@@ -100,13 +101,13 @@ inline __device__ void apply_rotary_embedding(
 
       scalar_t* key_for_token_head = key + head_idx * (int)head_stride_key;
 
-      apply_token_rotary_embedding<scalar_t, IS_NEOX>(
+      apply_token_rotary_embedding<scalar_t, interleaved>(
           key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
     }
   }
 }
 
-template <typename scalar_t, bool IS_NEOX>
+template <typename scalar_t, bool interleaved>
 __global__ void rotary_embedding_kernel(
     const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim_arg]
     const scalar_t* __restrict__ sin_data,  // [num_tokens, rot_dim_arg]
@@ -127,7 +128,7 @@ __global__ void rotary_embedding_kernel(
   scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
 
-  apply_rotary_embedding<scalar_t, IS_NEOX>(
+  apply_rotary_embedding<scalar_t, interleaved>(
       query_for_token,
       key_for_token,
       current_token_cos_ptr,
@@ -140,13 +141,13 @@ __global__ void rotary_embedding_kernel(
       head_stride_key);
 }
 
-void rotary_embedding(
+void rotary_embedding_cos_sin(
     at::Tensor& cos,
     at::Tensor& sin,
     at::Tensor& query,
     const std::optional<at::Tensor>& key,
     int64_t head_size,
-    bool is_neox) {
+    bool interleaved) {
   TORCH_CHECK(
       query.dim() == 2 || query.dim() == 3,
       "query must be in  shape [num_tokens, hidden_size] or [num_tokens, num_heads, head_size]");
@@ -199,6 +200,14 @@ void rotary_embedding(
   }
   TORCH_CHECK(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads");
 
+  // If caller passed full-dim cos/sin for interleaved layout, downsample to half-dim once here.
+  if (interleaved && cos.size(1) == head_size) {
+    const int64_t half = head_size / 2;
+    std::vector<int64_t> new_shape = {cos.size(0), half, 2};
+    cos = cos.view(new_shape).select(2, 0).contiguous();  // even positions
+    sin = sin.view(new_shape).select(2, 1).contiguous();
+  }
+
   int rot_dim_from_cache = (int)cos.size(1);
 
   int64_t query_token_stride = query_hidden_size_calculated;
@@ -225,7 +234,7 @@ void rotary_embedding(
   // Number of (x,y) pairs rotated per head:
   //  - NeoX: cos.size(1) = rotary_dim/2  => pairs = rot_dim_from_cache
   //  - GPT-J: cos.size(1) = rotary_dim   => pairs = rot_dim_from_cache / 2
-  int embed_dim_for_block_calc = is_neox ? rot_dim_from_cache : (rot_dim_from_cache / 2);
+  int embed_dim_for_block_calc = interleaved ? rot_dim_from_cache : (rot_dim_from_cache / 2);
   int max_pairs_to_rotate_per_token =
       std::max(num_heads * embed_dim_for_block_calc, num_kv_heads * embed_dim_for_block_calc);
   dim3 block(std::min<int64_t>(max_pairs_to_rotate_per_token, 512L));
@@ -236,13 +245,13 @@ void rotary_embedding(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding", [&] {
+      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding_cos_sin", [&] {
         using cuda_scalar_t = typename std::conditional<
             std::is_same<scalar_t, at::Half>::value,
             nv_half,
             typename std::conditional<std::is_same<scalar_t, at::BFloat16>::value, nv_bfloat16, scalar_t>::type>::type;
 
-        if (is_neox) {
+        if (interleaved) {
           rotary_embedding_kernel<cuda_scalar_t, true><<<grid, block, 0, stream>>>(
               reinterpret_cast<cuda_scalar_t*>(cos.data_ptr<scalar_t>()),
               reinterpret_cast<cuda_scalar_t*>(sin.data_ptr<scalar_t>()),
