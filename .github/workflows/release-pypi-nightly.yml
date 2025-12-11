@@ -63,11 +63,6 @@ jobs:
           BASE_VERSION=$(cat sglang/version.py | cut -d'"' -f2)
           NIGHTLY_VERSION="${{ steps.gen_version.outputs.nightly_version }}"
 
-          # IMPORTANT: This modification is TEMPORARY and only exists in the CI runner.
-          # We are NOT committing this change back to the repo.
-          # The stable pyproject.toml in the repo remains unchanged.
-          # This is just so `python -m build` creates a wheel with the nightly version.
-
           # Update version (temporary, not committed)
           sed -i "s/version = \"${BASE_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
 
