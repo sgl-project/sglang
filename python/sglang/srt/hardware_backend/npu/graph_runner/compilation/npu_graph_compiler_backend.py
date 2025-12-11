@@ -32,8 +32,8 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 
 class NpuGraphCompilerBackend:
-    def __init__(self, model_type: torch.dtype):
-        self.model_type = model_type
+    def __init__(self, model_runner):
+        self.model_type = model_runner.model_config.dtype
 
     def __call__(self, graph: torch.fx.GraphModule, example_inputs) -> Callable:
         if self.model_type == torch.bfloat16:
