@@ -1134,7 +1134,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
-    is_hybrid_gdn_cache: bool = False
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
@@ -1240,17 +1239,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid_swa = True
 
-        is_hybrid_gdn_cache = False
-        if isinstance(tree_cache, MambaRadixCache) and not tree_cache.disable:
-            is_hybrid_gdn_cache = True
-
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             is_hybrid_swa=is_hybrid_swa,
-            is_hybrid_gdn_cache=is_hybrid_gdn_cache,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
@@ -1433,7 +1427,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.already_computed = seq_len
             req.is_retracted = False
 
-            if self.is_hybrid_gdn_cache:
+            if get_global_server_args().enable_mamba_radix_cache_v2:
                 mask = (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE > 0
                 mamba_track_mask_cpu.append(mask)
                 mamba_track_indices_cpu.append(
@@ -1590,7 +1584,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if self.is_hybrid_gdn_cache:
+        if get_global_server_args().enable_mamba_radix_cache_v2:
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -1878,7 +1872,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
-        if self.is_hybrid_gdn_cache:
+        if get_global_server_args().enable_mamba_radix_cache_v2:
             self.mamba_track_indices = torch.tensor(
                 [
                     req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]

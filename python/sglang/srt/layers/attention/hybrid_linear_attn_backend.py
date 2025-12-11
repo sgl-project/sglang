@@ -168,9 +168,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         self.query_start_loc_list = []
@@ -179,9 +176,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
-        assert (
-            self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-        ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+        self.conv_states_shape: tuple[int, int] = None
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -764,6 +759,15 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
 
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend using Mamba kernel."""
+
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__(model_runner)
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
+        assert (
+            self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+        ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
     def forward_decode(
         self,

@@ -338,7 +338,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
-        disable_radix_cache: bool,
+        enable_mamba_radix_cache_v2: bool,
         speculative_num_draft_tokens: int = None,
     ):
         super().__init__(
@@ -350,14 +350,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = (
             2 if speculative_num_draft_tokens is None else 1
         )
-        self.disable_radix_cache = disable_radix_cache
+        self.enable_mamba_radix_cache_v2 = enable_mamba_radix_cache_v2
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
             size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             device=device,
-            disable_radix_cache=disable_radix_cache,
+            enable_mamba_radix_cache_v2=enable_mamba_radix_cache_v2,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
 
@@ -367,7 +367,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_spec_state_size: int,
         cache_params: BaseLinearStateParams,
         device: str,
-        disable_radix_cache: bool,
+        enable_mamba_radix_cache_v2: bool,
         speculative_num_draft_tokens: int = None,
     ):
         self.mamba_pool = MambaPool(
@@ -384,7 +384,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             size, dtype=torch.int32, device=self.device
         )
-        if not disable_radix_cache:
+        if enable_mamba_radix_cache_v2:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (size, self.mamba_ping_pong_track_buffer_size),
@@ -415,7 +415,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mid = mid[0]
                 req.mamba_pool_idx = mid
             mamba_index.append(mid)
-            if not self.disable_radix_cache:
+            if self.enable_mamba_radix_cache_v2:
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
                         self.mamba_ping_pong_track_buffer_size
@@ -430,14 +430,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         assert len(select_index) == len(
             mamba_index
         ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
-        if not self.disable_radix_cache:
+        if self.enable_mamba_radix_cache_v2:
             assert len(select_index) == len(
                 mamba_ping_pong_track_buffer_list
             ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         self.req_index_to_mamba_index_mapping[select_index] = torch.tensor(
             mamba_index, dtype=torch.int32, device=self.device
         )
-        if not self.disable_radix_cache:
+        if self.enable_mamba_radix_cache_v2:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 torch.tensor(
                     mamba_ping_pong_track_buffer_list,
@@ -477,7 +477,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_index = self.req_index_to_mamba_index_mapping[free_index]
             self.mamba_pool.free(mamba_index)
 
-            if not self.disable_radix_cache:
+            if self.enable_mamba_radix_cache_v2:
                 mamba_ping_pong_track_buffer_to_free = (
                     self.req_index_to_mamba_ping_pong_track_buffer_mapping[
                         free_index
@@ -500,7 +500,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         super().clear()
         self.mamba_pool.clear()
         self.req_index_to_mamba_index_mapping.zero_()
-        if not self.disable_radix_cache:
+        if self.enable_mamba_radix_cache_v2:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 

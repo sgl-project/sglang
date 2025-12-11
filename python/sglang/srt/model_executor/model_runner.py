@@ -240,8 +240,9 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 # the ratio of mamba cache pool size to max_running_requests
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 5
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_NO_OVERLAP_RATIO = 4
+MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
@@ -1500,6 +1501,13 @@ class ModelRunner:
         return total_rest_memory - mamba_state_memory
 
     @property
+    def qwen3_next_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, Qwen3NextConfig):
+            return config
+        return None
+
+    @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
         if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
@@ -1688,12 +1696,18 @@ class ModelRunner:
             )
 
         if self.mambaish_config is not None:
+            additional_ratio = 0
+            if (
+                self.server_args.enable_mamba_radix_cache_v2
+                and not self.spec_algorithm.is_none()
+            ):
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+            else:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             if self.server_args.disable_radix_cache:
                 ratio = 1
-            elif not self.spec_algorithm.is_none():
-                ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_NO_OVERLAP_RATIO
             else:
-                ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+                ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
@@ -1801,7 +1815,7 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
-                    disable_radix_cache=self.server_args.disable_radix_cache,
+                    enable_mamba_radix_cache_v2=self.server_args.enable_mamba_radix_cache_v2,
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:

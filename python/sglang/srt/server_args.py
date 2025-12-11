@@ -456,6 +456,7 @@ class ServerArgs:
     mamba_ssm_dtype: str = "float32"
     mamba_full_memory_ratio: float = 0.9
     mamba_track_interval: int = 256
+    enable_mamba_radix_cache_v2: bool = False
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -1279,26 +1280,6 @@ class ServerArgs:
                         f"{model_arch}"
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
-            if not self.disable_radix_cache:
-                if self.speculative_num_draft_tokens is not None:
-                    assert (
-                        self.mamba_track_interval >= self.speculative_num_draft_tokens
-                    ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
-
-                if self.page_size is not None:
-                    assert (
-                        self.mamba_track_interval % self.page_size == 0
-                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                    assert (
-                        FLA_CHUNK_SIZE % self.page_size == 0
-                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
-
-            if self.speculative_algorithm is not None:
-                logger.info(
-                    f"Disable overlap schedule for {model_arch} model speculative decoding."
-                )
-                self.disable_overlap_schedule = True
-
             if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
@@ -1332,12 +1313,46 @@ class ServerArgs:
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
+
+            # Mamba radix cache v2
+            self.enable_mamba_radix_cache_v2 = (
+                not self.disable_radix_cache and is_cuda()
+            )
+            if self.enable_mamba_radix_cache_v2:
+                if self.speculative_num_draft_tokens is not None:
+                    assert (
+                        self.mamba_track_interval >= self.speculative_num_draft_tokens
+                    ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+
+                if self.page_size is not None:
+                    assert (
+                        self.mamba_track_interval % self.page_size == 0
+                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                    assert (
+                        FLA_CHUNK_SIZE % self.page_size == 0
+                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+
+                if self.speculative_algorithm is not None:
+                    logger.info(
+                        f"Disable overlap schedule for {model_arch} model speculative decoding."
+                    )
+                    self.disable_overlap_schedule = True
+            else:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache v1 is not compatible with "
+                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
+
         elif model_arch in [
             "NemotronHForCausalLM",
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
+            assert (
+                not self.enable_mamba_radix_cache_v2
+            ), f"MambaRadixCache v2 is not supported for {model_arch} model"
             if not self.disable_radix_cache:
                 logger.warning(
                     "Disabling overlap schedule since MambaRadixCache is not compatible with "
@@ -3307,6 +3322,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--enable-mamba-radix-cache-v2",
+            action="store_true",
+            help="Enable MambaRadixCache v2",
         )
 
         # Hierarchical cache

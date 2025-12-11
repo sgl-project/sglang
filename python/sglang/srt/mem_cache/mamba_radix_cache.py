@@ -369,6 +369,14 @@ class MambaRadixCache(BasePrefixCache):
 
         self.page_size = params.page_size
         self.disable = params.disable
+        self.enable_mamba_radix_cache_v2 = params.enable_mamba_radix_cache_v2
+
+        if not self.enable_mamba_radix_cache_v2:
+            assert (
+                self.page_size == 1
+            ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
+        else:
+            logger.info(f"MambaRadixCache v2 is enabled.")
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -496,7 +504,11 @@ class MambaRadixCache(BasePrefixCache):
         ]
 
         if is_insert:
-            cache_len = req.mamba_last_track_seqlen
+            cache_len = (
+                req.mamba_last_track_seqlen
+                if self.enable_mamba_radix_cache_v2
+                else len(token_ids)
+            )
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
@@ -520,16 +532,23 @@ class MambaRadixCache(BasePrefixCache):
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
-            mamba_ping_pong_track_buffer_to_keep = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+            if self.enable_mamba_radix_cache_v2:
+                mamba_ping_pong_track_buffer_to_keep = (
+                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
                 )
-            )
-            mamba_value = (
-                req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
-                .unsqueeze(-1)
-                .clone()
-            )
+                mamba_value = (
+                    req.mamba_ping_pong_track_buffer[
+                        mamba_ping_pong_track_buffer_to_keep
+                    ]
+                    .unsqueeze(-1)
+                    .clone()
+                )
+            else:
+                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+                mamba_ping_pong_track_buffer_to_keep = None
+
             new_prefix_len, mamba_exist = self.insert(
                 RadixKey(token_ids[:page_aligned_len], req.extra_key),
                 page_aligned_kv_indices,
@@ -545,8 +564,12 @@ class MambaRadixCache(BasePrefixCache):
 
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
+
+        free_mamba_cache = True if self.enable_mamba_radix_cache_v2 else mamba_exist
+
         self.req_to_token_pool.free(
             req.req_pool_idx,
+            free_mamba_cache=free_mamba_cache,
             mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
         )
 
@@ -564,11 +587,15 @@ class MambaRadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        cache_len = req.mamba_last_track_seqlen
+        token_ids = req.fill_ids
+        cache_len = (
+            req.mamba_last_track_seqlen
+            if self.enable_mamba_radix_cache_v2
+            else len(token_ids)
+        )
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
 
-        token_ids = req.fill_ids
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -589,17 +616,22 @@ class MambaRadixCache(BasePrefixCache):
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        # copy from the ping pong track buffer
-        mamba_ping_pong_track_buffer_to_keep = (
-            self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                req.mamba_next_track_idx
+        if self.enable_mamba_radix_cache_v2:
+            # copy from the ping pong track buffer
+            mamba_ping_pong_track_buffer_to_keep = (
+                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    req.mamba_next_track_idx
+                )
             )
-        )
-        mamba_value = (
-            req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
-            .unsqueeze(-1)
-            .clone()
-        )
+            mamba_value = (
+                req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
+                .unsqueeze(-1)
+                .clone()
+            )
+        else:
+            mamba_value = self.req_to_token_pool.get_mamba_indices(
+                req.req_pool_idx
+            ).unsqueeze(-1)
         # radix tree mamba value is forked from req space
         mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
 

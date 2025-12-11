@@ -146,7 +146,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             bs,
         )
 
-        if batch.is_hybrid_gdn_cache:
+        if get_global_server_args().enable_mamba_radix_cache_v2:
             batch.mamba_track_indices = torch.tensor(
                 [
                     req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
