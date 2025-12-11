@@ -349,7 +349,7 @@ class _SinglePassGatherer(ABC):
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
     # DeepSeek V3 has this value; should generalize later
-    _TOP_K_NUM = 8
+    _TOP_K_NUM = get_int_env_var("SGLANG_MOE_TOP_K", 8)
 
     def __init__(
         self,
@@ -379,7 +379,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         assert self._metadata is None
         self._metadata = dict(
             # TODO pr-chain
-            # rids=forward_batch.rids,
+            rids=forward_batch.rids,
             input_ids=forward_batch.input_ids.cpu().tolist(),
             positions=forward_batch.positions.cpu().tolist(),
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
