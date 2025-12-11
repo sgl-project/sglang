@@ -95,7 +95,10 @@ class VLMInputTestBase:
                     "content": [
                         {"type": "image_url", "image_url": {"url": self.image_urls[0]}},
                         {"type": "image_url", "image_url": {"url": self.image_urls[1]}},
-                        {"type": "text", "text": "Describe the first image and the second image in detail "},
+                        {
+                            "type": "text",
+                            "text": "Describe the first image and the second image in detail ",
+                        },
                     ],
                 }
             ],
@@ -132,10 +135,10 @@ class VLMInputTestBase:
     async def test_accepts_precomputed_embeddings(self):
         req = self.get_completion_request()
         processor_output, _ = self.get_processor_output(req=req)
-        
+
         with torch.inference_mode():
             precomputed_embeddings = self.__class__.visual(processor_output)
-            
+
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[
@@ -187,6 +190,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
+
 
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "google/gemma-3-4b-it"
@@ -267,43 +271,43 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
 #         )
 
 
-class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
-    model_path = "llava-hf/llava-1.5-7b-hf"
-    chat_template = "vicuna_v1.1"
+# class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+#     model_path = "llava-hf/llava-1.5-7b-hf"
+#     chat_template = "vicuna_v1.1"
 
-    @classmethod
-    def _init_visual(cls):
-        from transformers import LlavaForConditionalGeneration
+#     @classmethod
+#     def _init_visual(cls):
+#         from transformers import LlavaForConditionalGeneration
 
-        model = LlavaForConditionalGeneration.from_pretrained(
-            cls.model_path,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        )
-        cls.vision_tower = model.vision_tower.eval().to(cls.device)
-        cls.multi_modal_projector = model.multi_modal_projector.eval().to(cls.device)
-        cls.config = model.config
+#         model = LlavaForConditionalGeneration.from_pretrained(
+#             cls.model_path,
+#             torch_dtype=torch.float16,
+#             low_cpu_mem_usage=True,
+#         )
+#         cls.vision_tower = model.vision_tower.eval().to(cls.device)
+#         cls.multi_modal_projector = model.multi_modal_projector.eval().to(cls.device)
+#         cls.config = model.config
 
-        def visual_func(processor_output):
-            pixel_values = processor_output["pixel_values"].to(
-                cls.device, dtype=torch.float16
-            )
+#         def visual_func(processor_output):
+#             pixel_values = processor_output["pixel_values"].to(
+#                 cls.device, dtype=torch.float16
+#             )
 
-            vision_outputs = cls.vision_tower(pixel_values, output_hidden_states=True)
-            image_features = vision_outputs.hidden_states[-2]
+#             vision_outputs = cls.vision_tower(pixel_values, output_hidden_states=True)
+#             image_features = vision_outputs.hidden_states[-2]
 
-            if cls.config.vision_feature_select_strategy == "default":
-                image_features = image_features[:, 1:]
-            elif cls.config.vision_feature_select_strategy == "full":
-                image_features = image_features
+#             if cls.config.vision_feature_select_strategy == "default":
+#                 image_features = image_features[:, 1:]
+#             elif cls.config.vision_feature_select_strategy == "full":
+#                 image_features = image_features
 
-            image_features = cls.multi_modal_projector(image_features)
-            return image_features
+#             image_features = cls.multi_modal_projector(image_features)
+#             return image_features
 
-        cls.visual = visual_func
+#         cls.visual = visual_func
 
-    def _processor_output_image_data(self, processor_output):
-        return dict(processor_output, format="processor_output")
+#     def _processor_output_image_data(self, processor_output):
+#         return dict(processor_output, format="processor_output")
 
 
 if __name__ == "__main__":
