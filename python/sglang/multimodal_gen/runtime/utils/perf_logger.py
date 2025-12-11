@@ -223,9 +223,9 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            print(f"[Performance] Metrics dumped to: {abs_path}")
+            logger.info(f"[Performance] Metrics dumped to: {abs_path}")
         except IOError as e:
-            print(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
+            logger.info(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
             logging.getLogger(__name__).error(f"Dump failed: {e}")
 
     @classmethod
