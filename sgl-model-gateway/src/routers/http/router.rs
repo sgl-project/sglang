@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     body::{to_bytes, Body},
@@ -210,7 +210,7 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(&text)) {
+        let worker = match self.select_worker_for_model(model_id, Some(text)) {
             Some(w) => w,
             None => {
                 RouterMetrics::record_request_error(route, "no_available_workers");
