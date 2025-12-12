@@ -157,18 +157,18 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignore,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                return UnquantizedLinearMethod()
             key = "model"
             if "vision_model" in prefix:
                 key = "vision_model"
             elif "visual" in prefix:
                 key = "visual"
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
+            if should_ignore_layer(
+                prefix,
+                ignore=self.ignore,
+                fused_mapping=packed_modules_mapping_subset,
+            ):
+                return UnquantizedLinearMethod()
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
