@@ -383,11 +383,12 @@ void fused_add_layernorm_kernel_impl(
       const fVec scale_fvec = fVec(rsqrt_var);
 
       // Second pass: apply normalization
-      scalar_t* __restrict__ apply_norm_ptr{(residual_ptr != nullptr) ? residual_ptr : input_ptr};
+      scalar_t* __restrict__ apply_norm_ptr{(residual_ptr != nullptr) ? residual_ptr : (scalar_t*)(input_ptr)};
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        fVec x_fvec0 = fVec::loadu(apply_norm_ptr + d);
-        fVec x_fvec1 = fVec::loadu(apply_norm_ptr + d + fVec::size());
+        bVec x_bvec = bVec::loadu(apply_norm_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
@@ -396,12 +397,12 @@ void fused_add_layernorm_kernel_impl(
         x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
         x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
 
-        bVec x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        x_bvec.store(out_ptr + d);
+        bVec x_ovec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        x_ovec.store(out_ptr + d);
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
-        float normalized = (apply_norm_ptr[d] - mean) * rsqrt_var;
+        float normalized = (static_cast<float>(apply_norm_ptr[d]) - mean) * rsqrt_var;
         float x_val = normalized * static_cast<float>(weight[d]);
         out_ptr[d] = static_cast<scalar_t>(x_val);
       }
