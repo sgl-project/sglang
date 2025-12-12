@@ -44,28 +44,29 @@ def get_answer_value(answer_str):
         return INVALID
 
 
-# OpenAI-compatible backend
+# OpenAI-compatible backend (using chat completions API for compatibility)
 async def _openai_request(session, url, prompt, model, semaphore):
     import aiohttp
 
     async with semaphore:
+        # Use chat completions format for dynamo frontend compatibility
         payload = {
             "model": model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 512,
             "temperature": 0,
             "stop": ["Question", "Assistant:", "<|separator|>"],
         }
         try:
             async with session.post(
-                f"{url}/v1/completions",
+                f"{url}/v1/chat/completions",
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=600),
             ) as resp:
                 if resp.status != 200:
                     return "ERROR", 0
                 result = await resp.json()
-                return result["choices"][0]["text"], result.get("usage", {}).get(
+                return result["choices"][0]["message"]["content"], result.get("usage", {}).get(
                     "completion_tokens", 0
                 )
         except:
