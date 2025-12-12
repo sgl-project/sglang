@@ -196,9 +196,9 @@ test_safetensors_pattern() {
     if [ "$(awk "BEGIN {print ($time_per_shard <= 2.0) ? 1 : 0}")" = "1" ]; then
         echo -e "${GREEN}✓ Safetensors loading speed is healthy (<= 2s/shard)${NC}"
     else
-        echo -e "${RED}✗ Safetensors loading is SLOW (${time_per_shard}s/shard, expected <= 2s)${NC}"
         echo "This may cause CI timeouts during model loading!"
-    fi
+        # Consider returning 1 here if slow safetensors loading should fail the CI
+        return 1
 }
 
 # Main
