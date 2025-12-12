@@ -844,9 +844,9 @@ class ServerArgs:
                         "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                     )
                 if not self.enable_dp_attention:
-                    self.enable_flashinfer_allreduce_fusion = True
+                    self.enable_flashinfer_allreduce_fusion = False
                     logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                        "[hzh02 fix] Disable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
                 if (
                     self.quantization == "modelopt_fp4"
