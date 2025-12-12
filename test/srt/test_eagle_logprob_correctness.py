@@ -1,4 +1,3 @@
-import json
 import time
 import unittest
 
@@ -94,15 +93,6 @@ class TestEagleLogprobCorrectness(unittest.TestCase):
         # Run with Eagle
         print("Running with Eagle...")
         out_eagle = self.run_server_test(use_eagle=True)
-
-        # Dump results for debugging
-        with open("eagle_test_debug_base.json", "w") as f:
-            json.dump(out_base, f, indent=2)
-        with open("eagle_test_debug_eagle.json", "w") as f:
-            json.dump(out_eagle, f, indent=2)
-        print(
-            f"Dumped results to eagle_test_debug_base.json and eagle_test_debug_eagle.json"
-        )
 
         # --- Check consistency ---
         print("\nChecking consistency...")
