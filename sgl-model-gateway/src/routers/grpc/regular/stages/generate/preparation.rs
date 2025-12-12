@@ -11,10 +11,11 @@ use crate::{
     routers::grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        error, utils,
+        utils,
     },
     tokenizer::traits::Tokenizer,
 };
+use crate::routers::error;
 
 /// Generate preparation stage
 ///

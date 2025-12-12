@@ -4,12 +4,11 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 use uuid::Uuid;
-
+use crate::routers::error;
 use crate::routers::grpc::{
     client::GrpcClient,
     common::stages::{helpers, PipelineStage},
     context::{ClientSelection, RequestContext, WorkerSelection},
-    error,
     proto_wrapper::ProtoGenerateRequest,
 };
 

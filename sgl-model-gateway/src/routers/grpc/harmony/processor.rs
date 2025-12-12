@@ -19,9 +19,9 @@ use crate::{
     routers::grpc::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        error,
     },
 };
+use crate::routers::error;
 
 /// Processor for non-streaming Harmony responses
 ///

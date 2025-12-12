@@ -10,11 +10,9 @@ use super::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
-    routers::grpc::{
-        context::{RequestContext, WorkerSelection},
-        error,
-    },
+    routers::grpc::context::{RequestContext, WorkerSelection},
 };
+use crate::routers::error;
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub struct WorkerSelectionStage {

@@ -17,11 +17,9 @@ use crate::{
         common::Tool,
         responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
     },
-    routers::{
-        grpc::error,
-        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
-    },
+    routers::openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
 };
+use crate::routers::error;
 
 /// Ensure MCP connection succeeds if MCP tools are declared
 ///

@@ -19,7 +19,6 @@ use crate::{
     routers::grpc::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        error,
         proto_wrapper::ProtoGenerateComplete,
         utils,
     },
@@ -29,6 +28,7 @@ use crate::{
     },
     tool_parser::ParserFactory as ToolParserFactory,
 };
+use crate::routers::error;
 
 /// Unified response processor for both routers
 #[derive(Clone)]

@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 use super::{
     client::GrpcClient,
-    error,
     proto_wrapper::{ProtoGenerateComplete, ProtoStream},
     ProcessedMessages,
 };
@@ -40,6 +39,7 @@ use crate::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
     },
 };
+use crate::routers::error;
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {

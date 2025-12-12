@@ -60,11 +60,11 @@ use crate::{
             streaming::{OutputItemType, ResponseStreamEventEmitter},
         },
         context::SharedComponents,
-        error,
         harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         pipeline::RequestPipeline,
     },
 };
+use crate::routers::error;
 
 /// Maximum number of tool execution iterations to prevent infinite loops
 const MAX_TOOL_ITERATIONS: usize = 10;

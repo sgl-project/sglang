@@ -11,9 +11,10 @@ use crate::{
     routers::grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
-        error, utils,
+        utils,
     },
 };
+use crate::routers::error;
 
 /// Chat preparation stage
 ///

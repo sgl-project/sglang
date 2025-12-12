@@ -11,7 +11,7 @@ use tracing::error;
 use super::{
     common::stages::*,
     context::*,
-    error, harmony,
+    harmony,
     regular::{processor, stages::*, streaming},
 };
 use crate::{
@@ -25,6 +25,7 @@ use crate::{
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
+use crate::routers::error;
 
 /// Generic request pipeline for all request types
 ///
