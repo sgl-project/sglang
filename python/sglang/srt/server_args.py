@@ -1679,11 +1679,12 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            assert (
-                self.quantization == "modelopt_fp4"
-                or self.quantization == "modelopt_fp8"
-                or self.quantization == "fp8"
-            ), "modelopt_fp4, modelopt_fp8 or fp8 quantization is required for Flashinfer TRTLLM MoE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "fp8",
+                "modelopt_fp8",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
