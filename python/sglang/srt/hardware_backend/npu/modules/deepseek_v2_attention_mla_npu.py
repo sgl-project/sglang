@@ -273,39 +273,51 @@ def forward_dsa_prepare_npu(
                 m.qk_rope_head_dim,
                 m.quant_config,
             )
-        (
-            q_pe,
-            k_pe,
-            q_nope_out,
-            k_nope,
-            forward_batch,
-            zero_allocator,
-            positions,
-        ) = m.mla_preprocess.forward(
-            positions, hidden_states, forward_batch, zero_allocator
-        )
-
+        mla_event = torch.npu.Event()
+        mla_event.record()
+        with torch.npu.stream(m.alt_stream):
+            torch.npu.current_stream().wait_event(mla_event)
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         q, _ = fused_qkv_a_proj_out.split(
             [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
         )
         q_lora = m.q_a_layernorm(q)
+        torch.npu.current_stream().wait_stream(m.alt_stream)
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         q, latent_cache = fused_qkv_a_proj_out.split(
             [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
         )
-        k_nope = latent_cache[..., : m.kv_lora_rank]
 
+        # overlap qk norm
         q = m.q_a_layernorm(q)
-        k_nope = m.kv_a_layernorm(k_nope)
 
         q_lora = q.clone()  # required for topk_indices
-        k_nope = k_nope.unsqueeze(1)
-        q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+
+        m.alt_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(m.alt_stream):
+            q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            q.record_stream(m.alt_stream)
+            q_event = m.alt_stream.record_event()
+
+        k_nope, k_pe = latent_cache.unsqueeze(1).split(
+            [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+        )
+        k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
+        torch.npu.current_stream().wait_event(q_event)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
@@ -367,7 +379,11 @@ def forward_dsa_core_npu(
         device=attn_output.device,
     )
 
-    if not forward_batch.forward_mode.is_decode():
+    if (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        and not forward_batch.forward_mode.is_target_verify()
+    ):
         attn_output = attn_output.transpose(0, 1)
         torch.bmm(
             attn_output,
