@@ -572,6 +572,34 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         finally:
             LOGPROB_THRESHOLD = original_threshold
 
+    def test_lora_embedding_logprob_comparison_triton(self):
+        """
+        Test embedding LoRA (embed_tokens/lm_head) with TritonLoRABackend.
+
+        This serves as baseline to validate chunked backend against.
+        Adapter must have embed_tokens in target_modules (not modules_to_save).
+        """
+        if is_in_ci():
+            self.skipTest("Skipping in CI environment - requires large models")
+
+        model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        lora_paths = ["ash256/sglang_embedding_lora_test_adapter"]
+        prompts = DEFAULT_TEST_PROMPTS[:2]
+
+        global LOGPROB_THRESHOLD
+        original_threshold = LOGPROB_THRESHOLD
+        LOGPROB_THRESHOLD = 1.0  # Relaxed for embedding LoRA
+        try:
+            self._run_comparison_test(
+                model_path=model_path,
+                lora_paths=lora_paths,
+                prompts=prompts,
+                max_new_tokens=32,
+                lora_backend="triton",
+            )
+        finally:
+            LOGPROB_THRESHOLD = original_threshold
+
 
 if __name__ == "__main__":
     try:
