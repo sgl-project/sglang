@@ -58,9 +58,9 @@ def set_default_server_args(args: "ServerArgs"):
         else:
             args.hicache_mem_layout = "page_first_direct"
 
-    if args.enable_piecewise_npu_graph_decode and args.enable_torch_air_compile:
+    if args.enable_piecewise_npu_graph_decode and args.enable_torch_npugraph_ex_compile:
         raise ValueError(
-            "Cannot enable both --enable-piecewise-npu-graph-decode and --enable-torch-air-compile"
+            "Cannot enable both --enable-piecewise-npu-graph-decode and --enable-torch-npugraph-ex-compile"
         )
 
     if args.compilation_config:
@@ -77,21 +77,21 @@ def set_default_server_args(args: "ServerArgs"):
                     f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-piecewise-npu-graph-decode"
                 )
 
-            if args.enable_torch_air_compile:
+            if args.enable_torch_npugraph_ex_compile:
                 raise ValueError(
-                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torch-air-compile"
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torch-npugraph-ex-compile"
                 )
 
         if args.compilation_config.compiler == "piecewise":
             args.enable_piecewise_npu_graph_decode = True
 
-            if args.enable_torch_air_compile:
+            if args.enable_torch_npugraph_ex_compile:
                 raise ValueError(
-                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torch-air-compile"
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torch-npugraph-ex-compile"
                 )
 
-        if args.compilation_config.compiler == "torchair":
-            args.enable_torch_air_compile = True
+        if args.compilation_config.compiler == "npugraph_ex":
+            args.enable_torch_npugraph_ex_compile = True
 
             if args.enable_piecewise_npu_graph_decode:
                 raise ValueError(

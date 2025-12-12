@@ -104,6 +104,17 @@ if TYPE_CHECKING:
 
     from sglang.srt.server_args import ServerArgs
 
+if hasattr(torch, "npu") and torch.npu.is_available():
+    try:
+        import torchair
+        import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+        from torchair.configs.compiler_config import CompilerConfig
+
+        torchair_package_installed = True
+    except ImportError as e:
+        torchair_package_installed = False
+
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -1955,6 +1966,7 @@ def get_npu_compiler_config():
     return config
 
 
+@lru_cache(maxsize=1)
 def get_compiler_backend(
     mode: str = None,
     model_runner=None,
@@ -1966,7 +1978,7 @@ def get_compiler_backend(
 
     if hasattr(torch, "npu") and torch.npu.is_available():
         if compilation_config is None:
-            compilation_config = CompilationConfig(compiler="torchair")
+            compilation_config = CompilationConfig(compiler="npugraph_ex")
 
         if compilation_config.compiler == "piecewise":
             from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_graph_compiler_backend import (
@@ -1984,12 +1996,8 @@ def get_compiler_backend(
 
             return NpuGraphCompilerBackend(model_runner)
 
-        if compilation_config.compiler == "torchair":
-            try:
-                import torchair
-                import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
-                from torchair.configs.compiler_config import CompilerConfig
-            except ImportError as e:
+        if compilation_config.compiler == "npugraph_ex":
+            if not torchair_package_installed:
                 raise ImportError(
                     "NPU detected, but torchair package is not installed. "
                     "Please install torchair for torch.compile support on NPU."

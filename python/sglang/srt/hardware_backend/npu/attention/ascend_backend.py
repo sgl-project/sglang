@@ -258,10 +258,10 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
-        self.enable_torch_air_compile = (
-            model_runner.server_args.enable_torch_air_compile
+        self.enable_torch_npugraph_ex_compile = (
+            model_runner.server_args.enable_torch_npugraph_ex_compile
         )
-        if self.enable_torch_air_compile:
+        if self.enable_torch_npugraph_ex_compile:
             max_total_tokens = model_runner.max_total_num_tokens
             self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
 
@@ -293,7 +293,7 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         if (
-            self.enable_torch_air_compile
+            self.enable_torch_npugraph_ex_compile
             and forward_batch.forward_mode.is_decode_or_idle()
         ):
             bs = forward_batch.input_ids.size(0)
@@ -1245,7 +1245,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_table=self.forward_metadata.block_tables,
                     actual_seq_lengths_kv=(
                         self.forward_metadata.seq_lens_cpu_list
-                        if self.enable_torch_air_compile
+                        if self.enable_torch_npugraph_ex_compile
                         else self.forward_metadata.seq_lens_cpu_int
                     ),
                     scale=layer.scaling,
