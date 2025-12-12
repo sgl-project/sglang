@@ -66,6 +66,7 @@ class SeparatorStyle(IntEnum):
     QWEN2_AUDIO = auto()
     GEMMA3 = auto()
     MPT = auto()
+    PADDLE_OCR = auto()
 
 
 @dataclasses.dataclass
@@ -374,6 +375,24 @@ class Conversation:
                 else:
                     ret += role + "\n"
 
+            return ret
+        elif self.sep_style == SeparatorStyle.PADDLE_OCR:
+            ret = system_prompt
+            for role, message in self.messages:
+                if message:
+                    ret += role + ": "
+                    if role == self.roles[0]:
+                        if self.image_token in message:
+                            ret += message.replace(
+                                self.image_token + "\n", self.image_token
+                            )
+                        else:
+                            ret += message
+                        ret += "\n"
+                    else:
+                        ret += message + self.sep
+                else:
+                    ret += role + ": "  # must be end with a space
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -859,6 +878,19 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="paddle-ocr",
+        system_message="",
+        system_template="<|begin_of_sentence|>{system_message}",
+        roles=("User", "Assistant"),
+        sep="<|end_of_sentence|>",
+        sep_style=SeparatorStyle.PADDLE_OCR,
+        stop_str=["<|end_of_sentence|>"],
+        image_token="<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="deepseek-vl2",
         system_template="{system_message}",
         # system_message="You are a helpful assistant. Please answer truthfully and write out your "
@@ -1001,6 +1033,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "minicpmv": "minicpmv",
     "minicpmo": "minicpmo",
     "deepseek-ocr": "deepseek-ocr",
+    "paddleocr_vl": "paddle-ocr",
 }
 
 
@@ -1083,5 +1116,13 @@ def match_phi_4_mm(model_path: str):
 def match_deepseek_ocr(model_path: str):
     if "deepseek-ocr" in model_path.lower():
         return "deepseek-ocr"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_paddle_ocr(model_path: str):
+    if "paddleocr" in model_path.lower():
+        return "paddle-ocr"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)

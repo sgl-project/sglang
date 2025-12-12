@@ -48,6 +48,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -104,6 +105,7 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -187,7 +189,7 @@ if _use_aiter_gfx95:
     )
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
-        fused_qk_rope_cat,
+        fused_qk_rope_cat_and_cache_mla,
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
@@ -658,7 +660,9 @@ class DeepseekV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
+            routing_method_type=getattr(
+                config, "routing_method_type", RoutingMethodType.DeepSeekV3
+            ),
             prefix=add_prefix("experts", prefix),
         )
 
@@ -675,8 +679,13 @@ class DeepseekV2MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
-            # and requires the output format to be standard. We use quant_config to determine the output format.
-            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if (quant_config is None)
+                and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                else None
+            ),
         )
 
         self.shared_experts_is_int8 = False
@@ -696,6 +705,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_ascend_fuseep()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -734,7 +744,11 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -751,7 +765,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -982,7 +998,14 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag:
-                shared_output = self._forward_shared_experts(hidden_states)
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                else:
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1101,6 +1124,12 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
+        if (
+            hidden_states.shape[0] > 0
+            and not sbo_enabled_flag
+            and self.alt_stream is not None
+        ):
+            torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -1836,7 +1865,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope, *_ = fused_rms_mxfp4_quant(
+                    q, _, k_nope, *_ = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.variance_epsilon,
@@ -2003,6 +2032,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         topk_indices,
         llama_4_scaling,
     ):
+        save_kv_cache = True
+
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
@@ -2026,16 +2057,29 @@ class DeepseekV2AttentionMLA(nn.Module):
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
-                q, k = fused_qk_rope_cat(
+
+                kv_cache_dtype = (
+                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+                )
+
+                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,
                     q_pe,
                     k_nope,
                     k_pe,
+                    forward_batch.token_to_kv_pool.get_key_buffer(
+                        self.attn_mqa.layer_id
+                    ),
+                    forward_batch.out_cache_loc,
                     positions,
                     cos,
                     sin,
+                    self.attn_mqa.k_scale,
                     self.rotary_emb.is_neox_style,
+                    q_out_dtype=kv_cache_dtype,
                 )
+
+                save_kv_cache = False
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
@@ -2049,6 +2093,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 k,
                 k_nope,
                 forward_batch,
+                save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -2500,7 +2545,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
-        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
+            forward_batch.extend_prefix_lens_cpu
+        )
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)
@@ -2655,7 +2702,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
-        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
             # refer to real DeepSeek V3 quant config
             return Fp8Config(
                 is_checkpoint_fp8_serialized=True,
@@ -2712,12 +2759,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -2967,7 +3016,8 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_npu else None
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
@@ -3188,7 +3238,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         self.fuse_qkv_a_proj = (
@@ -3270,10 +3319,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        elif (
-            get_moe_expert_parallel_world_size() > 1
-            and _is_hip
-            and torch.cuda.get_device_capability("cuda") < (9, 4)
+        elif get_moe_expert_parallel_world_size() > 1 and (
+            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and get_moe_a2a_backend().is_deepep():
@@ -3400,16 +3447,22 @@ class DeepseekV2ForCausalLM(nn.Module):
                     selected_quant_config, "weight_block_size", None
                 )
                 if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
+                        self_attn.kv_b_proj, "weight_scale"
+                    )
+                    weight_scale = (
+                        self_attn.kv_b_proj.weight_scale
+                        if hasattr(self_attn.kv_b_proj, "weight_scale")
+                        else self_attn.kv_b_proj.weight_scale_inv
+                    )
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                            weight_scale=weight_scale,
                             input_scale=None,
                         )
                     else:
                         weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
@@ -3591,7 +3644,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
             weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             weights = self._quant_nextn_moe_to_fp8_ue8m0(
