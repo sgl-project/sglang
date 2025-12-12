@@ -1347,7 +1347,7 @@ class ServerArgs:
                         f"Disable overlap schedule for {model_arch} model speculative decoding."
                     )
                     self.disable_overlap_schedule = True
-            else:
+            elif not self.disable_radix_cache:
                 logger.warning(
                     "Disabling overlap schedule since MambaRadixCache v1 is not compatible with "
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
