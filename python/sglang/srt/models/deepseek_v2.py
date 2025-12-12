@@ -2704,12 +2704,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.config = config
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None:
-            # In transformers 5.0.0rc0+, rope_theta and rope_type are also included in rope_scaling.
-            # Therefore, if rope_scaling contains only these two keys,
-            # it effectively means there are no special rope_scaling parameters.
-            if set(rope_scaling.keys()) <= {"rope_theta", "rope_type"}:
-                rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -2740,12 +2734,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
