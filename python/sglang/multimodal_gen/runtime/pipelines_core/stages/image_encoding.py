@@ -121,12 +121,11 @@ class ImageEncodingStage(PipelineStage):
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
             # 1. neg prompt embeds
-            if batch.prompt:
-                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-                txt = prompt_template_encode.format(batch.negative_prompt)
-                neg_image_processor_kwargs = dict(text=[txt], padding=True)
-            else:
-                neg_image_processor_kwargs = {}
+            neg_image_processor_kwargs = (
+                server_args.pipeline_config.prepare_image_processor_kwargs(
+                    batch, neg=True
+                )
+            )
 
             neg_image_inputs = self.image_processor(
                 images=image, return_tensors="pt", **neg_image_processor_kwargs
@@ -211,89 +210,98 @@ class ImageVAEEncodingStage(PipelineStage):
 
         self.vae = self.vae.to(get_local_torch_device())
 
-        image = batch.condition_image
-        image = self.preprocess(
-            image,
-        ).to(get_local_torch_device(), dtype=torch.float32)
-
-        # (B, C, H, W) -> (B, C, 1, H, W)
-        image = image.unsqueeze(2)
-
-        if num_frames == 1:
-            video_condition = image
-        else:
-            video_condition = torch.cat(
-                [
-                    image,
-                    image.new_zeros(
-                        image.shape[0],
-                        image.shape[1],
-                        num_frames - 1,
-                        image.shape[3],
-                        image.shape[4],
-                    ),
-                ],
-                dim=2,
-            )
-        video_condition = video_condition.to(
-            device=get_local_torch_device(), dtype=torch.float32
+        images = (
+            batch.vae_image if batch.vae_image is not None else batch.condition_image
         )
+        if not isinstance(images, list):
+            images = [images]
 
-        # Setup VAE precision
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        all_image_latents = []
+        for image in images:
+            image = self.preprocess(
+                image,
+            ).to(get_local_torch_device(), dtype=torch.float32)
 
-        # Encode Image
-        with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
-        ):
-            if server_args.pipeline_config.vae_tiling:
-                self.vae.enable_tiling()
-            # if server_args.vae_sp:
-            #     self.vae.enable_parallel()
-            if not vae_autocast_enabled:
-                video_condition = video_condition.to(vae_dtype)
-            encoder_output: DiagonalGaussianDistribution = self.vae.encode(
-                video_condition
+            # (B, C, H, W) -> (B, C, 1, H, W)
+            image = image.unsqueeze(2)
+
+            if num_frames == 1:
+                video_condition = image
+            else:
+                video_condition = torch.cat(
+                    [
+                        image,
+                        image.new_zeros(
+                            image.shape[0],
+                            image.shape[1],
+                            num_frames - 1,
+                            image.shape[3],
+                            image.shape[4],
+                        ),
+                    ],
+                    dim=2,
+                )
+            video_condition = video_condition.to(
+                device=get_local_torch_device(), dtype=torch.float32
             )
 
-        generator = batch.generator
-        if generator is None:
-            raise ValueError("Generator must be provided")
+            # Setup VAE precision
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            vae_autocast_enabled = (
+                vae_dtype != torch.float32
+            ) and not server_args.disable_autocast
 
-        sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+            # Encode Image
+            with torch.autocast(
+                device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            ):
+                if server_args.pipeline_config.vae_tiling:
+                    self.vae.enable_tiling()
+                # if server_args.vae_sp:
+                #     self.vae.enable_parallel()
+                if not vae_autocast_enabled:
+                    video_condition = video_condition.to(vae_dtype)
+                encoder_output: DiagonalGaussianDistribution = self.vae.encode(
+                    video_condition
+                )
 
-        latent_condition = self.retrieve_latents(
-            encoder_output, generator, sample_mode=sample_mode
-        )
-        latent_condition = server_args.pipeline_config.postprocess_vae_encode(
-            latent_condition, self.vae
-        )
+            generator = batch.generator
+            if generator is None:
+                raise ValueError("Generator must be provided")
 
-        scaling_factor, shift_factor = (
-            server_args.pipeline_config.get_decode_scale_and_shift(
-                device=latent_condition.device,
-                dtype=latent_condition.dtype,
-                vae=self.vae,
+            sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+
+            latent_condition = self.retrieve_latents(
+                encoder_output, generator, sample_mode=sample_mode
             )
-        )
+            latent_condition = server_args.pipeline_config.postprocess_vae_encode(
+                latent_condition, self.vae
+            )
 
-        # apply shift & scale if needed
-        if isinstance(shift_factor, torch.Tensor):
-            shift_factor = shift_factor.to(latent_condition.device)
+            scaling_factor, shift_factor = (
+                server_args.pipeline_config.get_decode_scale_and_shift(
+                    device=latent_condition.device,
+                    dtype=latent_condition.dtype,
+                    vae=self.vae,
+                )
+            )
 
-        if isinstance(scaling_factor, torch.Tensor):
-            scaling_factor = scaling_factor.to(latent_condition.device)
+            # apply shift & scale if needed
+            if isinstance(shift_factor, torch.Tensor):
+                shift_factor = shift_factor.to(latent_condition.device)
 
-        latent_condition -= shift_factor
-        latent_condition = latent_condition * scaling_factor
+            if isinstance(scaling_factor, torch.Tensor):
+                scaling_factor = scaling_factor.to(latent_condition.device)
 
-        batch.image_latent = server_args.pipeline_config.postprocess_image_latent(
-            latent_condition, batch
-        )
+            latent_condition -= shift_factor
+            latent_condition = latent_condition * scaling_factor
 
+            image_latent = server_args.pipeline_config.postprocess_image_latent(
+                latent_condition, batch
+            )
+            all_image_latents.append(image_latent)
+
+        batch.image_latent = torch.cat(all_image_latents, dim=1)
         self.maybe_free_model_hooks()
 
         self.vae.to("cpu")
@@ -337,6 +345,7 @@ class ImageVAEEncodingStage(PipelineStage):
         assert batch.condition_image is None or (
             isinstance(batch.condition_image, PIL.Image.Image)
             or isinstance(batch.condition_image, torch.Tensor)
+            or isinstance(batch.condition_image, list)
         )
         assert batch.height is not None and isinstance(batch.height, int)
         assert batch.width is not None and isinstance(batch.width, int)

@@ -208,7 +208,10 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
-    def prepare_image_processor_kwargs(self, batch):
+    def prepare_calculated_size(self, image):
+        return self.calculate_condition_image_size(image, image.width, image.height)
+
+    def prepare_image_processor_kwargs(self, batch, neg):
         return {}
 
     def postprocess_image_latent(self, latent_condition, batch):
@@ -296,6 +299,9 @@ class PipelineConfig:
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
+
+    def preprocess_vae_image(self, batch, vae_image_processor):
+        pass
 
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models

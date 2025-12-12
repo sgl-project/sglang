@@ -933,6 +933,8 @@ class DenoisingStage(PipelineStage):
         denoising_start_time = time.time()
 
         # to avoid device-sync caused by timestep comparison
+
+        self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
