@@ -144,9 +144,9 @@ class DecodeKVCacheOffloadManager:
         cc = self.cache_controller
 
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+        for _, finish_event, _ in self.cache_controller.ack_write_queue:
             if not finish_event.query():
-                # the KV cache loading is still ongoing
+                # the KV cache offloading is still ongoing
                 break
             finish_count += 1
 
