@@ -1607,6 +1607,7 @@ class ServerArgs:
                             "cutlass_mla",
                             "flashinfer",
                             "trtllm_mla",
+                            "flashmla",
                         ]
                         assert (
                             self.attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES
