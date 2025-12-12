@@ -1,3 +1,5 @@
+use std::{future::Future, sync::Arc, time::Instant};
+
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
@@ -11,8 +13,6 @@ use axum::{
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
-use std::future::Future;
-use std::{sync::Arc, time::Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
