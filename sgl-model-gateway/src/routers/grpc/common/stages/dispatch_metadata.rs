@@ -7,9 +7,9 @@ use axum::response::Response;
 use tracing::error;
 
 use super::PipelineStage;
-use crate::routers::grpc::{
-    context::{DispatchMetadata, RequestContext, RequestType, WorkerSelection},
+use crate::routers::{
     error,
+    grpc::context::{DispatchMetadata, RequestContext, RequestType, WorkerSelection},
 };
 
 /// Dispatch metadata stage: Prepare metadata for dispatch

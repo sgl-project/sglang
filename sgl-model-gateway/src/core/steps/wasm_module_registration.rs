@@ -24,8 +24,8 @@ use wasmtime::{component::Component, Config, Engine};
 
 use crate::{
     app_context::AppContext,
-    core::workflow::*,
     wasm::module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
+    workflow::*,
 };
 
 /// WASM module registration request
