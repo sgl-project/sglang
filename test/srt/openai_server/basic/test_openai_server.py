@@ -14,7 +14,7 @@ from typing import Optional
 import openai
 import requests
 
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.custom_logit_processor import DeterministicLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
@@ -870,38 +870,44 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
     def tearDownClass(cls) -> None:
         kill_process_tree(cls.process.pid)
 
-    def run_custom_logit_processor(self, target_token_id: Optional[int] = None) -> None:
+    def run_custom_logit_processor(
+        self,
+        target_token_id: Optional[int] = None,
+        custom_logit_processor: str = DeterministicLogitProcessor().to_str(),
+    ) -> None:
         """
         Test custom logit processor with custom params.
 
         If target_token_id is None, the custom logit processor won't be passed in.
         """
-
-        class DeterministicLogitProcessor(CustomLogitProcessor):
-            """A dummy logit processor that changes the logits to always sample the given token id."""
-
-            CUSTOM_PARAM_KEY = "token_id"
-
-            def __call__(self, logits, custom_param_list):
-                assert logits.shape[0] == len(custom_param_list)
-
-                for i, param_dict in enumerate(custom_param_list):
-                    # Mask all other tokens
-                    logits[i, :] = -float("inf")
-                    # Assign highest probability to the specified token
-                    logits[i, param_dict[self.CUSTOM_PARAM_KEY]] = 0.0
-
-                return logits
-
-        extra_body = {}
+        custom_params = None
 
         if target_token_id is not None:
-            extra_body["custom_logit_processor"] = (
-                DeterministicLogitProcessor().to_str()
-            )
-            extra_body["custom_params"] = {
+            custom_params = {
                 "token_id": target_token_id,
             }
+
+        response = self.chat_completion_with_custom_logit_processor(
+            custom_params, custom_logit_processor
+        )
+        if target_token_id is not None:
+            target_text = self.tokenizer.decode([target_token_id] * 200)
+            self.assertTrue(
+                target_text == response.choices[0].message.content,
+                f"{target_token_id=}\n{target_text=}\n{response.model_dump(mode='json')}",
+            )
+
+    def chat_completion_with_custom_logit_processor(
+        self,
+        custom_params: Optional[dict] = None,
+        custom_logit_processor: Optional[str] = None,
+    ):
+        """Test chat completion with custom logit processor."""
+        extra_body = {}
+
+        if custom_params:
+            extra_body["custom_logit_processor"] = custom_logit_processor
+            extra_body["custom_params"] = custom_params
 
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         max_tokens = 200
@@ -918,17 +924,44 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
             max_tokens=max_tokens,
             extra_body=extra_body,
         )
-
-        if target_token_id is not None:
-            target_text = self.tokenizer.decode([target_token_id] * max_tokens)
-            self.assertTrue(
-                target_text == response.choices[0].message.content,
-                f"{target_token_id=}\n{target_text=}\n{response.model_dump(mode='json')}",
-            )
+        return response
 
     def test_custom_logit_processor(self) -> None:
         """Test custom logit processor with a single request."""
         self.run_custom_logit_processor(target_token_id=5)
+
+    def test_custom_logit_processor_with_class_path(self) -> None:
+        """Test custom logit processor with class path."""
+        self.run_custom_logit_processor(
+            target_token_id=5,
+            custom_logit_processor="sglang.srt.sampling.custom_logit_processor:DeterministicLogitProcessor",
+        )
+
+    def test_custom_logit_processor_with_error(self) -> None:
+        """Test custom logit processor with class path."""
+        try:
+            _res = self.chat_completion_with_custom_logit_processor(
+                custom_params={
+                    "token_id": 5,
+                },
+                custom_logit_processor="wrong_module_path:DeterministicLogitProcessor",
+            )
+        except openai.BadRequestError as e:
+            self.assertIn("No module named 'wrong_module_path'", e.message)
+            self.assertEqual(e.status_code, 400)
+
+        try:
+            _res = self.chat_completion_with_custom_logit_processor(
+                custom_params={
+                    "token_id": 5,
+                },
+                custom_logit_processor="wrong_module_path.DeterministicLogitProcessor",
+            )
+        except openai.BadRequestError as e:
+            self.assertIn(
+                "It should be in the format 'module_path:ClassName'", e.message
+            )
+            self.assertEqual(e.status_code, 400)
 
     def test_custom_logit_processor_batch_mixed(self) -> None:
         """Test a batch of requests mixed of requests with and without custom logit processor."""
