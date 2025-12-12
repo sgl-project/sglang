@@ -209,7 +209,9 @@ def run_unittest_files(
                         is_retriable, reason = is_retriable_failure(output)
 
                         if is_retriable:
-                            logger.info(f"\n[CI Retry] {filename} failed with {reason}")
+                            logger.info(
+                                f"\n[CI Retry] {filename} failed with {reason}"
+                            )
                             logger.info(
                                 f"[CI Retry] Waiting {retry_wait_seconds}s before retry...\n"
                             )
