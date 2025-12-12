@@ -102,8 +102,9 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::core::workflow::{
-        create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
+    use sgl_model_gateway::{
+        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
+        workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
     engine.register_workflow(create_worker_registration_workflow(&config));
@@ -233,8 +234,9 @@ pub async fn create_test_context_with_mcp_config(
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::core::workflow::{
-        create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
+    use sgl_model_gateway::{
+        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
+        workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
     engine.register_workflow(create_worker_registration_workflow(&config));

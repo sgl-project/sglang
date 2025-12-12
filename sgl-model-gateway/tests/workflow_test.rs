@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use sgl_model_gateway::core::workflow::*;
+use sgl_model_gateway::workflow::*;
 use tokio::time::sleep;
 
 // Test step that counts invocations

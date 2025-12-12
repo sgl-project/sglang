@@ -23,14 +23,12 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
-        worker_to_info,
-        workflow::{
+        steps::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
             create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
-            WorkflowEngine,
+            create_worker_registration_workflow, create_worker_removal_workflow,
         },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        worker_to_info, Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -52,6 +50,7 @@ use crate::{
     routers::{conversations, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
+    workflow::{LoggingSubscriber, WorkflowEngine},
 };
 
 #[derive(Clone)]

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::{app_context::AppContext, core::workflow::*};
+use crate::{app_context::AppContext, workflow::*};
 
 /// WASM module removal request
 #[derive(Debug, Clone)]
