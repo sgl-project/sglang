@@ -24,11 +24,12 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     core::{
-        workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
+        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
+        HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
     },
     protocols::worker_spec::WorkerConfigRequest,
     routers::grpc::client::GrpcClient,
+    workflow::*,
 };
 
 // HTTP client for metadata fetching
