@@ -1,6 +1,6 @@
 //! Workflow definition types
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use super::{
     executor::StepExecutor,
@@ -15,6 +15,7 @@ pub struct StepDefinition {
     pub retry_policy: Option<RetryPolicy>,
     pub timeout: Option<Duration>,
     pub on_failure: FailureAction,
+    pub depends_on: Vec<StepId>,
 }
 
 impl StepDefinition {
@@ -30,6 +31,7 @@ impl StepDefinition {
             retry_policy: None,
             timeout: None,
             on_failure: FailureAction::FailWorkflow,
+            depends_on: Vec::new(),
         }
     }
 
@@ -45,6 +47,14 @@ impl StepDefinition {
 
     pub fn with_failure_action(mut self, action: FailureAction) -> Self {
         self.on_failure = action;
+        self
+    }
+
+    /// Set dependencies for this step.
+    /// The step will only run after all specified dependencies have completed successfully.
+    /// Empty slice means no dependencies - step can run immediately in parallel with others.
+    pub fn depends_on(mut self, deps: &[&str]) -> Self {
+        self.depends_on = deps.iter().map(|s| StepId::new(*s)).collect();
         self
     }
 }
@@ -94,5 +104,83 @@ impl WorkflowDefinition {
     /// Get the timeout for a step (step-specific or default)
     pub fn get_timeout(&self, step: &StepDefinition) -> Duration {
         step.timeout.unwrap_or(self.default_timeout)
+    }
+
+    /// Validate the workflow DAG structure.
+    /// Returns an error if:
+    /// - A step depends on a non-existent step
+    /// - There's a cycle in the dependencies
+    pub fn validate(&self) -> Result<(), String> {
+        let step_ids: HashSet<_> = self.steps.iter().map(|s| &s.id).collect();
+
+        // Check all dependencies exist
+        for step in &self.steps {
+            for dep in &step.depends_on {
+                if !step_ids.contains(dep) {
+                    return Err(format!(
+                        "Step '{}' depends on non-existent step '{}'",
+                        step.id, dep
+                    ));
+                }
+            }
+        }
+
+        // Check for cycles using DFS
+        let mut visited = HashSet::new();
+        let mut rec_stack = HashSet::new();
+
+        for step in &self.steps {
+            if self.has_cycle(&step.id, &mut visited, &mut rec_stack) {
+                return Err(format!("Cycle detected involving step '{}'", step.id));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// DFS helper for cycle detection
+    fn has_cycle(
+        &self,
+        step_id: &StepId,
+        visited: &mut HashSet<StepId>,
+        rec_stack: &mut HashSet<StepId>,
+    ) -> bool {
+        if rec_stack.contains(step_id) {
+            return true; // Back edge found - cycle!
+        }
+        if visited.contains(step_id) {
+            return false; // Already fully processed
+        }
+
+        visited.insert(step_id.clone());
+        rec_stack.insert(step_id.clone());
+
+        // Find the step and check its dependencies
+        if let Some(step) = self.steps.iter().find(|s| &s.id == step_id) {
+            for dep in &step.depends_on {
+                if self.has_cycle(dep, visited, rec_stack) {
+                    return true;
+                }
+            }
+        }
+
+        rec_stack.remove(step_id);
+        false
+    }
+
+    /// Get steps that have no dependencies (can run immediately)
+    pub fn get_initial_steps(&self) -> Vec<&StepDefinition> {
+        self.steps
+            .iter()
+            .filter(|s| s.depends_on.is_empty())
+            .collect()
+    }
+
+    /// Get steps that depend on the given step
+    pub fn get_dependents(&self, step_id: &StepId) -> Vec<&StepDefinition> {
+        self.steps
+            .iter()
+            .filter(|s| s.depends_on.contains(step_id))
+            .collect()
     }
 }
