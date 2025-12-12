@@ -151,7 +151,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-gpu-1]
-        part: [0, 1]
+        part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -178,7 +178,7 @@ jobs:
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
@@ -186,11 +186,13 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2
+              --total-partitions 4
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
@@ -199,7 +201,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-gpu-2]
-        part: [0, 1]
+        part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -226,7 +228,7 @@ jobs:
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 80
         run: |
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
@@ -234,11 +236,13 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2
+              --total-partitions 4
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]

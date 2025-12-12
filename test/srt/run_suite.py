@@ -231,7 +231,7 @@ suite_amd = {
         TestFile("models/test_embedding_models.py", 73),
         TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("rl/test_fp32_lm_head.py", 30),
-        TestFile("test_build_eagle_tree.py", 8),
+        # TestFile("test_build_eagle_tree.py", 8), # Moved to test/registered/spec/utils/
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         TestFile("lora/test_lora.py", 665),

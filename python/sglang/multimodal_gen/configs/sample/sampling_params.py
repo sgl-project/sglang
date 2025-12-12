@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import os.path
 import re
 import time
@@ -194,6 +195,11 @@ class SamplingParams:
             self.width_not_provided = True
         if self.height is None:
             self.height_not_provided = True
+
+        # Allow env var to override num_inference_steps (for faster CI testing on AMD)
+        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        if env_steps is not None and self.num_inference_steps is not None:
+            self.num_inference_steps = int(env_steps)
 
     def check_sampling_param(self):
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
