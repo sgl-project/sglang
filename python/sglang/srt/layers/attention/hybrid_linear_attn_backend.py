@@ -259,6 +259,25 @@ class MambaAttnBackendBase(AttentionBackend):
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
+        """
+        Compute indices for extracting conv states from the input sequence during extend.
+
+        In Mamba models, the conv layer maintains a sliding window of recent inputs.
+        After processing a prefill chunk, we need to save the last `conv_state_len` tokens
+        of the processed region for prefix caching.
+
+        The key insight is that FLA (Flash Linear Attention) processes sequences in chunks
+        of FLA_CHUNK_SIZE. We only track the conv state up to the last complete chunk boundary
+        (aligned_len).
+
+        start_indices is the starting token index of the conv state to track in this extend batch.
+        indices include all pos to track in this extend batch, conv_state_len for each req that
+        needs to be tracked (i.e. mamba_track_mask is True)
+
+        Returns:
+            indices: Tensor of shape [num_tracked_requests, conv_state_len] containing
+                     flattened positions into the packed input tensor.
+        """
         conv_state_len = self.conv_states_shape[-1]
 
         # Calculate the end position of the last aligned chunk
@@ -281,6 +300,39 @@ class MambaAttnBackendBase(AttentionBackend):
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
     ):
+        """
+        Compute source and destination indices for tracking SSM states for prefix caching.
+
+        After processing a prefill, we need to save the SSM recurrent state for prefix caching.
+        The FLA kernel outputs intermediate hidden states `h` at each chunk boundary,
+        plus a `last_recurrent_state` at the end of the chunked prefill size.
+
+        The challenge is that sequences may or may not end on a chunk boundary:
+          - Aligned case (len % FLA_CHUNK_SIZE == 0): In this case, FLA will store the to-cache
+            state in the last_recurrent_state.
+          - Unaligned case (len % FLA_CHUNK_SIZE != 0): The last_recurrent_state includes the
+            unaligned position, but we only want state up to the last chunk boundary.
+            We must extract from the intermediate `h` tensor at the appropriate chunk index.
+
+        We compute the src and dst indices for all requests that need to be cached
+        (i.e. mamba_track_mask is True) based on the rule above.
+
+        For example:
+        1. If chunked prefill length is < 64, then only final state has value. In this case we
+           cache `final` state.
+        2. if chunked prefill length == 64, then only final state has value. In this case we
+           cache pos 64, from `final` state
+        3. if chunked prefill length >64 and < 128, then both h and final state have value.
+           We cache pos 64 from `h` state
+        4. if chunked prefill length ==128, then both h and final state have value. We cache
+           pos 128 from `final` state. Note `h` doesn't include the pos 128.
+
+        Returns:
+            track_ssm_h_src: Source indices into the packed `h` tensor (for unaligned seqs)
+            track_ssm_h_dst: Destination cache slot indices (for unaligned seqs)
+            track_ssm_final_src: Source indices into last_recurrent_state buffer (for aligned seqs)
+            track_ssm_final_dst: Destination cache slot indices (for aligned seqs)
+        """
         # Move to CPU to avoid kernel launches for masking operations
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -507,6 +559,19 @@ class MambaAttnBackendBase(AttentionBackend):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ):
+        """
+        Track and copy Mamba conv/SSM states during decode for prefix caching.
+
+        During decode, each token update modifies conv_states and ssm_states in-place
+        at positions indexed by cache_indices (the working slots). For prefix caching,
+        we need to copy these updated states to persistent cache slots (mamba_track_indices)
+        so they can be prefix cached.
+
+        This delegates to `track_mamba_states_if_needed`, which performs:
+            conv_states[mamba_track_indices[i]] = conv_states[cache_indices[i]]
+            ssm_states[mamba_track_indices[i]] = ssm_states[cache_indices[i]]
+        for all requests where mamba_track_mask[i] is True.
+        """
         if forward_batch.mamba_track_mask is not None:
             track_mamba_states_if_needed(
                 conv_states,
@@ -524,6 +589,18 @@ class MambaAttnBackendBase(AttentionBackend):
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
+        """
+        Track and copy SSM states during extend for prefix caching.
+
+        After the FLA chunked prefill kernel runs, we need to save the SSM recurrent
+        state at the last chunk boundary so it can be reused for prefix caching.
+        The source of the state depends on whether the sequence length is aligned
+        to FLA_CHUNK_SIZE. See `_init_track_ssm_indices` for more details on how
+        the source and destination indices are computed.
+
+        Note: Conv state tracking for extend is handled separately via gather operations
+        using indices computed by `_init_track_conv_indices`.
+        """
         if (
             forward_batch.mamba_track_mask is not None
             and forward_batch.mamba_track_mask.any()

@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 ACC_THRESHOLDS = {
-    QWEN3_NEXT_MODEL: {"kl_div": 0.01, "gsm8k": 0.93},
+    QWEN3_NEXT_MODEL: {"kl_div": 0.008, "gsm8k": 0.93},
 }
 
 
@@ -81,8 +81,8 @@ class TestQwen3Next(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=16,
-            max_new_tokens=384,
+            max_samples=32,
+            max_new_tokens=512,
         )
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
@@ -90,8 +90,8 @@ class TestQwen3Next(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=16,
-            max_new_tokens=384,
+            max_samples=32,
+            max_new_tokens=512,
         )
 
     def test_prefix_cache_branching(self):
@@ -175,8 +175,8 @@ class TestQwen3NextMTP(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=16,
-            max_new_tokens=384,
+            max_samples=32,
+            max_new_tokens=512,
         )
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
@@ -184,8 +184,8 @@ class TestQwen3NextMTP(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=16,
-            max_new_tokens=384,
+            max_samples=32,
+            max_new_tokens=512,
         )
 
 
@@ -245,8 +245,8 @@ class TestQwen3NextMTPTopk(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=16,
-            max_new_tokens=384,
+            max_samples=32,
+            max_new_tokens=512,
         )
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
@@ -254,8 +254,8 @@ class TestQwen3NextMTPTopk(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=16,
-            max_new_tokens=384,
+            max_samples=32,
+            max_new_tokens=512,
         )
 
     def test_prefix_cache_branching(self):
