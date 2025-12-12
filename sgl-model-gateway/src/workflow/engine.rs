@@ -266,22 +266,26 @@ impl WorkflowEngine {
 
             // Handle blocked workflow
             if ready_step_indices.is_empty() && running_count == 0 {
-                if blocked_by_failure {
-                    self.state_store.update(instance_id, |s| {
-                        s.status = WorkflowStatus::Failed;
-                    })?;
+                let error_message = if blocked_by_failure {
+                    "Workflow failed due to step dependency failure".to_string()
+                } else {
+                    "Workflow deadlocked: no steps ready and none running. This may indicate a scheduler bug.".to_string()
+                };
 
-                    let failed_step = tracker.read().failed.iter().next().cloned();
-                    self.event_bus
-                        .publish(WorkflowEvent::WorkflowFailed {
-                            instance_id,
-                            failed_step: failed_step.unwrap_or_else(|| StepId::new("unknown")),
-                            error: "Workflow failed due to step dependency failure".to_string(),
-                        })
-                        .await;
-                    return Ok(());
-                }
-                break;
+                self.state_store.update(instance_id, |s| {
+                    s.status = WorkflowStatus::Failed;
+                })?;
+
+                let failed_step = tracker.read().failed.iter().next().cloned();
+                self.event_bus
+                    .publish(WorkflowEvent::WorkflowFailed {
+                        instance_id,
+                        failed_step: failed_step
+                            .unwrap_or_else(|| StepId::new("internal_scheduler")),
+                        error: error_message,
+                    })
+                    .await;
+                return Ok(());
             }
 
             // Launch ready steps in parallel
