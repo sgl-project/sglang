@@ -11,6 +11,7 @@ torch.manual_seed(1234)
 from utils import (
     BLOCK_K,
     BLOCK_N,
+    MXFP4QuantizeUtil,
     factor_for_scale,
     fp8_max,
     fp8_min,
@@ -48,6 +49,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         topk_weights,
         topk_ids,
         inplace,
+        False,
         False,
         False,
         None,
@@ -123,6 +125,7 @@ class TestFusedExperts(CustomTestCase):
             inplace,
             True,
             False,
+            False,
             w1_s,
             w2_s,
             None,
@@ -180,6 +183,7 @@ class TestFusedExperts(CustomTestCase):
             False,
             False,
             True,
+            False,
             w1s,
             w2s,
             [BLOCK_N, BLOCK_K],
@@ -189,6 +193,54 @@ class TestFusedExperts(CustomTestCase):
         )
 
         atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
+    def test_mxfp4_moe(self, M, N, K, E, topk):
+        dtype = torch.bfloat16
+
+        a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
+
+        w1q = torch.randint(0, 256, (E, 2 * N, K // 2), dtype=torch.uint8)
+        w1s = torch.randint(126, 127, (E, 2 * N, K // 32), dtype=torch.uint8)
+        w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
+
+        w2q = torch.randint(0, 256, (E, K, N // 2), dtype=torch.uint8)
+        w2s = torch.randint(126, 127, (E, K, N // 32), dtype=torch.uint8)
+        w2dq = MXFP4QuantizeUtil.dequantize(w2q, dtype, w2s)
+
+        score = torch.randn((M, E), dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+
+        w1 = kernel.convert_weight_packed(w1q)
+        w2 = kernel.convert_weight_packed(w2q)
+        w1s = kernel.convert_scale_packed(w1s)
+        w2s = kernel.convert_scale_packed(w2s)
+
+        ref_out = native_fp8_fused_moe(
+            a, w1dq.float(), w2dq.float(), topk_weight, topk_ids, topk
+        )
+        out = kernel.fused_experts_cpu(
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,
+            False,
+            False,
+            True,
+            w1s,
+            w2s,
+            None,
+            None,
+            None,
+            True,
+        )
+
+        atol = rtol = precision[dtype]
+
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
 

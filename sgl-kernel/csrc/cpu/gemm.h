@@ -124,6 +124,34 @@ void fused_experts_fp8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
+// moe implementations for mxfp4
+template <typename scalar_t>
+void fused_experts_fp4_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const uint8_t* __restrict__ packed_w1,
+    const uint8_t* __restrict__ packed_w2,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w2s,
+    int64_t block_size_N,
+    int64_t block_size_K,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad);
+
 // shared expert implementation for int8 w8a8
 template <typename scalar_t>
 void shared_expert_int8_kernel_impl(
