@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_sm90_supported,
     offloader,
@@ -57,10 +58,11 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     import aiter
+    from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
 
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+    if is_gfx95_supported():
+        from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
