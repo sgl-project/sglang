@@ -196,7 +196,7 @@ class SchedulerRuntimeCheckerMixin:
             )
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
                 "count_req_pool_leak_warnings",
                 msg,
             )

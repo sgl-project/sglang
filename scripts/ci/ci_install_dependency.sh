@@ -2,6 +2,7 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+# Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
 OPTIONAL_DEPS="${1:-}"
@@ -70,37 +71,37 @@ else
 fi
 
 # Install uv
+pip install --upgrade pip
+
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
     PIP_CMD="pip"
     PIP_INSTALL_SUFFIX="--break-system-packages"
-    $PIP_CMD install --upgrade pip
-
-    # Clean up existing installations
-    $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
-    $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_INSTALL_SUFFIX || true
+    PIP_UNINSTALL_CMD="pip uninstall -y"
+    PIP_UNINSTALL_SUFFIX="--break-system-packages"
 else
     # In normal cases, we use uv, which is much faster than pip.
-    pip install --upgrade pip
     pip install uv
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
-
-    # Clean up existing installations
-    $PIP_CMD uninstall sgl-kernel sglang || true
-    $PIP_CMD uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
+    PIP_UNINSTALL_CMD="uv pip uninstall"
+    PIP_UNINSTALL_SUFFIX=""
 fi
 
+# Clean up existing installations
+$PIP_UNINSTALL_CMD sgl-kernel sglang $PIP_UNINSTALL_SUFFIX || true
+$PIP_UNINSTALL_CMD flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_UNINSTALL_SUFFIX || true
+
+# Install the main package
 EXTRAS="dev"
 if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
-# Install the main package
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
@@ -137,6 +138,7 @@ fi
 # Show current packages
 $PIP_CMD list
 
+# Install other python dependencies
 $PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
@@ -151,6 +153,7 @@ $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFI
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
 $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 $PIP_CMD uninstall xformers || true
+
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
@@ -158,6 +161,7 @@ python3 -c "import torch; print(torch.version.cuda)"
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
 
+# Remove flash_attn folder to avoid conflicts with sgl-kernel
 PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 

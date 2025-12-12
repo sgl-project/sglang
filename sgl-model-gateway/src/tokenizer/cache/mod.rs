@@ -163,26 +163,25 @@ impl CachedTokenizer {
 
 impl Encoder for CachedTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
-        // Collect special tokens once if L1 is enabled (avoid redundant allocation)
-        let special_tokens: Option<Vec<&str>> = self.l1.as_ref().map(|_| {
-            self.special_token_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect()
-        });
-
-        // L0 cache lookup (exact match)
+        // L0 cache lookup (exact match) - returns Arc<Encoding> for zero-copy
         if let Some(l0) = &self.l0 {
             if let Some(cached) = l0.get(input) {
-                return Ok(cached);
+                // Unwrap the Arc - since Encoding is Clone, we can return the inner value
+                // For callers who need the tokens, they can access via token_ids() which is &[u32]
+                return Ok((*cached).clone());
             }
         }
 
         // L1 cache lookup (prefix match at special token boundaries)
         if let Some(l1) = &self.l1 {
-            let tokens = special_tokens.as_ref().unwrap();
+            // Use pre-computed special tokens refs (avoids allocation per call)
+            let tokens: Vec<&str> = self
+                .special_token_strings
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
 
-            if let Some((prefix_tokens, prefix_len)) = l1.longest_prefix_match(input, tokens) {
+            if let Some((prefix_tokens, prefix_len)) = l1.longest_prefix_match(input, &tokens) {
                 // We have a prefix match - tokenize the suffix
                 let suffix = &input[prefix_len..];
                 if !suffix.is_empty() {
@@ -216,8 +215,12 @@ impl Encoder for CachedTokenizer {
         // Cache in L1 at special token boundaries
         // Re-tokenizes prefixes for correctness (optimized for high prefix reuse)
         if let Some(l1) = &self.l1 {
-            let tokens = special_tokens.as_ref().unwrap();
-            let _ = l1.insert_at_boundaries(input, self.inner.as_ref(), tokens);
+            let tokens: Vec<&str> = self
+                .special_token_strings
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let _ = l1.insert_at_boundaries(input, self.inner.as_ref(), &tokens);
             // Ignore errors in cache insertion - cache is best-effort
         }
 

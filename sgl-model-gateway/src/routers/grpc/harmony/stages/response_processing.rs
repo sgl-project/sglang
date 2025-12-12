@@ -7,10 +7,12 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{FinalResponse, RequestContext, RequestType},
+use crate::routers::{
     error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{FinalResponse, RequestContext, RequestType},
+    },
 };
 
 /// Harmony Response Processing stage: Parse and format Harmony responses

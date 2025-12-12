@@ -12,10 +12,13 @@ use crate::{
         common::{Tool, ToolChoice, ToolChoiceValue},
         responses::ResponsesRequest,
     },
-    routers::grpc::{
-        common::{responses::utils::extract_tools_from_response_tools, stages::PipelineStage},
-        context::{PreparationOutput, RequestContext, RequestType},
-        error, utils,
+    routers::{
+        error,
+        grpc::{
+            common::{responses::utils::extract_tools_from_response_tools, stages::PipelineStage},
+            context::{PreparationOutput, RequestContext, RequestType},
+            utils,
+        },
     },
 };
 

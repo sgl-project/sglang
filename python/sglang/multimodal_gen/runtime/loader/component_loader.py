@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import time
+import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
@@ -155,6 +156,10 @@ class ComponentLoader(ABC):
             )
             source = "customized"
         except Exception as _e:
+            traceback.print_exc()
+            logger.error(
+                f"Error while loading customized {module_name}, falling back to native version"
+            )
             # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers

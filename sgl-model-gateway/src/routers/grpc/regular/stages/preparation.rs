@@ -8,10 +8,12 @@ use axum::response::Response;
 use tracing::error;
 
 use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{RequestContext, RequestType},
+use crate::routers::{
     error as grpc_error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{RequestContext, RequestType},
+    },
 };
 
 /// Preparation stage (delegates to endpoint-specific implementations)

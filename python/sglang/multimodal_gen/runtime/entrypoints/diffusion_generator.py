@@ -4,7 +4,7 @@
 """
 DiffGenerator module for sglang-diffusion.
 
-This module provides a consolidated interface for generating videos using
+This module provides a consolidated interface for generating images/videos using
 diffusion models.
 """
 
@@ -82,9 +82,6 @@ class DiffGenerator:
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
-        self._current_lora_path: str | None = None
-        self._current_lora_nickname: str | None = None
-        self._is_lora_merged: bool = False
 
     @classmethod
     def from_pretrained(
@@ -344,29 +341,57 @@ class DiffGenerator:
             )
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
-    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
-        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
+    def set_lora(
+        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+    ) -> None:
+        """
+        Set a LoRA adapter for the specified transformer(s).
+
+        Args:
+            lora_nickname: The nickname of the adapter.
+            lora_path: Path to the LoRA adapter.
+            target: Which transformer(s) to apply the LoRA to. One of:
+                - "all": Apply to all transformers (default)
+                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
+                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
+                - "critic": Apply only to the critic model
+        """
+        req = SetLoraReq(
+            lora_nickname=lora_nickname, lora_path=lora_path, target=target
+        )
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname}",
+            f"Successfully set LoRA adapter: {lora_nickname} (target: {target})",
             "Failed to set LoRA adapter",
         )
 
-    def unmerge_lora_weights(self) -> None:
-        req = UnmergeLoraWeightsReq()
+    def unmerge_lora_weights(self, target: str = "all") -> None:
+        """
+        Unmerge LoRA weights from the base model.
+
+        Args:
+            target: Which transformer(s) to unmerge.
+        """
+        req = UnmergeLoraWeightsReq(target=target)
         self._send_lora_request(
             req,
-            "Successfully unmerged LoRA weights",
+            f"Successfully unmerged LoRA weights (target: {target})",
             "Failed to unmerge LoRA weights",
         )
-        self._is_lora_merged = False
 
-    def merge_lora_weights(self) -> None:
-        req = MergeLoraWeightsReq()
+    def merge_lora_weights(self, target: str = "all") -> None:
+        """
+        Merge LoRA weights into the base model.
+
+        Args:
+            target: Which transformer(s) to merge.
+        """
+        req = MergeLoraWeightsReq(target=target)
         self._send_lora_request(
-            req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
+            req,
+            f"Successfully merged LoRA weights (target: {target})",
+            "Failed to merge LoRA weights",
         )
-        self._is_lora_merged = True
 
     def _ensure_lora_state(
         self,
@@ -374,29 +399,27 @@ class DiffGenerator:
         lora_nickname: str | None = None,
         merge_lora: bool = True,
     ) -> None:
+        """
+        Ensure the LoRA state matches the desired configuration.
+
+        Note: This method does not cache client-side state. The server handles
+        idempotent operations, so redundant calls are safe but may have minor overhead.
+        """
         if lora_path is None:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-            self._current_lora_path = None
-            self._current_lora_nickname = None
-            self._is_lora_merged = False
+            # Unmerge all LoRA weights when no lora_path is provided
+            self.unmerge_lora_weights()
             return
 
         lora_nickname = lora_nickname or self.server_args.lora_nickname
 
-        if self._current_lora_path != lora_path:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-                self._is_lora_merged = False
-            self.set_lora(lora_nickname, lora_path)
-            self._current_lora_path = lora_path
-            self._current_lora_nickname = lora_nickname
-            self._is_lora_merged = False
+        # Set the LoRA adapter (server handles idempotent logic)
+        self.set_lora(lora_nickname, lora_path)
 
-        if merge_lora and not self._is_lora_merged:
+        # Merge or unmerge based on the merge_lora flag
+        if merge_lora:
             self.merge_lora_weights()
-        elif not merge_lora:
-            self._is_lora_merged = False
+        else:
+            self.unmerge_lora_weights()
 
     def generate_with_lora(
         self,
