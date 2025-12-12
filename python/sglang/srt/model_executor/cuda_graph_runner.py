@@ -770,6 +770,11 @@ class CudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        max_bs_across_dp = (
+            forward_batch.batch_size_max_across_dp
+            if forward_batch.batch_size_max_across_dp
+            else raw_bs
+        )
 
         # Pad
         if self.require_mlp_tp_gather:
@@ -782,6 +787,9 @@ class CudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
+
+        if max_bs_across_dp:
+            index = bisect.bisect_left(self.capture_bs, max_bs_across_dp)
         bs = self.capture_bs[index]
 
         seq_lens_cpu = buffers.populate_from_forward_batch(

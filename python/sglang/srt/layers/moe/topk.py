@@ -30,6 +30,8 @@ from typing import (
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 try:
     from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
 except ImportError:
@@ -333,6 +335,7 @@ class TopK(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        forward_batch: ForwardBatch,
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
@@ -346,6 +349,7 @@ class TopK(CustomOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            forward_batch=forward_batch,
         )
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:

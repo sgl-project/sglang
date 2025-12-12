@@ -21,20 +21,32 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import (
+    get_o_proj_data_parallel_rank,
+    get_o_proj_data_parallel_world_size,
+    get_o_proj_dp_group,
+    get_o_proj_tensor_parallel_rank,
+    get_o_proj_tensor_parallel_world_size,
+    get_o_proj_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    get_world_size,
+    o_proj_data_model_parallel_all_gather,
+    o_proj_tensor_model_parallel_all_reduce,
+    o_proj_tensor_model_parallel_reduce_scatter_tensor,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -47,6 +59,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -309,6 +322,27 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
+
+
+def get_max_bs_across_dp(batch: ModelWorkerBatch):
+    """
+    Get max batch size across data parallel group.
+    This only works when O_PROJ_TP_SIZE is set and decode attention is DP.
+    """
+    if (
+        envs.get("SGLANG_O_PROJ_TP_SIZE") > 1
+        and get_attention_tp_size() == 1
+        and batch.forward_mode.is_decode_or_idle()
+    ):
+        bs_across_dp = [0] * get_attention_dp_size()
+        bs_across_dp[get_attention_dp_rank()] = len(batch.seq_lens)
+        bs_across_dp_tensor = torch.tensor(
+            bs_across_dp,
+            device=batch.seq_lens.device,
+            dtype=torch.int32,
+        )
+        torch.distributed.all_reduce(bs_across_dp_tensor)
+        batch.batch_size_max_across_dp = torch.max(bs_across_dp_tensor)
 
 
 class LayerCommunicator:
@@ -585,6 +619,105 @@ class LayerCommunicator:
         )
 
 
+class BeforeOproj:
+    def __init__(
+        self,
+        num_heads,
+        v_head_dim,
+        attn_tp_size,
+        o_proj_tp_size,
+        o_proj_dp_size,
+        attn_tp_rank,
+    ):
+        self.num_heads = num_heads
+        self.v_head_dim = v_head_dim
+        self.attn_tp_size = attn_tp_size
+        self.num_local_heads = num_heads // attn_tp_size
+        self.o_proj_tp_size = o_proj_tp_size
+        self.o_proj_dp_size = o_proj_dp_size
+        self.TP2DPadnTP = True if 1 < o_proj_tp_size < get_world_size() else False
+        self.attn_tp_rank = attn_tp_rank
+
+    def prepare_o_proj(self, attn_output, forward_batch):
+        bs = attn_output.shape[0]
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if self.o_proj_tp_size == 0:  # not enable o_proj_tp
+            return attn_output
+        # decode DP to DP+TP
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_idle()
+        ):
+            if self.attn_tp_size == 1:
+                attn_output = (
+                    attn_output.reshape(
+                        bs,
+                        self.o_proj_tp_size,
+                        self.num_heads * self.v_head_dim // self.o_proj_tp_size,
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+                attn_output = attn_output.reshape(-1)
+                all_to_all_attn_output = torch.empty(
+                    [bs * self.num_heads * self.v_head_dim],
+                    dtype=attn_output.dtype,
+                    device=attn_output.device,
+                )
+                device_group = get_o_proj_tp_group().device_group
+                torch.distributed.all_to_all_single(
+                    all_to_all_attn_output, attn_output, group=device_group
+                )
+                attn_output = all_to_all_attn_output.view(
+                    bs * self.o_proj_tp_size,
+                    self.num_heads * self.v_head_dim // self.o_proj_tp_size,
+                )
+        # prefill TP to DP+TP (DP)
+        else:
+            if self.TP2DPadnTP:
+                attn_output = attn_output.view(
+                    self.o_proj_dp_size, -1, self.num_local_heads, self.v_head_dim
+                )
+            attn_output = attn_output.reshape(-1)
+            device_group = (
+                get_o_proj_dp_group().device_group
+                if self.TP2DPadnTP
+                else get_tp_group().device_group
+            )
+            all_to_all_attn_output = torch.empty(
+                [bs * self.num_local_heads * self.v_head_dim],
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.distributed.all_to_all_single(
+                all_to_all_attn_output, attn_output, group=device_group
+            )
+            if self.TP2DPadnTP:
+                attn_output = (
+                    all_to_all_attn_output.view(
+                        self.attn_tp_size // self.o_proj_tp_size,
+                        bs // self.attn_tp_size * self.o_proj_tp_size,
+                        self.num_local_heads * self.v_head_dim,
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+            else:
+                attn_output = (
+                    all_to_all_attn_output.view(
+                        self.attn_tp_size,
+                        bs // self.attn_tp_size,
+                        self.num_local_heads * self.v_head_dim,
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
+            attn_output = attn_output.reshape(
+                -1, self.o_proj_dp_size * self.num_local_heads * self.v_head_dim
+            )
+        return attn_output
+
+
 @dataclass
 class CommunicateContext:
     process_group_sizes: Dict[ScatterMode, int]
@@ -594,6 +727,10 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
+    o_proj_tp_size: int
+    o_proj_dp_size: int
+    o_proj_tp_rank: int
+    o_proj_dp_rank: int
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -605,6 +742,17 @@ class CommunicateContext:
         attn_dp_size = get_attention_dp_size()
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
+        o_proj_tp_size = (
+            get_o_proj_tensor_parallel_world_size()
+            if get_o_proj_tensor_parallel_world_size() > 0
+            else None
+        )
+        if o_proj_tp_size is not None:
+            o_proj_tp_rank = get_o_proj_tensor_parallel_rank()
+            o_proj_dp_size = get_o_proj_data_parallel_world_size()
+            o_proj_dp_rank = get_o_proj_data_parallel_rank()
+        else:
+            o_proj_tp_rank = o_proj_dp_size = o_proj_dp_rank = None
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
@@ -618,6 +766,10 @@ class CommunicateContext:
             attn_dp_size=attn_dp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
+            o_proj_tp_size=o_proj_tp_size,
+            o_proj_dp_size=o_proj_dp_size,
+            o_proj_tp_rank=o_proj_tp_rank,
+            o_proj_dp_rank=o_proj_dp_rank,
         )
 
 
@@ -726,6 +878,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
+        if context.o_proj_tp_size:
+            input_hidden_states = hidden_states
+            hidden_states = input_hidden_states.tensor_split(context.o_proj_tp_size)[0]
+            o_proj_tensor_model_parallel_reduce_scatter_tensor(
+                hidden_states, input_hidden_states
+            )
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
@@ -792,7 +950,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if context.o_proj_tp_size:
+                    hidden_states = o_proj_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
+                    hidden_states = o_proj_data_model_parallel_all_gather(
+                        hidden_states, dim=0
+                    )
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -809,10 +975,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual_input_mode,
     ):
         input_hidden_states = hidden_states
-        hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
-            context.attn_tp_rank
-        ]
-        attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        if context.o_proj_tp_size:
+            hidden_states = hidden_states.tensor_split(context.o_proj_tp_size)[
+                context.o_proj_tp_rank
+            ]
+            o_proj_tensor_model_parallel_reduce_scatter_tensor(
+                hidden_states, input_hidden_states
+            )
+        else:
+            hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
+                context.attn_tp_rank
+            ]
+            attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:

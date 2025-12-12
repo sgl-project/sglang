@@ -949,6 +949,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
         cos, sin = self.get_cos_sin_cache(positions, query.dtype, offsets)
 
+        if cos.shape[0] == 0 or sin.shape[0] == 0:
+            sin = torch.empty(
+                [num_tokens, 1, 1, self.rotary_dim], device=sin.device, dtype=sin.dtype
+            )
+            cos = torch.empty(
+                [num_tokens, 1, 1, self.rotary_dim], device=cos.device, dtype=cos.dtype
+            )
+
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:

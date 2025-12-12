@@ -395,6 +395,8 @@ class ForwardBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    batch_size_max_across_dp: Optional[int] = None
+
     @classmethod
     def init_new(
         cls,
@@ -441,6 +443,9 @@ class ForwardBatch:
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
         )
         device = model_runner.device
+
+        if batch.batch_size_max_across_dp is not None:
+            ret_batch_size_max_across_dp = batch.batch_size_max_across_dp
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

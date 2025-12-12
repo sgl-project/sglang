@@ -18,6 +18,7 @@ def fused_topk_npu(
     topk_config: "TopKConfig",
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
+    forward_batch: Optional[torch.Tensor] = None,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
@@ -64,6 +65,15 @@ def fused_topk_npu(
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
+
+    if (
+        forward_batch.batch_size_max_across_dp > 0
+        and forward_batch.batch_size < forward_batch.batch_size_max_across_dp
+    ):
+        bs = topk_ids.shape[0]
+        padding_size = forward_batch.batch_size_max_across_dp - forward_batch.batch_size
+        start_index = max(0, bs - padding_size)
+        topk_ids[start_index:, :] = -1
 
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
