@@ -950,6 +950,7 @@ class BatchTokenIDOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    reasoning_tokens: Optional[List[int]] = None
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1029,6 +1030,7 @@ class BatchStrOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    reasoning_tokens: Optional[List[int]] = None
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1056,6 +1058,8 @@ class BatchMultimodalOutput(BaseBatchReq):
     placeholder_tokens_val: List[Optional[List[int]]]
 
     return_bytes: List[bool]
+
+    reasoning_tokens: Optional[List[int]] = None
 
 
 @dataclass
