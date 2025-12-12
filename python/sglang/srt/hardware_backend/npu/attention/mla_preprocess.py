@@ -94,7 +94,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
     def preprocess_weights(self, hidden_states):
-        self.dummy = torch.empty(
+        self.dummy = torch.zeros(
             (hidden_states.shape[-1]),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -349,6 +349,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             )
         # TODO: dummy inputs to be removed
         # https://github.com/sgl-project/sgl-kernel-npu/issues/78
+        if hasattr(self.q_a_layernorm, "bias"):
+            q_a_layernorm_bias = self.q_a_layernorm.bias
+        else:
+            q_a_layernorm_bias = self.dummy
+
         torch.ops.npu.mla_preprocess(
             hidden_states,
             self.dummy,
@@ -356,7 +361,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.qkv_a_proj_weight_nz,
             self.qkv_a_proj_deq_scale_kvq,
             self.q_a_layernorm.weight,
-            self.q_a_layernorm.bias,
+            q_a_layernorm_bias,
             self.q_b_proj_weight_nz,
             self.q_b_proj_deq_scale,
             self.kv_a_layernorm.weight,
