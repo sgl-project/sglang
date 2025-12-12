@@ -107,8 +107,12 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
-    engine.register_workflow(create_worker_registration_workflow(&config));
-    engine.register_workflow(create_worker_removal_workflow());
+    engine
+        .register_workflow(create_worker_registration_workflow(&config))
+        .expect("worker_registration workflow should be valid");
+    engine
+        .register_workflow(create_worker_removal_workflow())
+        .expect("worker_removal workflow should be valid");
     app_context
         .workflow_engine
         .set(engine)
@@ -239,8 +243,12 @@ pub async fn create_test_context_with_mcp_config(
         workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
-    engine.register_workflow(create_worker_registration_workflow(&config));
-    engine.register_workflow(create_worker_removal_workflow());
+    engine
+        .register_workflow(create_worker_registration_workflow(&config))
+        .expect("worker_registration workflow should be valid");
+    engine
+        .register_workflow(create_worker_removal_workflow())
+        .expect("worker_removal workflow should be valid");
     app_context
         .workflow_engine
         .set(engine)
