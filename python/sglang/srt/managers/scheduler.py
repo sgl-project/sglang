@@ -901,6 +901,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                pp_rank=self.pp_rank,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
@@ -2608,9 +2609,6 @@ class Scheduler(
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
-    def get_remote_instance_transfer_engine_info(self):
-        return self.tp_worker.get_remote_instance_transfer_engine_info()
-
 
 class IdleSleeper:
     """
@@ -2724,29 +2722,13 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
-        if server_args.remote_instance_weight_loader_support_transfer_engine:
-            (
-                remote_instance_transfer_engine_session_id,
-                remote_instance_transfer_engine_weights_info_dict,
-            ) = scheduler.get_remote_instance_transfer_engine_info()
-            pipe_writer.send(
-                {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
-                    "tp_rank": tp_rank,
-                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                }
-            )
-        else:
-            pipe_writer.send(
-                {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
-                }
-            )
+        pipe_writer.send(
+            {
+                "status": "ready",
+                "max_total_num_tokens": scheduler.max_total_num_tokens,
+                "max_req_input_len": scheduler.max_req_input_len,
+            }
+        )
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
@@ -2771,7 +2753,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_decode()
             else:
-                scheduler.event_loop_normal_disagg_decode()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_decode()
+                else:
+                    scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()
