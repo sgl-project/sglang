@@ -209,16 +209,16 @@ impl Router {
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
-    ) -> Result<Response, impl Future<Output = Response> + Sized> {
+    ) -> Response {
         let worker = match self.select_worker_for_model(model_id, Some(&text)) {
             Some(w) => w,
             None => {
                 RouterMetrics::record_request_error(route, "no_available_workers");
-                return Err((
+                return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "No available workers (all circuits open or unhealthy)",
                 )
-                    .into_response());
+                    .into_response();
             }
         };
 
@@ -274,7 +274,7 @@ impl Router {
             }
         }
 
-        Ok(response)
+        response
     }
 
     // Helper: return base worker URL (strips DP suffix when enabled)
