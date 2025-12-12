@@ -1339,6 +1339,9 @@ class ServerArgs:
             # Mamba radix cache v2
             if self.enable_mamba_radix_cache_v2:
                 assert is_cuda(), "MambaRadixCache v2 is only supported on CUDA devices"
+                assert (
+                    self.disaggregation_mode == "null"
+                ), "MambaRadixCache v2 is not compatible with disaggregation mode yet."
                 if self.speculative_num_draft_tokens is not None:
                     assert (
                         self.mamba_track_interval >= self.speculative_num_draft_tokens
