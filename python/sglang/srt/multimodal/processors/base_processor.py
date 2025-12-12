@@ -680,14 +680,37 @@ class BaseMultimodalProcessor(ABC):
             ).input_ids.flatten()
 
         # Add offsets to all items
+        modality_counters = {}
+        token_id_offsets_cache = {}
+
         for mm_item in all_collected_items:
             mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
             if mm_token_id is None:
                 raise ValueError(f"No token id found for modality: {mm_item.modality}")
-            mm_item.offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=mm_token_id,
-            )
+
+            # Cache offsets for this token_id if not already calculated
+            if mm_token_id not in token_id_offsets_cache:
+                token_id_offsets_cache[mm_token_id] = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=mm_token_id,
+                )
+
+            all_offsets = token_id_offsets_cache[mm_token_id]
+
+            # Get current index for this modality
+            current_idx = modality_counters.get(mm_item.modality, 0)
+
+            # Assign the specific offset range to this item
+            if current_idx < len(all_offsets):
+                # Assign as a list containing the single correct range
+                mm_item.offsets = [all_offsets[current_idx]]
+                modality_counters[mm_item.modality] = current_idx + 1
+            else:
+                # Handle case where there are more items than tokens
+                logger.warning(
+                    f"Warning: More {mm_item.modality} items provided than corresponding tokens found in the prompt."
+                )
+                mm_item.offsets = []
 
         """
         solution for cuda-ipc memory-leak:
