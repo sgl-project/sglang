@@ -246,6 +246,7 @@ class HFRunner:
         monkey_patch_gemma2_sdpa()
 
         # Load the model and tokenizer
+        device = "npu" if is_npu() else "cuda"
         if self.model_type == "generation":
             config = AutoConfig.from_pretrained(
                 model_path, trust_remote_code=self.trust_remote_code
@@ -260,7 +261,7 @@ class HFRunner:
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.trust_remote_code,
                 low_cpu_mem_usage=True,
-            ).cuda()
+            ).to(device)
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
                 self.model = AutoModelForVision2Seq.from_pretrained(
@@ -268,10 +269,10 @@ class HFRunner:
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
                     low_cpu_mem_usage=True,
-                ).cuda()
+                ).to(device)
                 self.processor = AutoProcessor.from_pretrained(model_path)
             elif "clip" in model_path.lower():
-                self.model = AutoModel.from_pretrained(model_path).cuda()
+                self.model = AutoModel.from_pretrained(model_path).to(device)
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
@@ -280,7 +281,6 @@ class HFRunner:
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
 
-            device = "npu" if is_npu() else "cuda"
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
