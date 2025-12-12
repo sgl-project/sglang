@@ -10,7 +10,7 @@ Ollama API compatibility for SGLang, plus a Smart Router for intelligent routing
 ## Prerequisites
 
 ```bash
-# Install ollama Python library (required for Smart Router)
+# Install ollama Python library
 pip install ollama
 ```
 
