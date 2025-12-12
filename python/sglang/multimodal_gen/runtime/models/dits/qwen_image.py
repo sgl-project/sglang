@@ -399,7 +399,6 @@ class QwenImageCrossAttention(nn.Module):
         if self.norm_added_k is not None:
             txt_key = self.norm_added_k(txt_key)
 
-        # Apply RoPE
         if image_rotary_emb is not None:
             (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
 
@@ -409,7 +408,6 @@ class QwenImageCrossAttention(nn.Module):
                     q_shape = q.shape
                     q_view = q.contiguous().view(-1, q_shape[-2], q_shape[-1])
                     k_view = k.contiguous().view(-1, k.shape[-2], k.shape[-1]) if k is not None else None
-                    # interleaved=True; kernel内部会根据 cos/sin 形状处理 Neox / GPT-J 布局
                     sgl_rotary_embedding(cos, sin, q_view, k_view, q_shape[-1], True)
                     q_out = q_view.view(q_shape)
                     k_out = k_view.view(k.shape) if k_view is not None else None
@@ -418,18 +416,10 @@ class QwenImageCrossAttention(nn.Module):
                 img_query, img_key = _apply_sgl_rope(img_query, img_key, img_cos, img_sin)
                 txt_query, txt_key = _apply_sgl_rope(txt_query, txt_key, txt_cos, txt_sin)
             else:
-                img_query = apply_rotary_embedding(
-                    img_query, img_cos, img_sin, interleaved=True
-                )
-                img_key = apply_rotary_embedding(
-                    img_key, img_cos, img_sin, interleaved=True
-                )
-                txt_query = apply_rotary_embedding(
-                    txt_query, txt_cos, txt_sin, interleaved=True
-                )
-                txt_key = apply_rotary_embedding(
-                    txt_key, txt_cos, txt_sin, interleaved=True
-                )
+                img_query = apply_rotary_embedding(img_query, img_cos, img_sin, interleaved=True)
+                img_key = apply_rotary_embedding(img_key, img_cos, img_sin, interleaved=True)
+                txt_query = apply_rotary_embedding(txt_query, txt_cos, txt_sin, interleaved=True)
+                txt_key = apply_rotary_embedding(txt_key, txt_cos, txt_sin, interleaved=True)
 
         # Concatenate for joint attention
         # Order: [text, image]
