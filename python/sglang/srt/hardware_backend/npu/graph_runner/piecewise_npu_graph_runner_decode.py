@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import torch._dynamo.config
 import tqdm
+from torch._dynamo.eval_frame import DisableContext
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -29,6 +30,11 @@ from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.graph_runner.compilation.compilation_context import (
     CompilationContext,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.patch_dynamo import (
+    patch_dynamo_context,
+    patch_dynamo_context_call,
+    restore_dynamo_context_call,
 )
 from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_graph_compiler import (
     PiecewiseNpuGraphCompiler,
@@ -87,6 +93,7 @@ class PiecewiseNPUGraphRunnerDecode:
 
     def __init__(self, model_runner: ModelRunner):
         model_runner.attn_backend.enable_piecewise_npu_graph_decode = True
+        patch_dynamo_context()
         self.inference_counter = 1
         self.init_forward_metadata_was_done = True
 
@@ -406,6 +413,9 @@ class PiecewiseNPUGraphRunnerDecode:
             compilation_context=self.compilation_context,
         )
 
+        patch_dynamo_context_call()
+        DisableContext.batch_size = bs
+
         logits_output_or_pp_proxy_tensors = compiler.compiled_callable(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
@@ -413,6 +423,17 @@ class PiecewiseNPUGraphRunnerDecode:
         compiled_graph = CompiledGraph(
             bs, forward_batch, None, compiler.compiled_callable
         )
+
+        try:
+            logits_output_or_pp_proxy_tensors = compiler.compiled_callable(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
+        finally:
+            DisableContext.batch_size = None
+            restore_dynamo_context_call()
+
+        assert DisableContext.compiled_function
+        assert DisableContext.compiled_function_args
 
         torch._dynamo.reset()
         gc.collect()
@@ -531,10 +552,8 @@ class PiecewiseNPUGraphRunnerDecode:
 
         self.model_runner.attn_backend.graph_mode = True
 
-        compiled_graph = self.graphs[self.bs]
-        forward_batch = compiled_graph.forward_batch
-        compiled_graph.callable(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+        DisableContext.compiled_function[self.bs](
+            *DisableContext.compiled_function_args[self.bs]
         )
 
         output = self.output_buffers[self.bs]
