@@ -20,7 +20,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.pipelines_core import Req, build_pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.common import is_cuda, set_cuda_arch
+
+_is_cuda = is_cuda()
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
@@ -68,7 +70,7 @@ class GPUWorker:
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
-        torch.cuda.set_device(self.local_rank)
+        torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -83,6 +85,7 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
         )
 
         self.pipeline = build_pipeline(self.server_args)
@@ -178,7 +181,8 @@ def run_scheduler_process(
     """
     configure_logger(server_args)
     suppress_other_loggers()
-    set_cuda_arch()
+    if _is_cuda:
+        set_cuda_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 

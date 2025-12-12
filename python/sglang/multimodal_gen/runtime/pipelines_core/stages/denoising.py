@@ -18,6 +18,10 @@ import torch
 from einops import rearrange
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.runtime.utils.common import is_cuda
+
+_is_cuda = is_cuda()
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
@@ -35,9 +39,17 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    FlashAttentionBackend,
-)
+
+if _is_cuda:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+        FlashAttentionBackend,
+    )
+else:
+
+    class FlashAttentionBackend:
+        pass
+
+
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
@@ -1165,9 +1177,8 @@ class DenoisingStage(PipelineStage):
                 raw_latent_shape=batch.raw_latent_shape
             )
         else:
+            # attn_metadata can be None for SDPA attention backend
             return None
-
-        assert attn_metadata is not None, "attn_metadata cannot be None"
 
         return attn_metadata
 
