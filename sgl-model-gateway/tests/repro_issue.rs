@@ -1,12 +1,18 @@
 use std::sync::Arc;
 use std::time::Instant;
-use sgl_model_gateway::core::{WorkerManager, WorkerRegistry, WorkerBuilder, WorkerType, ConnectionMode};
+// Rename core WorkerType to avoid conflict with MockWorkerType
+use sgl_model_gateway::core::{
+    WorkerManager, WorkerRegistry, BasicWorkerBuilder, WorkerType as CoreWorkerType
+};
 use reqwest::Client;
 
 // Import common test utilities
 #[path = "./common/mod.rs"]
 mod common;
-use common::mock_worker::{MockWorker, MockWorkerConfig, HealthStatus};
+// Rename mock WorkerType
+use common::mock_worker::{
+    MockWorker, MockWorkerConfig, HealthStatus, WorkerType as MockWorkerType
+};
 
 #[tokio::test]
 async fn test_metrics_performance_waterfall() {
@@ -16,7 +22,8 @@ async fn test_metrics_performance_waterfall() {
 
     let worker_config = MockWorkerConfig {
         port: 0, // Find available port
-        worker_type: WorkerType::Regular,
+        // Use the Mock type here
+        worker_type: MockWorkerType::Regular,
         health_status: HealthStatus::Healthy,
         response_delay_ms: delay_ms,
         fail_rate: 0.0,
@@ -33,13 +40,14 @@ async fn test_metrics_performance_waterfall() {
         let mut worker = MockWorker::new(worker_config.clone());
         let url = worker.start().await.expect("Failed to start worker");
 
-        // Add to registry (using Basic or default builder pattern)
-        // Assuming we can construct a basic worker representation
-        let worker_instance = sgl_model_gateway::core::BasicWorkerBuilder::new(&url)
-            .worker_type(WorkerType::Regular)
+        // Build the worker instance using the Core type
+        let worker_instance = BasicWorkerBuilder::new(&url)
+            .worker_type(CoreWorkerType::Regular)
             .build();
 
-        registry.add_worker(worker_instance);
+        // Use register() instead of add_worker(), and wrap in Arc
+        registry.register(Arc::new(worker_instance));
+
         workers.push(worker);
         println!("   Worker {} started at {}", i+1, url);
     }
@@ -70,10 +78,7 @@ async fn test_metrics_performance_waterfall() {
         w.stop().await;
     }
 
-    // 4. Assertion to prove it is currently SERIAL
-    // Ideally, this test should FAIL if we want to enforce the fix,
-    // or PASS if we just want to reproduce the slow behavior.
-    // Here we assert that it IS slow to confirm reproduction.
+    // 4. Assertion
     if seconds >= expected_serial - 0.5 {
         println!("RESULT: Confirmed SERIAL execution (Issue Reproduced)");
     } else if seconds <= expected_parallel + 0.5 {
