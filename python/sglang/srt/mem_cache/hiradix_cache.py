@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.session_cache import SessionCache
 from sglang.srt.metrics.collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -68,6 +69,7 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        self.enable_session_cache = server_args.enable_session_cache
 
         (
             extra_config,
@@ -98,6 +100,7 @@ class HiRadixCache(RadixCache):
             write_policy=server_args.hicache_write_policy,
             io_backend=server_args.hicache_io_backend,
             storage_backend=server_args.hicache_storage_backend,
+            enable_session_cache=server_args.enable_session_cache,
             prefetch_threshold=self.prefetch_threshold,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
@@ -118,6 +121,10 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        if self.enable_session_cache:
+            self.ongoing_session_append = {}
+            self.ongoing_session_prefetch = {}
+
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -181,6 +188,9 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        if self.enable_session_cache:
+            self.ongoing_session_append.clear()
+            self.ongoing_session_prefetch.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -498,12 +508,131 @@ class HiRadixCache(RadixCache):
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
+        if self.enable_session_cache:
+            self.check_session_cache_events()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def check_session_cache_events(self):
+        # todo: handle TP synchronization if needed
+        to_finalize = []
+        for session_id, (node, copy_event) in list(self.ongoing_session_append.items()):
+            if not copy_event.query():
+                continue
+            to_finalize.append(session_id)
+            self.dec_lock_ref(node)
+        for session_id in to_finalize:
+            del self.ongoing_session_append[session_id]
+
+    def prefetch_from_session_cache(
+        self,
+        session_id: str,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        old_kv_cache: SessionCache,
+    ):
+        if old_kv_cache.total_token_length <= self.prefetch_threshold:
+            return
+
+        last_host_node.protect_host()
+
+        old_kv_cache = old_kv_cache.shift_token_range()
+
+        prefetch_length = old_kv_cache.total_token_length
+
+        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            self.evict_host(prefetch_length)
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            last_host_node.release_host()
+            # no sufficient host memory for prefetch
+            return
+
+        operation = self.cache_controller.prefetch_from_session_cache(
+            session_id,
+            host_indices,
+            new_input_tokens,
+            old_kv_cache,
+        )
+        self.ongoing_session_prefetch[session_id] = (last_host_node, operation)
+
+    def check_session_prefetch_progress(self, session_id: str) -> bool:
+        if session_id not in self.ongoing_session_prefetch:
+            return True
+
+        last_host_node, operation = self.ongoing_session_prefetch[session_id]
+
+        if operation.done == True:
+            need_free = len(operation.host_indices)
+
+            if operation.ok:
+                from sglang.srt.mem_cache.hicache_storage import get_hash_str
+
+                hash_value = []
+                last_hash = last_host_node.get_last_hash_value()
+                for i in range(0, len(operation.token_ids), self.page_size):
+                    last_hash = get_hash_str(
+                        operation.token_ids[i : i + self.page_size], last_hash
+                    )
+                    hash_value.append(last_hash)
+
+                need_free = self._insert_helper_host(
+                    last_host_node,
+                    RadixKey(
+                        token_ids=operation.token_ids,
+                        extra_key=last_host_node.key.extra_key,
+                    ),
+                    host_value=operation.host_indices,
+                    hash_value=hash_value,
+                )
+
+            self.cache_controller.mem_pool_host.free(operation.host_indices[:need_free])
+
+            last_host_node.release_host()
+            del self.ongoing_session_prefetch[session_id]
+            return True
+        return False
+
+    def write_backup_session(
+        self,
+        device_indices: torch.Tensor,
+        node: TreeNode,
+        session_id: Optional[str],
+        new_kv_cache: Optional[SessionCache],
+    ):
+        if (
+            not self.enable_session_cache
+            or session_id is None
+            or new_kv_cache is None
+            or len(new_kv_cache) == 0
+            or len(device_indices) <= new_kv_cache.token_start
+        ):
+            return None
+
+        # todo: replace with a GPU direct copy
+        flat_data = self.cache_controller.mem_pool_device.get_flat_data(
+            device_indices[new_kv_cache.token_start :]
+        )
+        copy_event = torch.cuda.Event()
+        copy_event.record()
+
+        truncated_cache = new_kv_cache.truncate_suffix_by_token_offset(
+            len(device_indices),
+            self.cache_controller.mem_pool_host.get_size_per_token(),
+        )
+        shifted_cache = truncated_cache.shift_token_range()
+
+        self.cache_controller.append_session_cache(flat_data, copy_event, shifted_cache)
+
+        self.inc_lock_ref(node)
+        self.ongoing_session_append[session_id] = (node, copy_event)
+
+        return truncated_cache
 
     def drain_storage_control_queues(self):
         """

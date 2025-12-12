@@ -13,6 +13,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    SessionParams,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -756,6 +757,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
+        session_params = []
 
         queue_times = []
         forward_entry_times = []
@@ -868,6 +870,17 @@ class SchedulerOutputProcessorMixin:
                 prefill_launch_delays.append(req.time_stats.get_prefill_launch_delay())
                 prefill_launch_latencies.append(
                     req.time_stats.get_prefill_launch_latency()
+                )
+
+                session_params.append(
+                    SessionParams(
+                        id=req.session_id,
+                        new_kv_cache=(
+                            req.new_kv_cache.to_dicts() if req.new_kv_cache else []
+                        ),
+                    )
+                    if req.session_id is not None
+                    else None
                 )
 
                 if not self.spec_algorithm.is_none():
@@ -997,6 +1010,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    session_params=session_params,
                 )
             )
 

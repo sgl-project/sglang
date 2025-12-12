@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.session_cache import SessionCache, SessionCacheStorageManager
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,22 @@ class StorageOperation:
         return self.id < other.id
 
 
+class SessionOperation:
+    def __init__(
+        self,
+        session_id: str,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        old_kv_cache: SessionCache,
+    ):
+        self.session_id = session_id
+        self.host_indices = host_indices
+        self.token_ids = token_ids
+        self.old_kv_cache = old_kv_cache
+        self.done = False
+        self.ok = False
+
+
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
@@ -256,6 +273,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
+        enable_session_cache: bool = False,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
@@ -267,6 +285,7 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.enable_session_cache = enable_session_cache
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -369,6 +388,107 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
+            self.prefetch_queue = Queue()
+            self.backup_queue = Queue()
+
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+            self.storage_config = self._generate_storage_config(model_name, None)
+
+    def prefetch_from_session_cache(
+        self,
+        session_id: str,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        old_kv_cache: SessionCache,
+    ):
+        operation = SessionOperation(session_id, host_indices, token_ids, old_kv_cache)
+        self.prefetch_queue.put(operation)
+        return operation
+
+    def append_session_cache(
+        self,
+        data: torch.Tensor,
+        event,
+        new_kv_cache: SessionCache,
+    ):
+        self.backup_queue.put((new_kv_cache, data, event))
+
+    def prefetch_session_cache_func(self):
+        while not self.stop_event.is_set() or not self.prefetch_queue.empty():
+            op: Optional[SessionOperation] = None
+            try:
+                op = self.prefetch_queue.get(block=True, timeout=1)
+                if op is None:
+                    continue
+
+                op.old_kv_cache.check_token_aligned(self.mem_pool_host.page_size)
+                op.old_kv_cache.check_kv_length(self.mem_pool_host.get_size_per_token())
+
+                for seg in op.old_kv_cache:
+                    host_indices = op.host_indices[
+                        seg.token_start : seg.token_start + seg.token_length
+                    ]
+                    page_num = len(host_indices) // self.mem_pool_host.page_size
+
+                    flat_data = self.mem_pool_host.get_dummy_flat_data_page(page_num)
+
+                    storage, filepath = SessionCacheStorageManager.get_storage(
+                        seg.kv_uri, self.storage_config, self.mem_pool_host
+                    )
+
+                    storage.load(filepath, seg.kv_start, flat_data)
+
+                    self.mem_pool_host.set_from_flat_data(host_indices, flat_data)
+
+                op.done = True
+                op.ok = True
+            except Empty:
+                continue
+            except Exception as e:
+                if op is not None:
+                    logger.error(
+                        f"Prefetch session cache failed for op {op}: {e}", exc_info=True
+                    )
+                    op.done = True
+                    op.ok = False
+                else:
+                    logger.error(
+                        f"Unexpected error in prefetch thread: {e}", exc_info=True
+                    )
+                continue
+
+    def backup_session_cache_func(self):
+        while not self.stop_event.is_set():
+            try:
+                new_kv_cache, flat_data, event = self.backup_queue.get(
+                    block=True, timeout=1
+                )
+                torch.cuda.current_stream().wait_event(event)
+
+                for seg in new_kv_cache:
+                    seg_data = flat_data[
+                        :, :, seg.token_start : seg.token_start + seg.token_length, :, :
+                    ]
+
+                    storage, filepath = SessionCacheStorageManager.get_storage(
+                        seg.kv_uri, self.storage_config, self.mem_pool_host
+                    )
+
+                    storage.save(filepath, seg.kv_start, seg_data)
+
+            except Empty:
+                continue
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -412,6 +532,11 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+        elif self.enable_session_cache:
+            self.prefetch_thread.join()
+            self.backup_thread.join()
+            self.prefetch_queue.queue.clear()
+            self.backup_queue.queue.clear()
 
         self.stop_event.clear()
 
@@ -422,6 +547,17 @@ class HiCacheController:
             self.backup_thread = threading.Thread(
                 target=self.backup_thread_func, daemon=True
             )
+            self.prefetch_thread.start()
+            self.backup_thread.start()
+
+        elif self.enable_session_cache:
+            self.prefetch_thread = threading.Thread(
+                target=self.prefetch_session_cache_func, daemon=True
+            )
+            self.backup_thread = threading.Thread(
+                target=self.backup_session_cache_func, daemon=True
+            )
+
             self.prefetch_thread.start()
             self.backup_thread.start()
 
