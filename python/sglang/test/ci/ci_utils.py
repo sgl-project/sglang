@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import subprocess
@@ -7,6 +8,8 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from sglang.srt.utils.common import kill_process_tree
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -138,9 +141,8 @@ def run_unittest_files(
             nonlocal process, output_lines
 
             full_path = os.path.join(os.getcwd(), filename)
-            print(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n",
-                flush=True,
+            logger.info(
+                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
             )
             file_tic = time.perf_counter()
 
@@ -155,7 +157,7 @@ def run_unittest_files(
                 )
                 output_lines = []
                 for line in process.stdout:
-                    print(line, end="", flush=True)
+                    logger.info(line.rstrip())
                     output_lines.append(line)
                 process.wait()
             else:
@@ -166,9 +168,8 @@ def run_unittest_files(
 
             elapsed = time.perf_counter() - file_tic
 
-            print(
-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
-                flush=True,
+            logger.info(
+                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
             )
             return process.returncode
 
@@ -179,9 +180,8 @@ def run_unittest_files(
 
         while attempt <= (max_attempts if enable_retry else 1):
             if attempt > 1:
-                print(
-                    f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n",
-                    flush=True,
+                logger.info(
+                    f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n"
                 )
                 was_retried = True
 
@@ -196,9 +196,8 @@ def run_unittest_files(
                 if ret_code == 0:
                     file_passed = True
                     if was_retried:
-                        print(
-                            f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n",
-                            flush=True,
+                        logger.info(
+                            f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n"
                         )
                         retried_tests.append((filename, attempt, "passed"))
                     passed_tests.append(filename)
@@ -210,27 +209,23 @@ def run_unittest_files(
                         is_retriable, reason = is_retriable_failure(output)
 
                         if is_retriable:
-                            print(
-                                f"\n[CI Retry] {filename} failed with {reason}",
-                                flush=True,
+                            logger.info(
+                                f"\n[CI Retry] {filename} failed with {reason}"
                             )
-                            print(
-                                f"[CI Retry] Waiting {retry_wait_seconds}s before retry...\n",
-                                flush=True,
+                            logger.info(
+                                f"[CI Retry] Waiting {retry_wait_seconds}s before retry...\n"
                             )
                             time.sleep(retry_wait_seconds)
                             attempt += 1
                             continue
                         else:
-                            print(
-                                f"\n[CI Retry] {filename} failed with {reason} - not retrying\n",
-                                flush=True,
+                            logger.info(
+                                f"\n[CI Retry] {filename} failed with {reason} - not retrying\n"
                             )
 
                     # No retry or not retriable
-                    print(
-                        f"\n✗ FAILED: {filename} returned exit code {ret_code}\n",
-                        flush=True,
+                    logger.info(
+                        f"\n✗ FAILED: {filename} returned exit code {ret_code}\n"
                     )
                     if was_retried:
                         retried_tests.append((filename, attempt, "failed"))
@@ -240,9 +235,8 @@ def run_unittest_files(
             except TimeoutError:
                 kill_process_tree(process.pid)
                 time.sleep(5)
-                print(
-                    f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n",
-                    flush=True,
+                logger.info(
+                    f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n"
                 )
                 if was_retried:
                     retried_tests.append((filename, attempt, "timeout"))
@@ -257,29 +251,29 @@ def run_unittest_files(
     elapsed_total = time.perf_counter() - tic
 
     if success:
-        print(f"Success. Time elapsed: {elapsed_total:.2f}s", flush=True)
+        logger.info(f"Success. Time elapsed: {elapsed_total:.2f}s")
     else:
-        print(f"Fail. Time elapsed: {elapsed_total:.2f}s", flush=True)
+        logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
     # Print summary
-    print(f"\n{'='*60}", flush=True)
-    print(f"Test Summary: {len(passed_tests)}/{len(files)} passed", flush=True)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
-        print(f"Retries: {len(retried_tests)} test(s) were retried", flush=True)
-    print(f"{'='*60}", flush=True)
+        logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
+    logger.info(f"{'='*60}")
     if passed_tests:
-        print("✓ PASSED:", flush=True)
+        logger.info("✓ PASSED:")
         for test in passed_tests:
-            print(f"  {test}", flush=True)
+            logger.info(f"  {test}")
     if failed_tests:
-        print("\n✗ FAILED:", flush=True)
+        logger.info("\n✗ FAILED:")
         for test, reason in failed_tests:
-            print(f"  {test} ({reason})", flush=True)
+            logger.info(f"  {test} ({reason})")
     if retried_tests:
-        print("\n↻ RETRIED:", flush=True)
+        logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
-            print(f"  {test} ({attempts} attempts, {result})", flush=True)
-    print(f"{'='*60}\n", flush=True)
+            logger.info(f"  {test} ({attempts} attempts, {result})")
+    logger.info(f"{'='*60}\n")
 
     # Write GitHub Step Summary
     if retried_tests:
