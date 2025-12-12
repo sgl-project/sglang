@@ -1,8 +1,3 @@
-//! Centralized error response handling for all routers
-//!
-//! This module provides consistent error responses across OpenAI and gRPC routers,
-//! ensuring all errors follow OpenAI's API error format.
-
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -10,138 +5,51 @@ use axum::{
 };
 use serde_json::json;
 
-/// Create a 500 Internal Server Error response
-///
-/// Use this for unexpected server-side errors, database failures, etc.
-///
-/// # Example
-/// ```ignore
-/// return Err(internal_error("Database connection failed"));
-/// ```
 pub fn internal_error(message: impl Into<String>) -> Response {
-    let msg = message.into();
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": msg,
-                "type": "internal_error",
-                "code": 500
-            }
-        })),
-    )
-        .into_response()
+    create_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
 }
 
-/// Create a 400 Bad Request response
-///
-/// Use this for invalid request parameters, malformed JSON, validation errors, etc.
-///
-/// # Example
-/// ```ignore
-/// return Err(bad_request("Invalid conversation ID format"));
-/// ```
 pub fn bad_request(message: impl Into<String>) -> Response {
-    let msg = message.into();
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": {
-                "message": msg,
-                "type": "invalid_request_error",
-                "code": 400
-            }
-        })),
-    )
-        .into_response()
+    create_error(StatusCode::BAD_REQUEST, "invalid_request_error", message)
 }
 
-/// Create a 404 Not Found response
-///
-/// Use this for resources that don't exist (conversations, responses, etc.)
-///
-/// # Example
-/// ```ignore
-/// return Err(not_found(format!("Conversation '{}' not found", id)));
-/// ```
 pub fn not_found(message: impl Into<String>) -> Response {
-    let msg = message.into();
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": {
-                "message": msg,
-                "type": "invalid_request_error",
-                "code": 404
-            }
-        })),
-    )
-        .into_response()
+    create_error(StatusCode::NOT_FOUND, "invalid_request_error", message)
 }
 
-/// Create a 503 Service Unavailable response
-///
-/// Use this for temporary service issues like no workers available, rate limiting, etc.
-///
-/// # Example
-/// ```ignore
-/// return Err(service_unavailable("No workers available for this model"));
-/// ```
 pub fn service_unavailable(message: impl Into<String>) -> Response {
-    let msg = message.into();
-    (
+    create_error(
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": {
-                "message": msg,
-                "type": "service_unavailable",
-                "code": 503
-            }
-        })),
+        "service_unavailable",
+        message,
     )
-        .into_response()
 }
 
-/// Create a 424 Failed Dependency response
-///
-/// Use this when an external dependency (like MCP server) fails.
-///
-/// # Example
-/// ```ignore
-/// return Err(failed_dependency("Failed to connect to MCP server"));
-/// ```
 pub fn failed_dependency(message: impl Into<String>) -> Response {
-    let msg = message.into();
-    (
+    create_error(
         StatusCode::FAILED_DEPENDENCY,
-        Json(json!({
-            "error": {
-                "message": msg,
-                "type": "external_connector_error",
-                "code": 424
-            }
-        })),
+        "external_connector_error",
+        message,
     )
-        .into_response()
 }
 
-/// Create a 501 Not Implemented response
-///
-/// Use this for features that are not yet implemented or supported.
-///
-/// # Example
-/// ```ignore
-/// return Err(not_implemented("vLLM backend integration is in progress"));
-/// ```
 pub fn not_implemented(message: impl Into<String>) -> Response {
+    create_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "not_implemented_error",
+        message,
+    )
+}
+
+fn create_error(status_code: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
     let msg = message.into();
     (
-        StatusCode::NOT_IMPLEMENTED,
+        status_code,
         Json(json!({
             "error": {
                 "message": msg,
-                "type": "not_implemented_error",
-                "code": 501
+                "type": error_type,
+                "code": status_code.as_u16()
             }
         })),
     )
