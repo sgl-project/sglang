@@ -135,6 +135,10 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Check disk I/O bandwidth
+        run: |
+          docker exec ci_sglang bash /sglang-checkout/scripts/check_disk_io.sh
+
       - name: Run test
         timeout-minutes: 10
         run: |
