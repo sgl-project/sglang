@@ -55,7 +55,7 @@ class RequestTrackers:
         self.curr_device_indices = torch.full(
             (max_pool_size, self.top_k + 1),
             -1,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         self.should_load_device_indices = torch.full(

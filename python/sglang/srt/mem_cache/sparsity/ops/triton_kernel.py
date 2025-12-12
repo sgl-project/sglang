@@ -36,6 +36,7 @@ def nsa_sparse_diff_triton_kernel(
     bid = tl.program_id(0)
     offset = tl.arange(0, TOPK)
     req_pool_index = tl.load(req_pool_indices_ptr + bid)
+    seq_len = tl.load(seq_lens_ptr + bid) - 1
     prev_top_k_result_start_ptr = (
         prev_top_k_result_ptr
         + req_pool_index * prev_top_k_result_stride_0
@@ -62,8 +63,7 @@ def nsa_sparse_diff_triton_kernel(
     )
 
     sparse_mask_val = tl.load(sparse_mask_ptr + bid)
-
-    if sparse_mask_val == 0:
+    if (sparse_mask_val == 0) | (seq_len <= 0):
         page_table_ptr = page_table_ptr + page_table_stride * req_pool_index
         topk_indices_ptr = curr_top_k_result_ptr + curr_top_k_result_stride * bid
         result_ptr = curr_device_indices_ptr + curr_device_indices_stride * bid
@@ -81,7 +81,6 @@ def nsa_sparse_diff_triton_kernel(
 
     prev_top_k_result = tl.load(prev_top_k_result_start_ptr + offset)
     max_val = tl.max(prev_top_k_result)
-    seq_len = tl.load(seq_lens_ptr + bid)
 
     if max_val == -1:
         no_exist_top_k_result = tl.load(
@@ -506,7 +505,6 @@ if __name__ == "__main__":
         page_table,
         layer_id,
         1,  # page_size
-        max_seqlen_k,
     )
 
     # print(bitmap.tolist())
@@ -746,7 +744,6 @@ if __name__ == "__main__":
             page_table_large.clone(),
             1,  # layer_id
             1,  # page_size
-            max_seqlen_k_large,
         ),
         "Original (TOPK=2048)",
         num_warmup=5,

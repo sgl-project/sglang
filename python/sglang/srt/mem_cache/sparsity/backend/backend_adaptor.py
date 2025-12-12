@@ -82,9 +82,7 @@ class NSABackendAdaptor(BackendAdaptor):
                 layer_id=layer_id,
                 page_size=1,
             )
-            .detach()
-            .clone()
-        ).to(torch.int32)
+        )
         return transformed_indices
 
 

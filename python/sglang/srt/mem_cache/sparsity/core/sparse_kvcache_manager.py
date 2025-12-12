@@ -112,7 +112,7 @@ class SparseKVCacheManager:
             self.req_states.should_load_device_indices,
             self.req_states.should_load_host_indices,
             out_cache_loc,
-            seq_lens - 1,
+            seq_lens,
             req_pool_indices,
             sparse_mask,
             page_table,
