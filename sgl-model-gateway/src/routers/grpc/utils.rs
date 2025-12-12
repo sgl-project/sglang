@@ -27,7 +27,7 @@ use crate::{
         ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
         ReasoningParser,
     },
-    routers::grpc::proto_wrapper::ProtoResponseVariant,
+    routers::{error, grpc::proto_wrapper::ProtoResponseVariant},
     tokenizer::{
         cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
@@ -39,7 +39,6 @@ use crate::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
     },
 };
-use crate::routers::error;
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {

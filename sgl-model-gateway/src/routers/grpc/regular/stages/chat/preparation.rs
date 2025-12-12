@@ -8,13 +8,15 @@ use tracing::error;
 
 use crate::{
     protocols::chat::ChatCompletionRequest,
-    routers::grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        utils,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{PreparationOutput, RequestContext},
+            utils,
+        },
     },
 };
-use crate::routers::error;
 
 /// Chat preparation stage
 ///

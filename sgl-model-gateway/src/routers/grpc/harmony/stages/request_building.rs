@@ -4,11 +4,14 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::{debug, error};
 use uuid::Uuid;
-use crate::routers::error;
-use crate::routers::grpc::{
-    common::stages::{helpers, PipelineStage},
-    context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
-    proto_wrapper::ProtoGenerateRequest,
+
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::{helpers, PipelineStage},
+        context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
+        proto_wrapper::ProtoGenerateRequest,
+    },
 };
 
 /// Harmony Request Building stage: Convert Harmony tokens to gRPC request

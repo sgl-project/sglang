@@ -8,11 +8,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
-use crate::routers::error;
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{FinalResponse, RequestContext},
-    regular::{processor, streaming},
+
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{FinalResponse, RequestContext},
+        regular::{processor, streaming},
+    },
 };
 
 /// Chat response processing stage

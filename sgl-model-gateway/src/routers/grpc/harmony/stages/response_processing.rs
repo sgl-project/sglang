@@ -5,11 +5,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
-use crate::routers::error;
+
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{FinalResponse, RequestContext, RequestType},
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{FinalResponse, RequestContext, RequestType},
+    },
 };
 
 /// Harmony Response Processing stage: Parse and format Harmony responses

@@ -4,9 +4,10 @@
 //! Both regular and harmony processors use these functions to avoid duplication.
 
 use axum::response::Response;
-use crate::routers::error;
-use crate::routers::grpc::{
-    context::ExecutionResult, proto_wrapper::ProtoGenerateComplete, utils,
+
+use crate::routers::{
+    error,
+    grpc::{context::ExecutionResult, proto_wrapper::ProtoGenerateComplete, utils},
 };
 
 /// Collect and merge responses from execution result

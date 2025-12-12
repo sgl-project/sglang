@@ -318,8 +318,7 @@ impl RouterMetrics {
     }
 
     pub fn record_request_duration(duration: Duration) {
-        histogram!("sgl_router_request_duration_seconds")
-        .record(duration.as_secs_f64());
+        histogram!("sgl_router_request_duration_seconds").record(duration.as_secs_f64());
     }
 
     pub fn record_request_error(route: &str, error_type: &str) {

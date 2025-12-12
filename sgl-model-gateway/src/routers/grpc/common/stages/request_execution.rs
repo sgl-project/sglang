@@ -3,11 +3,14 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::{error, info_span, Instrument};
-use crate::routers::error;
+
 use super::PipelineStage;
-use crate::routers::grpc::{
-    context::{ClientSelection, ExecutionResult, RequestContext},
-    proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+use crate::routers::{
+    error,
+    grpc::{
+        context::{ClientSelection, ExecutionResult, RequestContext},
+        proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+    },
 };
 
 type StreamResult = Result<ProtoStream, Box<dyn std::error::Error + Send + Sync>>;

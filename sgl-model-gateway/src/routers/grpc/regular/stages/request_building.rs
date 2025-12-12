@@ -3,11 +3,14 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
-use crate::routers::error as grpc_error;
+
 use super::{chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingStage};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{RequestContext, RequestType},
+use crate::routers::{
+    error as grpc_error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{RequestContext, RequestType},
+    },
 };
 
 /// Request building stage (delegates to endpoint-specific implementations)

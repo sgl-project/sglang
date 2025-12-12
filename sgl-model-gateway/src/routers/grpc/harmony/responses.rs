@@ -54,17 +54,19 @@ use crate::{
             ResponsesUsage, StringOrContentParts,
         },
     },
-    routers::grpc::{
-        common::responses::{
-            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-            streaming::{OutputItemType, ResponseStreamEventEmitter},
+    routers::{
+        error,
+        grpc::{
+            common::responses::{
+                build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+                streaming::{OutputItemType, ResponseStreamEventEmitter},
+            },
+            context::SharedComponents,
+            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+            pipeline::RequestPipeline,
         },
-        context::SharedComponents,
-        harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
-        pipeline::RequestPipeline,
     },
 };
-use crate::routers::error;
 
 /// Maximum number of tool execution iterations to prevent infinite loops
 const MAX_TOOL_ITERATIONS: usize = 10;

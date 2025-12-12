@@ -5,9 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
-use crate::routers::error;
+
 use super::PipelineStage;
-use crate::routers::grpc::context::{DispatchMetadata, RequestContext, RequestType, WorkerSelection};
+use crate::routers::{
+    error,
+    grpc::context::{DispatchMetadata, RequestContext, RequestType, WorkerSelection},
+};
 
 /// Dispatch metadata stage: Prepare metadata for dispatch
 pub struct DispatchMetadataStage;

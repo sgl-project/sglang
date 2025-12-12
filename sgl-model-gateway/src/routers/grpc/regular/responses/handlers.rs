@@ -64,12 +64,14 @@ use crate::{
             ResponsesUsage,
         },
     },
-    routers::grpc::common::responses::{
-        build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-        streaming::ResponseStreamEventEmitter,
+    routers::{
+        error,
+        grpc::common::responses::{
+            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+            streaming::ResponseStreamEventEmitter,
+        },
     },
 };
-use crate::routers::error;
 
 /// Main handler for POST /v1/responses
 ///

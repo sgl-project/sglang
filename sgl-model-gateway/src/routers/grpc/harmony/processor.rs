@@ -16,12 +16,14 @@ use crate::{
             ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+    routers::{
+        error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+        },
     },
 };
-use crate::routers::error;
 
 /// Processor for non-streaming Harmony responses
 ///

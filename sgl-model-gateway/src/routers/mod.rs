@@ -21,13 +21,13 @@ use crate::protocols::{
 };
 
 pub mod conversations;
+pub mod error;
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
 pub mod openai;
 pub mod router_manager;
-pub mod error;
 
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience

@@ -16,11 +16,14 @@ use crate::{
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
-        proto_wrapper::ProtoGenerateComplete,
-        utils,
+    routers::{
+        error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::ProtoGenerateComplete,
+            utils,
+        },
     },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
@@ -28,7 +31,6 @@ use crate::{
     },
     tool_parser::ParserFactory as ToolParserFactory,
 };
-use crate::routers::error;
 
 /// Unified response processor for both routers
 #[derive(Clone)]

@@ -34,9 +34,11 @@ use crate::{
             ResponsesResponse,
         },
     },
-    routers::grpc::common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+    routers::{
+        error,
+        grpc::common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+    },
 };
-use crate::routers::error;
 
 /// Merge function tools from request with MCP tools and set tool_choice based on iteration
 fn prepare_chat_tools_and_choice(
