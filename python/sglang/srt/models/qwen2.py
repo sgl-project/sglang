@@ -49,7 +49,6 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 Qwen2Config = None
@@ -90,9 +89,6 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        if get_global_server_args().rl_on_policy_target is not None:
-            x = x.bfloat16()
-
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -279,11 +275,6 @@ class Qwen2Model(nn.Module):
                 quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
-                params_dtype=(
-                    torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
-                    else None
-                ),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -304,19 +295,7 @@ class Qwen2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                    override_orig_dtype=torch.float32,
-                    fp32_residual=True,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
-            )
-            self.norm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
-            )
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -340,7 +319,6 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -463,7 +441,7 @@ class Qwen2ForCausalLM(nn.Module):
                 self.pp_group.send(
                     self.model.embed_tokens.weight, dst=self.pp_group.last_rank
                 )
-            elif self.pp_group.is_last_rank:
+            else:
                 emb_token_weight = self.pp_group.recv(
                     size=(config.vocab_size, config.hidden_size),
                     dtype=next(self.model.parameters()).dtype,

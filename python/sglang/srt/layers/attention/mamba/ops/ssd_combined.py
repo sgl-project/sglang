@@ -10,6 +10,7 @@
 
 import torch
 import triton
+import triton.language as tl
 from einops import rearrange
 from packaging import version
 

@@ -1,5 +1,10 @@
-from transformers import AutoProcessor, PretrainedConfig
-from transformers.processing_utils import ProcessingKwargs
+from typing import Any, List, Optional, Union
+
+from transformers import AutoProcessor, LlamaTokenizerFast, PretrainedConfig
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_utils import ImageInput
+from transformers.processing_utils import ProcessingKwargs, Unpack
+from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 try:
     from transformers import Qwen2_5_VLProcessor

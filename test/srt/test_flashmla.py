@@ -16,7 +16,9 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
+    run_bench_one_batch,
 )
 
 
@@ -29,6 +31,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
+                    "--enable-torch-compile",
                     "--cuda-graph-max-bs",
                     "2",
                     "--attention-backend",
@@ -60,6 +63,24 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.60)
+
+
+class TestFlashMLAAttnLatency(unittest.TestCase):
+    def test_latency(self):
+        _, output_throughput, _ = run_bench_one_batch(
+            DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+            [
+                "--attention-backend",
+                "flashmla",
+                "--enable-torch-compile",
+                "--cuda-graph-max-bs",
+                "16",
+                "--trust-remote-code",
+            ],
+        )
+
+        if is_in_ci():
+            self.assertGreater(output_throughput, 100)
 
 
 class TestFlashMLAMTP(CustomTestCase):

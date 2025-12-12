@@ -12,6 +12,12 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import safe_exp
 
 
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "USE_G": lambda args: args["g_cumsum"] is not None,
+    }
+)
 # @triton.autotune(
 #     configs=[
 #         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
@@ -139,8 +145,6 @@ def chunk_scaled_dot_kkt_fwd(
         K=K,
         BT=BT,
         BK=64,
-        IS_VARLEN=cu_seqlens is not None,
-        USE_G=g_cumsum is not None,
         num_warps=8,
         num_stages=3,
     )

@@ -4,18 +4,31 @@ import math
 import os
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Optional, Union
+from typing import Any, Callable, List, Optional, TypeVar, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
-import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
-from sglang.srt.utils import is_hip
+from sglang.srt import _custom_ops as ops
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
+
+mscclpp_is_available = False
+if _is_hip:
+    # TODO(zyksir): mscclpp is untested on AMD and therefore disabled.
+    mscclpp_is_available = False
+if _is_cuda:
+    try:
+        import sgl_kernel
+
+        mscclpp_is_available = True
+    except:
+        mscclpp_is_available = False
 
 
 class MscclContextSelection(IntEnum):
@@ -114,7 +127,7 @@ class PyMscclppCommunicator:
         self._IS_CAPTURING = False
         self.disabled = True
 
-        if not ops.IS_MSCCLPP_AR_AVAILABLE:
+        if not mscclpp_is_available:
             # disable because of missing mscclpp library
             # e.g. in a non-cuda environment
             return

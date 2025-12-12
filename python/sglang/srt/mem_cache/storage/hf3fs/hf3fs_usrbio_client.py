@@ -1,4 +1,3 @@
-import datetime
 import logging
 import multiprocessing
 import os
@@ -57,14 +56,7 @@ def wsynchronized():
 class Hf3fsUsrBioClient(Hf3fsClient):
     """HF3FS client implementation using usrbio."""
 
-    def __init__(
-        self,
-        path: str,
-        size: int,
-        bytes_per_page: int,
-        entries: int,
-        client_timeout: int,
-    ):
+    def __init__(self, path: str, size: int, bytes_per_page: int, entries: int):
         if not HF3FS_AVAILABLE:
             raise ImportError(
                 "hf3fs_fuse.io is not available. Please install the hf3fs_fuse package."
@@ -74,7 +66,6 @@ class Hf3fsUsrBioClient(Hf3fsClient):
         self.size = size
         self.bytes_per_page = bytes_per_page
         self.entries = entries
-        self.client_timeout = client_timeout
 
         self.file = os.open(self.path, os.O_RDWR | os.O_CREAT)
         os.ftruncate(self.file, size)
@@ -130,9 +121,7 @@ class Hf3fsUsrBioClient(Hf3fsClient):
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_r.submit().wait(
-            min_results=ionum, timeout=datetime.timedelta(seconds=self.client_timeout)
-        )
+        resv = self.ior_r.submit().wait(min_results=ionum)
 
         # results
         hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
@@ -156,9 +145,7 @@ class Hf3fsUsrBioClient(Hf3fsClient):
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_w.submit().wait(
-            min_results=ionum, timeout=datetime.timedelta(seconds=self.client_timeout)
-        )
+        resv = self.ior_w.submit().wait(min_results=ionum)
 
         # results
         results = [res.result for res in resv]

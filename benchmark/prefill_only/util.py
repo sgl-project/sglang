@@ -240,7 +240,7 @@ async def make_http_call(
         api_name: Name of the API for error messages
     """
     try:
-        start_time = asyncio.get_running_loop().time()
+        start_time = asyncio.get_event_loop().time()
 
         request_json = build_http_request_json(request_data)
         headers = {"Content-Type": "application/json"}
@@ -253,7 +253,7 @@ async def make_http_call(
                     f"[HTTP] {api_name} Request {request_id} failed with status "
                     f"{resp.status}: {resp_text}"
                 )
-                completion_time = asyncio.get_running_loop().time()
+                completion_time = asyncio.get_event_loop().time()
                 await results_queue.put((request_id, 0, False, completion_time))
                 return
 
@@ -271,13 +271,13 @@ async def make_http_call(
                 )
                 success = False
 
-        completion_time = asyncio.get_running_loop().time()
+        completion_time = asyncio.get_event_loop().time()
         elapsed_time = (completion_time - start_time) * 1000
         await results_queue.put((request_id, elapsed_time, success, completion_time))
 
     except Exception as e:
         print(f"[HTTP] {api_name} Error for request {request_id}: {e}")
-        completion_time = asyncio.get_running_loop().time()
+        completion_time = asyncio.get_event_loop().time()
         await results_queue.put((request_id, 0, False, completion_time))
 
 
@@ -738,7 +738,7 @@ async def run_generic_benchmark(
     tasks = []
 
     # Track timing for sending requests
-    send_start_time = asyncio.get_running_loop().time()
+    send_start_time = asyncio.get_event_loop().time()
 
     # HTTP implementation
     async with aiohttp.ClientSession(
@@ -778,7 +778,7 @@ async def run_generic_benchmark(
                 if i < len(all_requests) - 1:
                     await sleep_with_distribution(config.distribution, rps)
 
-        send_end_time = asyncio.get_running_loop().time()
+        send_end_time = asyncio.get_event_loop().time()
         send_duration = send_end_time - send_start_time
 
         # Wait for all requests to complete with progress tracking
@@ -796,7 +796,7 @@ async def run_generic_benchmark(
         if config.profile:
             await send_profile_request("STOP_PROFILE", http_url, session=session)
 
-    completion_end_time = asyncio.get_running_loop().time()
+    completion_end_time = asyncio.get_event_loop().time()
     total_duration = completion_end_time - send_start_time
 
     return await process_results(

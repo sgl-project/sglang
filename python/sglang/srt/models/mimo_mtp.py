@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/pull/17433/files  and deepseek_nextn.py
 
-from typing import Iterable, Optional, Tuple
+from functools import partial
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn

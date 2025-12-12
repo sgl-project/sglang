@@ -27,7 +27,8 @@ void bmm_fp8(
     at::Tensor A_scale,
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
-    int64_t cublas_handle) {
+    int64_t cublas_handle,
+    int64_t cuda_stream) {
   TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
   TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
   TORCH_CHECK(D.is_cuda(), "D must be a CUDA tensor");
@@ -50,7 +51,7 @@ void bmm_fp8(
         auto n = B.size(2);
 
         auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
-        auto stream = at::cuda::getCurrentCUDAStream();
+        auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
         auto status = flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
             workspace_buffer.data_ptr(),

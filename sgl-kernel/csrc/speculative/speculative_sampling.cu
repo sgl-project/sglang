@@ -42,7 +42,8 @@ void tree_speculative_sampling_target_only(
     at::Tensor draft_probs,
     double threshold_single,
     double threshold_acc,
-    bool deterministic = true) {
+    bool deterministic = true,
+    int64_t cuda_stream = 0) {
   CHECK_INPUT(candidates);
   CHECK_INPUT(retrive_index);
   CHECK_INPUT(retrive_next_token);
@@ -123,7 +124,7 @@ void tree_speculative_sampling_target_only(
   CHECK_GE(threshold_acc, 0);
   CHECK_GE(1, threshold_acc);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int32_t, int64_t>(
       static_cast<int32_t*>(predicts.data_ptr()),
       static_cast<int32_t*>(accept_index.data_ptr()),

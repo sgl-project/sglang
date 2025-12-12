@@ -98,51 +98,19 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
         print(f"[Server Mode] Generated text: {response.json()['text']}")
         return response.json()["text"]
 
-    def run_decode_random(self, max_new_tokens=32):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": f"Question: {random.randint(0, 100)},The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
-                },
-            },
-        )
-        return response.json()
-
     def get_model_info(self):
         response = requests.get(self.base_url + "/get_model_info")
         model_path = response.json()["model_path"]
         print(json.dumps(response.json()))
         return model_path
 
-    def run_update_weights(self, model_path, flush_cache=True):
+    def run_update_weights(self, model_path):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
-            json={
-                "model_path": model_path,
-                "flush_cache": flush_cache,
-            },
+            json={"model_path": model_path},
         )
         ret = response.json()
-        return ret
-
-    def pause_generation(self, mode):
-        response = requests.post(
-            self.base_url + "/pause_generation",
-            json={"mode": mode},
-        )
-        ret = response.json()
-        return ret
-
-    def continue_generation(self):
-        response = requests.post(
-            self.base_url + "/continue_generation",
-            json={},
-        )
-        ret = response.json()
+        print(json.dumps(ret))
         return ret
 
     def test_update_weights(self):
@@ -169,42 +137,6 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
 
         updated_response = self.run_decode()
         self.assertEqual(origin_response[:32], updated_response[:32])
-
-    def test_update_weights_non_blocking(self):
-        origin_model_path = self.get_model_info()
-        print(f"[Server Mode] origin_model_path: {origin_model_path}")
-
-        pause_generation_modes = ["in_place", "retract"]
-        for pause_generation_mode in pause_generation_modes:
-            num_requests = 32
-            with ThreadPoolExecutor(num_requests) as executor:
-                futures = [
-                    executor.submit(self.run_decode_random, 1600)
-                    for _ in range(num_requests)
-                ]
-
-                # ensure the decode has been started
-                time.sleep(2)
-
-                new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace(
-                    "-Instruct", ""
-                )
-                ret = self.pause_generation(pause_generation_mode)
-                ret = self.run_update_weights(
-                    new_model_path, flush_cache=pause_generation_mode == "retract"
-                )
-                self.assertTrue(ret["success"])
-                ret = self.continue_generation()
-
-                for future in as_completed(futures):
-                    self.assertNotEqual(
-                        future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                    )
-
-            updated_model_path = self.get_model_info()
-            print(f"[Server Mode] updated_model_path: {updated_model_path}")
-            self.assertEqual(updated_model_path, new_model_path)
-            self.assertNotEqual(updated_model_path, origin_model_path)
 
     def test_update_weights_unexist_model(self):
         origin_model_path = self.get_model_info()

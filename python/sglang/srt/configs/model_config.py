@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import Any, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -47,20 +47,13 @@ class ModelImpl(str, Enum):
     AUTO = "auto"
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
-    MINDSPORE = "mindspore"
 
 
 def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     return (
         config.architectures is not None
         and config.architectures[0]
-        in [
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "DeepseekV3ForCausalLMNextN",
-            "MistralLarge3ForCausalLM",
-            "PixtralForConditionalGeneration",
-        ]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"]
         and getattr(config, "index_topk", None) is not None
     )
 
@@ -92,6 +85,7 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        modelopt_quant: Optional[Union[str, Dict]] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[
@@ -99,19 +93,15 @@ class ModelConfig:
         ] = None,  # TODO: remove this, it is not a model config
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
-        quantize_and_serve: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.modelopt_quant = modelopt_quant
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
-        self.quantize_and_serve = quantize_and_serve
-
-        # Validate quantize_and_serve configuration
-        self._validate_quantize_and_serve_config()
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -156,13 +146,13 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        self.is_hybrid_swa = is_hybrid_model(
+        self.is_hybrid = is_hybrid_model(
             self.hf_config.architectures,
             hybrid_kvcache_ratio=hybrid_kvcache_ratio,
             context_length=context_length,
             attention_chunk_size=self.attention_chunk_size,
         )
-        if self.is_hybrid_swa is not None:
+        if self.is_hybrid is not None:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures, self.hf_text_config.num_hidden_layers
@@ -183,14 +173,6 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
-        # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "vision_config"
-        )
-        self.is_audio_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "audio_config"
-        )
-
         self.is_multimodal_chunked_prefill_supported = (
             enable_multimodal
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
@@ -216,14 +198,6 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
-        # matryoshka embeddings
-        self.matryoshka_dimensions = getattr(
-            self.hf_config, "matryoshka_dimensions", None
-        )
-        self.is_matryoshka = self.matryoshka_dimensions or getattr(
-            self.hf_config, "is_matryoshka", False
-        )
-
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -241,11 +215,10 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            modelopt_quant=server_args.modelopt_quant,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
-            quantize_and_serve=server_args.quantize_and_serve,
-            override_config_file=server_args.decrypted_config_file,
             **kwargs,
         )
 
@@ -336,9 +309,6 @@ class ModelConfig:
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
-            or "MistralLarge3ForCausalLM" in self.hf_config.architectures
-            or "PixtralForConditionalGeneration" in self.hf_config.architectures
-            or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -381,13 +351,6 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
-        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
-            self.head_dim = 72
-            self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -523,18 +486,12 @@ class ModelConfig:
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             if not is_local:
-                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-                if envs.SGLANG_USE_MODELSCOPE.get():
+                import huggingface_hub
 
-                    from modelscope import HubApi, model_file_download
-
-                    hf_api = HubApi()
-                else:
-                    import huggingface_hub
+                try:
                     from huggingface_hub import HfApi, hf_hub_download
 
                     hf_api = HfApi()
-                try:
                     # Retry HF API call up to 3 times
                     file_exists = retry(
                         lambda: hf_api.file_exists(
@@ -546,18 +503,11 @@ class ModelConfig:
                     )
                     if file_exists:
                         # Download and parse the quantization config for remote models
-                        if envs.SGLANG_USE_MODELSCOPE.get():
-                            quant_config_file = model_file_download(
-                                model_id=self.model_path,
-                                file_path="hf_quant_config.json",
-                                revision=self.revision,
-                            )
-                        else:
-                            quant_config_file = hf_hub_download(
-                                repo_id=self.model_path,
-                                filename="hf_quant_config.json",
-                                revision=self.revision,
-                            )
+                        quant_config_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename="hf_quant_config.json",
+                            revision=self.revision,
+                        )
                         with open(quant_config_file) as f:
                             quant_config_dict = json.load(f)
                         quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
@@ -578,7 +528,7 @@ class ModelConfig:
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
 
-    def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
+    def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> dict:
         """Parse ModelOpt quantization config and return the appropriate quant_method."""
         json_quant_configs = quant_config_dict["quantization"]
         quant_algo = json_quant_configs.get("quant_algo", None)
@@ -590,63 +540,8 @@ class ModelConfig:
         elif quant_algo and "FP8" in quant_algo:
             return {"quant_method": "modelopt_fp8"}
         else:
-            return None
-
-    def _is_already_quantized(self) -> bool:
-        """Check if the model is already quantized based on config files."""
-        # Check for HuggingFace quantization config
-        from sglang.srt.utils import has_hf_quant_config
-
-        return has_hf_quant_config(self.model_path)
-
-    def _get_modelopt_quant_type(self) -> str:
-        """Extract ModelOpt quantization type from unified quantization flag."""
-        if self.quantization == "modelopt_fp8":
-            return "fp8"
-        elif self.quantization == "modelopt_fp4":
-            return "nvfp4"
-        elif self.quantization == "modelopt":
-            # Auto-detect from model config
-            quant_cfg = self._parse_quant_hf_config()
-            if quant_cfg:
-                quant_method = quant_cfg.get("quant_method", "").lower()
-                if "fp4" in quant_method:
-                    return "fp4"
-                elif "fp8" in quant_method:
-                    return "fp8"
-            # Default to fp8 if can't detect
-            return "fp8"
-        else:
-            return "fp8"  # Default fallback
-
-    def _validate_quantize_and_serve_config(self):
-        """Validate quantize_and_serve configuration."""
-        if not self.quantize_and_serve:
-            return
-
-        # Check if ModelOpt quantization is specified
-        _MODELOPT_QUANTIZATION_METHODS = [
-            "modelopt",
-            "modelopt_fp8",
-            "modelopt_fp4",
-        ]
-        modelopt_quantization_specified = (
-            self.quantization in _MODELOPT_QUANTIZATION_METHODS
-        )
-
-        if not modelopt_quantization_specified:
-            raise ValueError(
-                "quantize_and_serve requires ModelOpt quantization (set with --quantization "
-                f"{{{', '.join(sorted(_MODELOPT_QUANTIZATION_METHODS))}}})"
-            )
-
-        # quantize_and_serve is disabled due to compatibility issues
-        raise NotImplementedError(
-            "quantize_and_serve functionality is currently disabled due to compatibility issues. "
-            "Please use the separate quantize-then-deploy workflow instead. "
-            "Step 1: Quantize and export model. "
-            "Step 2: Deploy the exported model."
-        )
+            # Default to FP8 for backward compatibility
+            return {"quant_method": "modelopt_fp8"}
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
@@ -662,7 +557,6 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "mxfp4",
-            "auto-round",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -682,10 +576,8 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
-            "quark",
         ]
         compatible_quantization_methods = {
-            "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -716,16 +608,7 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                # Allow auto-detection of quantization from checkpoint for draft model
-                # even if it differs from main model's quantization
-                if self.is_draft_model:
-                    logger.info(
-                        f"Draft model quantization ({quant_method}) differs from "
-                        f"main model quantization ({self.quantization}). "
-                        f"Using draft model's detected quantization: {quant_method}"
-                    )
-                    self.quantization = quant_method
-                elif (
+                if (
                     self.quantization not in compatible_quantization_methods
                     or quant_method
                     not in compatible_quantization_methods[self.quantization]
@@ -866,7 +749,7 @@ def _get_and_verify_dtype(
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "dtype", None)
+    config_dtype = getattr(config, "torch_dtype", None)
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
@@ -965,32 +848,21 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
-    "NemotronH_Nano_VL_V2",
-    "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
-    "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
-    "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
-    "NVILAForConditionalGeneration",
-    "NVILALiteForConditionalGeneration",
-    "DeepseekOCRForCausalLM",
-    "JetVLMForConditionalGeneration",
-    "PaddleOCRVLForConditionalGeneration",
 ]
-
-if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
-    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
 
 
 def is_multimodal_model(model_architectures: List[str]):

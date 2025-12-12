@@ -5,7 +5,7 @@ Handles merging of YAML configuration files with command-line arguments.
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 import yaml
 

@@ -150,13 +150,14 @@ void downcast_fp8(
     at::Tensor& v_scale,
     at::Tensor& loc,
     int64_t mult,
-    int64_t offset) {
+    int64_t offset,
+    int64_t cuda_stream) {
   CHECK_INPUT(k);
   CHECK_INPUT(v);
   CHECK_INPUT(k_out);
   CHECK_INPUT(v_out);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   switch (k.scalar_type()) {
     case at::ScalarType::BFloat16:
       downcast_fp8_impl<__nv_bfloat16>(k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, stream);

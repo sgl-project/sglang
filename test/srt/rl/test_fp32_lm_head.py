@@ -36,6 +36,7 @@ class TestLMHeadFP32(unittest.TestCase):
             raise unittest.SkipTest("needs CUDA GPU")
 
     def _make_logprocessor(self, vocab_size, enable_fp32):
+        ServerArgs.__post_init__ = lambda self: None  # disable validation
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         get_global_server_args().enable_dp_lm_head = False
         get_global_server_args().enable_fp32_lm_head = enable_fp32

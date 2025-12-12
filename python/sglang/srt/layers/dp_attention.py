@@ -17,9 +17,6 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -89,9 +86,7 @@ class _DpGatheredBufferWrapper:
     _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
-    _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
-    _is_extend_in_batch: bool
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -104,33 +99,27 @@ class _DpGatheredBufferWrapper:
         cls,
         global_dp_buffer_len: int,
         local_dp_buffer_len: int,
-        dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
-        cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group()):
-            buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
-            )
-        return buffer
+        return torch.empty(
+            (cls._global_dp_buffer_len, cls._hidden_size),
+            dtype=cls._dtype,
+            device=cls._device,
+        )
 
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
-            )
-        return buffer
+        return torch.empty(
+            (cls._local_dp_buffer_len, cls._hidden_size),
+            dtype=cls._dtype,
+            device=cls._device,
+        )
 
     @classmethod
     def get_global_dp_buffer_len(cls) -> int:
@@ -156,27 +145,14 @@ class _DpGatheredBufferWrapper:
     def get_dp_device(cls) -> torch.device:
         return cls._device
 
-    @classmethod
-    def set_is_extend_in_batch(cls, is_extend_in_batch: bool):
-        cls._is_extend_in_batch = is_extend_in_batch
-
-    @classmethod
-    def get_is_extend_in_batch(cls) -> bool:
-        return cls._is_extend_in_batch
-
-    @classmethod
-    def is_dp_max_padding(cls) -> bool:
-        return cls._dp_max_padding
-
 
 def set_dp_buffer_len(
     global_dp_buffer_len: int,
     local_dp_buffer_len: int,
-    dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
-        global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
+        global_dp_buffer_len, local_dp_buffer_len, global_num_tokens
     )
 
 
@@ -210,18 +186,6 @@ def get_dp_dtype() -> torch.dtype:
 
 def get_dp_device() -> torch.device:
     return _DpGatheredBufferWrapper.get_dp_device()
-
-
-def set_is_extend_in_batch(is_extend_in_batch: bool):
-    _DpGatheredBufferWrapper.set_is_extend_in_batch(is_extend_in_batch)
-
-
-def get_is_extend_in_batch() -> bool:
-    return _DpGatheredBufferWrapper.get_is_extend_in_batch()
-
-
-def is_dp_max_padding() -> bool:
-    return _DpGatheredBufferWrapper.is_dp_max_padding()
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
@@ -289,10 +253,6 @@ def initialize_dp_attention(
         _LOCAL_ATTN_DP_SIZE = 1
 
     tp_group = get_tp_group()
-    # Trick to solve circular references
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-
-    use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
     _ATTN_TP_GROUP = GroupCoordinator(
         [
             list(range(head, head + _ATTN_TP_SIZE))
@@ -300,10 +260,10 @@ def initialize_dp_attention(
         ],
         tp_group.local_rank,
         torch.distributed.get_backend(tp_group.device_group),
-        use_pynccl=use_pynccl,
+        use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_pymscclpp=False,
         use_custom_allreduce=False,
-        use_torch_symm_mem_all_reduce=False,
+        use_torch_symm_mem=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
@@ -319,10 +279,6 @@ def initialize_dp_attention(
 
 def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG
-
-
-def is_allocation_symmetric() -> bool:
-    return not is_dp_attention_enabled() or is_dp_max_padding()
 
 
 def get_attention_tp_group() -> GroupCoordinator:

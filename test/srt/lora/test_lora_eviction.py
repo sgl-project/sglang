@@ -97,17 +97,7 @@ class TestLoRAEviction(CustomTestCase):
             max_loras_per_batch=1,
             enable_lora=True,
             max_lora_rank=256,
-            # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-            # lora_target_modules=["all"],
-            lora_target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            lora_target_modules=["all"],
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 

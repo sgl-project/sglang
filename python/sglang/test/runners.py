@@ -12,11 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
-import json
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -31,14 +30,9 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import is_npu, load_image
+from sglang.srt.utils import load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
-
-if is_npu():
-    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
-
-    init_npu_backend()
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -77,8 +71,6 @@ def get_dtype_str(torch_dtype):
         return "float16"
     if torch_dtype is torch.float32:
         return "float32"
-    if torch_dtype is torch.bfloat16:
-        return "bfloat16"
     else:
         raise NotImplementedError()
 
@@ -97,9 +89,7 @@ def get_token_ids_logprobs(logits, token_ids):
     return logprobs
 
 
-def _get_sentence_transformer_embedding_model(
-    model_path, torch_dtype, matryoshka_dim: Optional[int] = None
-):
+def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
@@ -107,7 +97,6 @@ def _get_sentence_transformer_embedding_model(
         model = SentenceTransformer(
             model_path,
             model_kwargs={"torch_dtype": torch_dtype},
-            truncate_dim=matryoshka_dim,
         )
     else:  # if no pre-trained sentence-transformers model
         from sentence_transformers import models
@@ -117,9 +106,7 @@ def _get_sentence_transformer_embedding_model(
             word_embedding_model.get_word_embedding_dimension(),
             pooling_mode="lasttoken",
         )
-        model = SentenceTransformer(
-            modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
-        )
+        model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
 
     return model.cuda()
 
@@ -148,7 +135,6 @@ class HFRunner:
         output_str_only: bool = False,
         trust_remote_code: bool = False,
         patch_model_do_sample_false: bool = False,
-        matryoshka_dim: Optional[int] = None,
     ):
         self.model_type = model_type
         self.output_str_only = output_str_only
@@ -165,7 +151,6 @@ class HFRunner:
                 self.out_queue,
                 model_path,
                 torch_dtype,
-                matryoshka_dim,
             ),
         )
         self.model_proc.start()
@@ -240,14 +225,7 @@ class HFRunner:
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return embeddings.contiguous()
 
-    def start_model_process(
-        self,
-        in_queue,
-        out_queue,
-        model_path,
-        torch_dtype,
-        matryoshka_dim: Optional[int] = None,
-    ):
+    def start_model_process(self, in_queue, out_queue, model_path, torch_dtype):
         # Apply model-specific patches
         monkey_patch_gemma2_sdpa()
 
@@ -281,7 +259,7 @@ class HFRunner:
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
-                    model_path, torch_dtype, matryoshka_dim=matryoshka_dim
+                    model_path, torch_dtype
                 )
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
@@ -360,7 +338,7 @@ class HFRunner:
                     scores = []
                     for conv in prompts:
                         conv_formatted = self.tokenizer.apply_chat_template(
-                            conv, tokenize=False, return_dict=False
+                            conv, tokenize=False
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
@@ -436,7 +414,6 @@ class HFRunner:
                 )
             else:
                 model = base_model
-
             if patch_model_do_sample_false:
                 model.generation_config.do_sample = False
             outputs = model.generate(
@@ -456,7 +433,6 @@ class HFRunner:
             text = tokenizer.decode(
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
-
             # Check if the text is empty or only whitespace.
             if not text.strip():
                 raise ValueError(
@@ -524,9 +500,6 @@ class SRTRunner:
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
         chunked_prefill_size: Optional[int] = None,
-        context_length: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
-        page_size: Optional[int] = None,
         dp_size: int = 1,
         tokenizer_path: Optional[str] = None,
         mem_fraction_static: float = 0.65,
@@ -537,8 +510,6 @@ class SRTRunner:
         speculative_num_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
-        speculative_ngram_min_match_window_size: Optional[int] = None,
-        speculative_ngram_max_match_window_size: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
         torchao_config: Optional[str] = None,
@@ -548,9 +519,7 @@ class SRTRunner:
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
-        json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
-        enable_deterministic_inference: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -566,14 +535,6 @@ class SRTRunner:
             spec_kwargs["speculative_num_steps"] = speculative_num_steps
             spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
             spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
-        elif speculative_algorithm == "NGRAM":
-            spec_kwargs["speculative_algorithm"] = speculative_algorithm
-            spec_kwargs["speculative_ngram_min_match_window_size"] = (
-                speculative_ngram_min_match_window_size
-            )
-            spec_kwargs["speculative_ngram_max_match_window_size"] = (
-                speculative_ngram_max_match_window_size
-            )
 
         self.engine = Engine(
             model_path=model_path,
@@ -594,9 +555,6 @@ class SRTRunner:
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
             chunked_prefill_size=chunked_prefill_size,
-            context_length=context_length,
-            max_total_tokens=max_total_tokens,
-            page_size=page_size,
             enable_dp_attention=enable_dp_attention,
             dp_size=dp_size,
             tokenizer_path=tokenizer_path,
@@ -608,13 +566,7 @@ class SRTRunner:
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
             max_loaded_loras=max_loaded_loras,
-            json_model_override_args=(
-                json.dumps(json_model_override_args)
-                if json_model_override_args
-                else "{}"
-            ),
             lora_eviction_policy=lora_eviction_policy,
-            enable_deterministic_inference=enable_deterministic_inference,
             **spec_kwargs,
         )
 
@@ -642,7 +594,6 @@ class SRTRunner:
         logprob_start_len: int = 0,
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
-        dimensions: Optional[int] = None,
     ):
         if self.is_generation:
             return self.forward_generation_raw(
@@ -656,9 +607,7 @@ class SRTRunner:
             )
         else:
             if self.model_type == "embedding":
-                response = self.engine.encode(
-                    prompt=prompts, image_data=image_data, dimensions=dimensions
-                )
+                response = self.engine.encode(prompt=prompts, image_data=image_data)
                 if isinstance(response, list):
                     logits = [x["embedding"] for x in response]
                 else:

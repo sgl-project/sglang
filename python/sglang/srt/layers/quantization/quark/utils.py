@@ -6,17 +6,7 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 import torch
-
-try:
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-except ImportError as err:
-
-    def raise_aiter_import_error(*args, **kwargs):
-        raise ImportError(
-            "Failed to import aiter. " "Make sure AITER is installed and accessible."
-        )
-
-    dynamic_mxfp4_quant = raise_aiter_import_error
+from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from torch import nn
 
 

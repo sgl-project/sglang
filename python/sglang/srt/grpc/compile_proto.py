@@ -18,9 +18,6 @@ Options:
 ### Install Dependencies
 pip install "grpcio==1.75.1" "grpcio-tools==1.75.1"
 
-Please make sure to use the same version of grpcio and grpcio-tools specified in pyproject.toml
-otherwise update the versions specified in pyproject.toml
-
 ### Run Script
 cd python/sglang/srt/grpc
 python compile_proto.py
@@ -73,7 +70,7 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
 
     # Check if grpc_tools is available
     try:
-        import grpc_tools.protoc  # noqa: F401
+        import grpc_tools.protoc
     except ImportError:
         print("Error: grpcio-tools not installed")
         print(

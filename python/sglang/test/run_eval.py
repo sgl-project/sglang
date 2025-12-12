@@ -115,11 +115,7 @@ def run_eval(args):
         # VLM MMMU evaluation with fixed 100 examples by default
         from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
 
-        eval_obj = MMMUVLMEval(
-            args.num_examples,
-            args.num_threads,
-            response_answer_regex=getattr(args, "response_answer_regex", None),
-        )
+        eval_obj = MMMUVLMEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 

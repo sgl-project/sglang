@@ -3,17 +3,45 @@
 import dataclasses
 import logging
 from contextlib import ExitStack
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
 import torch
 import torch.fx as fx
 
+import sglang.srt.compilation.weak_ref_tensor_jit
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
 logger = logging.getLogger(__name__)
+
+
+def weak_ref_tensor(tensor: Any) -> Any:
+    """
+    Create a weak reference to a tensor.
+    The new tensor will share the same data as the original tensor,
+    but will not keep the original tensor alive.
+    """
+    if isinstance(tensor, torch.Tensor):
+        # TODO(yuwei): introduce weak_ref_tensor from sgl_kernel
+        return torch.ops.jit_weak_ref_tensor.weak_ref_tensor(tensor)
+    return tensor
+
+
+def weak_ref_tensors(
+    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]]
+) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
+    """
+    Convenience function to create weak references to tensors,
+    for single tensor, list of tensors or tuple of tensors.
+    """
+    if isinstance(tensors, torch.Tensor):
+        return weak_ref_tensor(tensors)
+    if isinstance(tensors, list):
+        return [weak_ref_tensor(t) for t in tensors]
+    if isinstance(tensors, tuple):
+        return tuple(weak_ref_tensor(t) for t in tensors)
+    raise ValueError("Invalid type for tensors")
 
 
 @dataclasses.dataclass
@@ -80,6 +108,8 @@ class CUDAPiecewiseBackend:
 
         self.sym_shape_indices = sym_shape_indices
 
+        self.is_debugging_mode = True
+
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
@@ -143,11 +173,10 @@ class CUDAPiecewiseBackend:
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
-            if self.compile_config.get_enable_debug_mode():
-                input_addresses = [
-                    x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-                ]
-                entry.input_addresses = input_addresses
+            input_addresses = [
+                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+            ]
+            entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -185,7 +214,7 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
-        if self.compile_config.get_enable_debug_mode():
+        if self.is_debugging_mode:
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)

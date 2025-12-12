@@ -5,8 +5,10 @@ python3 -m unittest test_skip_tokenizer_init.TestSkipTokenizerInit.run_decode_st
 
 import json
 import unittest
+from io import BytesIO
 
 import requests
+from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
@@ -18,7 +20,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    download_image_with_retry,
     popen_launch_server,
 )
 
@@ -203,7 +204,8 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     @classmethod
     def setUpClass(cls):
         cls.image_url = DEFAULT_IMAGE_URL
-        cls.image = download_image_with_retry(cls.image_url)
+        response = requests.get(cls.image_url)
+        cls.image = Image.open(BytesIO(response.content))
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
         cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)

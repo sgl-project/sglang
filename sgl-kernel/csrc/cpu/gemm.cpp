@@ -85,26 +85,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
-inline void copy_stub(float* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0, data1;
-    bVec b_vec = bVec::loadu(input + d);
-    std::tie(data0, data1) = at::vec::convert_to_float(b_vec);
-    data0.store(out + d);
-    data1.store(out + d + fVec::size());
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<float>(input[d]);
-  }
-}
-
-template <typename scalar_t>
 inline void copy_add_stub(
     scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -121,40 +101,6 @@ inline void copy_add_stub(
   }
   for (; d < size; ++d) {
     out[d] = static_cast<scalar_t>(input[d] + bias[d]);
-  }
-}
-
-template <typename scalar_t, bool has_bias>
-inline void scalar_sigmoid_and_mul(
-    scalar_t* __restrict__ out,
-    const float* __restrict__ input,
-    const float* __restrict__ bias,
-    const scalar_t* __restrict__ mul,
-    int SIZE) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  // scalar sigmoid
-  const fVec one = fVec(1.f);
-  fVec X;
-  if constexpr (has_bias) {
-    assert(bias != nullptr);
-    X = fVec(input[0] + bias[0]);
-  } else {
-    X = fVec(input[0]);
-  }
-  X = one / (one + X.neg().exp_u20());
-
-  // vec mul
-  constexpr int kVecSize = bVec::size();
-  for (int d = 0; d < SIZE; d += kVecSize) {
-    bVec m_bvec = bVec::loadu(mul + d);
-    fVec m_fvec0, m_fvec1;
-    std::tie(m_fvec0, m_fvec1) = at::vec::convert_to_float(m_bvec);
-    m_fvec0 = m_fvec0 * X;
-    m_fvec1 = m_fvec1 * X;
-
-    bVec out_vec = convert_from_float_ext<scalar_t>(m_fvec0, m_fvec1);
-    out_vec.store(out + d);
   }
 }
 
@@ -287,21 +233,6 @@ struct brgemm {
       }
     }
   }
-  static inline void apply(
-      const float* __restrict__ A,
-      const float* __restrict__ B,
-      scalar_t* __restrict__ C,
-      float* __restrict__ Ctmp,
-      const float* __restrict__ bias,
-      int64_t M,
-      int64_t N,
-      int64_t K,
-      int64_t lda,
-      int64_t ldb,
-      int64_t ldc) {
-    constexpr int BLOCK_N = block_size_n();
-    at::native::cpublas::brgemm(M, N, K, lda, ldb, BLOCK_N, /* add_C */ false, A, B, Ctmp);
-  }
 };
 
 template <typename scalar_t, bool has_bias>
@@ -395,28 +326,6 @@ void tinygemm_kernel(
   }
 }
 
-template <typename scalar_t, bool has_bias>
-void tinygemm_kernel(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    scalar_t* __restrict__ C,
-    float* __restrict__ Ctmp,
-    const float* __restrict__ bias,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg) {
-  TORCH_CHECK(brg, "Expected to use fp32 brgemm for small N GEMM");
-  if (brg) {
-    brgemm<scalar_t, has_bias>::apply(A, B, C, Ctmp, bias, M, N, K, lda, ldb, ldc);
-    return;
-  }
-  // TODO : add intrinsic path
-}
-
 template <typename scalar_t>
 void weight_packed_linear_kernel_impl(
     scalar_t* __restrict__ out,
@@ -460,81 +369,6 @@ void weight_packed_linear_kernel_impl(
             /* ldb */ nb_size,
             /* ldc */ out_strideM,
             /* brg */ use_brgemm);
-      });
-
-      if (use_brgemm) {
-        at::native::cpublas::brgemm_release();
-      }
-    });
-  });
-}
-
-template <typename scalar_t>
-void weight_packed_linear_kernel_impl(
-    scalar_t* __restrict__ out,
-    const scalar_t* __restrict__ mat1,
-    const float* __restrict__ mat2,
-    const float* __restrict__ bias,
-    const scalar_t* __restrict__ post_mul_mat,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t mat1_strideM,
-    int64_t out_strideM) {
-  constexpr int64_t BLOCK_M = block_size_m();
-  constexpr int64_t BLOCK_N = block_size_n();
-  const int64_t MB = div_up(M, BLOCK_M);
-  const int64_t NB = div_up(N, BLOCK_N);
-
-  const bool use_brgemm = true;  // TODO: add intrinsic path
-  // parallel on [MB, NB]
-  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-      // for brgemm, use float32 for accumulate
-      alignas(64) float Atmp[BLOCK_M * K];
-      alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
-
-      loop_2d<float>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-        int64_t mb_start = mb * BLOCK_M;
-        int64_t mb_size = std::min(M - mb_start, BLOCK_M);
-        int64_t nb_start = nb * BLOCK_N;
-        int64_t nb_size = std::min(N - nb_start, BLOCK_N);
-        for (int64_t m = 0; m < mb_size; ++m) {
-          copy_stub<scalar_t>(Atmp + m * K, mat1 + mb_start * mat1_strideM + m * K, K);
-        }
-        tinygemm_kernel<scalar_t, has_bias>(
-            /*   A */ Atmp,
-            /*   B */ mat2 + nb_start * K /* nb * BLOCK_N * K */,
-            /*   C */ out + mb_start * out_strideM + nb_start,
-            /* Ctmp*/ Ctmp,
-            /* bias*/ bias + nb_start,
-            /*   M */ mb_size,
-            /*   N */ nb_size,
-            /*   K */ K,
-            /* lda */ mat1_strideM,
-            /* ldb */ nb_size,
-            /* ldc */ out_strideM,
-            /* brg */ use_brgemm);
-
-        if (post_mul_mat != nullptr) {
-          for (int64_t m = 0; m < mb_size; ++m) {
-            scalar_sigmoid_and_mul<scalar_t, has_bias>(
-                out + mb_start * out_strideM + nb_start + m * out_strideM,
-                Ctmp + m * BLOCK_N,
-                bias + nb_start,
-                post_mul_mat + mb_start * out_strideM + m * out_strideM,
-                out_strideM);
-          }
-        } else {
-          for (int64_t m = 0; m < mb_size; ++m) {
-            if constexpr (has_bias) {
-              copy_add_stub(
-                  out + mb_start * out_strideM + nb_start + m * out_strideM, Ctmp + m * BLOCK_N, bias + nb_start, N);
-            } else {
-              copy_stub(out + mb_start * out_strideM + nb_start + m * out_strideM, Ctmp + m * BLOCK_N, N);
-            }
-          }
-        }
       });
 
       if (use_brgemm) {
@@ -589,12 +423,6 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 
   const int64_t ndim = weight.ndimension();
   TORCH_CHECK(ndim == 2 || ndim == 3, "expect weight to be 2d or 3d, got ", ndim, "d tensor.");
-
-  if (ndim == 2 && weight.size(0) < TILE_N) {
-    // for 2D weight and small OC shape, we use fma linear path, which needs transpose not pack
-    return weight.to(at::kFloat).t().contiguous();
-  }
-
   const auto st = weight.scalar_type();
   const int64_t E = ndim == 3 ? weight.size(0) : 1;
   const int64_t OC = ndim == 3 ? weight.size(1) : weight.size(0);
@@ -647,7 +475,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 }
 
 // mat1 : [M, K]
-// mat2 : [N, K] ([K, N] if use_fma_gemm)
+// mat2 : [N, K]
 // bias : [N]
 // out  : [M, N]
 //
@@ -656,28 +484,22 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
-  bool use_fma_gemm = false;
-  if (packed_w.scalar_type() == at::kFloat) {
-    use_fma_gemm = true;
-  }
-
-  int64_t M = mat1.size(0);
-  int64_t K = mat1.size(1);
-  int64_t N = use_fma_gemm ? mat2.size(1) : mat2.size(0);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
+
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(0);
+  int64_t K = mat2.size(1);
+  CHECK_EQ(mat1.size(1), K);
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
-  if (!use_fma_gemm) {
-    CHECK_EQ(mat1.size(1), K);
-  }
 
-  auto dispatch_type = mat1.scalar_type();
   auto out = at::empty({M, N}, mat1.options());
+
   // strides
+  int64_t mat1_strideM = mat1.stride(0);
   int64_t out_strideM = out.stride(0);
-  int64_t mat1_strideM = mat1.stride(0);
 
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
@@ -686,85 +508,12 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
     bias_data = bias.value().data_ptr<float>();
   }
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "weight_packed_linear_kernel_impl", [&] {
-    if (use_fma_gemm) {
-      weight_packed_linear_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
-          mat1.data_ptr<scalar_t>(),
-          packed_w.data_ptr<float>(),
-          bias_data,
-          nullptr,
-          M,
-          N,
-          K,
-          mat1_strideM,
-          out_strideM);
-    } else {
-      weight_packed_linear_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
-          mat1.data_ptr<scalar_t>(),
-          packed_w.data_ptr<scalar_t>(),
-          bias_data,
-          M,
-          N,
-          K,
-          mat1_strideM,
-          out_strideM);
-    }
-  });
-
-  return out;
-}
-
-// mat1         : [M, K]
-// mat2         : [K, 1]
-// post_mul_mat : [M, K]
-// bias         : [N]
-// out          : [M, N]
-//
-at::Tensor fused_linear_sigmoid_mul(
-    at::Tensor& mat1,
-    at::Tensor& mat2,
-    const std::optional<at::Tensor>& bias,
-    bool is_vnni,
-    const at::Tensor& post_mul_mat) {
-  RECORD_FUNCTION("sgl-kernel::fused_linear_sigmoid_mul", std::vector<c10::IValue>({mat1, mat2, bias, post_mul_mat}));
-
-  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
-  TORCH_CHECK(packed_w.scalar_type() == at::kFloat, "fused_linear_sigmoid_mul requires packed float weight")
-
-  int64_t M = mat1.size(0);
-  int64_t K = mat1.size(1);
-  int64_t N = mat2.size(1);
-
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
-  CHECK_INPUT(mat2);
-  CHECK_DIM(2, mat1);
-  CHECK_DIM(2, mat2);
-
-  int64_t out_strideM = post_mul_mat.size(1);
-  int64_t mat1_strideM = mat1.stride(0);
-  auto dispatch_type = mat1.scalar_type();
-  auto out = at::empty({M, out_strideM}, mat1.options());
-
-  TORCH_CHECK(
-      N == 1 && out_strideM % 32 == 0,
-      "post_mul_mat tensor size(1) should be 32 dividable, and the mat2 OC=1 (Mx1 as linear output shape)")
-
-  const bool has_bias = bias.has_value();
-  const float* bias_data = nullptr;
-  if (has_bias) {
-    CHECK_EQ(bias.value().size(0), N);
-    bias_data = bias.value().data_ptr<float>();
-  }
-
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "fused_linear_sigmoid_mul", [&] {
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(mat1.scalar_type(), "weight_packed_linear_kernel_impl", [&] {
     weight_packed_linear_kernel_impl<scalar_t>(
         out.data_ptr<scalar_t>(),
         mat1.data_ptr<scalar_t>(),
-        packed_w.data_ptr<float>(),
+        packed_w.data_ptr<scalar_t>(),
         bias_data,
-        post_mul_mat.data_ptr<scalar_t>(),
         M,
         N,
         K,

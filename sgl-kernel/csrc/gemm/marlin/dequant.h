@@ -452,51 +452,6 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162>(int q, nv_bfloat162* fra
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
   frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
-};
-
-// New version with s_type_id parameter for marlin_moe_wna16_v2
-template <typename scalar_t2, sglang::ScalarTypeId s_type_id>
-__device__ inline void dequant_fp8_scales(int q, scalar_t2* frag_b);
-
-template <>
-__device__ inline void dequant_fp8_scales<half2, sglang::kFE4M3fn.id()>(int q, half2* frag_b) {
-  int Out1 = (q & 0xFF00FF00) >> 1;
-  ;
-  q <<= 8;
-  int Out2 = (q & 0xFF00FF00) >> 1;
-
-  // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const half2*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const half2*>(&Out2);
-};
-
-template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162, sglang::kFE4M3fn.id()>(int q, nv_bfloat162* frag_b) {
-  constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
-  constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
-  constexpr int MASK = 0x7F007F00;
-
-  // Extract and shift FP8 values to BF16 format
-  int Out1 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
-  q <<= 8;
-  int Out2 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
-
-  // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
-}
-
-template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162, sglang::kFE8M0fnu.id()>(int q, nv_bfloat162* frag_b) {
-  // In this conversion, 2 ** -127 in FP8E8M0 would become 0 in BF16,
-  // but we assume that such a extreme value would not occur in real models.
-  int Out1 = (q & 0xFF00FF00) >> 1;
-  q <<= 7;
-  int Out2 = q & 0x7F807F80;
-
-  // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
 }
 
 #endif

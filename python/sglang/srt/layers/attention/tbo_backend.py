@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
-from sglang.srt.batch_overlap import two_batch_overlap
+from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.spec_info import SpecInput
 

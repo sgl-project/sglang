@@ -13,24 +13,9 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_npu,
-    load_audio,
-    load_image,
-    load_video,
-    logger,
-)
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-)
+from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
 
 _is_npu = is_npu()
-
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
 
 
 @dataclasses.dataclass
@@ -170,6 +155,7 @@ class BaseMultimodalProcessor(ABC):
     ):
         self.hf_config = hf_config
         self._processor = _processor
+        self.arch = hf_config.architectures[0]
         self.server_args = server_args
         self.transport_mode = transport_mode
 
@@ -193,21 +179,18 @@ class BaseMultimodalProcessor(ABC):
             "image_attention_mask": Modality.IMAGE,
             "image_emb_mask": Modality.IMAGE,
             "images_spatial_crop": Modality.IMAGE,
-            "images_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
             "aspect_ratio_mask": Modality.IMAGE,
             "num_patches": Modality.IMAGE,
             "patch_pixel_values": Modality.IMAGE,
-            "block_sizes": Modality.IMAGE,
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
             "input_features": Modality.AUDIO,
             "input_features_mask": Modality.AUDIO,
             "audio_attention_mask": Modality.AUDIO,
-            "feature_attention_mask": Modality.AUDIO,
             # Video-related attributes
             "pixel_values_videos": Modality.VIDEO,
             "second_per_grid_ts": Modality.VIDEO,
@@ -225,12 +208,6 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if SGL_USE_CUDA_IPC:
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                MM_FEATURE_CACHE_SIZE,
-                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-            )
-
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
@@ -245,12 +222,9 @@ class BaseMultimodalProcessor(ABC):
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
                 "Qwen2AudioProcessor",
-                "Qwen3OmniMoeProcessor",
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
-                kwargs["audio_kwargs"] = {}
-                kwargs["audio_kwargs"].setdefault("truncation", False)
             else:
                 kwargs["audios"] = audios
 
@@ -277,13 +251,10 @@ class BaseMultimodalProcessor(ABC):
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
-                    pass
-                else:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -341,9 +312,7 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
-                    img = img.convert("RGB")
-                return img
+                return img.convert("RGB") if discard_alpha_channel else img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
@@ -688,52 +657,5 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
-
-        """
-        solution for cuda-ipc memory-leak:
-        1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
-        2. if can not get a slice , transport normal tensor
-        3. copy tensor in scheduler and release it (use position mark)
-        4. copy
-        """
-
-        if SGL_USE_CUDA_IPC:
-            # post-process
-            for item in all_collected_items:
-                if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    sync_flag, available_slice = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.feature
-                        )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.feature.view(torch.int8).view(-1), non_blocking=True
-                        )
-                        item.feature = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.feature,
-                            sync_buffer_meta=sync_flag,
-                        )
-                elif (
-                    isinstance(item.precomputed_embeddings, torch.Tensor)
-                    and item.precomputed_embeddings.is_cuda
-                ):
-
-                    sync_flag, available_slice = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.precomputed_embeddings
-                        )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.precomputed_embeddings.view(torch.int8).view(-1),
-                            non_blocking=True,
-                        )
-                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.precomputed_embeddings,
-                            sync_buffer_meta=sync_flag,
-                        )
 
         return all_collected_items, input_ids, ret

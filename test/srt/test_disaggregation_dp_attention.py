@@ -1,30 +1,25 @@
+import os
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.server_fixtures.disaggregation_fixture import (
-    PDDisaggregationServerBase,
-)
+from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
-    try_cached_model,
 )
 
 
-class TestDisaggregationDPAttention(PDDisaggregationServerBase):
-    PREFILL_DP_SIZE = 4
-    DECODE_DP_SIZE = 4
-
+class TestDisaggregationDPAttention(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
 
         # Non blocking start servers
         cls.start_prefill()
@@ -43,9 +38,9 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            str(cls.PREFILL_DP_SIZE),
+            "2",
             "--dp",
-            str(cls.PREFILL_DP_SIZE),
+            "2",
             "--enable-dp-attention",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
@@ -63,13 +58,12 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            str(cls.DECODE_DP_SIZE),
+            "2",
             "--dp",
-            str(cls.DECODE_DP_SIZE),
+            "2",
             "--enable-dp-attention",
             "--base-gpu-id",
-            str(cls.PREFILL_DP_SIZE),
-            "--prefill-round-robin-balance",
+            "2",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -83,7 +77,7 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=1400,
+            num_questions=200,
             max_new_tokens=512,
             parallel=128,
             host=f"http://{self.base_host}",

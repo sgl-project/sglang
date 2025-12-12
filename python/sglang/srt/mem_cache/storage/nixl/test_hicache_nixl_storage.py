@@ -2,7 +2,7 @@
 
 import os
 import unittest
-from typing import List
+from typing import List, Optional
 from unittest.mock import MagicMock
 
 import torch

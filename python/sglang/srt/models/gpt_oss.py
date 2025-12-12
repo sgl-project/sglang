@@ -70,13 +70,22 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    is_cuda,
+    is_flashinfer_available,
+    is_sm100_supported,
+    make_layers,
+)
 
 _is_cuda = is_cuda()
+_is_flashinfer_available = is_flashinfer_available()
+_is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+    from sgl_kernel import FusedSetKVBufferArg
 
 
 class GptOssConfig(PretrainedConfig):
@@ -395,14 +404,12 @@ class GptOssDecoderLayer(nn.Module):
         self.is_layer_sparse = True
         self.is_nextn = False
         is_previous_layer_sparse = True
-        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:

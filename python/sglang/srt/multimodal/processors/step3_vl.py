@@ -1,7 +1,7 @@
 import math
 import re
 from itertools import product
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, TypedDict, Union
 
 import numpy as np
 import torch

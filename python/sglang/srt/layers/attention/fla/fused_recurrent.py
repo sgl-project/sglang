@@ -12,6 +12,13 @@ from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
     q,
@@ -37,7 +44,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -61,11 +67,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_beta = beta + (bos * HV + i_hv) * V + o_v
     else:
         p_beta = beta + bos * HV + i_hv
-    if not IS_KDA:
-        p_g = g + bos * HV + i_hv
-    else:
-        p_gk = g + (bos * HV + i_hv) * K + o_k
-
+    p_g = g + bos * HV + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -81,18 +83,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        b_g = tl.load(p_g).to(tl.float32)
 
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
         b_q = b_q * scale
         # [BK, BV]
-        if not IS_KDA:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h *= exp(b_g)
-        else:
-            b_gk = tl.load(p_gk).to(tl.float32)
-            b_h *= exp(b_gk[:, None])
+        b_h *= exp(b_g)
         # [BV]
         b_v -= tl.sum(b_h * b_k[:, None], 0)
         if IS_BETA_HEADWISE:
@@ -110,10 +108,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_k += H * K
         p_o += HV * V
         p_v += HV * V
-        if not IS_KDA:
-            p_g += HV
-        else:
-            p_gk += HV * K
+        p_g += HV
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     if STORE_FINAL_STATE:
@@ -168,12 +163,8 @@ def fused_recurrent_gated_delta_rule_fwd(
         V=V,
         BK=BK,
         BV=BV,
-        USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        IS_VARLEN=cu_seqlens is not None,
-        IS_KDA=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -326,20 +317,14 @@ def fused_recurrent_gated_delta_rule(
     return o, final_state
 
 
-# HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
-# retrieve_parent_token_ptr: [N, NP2_T], retrieve_next_sibling_ptr: [N, NP2_T]
-# e.g. for a sequence of length 4, the eagle tree attention structure is:
-# retrieve_next_token=[1, 3, -1, -1] -> retrieve_next_token[i]: the 1st child token of token i
-# retrieve_next_sibling=[-1, 2, -1, -1] -> retrieve_next_sibling[i]: the 1st tree sibling token of token i
-# retrieve_parent_token=[n/a, 0, 0, 1] -> retrieve_parent_token[i]: the parent token of token i
-# Tree:
-#    0
-#   / \
-#  1   2
-# /
-# 3
-# When calculating token 3's attention, it should attend to token 1 (parent) and token 0 (grand-parent)
-# When calculating token 2's attention, it should attend to token 0 (parent)
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
+        is not None,
+    }
+)
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     q,
@@ -354,11 +339,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     scale,
     intermediate_states_buffer,
     cache_steps,
-    retrieve_parent_token_ptr,
-    stride_retrieve_parent_token_seq: tl.constexpr,
-    stride_retrieve_parent_token_token: tl.constexpr,
     T,
-    NP2_T: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -373,7 +354,6 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr,  # whether to disable final state update
     DISABLE_OUTPUT_CALCULATION: tl.constexpr,  # whether to disable output calculation
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
-    HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -400,16 +380,6 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     p_g = g + bos * HV + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
-    if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-        token_indices = tl.arange(0, NP2_T)
-        mask_retrieve = token_indices < T
-        retrieve_parent_token_base = (
-            retrieve_parent_token_ptr
-            + (i_n * stride_retrieve_parent_token_seq)
-            + token_indices * stride_retrieve_parent_token_token
-        )
-        parent_idx_tokens = tl.load(retrieve_parent_token_base, mask_retrieve)
-
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
@@ -435,24 +405,6 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
     step_idx = 0
     for _ in range(0, T):
-        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-            # step_idx = 0 should use the b_h from USE_INITIAL_STATE
-            if step_idx != 0 and cache_idx >= 0:
-                # when calculating current step's attention, load the state from the parent token
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
-                step_offset = parent_step_idx * HV * K * V
-                cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
-                )
-                b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
-
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
@@ -533,7 +485,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
-    retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -552,16 +503,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
 
     grid = (NK, NV, N * HV)
 
-    # prepare retrieve next token buffer strides if provided
-    if retrieve_parent_token is not None:
-        stride_retrieve_parent_token_seq, stride_retrieve_parent_token_token = (
-            retrieve_parent_token.stride(0),
-            retrieve_parent_token.stride(1),
-        )
-    else:
-        stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
-
-    NP2_T = triton.next_power_of_2(T)
     fused_recurrent_gated_delta_rule_update_fwd_kernel[grid](
         q=q,
         k=k,
@@ -575,11 +516,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,
         cache_steps=0 if cache_steps is None else cache_steps,
-        retrieve_parent_token_ptr=retrieve_parent_token,
-        stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
-        stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         T=T,
-        NP2_T=NP2_T,
         B=B,
         H=H,
         HV=HV,
@@ -587,14 +524,10 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         V=V,
         BK=BK,
         BV=BV,
-        USE_INITIAL_STATE=initial_state_source is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        IS_VARLEN=cu_seqlens is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         DISABLE_OUTPUT_CALCULATION=disable_output_calculation,
-        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
-        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -622,7 +555,6 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         disable_output_calculation: bool = False,
         intermediate_states_buffer: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
-        retrieve_parent_token: Optional[torch.Tensor] = None,
     ):
         o = fused_recurrent_gated_delta_rule_update_fwd(
             q=q,
@@ -639,7 +571,6 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             disable_output_calculation=disable_output_calculation,
             intermediate_states_buffer=intermediate_states_buffer,
             cache_steps=cache_steps,
-            retrieve_parent_token=retrieve_parent_token,
         )
 
         return o
@@ -669,7 +600,6 @@ def fused_recurrent_gated_delta_rule_update(
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
-    retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -706,6 +636,5 @@ def fused_recurrent_gated_delta_rule_update(
         disable_output_calculation,
         intermediate_states_buffer,
         cache_steps,
-        retrieve_parent_token,
     )
     return o

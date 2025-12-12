@@ -89,7 +89,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         grid_pinpoints: str,
     ):
         if self.cpu_executor is not None:
-            loop = asyncio.get_running_loop()
+            loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.cpu_executor,
                 LlavaImageProcessor._process_single_image_task,

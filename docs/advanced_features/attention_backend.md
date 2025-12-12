@@ -5,47 +5,43 @@ You can test them according to your needs.
 
 ```{important}
 Selecting an optimal attention backend is crucial for maximizing your performance. Different backends excel in various scenarios, so choose based on your model, hardware, and use case. Not all backends are supported on all platforms and model architectures.
-
-If you don't specify `--attention-backend`, SGLang makes a best effort to automatically select the most performant backend based on your hardware and model architecture.
 ```
 
 ## Support Matrix
 
-The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](../basic_usage/deepseek_v3.md#multi-head-latent-attention-mla-throughput-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
+The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](https://github.com/sgl-project/sglang/blob/main/docs/basic_usage/deepseek.md#multi-head-latent-attention-mla) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
 
 ### MHA Backends
 
-| **Backend**                     | **Page Size > 1 (native)** | **FP8 KV Cache** | **FP4 KV Cache** | **Spec topk=1** | **Spec topk>1** | **Sliding Window** | **MultiModal** |
-|---------------------------------|-----------------------------|------------------|-----------------|-----------------|-----------------|--------------------|----------------|
-| **FlashInfer**                  | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ❌             |
-| **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ✅             |
-| **FA4 (FlashAttention 4)**      | 128                         | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
-| **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅              | ✅                 | ✅             |
-| **Torch Native (SDPA)**         | ❌                          | ❌               | ✅              | ❌              | ❌              | ❌                 | ✅             |
-| **FlexAttention (PyTorch)**     | ❌                          | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
-| **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ✅              | ❌              | ✅                 | ❌             |
-| **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **AITER (ROCm)**                | ✅                          | ❌               | ❌              | ✅              | ✅              | ❌                 | ✅             |
-| **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ✅             |
-| **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ❌              | ✅                 | ❌             |
-| **Intel AMX (CPU)**             | ❌                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
+| **Backend**                     | **Page Size > 1 (native)** | **FP8 KV Cache** | **Spec topk=1** | **Spec topk>1** | **Sliding Window** | **MultiModal** |
+|---------------------------------|-----------------------------|------------------|-----------------|-----------------|--------------------|----------------|
+| **FlashInfer**                  | ✅                          | ✅               | ✅              | ✅              | ✅                 | ❌             |
+| **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ✅              | ✅              | ✅                 | ✅             |
+| **FA4 (FlashAttention 4)**      | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ✅             |
+| **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **FlexAttention (PyTorch)**     | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **TRTLLM MHA**                  | 16, 32 or 64                | ❌               | ✅              | ❌              | ❌                 | ❌             |
+| **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ❌             |
+| **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 
 ### MLA Backends
 
-| **Backend**                | **Native Page Sizes**     | **FP8 KV Cache** | **FP4 KV Cache** | **Chunked Prefix Cache** | **Spec topk=1** | **Spec topk>1** |
-|----------------------------|---------------------------|------------------|------------------|--------------------------|-----------------|-----------------|
-| **FlashInfer MLA**         | 1                         | ❌               | ✅               | ✅                       | ✅              | ❌              |
-| **FlashMLA**               | 64                        | ✅               | ❌               | ✅                       | ✅              | ❌              |
-| **Cutlass MLA**            | 128                       | ✅               | ✅               | ✅                       | ✅              | ❌              |
-| **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅               | ✅                       | ✅              | ❌              |
-| **FA3 (FlashAttention 3)** | n/a                       | ❌               | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
-| **Triton**                 | n/a                       | ❌               | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
-| **FA4**                    | 1                         | ❌               | ✅               | ❌                       | ❌              | ❌              |
-| **Ascend MLA (NPU)**       | 128                       | ❌               | ❌               | ❌                       | ❌              | ❌              |
+| **Backend**                | **Native Page Sizes**     | **FP8 KV Cache** | **Chunked Prefix Cache** | **Spec topk=1** | **Spec topk>1** |
+|----------------------------|---------------------------|------------------|--------------------------|-----------------|-----------------|
+| **FlashInfer MLA**         | 1                         | ❌               | ✅                       | ✅              | ❌              |
+| **FlashMLA**               | 64                        | ❌               | ✅                       | ✅              | ❌              |
+| **Cutlass MLA**            | 128                       | ✅               | ✅                       | ✅              | ❌              |
+| **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅                       | ✅              | ❌              |
+| **FA3 (FlashAttention 3)** | n/a                       | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
+| **Triton**                 | n/a                       | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
+| **FA4**                    | n/a                       | ❌               | ❌                       | ❌              | ❌              |
+| **Ascend MLA (NPU)**       | 128                       | ❌               | ❌                       | ❌              | ❌              |
 
-```{note}
-Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" column indicates whether a corresponding multimodal implementation exists for that backend family.
+```{warning}
+FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https://github.com/sgl-project/sglang/pull/8856). Use non-FP8 KV or another backend when FP8 KV cache is required.
 ```
 
 ```{note}
@@ -53,19 +49,11 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 - NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
-```{note}
-For the KV4 FA4 scenario, FA4 requires using a different --decode-attention-backend to run. Except for trtllm_mha being incompatible with FA4, all other decode backends behave as shown in the table.
-```
-
 ```{tip}
 Speculative decoding topk: `topk` is the number of draft tokens sampled per step from the draft model. `topk = 1` follows classic EAGLE; `topk > 1` explores multiple branches and requires backend support in both draft and verification paths.
 ```
 
-```{tip}
-Page size controls how many tokens are grouped into a KV cache block. For the prefix cache to take effect, the number of tokens must fill at least one complete page. For example, if your prompt is only 32 tokens and `page_size = 64`, it won't fill a complete page and cannot be matched in the prefix cache (pages cannot be padded). With 65 tokens and `page_size = 64`, only the first page of 64 tokens will be cached and matched; the remaining 1 token is discarded. Use `page_size = 1` for maximum prefix reuse (token-level matching).
-```
-
-Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), Ascend (128).
+Note: Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), Ascend (128).
 
 MLA page-size constraints:
 - FlashInfer MLA: page_size = 1.
@@ -103,6 +91,8 @@ Constraints when combining hybrid attention with speculative decoding:
 
 - If any attention backend is `trtllm_mha`, speculative decoding supports only `--speculative-eagle-topk 1`.
 - For paged MHA backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` is supported.
+- `flex_attention` is not supported with speculative decoding.
+- For MLA backends, `trtllm_mla` supports `topk > 1`; `flashmla` and `flashinfer_mla` support only `topk = 1`.
 - CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
 
 
@@ -111,9 +101,9 @@ If you set only one of `--prefill-attention-backend` or `--decode-attention-back
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
 ```
 
-## User Guide
+## User guide
 
-### Launch Command for Different Attention Backends
+### Launch command for different attention backends.
 
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
 ```bash
@@ -151,6 +141,13 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
+- Torch Native
+```bash
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend torch_native
+```
+
 - FlashMLA
 ```bash
 python3 -m sglang.launch_server \
@@ -185,36 +182,11 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
-- FlashAttention 4 (MHA & MLA)
-```bash
-python3 -m sglang.launch_server \
-  --tp 8 \
-  --model deepseek-ai/DeepSeek-R1 \
-  --prefill-attention-backend fa4 \
-  --trust-remote-code
-```
-
-- Cutlass MLA
-```bash
-python3 -m sglang.launch_server \
-  --tp 8 \
-  --model deepseek-ai/DeepSeek-R1 \
-  --attention-backend cutlass_mla \
-  --trust-remote-code
-```
-
 - Ascend
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend ascend
-```
-
-- Intel XPU
-```bash
-python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --attention-backend intel_xpu
 ```
 
 - Wave
@@ -231,18 +203,29 @@ python3 -m sglang.launch_server \
   --attention-backend flex_attention
 ```
 
-- Dual Chunk FlashAttention
+- Dual Chunk FlashAttention (MHA-only)
 ```bash
 python3 -m sglang.launch_server \
   --model Qwen/Qwen2.5-14B-Instruct-1M \
   --attention-backend dual_chunk_flash_attn
 ```
 
-- Torch Native
+- Cutlass MLA
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --attention-backend torch_native
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-R1 \
+  --attention-backend cutlass_mla \
+  --trust-remote-code
+```
+
+- FlashAttention 4 (MHA & MLA)
+```bash
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-R1 \
+  --attention-backend fa4 \
+  --trust-remote-code
 ```
 
 ## Steps to add a new attention backend

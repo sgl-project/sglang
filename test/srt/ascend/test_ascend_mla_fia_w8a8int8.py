@@ -38,7 +38,7 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--quantization",
-            "modelslim",
+            "w8a8_int8",
             "--tp-size",
             2,
             "--disable-radix-cache",

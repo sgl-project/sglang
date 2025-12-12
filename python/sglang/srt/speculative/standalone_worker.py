@@ -1,24 +1,29 @@
 import logging
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
 
-from sglang.srt.layers.moe.utils import (
-    speculative_moe_a2a_backend_context,
-    speculative_moe_backend_context,
-)
+from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.eagle_worker import EAGLEWorker, load_token_map
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
-    from sgl_kernel import segment_packbits  # noqa: F401
+    from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+
+
+@contextmanager
+def draft_tp_context(tp_group: GroupCoordinator):
+    # Draft model doesn't use dp and has its own tp group.
+    # We disable mscclpp now because it doesn't support 2 comm groups.
+    with patch_tensor_parallel_group(tp_group):
+        yield
 
 
 class StandaloneWorker(EAGLEWorker):
@@ -46,6 +51,7 @@ class StandaloneWorker(EAGLEWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.padded_static_len = -1
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -70,7 +76,7 @@ class StandaloneWorker(EAGLEWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with empty_context():
             TpModelWorker.__init__(
                 self,
                 server_args=server_args,
@@ -92,9 +98,7 @@ class StandaloneWorker(EAGLEWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with self.draft_tp_context(self.draft_model_runner.tp_group):
             self.init_attention_backend()
             self.init_cuda_graphs()
 

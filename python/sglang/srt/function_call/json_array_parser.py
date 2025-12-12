@@ -1,3 +1,5 @@
+import json
+import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -32,6 +34,16 @@ class JsonArrayParser(BaseFormatDetector):
         """
         raise NotImplementedError(
             "Detect and parse not supported for JSON schema constraints."
+        )
+
+    def build_ebnf(self, tools: List[Tool]) -> str:
+        """
+        Build an EBNF grammar for constrained generation.
+        This is not used for JSON schema constraints as they are handled
+        by the constraint backends directly.
+        """
+        raise NotImplementedError(
+            "EBNF generation is not supported for JSON schema constraints."
         )
 
     def parse_streaming_increment(

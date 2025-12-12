@@ -15,14 +15,12 @@
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -33,10 +31,10 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    PostLoadedWeightsReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -57,151 +55,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class BaseTpWorker(ABC):
-    @abstractmethod
-    def forward_batch_generation(self, forward_batch: ForwardBatch):
-        pass
-
-    @property
-    @abstractmethod
-    def model_runner(self) -> ModelRunner:
-        pass
-
-    @property
-    def sliding_window_size(self) -> Optional[int]:
-        return self.model_runner.sliding_window_size
-
-    @property
-    def is_hybrid_swa(self) -> bool:
-        return self.model_runner.is_hybrid_swa is not None
-
-    def get_tokens_per_layer_info(self):
-        return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
-        )
-
-    def get_pad_input_ids_func(self):
-        return getattr(self.model_runner.model, "pad_input_ids", None)
-
-    def get_tp_group(self):
-        return self.model_runner.tp_group
-
-    def get_attention_tp_group(self):
-        return self.model_runner.attention_tp_group
-
-    def get_attention_tp_cpu_group(self):
-        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
-
-    def get_memory_pool(self):
-        return (
-            self.model_runner.req_to_token_pool,
-            self.model_runner.token_to_kv_pool_allocator,
-        )
-
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        return success, message
-
-    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.init_weights_update_group(
-            recv_req.master_address,
-            recv_req.master_port,
-            recv_req.rank_offset,
-            recv_req.world_size,
-            recv_req.group_name,
-            recv_req.backend,
-        )
-        return success, message
-
-    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.destroy_weights_update_group(
-            recv_req.group_name,
-        )
-        return success, message
-
-    def init_weights_send_group_for_remote_instance(
-        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
-    ):
-        success, message = (
-            self.model_runner.init_weights_send_group_for_remote_instance(
-                recv_req.master_address,
-                recv_req.ports,
-                recv_req.group_rank,
-                recv_req.world_size,
-                recv_req.group_name,
-                recv_req.backend,
-            )
-        )
-        return success, message
-
-    def send_weights_to_remote_instance(
-        self, recv_req: SendWeightsToRemoteInstanceReqInput
-    ):
-        success, message = self.model_runner.send_weights_to_remote_instance(
-            recv_req.master_address,
-            recv_req.ports,
-            recv_req.group_name,
-        )
-        return success, message
-
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
-        )
-        return success, message
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-
-        monkey_patch_torch_reductions()
-        success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
-            load_format=recv_req.load_format,
-        )
-        return success, message
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update weights from IPC for checkpoint-engine integration."""
-        success, message = self.model_runner.update_weights_from_ipc(recv_req)
-        return success, message
-
-    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
-        parameter = self.model_runner.get_weights_by_name(
-            recv_req.name, recv_req.truncate_size
-        )
-        return parameter
-
-    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
-        return result
-
-    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
-        return result
-
-    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
-        return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
-
-    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output, _ = self.model_runner.forward(forward_batch)
-        embeddings = logits_output.embeddings
-        return embeddings
-
-
-class TpModelWorker(BaseTpWorker):
+class TpModelWorker:
     """A tensor parallel model worker."""
 
     def __init__(
@@ -239,13 +93,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=is_draft_worker,
         )
 
-        # Init DLLM algorithm
-        if server_args.dllm_algorithm is not None:
-            self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
-        else:
-            self.dllm_algorithm = None
-
-        self._model_runner = ModelRunner(
+        self.model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=gpu_id,
@@ -322,12 +170,7 @@ class TpModelWorker(BaseTpWorker):
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
-
-    @property
-    def model_runner(self) -> ModelRunner:
-        return self._model_runner
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
@@ -351,32 +194,42 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
-    def is_dllm(self):
-        return self.dllm_algorithm is not None
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.model_runner.sliding_window_size
 
-    def _forward_batch_generation_dllm(
-        self, forward_batch: ForwardBatch
-    ) -> GenerationBatchResult:
-        logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
-            self.model_runner, forward_batch
-        )
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
+    @property
+    def is_hybrid(self) -> bool:
+        return self.model_runner.is_hybrid is not None
 
-    def get_remote_instance_transfer_engine_info(self):
+    def get_tokens_per_layer_info(self):
         return (
-            self.model_runner.remote_instance_transfer_engine_session_id,
-            self.model_runner.remote_instance_transfer_engine_weight_info,
+            self.model_runner.full_max_total_num_tokens,
+            self.model_runner.swa_max_total_num_tokens,
+        )
+
+    def get_pad_input_ids_func(self):
+        return getattr(self.model_runner.model, "pad_input_ids", None)
+
+    def get_tp_group(self):
+        return self.model_runner.tp_group
+
+    def get_attention_tp_group(self):
+        return self.model_runner.attention_tp_group
+
+    def get_attention_tp_cpu_group(self):
+        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
+
+    def get_memory_pool(self):
+        return (
+            self.model_runner.req_to_token_pool,
+            self.model_runner.token_to_kv_pool_allocator,
         )
 
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
         forward_batch: Optional[ForwardBatch] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
@@ -392,10 +245,15 @@ class TpModelWorker(BaseTpWorker):
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
 
-        if self.pp_group.is_last_rank:
-            if self.is_dllm():
-                return self._forward_batch_generation_dllm(forward_batch)
+        pp_proxy_tensors = None
+        if not self.pp_group.is_first_rank:
+            pp_proxy_tensors = PPProxyTensors(
+                self.pp_group.recv_tensor_dict(
+                    all_gather_group=self.get_attention_tp_group()
+                )
+            )
 
+        if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -412,7 +270,6 @@ class TpModelWorker(BaseTpWorker):
 
             if (
                 self.enable_overlap
-                and not self.enable_spec
                 and model_worker_batch.sampling_info.grammars is not None
             ):
 
@@ -458,25 +315,98 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
-        if batch.split_index == 0:
-            model_worker_batch = batch.get_model_worker_batch()
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-            batch.split_forward_batch = forward_batch
-            batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
-        else:
-            model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
+    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        logits_output, _ = self.model_runner.forward(forward_batch)
+        embeddings = logits_output.embeddings
+        return embeddings
 
-        logits_output, can_run_cuda_graph = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        success, message = self.model_runner.update_weights_from_disk(
+            recv_req.model_path, recv_req.load_format
         )
-        if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        else:
-            next_token_ids = None
-        batch_result = GenerationBatchResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
+        return success, message
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.init_weights_update_group(
+            recv_req.master_address,
+            recv_req.master_port,
+            recv_req.rank_offset,
+            recv_req.world_size,
+            recv_req.group_name,
+            recv_req.backend,
         )
-        batch_result.next_token_ids = next_token_ids
-        return batch_result
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.destroy_weights_update_group(
+            recv_req.group_name,
+        )
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = (
+            self.model_runner.init_weights_send_group_for_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_rank,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        success, message = self.model_runner.send_weights_to_remote_instance(
+            recv_req.master_address,
+            recv_req.ports,
+            recv_req.group_name,
+        )
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        success, message = self.model_runner.update_weights_from_distributed(
+            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
+        )
+        return success, message
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+
+        monkey_patch_torch_reductions()
+        success, message = self.model_runner.update_weights_from_tensor(
+            named_tensors=MultiprocessingSerializer.deserialize(
+                recv_req.serialized_named_tensors[self.tp_rank]
+            ),
+            load_format=recv_req.load_format,
+        )
+        return success, message
+
+    def post_loaded_weights(self, recv_req: PostLoadedWeightsReqInput):
+
+        monkey_patch_torch_reductions()
+        success, message = self.model_runner.post_loaded_weights()
+        return success, message
+
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        parameter = self.model_runner.get_weights_by_name(
+            recv_req.name, recv_req.truncate_size
+        )
+        return parameter
+
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
+        return result
+
+    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
+        return result
+
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        return self.model_runner.lora_manager.validate_lora_batch(lora_ids)

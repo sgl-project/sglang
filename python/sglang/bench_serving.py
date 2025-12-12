@@ -12,34 +12,26 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
-import importlib.util
 import io
 import json
 import os
 import pickle
 import random
 import resource
-import shutil
 import sys
 import time
 import traceback
-import uuid
 import warnings
 from argparse import ArgumentParser
-from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
-import pybase64
 import requests
-from datasets import load_dataset
-from PIL import Image
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoProcessor,
@@ -50,10 +42,6 @@ from transformers import (
 )
 
 ASSISTANT_SUFFIX = "Assistant:"
-
-TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
-    shutil.which("gnuplot") is not None
-)
 
 global args
 
@@ -97,11 +85,9 @@ class RequestFuncOutput:
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
-    text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
-    start_time: float = 0.0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -187,9 +173,7 @@ async def async_request_trt_llm(
                     output.output_len = request_func_input.output_len
 
                 else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
+                    output.error = response.reason or ""
                     output.success = False
         except Exception:
             output.success = False
@@ -241,7 +225,6 @@ async def async_request_openai_completions(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
-        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -272,9 +255,6 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
@@ -288,9 +268,7 @@ async def async_request_openai_completions(
                     output.latency = latency
                     output.output_len = output_len
                 else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
+                    output.error = response.reason or ""
                     output.success = False
         except Exception:
             output.success = False
@@ -324,16 +302,6 @@ async def async_request_openai_chat_completions(
     assert api_url.endswith(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
-
-    # TODO put it to other functions when `pbar` logic is refactored
-    if getattr(args, "print_requests", False):
-        rid = str(uuid.uuid4())
-        input_partial = deepcopy(request_func_input)
-        input_partial.prompt = "..."
-        request_start_time = time.time()
-        print(
-            f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
-        )
 
     if request_func_input.image_data:
         # Build multi-image content: a list of image_url entries followed by the text
@@ -378,7 +346,6 @@ async def async_request_openai_chat_completions(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
-        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -426,7 +393,6 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
-                                        output.text_chunks.append(content)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
@@ -444,23 +410,12 @@ async def async_request_openai_chat_completions(
                         output.latency = latency
                         output.output_len = output_len
                 else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
+                    output.error = response.reason or ""
                     output.success = False
         except Exception:
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
-
-    # TODO put it to other functions when `pbar` logic is refactored
-    if getattr(args, "print_requests", False):
-        curr_t = time.time()
-        output_partial = deepcopy(output)
-        output_partial.generated_text = "..."
-        print(
-            f'rid={rid} time={curr_t} time_delta={curr_t - request_start_time} message="request end" output="{str(output_partial)}"'
-        )
 
     if pbar:
         pbar.update(1)
@@ -533,9 +488,7 @@ async def async_request_truss(
                     output.latency = latency
                     output.output_len = request_func_input.output_len
                 else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
+                    output.error = response.reason or ""
                     output.success = False
         except Exception:
             output.success = False
@@ -581,7 +534,6 @@ async def async_request_sglang_generate(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
-        output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
         try:
@@ -619,8 +571,9 @@ async def async_request_sglang_generate(
                                     num_new_tokens = output_len - last_output_len
                                     if num_new_tokens == 0:
                                         continue
-                                    chunk_gap = timestamp - most_recent_timestamp
-                                    adjust_itl = chunk_gap / num_new_tokens
+                                    adjust_itl = (
+                                        timestamp - most_recent_timestamp
+                                    ) / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
@@ -631,9 +584,7 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.output_len = output_len
                 else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
+                    output.error = response.reason or ""
                     output.success = False
         except Exception:
             output.success = False
@@ -657,20 +608,11 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            body = {
-                "activities": getattr(args, "profile_activities", []),
-                "num_steps": getattr(args, "profile_num_steps", None),
-                "profile_by_stage": getattr(args, "profile_by_stage", None),
-                "profile_stages": getattr(args, "profile_stages", None),
-            }
-            print(f"async_request_profile {api_url=} {body=}")
-            async with session.post(url=api_url, json=body) as response:
+            async with session.post(url=api_url) as response:
                 if response.status == 200:
                     output.success = True
                 else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
+                    output.error = response.reason or ""
                     output.success = False
         except Exception:
             output.success = False
@@ -819,7 +761,6 @@ def get_dataset(args, tokenizer, model_id=None):
             image_content=args.image_content,
             image_format=args.image_format,
             image_resolution=args.image_resolution,
-            backend=args.backend,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -829,7 +770,6 @@ def get_dataset(args, tokenizer, model_id=None):
             system_prompt_len=args.gsp_system_prompt_len,
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,
-            range_ratio=getattr(args, "gsp_range_ratio", 1.0),
             tokenizer=tokenizer,
             args=args,
         )
@@ -838,7 +778,6 @@ def get_dataset(args, tokenizer, model_id=None):
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
             processor=processor,
-            backend=args.backend,
             fixed_output_len=args.random_output_len,
             random_sample=True,
         )
@@ -913,8 +852,6 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
-    max_output_tokens_per_s: float = 0.0
-    max_concurrent_requests: int = 0
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -1045,10 +982,7 @@ async def get_mooncake_request_over_time(
             # Form the full prompt from history
             try:
                 full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    return_dict=False,
+                    chat_history, tokenize=False, add_generation_prompt=True
                 )
             except Exception:
                 full_prompt_text = "\n".join(
@@ -1072,7 +1006,6 @@ async def get_mooncake_request_over_time(
 def sample_mmmu_requests(
     num_requests: int,
     processor: AutoProcessor | AutoTokenizer,
-    backend: str = "sglang",
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
@@ -1087,6 +1020,14 @@ def sample_mmmu_requests(
     Returns:
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
+    try:
+        import io
+
+        import pybase64
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Please install datasets: pip install datasets")
+
     print("Loading MMMU dataset from HuggingFace...")
 
     try:
@@ -1145,7 +1086,7 @@ def sample_mmmu_requests(
                 text_prompt = f"Question: {question}\n\nAnswer: "
                 output_len = fixed_output_len if fixed_output_len is not None else 256
                 data_row = create_mm_data_row(
-                    text_prompt, [image], [image_data], output_len, processor, backend
+                    text_prompt, [image], [image_data], output_len, processor
                 )
                 filtered_dataset.append(data_row)
 
@@ -1214,7 +1155,6 @@ def sample_sharegpt_requests(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 tokenize=False,
-                return_dict=False,
             )
             if tokenizer.bos_token:
                 prompt = prompt.replace(tokenizer.bos_token, "")
@@ -1248,14 +1188,6 @@ def sample_sharegpt_requests(
     return filtered_dataset
 
 
-def compute_random_lens(full_len: int, range_ratio: float, num: int):
-    return np.random.randint(
-        max(int(full_len * range_ratio), 1),
-        full_len + 1,
-        size=num,
-    )
-
-
 def sample_random_requests(
     input_len: int,
     output_len: int,
@@ -1266,15 +1198,15 @@ def sample_random_requests(
     random_sample: bool = True,
     return_text: bool = True,
 ) -> List[DatasetRow]:
-    input_lens = compute_random_lens(
-        full_len=input_len,
-        range_ratio=range_ratio,
-        num=num_prompts,
+    input_lens = np.random.randint(
+        max(int(input_len * range_ratio), 1),
+        input_len + 1,
+        size=num_prompts,
     )
-    output_lens = compute_random_lens(
-        full_len=output_len,
-        range_ratio=range_ratio,
-        num=num_prompts,
+    output_lens = np.random.randint(
+        int(output_len * range_ratio),
+        output_len + 1,
+        size=num_prompts,
     )
 
     if random_sample:
@@ -1389,19 +1321,13 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
-def create_mm_data_row(
-    text_prompt, images: list, images_base64, output_len, processor, backend
-):
+def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor):
     try:
-        if type(processor).__name__ == "Phi4MMProcessor":
-            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
-            content_items = text_prompt.replace("image 1", "|endoftext10|")
-        else:
-            content_items = [
-                {"type": "image", "image": {"url": image_base64}}
-                for image_base64 in images_base64
-            ]
-            content_items.append({"type": "text", "text": text_prompt})
+        content_items = [
+            {"type": "image", "image": {"url": image_base64}}
+            for image_base64 in images_base64
+        ]
+        content_items.append({"type": "text", "text": text_prompt})
         prompt_str = processor.apply_chat_template(
             [{"role": "user", "content": content_items}],
             add_generation_prompt=True,
@@ -1436,25 +1362,13 @@ def create_mm_data_row(
         )["input_ids"].numel()
     except Exception:
         # Fallback: just tokenize the text prompt directly
-        tokenizer_to_use = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
+        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
 
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
-    use_raw_prompt = backend in [
-        "sglang",
-        "sglang-oai",
-        "sglang-oai-chat",
-        "vllm",
-        "vllm-chat",
-        "lmdeploy",
-        "lmdeploy-chat",
-    ]
     return DatasetRow(
-        prompt=text_prompt if use_raw_prompt else prompt_str,
+        prompt=text_prompt,
         prompt_len=prompt_len,
         output_len=output_len,
         text_prompt_len=text_prompt_len,
@@ -1473,7 +1387,6 @@ def sample_image_requests(
     image_content: str,
     image_format: str,
     image_resolution: str,
-    backend: str,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -1483,6 +1396,13 @@ def sample_image_requests(
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
       only counts text tokens and excludes image data.
     """
+    try:
+        import pybase64
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError(
+            "Please install Pillow to generate random images: pip install pillow"
+        ) from e
 
     # Parse resolution (supports presets and 'heightxwidth')
     width, height = parse_image_resolution(image_resolution)
@@ -1497,15 +1417,11 @@ def sample_image_requests(
         )
 
     # Sample text lengths
-    input_lens = compute_random_lens(
-        full_len=input_len,
-        range_ratio=range_ratio,
-        num=num_requests,
+    input_lens = np.random.randint(
+        max(int(input_len * range_ratio), 1), input_len + 1, size=num_requests
     )
-    output_lens = compute_random_lens(
-        full_len=output_len,
-        range_ratio=range_ratio,
-        num=num_requests,
+    output_lens = np.random.randint(
+        int(output_len * range_ratio), output_len + 1, size=num_requests
     )
 
     def _gen_random_image_data_uri(
@@ -1529,11 +1445,7 @@ def sample_image_requests(
     total_image_bytes = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_mm_prompt(
-            processor.tokenizer,
-            processor.image_token_id if hasattr(processor, "image_token_id") else None,
-            int(input_lens[i]),
-        )
+        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1547,7 +1459,6 @@ def sample_image_requests(
             list(images_base64),
             int(output_lens[i]),
             processor,
-            backend,
         )
 
         dataset.append(data_row)
@@ -1560,24 +1471,9 @@ def sample_image_requests(
     return dataset
 
 
-@lru_cache(maxsize=1)
-def get_available_tokens(tokenizer):
-    """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
-
-
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = get_available_tokens(tokenizer)
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def gen_mm_prompt(tokenizer, image_pad_id, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
-    if image_pad_id:
-        all_available_tokens.remove(image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -1588,7 +1484,7 @@ def get_gen_prefix_cache_path(args, tokenizer):
 
     # Create a unique cache filename based on the generation parameters
     cache_key = (
-        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
+        f"gen_shared_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
@@ -1601,7 +1497,6 @@ def sample_generated_shared_prefix_requests(
     system_prompt_len: int,
     question_len: int,
     output_len: int,
-    range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     args: argparse.Namespace,
 ) -> List[DatasetRow]:
@@ -1609,43 +1504,23 @@ def sample_generated_shared_prefix_requests(
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
 
     # Try to load from cache first
-    if cache_path.exists() and range_ratio == 1:
+    if cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
 
-    print(
-        f"\nGenerating new input data... "
-        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=})"
-    )
-
-    system_prompt_lens = compute_random_lens(
-        full_len=system_prompt_len,
-        range_ratio=range_ratio,
-        num=num_groups,
-    )
-    question_lens = compute_random_lens(
-        full_len=question_len,
-        range_ratio=range_ratio,
-        num=num_groups * prompts_per_group,
-    )
-    output_lens = compute_random_lens(
-        full_len=output_len,
-        range_ratio=range_ratio,
-        num=num_groups * prompts_per_group,
-    )
-    del system_prompt_len, question_len, output_len
+    print("\nGenerating new input data...")
 
     # Generate system prompts for each group
     system_prompts = []
-    for i in range(num_groups):
-        system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
+    for _ in range(num_groups):
+        system_prompt = gen_prompt(tokenizer, system_prompt_len)
         system_prompts.append(system_prompt)
 
     # Generate questions
     questions = []
-    for i in range(num_groups * prompts_per_group):
-        question = gen_prompt(tokenizer, question_lens[i].item())
+    for _ in range(num_groups * prompts_per_group):
+        question = gen_prompt(tokenizer, question_len)
         questions.append(question)
 
     # Combine system prompts with questions
@@ -1658,8 +1533,7 @@ def sample_generated_shared_prefix_requests(
         for prompt_idx in tqdm(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
-            flat_index = group_idx * prompts_per_group + prompt_idx
-            question = questions[flat_index]
+            question = questions[group_idx * prompts_per_group + prompt_idx]
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
 
@@ -1667,11 +1541,11 @@ def sample_generated_shared_prefix_requests(
                 DatasetRow(
                     prompt=full_prompt,
                     prompt_len=prompt_len,
-                    output_len=output_lens[flat_index].item(),
+                    output_len=output_len,
                 )
             )
             total_input_tokens += prompt_len
-            total_output_tokens += output_lens[flat_index].item()
+            total_output_tokens += output_len
 
     # Shuffle questions
     random.shuffle(input_requests)
@@ -1745,8 +1619,6 @@ def calculate_metrics(
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
-    accept_length: Optional[float] = None,
-    plot_throughput: bool = False,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1758,14 +1630,6 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
-    retokenized_itls: List[float] = []
-
-    use_retokenized_itl = (
-        accept_length is not None
-        and accept_length > 0
-        and backend in ("sglang-oai", "sglang-oai-chat")
-    )
-
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len
@@ -1779,17 +1643,7 @@ def calculate_metrics(
             total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            if use_retokenized_itl:
-                for k, itl in enumerate(outputs[i].itl):
-                    num_tokens = len(
-                        tokenizer.encode(
-                            outputs[i].text_chunks[k], add_special_tokens=False
-                        )
-                    )
-                    adjusted_itl = itl / num_tokens
-                    retokenized_itls.extend([adjusted_itl] * num_tokens)
-            else:
-                itls += outputs[i].itl
+            itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
@@ -1805,72 +1659,6 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
-
-    max_output_tokens_per_s = 0.0
-    max_concurrent_requests = 0
-
-    successful_outputs = [output for output in outputs if output.success]
-    if successful_outputs:
-        min_start_time = min(output.start_time for output in successful_outputs)
-        max_end_time = max(
-            output.start_time + output.latency for output in successful_outputs
-        )
-
-        duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
-        tokens_per_second = np.zeros(duration_seconds)
-        concurrent_requests_per_second = np.zeros(duration_seconds)
-
-        for output in outputs:
-            if not output.success:
-                continue
-
-            token_times = [output.start_time + output.ttft]
-            current_time = token_times[0]
-            for itl_value in output.itl:
-                current_time += itl_value
-                token_times.append(current_time)
-
-            for token_time in token_times:
-                second_bucket = int(token_time - min_start_time)
-                if 0 <= second_bucket < duration_seconds:
-                    tokens_per_second[second_bucket] += 1
-
-            request_start_second = int(output.start_time - min_start_time)
-            request_end_second = int(
-                (output.start_time + output.latency) - min_start_time
-            )
-
-            for second in range(
-                request_start_second, min(request_end_second + 1, duration_seconds)
-            ):
-                concurrent_requests_per_second[second] += 1
-
-        if len(tokens_per_second) > 0:
-            max_output_tokens_per_s = float(np.max(tokens_per_second))
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
-
-        if plot_throughput:
-            if TERM_PLOTLIB_AVAILABLE:
-                import termplotlib as tpl
-
-                fig = tpl.figure()
-                fig.plot(
-                    np.arange(len(tokens_per_second)),
-                    tokens_per_second,
-                    title="Output tokens per second",
-                    xlabel="Time (s)",
-                )
-                fig.plot(
-                    np.arange(len(concurrent_requests_per_second)),
-                    concurrent_requests_per_second,
-                    title="Concurrent requests per second",
-                    xlabel="Time (s)",
-                )
-                fig.show()
-            else:
-                print("tip: install termplotlib and gnuplot to plot the metrics")
-
-    itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -1905,8 +1693,6 @@ def calculate_metrics(
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
-        max_output_tokens_per_s=max_output_tokens_per_s,
-        max_concurrent_requests=max_concurrent_requests,
     )
 
     return metrics, output_lens
@@ -1923,8 +1709,6 @@ async def benchmark(
     max_concurrency: Optional[int],
     disable_tqdm: bool,
     lora_names: List[str],
-    lora_request_distribution: Optional[str],
-    lora_zipf_alpha: Optional[float],
     extra_request_body: Dict[str, Any],
     profile: bool,
     pd_separated: bool = False,
@@ -2065,30 +1849,11 @@ async def benchmark(
     else:
         request_generator = get_request(input_requests, request_rate)
 
-    # Prepare LoRA request distribution parameters
-    if lora_request_distribution == "distinct":
-        lora_idx = 0
-    elif lora_request_distribution == "skewed":
-        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-        lora_probs = weights / np.sum(weights)
-    else:
-        lora_idx = None
-        lora_probs = None
-
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
-            else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-
-                lora_name = np.random.choice(lora_names, p=lora_probs)
+            idx = random.randint(0, len(lora_names) - 1)
+            lora_name = lora_names[idx]
         else:
             lora_name = None
 
@@ -2117,13 +1882,12 @@ async def benchmark(
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
         else:
-            if getattr(args, "profile_num_steps", None) is None:
-                print("Stopping profiler...")
-                profile_output = await async_request_profile(
-                    api_url=base_url + "/stop_profile"
-                )
-                if profile_output.success:
-                    print("Profiler stopped")
+            print("Stopping profiler...")
+            profile_output = await async_request_profile(
+                api_url=base_url + "/stop_profile"
+            )
+            if profile_output.success:
+                print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -2158,8 +1922,6 @@ async def benchmark(
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
-        accept_length=accept_length,
-        plot_throughput=args.plot_throughput,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -2205,16 +1967,6 @@ async def benchmark(
     )
     print(
         "{:<40} {:<10.2f}".format(
-            "Peak output token throughput (tok/s):", metrics.max_output_tokens_per_s
-        )
-    )
-    print(
-        "{:<40} {:<10}".format(
-            "Peak concurrent requests:", metrics.max_concurrent_requests
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
             "Total token throughput (tok/s):", metrics.total_throughput
         )
     )
@@ -2234,12 +1986,6 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
-    print(
-        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
-    )
-    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
-    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
-    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
@@ -2248,9 +1994,6 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
-
     if (
         metrics.median_ttft_ms is not None
         and metrics.mean_itl_ms is not None
@@ -2258,7 +2001,6 @@ async def benchmark(
     ):
         result = {
             # Arguments
-            "tag": getattr(args, "tag", None),
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
@@ -2267,8 +2009,6 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
-            # Information
-            "server_info": server_info,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -2280,7 +2020,6 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
-            "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
@@ -2300,8 +2039,6 @@ async def benchmark(
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
-            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
-            "max_concurrent_requests": metrics.max_concurrent_requests,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -2378,9 +2115,6 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
 
-    if not hasattr(args, "plot_throughput"):
-        args.plot_throughput = False
-
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -2391,12 +2125,6 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
-
-    if not hasattr(args, "served_model_name"):
-        args.served_model_name = None
-
-    if getattr(args, "print_requests", False):
-        assert args.backend == "sglang-oai-chat"  # only support this now
 
     print(f"benchmark_args={args}")
 
@@ -2507,20 +2235,11 @@ def run_benchmark(args_: argparse.Namespace):
             not args.tokenize_prompt
         ), "`--tokenize-prompt` not compatible with image dataset"
 
-    if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert (
-            args.lora_name is not None and len(args.lora_name) > 1
-        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
-
-    assert (
-        args.lora_zipf_alpha > 1
-    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
-
     print(f"{args}\n")
 
     # Read dataset
     backend = args.backend
-    model_id = args.served_model_name or args.model
+    model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
@@ -2528,17 +2247,6 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
-
-    # Prepare LoRA arguments
-    lora_request_distribution = (
-        args.lora_request_distribution if args.lora_name is not None else None
-    )
-
-    lora_zipf_alpha = (
-        args.lora_zipf_alpha
-        if args.lora_name is not None and args.lora_request_distribution == "skewed"
-        else None
-    )
 
     return asyncio.run(
         benchmark(
@@ -2552,8 +2260,6 @@ def run_benchmark(args_: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             disable_tqdm=args.disable_tqdm,
             lora_names=args.lora_name,
-            lora_request_distribution=lora_request_distribution,
-            lora_zipf_alpha=lora_zipf_alpha,
             extra_request_body=extra_request_body,
             profile=args.profile,
             pd_separated=args.pd_separated,
@@ -2631,11 +2337,6 @@ if __name__ == "__main__":
         "--model",
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
-    )
-    parser.add_argument(
-        "--served-model-name",
-        type=str,
-        help="The name of the model as served by the serving service. If not set, this defaults to the value of --model.",
     )
     parser.add_argument(
         "--tokenizer",
@@ -2737,11 +2438,6 @@ if __name__ == "__main__":
         "--output-details", action="store_true", help="Output details of benchmarking."
     )
     parser.add_argument(
-        "--print-requests",
-        action="store_true",
-        help="Print requests immediately during benchmarking. Useful to quickly realize issues.",
-    )
-    parser.add_argument(
         "--disable-tqdm",
         action="store_true",
         help="Specify to disable tqdm progress bar.",
@@ -2781,49 +2477,12 @@ if __name__ == "__main__":
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
-        "--plot-throughput",
-        action="store_true",
-        help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
-    )
-    # TODO unify all these
-    parser.add_argument(
-        "--profile-activities",
-        type=str,
-        nargs="+",
-        default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER"],
-    )
-    parser.add_argument("--profile-num-steps", type=int, default=None)
-    parser.add_argument("--profile-by-stage", action="store_true", default=False)
-    parser.add_argument("--profile-stages", nargs="+", default=None)
-    parser.add_argument(
         "--lora-name",
         type=str,
         nargs="*",
         default=None,
         action=LoRAPathAction,
         help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
-    )
-    parser.add_argument(
-        "--lora-request-distribution",
-        type=str,
-        default="uniform",
-        choices=[
-            "uniform",
-            "distinct",
-            "skewed",
-        ],
-        help="What distribution to sample the LoRA adapters specified in --lora-name. Borrowed from the Punica paper. "
-        "'distinct' distribution means selecting a new LoRA adapter for every request. "
-        "'skewed' distribution follows the Zipf distribution, where the number of requests "
-        "to model i specified in --lora-name is α times the number of requests for model i+1, "
-        "where α > 1.",
-    )
-    parser.add_argument(
-        "--lora-zipf-alpha",
-        type=float,
-        default=1.5,
-        help="The parameter to use for the Zipf distribution when --lora-request-distribution='skewed'.",
     )
     parser.add_argument(
         "--prompt-suffix",
@@ -2908,13 +2567,6 @@ if __name__ == "__main__":
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
     )
-    parser.add_argument(
-        "--gsp-range-ratio",
-        type=float,
-        # WARN: The default 1.0 is for backward compatibility, and is different from the default 0.0 for random dataset
-        default=1.0,
-        help="Range of sampled ratio of input/output length, used only for gsp dataset.",
-    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
@@ -2942,9 +2594,6 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
-    )
-    parser.add_argument(
-        "--tag", type=str, default=None, help="The tag to be dumped to output."
     )
     args = parser.parse_args()
     run_benchmark(args)

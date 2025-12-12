@@ -11,7 +11,6 @@ from typing import Any, Callable, Optional, Union
 import torch
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.utils.common import rank0_log
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +112,6 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
             for a in getattr(ann, "__args__", [])
         ):
             dyn[name] = 0
-        elif ann == "torch.Tensor" or ann == "Optional[torch.Tensor]":
-            # For future import annotations (e.g. from __future__ import annotations), the annotation is a string
-            dyn[name] = 0
     if not dyn:
         raise ValueError("No dynamic dims inferred; pass dynamic_arg_dims explicitly.")
     return dyn
@@ -130,7 +126,6 @@ def install_torch_compiled(
     fullgraph: bool = True,
     graph_pool: Any = None,
 ):
-    rank0_log(f"install_torch_compiled")
     unbound_fwd = module.__class__.forward
     if not callable(unbound_fwd):
         raise TypeError("module.__class__.forward must be callable")

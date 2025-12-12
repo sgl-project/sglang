@@ -1,20 +1,14 @@
+import base64
 import io
 import os
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import openai
-import pybase64
 import requests
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
 # image
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
@@ -28,27 +22,13 @@ AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test
 AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
 
 
-class TestOpenAIMLLMServerBase(CustomTestCase):
-    model: str
-    extra_args: list = []
-    fixed_args: list = ["--trust-remote-code", "--enable-multimodal"]
-    trust_remote_code: bool = True
-
+class TestOpenAIOmniServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        cls.model = ""
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=(
-                cls.extra_args + cls.fixed_args + ["--trust-remote-code"]
-                if cls.trust_remote_code
-                else []
-            ),
-        )
+        cls.process = None
         cls.base_url += "/v1"
 
     @classmethod
@@ -78,20 +58,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
         return file_path
 
 
-class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
-    def verify_speech_recognition_response(self, text):
-        check_list = [
-            "thank you",
-            "it's a privilege to be here",
-            "leader",
-            "science",
-            "art",
-        ]
-        for check_word in check_list:
-            assert (
-                check_word in text.lower()
-            ), f"audio_response: ｜{text}｜ should contain ｜{check_word}｜"
-
+class AudioOpenAITestMixin(TestOpenAIOmniServerBase):
     def prepare_audio_messages(self, prompt, audio_file_name):
         messages = [
             {
@@ -149,7 +116,17 @@ class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
             "Listen to this audio and write down the audio transcription in English.",
             category="speech",
         )
-        self.verify_speech_recognition_response(audio_response)
+        check_list = [
+            "thank you",
+            "it's a privilege to be here",
+            "leader",
+            "science",
+            "art",
+        ]
+        for check_word in check_list:
+            assert (
+                check_word in audio_response
+            ), f"audio_response: ｜{audio_response}｜ should contain ｜{check_word}｜"
 
     def test_audio_ambient_completion(self):
         # bird song
@@ -161,79 +138,7 @@ class AudioOpenAITestMixin(TestOpenAIMLLMServerBase):
         assert "bird" in audio_response
 
 
-class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
-    def run_decode_with_image(self, image_id):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        content = []
-        if image_id == 0:
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                }
-            )
-        elif image_id == 1:
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
-                }
-            )
-        else:
-            pass
-
-        content.append(
-            {
-                "type": "text",
-                "text": "Describe this image in a sentence.",
-            }
-        )
-
-        response = client.chat.completions.create(
-            model="default",
-            messages=[
-                {"role": "user", "content": content},
-            ],
-            temperature=0,
-            **(self.get_vision_request_kwargs()),
-        )
-
-        assert response.choices[0].message.role == "assistant"
-        text = response.choices[0].message.content
-        assert isinstance(text, str)
-
-    def test_mixed_batch(self):
-        image_ids = [0, 1, 2] * 4
-        with ThreadPoolExecutor(4) as executor:
-            list(executor.map(self.run_decode_with_image, image_ids))
-
-    def verify_single_image_response(self, response):
-        assert response.choices[0].message.role == "assistant"
-        text = response.choices[0].message.content
-        assert isinstance(text, str)
-
-        # `driver` is for gemma-3-it
-        assert (
-            "man" in text or "person" or "driver" in text
-        ), f"text: {text}, should contain man, person or driver"
-        assert (
-            "cab" in text
-            or "taxi" in text
-            or "SUV" in text
-            or "vehicle" in text
-            or "car" in text
-        ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
-        # MiniCPMO fails to recognize `iron`, but `hanging`
-        assert (
-            "iron" in text or "hang" in text or "cloth" in text or "holding" in text
-        ), f"text: {text}, should contain iron, hang, cloth or holding"
-        assert response.id
-        assert response.created
-        assert response.usage.prompt_tokens > 0
-        assert response.usage.completion_tokens > 0
-        assert response.usage.total_tokens > 0
-
+class ImageOpenAITestMixin(TestOpenAIOmniServerBase):
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -258,11 +163,34 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             **(self.get_vision_request_kwargs()),
         )
 
-        print("-" * 30)
-        print(f"Single image response:\n{response.choices[0].message.content}")
-        print("-" * 30)
-
-        self.verify_single_image_response(response)
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        # `driver` is for gemma-3-it
+        assert (
+            "man" in text or "person" or "driver" in text
+        ), f"text: {text}, should contain man, person or driver"
+        assert (
+            "cab" in text
+            or "taxi" in text
+            or "SUV" in text
+            or "vehicle" in text
+            or "car" in text
+        ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
+        # MiniCPMO fails to recognize `iron`, but `hanging`
+        assert (
+            "iron" in text
+            or "hang" in text
+            or "cloth" in text
+            or "coat" in text
+            or "holding" in text
+            or "outfit" in text
+        ), f"text: {text}, should contain iron, hang, cloth, coat or holding or outfit"
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
 
     def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -336,7 +264,8 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                         },
                         {
                             "type": "text",
-                            "text": "I have two very different images. Please describe them.",
+                            "text": "I have two very different images. They are not related at all. "
+                            "Please describe the first image in one sentence, and then describe the second image in another sentence.",
                         },
                     ],
                 },
@@ -367,6 +296,64 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+    def _test_mixed_image_audio_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        },
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image in one sentence, and then write down the audio transcription in English.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+            **(self.get_vision_request_kwargs()),
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        print("-" * 30)
+        print(f"Mixed image & audio response:\n{text}")
+        print("-" * 30)
+        assert (
+            "man" in text
+            or "cab" in text
+            or "SUV" in text
+            or "taxi" in text
+            or "car" in text
+        ), f"text: {text}, should contain man, cab, SUV, taxi or car"
+        check_list = [
+            "thank you",
+            "it's a privilege to be here",
+            "leader",
+            "science",
+            "art",
+        ]
+        for check_word in check_list:
+            assert (
+                check_word in text
+            ), f"text: ｜{text}｜ should contain ｜{check_word}｜"
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
     def prepare_video_images_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
         # the size of the video embeds differs from the `modality` argument when preprocessed
@@ -391,7 +378,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             pil_img = Image.fromarray(frame)
             buff = io.BytesIO()
             pil_img.save(buff, format="JPEG")
-            base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
+            base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
             base64_frames.append(base64_str)
 
         messages = [{"role": "user", "content": []}]
@@ -440,7 +427,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "device" in video_response
             or "microphone" in video_response
         ), f"""
-        ====================== video_images response =====================
+        ====================== video_response =====================
         {video_response}
         ===========================================================
         should contain 'iPod' or 'device' or 'microphone'
@@ -454,7 +441,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "Steve" in video_response
             or "hand" in video_response
         ), f"""
-        ====================== video_images response =====================
+        ====================== video_response =====================
         {video_response}
         ===========================================================
         should contain 'man' or 'person' or 'individual' or 'speaker' or 'presenter' or 'Steve' or 'hand'
@@ -465,7 +452,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "display" in video_response
             or "hold" in video_response
         ), f"""
-        ====================== video_images response =====================
+        ====================== video_response =====================
         {video_response}
         ===========================================================
         should contain 'present' or 'examine' or 'display' or 'hold'
@@ -474,7 +461,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         self.assertGreater(len(video_response), 0)
 
 
-class VideoOpenAITestMixin(TestOpenAIMLLMServerBase):
+class VideoOpenAITestMixin(TestOpenAIOmniServerBase):
     def prepare_video_messages(self, video_path):
         messages = [
             {
@@ -539,45 +526,3 @@ class VideoOpenAITestMixin(TestOpenAIMLLMServerBase):
         ), f"video_response: {video_response}, should contain 'black' or 'dark'"
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
-
-
-class OmniOpenAITestMixin(
-    ImageOpenAITestMixin, VideoOpenAITestMixin, AudioOpenAITestMixin
-):
-    def test_mixed_modality_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                    },
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
-                    },
-                    {
-                        "type": "text",
-                        "text": "I have an image and audio, which are not related at all. Please:  1. Describe the image in a sentence, 2. Repeat the exact words from the audio I provided. Be exact",
-                    },
-                ],
-            },
-        ]
-        response = client.chat.completions.create(
-            model="default",
-            messages=messages,
-            temperature=0,
-            max_tokens=128,
-            stream=False,
-        )
-
-        text = response.choices[0].message.content
-
-        print("-" * 30)
-        print(f"Mixed modality response:\n{text}")
-        print("-" * 30)
-
-        self.verify_single_image_response(response=response)
-        self.verify_speech_recognition_response(text=text)

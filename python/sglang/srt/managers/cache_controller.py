@@ -14,10 +14,11 @@ limitations under the License.
 """
 
 import logging
+import math
 import threading
 import time
-from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from queue import Empty, Full, PriorityQueue, Queue
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 
@@ -40,26 +41,23 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.utils import get_device_module
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
 logger = logging.getLogger(__name__)
-
-device_module = get_device_module()
 
 
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.load_events = [torch.cuda.Event() for _ in range(num_layers)]
+        self.start_event = torch.cuda.Event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        device_module.current_stream().wait_event(self.load_events[layer_index])
+        torch.cuda.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
@@ -139,8 +137,8 @@ class CacheOperation:
 
 
 class HiCacheAck(NamedTuple):
-    start_event: device_module.Event
-    finish_event: device_module.Event
+    start_event: torch.cuda.Event
+    finish_event: torch.cuda.Event
     node_ids: List[int]
 
 
@@ -318,10 +316,7 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
-                self.storage_backend_type == "dynamic"
-                and bool(self.storage_config.extra_config.get("interface_v1", 0))
-            ):
+            if self.storage_backend_type in ["hf3fs", "mooncake", "eic"]:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
@@ -349,8 +344,8 @@ class HiCacheController:
             self.stop_event, buffer_count=10, max_buffer_size=100
         )
 
-        self.write_stream = device_module.Stream()
-        self.load_stream = device_module.Stream()
+        self.write_stream = torch.cuda.Stream()
+        self.load_stream = torch.cuda.Stream()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -384,7 +379,7 @@ class HiCacheController:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
-        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
+        # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
         return HiCacheStorageConfig(
@@ -451,11 +446,11 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = torch.cuda.Event()
+        finish_event = torch.cuda.Event()
 
         start_event.record()
-        with device_module.stream(self.write_stream):
+        with torch.cuda.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
@@ -502,8 +497,6 @@ class HiCacheController:
                 return host_indices, device_indices.index_select(0, idx)
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
-        elif self.io_backend == "kernel_ascend":
-            return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -518,7 +511,7 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        with device_module.stream(self.load_stream):
+        with torch.cuda.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
@@ -646,6 +639,11 @@ class HiCacheController:
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+        # release pre-allocated memory
+        self.append_host_mem_release(
+            operation.host_indices[operation.completed_tokens :]
+        )
 
     def prefetch_io_aux_func(self):
         """

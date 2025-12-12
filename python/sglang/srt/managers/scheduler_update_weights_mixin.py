@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 import logging
-import traceback
 from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.constants import (
-    GPU_MEMORY_ALL_TYPES,
-    GPU_MEMORY_TYPE_CUDA_GRAPH,
-    GPU_MEMORY_TYPE_KV_CACHE,
-    GPU_MEMORY_TYPE_WEIGHTS,
-)
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.managers.io_struct import (
-    CheckWeightsReqInput,
-    CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
@@ -29,10 +21,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    PostLoadedWeightsReqInput,
+    PostLoadedWeightsReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -47,9 +39,8 @@ class SchedulerUpdateWeightsMixin:
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
-                assert flush_cache_success, "Cache flush failed after updating weights"
+            flush_cache_success = self.flush_cache()
+            assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
@@ -80,8 +71,7 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        worker = self.draft_worker or self.tp_worker
-        success, message = worker.update_weights_from_tensor(recv_req)
+        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
@@ -92,17 +82,18 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update the online model parameter from IPC for checkpoint-engine integration."""
-        success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+    def post_loaded_weights(self, recv_req: PostLoadedWeightsReqInput):
+        """Post loaded model parameter."""
+        success, message = self.tp_worker.post_loaded_weights(recv_req)
+        # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
-                assert flush_cache_success, "Cache flush failed after updating weights"
+            # if recv_req.flush_cache:
+            flush_cache_success = self.flush_cache()
+            assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
-        return UpdateWeightsFromIPCReqOutput(success, message)
+        return PostLoadedWeightsReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
@@ -111,14 +102,10 @@ class SchedulerUpdateWeightsMixin:
     def release_memory_occupation(
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
-        assert (
-            self._is_no_request()
-        ), "release_memory_occupation should be called only when no ongoing request."
-
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         for tag in tags:
             self.offload_tags.add(tag)
@@ -134,11 +121,6 @@ class SchedulerUpdateWeightsMixin:
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
-
-        torch.get_device_module().synchronize()
-
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(
@@ -147,13 +129,10 @@ class SchedulerUpdateWeightsMixin:
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         for tag in tags:
             self.offload_tags.remove(tag)
-
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
@@ -168,15 +147,6 @@ class SchedulerUpdateWeightsMixin:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
 
         return ResumeMemoryOccupationReqOutput()
-
-    def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
-        try:
-            self.tp_worker.model_runner.check_weights(action=recv_req.action)
-            return CheckWeightsReqOutput(success=True, message="Success.")
-        except Exception as e:
-            logger.warning(f"check_weights see error: {e}")
-            traceback.print_exc()
-            return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self: Scheduler, params):
         url = params["url"]

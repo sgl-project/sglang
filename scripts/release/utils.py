@@ -3,11 +3,6 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
-try:
-    import tomllib  # Python 3.11+
-except ImportError:
-    import tomli as tomllib  # Fallback for older Python versions
-
 
 def normalize_version(version: str) -> str:
     """Remove 'v' prefix from version string if present."""
@@ -97,34 +92,7 @@ def replace_in_file(file_path: Path, old_version: str, new_version: str) -> bool
         return False
 
     content = file_path.read_text()
-
-    # For TOML files, parse and update only the [project] version field
-    if file_path.suffix == ".toml":
-        try:
-            # Parse TOML to verify structure
-            toml_data = tomllib.loads(content)
-
-            # Check if [project] section exists and has version field
-            if "project" not in toml_data or "version" not in toml_data["project"]:
-                print(
-                    f"Warning: {file_path} does not have [project] version field, skipping"
-                )
-                return False
-
-            # Use regex to replace only the version field in [project] section
-            # This pattern matches the version field that comes after [project]
-            # and before any other section marker
-            pattern = r'(\[project\].*?version\s*=\s*)["\']([^"\']+)["\']'
-            new_content = re.sub(
-                pattern, rf'\g<1>"{new_version}"', content, flags=re.DOTALL
-            )
-        except Exception as e:
-            print(f"Warning: Failed to parse {file_path} as TOML: {e}")
-            print("Falling back to simple string replacement")
-            new_content = content.replace(old_version, new_version)
-    else:
-        # For non-TOML files, use simple string replacement
-        new_content = content.replace(old_version, new_version)
+    new_content = content.replace(old_version, new_version)
 
     if content == new_content:
         print(f"No changes needed in {file_path}")
@@ -182,39 +150,3 @@ def bump_version(
     print()
     print(f"Successfully updated {updated_count} file(s)")
     print(f"Version bumped from {old_version} to {new_version}")
-
-    # Validate that all files now contain the new version
-    print("\nValidating version updates...")
-    failed_files = []
-    for file_rel in files_to_update:
-        file_abs = repo_root / file_rel
-        if not file_abs.exists():
-            print(f"Warning: File {file_rel} does not exist, skipping validation.")
-            continue
-
-        content = file_abs.read_text()
-
-        # For TOML files, use regex to specifically check the version field
-        if file_abs.suffix == ".toml":
-            # Match version field with optional quotes
-            pattern = r'version\s*=\s*["\']?' + re.escape(new_version) + r'["\']?'
-            if not re.search(pattern, content):
-                failed_files.append(file_rel)
-                print(f"✗ {file_rel} does not contain version {new_version}")
-            else:
-                print(f"✓ {file_rel} validated")
-        else:
-            # For non-TOML files, use simple string search
-            if new_version not in content:
-                failed_files.append(file_rel)
-                print(f"✗ {file_rel} does not contain version {new_version}")
-            else:
-                print(f"✓ {file_rel} validated")
-
-    if failed_files:
-        print(f"\nError: {len(failed_files)} file(s) were not updated correctly:")
-        for file_rel in failed_files:
-            print(f"  - {file_rel}")
-        sys.exit(1)
-
-    print("\nAll files validated successfully!")

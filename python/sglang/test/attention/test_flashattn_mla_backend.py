@@ -20,7 +20,6 @@ class MockModelRunner:
         attention_arch = AttentionArch.MLA
         self.device = "cuda"
         self.dtype = torch.float16
-        self.is_hybrid_swa = False
         context_len = 2048
         self.model_config = type(
             "ModelConfig",
@@ -31,18 +30,6 @@ class MockModelRunner:
             },
         )
         self.sliding_window_size = None
-        # Add server_args attribute
-        self.server_args = type(
-            "ServerArgs",
-            (),
-            {
-                "kv_cache_dtype": torch.float16,
-                "speculative_eagle_topk": None,
-                "speculative_num_draft_tokens": 0,
-                "enable_deterministic_inference": False,
-            },
-        )
-        self.kv_cache_dtype = self.server_args.kv_cache_dtype
 
         batch_size = 160
         # Create a proper req_to_token_pool with the req_to_token attribute
@@ -63,7 +50,7 @@ class MockModelRunner:
         self.token_to_kv_pool = MLATokenToKVPool(
             size=max_total_num_tokens,
             page_size=self.page_size,
-            dtype=self.kv_cache_dtype,
+            dtype=self.dtype,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             layer_num=1,  # only consider layer=1 for unit test
@@ -84,15 +71,6 @@ class MockReqToTokenPool:
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFlashAttentionMLABackend(CustomTestCase):
     def setUp(self):
-        # MLA with different V headdim requires Hopper architecture (compute capability >= 9.0)
-        if torch.cuda.is_available():
-            compute_capability = torch.cuda.get_device_capability()
-            if compute_capability[0] < 9:
-                self.skipTest(
-                    f"MLA requires Hopper GPU (compute capability >= 9.0), "
-                    f"but found compute capability {compute_capability[0]}.{compute_capability[1]}"
-                )
-
         # Test parameters
         self.batch_size = 2
         self.seq_len = 360
@@ -108,7 +86,6 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         # Initialize model runner and backend
         self._init_model_runner()
         self.backend = FlashAttentionBackend(self.model_runner)
-        self.ref_backend = TorchNativeAttnBackend(self.model_runner)
         self.num_local_heads = 2
 
     def _init_model_runner(self):
@@ -116,6 +93,7 @@ class TestFlashAttentionMLABackend(CustomTestCase):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
+        self.backend = FlashAttentionBackend(self.model_runner)
 
     def _create_attention_layer(self):
         """Create attention layer for testing."""
@@ -230,29 +208,21 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         if cache_len <= 0:
             return
 
-        # For MLA, create separate nope and rope caches
-        cache_k_nope = torch.ones(
+        # Create constant values for the prefix cache for easy debugging
+        latent_cache = torch.ones(
             self.batch_size * cache_len,
             1,  # latent cache has only one head in MQA
-            self.kv_lora_rank,
+            self.kv_lora_rank + self.qk_rope_head_dim,
             dtype=self.dtype,
             device=self.device,
         )
 
-        cache_k_rope = torch.ones(
-            self.batch_size * cache_len,
-            1,  # latent cache has only one head in MQA
-            self.qk_rope_head_dim,
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-        # Set the prefix KV cache using MLA-specific method
-        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+        # Set the prefix KV cache
+        forward_batch.token_to_kv_pool.set_kv_buffer(
             layer,
             torch.arange(self.batch_size * cache_len, device=self.device),
-            cache_k_nope,
-            cache_k_rope,
+            latent_cache,
+            None,
         )
 
     def _run_attention_test(self, mode, q_len, prefix_len=0):
@@ -273,18 +243,8 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         kv_shape = (self.batch_size * q_len, self.qk_head_dim)
         q = torch.randn(q_shape, dtype=self.dtype, device=self.device)
         kv_compressed = torch.randn(kv_shape, dtype=self.dtype, device=self.device)
-
-        # For MLA, split kv_compressed into k_nope and k_rope
-        # k_nope has dimension kv_lora_rank, k_rope has dimension qk_rope_head_dim
-        k_nope = kv_compressed[:, : self.kv_lora_rank]
-        k_rope = kv_compressed[:, self.kv_lora_rank :]
-
-        # k_nope needs to be unsqueezed for the num_heads dimension
-        k = k_nope.unsqueeze(1)
-        # k_rope also needs to be unsqueezed
-        k_rope = k_rope.unsqueeze(1)
-
-        # v is not used for mqa
+        # v is not used for mqa, all values passed in through k
+        k = kv_compressed.unsqueeze(1)
         v = torch.randn((1), dtype=self.dtype, device=self.device)
 
         self._setup_kv_cache(forward_batch, layer, prefix_len)
@@ -297,13 +257,9 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         )
 
         if mode == ForwardMode.EXTEND:
-            output = self.backend.forward_extend(
-                q, k, v, layer, forward_batch, k_rope=k_rope
-            )
+            output = self.backend.forward_extend(q, k, v, layer, forward_batch)
         else:
-            output = self.backend.forward_decode(
-                q, k, v, layer, forward_batch, k_rope=k_rope
-            )
+            output = self.backend.forward_decode(q, k, v, layer, forward_batch)
 
         self._verify_output(output, expected_shape)
         return output

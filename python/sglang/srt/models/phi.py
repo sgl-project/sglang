@@ -1,5 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/phi.py
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Union
 
 import torch
 from torch import nn

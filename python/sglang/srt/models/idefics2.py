@@ -82,6 +82,7 @@ class Idefics2EncoderLayer(nn.Module):
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=config.attention_dropout,
+            qkv_backend="sdpa",
             softmax_in_single_precision=True,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),

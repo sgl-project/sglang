@@ -3,21 +3,11 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    npu_fused_experts,
-)
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
-from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -41,26 +31,25 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import (
-        CombineInput,
         StandardDispatchOutput,
+        CombineInput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_xpu = is_xpu()
-_is_npu = is_npu()
-
-if _is_npu:
-    import torch_npu
-
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, awq_marlin_moe_repack, awq_marlin_repack
+    from sgl_kernel import (
+        awq_dequantize,
+        awq_marlin_moe_repack,
+        awq_marlin_repack,
+        fused_marlin_moe,
+    )
 
 
 elif _is_hip:
@@ -69,12 +58,8 @@ elif _is_hip:
     )
 
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
-elif _is_xpu:
-    from sgl_kernel import awq_dequantize
-
-    warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+    warnings.warn(f"Only CUDA and HIP support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -127,17 +112,12 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
+        return [torch.half]
 
     @classmethod
     def get_min_capability(cls) -> int:
         # The AWQ kernel only supports Turing or newer GPUs.
-        if _is_npu:
-            raise NotImplementedError(
-                'NPU hardware does not support "get_min_capability" feature.'
-            )
-        else:
-            return 75
+        return 75
 
     @staticmethod
     def get_config_filenames() -> List[str]:
@@ -161,16 +141,6 @@ class AWQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
-        if _is_npu:
-            if isinstance(layer, LinearBase):
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
-                    return UnquantizedLinearMethod()
-                return AWQLinearAscendMethod(self)
-            elif isinstance(layer, FusedMoE):
-                return AWQMoEAscendMethod(self)
-            return None
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
@@ -600,64 +570,6 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         )
 
 
-class AWQLinearAscendMethod(AWQLinearMethod):
-    """Linear method for AWQ on Ascend.
-
-    Args:
-        quant_config: The AWQ quantization config.
-    """
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        qweight_tmp = torch.zeros_like(layer.qweight.data)
-        qzeros_tmp = layer.qzeros.data
-        qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-
-        for i in range(0, self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-            qweight_tmp.bitwise_or_(
-                ((layer.qweight.data >> shift_num) * (2 ** (4 * i))) & (0xF << (4 * i))
-            )
-
-        qweight_tmp.bitwise_xor_(0x88888888)
-
-        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
-        qzeros_tmp = -(qzeros_tmp - 8)
-        qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
-
-        layer.qzeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        qweight = layer.qweight
-        scales = layer.scales
-        qzeros = layer.qzeros
-        pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
-        reshaped_x = x.reshape(-1, x.shape[-1])
-
-        if bias is not None and bias.dtype == torch.bfloat16:
-            bias = bias.float()
-
-        out = torch_npu.npu_weight_quant_batchmatmul(
-            reshaped_x,
-            qweight,
-            antiquant_scale=scales,
-            antiquant_offset=qzeros,
-            antiquant_group_size=self.quant_config.group_size,
-            bias=bias,
-        )
-
-        return out.reshape(out_shape)
-
-
 class AWQMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: AWQMarlinConfig):
@@ -759,6 +671,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
+        device = layer.w13_qweight.device
+        layer.workspace = marlin_make_workspace(device, 4)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_qweight.shape[0]
         device = layer.w13_qweight.device
@@ -827,140 +742,41 @@ class AWQMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        assert get_moe_runner_backend().is_auto()
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
-        quant_info = MarlinMoeQuantInfo(
-            w13_qweight=layer.w13_qweight,
-            w2_qweight=layer.w2_qweight,
-            w13_scales=layer.w13_scales,
-            w2_scales=layer.w2_scales,
-            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
-            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
-            w13_qzeros=layer.w13_qzeros,
-            w2_qzeros=layer.w2_qzeros,
-            weight_bits=self.quant_config.weight_bits,
-        )
-
-        return self.runner.run(dispatch_output, quant_info)
-
-
-class AWQMoEAscendMethod(AWQMoEMethod):
-    def __init__(self, quant_config: AWQConfig):
-        self.quant_config = quant_config
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
-        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
-        w13_qzeros_list = []
-        w2_qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-        for i in range(0, self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            w13_qzeros_list.append(
-                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w2_qzeros_list.append(
-                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w13_qweight_tmp.bitwise_or_(
-                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-            w2_qweight_tmp.bitwise_or_(
-                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-
-        w13_qweight_tmp.bitwise_xor_(0x88888888)
-        w2_qweight_tmp.bitwise_xor_(0x88888888)
-
-        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
-            layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
-        )
-        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
-            layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
-        )
-        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
-
-        layer.register_parameter(
-            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
-        )
-
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
-        self.moe_runner_config = moe_runner_config
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
+        # The input must currently be float16
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        topk_weights, topk_ids, _ = topk_output
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_qweight,
-            w13_scale=layer.w13_scales,
-            w13_offset=layer.w13_qzeros,
-            w2=layer.w2_qweight,
-            w2_scale=layer.w2_scales,
-            w2_offset=layer.w2_qzeros,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-            use_wna16=True,
-        )
+        orig_dtype = x.dtype
+        x = x.half()
+
+        topk_weights, topk_ids, router_logits = topk_output
+
+        output = fused_marlin_moe(
+            x,
+            layer.w13_qweight,
+            layer.w2_qweight,
+            layer.w13_scales,
+            layer.w2_scales,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
+            w1_zeros=layer.w13_qzeros,
+            w2_zeros=layer.w2_qzeros,
+            num_bits=self.quant_config.weight_bits,
+        ).to(orig_dtype)
         return StandardCombineInput(hidden_states=output)
-
-
-# Register fake implementations for torch.compile support
-if _is_cuda:
-
-    @register_fake_if_exists("sgl_kernel::awq_dequantize")
-    def _(
-        qweight,
-        scales,
-        qzeros,
-        ch_axis,
-        group_size,
-        num_bits,
-    ):
-        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 32 // num_bits,)
-        return qweight.new_empty(out_shape, dtype=scales.dtype)
-
-    @register_fake_if_exists("sgl_kernel::awq_marlin_repack")
-    def _(b_q_weight, size_k, size_n, num_bits):
-        return b_q_weight.new_empty(
-            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
-        )
