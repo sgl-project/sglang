@@ -16,8 +16,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
-    core::workflow::*,
     mcp::{config::McpServerConfig, manager::McpManager},
+    workflow::*,
 };
 
 /// MCP server connection configuration

@@ -28,11 +28,11 @@ use crate::{
     core::{
         model_card::{ModelCard, ProviderType},
         model_type::ModelType,
-        workflow::*,
         BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, HealthConfig, RuntimeType,
         Worker, WorkerType,
     },
     protocols::worker_spec::WorkerConfigRequest,
+    workflow::*,
 };
 
 // HTTP client for API calls

@@ -14,10 +14,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use tracing::{debug, info};
 
-use crate::{
-    app_context::AppContext,
-    core::{workflow::*, Worker},
-};
+use crate::{app_context::AppContext, core::Worker, workflow::*};
 
 /// Request structure for worker removal
 #[derive(Debug, Clone)]
