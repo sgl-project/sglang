@@ -1279,12 +1279,16 @@ async fn metrics_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) ->
     }
 
     // Return fake prometheus metrics
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
     format!(
         "# HELP sglang_num_running_reqs The number of running requests\n\
          # TYPE sglang_num_running_reqs gauge\n\
          sglang_num_running_reqs{{worker_port=\"{}\"}} 42\n\
          sglang_up_timestamp {}\n",
         config.port, timestamp
-    ).into_response()
+    )
+    .into_response()
 }

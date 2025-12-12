@@ -295,7 +295,8 @@ impl WorkerManager {
                 };
 
                 if let Some(key) = api_key {
-                    request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
+                    request_builder =
+                        request_builder.header("Authorization", format!("Bearer {}", key));
                 }
 
                 match request_builder.send().await {

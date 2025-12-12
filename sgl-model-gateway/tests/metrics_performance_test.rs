@@ -1,14 +1,14 @@
-use std::sync::Arc;
-use std::time::Instant;
-use sgl_model_gateway::core::{
-    WorkerManager, WorkerRegistry, BasicWorkerBuilder, WorkerType as CoreWorkerType
-};
+use std::{sync::Arc, time::Instant};
+
 use reqwest::Client;
+use sgl_model_gateway::core::{
+    BasicWorkerBuilder, WorkerManager, WorkerRegistry, WorkerType as CoreWorkerType,
+};
 
 #[path = "./common/mod.rs"]
 mod common;
 use common::mock_worker::{
-    MockWorker, MockWorkerConfig, HealthStatus, WorkerType as MockWorkerType
+    HealthStatus, MockWorker, MockWorkerConfig, WorkerType as MockWorkerType,
 };
 
 #[tokio::test]
@@ -26,7 +26,10 @@ async fn test_metrics_performance_waterfall() {
         fail_rate: 0.0,
     };
 
-    println!("-> Starting {} mock workers with {}ms delay each...", worker_count, delay_ms);
+    println!(
+        "-> Starting {} mock workers with {}ms delay each...",
+        worker_count, delay_ms
+    );
 
     let mut workers = Vec::new();
     let registry = Arc::new(WorkerRegistry::default());
@@ -46,7 +49,7 @@ async fn test_metrics_performance_waterfall() {
         registry.register(Arc::new(worker_instance));
 
         workers.push(worker);
-        println!("   Worker {} started at {}", i+1, url);
+        println!("   Worker {} started at {}", i + 1, url);
     }
 
     println!("-> Requesting engine metrics (calling Gateway)...");
@@ -65,8 +68,14 @@ async fn test_metrics_performance_waterfall() {
     let expected_parallel = delay_ms as f64 / 1000.0;
 
     println!("---------------------------------------------------");
-    println!("Expected Time (Serial)   : ~{:.2} seconds (Sum of delays)", expected_serial);
-    println!("Expected Time (Parallel) : ~{:.2} seconds (Max of delays)", expected_parallel);
+    println!(
+        "Expected Time (Serial)   : ~{:.2} seconds (Sum of delays)",
+        expected_serial
+    );
+    println!(
+        "Expected Time (Parallel) : ~{:.2} seconds (Max of delays)",
+        expected_parallel
+    );
     println!("Actual Time              : {:.2} seconds", seconds);
     println!("---------------------------------------------------");
 
