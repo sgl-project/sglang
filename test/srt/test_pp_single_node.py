@@ -20,8 +20,8 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_MODEL_NAME_FOR_TEST_VL_PP,
     DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP,
+    DEFAULT_MODEL_NAME_FOR_TEST_VL_PP,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
