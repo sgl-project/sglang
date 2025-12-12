@@ -97,7 +97,7 @@ class TestQwen3Next(CustomTestCase):
     def test_prefix_cache_branching(self):
         print("running test_prefix_cache_branching")
         requests.get(self.base_url + "/flush_cache")
-        branching_pos = 256
+        branching_pos = 257
         text_prefix = "hi" * branching_pos
         suffix_list = ["this" * 256, "here" * 256, "that" * 256]
         cache_hit_list = [False, False, True]
@@ -111,9 +111,10 @@ class TestQwen3Next(CustomTestCase):
             result = send_request_helper(self.base_url, text_prefix + suffix)
             cached_tokens = result["meta_info"]["cached_tokens"]
             if cache_hit:
+                expected_cached_tokens = branching_pos // 64 * 64
                 assert (
-                    cached_tokens > 0
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not greater than 0"
+                    cached_tokens == expected_cached_tokens
+                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not equal to {expected_cached_tokens=}, {branching_pos=}"
             else:
                 assert (
                     cached_tokens == 0
@@ -260,7 +261,7 @@ class TestQwen3NextMTPTopk(CustomTestCase):
     def test_prefix_cache_branching(self):
         print("running test_prefix_cache_branching")
         requests.get(self.base_url + "/flush_cache")
-        branching_pos = 256
+        branching_pos = 257
         text_prefix = "hi" * branching_pos
         suffix_list = ["this" * 256, "here" * 256, "that" * 256]
         cache_hit_list = [False, False, True]
@@ -274,9 +275,10 @@ class TestQwen3NextMTPTopk(CustomTestCase):
             result = send_request_helper(self.base_url, text_prefix + suffix)
             cached_tokens = result["meta_info"]["cached_tokens"]
             if cache_hit:
+                expected_cached_tokens = branching_pos // 64 * 64
                 assert (
-                    cached_tokens > 0
-                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not greater than 0"
+                    cached_tokens == expected_cached_tokens
+                ), f"{i=}, {cache_hit=}, {cached_tokens=} is not equal to {expected_cached_tokens=}, {branching_pos=}"
             else:
                 assert (
                     cached_tokens == 0

@@ -1604,13 +1604,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
+                branching_seqlen_aligned_mask = (
+                    req.mamba_branching_seqlen - len(req.prefix_indices)
+                ) % FLA_CHUNK_SIZE == 0
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
+                    and branching_seqlen_aligned_mask
                 ):
-                    assert (
-                        req.mamba_branching_seqlen - len(req.prefix_indices)
-                    ) % FLA_CHUNK_SIZE == 0, f"{req.mamba_branching_seqlen=}, {len(req.prefix_indices)=}, {FLA_CHUNK_SIZE=}, {req.mamba_branching_seqlen - len(req.prefix_indices)=}"
                     # NOTE: See the comment above for mamba_track_seqlen, the +1 is necessary
                     # because the branching point is not the last aligned position, so we need
                     # to retrieve its state from h. Adding 1 will give us the correct index in h,
