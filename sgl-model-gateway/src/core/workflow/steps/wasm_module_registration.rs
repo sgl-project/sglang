@@ -75,9 +75,8 @@ pub struct ValidateDescriptorStep;
 #[async_trait]
 impl StepExecutor for ValidateDescriptorStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let descriptor = &config_request.descriptor;
 
@@ -235,9 +234,8 @@ pub struct CalculateHashStep;
 #[async_trait]
 impl StepExecutor for CalculateHashStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let file_path = &config_request.descriptor.file_path;
 
@@ -295,15 +293,10 @@ pub struct CheckDuplicateStep;
 #[async_trait]
 impl StepExecutor for CheckDuplicateStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash: Arc<[u8; 32]> = context
-            .get("sha256_hash")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
 
         debug!(
             "Checking for duplicate SHA256 hash for module: {}",
@@ -349,9 +342,8 @@ pub struct LoadWasmBytesStep;
 #[async_trait]
 impl StepExecutor for LoadWasmBytesStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let file_path = &config_request.descriptor.file_path;
 
@@ -386,12 +378,9 @@ pub struct ValidateWasmComponentStep;
 #[async_trait]
 impl StepExecutor for ValidateWasmComponentStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
-        let wasm_bytes: Arc<Vec<u8>> = context
-            .get("wasm_bytes")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let wasm_bytes: Arc<Vec<u8>> = context.get_or_err("wasm_bytes")?;
 
         debug!(
             "Validating WASM component format for module: {}",
@@ -441,21 +430,12 @@ pub struct RegisterModuleStep;
 #[async_trait]
 impl StepExecutor for RegisterModuleStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash: Arc<[u8; 32]> = context
-            .get("sha256_hash")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
-        let file_size_bytes: Arc<u64> = context
-            .get("file_size_bytes")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("file_size_bytes".to_string()))?;
-        let wasm_bytes: Arc<Vec<u8>> = context
-            .get("wasm_bytes")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
+        let file_size_bytes: Arc<u64> = context.get_or_err("file_size_bytes")?;
+        let wasm_bytes: Arc<Vec<u8>> = context.get_or_err("wasm_bytes")?;
 
         debug!(
             "Registering WASM module in manager: {}",

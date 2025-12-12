@@ -105,7 +105,7 @@ impl TokenBucket {
         let wait_time = {
             let inner = self.inner.lock().await;
             let tokens_needed = tokens - inner.tokens;
-            let wait_secs = tokens_needed / self.refill_rate;
+            let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
             Duration::from_secs_f64(wait_secs)
         };
 

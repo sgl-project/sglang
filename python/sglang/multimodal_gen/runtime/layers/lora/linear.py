@@ -51,7 +51,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.cpu_weight = base_layer.weight.to("cpu")
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
-        self.disable_lora: bool = False
+        # Default to True to prevent using uninitialized weights; set to False when weights are loaded
+        self.disable_lora: bool = True
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_path: str | None = None
