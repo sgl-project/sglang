@@ -192,43 +192,6 @@ Streaming is supported in a similar manner as [above](#streaming).
 
 Detailed example in [OpenAI API Vision](openai_api_vision.ipynb).
 
-#### Multimodal Input Formats
-
-SGLang supports three different formats for `image_data` to accommodate various use cases:
-
-##### 1. Raw Images (Basic Usage)
-
-The simplest way to pass images - SGLang will handle all preprocessing automatically.
-**Use case**: Quick prototyping, simple applications, when you don't need fine control over preprocessing.
-
-##### 2. Processor Output (Advanced)
-
-Pass the output from a HuggingFace processor directly, bypassing SGLang's preprocessing.
-**Use case**: When you need precise control over image preprocessing, custom image transformations, or when integrating with existing preprocessing pipelines.
-
-##### 3. Precomputed Embeddings (High Performance)
-
-Pre-calculate visual embeddings to avoid redundant vision encoder computation, ideal for caching or serving the same image multiple times.
-**Use case**:
-- High-throughput serving with repeated image queries
-- Caching visual embeddings for frequently used images
-- Reducing latency when the same image is used across multiple requests
-- Multi-turn conversations with the same image
-**Performance benefits**:
-- Avoids redundant vision encoder computation (can save 30-50% of total inference time)
-- Enables efficient caching strategies
-- Reduces GPU memory usage during inference
-
-**Format Comparison**:
-
-| Format | Preprocessing | Vision Encoding | Use Case |
-|--------|--------------|-----------------|----------|
-| Raw Images | Automatic | Automatic | Simple usage, prototyping |
-| Processor Output | Manual | Automatic | Custom preprocessing pipelines |
-| Precomputed Embeddings | Manual | Pre-computed | High performance, caching |
-
-For detailed examples and model-specific usage, see [VLM Query Guide](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/vlm_query.ipynb).
-
 ### Structured Outputs (JSON, Regex, EBNF)
 
 You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request.
