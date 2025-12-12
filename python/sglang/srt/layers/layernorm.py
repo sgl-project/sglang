@@ -121,8 +121,9 @@ class RMSNorm(CustomOp):
                 self.variance_epsilon,
             )
         if residual is not None:
-            # TODO: Ideally we want to have (a+b)+c. but right now we can only have a+(b+c).
-            # (a+b)+c != a+(b+c), we probably need to add another parameter to fused_add_rmsnorm
+            # TODO: Ideally we want to have (hidden_states + residual) + post_residual_addition
+            # but right now we can only have hidden_states + (residual + post_residual_addition).
+            # since it is not associative, we probably need to add another parameter to fused_add_rmsnorm
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
