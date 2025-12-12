@@ -1,10 +1,3 @@
-//! Local worker management steps for SGLang/vLLM workers.
-//!
-//! This module handles the lifecycle of workers that run locally
-//! or on accessible infrastructure with SGLang/vLLM runtimes:
-//! - **Registration**: Adding new local workers
-//! - **Removal**: Removing local workers
-
 mod create_worker;
 mod detect_connection;
 mod discover_dp;
@@ -28,28 +21,6 @@ use crate::{
     workflow::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition},
 };
 
-/// Create local worker registration workflow definition.
-///
-/// DAG structure with parallel execution opportunities:
-/// ```text
-///                detect_connection_mode
-///                         │
-///            ┌────────────┴────────────┐
-///            │                         │
-///    discover_metadata         discover_dp_info
-///            │                         │
-///            └────────────┬────────────┘
-///                         │
-///                   create_worker
-///                         │
-///                  register_workers
-///                         │
-///            ┌────────────┴────────────┐
-///            │                         │
-///     update_policies          activate_workers
-///            │                         │
-///            └────────────┴────────────┘
-/// ```
 pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDefinition {
     let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
 
@@ -95,7 +66,7 @@ pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDef
             .with_failure_action(FailureAction::ContinueNextStep)
             .depends_on(&["detect_connection_mode"]),
         )
-        // Step 2b: Discover DP info (parallel with metadata discovery)
+        // Step 2b: Discover DP info (after metadata to avoid concurrent /server_info calls)
         .add_step(
             StepDefinition::new(
                 "discover_dp_info",
@@ -108,7 +79,7 @@ pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDef
             })
             .with_timeout(Duration::from_secs(10))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["detect_connection_mode"]),
+            .depends_on(&["discover_metadata"]),
         )
         // Step 3: Create worker(s)
         .add_step(
@@ -119,7 +90,7 @@ pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDef
             )
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["discover_metadata", "discover_dp_info"]),
+            .depends_on(&["discover_dp_info"]),
         )
         // Step 4: Register workers (shared step)
         .add_step(
