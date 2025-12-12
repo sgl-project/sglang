@@ -28,8 +28,14 @@ class VLMInputTestBase:
         assert cls.model_path is not None, "Set model_path in subclass"
         assert cls.chat_template is not None, "Set chat_template in subclass"
         cls.image_url = TEST_IMAGE_URL
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         cls.main_image = download_image_with_retry(cls.image_url)
+        if torch.cuda.is_available():
+            cls.device = torch.device("cuda")
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            cls.device = torch.device("xpu")
+        else:
+            cls.device = torch.device("cpu")
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )
