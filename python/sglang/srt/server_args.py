@@ -291,6 +291,7 @@ class ServerArgs:
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
+    prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
     abort_on_priority_when_disabled: bool = False
@@ -2525,6 +2526,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+        )
+        parser.add_argument(
+            "--prefill-max-requests",
+            type=int,
+            default=ServerArgs.prefill_max_requests,
+            help="The maximum number of requests in a prefill batch. If not specified, there is no limit.",
         )
         parser.add_argument(
             "--enable-dynamic-chunking",
