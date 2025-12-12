@@ -63,6 +63,12 @@ class TimeStats:
     alloc_waiting_duration: float = 0.0
     prefill_start_time_host: float = 0.0
     prefill_end_time_host: float = 0.0
+
+    # Timestamp when prefill phase finishes, obtained from `time.time()`.
+    # Note that this differs from the other `_time` fields tracked by the
+    # `TimeStats` class, which are obtained from `time.perf_counter()`.
+    # We use `time.time()` instead of `time.perf_counter()` here in order to
+    # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
     prefill_finished_ts: float = 0.0
 
     def get_queueing_time(self) -> float:
