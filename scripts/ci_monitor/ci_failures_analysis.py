@@ -828,16 +828,37 @@ class SGLangFailuresAnalyzer:
                     job_last_failure_in_streak[job_name] = None
 
                 # Track recent runs (last 5 for each job)
+                run_attempt = job.get("run_attempt", 1)
+
+                # Create status emoji with superscript if retry attempt > 1
+                if conclusion == "success":
+                    status = "✅"
+                elif conclusion == "failure":
+                    status = "❌"
+                else:
+                    status = "⚪"
+
+                # Add superscript for retry attempts (2+ only)
+                if run_attempt > 1:
+                    superscript_map = {
+                        "2": "²",
+                        "3": "³",
+                        "4": "⁴",
+                        "5": "⁵",
+                        "6": "⁶",
+                        "7": "⁷",
+                        "8": "⁸",
+                        "9": "⁹",
+                    }
+                    status += superscript_map.get(str(run_attempt), f"^{run_attempt}")
+
                 job_recent_runs[job_name].append(
                     {
                         "run_number": run_info["run_number"],
                         "job_url": job.get("html_url", run_info["url"]),
                         "conclusion": conclusion,
-                        "status": (
-                            "✅"
-                            if conclusion == "success"
-                            else "❌" if conclusion == "failure" else "⚪"
-                        ),
+                        "status": status,
+                        "run_attempt": run_attempt,
                     }
                 )
 
@@ -953,10 +974,16 @@ class SGLangFailuresAnalyzer:
                 reverse=True,
             )
             broken = [(name, d) for name, d in sorted_data if d["current_streak"] >= 2]
+            recently_failed = [
+                (name, d)
+                for name, d in sorted_data
+                if d["current_streak"] < 2 and d["total_failures"] > 0
+            ]
 
+            # Always show section header
+            print("\n" + "=" * 120)
             if broken:
-                print("\n" + "=" * 120)
-                print(f"## {title} ({len(broken)} jobs)")
+                print(f"## {title} ({len(broken)} jobs with active streaks)")
                 print("=" * 120)
                 print(
                     f"\n{'Job Name':<40} {'Current':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Recent History':<30}"
@@ -996,6 +1023,33 @@ class SGLangFailuresAnalyzer:
                         print(
                             f"{display_name:<40} {d['current_streak']:<8} {d['max_streak']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
                         )
+            else:
+                print(f"## {title}")
+                print("=" * 120)
+                print("\n✅ No jobs with active failure streaks (streak >= 2)")
+
+            # Show recently failed jobs in a collapsed section (terminal doesn't support collapse, so just show as separate section)
+            if recently_failed:
+                print(
+                    f"\n   Recently failed jobs (no active streak): {len(recently_failed)} jobs"
+                )
+                print(
+                    f"   {'Job Name':<38} {'Total Failures':<15} {'Failure Rate':<15} {'Recent History':<30}"
+                )
+                print("   " + "-" * 110)
+                for job_name, d in recently_failed[:10]:
+                    display_name = (
+                        job_name if len(job_name) <= 36 else job_name[:33] + "..."
+                    )
+                    recent_runs = d.get("recent_runs", [])
+                    history_str = (
+                        " ".join([r["status"] for r in recent_runs])
+                        if recent_runs
+                        else "N/A"
+                    )
+                    print(
+                        f"   {display_name:<38} {d['total_failures']:<15} {d['failure_rate']:.1f}%{'':<10} {history_str:<30}"
+                    )
 
         # 1. PR Test - Main (scheduled runs only) - RED
         print_job_section(
@@ -1063,14 +1117,16 @@ class SGLangFailuresAnalyzer:
                 r for r in sorted_runners if r["current_streak"] >= 2
             ]
 
+            # Always show section header
+            print("\n" + "=" * 140)
+            print("## 5. Top 15 Workers by Consecutive Failures")
+            print("=" * 140)
+
             if runners_with_issues:
-                print("\n" + "=" * 160)
-                print("## 5. Top 15 Workers by Consecutive Failures")
-                print("=" * 160)
                 print(
-                    f"\n{'Machine Name':<30} {'Curr':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Total Jobs':<11} {'Unique Jobs':<12}"
+                    f"\n{'Machine Name':<30} {'Curr':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'Total':<7} {'Unique':<8} {'First':<13} {'Last':<13}"
                 )
-                print("-" * 160)
+                print("-" * 140)
 
                 for runner_data in runners_with_issues[:15]:
                     # Truncate machine name if too long for display
@@ -1104,19 +1160,12 @@ class SGLangFailuresAnalyzer:
                         f"Run #{last_failure['run_number']}" if last_failure else "N/A"
                     )
 
-                    # Format top errors - don't truncate
-                    top_errors = runner_data.get("top_error_signatures", [])
-                    if top_errors:
-                        error_display = ", ".join(
-                            [f"{err[0]} ({err[1]})" for err in top_errors]
-                        )
-                    else:
-                        error_display = "N/A"
-
                     # Color red for workers with failures
                     print(
-                        f"\033[91m{display_name:<30}\033[0m {streak_str:<5} {max_str:<5} {runner_data['failure_rate']:>5.1f}% {avg_queue_str:<7} {first_failure_str:<13} {last_failure_str:<13} {error_display:<45} {runner_data['total_jobs']:<11} {runner_data['unique_jobs']:<12}"
+                        f"\033[91m{display_name:<30}\033[0m {streak_str:<5} {max_str:<5} {runner_data['failure_rate']:>5.1f}% {avg_queue_str:<7} {runner_data['total_jobs']:<7} {runner_data['unique_jobs']:<8} {first_failure_str:<13} {last_failure_str:<13}"
                     )
+            else:
+                print("\n✅ No runners with active failure streaks (streak >= 2)")
 
         # Build report data (always needed for GitHub summary)
         # Calculate overall queue time for summary
@@ -1257,9 +1306,7 @@ class SGLangFailuresAnalyzer:
                 summary_lines.append("")
 
             # Helper function to generate job section for GitHub markdown
-            def generate_job_section_md(
-                title: str, data: Dict[str, Dict], use_red_badge: bool = False
-            ):
+            def generate_job_section_md(title: str, data: Dict[str, Dict]):
                 sorted_data = sorted(
                     data.items(),
                     key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
@@ -1268,11 +1315,17 @@ class SGLangFailuresAnalyzer:
                 broken = [
                     (name, d) for name, d in sorted_data if d["current_streak"] >= 2
                 ]
+                recently_failed = [
+                    (name, d)
+                    for name, d in sorted_data
+                    if d["current_streak"] < 2 and d["total_failures"] > 0
+                ]
+
+                # Always show section header
+                summary_lines.append(f"## {title}")
+                summary_lines.append("")
 
                 if broken:
-                    badge_text = f"🔴 {title}" if use_red_badge else title
-                    summary_lines.append(f"## {badge_text}")
-                    summary_lines.append("")
                     summary_lines.append(
                         "| Job Name | Current Streak | Max | First Failure | Last Failure | Recent History |"
                     )
@@ -1322,33 +1375,69 @@ class SGLangFailuresAnalyzer:
                                 f"{first_str} | {last_str} | {history_links} |"
                             )
                     summary_lines.append("")
+                else:
+                    summary_lines.append(
+                        "✅ **No jobs with active failure streaks (streak >= 2)**"
+                    )
+                    summary_lines.append("")
 
-            # 1. PR Test - Main (scheduled runs only) - RED
+                # Show recently failed jobs in a collapsible section
+                if recently_failed:
+                    summary_lines.append("<details>")
+                    summary_lines.append(
+                        f"<summary>Recently failed jobs (no active streak) - {len(recently_failed)} jobs</summary>"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Job Name | Total Failures | Failure Rate | Recent History |"
+                    )
+                    summary_lines.append(
+                        "|----------|----------------|--------------|----------------|"
+                    )
+                    for job_name, d in recently_failed[:15]:
+                        display_name = (
+                            job_name if len(job_name) <= 35 else job_name[:32] + "..."
+                        )
+                        recent_runs = d.get("recent_runs", [])
+                        if recent_runs:
+                            history_links = " ".join(
+                                [
+                                    f"[{r['status']}]({r['job_url']})"
+                                    for r in recent_runs
+                                ]
+                            )
+                        else:
+                            history_links = "N/A"
+
+                        summary_lines.append(
+                            f"| `{display_name}` | {d['total_failures']} | {d['failure_rate']:.1f}% | {history_links} |"
+                        )
+                    summary_lines.append("")
+                    summary_lines.append("</details>")
+                    summary_lines.append("")
+
+            # 1. PR Test - Main (scheduled runs only)
             generate_job_section_md(
                 "1. PR Test - Main Branch (scheduled)",
                 report_data.get("pr_test_main_data", {}),
-                use_red_badge=True,
             )
 
-            # 2. Nightly Test - Main (scheduled runs only) - RED
+            # 2. Nightly Test - Main (scheduled runs only)
             generate_job_section_md(
                 "2. Nightly Test - Main Branch (scheduled)",
                 report_data.get("nightly_main_data", {}),
-                use_red_badge=True,
             )
 
             # 3. PR Test - General (all runs)
             generate_job_section_md(
                 "3. PR Test - General (all runs)",
                 report_data.get("pr_test_general_data", {}),
-                use_red_badge=False,
             )
 
             # 4. Nightly Test - General (all runs)
             generate_job_section_md(
                 "4. Nightly Test - General (all runs)",
                 report_data.get("nightly_general_data", {}),
-                use_red_badge=False,
             )
 
             # 5. Workers section
@@ -1368,12 +1457,10 @@ class SGLangFailuresAnalyzer:
                             "max_streak": streak_data.get("max_streak", 0),
                             "failure_rate": stats["failure_rate"],
                             "total_jobs": stats["total_jobs"],
+                            "unique_jobs": len(stats.get("jobs_failed", {})),
                             "avg_queue": stats.get("avg_queue_time_seconds", 0),
                             "first_failure": streak_data.get("first_failure_in_streak"),
                             "last_failure": streak_data.get("last_failure_in_streak"),
-                            "top_error_signatures": streak_data.get(
-                                "top_error_signatures", []
-                            ),
                         }
                     )
 
@@ -1391,16 +1478,16 @@ class SGLangFailuresAnalyzer:
                     r for r in sorted_runners if r["current_streak"] >= 2
                 ]
 
+                # Always show section header
+                summary_lines.append("## 5. Workers")
+                summary_lines.append("")
+
                 if runners_with_issues:
                     summary_lines.append(
-                        "## 🔴 5. Top 15 Workers by Consecutive Failures (streak >= 2)"
-                    )
-                    summary_lines.append("")
-                    summary_lines.append(
-                        "| Machine Name | Current Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors |"
+                        "| Machine Name | Current Streak | Max | Fail Rate | Avg Queue | Total Jobs | Unique Jobs | First Failure | Last Failure |"
                     )
                     summary_lines.append(
-                        "|--------------|----------------|-----|-----------|-----------|---------------|--------------|------------|"
+                        "|--------------|----------------|-----|-----------|-----------|------------|-------------|---------------|--------------|"
                     )
 
                     for runner_data in runners_with_issues[:15]:
@@ -1430,27 +1517,23 @@ class SGLangFailuresAnalyzer:
                             else "N/A"
                         )
 
-                        top_errors = runner_data.get("top_error_signatures", [])
-                        error_str = (
-                            "<br>".join(
-                                [f"• {err[0]} ({err[1]})" for err in top_errors]
-                            )
-                            if top_errors
-                            else "N/A"
-                        )
-
                         # Make entire row red if current streak >= 3
                         if runner_data["current_streak"] >= 3:
                             summary_lines.append(
                                 f"| <span style='color:red'>`{display_name}`</span> | <span style='color:red'>{runner_data['current_streak']}</span> | <span style='color:red'>{runner_data['max_streak']}</span> | "
-                                f"<span style='color:red'>{runner_data['failure_rate']:.1f}%</span> | <span style='color:red'>{avg_queue_str}</span> | <span style='color:red'>{first_str}</span> | <span style='color:red'>{last_str}</span> | <span style='color:red'>{error_str}</span> |"
+                                f"<span style='color:red'>{runner_data['failure_rate']:.1f}%</span> | <span style='color:red'>{avg_queue_str}</span> | <span style='color:red'>{runner_data['total_jobs']}</span> | <span style='color:red'>{runner_data.get('unique_jobs', 0)}</span> | <span style='color:red'>{first_str}</span> | <span style='color:red'>{last_str}</span> |"
                             )
                         else:
                             summary_lines.append(
                                 f"| `{display_name}` | {runner_data['current_streak']} | {runner_data['max_streak']} | "
-                                f"{runner_data['failure_rate']:.1f}% | {avg_queue_str} | {first_str} | {last_str} | {error_str} |"
+                                f"{runner_data['failure_rate']:.1f}% | {avg_queue_str} | {runner_data['total_jobs']} | {runner_data.get('unique_jobs', 0)} | {first_str} | {last_str} |"
                             )
 
+                    summary_lines.append("")
+                else:
+                    summary_lines.append(
+                        "✅ **No runners with active failure streaks (streak >= 2)**"
+                    )
                     summary_lines.append("")
 
             # Write summary
