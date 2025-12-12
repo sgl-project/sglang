@@ -143,9 +143,16 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
+        finish_count = 0
+        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+            if not finish_event.query():
+                # the KV cache loading is still ongoing
+                break
+            finish_count += 1
+
         qsizes = torch.tensor(
             [
-                len(cc.ack_write_queue),
+                finish_count,
                 cc.ack_backup_queue.qsize(),
             ],
             dtype=torch.int,
