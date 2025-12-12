@@ -27,7 +27,6 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
-  SGLANG_CI_ENABLE_RETRY: true
 
 jobs:
   # =============================================== check changes ====================================================
@@ -551,10 +550,10 @@ jobs:
             CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
         - name: Run test
-          timeout-minutes: 40
+          timeout-minutes: 30
           run: |
             cd test/srt
-            python3 run_suite.py --suite quantization_test --enable-retry
+            python3 run_suite.py --suite quantization_test
 
   unit-test-backend-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1]
@@ -593,10 +592,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15 --enable-retry
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15
 
   unit-test-backend-2-gpu:
     needs: [check-changes, call-gate, unit-test-backend-1-gpu]
@@ -634,10 +633,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --enable-retry
+          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
@@ -675,10 +674,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --enable-retry
+          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
@@ -722,10 +721,10 @@ jobs:
           python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --enable-retry
+          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
@@ -764,10 +763,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --enable-retry
+          python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, call-gate, stage-a-test-1]
@@ -1056,12 +1055,10 @@ jobs:
           pip install -e .
 
       - name: Evaluate accuracy
-        timeout-minutes: 25
+        timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_eval_accuracy_large.py
-        env:
-          SGLANG_CI_ENABLE_RETRY: ${{ env.SGLANG_CI_ENABLE_RETRY }}
 
   accuracy-test-2-gpu:
     needs: [check-changes, call-gate, accuracy-test-1-gpu]
@@ -1098,12 +1095,10 @@ jobs:
           pip install -e .
 
       - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 25
+        timeout-minutes: 20
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
-        env:
-          SGLANG_CI_ENABLE_RETRY: ${{ env.SGLANG_CI_ENABLE_RETRY }}
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
@@ -1137,10 +1132,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-deepep --enable-retry
+          python3 run_suite.py --suite per-commit-4-gpu-deepep
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
@@ -1174,10 +1169,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep --enable-retry
+          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
@@ -1216,10 +1211,10 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 30
         run: |
           cd test/srt
-          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 --enable-retry
+          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 3 --timeout-per-file 1800
 
   # TODO: Add gb200 tests back after the ci runner is fixed
   # unit-test-backend-4-gpu-gb200:
@@ -1256,10 +1251,10 @@ jobs:
   #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
 
   #     - name: Run test
-  #       timeout-minutes: 55
+  #       timeout-minutes: 45
   #       run: |
   #         cd test/srt
-  #         python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600 --enable-retry
+  #         python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
   pr-test-finish:
     needs:

@@ -18,9 +18,14 @@ use axum::{
 use sgl_model_gateway::{
     app_context::AppContext,
     config::RouterConfig,
-    core::workflow::{
-        create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
+    core::{
+        steps::{create_wasm_module_registration_workflow, create_wasm_module_removal_workflow},
+        LoadMonitor, WorkerRegistry,
     },
+    data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    },
+    policies::PolicyRegistry,
     routers::RouterFactory,
     server::{build_app, AppState},
     wasm::{
@@ -47,15 +52,6 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
 
     // Create AppContext with wasm_manager from the start
     let client = reqwest::Client::new();
-
-    // Initialize registries
-    use sgl_model_gateway::{
-        core::{LoadMonitor, WorkerRegistry},
-        data_connector::{
-            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-        },
-        policies::PolicyRegistry,
-    };
 
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
@@ -113,14 +109,23 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::core::workflow::{
-        create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
+    use sgl_model_gateway::{
+        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
+        workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
-    engine.register_workflow(create_worker_registration_workflow(&config));
-    engine.register_workflow(create_worker_removal_workflow());
-    engine.register_workflow(create_wasm_module_registration_workflow());
-    engine.register_workflow(create_wasm_module_removal_workflow());
+    engine
+        .register_workflow(create_worker_registration_workflow(&config))
+        .expect("worker_registration workflow should be valid");
+    engine
+        .register_workflow(create_worker_removal_workflow())
+        .expect("worker_removal workflow should be valid");
+    engine
+        .register_workflow(create_wasm_module_registration_workflow())
+        .expect("wasm_module_registration workflow should be valid");
+    engine
+        .register_workflow(create_wasm_module_removal_workflow())
+        .expect("wasm_module_removal workflow should be valid");
     app_context
         .workflow_engine
         .set(engine)
@@ -684,8 +689,9 @@ async fn test_wasm_module_execution() {
         .expect("Workflow engine should be initialized");
 
     // Create workflow context for registration
-    use sgl_model_gateway::core::workflow::{
-        steps::WasmModuleConfigRequest, WorkflowContext, WorkflowId, WorkflowInstanceId,
+    use sgl_model_gateway::{
+        core::steps::WasmModuleConfigRequest,
+        workflow::{WorkflowContext, WorkflowId, WorkflowInstanceId},
     };
 
     let descriptor = WasmModuleDescriptor {
@@ -727,14 +733,14 @@ async fn test_wasm_module_execution() {
             .expect("Failed to get workflow status");
 
         match state.status {
-            sgl_model_gateway::core::workflow::WorkflowStatus::Completed => {
+            sgl_model_gateway::workflow::WorkflowStatus::Completed => {
                 // Extract module UUID from context
                 if let Some(uuid_arc) = state.context.get::<Uuid>("module_uuid") {
                     module_uuid = Some(*uuid_arc.as_ref());
                 }
                 break;
             }
-            sgl_model_gateway::core::workflow::WorkflowStatus::Failed => {
+            sgl_model_gateway::workflow::WorkflowStatus::Failed => {
                 panic!("Workflow failed: {:?}", state);
             }
             _ => {

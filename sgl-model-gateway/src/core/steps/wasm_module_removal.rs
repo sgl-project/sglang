@@ -1,18 +1,10 @@
-//! WASM Module Removal Workflow Steps
-//!
-//! Each step is atomic and performs a single operation in the WASM module removal process.
-//!
-//! Workflow order:
-//! 1. FindModuleToRemove - Find the module to remove by UUID
-//! 2. RemoveModule - Remove module from WasmModuleManager
-
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::{app_context::AppContext, core::workflow::*};
+use crate::{app_context::AppContext, workflow::*};
 
 /// WASM module removal request
 #[derive(Debug, Clone)]
@@ -147,6 +139,7 @@ pub fn create_wasm_module_removal_workflow() -> WorkflowDefinition {
         .add_step(
             StepDefinition::new("remove_module", "Remove Module", Arc::new(RemoveModuleStep))
                 .with_timeout(Duration::from_secs(5))
-                .with_failure_action(FailureAction::FailWorkflow),
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["find_module_to_remove"]),
         )
 }

@@ -75,6 +75,6 @@ if __name__ == "__main__":
         app,
         host=server_args.host,
         port=server_args.port,
-        log_config=None,
+        use_colors=True,
         reload=False,  # Set to True during development for auto-reloading
     )

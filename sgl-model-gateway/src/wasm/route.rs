@@ -15,7 +15,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
-    core::{job_queue::Job, workflow::steps::WasmModuleConfigRequest},
+    core::{job_queue::Job, steps::WasmModuleConfigRequest},
     server::AppState,
     wasm::module::{
         WasmMetrics, WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult,
@@ -172,7 +172,7 @@ pub async fn remove_wasm_module(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
-    use crate::core::workflow::steps::WasmModuleRemovalRequest;
+    use crate::core::steps::WasmModuleRemovalRequest;
 
     let removal_request = WasmModuleRemovalRequest::new(module_uuid);
 
