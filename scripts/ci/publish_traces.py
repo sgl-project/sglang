@@ -7,15 +7,7 @@ import base64
 import json
 import os
 import sys
-import time
-import warnings
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-
-
-def is_rate_limit_error(e):
-    """Check if an exception is a GitHub permission/quota error that should not be retried"""
-    return isinstance(e, HTTPError) and e.code in [403, 429]
 
 
 def make_github_request(url, token, method="GET", data=None):
@@ -36,17 +28,14 @@ def make_github_request(url, token, method="GET", data=None):
     try:
         with urlopen(req) as response:
             return response.read().decode("utf-8")
-    except HTTPError as e:
-        print(f"GitHub API request failed: {e}")
-        try:
-            error_body = e.read().decode("utf-8")
-            print(f"Error response body: {error_body}")
-            e.error_body = error_body  # Attach for later inspection
-        except Exception:
-            e.error_body = ""
-        raise
     except Exception as e:
-        print(f"GitHub API request failed with a non-HTTP error: {e}")
+        print(f"GitHub API request failed: {e}")
+        if hasattr(e, "read"):
+            try:
+                error_body = e.read().decode("utf-8")
+                print(f"Error response body: {error_body}")
+            except:
+                pass
         raise
 
 
@@ -54,33 +43,24 @@ def verify_token_permissions(repo_owner, repo_name, token):
     """Verify that the token has necessary permissions for the repository"""
     print("Verifying token permissions...")
 
-    checks = [
-        (
-            f"https://api.github.com/repos/{repo_owner}/{repo_name}",  # Check if we can access the repository
-            "Repository access verified",
-        ),
-        (
-            f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents",  # Check if we can read the repository contents
-            "Repository contents access verified",
-        ),
-    ]
+    # Check if we can access the repository
+    try:
+        url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
+        response = make_github_request(url, token)
+        repo_data = json.loads(response)
+        print(f"Repository access verified: {repo_data['full_name']}")
+    except Exception as e:
+        print(f"Failed to access repository: {e}")
+        return False
 
-    for url, success_message in checks:
-        try:
-            response = make_github_request(url, token)
-            if success_message == "Repository access verified":
-                repo_data = json.loads(response)
-                print(f"{success_message}: {repo_data['full_name']}")
-            else:
-                print(success_message)
-        except Exception as e:
-            if is_rate_limit_error(e):
-                warnings.warn(
-                    "GitHub API rate limit exceeded during token verification."
-                )
-                return "rate_limited"
-            print(f"Failed to verify permissions for {url}: {e}")
-            return False
+    # Check if we can read the repository contents
+    try:
+        url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents"
+        response = make_github_request(url, token)
+        print("Repository contents access verified")
+    except Exception as e:
+        print(f"Failed to access repository contents: {e}")
+        return False
 
     return True
 
@@ -103,7 +83,7 @@ def get_tree_sha(repo_owner, repo_name, commit_sha, token):
     return data["tree"]["sha"]
 
 
-def create_blob(repo_owner, repo_name, content, token, max_retries=3):
+def create_blob(repo_owner, repo_name, content, token):
     """Create a blob with file content"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/blobs"
 
@@ -112,29 +92,16 @@ def create_blob(repo_owner, repo_name, content, token, max_retries=3):
 
     data = {"content": content_b64, "encoding": "base64"}
 
-    for attempt in range(max_retries):
-        try:
-            response = make_github_request(url, token, method="POST", data=data)
-            return json.loads(response)["sha"]
-        except Exception as e:
-            # Don't retry on rate limit errors - fail fast
-            if is_rate_limit_error(e):
-                raise
-
-            if attempt < max_retries - 1:
-                wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
-                print(
-                    f"Blob creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
-                )
-                time.sleep(wait_time)
-            else:
-                raise
+    response = make_github_request(url, token, method="POST", data=data)
+    return json.loads(response)["sha"]
 
 
-def create_blobs(repo_owner, repo_name, files, token):
-    """Create blobs for all files and return tree items with blob SHAs"""
+def create_tree(repo_owner, repo_name, base_tree_sha, files, token):
+    """Create a new tree with files"""
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees"
+
     tree_items = []
-    for i, (file_path, content) in enumerate(files):
+    for file_path, content in files:
         # Create blob first to get SHA
         blob_sha = create_blob(repo_owner, repo_name, content, token)
         tree_items.append(
@@ -145,76 +112,24 @@ def create_blobs(repo_owner, repo_name, files, token):
                 "sha": blob_sha,
             }
         )
-        # Progress indicator for large uploads
-        if (i + 1) % 10 == 0 or (i + 1) == len(files):
-            print(f"Created {i + 1}/{len(files)} blobs...")
-    return tree_items
-
-
-def create_tree(repo_owner, repo_name, base_tree_sha, tree_items, token, max_retries=3):
-    """Create a new tree from pre-created blob SHAs"""
-    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees"
 
     data = {"base_tree": base_tree_sha, "tree": tree_items}
 
-    for attempt in range(max_retries):
-        try:
-            response = make_github_request(url, token, method="POST", data=data)
-            return json.loads(response)["sha"]
-        except Exception as e:
-            # Don't retry on rate limit errors - fail fast
-            if is_rate_limit_error(e):
-                raise
-
-            if attempt < max_retries - 1:
-                wait_time = 2**attempt
-                print(
-                    f"Tree creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
-                )
-                time.sleep(wait_time)
-            else:
-                raise
+    response = make_github_request(url, token, method="POST", data=data)
+    return json.loads(response)["sha"]
 
 
-def create_commit(
-    repo_owner, repo_name, tree_sha, parent_sha, message, token, max_retries=3
-):
+def create_commit(repo_owner, repo_name, tree_sha, parent_sha, message, token):
     """Create a new commit"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits"
 
     data = {"tree": tree_sha, "parents": [parent_sha], "message": message}
 
-    for attempt in range(max_retries):
-        try:
-            response = make_github_request(url, token, method="POST", data=data)
-            commit_sha = json.loads(response)["sha"]
-
-            # Verify the commit was actually created
-            verify_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits/{commit_sha}"
-            verify_response = make_github_request(verify_url, token)
-            verify_data = json.loads(verify_response)
-            if verify_data["sha"] != commit_sha:
-                raise Exception(
-                    f"Commit verification failed: expected {commit_sha}, got {verify_data['sha']}"
-                )
-
-            return commit_sha
-        except Exception as e:
-            # Don't retry on rate limit errors - fail fast
-            if is_rate_limit_error(e):
-                raise
-
-            if attempt < max_retries - 1:
-                wait_time = 2**attempt
-                print(
-                    f"Commit creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
-                )
-                time.sleep(wait_time)
-            else:
-                raise
+    response = make_github_request(url, token, method="POST", data=data)
+    return json.loads(response)["sha"]
 
 
-def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retries=3):
+def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token):
     """Update branch reference to point to new commit"""
     url = (
         f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{branch}"
@@ -222,50 +137,10 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
 
     data = {"sha": commit_sha}
 
-    for attempt in range(max_retries):
-        try:
-            make_github_request(url, token, method="PATCH", data=data)
-            return
-        except HTTPError as e:
-            # Don't retry on rate limit errors - fail fast
-            if is_rate_limit_error(e):
-                raise
-
-            # Check if this is an "Object does not exist" error
-            is_object_not_exist = False
-            if hasattr(e, "error_body"):
-                try:
-                    error_data = json.loads(e.error_body)
-                    if "Object does not exist" in error_data.get("message", ""):
-                        is_object_not_exist = True
-                except Exception:
-                    pass
-
-            if is_object_not_exist and attempt < max_retries - 1:
-                # This might be a transient consistency issue - wait and retry
-                wait_time = 2**attempt
-                print(
-                    f"Branch update failed with 'Object does not exist' (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s for consistency..."
-                )
-                time.sleep(wait_time)
-            else:
-                raise
-        except Exception as e:
-            # Don't retry on rate limit errors - fail fast
-            if is_rate_limit_error(e):
-                raise
-
-            if attempt < max_retries - 1:
-                wait_time = 2**attempt
-                print(
-                    f"Branch update failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
-                )
-                time.sleep(wait_time)
-            else:
-                raise
+    make_github_request(url, token, method="PATCH", data=data)
 
 
-def copy_trace_files(source_dir, target_base_path):
+def copy_trace_files(source_dir, target_base_path, is_vlm=False):
     """Copy trace files and return list of files to upload"""
     files_to_upload = []
 
@@ -291,7 +166,7 @@ def copy_trace_files(source_dir, target_base_path):
     return files_to_upload
 
 
-def publish_traces(traces_dir, run_id, run_number):
+def publish_traces(traces_dir, run_id, run_number, is_vlm=False):
     """Publish traces to GitHub repository in a single commit"""
     # Get environment variables
     token = os.getenv("GITHUB_TOKEN")
@@ -306,7 +181,7 @@ def publish_traces(traces_dir, run_id, run_number):
     target_base_path = f"traces/{run_id}"
 
     # Copy trace files
-    files_to_upload = copy_trace_files(traces_dir, target_base_path)
+    files_to_upload = copy_trace_files(traces_dir, target_base_path, is_vlm)
 
     if not files_to_upload:
         print("No trace files found to upload")
@@ -315,116 +190,54 @@ def publish_traces(traces_dir, run_id, run_number):
     print(f"Found {len(files_to_upload)} files to upload")
 
     # Verify token permissions before proceeding
-    permission_check = verify_token_permissions(repo_owner, repo_name, token)
-    if permission_check == "rate_limited":
-        warnings.warn(
-            "Skipping trace upload due to GitHub API rate limit. "
-            "This is expected during high CI activity and does not indicate a test failure."
-        )
-        return
-    elif not permission_check:
+    if not verify_token_permissions(repo_owner, repo_name, token):
         print(
             "Token permission verification failed. Please check the token permissions."
         )
         sys.exit(1)
 
-    max_retries = 5
-    retry_delay = 5  # seconds
-
-    # Create blobs once before retry loop to avoid re-uploading on failures
     try:
-        tree_items = create_blobs(repo_owner, repo_name, files_to_upload, token)
+        # Get current branch head
+        branch_sha = get_branch_sha(repo_owner, repo_name, branch, token)
+        print(f"Current branch head: {branch_sha}")
+
+        # Get current tree
+        tree_sha = get_tree_sha(repo_owner, repo_name, branch_sha, token)
+        print(f"Current tree SHA: {tree_sha}")
+
+        # Create new tree with all files
+        new_tree_sha = create_tree(
+            repo_owner, repo_name, tree_sha, files_to_upload, token
+        )
+        print(f"Created new tree: {new_tree_sha}")
+
+        # Create commit
+        commit_message = f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files)"
+        commit_sha = create_commit(
+            repo_owner, repo_name, new_tree_sha, branch_sha, commit_message, token
+        )
+        print(f"Created commit: {commit_sha}")
+
+        # Update branch reference
+        update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
+        print("Updated branch reference")
+
+        print("Successfully published all traces in a single commit")
+
     except Exception as e:
-        # Check for rate limit errors during blob creation
-        if is_rate_limit_error(e):
-            warnings.warn(
-                "GitHub API rate limit exceeded during blob creation. Skipping trace upload."
-            )
-            return
-        print(f"Failed to create blobs: {e}")
+        print(f"Failed to publish traces: {e}")
         raise
-
-    for attempt in range(max_retries):
-        try:
-            # Get current branch head
-            branch_sha = get_branch_sha(repo_owner, repo_name, branch, token)
-            print(f"Current branch head: {branch_sha}")
-
-            # Get current tree
-            tree_sha = get_tree_sha(repo_owner, repo_name, branch_sha, token)
-            print(f"Current tree SHA: {tree_sha}")
-
-            # Create new tree with pre-created blobs
-            new_tree_sha = create_tree(
-                repo_owner, repo_name, tree_sha, tree_items, token
-            )
-            print(f"Created new tree: {new_tree_sha}")
-
-            # Create commit
-            commit_message = f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files)"
-            commit_sha = create_commit(
-                repo_owner,
-                repo_name,
-                new_tree_sha,
-                branch_sha,
-                commit_message,
-                token,
-            )
-            print(f"Created commit: {commit_sha}")
-
-            # Update branch reference
-            update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
-            print("Updated branch reference")
-
-            print("Successfully published all traces in a single commit")
-            return
-
-        except Exception as e:
-            # Check for retryable errors
-            is_retryable = False
-            error_type = "unknown"
-
-            if hasattr(e, "error_body"):
-                if "Update is not a fast forward" in e.error_body:
-                    is_retryable = True
-                    error_type = "fast-forward conflict"
-                elif "Object does not exist" in e.error_body:
-                    is_retryable = True
-                    error_type = "object consistency"
-
-            # Also retry on HTTP errors that might be transient
-            if isinstance(e, HTTPError) and e.code in [422, 500, 502, 503, 504]:
-                is_retryable = True
-                error_type = f"HTTP {e.code}"
-
-            # Check for rate limit errors (non-fatal - just warn and skip)
-            if is_rate_limit_error(e):
-                warnings.warn("GitHub API rate limit exceeded. Skipping trace upload.")
-                return
-
-            if is_retryable and attempt < max_retries - 1:
-                print(
-                    f"Attempt {attempt + 1}/{max_retries} failed ({error_type}). Retrying in {retry_delay} seconds..."
-                )
-                time.sleep(retry_delay)
-            else:
-                print(f"Failed to publish traces after {attempt + 1} attempts: {e}")
-                raise
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Publish performance traces to GitHub repository"
     )
-    parser.add_argument(
-        "--traces-dir",
-        type=str,
-        required=True,
-        help="Traces directory to publish",
-    )
+    parser.add_argument("--vlm", action="store_true", help="Process VLM model traces")
     args = parser.parse_args()
 
     # Get environment variables
+
     run_id = os.getenv("GITHUB_RUN_ID", "test")
     run_number = os.getenv("GITHUB_RUN_NUMBER", "12345")
 
@@ -434,12 +247,16 @@ def main():
         )
         sys.exit(1)
 
-    # Use traces directory
-    traces_dir = args.traces_dir
-    print(f"Processing traces from directory: {traces_dir}")
+    # Determine traces directory
+    if args.vlm:
+        traces_dir = "performance_profiles_vlms"
+        print("Processing VLM model traces")
+    else:
+        traces_dir = "performance_profiles_text_models"
+        print("Processing text model traces")
 
     # Publish traces
-    publish_traces(traces_dir, run_id, run_number)
+    publish_traces(traces_dir, run_id, run_number, args.vlm)
 
 
 if __name__ == "__main__":

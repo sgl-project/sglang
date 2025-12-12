@@ -10,6 +10,7 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingRequest,
+    EmbeddingResponse,
     MultimodalEmbeddingInput,
 )
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding

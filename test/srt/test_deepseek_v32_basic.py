@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
 
-class TestDeepseekV32Basic(CustomTestCase):
+class TestDeepseekV3Basic(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH
@@ -44,7 +44,7 @@ class TestDeepseekV32Basic(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
-            num_shots=20,
+            num_shots=8,
             data_path=None,
             num_questions=1400,
             parallel=1400,
@@ -57,7 +57,7 @@ class TestDeepseekV32Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f"### test_gsm8k (deepseek-v3)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.935)
 
@@ -69,7 +69,7 @@ class TestDeepseekV32Basic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 50)
 

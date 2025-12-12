@@ -1,0 +1,9 @@
+[run]
+source = py_src/sglang_router
+omit =
+    py_src/sglang_router/mini_lb.py
+
+[report]
+fail_under = 80
+omit =
+    py_src/sglang_router/mini_lb.py

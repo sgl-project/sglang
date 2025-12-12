@@ -3,14 +3,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang import Engine
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_IMAGE_URL,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -72,23 +68,6 @@ class TestTorchAO(CustomTestCase):
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
         assert throughput >= 210
-
-
-class TestTorchAOForVLM(CustomTestCase):
-    def test_vlm_generate(self):
-        model_path = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
-        chat_template = get_chat_template_by_model_path(model_path)
-        text = f"{chat_template.image_token}What is in this picture? Answer: "
-
-        engine = Engine(
-            model_path=model_path,
-            max_total_tokens=512,
-            enable_multimodal=True,
-            torchao_config="fp8wo",
-        )
-        out = engine.generate([text], image_data=[DEFAULT_IMAGE_URL])
-        engine.shutdown()
-        self.assertGreater(len(out), 0)
 
 
 if __name__ == "__main__":

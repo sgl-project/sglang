@@ -19,12 +19,12 @@ import requests
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.entrypoints.warmup import warmup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.warmup import warmup
 
 multiprocessing.set_start_method("spawn", force=True)
 
@@ -104,21 +104,15 @@ def launch_server_process_and_send_one_request(
             if response.status_code == 200:
                 # Rank-0 node send a request to sync with other node and then return.
                 if server_args.node_rank == 0:
-                    payload = {
-                        "input_ids": [0, 1, 2, 3],
-                        "sampling_params": {
-                            "max_new_tokens": 8,
-                            "temperature": 0,
-                        },
-                    }
-                    # In PD mode, include fake bootstrap fields so workers don't assert
-                    if server_args.disaggregation_mode != "null":
-                        payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
-                        payload["bootstrap_room"] = 0
-
                     response = requests.post(
                         f"{base_url}/generate",
-                        json=payload,
+                        json={
+                            "input_ids": [0, 1, 2, 3],
+                            "sampling_params": {
+                                "max_new_tokens": 8,
+                                "temperature": 0,
+                            },
+                        },
                         timeout=600,
                     )
                     if response.status_code != 200:
@@ -147,6 +141,9 @@ def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
     server_args.disable_cuda_graph = True
     server_args.enable_torch_compile = False
     print(f"Disable CUDA Graph and Torch Compile to save time...")
+
+    server_args.load_format = "dummy"
+    print(f"Set load format to dummy to save time...")
 
     # Set watchdog timeout to compile_args.timeout because compilation will take a long time
     server_args.watchdog_timeout = compile_args.timeout

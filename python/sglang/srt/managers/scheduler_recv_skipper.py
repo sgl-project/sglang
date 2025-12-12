@@ -1,4 +1,3 @@
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 
@@ -15,20 +14,11 @@ class SchedulerRecvSkipper:
         assert not server_args.enable_dp_attention
         self._counter = 0
         self._threshold = server_args.scheduler_recv_interval
-        # All can be tuned if needed
-        self._default_weight = envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT.get()
-        self._weight_of_forward_mode = {
-            ForwardMode.DECODE: envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE.get(),
-            ForwardMode.TARGET_VERIFY: envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY.get(),
-            None: envs.SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE.get(),
-        }
 
     def handle(self, last_forward_mode: ForwardMode):
         should_recv = False
 
-        last_weight = self._weight_of_forward_mode.get(
-            last_forward_mode, self._default_weight
-        )
+        last_weight = _WEIGHT_OF_FORWARD_MODE.get(last_forward_mode, _DEFAULT_WEIGHT)
         self._counter += last_weight
 
         if self._counter >= self._threshold:
@@ -36,3 +26,12 @@ class SchedulerRecvSkipper:
             should_recv = True
 
         return should_recv
+
+
+# All can be tuned if needed
+_DEFAULT_WEIGHT = 1000
+_WEIGHT_OF_FORWARD_MODE = {
+    ForwardMode.DECODE: 1,
+    ForwardMode.TARGET_VERIFY: 1,
+    None: 1,
+}

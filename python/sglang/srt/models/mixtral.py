@@ -24,6 +24,7 @@ from torch import nn
 from transformers import MixtralConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -353,7 +354,6 @@ class MixtralForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

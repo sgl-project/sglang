@@ -3,6 +3,7 @@ Usage:
 python3 -m unittest test_vision_chunked_prefill.TestVisionChunkedPrefill.test_chunked_prefill
 """
 
+import base64
 import io
 import os
 import unittest
@@ -10,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Union
 
 import numpy as np
-import pybase64
 import requests
 from PIL import Image
 
@@ -19,7 +19,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    calculate_rouge_l,
     popen_launch_server,
 )
 
@@ -46,7 +45,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
             pil_img = Image.fromarray(frame)
             buff = io.BytesIO()
             pil_img.save(buff, format="JPEG")
-            base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
+            base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
             base64_frames.append(base64_str)
 
         messages = [{"role": "user", "content": []}]
@@ -179,18 +178,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
             print(output_chunked)
             print("output without chunked prefill:")
             print(output_no_chunked)
-            self.assertEqual(len(output_chunked), len(output_no_chunked))
-            rouge_scores = calculate_rouge_l(output_chunked, output_no_chunked)
-            avg_score = sum(rouge_scores) / len(rouge_scores)
-            print(f"ROUGE-L scores: {rouge_scores}")
-            print(f"Average ROUGE-L score: {avg_score:.4f}")
-            # Allow for occasional divergence in one item while maintaining overall output quality
-            self.assertGreater(
-                avg_score,
-                0.90,
-                f"Average ROUGE-L score too low: {avg_score:.4f}. "
-                f"Individual scores: {rouge_scores}",
-            )
+            self.assertEqual(output_chunked, output_no_chunked)
 
     def test_chunked_prefill(self):
         self._test_chunked_prefill(batches=[False, True], num_frames=[1, [2, 6, 8, 10]])

@@ -432,7 +432,7 @@ class GetModelInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetModelInfoResponse(_message.Message):
-    __slots__ = ("model_path", "tokenizer_path", "is_generation", "preferred_sampling_params", "weight_version", "served_model_name", "max_context_length", "vocab_size", "supports_vision", "model_type", "eos_token_ids", "pad_token_id", "bos_token_id", "max_req_input_len", "architectures")
+    __slots__ = ("model_path", "tokenizer_path", "is_generation", "preferred_sampling_params", "weight_version", "served_model_name", "max_context_length", "vocab_size", "supports_vision", "model_type", "eos_token_ids", "pad_token_id", "bos_token_id", "max_req_input_len")
     MODEL_PATH_FIELD_NUMBER: _ClassVar[int]
     TOKENIZER_PATH_FIELD_NUMBER: _ClassVar[int]
     IS_GENERATION_FIELD_NUMBER: _ClassVar[int]
@@ -447,7 +447,6 @@ class GetModelInfoResponse(_message.Message):
     PAD_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
     BOS_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
     MAX_REQ_INPUT_LEN_FIELD_NUMBER: _ClassVar[int]
-    ARCHITECTURES_FIELD_NUMBER: _ClassVar[int]
     model_path: str
     tokenizer_path: str
     is_generation: bool
@@ -462,8 +461,7 @@ class GetModelInfoResponse(_message.Message):
     pad_token_id: int
     bos_token_id: int
     max_req_input_len: int
-    architectures: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., is_generation: bool = ..., preferred_sampling_params: _Optional[str] = ..., weight_version: _Optional[str] = ..., served_model_name: _Optional[str] = ..., max_context_length: _Optional[int] = ..., vocab_size: _Optional[int] = ..., supports_vision: bool = ..., model_type: _Optional[str] = ..., eos_token_ids: _Optional[_Iterable[int]] = ..., pad_token_id: _Optional[int] = ..., bos_token_id: _Optional[int] = ..., max_req_input_len: _Optional[int] = ..., architectures: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., is_generation: bool = ..., preferred_sampling_params: _Optional[str] = ..., weight_version: _Optional[str] = ..., served_model_name: _Optional[str] = ..., max_context_length: _Optional[int] = ..., vocab_size: _Optional[int] = ..., supports_vision: bool = ..., model_type: _Optional[str] = ..., eos_token_ids: _Optional[_Iterable[int]] = ..., pad_token_id: _Optional[int] = ..., bos_token_id: _Optional[int] = ..., max_req_input_len: _Optional[int] = ...) -> None: ...
 
 class GetServerInfoRequest(_message.Message):
     __slots__ = ()

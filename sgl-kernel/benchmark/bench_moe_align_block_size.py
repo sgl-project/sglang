@@ -162,17 +162,14 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         ]
     )
 
-    # SGL kernel uses dynamic padding optimization
-    max_num_tokens_padded_sgl = topk_ids.numel() + num_experts * (block_size - 1)
-    if topk_ids.numel() < num_experts + 1:
-        max_num_tokens_padded_sgl = topk_ids.numel() * block_size
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids_cuda = torch.empty(
-        (max_num_tokens_padded_sgl,), dtype=torch.int32, device=topk_ids.device
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
     sorted_ids_cuda.fill_(topk_ids.numel())
-    max_num_m_blocks_sgl = max_num_tokens_padded_sgl // block_size
+    max_num_m_blocks = max_num_tokens_padded // block_size
     expert_ids_cuda = torch.zeros(
-        (max_num_m_blocks_sgl,), dtype=torch.int32, device=topk_ids.device
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad_cuda = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
@@ -181,21 +178,14 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
 
-    # Triton and vLLM use original padding calculation
-    max_num_tokens_padded_triton = topk_ids.numel() + num_experts * (block_size - 1)
-    max_num_m_blocks_triton = max_num_tokens_padded_triton // block_size
-    sorted_ids_triton = torch.empty(
-        (max_num_tokens_padded_triton,), dtype=torch.int32, device=topk_ids.device
-    )
+    sorted_ids_triton = torch.empty_like(sorted_ids_cuda)
     sorted_ids_triton.fill_(topk_ids.numel())
-    expert_ids_triton = torch.zeros(
-        (max_num_m_blocks_triton,), dtype=torch.int32, device=topk_ids.device
-    )
+    expert_ids_triton = torch.zeros_like(expert_ids_cuda)
     num_tokens_post_pad_triton = torch.empty_like(num_tokens_post_pad_cuda)
 
-    sorted_ids_vllm = torch.empty_like(sorted_ids_triton)
+    sorted_ids_vllm = torch.empty_like(sorted_ids_cuda)
     sorted_ids_vllm.fill_(topk_ids.numel())
-    expert_ids_vllm = torch.zeros_like(expert_ids_triton)
+    expert_ids_vllm = torch.zeros_like(expert_ids_cuda)
     num_tokens_post_pad_vllm = torch.empty_like(num_tokens_post_pad_cuda)
 
     # compare the performance of cuda, triton and vllm implementation
@@ -336,17 +326,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
             device="cuda",
         )
 
-    # Calculate max_num_tokens_padded based on provider
-    if provider == "sgl" or provider == "sgl_fusion":
-        # Apply dynamic padding optimization for SGL kernel
-        max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-        if topk_ids.numel() < num_experts:
-            max_num_tokens_padded = topk_ids.numel() * block_size
-    else:  # triton
-        # Use original padding calculation for Triton
-        max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-
-    # Create tensors
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )

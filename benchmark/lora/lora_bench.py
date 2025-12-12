@@ -24,15 +24,16 @@ from argparse import ArgumentParser
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 from launch_server import LORA_PATH, NUM_LORAS
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from sglang.bench_serving import (
+    AIOHTTP_TIMEOUT,
     RequestFuncInput,
     RequestFuncOutput,
-    _create_bench_client_session,
     calculate_metrics,
     get_request,
     get_tokenizer,
@@ -55,7 +56,7 @@ async def async_request_openai_completions(
 
     prompt = request_func_input.prompt
 
-    async with _create_bench_client_session() as session:
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         # payload = {
         #     "model": request_func_input.model,
         #     "prompt": prompt,

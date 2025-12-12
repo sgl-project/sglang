@@ -1,15 +1,12 @@
 import json
 import logging
 import os
-import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-import requests
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -17,9 +14,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
-SETUP_TIMEOUT = 600  # 10min
-
+DEFAULT_MOONCAKE_CONFIG_PATH_ENV = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
 logger = logging.getLogger(__name__)
 
 
@@ -44,48 +41,32 @@ class MooncakeStoreConfig:
     local_hostname: str
     metadata_server: str
     global_segment_size: int
+    local_buffer_size: int
     protocol: str
     device_name: str
     master_server_address: str
-    master_metrics_port: int
-    check_server: bool
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
-        if not envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-            raise RuntimeError(
-                f"Config file path not set. Please set {envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.name}"
-            )
-        file_path = envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.value
+        file_path = os.getenv(DEFAULT_MOONCAKE_CONFIG_PATH_ENV)
         try:
             with open(file_path) as fin:
                 config = json.load(fin)
         except Exception as e:
             raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
 
-        if "master_server_address" not in config:
-            raise ValueError("master_server_address is required in config file")
-
         return MooncakeStoreConfig(
-            local_hostname=config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
-            metadata_server=config.get(
-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
-            ),
+            local_hostname=config.get("local_hostname"),
+            metadata_server=config.get("metadata_server"),
             global_segment_size=_parse_global_segment_size(
-                config.get(
-                    "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
-                )
+                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
-            device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
+            # Zero copy interface does not need local buffer
+            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
+            protocol=config.get("protocol", "tcp"),
+            device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
-            master_metrics_port=config.get(
-                "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
-            ),
-            check_server=config.get("check_server", envs.MOONCAKE_CHECK_SERVER.default),
         )
 
     @staticmethod
@@ -97,30 +78,19 @@ class MooncakeStoreConfig:
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
         # other required environment variables...
-        if not envs.MOONCAKE_MASTER.is_set():
+        if not os.getenv("MOONCAKE_MASTER"):
             raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
-
-        # Special handling for local_hostname: try MOONCAKE_LOCAL_HOSTNAME first,
-        # then fall back to LOCAL_HOSTNAME if not set.
-        # This is for forward compatibility with the legacy LOCAL_HOSTNAME environment variable.
-        if envs.MOONCAKE_LOCAL_HOSTNAME.is_set():
-            local_hostname = envs.MOONCAKE_LOCAL_HOSTNAME.value
-        else:
-            local_hostname = os.getenv(
-                "LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            )
-
         return MooncakeStoreConfig(
-            local_hostname=local_hostname,
-            metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.value,
+            local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
+            metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
             global_segment_size=_parse_global_segment_size(
-                envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.value
+                os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            protocol=envs.MOONCAKE_PROTOCOL.value,
-            device_name=envs.MOONCAKE_DEVICE.value,
-            master_server_address=envs.MOONCAKE_MASTER.value,
-            master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.value,
-            check_server=envs.MOONCAKE_CHECK_SERVER.value,
+            # Zero copy interface does not need local buffer
+            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
+            protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
+            device_name=os.getenv("MOONCAKE_DEVICE", ""),
+            master_server_address=os.getenv("MOONCAKE_MASTER"),
         )
 
     @staticmethod
@@ -130,26 +100,17 @@ class MooncakeStoreConfig:
             raise ValueError("master_server_address is required in extra_config")
 
         return MooncakeStoreConfig(
-            local_hostname=extra_config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
-            metadata_server=extra_config.get(
-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
-            ),
+            local_hostname=extra_config.get("local_hostname", "localhost"),
+            metadata_server=extra_config.get("metadata_server", "P2PHANDSHAKE"),
             global_segment_size=_parse_global_segment_size(
-                extra_config.get(
-                    "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
-                )
+                extra_config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
-            device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
+            local_buffer_size=extra_config.get(
+                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
+            protocol=extra_config.get("protocol", "tcp"),
+            device_name=extra_config.get("device_name", ""),
             master_server_address=extra_config["master_server_address"],
-            master_metrics_port=extra_config.get(
-                "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
-            ),
-            check_server=extra_config.get(
-                "check_server", envs.MOONCAKE_CHECK_SERVER.default
-            ),
         )
 
 
@@ -183,7 +144,7 @@ class MooncakeStore(HiCacheStorage):
                 logger.info(
                     "Mooncake Configuration loaded from extra_config successfully."
                 )
-            elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+            elif os.getenv(DEFAULT_MOONCAKE_CONFIG_PATH_ENV):
                 # Load from config file
                 self.config = MooncakeStoreConfig.from_file()
                 logger.info("Mooncake Configuration loaded from file successfully.")
@@ -197,6 +158,7 @@ class MooncakeStore(HiCacheStorage):
             per_tp_global_segment_size = (
                 self.config.global_segment_size // tp_scale_factor
             )
+            per_tp_local_buffer_size = self.config.local_buffer_size // tp_scale_factor
 
             # Check if extra_backend_tag should be passed to MooncakeDistributedStore
             self.extra_backend_tag = None
@@ -204,44 +166,19 @@ class MooncakeStore(HiCacheStorage):
                 self.extra_backend_tag = extra_config["extra_backend_tag"]
                 logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
 
-            # Check server status
-            if self.config.check_server:
-                self.check_server()
-
-            # Handle JSON device_name configuration
-            device_name = self.config.device_name
-            if device_name and device_name.strip().startswith("{"):
-                try:
-                    device_config = json.loads(device_name)
-                    if storage_config and hasattr(storage_config, "tp_rank"):
-                        tp_rank = storage_config.tp_rank
-                        # Try both integer and string keys since JSON parsing may convert keys
-                        device_name = device_config.get(tp_rank, "")
-                        if not device_name:
-                            device_name = device_config.get(str(tp_rank), "")
-                    else:
-                        device_name = ""
-                except (json.JSONDecodeError, AttributeError):
-                    logger.warning(
-                        f"Failed to parse device_name as JSON: {device_name}"
-                    )
-                    device_name = ""
-
             ret_code = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
                 per_tp_global_segment_size,
-                DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                per_tp_local_buffer_size,
                 self.config.protocol,
-                device_name,
+                self.config.device_name,
                 self.config.master_server_address,
             )
             if ret_code:
-                raise RuntimeError(
-                    f"Failed to setup Mooncake store, error code: {ret_code}"
-                )
-            logger.info("Mooncake store setup successfully.")
+                logger.error(f"failed to setup mooncake store, error code: {ret_code}")
 
+            logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
@@ -259,39 +196,6 @@ class MooncakeStore(HiCacheStorage):
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
 
-    def check_server(self):
-        master_server_ip = self.config.master_server_address.split(":")[0]
-        segments_url = f"http://{master_server_ip}:{self.config.master_metrics_port}/get_all_segments"
-        start_time = time.perf_counter()
-
-        check_result = False
-        while time.perf_counter() - start_time < SETUP_TIMEOUT:
-            try:
-                check_segments_resp = requests.get(segments_url, timeout=3)
-            except Exception:
-                logger.info(
-                    "waiting mooncake store server started, cost_time: %.2f seconds.",
-                    time.perf_counter() - start_time,
-                )
-                time.sleep(3)
-                continue
-
-            if check_segments_resp.text == "":
-                logger.info(
-                    "waiting mooncake store server started, cost_time: %.2f seconds.",
-                    time.perf_counter() - start_time,
-                )
-                time.sleep(3)
-                continue
-
-            logger.info("Mooncake store server started successfully.")
-            check_result = True
-            break
-
-        if not check_result:
-            logger.error("Launch mooncake store server timeout")
-            raise ValueError("Launch mooncake store server timeout")
-
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
@@ -304,7 +208,6 @@ class MooncakeStore(HiCacheStorage):
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
-            "page_head",
         ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
@@ -312,10 +215,7 @@ class MooncakeStore(HiCacheStorage):
             buffer_size = buffer.numel() * buffer.element_size()
             ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
             if ret_code:
-                logger.error(f"Failed to register buffer, error code: {ret_code}")
-                raise RuntimeError(
-                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-                )
+                logger.error(f"failed to register buffer, error code: {ret_code}")
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err

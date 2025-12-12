@@ -4,7 +4,6 @@ import re
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -221,8 +220,7 @@ class GptOssDetector(BaseFormatDetector):
         # Check if tool exists
         if function_name not in tool_indices:
             logger.debug(f"Function {function_name} not in available tools")
-            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                return None  # Skip unknown tools (default legacy behavior)
+            return None
 
         # Parse JSON arguments
         try:
@@ -239,3 +237,6 @@ class GptOssDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError("structure_info not used with HarmonyParser")
+
+    def build_ebnf(self, tools: List[Tool]) -> str:
+        raise NotImplementedError("build_ebnf not used with HarmonyParser")

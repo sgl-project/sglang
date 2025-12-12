@@ -18,7 +18,7 @@ Records the latency of some functions
 import asyncio
 import time
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 from sglang.srt.metrics.utils import exponential_buckets
 

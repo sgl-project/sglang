@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
-
-from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
@@ -99,16 +97,6 @@ class AttentionBackend(ABC):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
-        elif forward_batch.forward_mode.is_mixed() and is_npu():
-            return self.forward_mixed(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
         else:
             return self.forward_extend(
                 q,
@@ -142,18 +130,6 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
     ):
         """Run a forward for extend."""
-        raise NotImplementedError()
-
-    def forward_mixed(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-    ):
-        """Run a forward for mix."""
         raise NotImplementedError()
 
     def support_triton(self):

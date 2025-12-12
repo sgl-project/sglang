@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, 
 
 import jinja2
 import openai.types.responses as openai_responses_types
-import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from openai.types.responses import (
@@ -779,9 +778,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Update the status to "cancelled"
             response.status = "cancelled"
 
-        # The response_id is the same as the rid used when submitting the request
-        self.tokenizer_manager.abort_request(rid=response_id)
-
+        # Abort the request
         if task := self.background_tasks.get(response_id):
             task.cancel()
             try:
@@ -1064,7 +1061,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ):
                     function_name = previous_item.recipient[len("browser.") :]
                     action = None
-                    parsed_args = orjson.loads(previous_item.content[0].text)
+                    parsed_args = ororjson.loads(previous_item.content[0].text)
                     if function_name == "search":
                         action = openai_responses_types.response_function_web_search.ActionSearch(
                             type="search",

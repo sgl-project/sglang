@@ -14,18 +14,16 @@
 
 import multiprocessing as mp
 import os
-import sys
 import unittest
-from pathlib import Path
+from typing import List
 
-# Add test directory to path for lora_utils import
-# TODO: can be removed after migration
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from lora_utils import (
+from utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
+    BACKENDS,
     CI_MULTI_LORA_MODELS,
-    run_lora_multiple_batch_on_model_cases,
+    TORCH_DTYPES,
+    LoRAModelCase,
+    run_lora_test_one_by_one,
 )
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci
@@ -46,8 +44,28 @@ PROMPTS = [
 
 
 class TestMultiLoRABackend(CustomTestCase):
+
+    def _run_multi_lora_test_on_model_cases(self, model_cases: List[LoRAModelCase]):
+        for model_case in model_cases:
+            # If skip_long_prompt is True, filter out prompts longer than 1000 characters.
+            batch_prompts = (
+                PROMPTS
+                if not model_case.skip_long_prompt
+                else [p for p in PROMPTS if len(p) < 1000]
+            )
+            for torch_dtype in TORCH_DTYPES:
+                for backend in BACKENDS:
+                    run_lora_test_one_by_one(
+                        batch_prompts,
+                        model_case,
+                        torch_dtype,
+                        max_new_tokens=32,
+                        backend=backend,
+                        test_tag="multi-lora-backend",
+                    )
+
     def test_ci_lora_models(self):
-        run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
+        self._run_multi_lora_test_on_model_cases(CI_MULTI_LORA_MODELS)
 
     def test_all_lora_models(self):
         if is_in_ci():
@@ -60,7 +78,7 @@ class TestMultiLoRABackend(CustomTestCase):
                 continue
             filtered_models.append(model_case)
 
-        run_lora_multiple_batch_on_model_cases(filtered_models)
+        self._run_multi_lora_test_on_model_cases(filtered_models)
 
 
 if __name__ == "__main__":

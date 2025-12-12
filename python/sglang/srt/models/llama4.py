@@ -58,7 +58,6 @@ from sglang.srt.utils import (
     is_cuda,
     make_layers,
 )
-from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
 
@@ -149,7 +148,7 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if _is_cuda:
+        if hidden_states.shape[0] < 4 and _is_cuda:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -165,7 +164,7 @@ class Llama4MoE(nn.Module):
     def _forward_core_shared_routed_overlap(self, hidden_states):
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
-        alt_stream.wait_stream(get_current_device_stream_fast())
+        alt_stream.wait_stream(self.device_module.current_stream())
 
         shared_out = self.shared_expert(hidden_states)
 
@@ -174,7 +173,7 @@ class Llama4MoE(nn.Module):
             router_logits, _ = self.router(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             routed_out = self.experts(hidden_states, topk_output)
-        get_current_device_stream_fast().wait_stream(alt_stream)
+        self.device_module.current_stream().wait_stream(alt_stream)
 
         return shared_out, routed_out
 
@@ -384,7 +383,6 @@ class Llama4DecoderLayer(nn.Module):
         self.config = config
         is_moe_layer = self._is_moe_layer(layer_id)
         is_previous_moe_layer = self._is_moe_layer(layer_id - 1)
-        is_next_moe_layer = self._is_moe_layer(layer_id + 1)
 
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
@@ -411,7 +409,6 @@ class Llama4DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_moe_layer,
             is_previous_layer_sparse=is_previous_moe_layer,
-            is_next_layer_sparse=is_next_moe_layer,
         )
 
         self.layer_communicator = LayerCommunicator(

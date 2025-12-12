@@ -1,73 +1,83 @@
-from __future__ import annotations
-
 import heapq
 import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.radix_cache import (
-    RadixCache,
-    RadixKey,
-    TreeNode,
-    compute_node_hash_values,
-    split_node_hash_value,
-)
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
 
-    def __init__(self, params: CacheInitParams, server_args: ServerArgs):
-        if server_args.hicache_io_backend == "direct":
-            # FIXME: move this logic into server_args parsing
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        tp_cache_group: torch.distributed.ProcessGroup,
+        page_size: int,
+        hicache_ratio: float,
+        hicache_size: int,
+        hicache_write_policy: str,
+        hicache_io_backend: str,
+        hicache_mem_layout: str,
+        enable_metrics: bool,
+        eviction_policy: str = "lru",
+        hicache_storage_backend: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = "best_effort",
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[str] = None,
+        is_eagle: bool = False,
+    ):
+
+        if hicache_io_backend == "direct":
+            if hicache_mem_layout == "page_first":
+                hicache_mem_layout = "page_first_direct"
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, switching to page first direct layout"
                 )
 
-        self.page_size = params.page_size
-        self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
-        self.tp_group = params.tp_cache_group
+        self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-        self.enable_storage = server_args.hicache_storage_backend is not None
-        self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        self.enable_storage = hicache_storage_backend is not None
+        self.enable_storage_metrics = self.enable_storage and enable_metrics
 
         (
             extra_config,
@@ -75,41 +85,39 @@ class HiRadixCache(RadixCache):
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
-        ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
-        )
+        ) = self._parse_storage_backend_extra_config(storage_backend_extra_config)
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = (
-            self.page_size / 1024 * prefetch_timeout_per_ki_token
+            page_size / 1024 * prefetch_timeout_per_ki_token
         )
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
-        self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+        self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
-            params.token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,
-            self.page_size,
+            page_size,
             self.tp_group,
             load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
+            write_policy=hicache_write_policy,
+            io_backend=hicache_io_backend,
+            storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
-            model_name=server_args.served_model_name,
+            model_name=model_name,
             storage_backend_extra_config=extra_config,
         )
         if self.enable_storage_metrics:
             # TODO: support pp
             labels = {
-                "storage_backend": server_args.hicache_storage_backend,
+                "storage_backend": hicache_storage_backend,
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,
             }
-            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+            self.metrics_collector = StorageMetricsCollector(labels=labels)
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -120,11 +128,18 @@ class HiRadixCache(RadixCache):
         self.ongoing_backup = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+            1 if hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
 
-        super().__init__(params=params)
+        super().__init__(
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            page_size,
+            disable=False,
+            eviction_policy=eviction_policy,
+            is_eagle=is_eagle,
+        )
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -319,7 +334,6 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def evict(self, num_tokens: int):
-        start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -360,8 +374,6 @@ class HiRadixCache(RadixCache):
                 assert node.backuped
                 self._evict_backuped(node)
 
-        self.update_eviction_metrics(num_evicted, start_time)
-
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
         num_evicted = self.cache_controller.evict_device(node.value)
@@ -399,9 +411,10 @@ class HiRadixCache(RadixCache):
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
-            key = self.get_child_key_fn(x.key)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
+            for k, v in x.parent.children.items():
+                if v == x:
+                    break
+            del x.parent.children[k]
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
@@ -412,7 +425,6 @@ class HiRadixCache(RadixCache):
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
 
-        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -457,12 +469,6 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
-
         return device_indices
 
     def init_load_back(
@@ -501,7 +507,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
+            self.metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
 
@@ -545,9 +551,7 @@ class HiRadixCache(RadixCache):
             if entry is not None:
                 entry.release_host()
             if self.enable_storage_metrics:
-                self.storage_metrics_collector.log_backuped_tokens(
-                    operation.completed_tokens
-                )
+                self.metrics_collector.log_backuped_tokens(operation.completed_tokens)
 
         # release host memory
         host_indices_list = []
@@ -660,7 +664,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(
+            self.metrics_collector.log_prefetched_tokens(
                 min_completed_tokens - matched_length
             )
 
@@ -668,7 +672,7 @@ class HiRadixCache(RadixCache):
 
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key, _ = self.maybe_bigram_convert(key)
+        key.token_ids = self.key_convert_fn(key.token_ids)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -769,7 +773,7 @@ class HiRadixCache(RadixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode(priority=node.priority)
+            new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
             new_node.value = None
@@ -806,7 +810,7 @@ class HiRadixCache(RadixCache):
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
-        new_node = TreeNode(priority=child.priority)
+        new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -823,24 +827,16 @@ class HiRadixCache(RadixCache):
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
 
-        new_node.hash_value, child.hash_value = split_node_hash_value(
-            child.hash_value, split_len, self.page_size
-        )
+        if child.hash_value:
+            new_node.hash_value = child.hash_value[: split_len // self.page_size]
+            child.hash_value = child.hash_value[split_len // self.page_size :]
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(
-        self,
-        key: RadixKey,
-        value=None,
-        chunked: bool = False,
-        priority: int | None = None,
-    ):
-        if priority is None:
-            priority = 0
-        key, value = self.maybe_bigram_convert(key, value)
+    def insert(self, key: RadixKey, value=None, chunked=False):
+        key.token_ids = self.key_convert_fn(key.token_ids)
 
         if len(key) == 0:
             return 0
@@ -856,7 +852,6 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):
@@ -871,8 +866,6 @@ class HiRadixCache(RadixCache):
             else:
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
-                # shared-prefix node should also reflect max priority
-                new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len]
                     self.evictable_size_ += len(new_node.value)
@@ -888,16 +881,27 @@ class HiRadixCache(RadixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            new_node = TreeNode(priority=priority)
+            new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 
-            # Compute hash_value if storage is enabled
             if self.enable_storage:
-                new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+                last_hash = node.get_last_hash_value()
+                assert (node == self.root_node) or (
+                    last_hash is not None
+                ), "Parent node must have a hash value with storage enabled"
+                new_node.hash_value = []
+                for idx in range(0, len(key), self.page_size):
+                    new_node.hash_value.append(
+                        self.cache_controller.get_hash_str(
+                            key.token_ids[idx : idx + self.page_size],
+                            prior_hash=last_hash,
+                        )
+                    )
+                    last_hash = new_node.hash_value[-1]
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)

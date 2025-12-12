@@ -84,8 +84,6 @@ def w8a8_block_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
-
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -129,7 +127,6 @@ def w8a8_block_matmul(
         Bs.stride(1),
         Bs.stride(0),
         **config,
-        needs_masking=needs_masking,
     )
 
     return C
@@ -431,13 +428,7 @@ def main(args):
         batch_sizes = [args.batch_size]
         num_gpus = 1  # If only one batch size, use only one GPU
 
-    # Support manual N and K specification
-    if args.N is not None and args.K is not None:
-        weight_shapes = [(args.N, args.K)]
-        print(f"Using manually specified weight shape: N={args.N}, K={args.K}")
-    else:
-        weight_shapes = get_weight_shapes(args.tp_size)
-        print(f"Using predefined weight shapes for TP size {args.tp_size}")
+    weight_shapes = get_weight_shapes(args.tp_size)
 
     batches_per_gpu = distribute_batch_sizes(batch_sizes, num_gpus)
 
@@ -462,25 +453,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        "--tp-size",
-        "-tp",
-        type=int,
-        default=8,
-        help="Tensor parallelism size (ignored if --N and --K are specified)",
-    )
-    parser.add_argument(
-        "--N",
-        type=int,
-        default=None,
-        help="Output dimension of weight matrix (number of columns)",
-    )
-    parser.add_argument(
-        "--K",
-        type=int,
-        default=None,
-        help="Input dimension of weight matrix (number of rows)",
-    )
+    parser.add_argument("--tp-size", "-tp", type=int, default=8)
     parser.add_argument(
         "--input-type", type=str, choices=["fp8", "int8"], default="fp8"
     )
@@ -497,9 +470,5 @@ if __name__ == "__main__":
         "--save-path", type=str, default="python/sglang/srt/layers/quantization/configs"
     )
     args = parser.parse_args()
-
-    # Validate arguments
-    if (args.N is None) != (args.K is None):
-        parser.error("--N and --K must be specified together or not at all")
 
     main(args)

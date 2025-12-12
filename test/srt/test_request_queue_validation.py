@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -36,8 +37,6 @@ class TestMaxQueuedRequests(CustomTestCase):
                 "1",
                 "--max-queued-requests",  # Enforce max queued request number is 1
                 "1",
-                "--attention-backend",
-                "triton",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -65,10 +64,9 @@ class TestMaxQueuedRequests(CustomTestCase):
         status_codes = asyncio.run(
             send_concurrent_generate_requests(self.base_url, num_requests=10)
         )
-        self.assertLessEqual(status_codes.count(200), 2)
 
-        # expected_status_codes = [200, 200, 503, 503, 503, 503, 503, 503, 503, 503]
-        # self.assertEqual(status_codes, expected_status_codes)
+        expected_status_codes = [200, 200, 503, 503, 503, 503, 503, 503, 503, 503]
+        assert status_codes == expected_status_codes
 
     def test_max_running_requests_and_max_queued_request_validation(self):
         """Verify running request and queued request numbers based on server logs."""

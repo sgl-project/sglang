@@ -51,9 +51,7 @@ elif _is_hip:
 
 
 if _is_cuda or _is_hip:
-    from sgl_kernel import (  # noqa: F401
-        moe_align_block_size as sgl_moe_align_block_size,
-    )
+    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
 
 @dataclass
@@ -152,8 +150,6 @@ class TritonRunnerCore(MoeRunnerCore):
         gemm1_limit = self.config.gemm1_clamp_limit
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
-
-        assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
@@ -379,10 +375,7 @@ def pre_permute_standard_to_triton(
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    hidden_states, topk_output = (
-        dispatch_output.hidden_states,
-        dispatch_output.topk_output,
-    )
+    hidden_states, topk_output = dispatch_output
 
     assert TopKOutputChecker.format_is_standard(topk_output)
 
@@ -417,7 +410,6 @@ def pre_permute_standard_to_triton(
         topk_output.topk_ids.shape[1],
         config_dtype,
         block_shape=quant_info.block_shape,
-        per_channel_quant=quant_info.per_channel_quant,
     )
 
     config = get_config_func(num_tokens)

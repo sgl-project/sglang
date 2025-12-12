@@ -6,7 +6,12 @@ from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    StructureInfo,
+    _GetInfoFunc,
+)
+from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
 
@@ -23,23 +28,13 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: list):
 
 def parse_arguments(json_value):
     try:
-        parsed_value = json.loads(json_value)
+        try:
+            parsed_value = json.loads(json_value)
+        except:
+            parsed_value = ast.literal_eval(json_value)
         return parsed_value, True
     except:
-        # If that fails, try wrapping it to unescape JSON characters
-        try:
-            # Wrap the value as a JSON string field
-            wrapped = json.loads('{"tmp": "' + json_value + '"}')
-            # parse the unescaped value
-            parsed_value = json.loads(wrapped["tmp"])
-            return parsed_value, True
-        except:
-            # Final fallback to ast.literal_eval
-            try:
-                parsed_value = ast.literal_eval(json_value)
-                return parsed_value, True
-            except:
-                return json_value, False
+        return json_value, False
 
 
 class Glm4MoeDetector(BaseFormatDetector):
@@ -54,13 +49,8 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
-        self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
-        )
-        self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
-            re.DOTALL,
-        )
+        self.func_detail_regex = r"<tool_call>([^\n]*)\n(.*)</tool_call>"
+        self.func_arg_regex = r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -83,10 +73,14 @@ class Glm4MoeDetector(BaseFormatDetector):
         try:
             for match_result in match_result_list:
                 # Get function name
-                func_detail = self.func_detail_regex.search(match_result)
+                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
                 func_name = func_detail.group(1)
                 func_args = func_detail.group(2)
-                pairs = self.func_arg_regex.findall(func_args)
+                pairs = re.findall(
+                    r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+                    func_args,
+                    re.DOTALL,
+                )
                 arguments = {}
                 for arg_key, arg_value in pairs:
                     arg_key = arg_key.strip()
@@ -156,3 +150,15 @@ class Glm4MoeDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+    def build_ebnf(self, tools: List[Tool]):
+        return EBNFComposer.build_ebnf(
+            tools,
+            individual_call_start_token=self.bot_token,
+            individual_call_end_token=self.eot_token,
+            tool_call_separator="\\n",
+            function_format="xml",
+            call_rule_fmt='"{name}" "\\n" ( {arguments_rule} "\\n" )?',
+            key_value_rule_fmt='"<arg_key>{key}</arg_key>" "\\n" "<arg_value>" {valrule} "</arg_value>"',
+            key_value_separator='"\\n"',
+        )

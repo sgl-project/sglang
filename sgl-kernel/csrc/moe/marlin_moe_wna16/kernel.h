@@ -1,6 +1,7 @@
+#pragma once
 
 #ifndef MARLIN_NAMESPACE_NAME
-#define MARLIN_NAMESPACE_NAME marlin_moe_wna16_v2
+#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
 #include "gemm/marlin/marlin.cuh"
@@ -9,18 +10,16 @@
 
 #define MARLIN_KERNEL_PARAMS                                                                                         \
   const int4 *__restrict__ A, const int4 *__restrict__ B, int4 *__restrict__ C, int4 *__restrict__ C_tmp,            \
-      const int4 *__restrict__ b_bias_ptr, const int4 *__restrict__ scales_ptr,                                      \
-      const uint16_t *__restrict__ scale2_ptr, const int4 *__restrict__ zp_ptr, const int *__restrict__ g_idx,       \
+      const int4 *__restrict__ scales_ptr, const int4 *__restrict__ zp_ptr, const int *__restrict__ g_idx,           \
       const int32_t *__restrict__ sorted_token_ids_ptr, const int32_t *__restrict__ expert_ids_ptr,                  \
       const int32_t *__restrict__ num_tokens_past_padded_ptr, const float *__restrict__ topk_weights_ptr, int top_k, \
       bool mul_topk_weights, bool is_ep, int num_groups, int prob_m, int prob_n, int prob_k, int *locks,             \
-      bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem
+      bool use_atomic_add, bool use_fp32_reduce
 
 namespace MARLIN_NAMESPACE_NAME {
 template <
     typename scalar_t,                     // compute dtype, half or nv_float16
     const sglang::ScalarTypeId w_type_id,  // weight ScalarType id
-    const sglang::ScalarTypeId s_type_id,  // weight scale ScalarType id
     const int threads,                     // number of threads in a threadblock
     const int thread_m_blocks,             // number of 16x16 blocks in the m
                                            // dimension (batchsize) of the
@@ -31,6 +30,8 @@ template <
                                            // only works when thread_m_blocks == 1
     const int stages,                      // number of stages for the async global->shared
                                            // fetch pipeline
+    const bool has_act_order,              // whether act_order is enabled
+    const bool has_zp,                     // whether zero-points are enabled
     const int group_blocks,                // number of consecutive 16x16 blocks
                                            // with a separate quantization scale
     const bool is_zp_float                 // is zero point of float16 type?

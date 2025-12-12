@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import glob
 import itertools
 import os
@@ -12,6 +11,9 @@ FILE_HEAD = """
 // clang-format off
 #pragma once
 
+#include "kernel.h"
+#include "marlin_template.h"
+
 namespace MARLIN_NAMESPACE_NAME {
 """.strip()
 
@@ -19,13 +21,14 @@ TEMPLATE = (
     "template __global__ void Marlin<"
     "{{scalar_t}}, "
     "{{w_type_id}}, "
-    "{{s_type_id}}, "
     "{{threads}}, "
     "{{thread_m_blocks}}, "
     "{{thread_n_blocks}}, "
     "{{thread_k_blocks}}, "
     "{{'true' if m_block_size_8 else 'false'}}, "
     "{{stages}}, "
+    "{{'true' if has_act_order else 'false'}}, "
+    "{{'true' if has_zp else 'false'}}, "
     "{{group_blocks}}, "
     "{{'true' if is_zp_float else 'false'}}>"
     "( MARLIN_KERNEL_PARAMS );"
@@ -44,15 +47,10 @@ KERNEL_FILE_NAME = "kernel_marlin.cuh"
 
 # int8 with zero point case (sglang::kU8) is also supported,
 # we don't add it to reduce wheel size.
-# Only keep the most commonly used types to reduce compilation time
-SCALAR_TYPES = [
-    "sglang::kU4",
-    "sglang::kU4B8",
-    "sglang::kU8B128",
-]
-THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256)]
+SCALAR_TYPES = ["sglang::kU4", "sglang::kU4B8", "sglang::kU8B128"]
+THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128)]
 
-THREAD_M_BLOCKS = [0.5, 1, 2, 4]
+THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
 # group_blocks:
 #   = 0 : act order case
 #   = -1 : channelwise quantization
@@ -69,36 +67,21 @@ def remove_old_kernels():
 def generate_new_kernels():
     kernel_files = set()
     for scalar_type, dtype in itertools.product(SCALAR_TYPES, DTYPES):
+        has_zp = "B" not in scalar_type
         all_template_str_list = []
 
         for group_blocks, m_blocks, thread_configs in itertools.product(
             GROUP_BLOCKS, THREAD_M_BLOCKS, THREAD_CONFIGS
         ):
-            # act order case only support gptq-int4 and gptq-int8
-            if group_blocks == 0 and scalar_type not in [
-                "sglang::kU4B8",
-                "sglang::kU8B128",
-            ]:
+
+            has_act_order = group_blocks == 0
+            if has_zp and has_act_order:
                 continue
             if thread_configs[2] == 256:
-                # for small batch (m_blocks == 1), we only need (128, 128, 256)
-                # for large batch (m_blocks > 1), we only need (64, 256, 256)
                 if m_blocks <= 1 and thread_configs[0] != 128:
                     continue
                 if m_blocks > 1 and thread_configs[0] != 64:
                     continue
-
-            # we only support channelwise quantization and group_size == 128
-            # for fp8
-            if scalar_type == "sglang::kFE4M3fn" and group_blocks not in [-1, 8]:
-                continue
-            # nvfp4 only supports group_size == 16
-            # mxfp4 only supports group_size == 32
-            if scalar_type == "sglang::kFE2M1f" and group_blocks not in [1, 2]:
-                continue
-            # other quantization methods don't support group_size = 16
-            if scalar_type != "sglang::kFE2M1f" and group_blocks == 1:
-                continue
 
             k_blocks = thread_configs[0] // 16
             n_blocks = thread_configs[1] // 16
@@ -106,28 +89,17 @@ def generate_new_kernels():
 
             c_dtype = "half" if dtype == "fp16" else "nv_bfloat16"
 
-            if scalar_type == "sglang::kFE2M1f" and group_blocks == 1:
-                s_type = "sglang::kFE4M3fn"
-            elif scalar_type == "sglang::kFE2M1f" and group_blocks == 2:
-                s_type = "sglang::kFE8M0fnu"
-                if dtype == "fp16":
-                    # we cannot safely dequantize e8m0 to fp16, so skip this
-                    continue
-            elif dtype == "fp16":
-                s_type = "sglang::kFloat16"
-            elif dtype == "bf16":
-                s_type = "sglang::kBFloat16"
-
             template_str = jinja2.Template(TEMPLATE).render(
                 scalar_t=c_dtype,
                 w_type_id=scalar_type + ".id()",
-                s_type_id=s_type + ".id()",
                 threads=threads,
                 thread_m_blocks=max(m_blocks, 1),
                 thread_n_blocks=n_blocks,
                 thread_k_blocks=k_blocks,
                 m_block_size_8=m_blocks == 0.5,
                 stages="pipe_stages",
+                has_act_order=has_act_order,
+                has_zp=has_zp,
                 group_blocks=group_blocks,
                 is_zp_float=False,
             )
@@ -136,7 +108,6 @@ def generate_new_kernels():
 
         file_content = FILE_HEAD + "\n\n"
         file_content += "\n\n".join(all_template_str_list) + "\n\n}\n"
-        # Remove "sglang::" prefix (8 chars) from scalar_type for filename
         filename = f"kernel_{dtype}_{scalar_type[8:].lower()}.cuh"
 
         with open(os.path.join(os.path.dirname(__file__), filename), "w") as f:

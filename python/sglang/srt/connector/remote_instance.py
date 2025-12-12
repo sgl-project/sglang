@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from typing import Generator, Optional, Tuple
+from typing import Generator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import torch

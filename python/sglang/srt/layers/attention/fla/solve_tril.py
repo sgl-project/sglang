@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -69,6 +70,7 @@ def solve_tril_16x16_kernel(
     )
 
 
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -148,6 +150,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     )
 
 
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -431,7 +434,6 @@ def solve_tril(
         T=T,
         H=H,
         BT=BT,
-        IS_VARLEN=cu_seqlens is not None,
         num_warps=1,
         num_stages=4,
     )
@@ -457,7 +459,6 @@ def solve_tril(
         T=T,
         H=H,
         BT=BT,
-        IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=3,
     )

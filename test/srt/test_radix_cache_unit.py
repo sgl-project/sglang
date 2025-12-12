@@ -240,9 +240,11 @@ class TestRadixCache(unittest.TestCase):
             with self.subTest(
                 page_size=page_size, disable=disable, enable_events=enable_events
             ):
-                cache = RadixCache.create_simulated(
-                    disable=disable,
+                cache = RadixCache(
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
                     page_size=page_size,
+                    disable=disable,
                     enable_kv_cache_events=enable_events,
                 )
 
@@ -255,7 +257,9 @@ class TestRadixCache(unittest.TestCase):
 
     def test_reset(self):
         """Test reset method."""
-        cache = RadixCache.create_simulated()
+        cache = RadixCache(
+            req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
+        )
 
         # Insert some data
         cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
@@ -271,7 +275,12 @@ class TestRadixCache(unittest.TestCase):
         """Test basic insert and match operations."""
         for disable_cache in [False, True]:
             with self.subTest(disable_cache=disable_cache):
-                cache = RadixCache.create_simulated(disable=disable_cache)
+                cache = RadixCache(
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    page_size=1,
+                    disable=disable_cache,
+                )
 
                 key = RadixKey([1, 2, 3])
                 value = torch.tensor([10, 20, 30], dtype=torch.int64)
@@ -298,9 +307,77 @@ class TestRadixCache(unittest.TestCase):
                     result.device_indices, torch.tensor([10, 20], dtype=torch.int64)
                 )
 
+    def test_insert_and_match_eagle(self):
+        """Test insert and match operations for EAGLE."""
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=False,
+            is_eagle=True,
+        )
+
+        key = RadixKey([1, 2, 3, 4])
+        value = torch.tensor([10, 20, 30, 40], dtype=torch.int64)
+        prefix_len = cache.insert(key, value)
+
+        self.assertEqual(prefix_len, 0)  # No existing prefix
+        self.assertEqual(
+            cache.total_size(), 3
+        )  # The last token is ignored in bigram key
+        self.assertEqual(cache.evictable_size(), 3)
+
+        # Test match_prefix
+        result = cache.match_prefix(RadixKey([1, 2, 3, 4]))
+        self.assertEqual(len(result.device_indices), 3)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([10, 20, 30], dtype=torch.int64)
+        )
+
+        # Test partial match
+        result = cache.match_prefix(RadixKey([1, 2]))
+        self.assertEqual(len(result.device_indices), 1)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([10], dtype=torch.int64)
+        )
+
+    def test_insert_and_match_eagle_page_size(self):
+        """Test insert and match operations for EAGLE and page_size > 1."""
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=2,
+            disable=False,
+            is_eagle=True,
+        )
+
+        key = RadixKey([1, 2, 3])
+        value = torch.tensor([10, 20, 30], dtype=torch.int64)
+        prefix_len = cache.insert(key, value)
+
+        self.assertEqual(prefix_len, 0)  # No existing prefix
+        self.assertEqual(cache.total_size(), 2)  # only one page is inserted
+        self.assertEqual(cache.evictable_size(), 2)
+
+        # Test match_prefix
+        result = cache.match_prefix(RadixKey([1, 2, 3, 4]))
+        self.assertEqual(len(result.device_indices), 2)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([10, 20], dtype=torch.int64)
+        )
+
+        # Test unmatched
+        result = cache.match_prefix(RadixKey([1, 2]))
+        self.assertEqual(len(result.device_indices), 0)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([], dtype=torch.int64)
+        )
+
     def test_insert_with_none_value(self):
         """Test insert with None value (should use token_ids as list)."""
-        cache = RadixCache.create_simulated()
+        cache = RadixCache(
+            req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
+        )
 
         key = RadixKey([1, 2, 3])
         prefix_len = cache.insert(key, None)
@@ -311,7 +388,9 @@ class TestRadixCache(unittest.TestCase):
 
     def test_total_size(self):
         """Test total_size calculation."""
-        cache = RadixCache.create_simulated()
+        cache = RadixCache(
+            req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
+        )
 
         self.assertEqual(cache.total_size(), 0)
 
@@ -331,8 +410,11 @@ class TestRadixCache(unittest.TestCase):
 
         for page_size, enable_events in test_cases:
             with self.subTest(page_size=page_size, enable_events=enable_events):
-                cache = RadixCache.create_simulated(
-                    page_size=page_size, enable_kv_cache_events=enable_events
+                cache = RadixCache(
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    page_size=page_size,
+                    enable_kv_cache_events=enable_events,
                 )
 
                 # Insert data
@@ -358,8 +440,11 @@ class TestRadixCache(unittest.TestCase):
         mock_allocator = unittest.mock.Mock()
         mock_allocator.device = torch.device("cpu")
 
-        cache = RadixCache.create_simulated(
-            mock_allocator=mock_allocator, enable_kv_cache_events=True
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+            enable_kv_cache_events=True,
         )
 
         # Insert and then evict data
@@ -381,7 +466,9 @@ class TestRadixCache(unittest.TestCase):
 
     def test_extra_key_isolation(self):
         """Test that keys with different extra_key values are isolated."""
-        cache = RadixCache.create_simulated()
+        cache = RadixCache(
+            req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
+        )
 
         # Insert same token sequence with different extra keys
         cache.insert(
@@ -421,7 +508,9 @@ class TestRadixCache(unittest.TestCase):
 
     def test_lock_ref_operations(self):
         """Test lock reference counting operations."""
-        cache = RadixCache.create_simulated()
+        cache = RadixCache(
+            req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
+        )
 
         # Insert sequence
         cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
@@ -448,7 +537,11 @@ class TestRadixCache(unittest.TestCase):
         mock_allocator = unittest.mock.Mock()
         mock_allocator.device = torch.device("cpu")
 
-        cache = RadixCache.create_simulated(mock_allocator=mock_allocator)
+        cache = RadixCache(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=1,
+        )
 
         # Insert sequences
         cache.insert(RadixKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
@@ -473,7 +566,11 @@ class TestRadixCache(unittest.TestCase):
 
         for page_size, sequence_length in test_cases:
             with self.subTest(page_size=page_size, sequence_length=sequence_length):
-                cache = RadixCache.create_simulated(page_size=page_size)
+                cache = RadixCache(
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    page_size=page_size,
+                )
 
                 tokens = list(range(sequence_length))
                 cache.insert(RadixKey(tokens), torch.tensor(tokens, dtype=torch.int64))
@@ -487,7 +584,9 @@ class TestRadixCache(unittest.TestCase):
 
     def test_pretty_print_basic(self):
         """Test pretty_print produces output."""
-        cache = RadixCache.create_simulated()
+        cache = RadixCache(
+            req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
+        )
 
         cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 20, 30], dtype=torch.int64))
 
@@ -499,7 +598,9 @@ class TestRadixCache(unittest.TestCase):
 
     def test_all_values_flatten(self):
         """Test all_values_flatten method."""
-        cache = RadixCache.create_simulated()
+        cache = RadixCache(
+            req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=1
+        )
 
         cache.insert(RadixKey([1, 2]), torch.tensor([10, 20], dtype=torch.int64))
         cache.insert(RadixKey([3, 4]), torch.tensor([30, 40], dtype=torch.int64))
@@ -514,7 +615,11 @@ class TestRadixCache(unittest.TestCase):
         """Advanced prefix matching: splits inside nodes and across pages."""
         for page_size in [1, 2]:
             with self.subTest(page_size=page_size):
-                cache = RadixCache.create_simulated(page_size=page_size)
+                cache = RadixCache(
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    page_size=page_size,
+                )
 
                 # Insert a long sequence that will be split later.
                 seq1 = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -552,94 +657,6 @@ class TestRadixCache(unittest.TestCase):
                 # Matching the short diverging branch should return exactly its indices.
                 result_branch = cache.match_prefix(RadixKey(seq2))
                 torch.testing.assert_close(result_branch.device_indices, val2)
-
-    def test_hash_value_storage(self):
-        """Test that hash_value is stored correctly after insert operations."""
-        cache = RadixCache.create_simulated(
-            page_size=4,
-            enable_kv_cache_events=True,
-        )
-
-        # Insert a sequence
-        cache.insert(RadixKey([1, 2, 3, 4, 5, 6, 7, 8]), None)
-
-        # Trigger event emission to compute hash_value lazily
-        cache.take_events()
-
-        # Find the inserted node (traverse from root)
-        node = cache.root_node
-        for i in range(0, 8, 4):  # page_size=4, so 2 pages
-            child_key = tuple([1, 2, 3, 4][:4]) if i == 0 else tuple([5, 6, 7, 8][:4])
-            if child_key in node.children:
-                node = node.children[child_key]
-                break
-
-        # Verify hash_value is set (computed lazily during event emission)
-        self.assertIsNotNone(node.hash_value)
-        # Should have 2 pages (8 tokens / 4 page_size)
-        self.assertEqual(len(node.hash_value), 2)
-
-    def test_hash_value_repeating_tokens(self):
-        """Test that repeating token patterns get different hash values."""
-        cache = RadixCache.create_simulated(
-            page_size=4,
-            enable_kv_cache_events=True,
-        )
-
-        # Insert a sequence with repeating token pattern: [1,2,3,4, 1,2,3,4]
-        cache.insert(RadixKey([1, 2, 3, 4, 1, 2, 3, 4]), None)
-
-        events = cache.take_events()
-        block_stored_events = [e for e in events if isinstance(e, BlockStored)]
-
-        # Should have 2 blocks (2 pages of size 4)
-        self.assertEqual(len(block_stored_events), 2)
-
-        # Extract block hashes
-        block_hash_1 = block_stored_events[0].block_hashes[0]
-        block_hash_2 = block_stored_events[1].block_hashes[0]
-
-        # The two blocks should have DIFFERENT hashes despite same content
-        # because they are at different positions (sequence-aware hashing)
-        self.assertNotEqual(
-            block_hash_1,
-            block_hash_2,
-            "Repeating token patterns should get different sequence-aware hashes",
-        )
-
-        # First block should have no parent
-        self.assertIsNone(block_stored_events[0].parent_block_hash)
-
-        # Second block's parent should be the first block's hash
-        self.assertEqual(block_stored_events[1].parent_block_hash, block_hash_1)
-
-    def test_hash_value_split(self):
-        """Test that hash_value is split correctly when nodes are split."""
-        cache = RadixCache.create_simulated(
-            page_size=2,
-            enable_kv_cache_events=True,
-        )
-
-        # Insert a sequence that will cause a split
-        cache.insert(RadixKey([1, 2, 3, 4]), None)
-        cache.take_events()  # Clear events and compute hash_value for first node
-
-        # Insert a diverging sequence that will cause a split at page boundary
-        cache.insert(RadixKey([1, 2, 5, 6]), None)
-        cache.take_events()  # Trigger event emission to compute hash_value
-
-        # Find the split node
-        node = cache.root_node
-        child_key = tuple([1, 2])
-        if child_key in node.children:
-            node = node.children[child_key]
-            # After split and event emission, hash_value should be computed
-            # Note: If hash_value wasn't set before split, it will be computed lazily
-            # during event emission. If it was set, it will be split.
-            # Either way, after events are emitted, it should be set.
-            self.assertIsNotNone(node.hash_value)
-            # Should have 1 page (split at page_size=2)
-            self.assertEqual(len(node.hash_value), 1)
 
 
 if __name__ == "__main__":

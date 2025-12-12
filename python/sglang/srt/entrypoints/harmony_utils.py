@@ -3,6 +3,7 @@
 # Adapted from vLLM: https://github.com/vllm-project/vllm/blob/1b9902806915040ac9b3029f2ab7522ec505afc3/vllm/entrypoints/harmony_utils.py
 # Slight differences in processing chat messages
 import datetime
+import json
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 
@@ -345,7 +346,11 @@ def parse_remaining_state(parser: StreamableParser):
         return [reasoning_item]
     elif parser.current_channel == "final":
         output_text = ResponseOutputText(
-            text=parser.current_content,
+            content=[
+                ResponseReasoningTextContent(
+                    text=parser.current_content, type="reasoning_text"
+                )
+            ],
             annotations=[],  # TODO
             type="output_text",
             logprobs=None,  # TODO

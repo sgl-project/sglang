@@ -93,17 +93,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
-        # Resolve LoRA adapter from model parameter or explicit lora_path
-        lora_path = self._resolve_lora_path(request.model, request.lora_path)
-        if lora_path:
-            first_adapter = (
-                lora_path
-                if isinstance(lora_path, str)
-                else next((a for a in lora_path if a), None)
-            )
-            if first_adapter:
-                self._validate_lora_enabled(first_adapter)
-
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             sampling_params=sampling_params,
@@ -112,17 +101,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
             logprob_start_len=logprob_start_len,
             return_text_in_logprobs=True,
             stream=request.stream,
-            lora_path=lora_path,
+            lora_path=request.lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
-            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request
@@ -151,7 +138,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
-            "custom_params": request.custom_params,
         }
 
         # Handle response_format constraints
@@ -272,16 +258,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[choice_data],
                     model=request.model,
                 )
-
-                # Add usage stats if continuous_usage_stats is enabled
-                if (
-                    request.stream_options
-                    and request.stream_options.continuous_usage_stats
-                ):
-                    chunk.usage = UsageProcessor.calculate_token_usage(
-                        prompt_tokens=prompt_tokens.get(index, 0),
-                        completion_tokens=completion_tokens.get(index, 0),
-                    )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
 

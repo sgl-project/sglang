@@ -8,19 +8,16 @@ from torch.nn import functional as F
 
 from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.token_dispatcher import (
-    StandardCombineInput,
-    StandardDispatchOutput,
-)
+from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
 def fused_moe_forward_native(
     layer: torch.nn.Module,
     dispatch_output: StandardDispatchOutput,
-) -> StandardCombineInput:
+) -> torch.Tensor:
 
-    x, x_scale, topk_output = dispatch_output
+    x, topk_output = dispatch_output
     moe_runner_config = layer.moe_runner_config
 
     if moe_runner_config.apply_router_weight_on_input:
@@ -40,10 +37,7 @@ def fused_moe_forward_native(
         raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
     x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
-    expert_outs = torch.einsum(
-        "tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)
-    )
-    return StandardCombineInput(hidden_states=expert_outs)
+    return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
 
 
 def moe_forward_native(

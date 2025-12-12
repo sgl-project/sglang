@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
@@ -159,33 +160,6 @@ class QuantizationConfig(ABC):
         this method should only be overwritten by subclasses in exceptional
         circumstances
         """
-        return None
-
-    @classmethod
-    def _modelopt_override_quantization_method(
-        cls, hf_quant_config, user_quant
-    ) -> Optional[str]:
-        """Shared ModelOpt quantization method override logic."""
-        if hf_quant_config is None:
-            return None
-
-        # Check if this is a ModelOpt config
-        quant_algo = hf_quant_config.get("quant_algo", "").upper()
-
-        # If user specified generic "modelopt", auto-detect the specific method
-        if user_quant == "modelopt":
-            if "FP8" in quant_algo:
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
-
-        # The hf_quant_config may be a parsed quant config, so we need to check the
-        # quant_method.
-        if hf_quant_config.get("quant_method", "") == "modelopt_fp8":
-            return "modelopt_fp8"
-        elif hf_quant_config.get("quant_method", "") == "modelopt_fp4":
-            return "modelopt_fp4"
-
         return None
 
     @staticmethod

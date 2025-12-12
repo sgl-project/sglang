@@ -8,11 +8,12 @@ from einops import rearrange, repeat
 
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
-from sglang.utils import is_in_ci
 
 # Added by the IBM Team, 2024
 
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/modules/ssd_minimal.py
+
+# TODO: These take a long time to run - we should cut down on some of the parameterized matrix.
 
 
 # this is the segsum implementation taken from above
@@ -190,22 +191,10 @@ def generate_continuous_batched_examples(
         )
 
 
-SINGLE_ITYPE = [torch.float32, torch.float16, torch.bfloat16]
-SINGLE_NHEADS = [3, 4, 11, 16, 32]
-SINGLE_DHEAD = [5, 8, 19, 32, 128]
-SINGLE_SEQ_LEN_CHUNK_SIZE = [(112, 16), (128, 32)]
-
-if is_in_ci():
-    SINGLE_ITYPE = [torch.float32, torch.bfloat16]
-    SINGLE_NHEADS = [3, 32]
-    SINGLE_DHEAD = [5, 128]
-    SINGLE_SEQ_LEN_CHUNK_SIZE = [(112, 16)]
-
-
-@pytest.mark.parametrize("itype", SINGLE_ITYPE)
-@pytest.mark.parametrize("n_heads", SINGLE_NHEADS)
-@pytest.mark.parametrize("d_head", SINGLE_DHEAD)
-@pytest.mark.parametrize("seq_len_chunk_size", SINGLE_SEQ_LEN_CHUNK_SIZE)
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("n_heads", [3, 4, 11, 16, 32])
+@pytest.mark.parametrize("d_head", [5, 8, 19, 32, 128])
+@pytest.mark.parametrize("seq_len_chunk_size", [(112, 16), (128, 32)])
 def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, itype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
@@ -249,19 +238,9 @@ def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, it
     )
 
 
-BATCHED_ITYPE = [torch.float32, torch.float16]
-BATCHED_NHEADS = [4, 8, 13]
-BATCHED_DHEAD = [5, 16, 21, 32]
-
-if is_in_ci():
-    BATCHED_ITYPE = [torch.float32]
-    BATCHED_NHEADS = [4, 13]
-    BATCHED_DHEAD = [5, 32]
-
-
-@pytest.mark.parametrize("itype", BATCHED_ITYPE)
-@pytest.mark.parametrize("n_heads", BATCHED_NHEADS)
-@pytest.mark.parametrize("d_head", BATCHED_DHEAD)
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("n_heads", [4, 8, 13])
+@pytest.mark.parametrize("d_head", [5, 16, 21, 32])
 @pytest.mark.parametrize(
     "seq_len_chunk_size_cases",
     [
@@ -600,7 +579,3 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x: f"seq{i} state " + x,
         )  # noqa: B023
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])

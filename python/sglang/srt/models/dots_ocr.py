@@ -6,6 +6,7 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from transformers.activations import ACT2FN
 
 from sglang.srt.configs import DotsOCRConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -21,6 +22,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dots_vlm_vit import DotsVisionTransformer
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 

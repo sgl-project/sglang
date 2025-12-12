@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name, is_cuda
+from sglang.srt.utils import get_bool_env_var, get_device_name, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:

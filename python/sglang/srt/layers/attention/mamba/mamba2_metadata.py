@@ -16,7 +16,6 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -27,11 +26,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
-    retrieve_next_token: Optional[torch.Tensor] = None
-    retrieve_next_sibling: Optional[torch.Tensor] = None
-    retrieve_parent_token: Optional[torch.Tensor] = None
-    is_target_verify: bool = False
-    draft_token_num: int = 1
 
 
 @dataclass(kw_only=True)
@@ -143,45 +137,31 @@ class Mamba2Metadata(ForwardMetadata):
 
     @staticmethod
     def prepare_decode(
-        forward_metadata: ForwardMetadata,
+        query_start_loc: torch.Tensor,
+        mamba_cache_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        *,
-        is_target_verify: bool,
-        draft_token_num: int,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
-            query_start_loc=forward_metadata.query_start_loc,
-            mamba_cache_indices=forward_metadata.mamba_cache_indices,
-            retrieve_next_token=forward_metadata.retrieve_next_token,
-            retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
-            retrieve_parent_token=forward_metadata.retrieve_parent_token,
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_cache_indices,
             num_decodes=len(seq_lens),
             num_prefills=0,
             num_prefill_tokens=0,
-            is_target_verify=is_target_verify,
-            draft_token_num=draft_token_num,
         )
 
     @classmethod
     def prepare_mixed(
         cls,
-        forward_metadata: ForwardMetadata,
+        query_start_loc: torch.Tensor,
+        mamba_cache_indices: torch.Tensor,
         chunk_size: int,
         forward_batch: ForwardBatch,
     ) -> "Mamba2Metadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
         if forward_batch.extend_num_tokens is None:
-            draft_token_num = (
-                forward_batch.spec_info.draft_token_num
-                if forward_batch.spec_info is not None
-                else 1
-            )
             return cls.prepare_decode(
-                forward_metadata,
-                forward_batch.seq_lens,
-                is_target_verify=forward_batch.forward_mode.is_target_verify(),
-                draft_token_num=draft_token_num,
+                query_start_loc, mamba_cache_indices, forward_batch.seq_lens
             )
         num_prefills = len(forward_batch.extend_seq_lens)
         num_prefill_tokens = forward_batch.extend_num_tokens
@@ -192,7 +172,7 @@ class Mamba2Metadata(ForwardMetadata):
         has_initial_states = context_lens_tensor > 0
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
-        query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
+        query_start_loc = query_start_loc[: num_prefills + 1]
         seq_idx = torch.repeat_interleave(
             torch.arange(
                 num_prefills, dtype=torch.int32, device=query_start_loc.device
@@ -213,22 +193,12 @@ class Mamba2Metadata(ForwardMetadata):
                 )
             )
 
-        draft_token_num = (
-            getattr(forward_batch.spec_info, "draft_token_num", 1)
-            if forward_batch.spec_info is not None
-            else 1
-        )
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
-            mamba_cache_indices=forward_metadata.mamba_cache_indices,
-            retrieve_next_token=forward_metadata.retrieve_next_token,
-            retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
-            retrieve_parent_token=forward_metadata.retrieve_parent_token,
+            mamba_cache_indices=mamba_cache_indices,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
-            is_target_verify=forward_batch.forward_mode.is_target_verify(),
-            draft_token_num=draft_token_num,
             mixed_metadata=cls.MixedMetadata(
                 has_initial_states=has_initial_states,
                 prep_initial_states=prep_initial_states,

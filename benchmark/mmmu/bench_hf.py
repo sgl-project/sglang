@@ -36,9 +36,8 @@ def eval_mmmu(args):
         try:
             # check if the model is belongs to internvl
             if "InternVL" in args.model_path:
+                from internvl_utils import load_image
                 from transformers import AutoTokenizer
-
-                from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
 
                 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
                 model = AutoModel.from_pretrained(
@@ -81,11 +80,7 @@ def eval_mmmu(args):
         assert image is not None
 
         if "InternVL" in args.model_path:
-            image = PIL.Image.open(sample["image_path"]).convert("RGB")
-            pixel_values = image_to_pixel_values(
-                image, input_size=448, max_num=12, use_thumbnail=True
-            )
-            pixel_values = pixel_values.to(device="cuda", dtype=torch.bfloat16)
+            pixel_values = load_image(sample["image_path"]).to(torch.bfloat16).cuda()
             contents = ""
             if prefix:
                 contents += prefix

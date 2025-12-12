@@ -3,7 +3,6 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.allocator import SWAKVPool, SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -111,13 +110,11 @@ class TestSWA(unittest.TestCase):
         )
         # setup radix cache
         tree = SWARadixCache(
-            params=CacheInitParams(
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                disable=False,
-                page_size=1,
-            ),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
             sliding_window_size=sliding_window_size,
+            page_size=1,
+            disable=False,
         )
 
         # test
@@ -244,14 +241,12 @@ class TestSWA(unittest.TestCase):
         )
         # setup radix cache
         tree = SWARadixCache(
-            params=CacheInitParams(
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-                disable=False,
-                is_eagle=True,
-            ),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
             sliding_window_size=sliding_window_size,
+            page_size=1,
+            disable=False,
+            is_eagle=True,
         )
 
         # test

@@ -1,10 +1,7 @@
-import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Dict, List, Literal, Optional
-
-import requests
 
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -63,8 +60,6 @@ class BaseTestGptOss(CustomTestCase):
         )
 
         try:
-            self._check_streaming_responses_api_request(model)
-
             # run multiple tests in parallel since we are mostly bound by the longest generate sequence
             # instead of the number of questions
             with ThreadPoolExecutor(max_workers=4) as executor:
@@ -83,42 +78,6 @@ class BaseTestGptOss(CustomTestCase):
                 )
         finally:
             kill_process_tree(process.pid)
-
-    def _check_streaming_responses_api_request(self, model):
-        # Use requests to verify /v1/responses streaming
-        url = f"{_base_url}/v1/responses"
-        payload = {
-            "model": model,
-            "input": "What is 1 + 1?",
-            "stream": True,
-            "temperature": 0,
-        }
-
-        response = requests.post(url, json=payload, stream=True)
-        if response.status_code != 200:
-            print(f"Response API failed: {response.text}")
-        response.raise_for_status()
-
-        content = ""
-        for line in response.iter_lines():
-            if line:
-                decoded_line = line.decode("utf-8")
-                if decoded_line.startswith("data: "):
-                    data_str = decoded_line[6:]
-                    if data_str.strip() == "[DONE]":
-                        break
-
-                    try:
-                        data = json.loads(data_str)
-                        if data.get("type") == "response.output_text.delta":
-                            delta = data.get("delta", "")
-                            content += delta
-                    except json.JSONDecodeError:
-                        pass
-
-        print(f"Streaming check response: {content}")
-        self.assertTrue(len(content) > 0)
-        self.assertIn("2", content)
 
     def _run_one_eval(self, model, reasoning_effort, expected_score):
         args = SimpleNamespace(

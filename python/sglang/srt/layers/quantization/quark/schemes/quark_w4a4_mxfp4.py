@@ -2,18 +2,20 @@
 
 from typing import Any, Callable, Optional
 
+import aiter
 import torch
+import torch.nn.functional as F
+from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
+from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.utility import dtypes
+from aiter.utility.fp4_utils import e8m0_shuffle
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-if _is_hip:
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-
+from sglang.srt.utils import get_bool_env_var
 
 __all__ = ["QuarkW4A4MXFP4"]
 

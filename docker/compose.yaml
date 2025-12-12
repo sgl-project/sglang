@@ -13,9 +13,9 @@ services:
     # ports:
     #   - 30000:30000
     environment:
-      - HF_TOKEN=<secret>
+      HF_TOKEN: <secret>
       # if you use modelscope to download model, you need set this environment
-      # - SGLANG_USE_MODELSCOPE=true
+      # - SGLANG_USE_MODELSCOPE: true
     entrypoint: python3 -m sglang.launch_server
     command: --model-path meta-llama/Llama-3.1-8B-Instruct
       --host 0.0.0.0
@@ -31,5 +31,5 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["0"]
               capabilities: [gpu]

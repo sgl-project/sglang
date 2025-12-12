@@ -1,16 +1,9 @@
 #include "ngram.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <limits>
-#include <list>
-#include <mutex>
 #include <queue>
-#include <stdexcept>
-#include <thread>
-#include <tuple>
-#include <unordered_map>
 #include <vector>
 
 namespace ngram {

@@ -81,7 +81,7 @@ Comprehensive example:
 python3 -m sglang_router.launch_server \
   --host 0.0.0.0 \
   --port 8080 \
-  --model meta-llama/Llama-3.1-8B-Instruct \
+  --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
   --tp-size 1 \
   --dp-size 8 \
   --grpc-mode \
@@ -91,7 +91,7 @@ python3 -m sglang_router.launch_server \
   --router-health-success-threshold 2 \
   --router-health-check-timeout-secs 6000 \
   --router-health-check-interval-secs 60 \
-  --router-model-path meta-llama/Llama-3.1-8B-Instruct \
+  --router-model-path /raid/models/meta-llama/Llama-3.1-8B-Instruct \
   --router-policy round_robin \
   --router-log-level debug
 ```
@@ -117,7 +117,7 @@ Use SRT gRPC workers to unlock the highest throughput and access native reasonin
 ```bash
 # Workers expose gRPC endpoints
 python -m sglang.launch_server \
-  --model meta-llama/Llama-3.1-8B-Instruct \
+  --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
   --grpc-mode \
   --port 20000
 
@@ -133,13 +133,14 @@ python -m sglang_router.launch_router \
 > gRPC router supports both single-stage and PD serving. Provide `--tokenizer-path` or `--model-path` (HF repo or local directory) plus optional `--chat-template`.
 
 ### Prefill/Decode Disaggregation
-Split prefill and decode workers for PD-aware caching and balancing. Specifying `--policy A` is equivalent to `--prefill-policy A --decode-policy A`.
+Split prefill and decode workers for PD-aware caching and balancing.
 
 ```bash
 python -m sglang_router.launch_router \
   --pd-disaggregation \
   --prefill http://prefill1:30001 9001 \
   --decode http://decode1:30011 \
+  --policy cache_aware \
   --prefill-policy cache_aware \
   --decode-policy power_of_two
 ```
@@ -151,6 +152,7 @@ Proxy OpenAI-compatible endpoints (OpenAI, xAI, etc.) while keeping history and 
 python -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
+  --api-key "$OPENAI_API_KEY" \
   --history-backend memory
 ```
 
@@ -169,13 +171,13 @@ curl -X POST http://localhost:30000/workers \
   -d '{"url":"grpc://0.0.0.0:31000","worker_type":"regular"}'
 
 # Inspect registry
-curl http://localhost:30000/workers
+curl http://localhost:30000/workers | jq
 
 # Remove a worker
-curl -X DELETE http://localhost:30000/workers/grpc%3A%2F%2F0.0.0.0%3A31000
+curl -X DELETE http://localhost:30000/workers/grpc://0.0.0.0:31000
 ```
 
-Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{url}` returns both registry data and queued job status. The worker url in the removal request should be escaped.
+Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{url}` returns both registry data and queued job status.
 
 ---
 
@@ -274,21 +276,10 @@ PD deployments can specify `--prefill-selector` and `--decode-selector` plus the
 | `memory` (default) | In-memory storage for quick prototyping. | `--history-backend memory` |
 | `none` | No persistence; APIs operate but store nothing. | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database-backed storage (pooled connections). | `--history-backend oracle` |
-| `postgres` | PostgreSQL Database-backed storage (pooled connections). | `--history-backend postgres` |
 
 Oracle configuration (choose DSN *or* TNS alias):
-Install the Oracle Instant Client and set `LD_LIBRARY_PATH` accordingly.
-Choose **one** connection method:
 ```bash
-# Option 1: Full connection descriptor
-export ATP_DSN="(description=(address=(protocol=tcps)(port=1522)(host=adb.region.oraclecloud.com))(connect_data=(service_name=service_name)))"
-
-# Option 2: TNS alias (requires wallet)
-export ATP_TNS_ALIAS="sglroutertestatp_high"
-export ATP_WALLET_PATH="/path/to/wallet"
-```
-Provide database credentials and optional pool sizing:
-```bash
+export ATP_DSN="tcps://host:port/service"  # or use ATP_TNS_ALIAS + ATP_WALLET_PATH
 export ATP_USER="admin"
 export ATP_PASSWORD="secret"
 export ATP_POOL_MIN=4
@@ -329,6 +320,7 @@ Use CLI flags to select parsers:
 | `POST`                | `/v1/completions`                        | OpenAI-compatible text completions.            |
 | `POST`                | `/v1/responses`                          | Create background responses (agentic loops).   |
 | `GET`                 | `/v1/responses/{id}`                     | Retrieve stored responses.                     |
+| `GET`                 | `/v1/responses/{id}/input`               | List captured input items.                     |
 | `POST`                | `/v1/embeddings`                         | Forward embedding requests.                    |
 | `POST`                | `/v1/rerank`                             | Ranking endpoint (`/rerank` synonym).          |
 | `POST`                | `/v1/conversations`                      | Create conversation metadata.                  |
@@ -435,14 +427,6 @@ Enable request ID propagation:
 python -m sglang_router.launch_router \
   --worker-urls http://worker1:8000 \
   --request-id-headers x-request-id x-trace-id
-```
-
-Enable opentelmetry tracing:
-```bash
-python -m sglang_router.launch_router \
-  --worker-urls http://worker1:8000 \
-  --enable-trace \
-  --otlp-traces-endpoint 0.0.0.0:4317
 ```
 
 ---

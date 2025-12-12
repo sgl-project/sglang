@@ -1,6 +1,7 @@
 import re
 import unittest
 
+import sgl_kernel
 import torch
 
 kernel = torch.ops.sgl_kernel

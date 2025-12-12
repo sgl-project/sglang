@@ -3,9 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
-    PDDisaggregationServerBase,
-)
+from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDisaggregationPPAccuracy(PDDisaggregationServerBase):
+class TestDisaggregationPPAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
