@@ -30,6 +30,7 @@ from PIL import Image
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -162,7 +163,7 @@ def is_in_amd_ci():
 
 def is_blackwell_system():
     """Return whether it is running on a Blackwell (B200) system."""
-    return get_bool_env_var("IS_BLACKWELL")
+    return envs.IS_BLACKWELL.get()
 
 
 def _use_cached_default_models(model_repo: str):

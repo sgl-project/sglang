@@ -679,8 +679,13 @@ class DeepseekV2MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
-            # and requires the output format to be standard. We use quant_config to determine the output format.
-            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if (quant_config is None)
+                and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                else None
+            ),
         )
 
         self.shared_experts_is_int8 = False
@@ -700,6 +705,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_ascend_fuseep()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -738,7 +744,11 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -755,7 +765,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -986,7 +998,14 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag:
-                shared_output = self._forward_shared_experts(hidden_states)
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                else:
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1105,6 +1124,12 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
+        if (
+            hidden_states.shape[0] > 0
+            and not sbo_enabled_flag
+            and self.alt_stream is not None
+        ):
+            torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -2734,12 +2759,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -2989,7 +3016,8 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_npu else None
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
