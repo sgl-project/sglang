@@ -163,9 +163,6 @@ class SGLangFailuresAnalyzer:
         runner_first_failure_in_streak: Dict[str, Optional[Dict]] = {}
         runner_last_failure_in_streak: Dict[str, Optional[Dict]] = {}
         runner_recovery_info: Dict[str, Optional[Dict]] = {}
-        runner_error_signatures: Dict[str, Dict[str, int]] = defaultdict(
-            lambda: defaultdict(int)
-        )
 
         # Track consecutive failures per runner instance
         runner_instance_current_streak: Dict[str, int] = defaultdict(int)
@@ -173,9 +170,6 @@ class SGLangFailuresAnalyzer:
         runner_instance_first_failure: Dict[str, Optional[Dict]] = {}
         runner_instance_last_failure: Dict[str, Optional[Dict]] = {}
         runner_instance_recovery: Dict[str, Optional[Dict]] = {}
-        runner_instance_error_signatures: Dict[str, Dict[str, int]] = defaultdict(
-            lambda: defaultdict(int)
-        )
 
         total_runs_processed = len(sorted_runs)
         for i, run in enumerate(sorted_runs, 1):
@@ -292,11 +286,6 @@ class SGLangFailuresAnalyzer:
                             "job_name": job_name,
                         }
 
-                    # Extract error signature for runner
-                    error_signature = self._extract_error_signature(job)
-                    if error_signature:
-                        runner_error_signatures[runner_key][error_signature] += 1
-
                     if runner_id:
                         runner_instance_stats[runner_instance_key]["failed_jobs"] += 1
                         runner_instance_stats[runner_instance_key]["jobs_failed"][
@@ -311,12 +300,6 @@ class SGLangFailuresAnalyzer:
                                 "job_url": job.get("html_url", run_info["url"]),
                                 "job_name": job_name,
                             }
-
-                        # Extract error signature for runner instance
-                        if error_signature:
-                            runner_instance_error_signatures[runner_instance_key][
-                                error_signature
-                            ] += 1
 
                 elif conclusion == "success":
                     runner_had_success[runner_key] = True
@@ -506,12 +489,6 @@ class SGLangFailuresAnalyzer:
         # Build runner streak data
         runner_streak_data = {}
         for runner_key in runner_total_jobs.keys():
-            # Get top 3 error signatures for this runner
-            error_sigs = runner_error_signatures.get(runner_key, {})
-            top_errors = sorted(error_sigs.items(), key=lambda x: x[1], reverse=True)[
-                :3
-            ]
-
             runner_streak_data[runner_key] = {
                 "current_streak": runner_current_streak[runner_key],
                 "max_streak": runner_max_streak[runner_key],
@@ -528,18 +505,11 @@ class SGLangFailuresAnalyzer:
                 ),
                 "last_failure_in_streak": runner_last_failure_in_streak.get(runner_key),
                 "recovery_info": runner_recovery_info.get(runner_key),
-                "top_error_signatures": top_errors,
             }
 
         # Build runner instance streak data
         runner_instance_streak_data = {}
         for instance_key in runner_instance_stats.keys():
-            # Get top 3 error signatures for this runner instance
-            error_sigs = runner_instance_error_signatures.get(instance_key, {})
-            top_errors = sorted(error_sigs.items(), key=lambda x: x[1], reverse=True)[
-                :3
-            ]
-
             runner_instance_streak_data[instance_key] = {
                 "current_streak": runner_instance_current_streak[instance_key],
                 "max_streak": runner_instance_max_streak[instance_key],
@@ -563,7 +533,6 @@ class SGLangFailuresAnalyzer:
                     instance_key
                 ),
                 "recovery_info": runner_instance_recovery.get(instance_key),
-                "top_error_signatures": top_errors,
             }
 
         return (
@@ -572,154 +541,6 @@ class SGLangFailuresAnalyzer:
             runner_streak_data,
             runner_instance_streak_data,
         )
-
-    def _extract_error_signature(self, job: Dict) -> str:
-        """
-        Extract error signature from a failed job.
-
-        Returns a simplified error type string.
-        """
-        # Check if job has steps with failures
-        steps = job.get("steps", [])
-        if not steps:
-            return "Unknown Error"
-
-        # Look for failed steps
-        failed_steps = [s for s in steps if s.get("conclusion") == "failure"]
-        if not failed_steps:
-            return "Unknown Error"
-
-        # Try to fetch and parse logs for the first failed step
-        first_failed_step = failed_steps[0]
-        step_number = first_failed_step.get("number")
-
-        # Attempt to get detailed error from logs
-        if step_number is not None:
-            try:
-                job_id = job.get("id")
-                # Fetch logs for this specific step
-                log_url = (
-                    f"{self.base_url}/repos/{self.repo}/actions/jobs/{job_id}/logs"
-                )
-                response = self.session.get(log_url, timeout=10)
-
-                if response.status_code == 200:
-                    log_text = response.text
-
-                    # Check for specific error patterns in logs (case-insensitive)
-                    log_lower = log_text.lower()
-
-                    # CUDA/GPU Memory errors (most common for GPU clusters)
-                    if (
-                        "cuda out of memory" in log_lower
-                        or "cudaerror: out of memory" in log_lower
-                    ):
-                        return "CUDA OOM"
-                    elif "out of memory" in log_lower and (
-                        "gpu" in log_lower or "device" in log_lower
-                    ):
-                        return "GPU OOM"
-                    elif "out of memory" in log_lower and "cuda" not in log_lower:
-                        return "Out of Memory"
-
-                    # CUDA/GPU device errors
-                    if (
-                        "cuda error: device-side assert" in log_lower
-                        or "device-side assert" in log_lower
-                    ):
-                        return "CUDA Device Assert"
-                    elif (
-                        "cuda error: an illegal memory access" in log_lower
-                        or "illegal memory access" in log_lower
-                    ):
-                        return "CUDA Illegal Memory Access"
-                    elif "cuda error" in log_lower or "cudaerror" in log_lower:
-                        return "CUDA Error"
-                    elif "gpu" in log_lower and (
-                        "hang" in log_lower or "hung" in log_lower
-                    ):
-                        return "GPU Hang"
-                    elif (
-                        "no cuda-capable device" in log_lower
-                        or "cuda device count" in log_lower
-                        and "0" in log_lower
-                    ):
-                        return "No GPU Available"
-
-                    # ROCm/AMD GPU errors
-                    if (
-                        "hipoutofmemoryerror" in log_lower
-                        or "hip out of memory" in log_lower
-                    ):
-                        return "ROCm OOM"
-                    elif "hiperror" in log_lower or "rocm error" in log_lower:
-                        return "ROCm/HIP Error"
-
-                    # NCCL/collective communication errors (multi-GPU)
-                    if "nccl error" in log_lower or "ncclerror" in log_lower:
-                        return "NCCL Error"
-                    elif "timeout after" in log_lower and "nccl" in log_lower:
-                        return "NCCL Timeout"
-
-                    # Process/system errors
-                    if "killed" in log_lower and (
-                        "oom" in log_lower or "out of memory" in log_lower
-                    ):
-                        return "Process Killed (OOM)"
-                    elif "killed" in log_lower or "sigkill" in log_lower:
-                        return "Process Killed"
-                    elif "segmentation fault" in log_lower or "sigsegv" in log_lower:
-                        return "Segmentation Fault"
-
-                    # Timeout errors
-                    if "timeout" in log_lower or "timed out" in log_lower:
-                        return "Timeout"
-
-                    # Connection/network errors
-                    if (
-                        "connection refused" in log_lower
-                        or "connection reset" in log_lower
-                    ):
-                        return "Connection Error"
-                    elif "ssh" in log_lower and (
-                        "failed" in log_lower or "error" in log_lower
-                    ):
-                        return "SSH Error"
-
-                    # Import/module errors
-                    if "modulenotfounderror" in log_lower or "importerror" in log_lower:
-                        return "Import Error"
-
-                    # Assertion errors
-                    if "assertionerror" in log_lower:
-                        return "Assertion Error"
-
-                    # Pytest-specific errors
-                    if (
-                        "pytest" in log_lower
-                        and "error" in log_lower
-                        and "collection" in log_lower
-                    ):
-                        return "Pytest Collection Error"
-
-            except Exception:
-                # If log fetching fails, fall back to step name analysis
-                pass
-
-        # Fallback to step name analysis if we couldn't get logs or didn't find specific errors
-        step_name = first_failed_step.get("name", "Unknown Step")
-
-        # Simplify common patterns based on step name
-        if "timeout" in step_name.lower():
-            return "Timeout"
-        elif "setup" in step_name.lower() or "install" in step_name.lower():
-            return "Setup/Installation Error"
-        elif "test" in step_name.lower():
-            return f"Test Failure: {step_name[:50]}"
-        elif "build" in step_name.lower():
-            return "Build Error"
-        else:
-            return f"Step Failed: {step_name[:50]}"
 
     def analyze_consecutive_failures(
         self, runs: List[Dict]
@@ -902,6 +723,9 @@ class SGLangFailuresAnalyzer:
         runner_streak_data: Optional[Dict[str, Dict]] = None,
         runner_instance_streak_data: Optional[Dict[str, Dict]] = None,
         output_file: Optional[str] = None,
+        pr_test_main_limit: int = 12,
+        nightly_main_limit: int = 6,
+        general_limit: int = 100,
     ):
         """Generate detailed failure analysis report."""
         print("\n" + "=" * 80)
@@ -981,14 +805,14 @@ class SGLangFailuresAnalyzer:
             ]
 
             # Always show section header
-            print("\n" + "=" * 120)
+            print("\n" + "=" * 130)
             if broken:
                 print(f"## {title} ({len(broken)} jobs with active streaks)")
-                print("=" * 120)
+                print("=" * 130)
                 print(
-                    f"\n{'Job Name':<40} {'Current':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Recent History':<30}"
+                    f"\n{'Job Name':<40} {'Current':<8} {'Max':<6} {'Runs':<6} {'First':<13} {'Last':<13} {'Recent History':<30}"
                 )
-                print("-" * 120)
+                print("-" * 130)
                 for job_name, d in broken[:15]:
                     display_name = (
                         job_name if len(job_name) <= 38 else job_name[:35] + "..."
@@ -1017,15 +841,15 @@ class SGLangFailuresAnalyzer:
                     # Color red if color_failures is True (for critical sections)
                     if color_failures:
                         print(
-                            f"\033[91m{display_name:<40}\033[0m {d['current_streak']:<8} {d['max_streak']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
+                            f"\033[91m{display_name:<40}\033[0m {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
                         )
                     else:
                         print(
-                            f"{display_name:<40} {d['current_streak']:<8} {d['max_streak']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
+                            f"{display_name:<40} {d['current_streak']:<8} {d['max_streak']:<6} {d['total_runs']:<6} {first_str:<13} {last_str:<13} {history_str:<30}"
                         )
             else:
                 print(f"## {title}")
-                print("=" * 120)
+                print("=" * 130)
                 print("\n✅ No jobs with active failure streaks (streak >= 2)")
 
             # Show recently failed jobs in a collapsed section (terminal doesn't support collapse, so just show as separate section)
@@ -1034,9 +858,9 @@ class SGLangFailuresAnalyzer:
                     f"\n   Recently failed jobs (no active streak): {len(recently_failed)} jobs"
                 )
                 print(
-                    f"   {'Job Name':<38} {'Total Failures':<15} {'Failure Rate':<15} {'Recent History':<30}"
+                    f"   {'Job Name':<38} {'Failures':<12} {'Fail Rate':<12} {'Total Runs':<12} {'Recent History (last 5)':<30}"
                 )
-                print("   " + "-" * 110)
+                print("   " + "-" * 120)
                 for job_name, d in recently_failed[:10]:
                     display_name = (
                         job_name if len(job_name) <= 36 else job_name[:33] + "..."
@@ -1048,33 +872,33 @@ class SGLangFailuresAnalyzer:
                         else "N/A"
                     )
                     print(
-                        f"   {display_name:<38} {d['total_failures']:<15} {d['failure_rate']:.1f}%{'':<10} {history_str:<30}"
+                        f"   {display_name:<38} {d['total_failures']:<12} {d['failure_rate']:.1f}%{'':<7} {d['total_runs']:<12} {history_str:<30}"
                     )
 
         # 1. PR Test - Main (scheduled runs only) - RED
         print_job_section(
-            "1. PR Test - Main Branch (scheduled)",
+            f"1. PR Test - Scheduled (latest {pr_test_main_limit} runs)",
             pr_test_main_data,
             color_failures=True,
         )
 
         # 2. Nightly Test - Main (scheduled runs only) - RED
         print_job_section(
-            "2. Nightly Test - Main Branch (scheduled)",
+            f"2. Nightly - Scheduled (latest {nightly_main_limit} runs)",
             nightly_main_data,
             color_failures=True,
         )
 
         # 3. PR Test - General (all runs)
         print_job_section(
-            "3. PR Test - General (all runs)",
+            f"3. PR Test - General (latest {general_limit} runs)",
             pr_test_general_data,
             color_failures=False,
         )
 
         # 4. Nightly Test - General (all runs)
         print_job_section(
-            "4. Nightly Test - General (all runs)",
+            f"4. Nightly - General (latest {general_limit} runs)",
             nightly_general_data,
             color_failures=False,
         )
@@ -1099,9 +923,6 @@ class SGLangFailuresAnalyzer:
                         "queue_samples": stats.get("queue_time_samples", 0),
                         "first_failure": streak_data.get("first_failure_in_streak"),
                         "last_failure": streak_data.get("last_failure_in_streak"),
-                        "top_error_signatures": streak_data.get(
-                            "top_error_signatures", []
-                        ),
                     }
                 )
 
@@ -1202,6 +1023,9 @@ class SGLangFailuresAnalyzer:
                 "nightly_main_count": nightly_main_count,
                 "nightly_main_with_streaks": nightly_main_with_streaks,
             },
+            "pr_test_main_limit": pr_test_main_limit,
+            "nightly_main_limit": nightly_main_limit,
+            "general_limit": general_limit,
             "pr_test_main_data": pr_test_main_data,
             "nightly_main_data": nightly_main_data,
             "pr_test_general_data": pr_test_general_data,
@@ -1366,12 +1190,12 @@ class SGLangFailuresAnalyzer:
                         # Make entire row red if current streak >= 3
                         if d["current_streak"] >= 3:
                             summary_lines.append(
-                                f"| <span style='color:red'>`{display_name}`</span> | <span style='color:red'>{d['current_streak']}</span> | <span style='color:red'>{d['max_streak']}</span> | "
+                                f"| <span style='color:red'>`{display_name}`</span> | <span style='color:red'>{d['current_streak']}</span> | <span style='color:red'>{d['max_streak']}</span> | <span style='color:red'>{d['total_runs']}</span> | "
                                 f"<span style='color:red'>{first_str}</span> | <span style='color:red'>{last_str}</span> | <span style='color:red'>{history_links}</span> |"
                             )
                         else:
                             summary_lines.append(
-                                f"| `{display_name}` | {d['current_streak']} | {d['max_streak']} | "
+                                f"| `{display_name}` | {d['current_streak']} | {d['max_streak']} | {d['total_runs']} | "
                                 f"{first_str} | {last_str} | {history_links} |"
                             )
                     summary_lines.append("")
@@ -1389,10 +1213,10 @@ class SGLangFailuresAnalyzer:
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Job Name | Total Failures | Failure Rate | Recent History |"
+                        "| Job Name | Failures | Fail Rate | Total Runs | Recent History (last 5) |"
                     )
                     summary_lines.append(
-                        "|----------|----------------|--------------|----------------|"
+                        "|----------|----------|-----------|------------|-------------------------|"
                     )
                     for job_name, d in recently_failed[:15]:
                         display_name = (
@@ -1410,33 +1234,36 @@ class SGLangFailuresAnalyzer:
                             history_links = "N/A"
 
                         summary_lines.append(
-                            f"| `{display_name}` | {d['total_failures']} | {d['failure_rate']:.1f}% | {history_links} |"
+                            f"| `{display_name}` | {d['total_failures']} | {d['failure_rate']:.1f}% | {d['total_runs']} | {history_links} |"
                         )
                     summary_lines.append("")
                     summary_lines.append("</details>")
                     summary_lines.append("")
 
             # 1. PR Test - Main (scheduled runs only)
+            pr_main_limit = report_data.get("pr_test_main_limit", 12)
             generate_job_section_md(
-                "1. PR Test - Main Branch (scheduled)",
+                f"1. PR Test - Scheduled (latest {pr_main_limit} runs)",
                 report_data.get("pr_test_main_data", {}),
             )
 
             # 2. Nightly Test - Main (scheduled runs only)
+            nightly_limit = report_data.get("nightly_main_limit", 6)
             generate_job_section_md(
-                "2. Nightly Test - Main Branch (scheduled)",
+                f"2. Nightly - Scheduled (latest {nightly_limit} runs)",
                 report_data.get("nightly_main_data", {}),
             )
 
             # 3. PR Test - General (all runs)
+            gen_limit = report_data.get("general_limit", 100)
             generate_job_section_md(
-                "3. PR Test - General (all runs)",
+                f"3. PR Test - General (latest {gen_limit} runs)",
                 report_data.get("pr_test_general_data", {}),
             )
 
             # 4. Nightly Test - General (all runs)
             generate_job_section_md(
-                "4. Nightly Test - General (all runs)",
+                f"4. Nightly - General (latest {gen_limit} runs)",
                 report_data.get("nightly_general_data", {}),
             )
 
@@ -1667,6 +1494,9 @@ def main():
             runner_streak_data,
             runner_instance_streak_data,
             args.output,
+            pr_test_main_limit,
+            nightly_main_limit,
+            args.limit,
         )
 
         # Generate GitHub Actions summary
