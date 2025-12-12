@@ -81,6 +81,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_rope_fused_qknorm = get_bool_env_var("AITER_ROPE_FUSED_QKNORM") and _use_aiter
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -415,8 +416,8 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if (
             _use_aiter
-            and self.rope_scaling is not None
-            and "aiter_rope_fused_qknorm" in self.rope_scaling
+            or (self.rope_scaling is not None and "aiter_rope_fused_qknorm" in self.rope_scaling)
+            or _use_aiter_rope_fused_qknorm
         ):
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
             q, k, v = self.rotary_emb(
