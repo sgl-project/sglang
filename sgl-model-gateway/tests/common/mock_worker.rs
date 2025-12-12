@@ -1270,7 +1270,6 @@ impl Default for MockWorkerConfig {
         }
     }
 }
-// Add this handler implementation at the end of the file
 async fn metrics_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
