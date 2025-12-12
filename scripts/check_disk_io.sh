@@ -16,6 +16,23 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Track files for cleanup (to prevent accumulation on CI hosts)
+CLEANUP_FILES=()
+CLEANUP_DIRS=()
+
+# Cleanup function - called on exit to ensure no test files are left behind
+cleanup() {
+    for file in "${CLEANUP_FILES[@]}"; do
+        rm -f "$file" 2>/dev/null || true
+    done
+    for dir in "${CLEANUP_DIRS[@]}"; do
+        rm -rf "$dir" 2>/dev/null || true
+    done
+}
+
+# Register cleanup trap for any exit (normal, error, or interrupt)
+trap cleanup EXIT
+
 print_header() {
     echo "=============================================="
     echo "       Disk I/O Bandwidth Benchmark"
@@ -55,6 +72,9 @@ test_read_bandwidth() {
     echo "Testing read bandwidth on: $test_dir"
     echo "Test size: ${size_mb}MB"
     echo ""
+    
+    # Register for cleanup before creating (in case of interruption)
+    CLEANUP_FILES+=("$test_file")
     
     # Create test file
     echo "Creating test file..."
@@ -132,6 +152,9 @@ test_safetensors_pattern() {
     echo ""
     echo "Testing safetensors-like read pattern..."
     echo "Pattern: $num_files files x ${file_size_mb}MB each"
+    
+    # Register for cleanup before creating (in case of interruption)
+    CLEANUP_DIRS+=("$test_subdir")
     
     mkdir -p "$test_subdir"
     
