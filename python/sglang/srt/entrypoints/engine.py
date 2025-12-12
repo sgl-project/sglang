@@ -820,22 +820,23 @@ def _set_envs_and_config(server_args: ServerArgs):
     set_ulimit()
 
     # Check flashinfer version
-    if server_args.attention_backend == "flashinfer":
-        assert_pkg_version(
-            "flashinfer_python",
-            "0.5.3",
-            "Please uninstall the old version and "
-            "reinstall the latest version by following the instructions "
-            "at https://docs.flashinfer.ai/installation.html.",
-        )
-    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        assert_pkg_version(
-            "sgl-kernel",
-            "0.3.19",
-            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
-        )
+    if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+        if server_args.attention_backend == "flashinfer":
+            assert_pkg_version(
+                "flashinfer_python",
+                "0.5.3",
+                "Please uninstall the old version and "
+                "reinstall the latest version by following the instructions "
+                "at https://docs.flashinfer.ai/installation.html.",
+            )
+        if _is_cuda:
+            assert_pkg_version(
+                "sgl-kernel",
+                "0.3.19",
+                "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+            )
 
-    if True:  # Keep this check for internal code compatibility
+    if server_args.custom_sigquit_handler is None:
         # Register the signal handler.
         # The child processes will send SIGQUIT to this process when any error happens
         # This process then clean up the whole process tree
@@ -848,6 +849,12 @@ def _set_envs_and_config(server_args: ServerArgs):
             kill_process_tree(os.getpid())
 
         signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+    else:
+        # Allow users to register a custom SIGQUIT handler for things like crash dump
+        logger.error(
+            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+        )
+        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
