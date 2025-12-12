@@ -334,6 +334,7 @@ class QwenImageCrossAttention(nn.Module):
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
             },
         )
 

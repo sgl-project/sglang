@@ -176,14 +176,13 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         *,
         residual_input_mode,
     ):
-        if context.attn_dp_size != 1:
-            if nsa_enable_prefill_cp():
-                hidden_states += residual
-                if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
-                return hidden_states, residual
-            else:
-                assert False, "not yet handled"
+        if nsa_enable_prefill_cp():
+            hidden_states += residual
+            if hidden_states.shape[0] != 0:
+                hidden_states = layernorm(hidden_states)
+            return hidden_states, residual
+        else:
+            assert False, "not yet handled"
 
     @staticmethod
     def _scatter_hidden_states_and_residual(
