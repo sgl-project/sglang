@@ -1,20 +1,20 @@
 # Pipeline Parallelism for Long Context
 
-## Why Pipeline parallelism?
+## Why Pipeline Parallelism?
 
 With chunked prefill, pipeline parallelism has the potential to reduce the TTFT of long-context inputs. For each request, its input tokens can be partitioned into multiple chunks, each no longer than the chunked prefill size. Different chunks of the same request can be processed simultaneously by different nodes, thus parallelizing the processing and reducing TTFT.
 
-Also, pipeline parallelism only requires cross-node communication at the boundaries of each pipeline stage, which can achieve better computation communication overlapping compared to a large TP. Therefore, it is also a promising optional parallel strategy for improving throughput.
+Also, pipeline parallelism only requires cross-node communication at the boundaries of each pipeline stage, which can achieve better computation-communication overlap compared to a large TP. Therefore, it is also a promising parallelization strategy for improving throughput.
 
-## Implementation Refactoring based on Async communication
-SGLang has supported Pipeline parallelism (#5724) in the main branch long ago, and also made it compatible with the PD Disaggregation feature (#8846), but the implementation is not perfect, and there remains a lot of space for performance improvements.
+## Implementation Refactoring based on Async Communication
+SGLang has supported Pipeline Parallelism (#5724) for some time and made it compatible with the PD Disaggregation feature (#8846), but the implementation was not perfect and had significant room for performance improvements.
 
-To reduce PP bubbles, SGLang now utilizes async send for PP stages communication (this was first proposed by @alpha-baby in [OPT] enable pp send/recv overlap when pp size > 2 #7979 and then has been redesigned and included in #11852).
+To reduce PP bubbles, SGLang now utilizes asynchronous sends for communication between PP stages. This approach was first proposed in #7979 and has been redesigned and included in #11852.
 
 ## Guidance about Dynamic Chunking
 
 ### Why Dynamic Chunking
-Chunked prefill with a fixed size can cause bubbles in the pipeline, especially when the pp size is large. The main reason behind this phenomenon is that the model has a non-uniform running time, even though each chunk size is identical (brought by the Transformer structure). The larger the prefix sequence length, the longer the running time of the chunk. And these bubbles will be propagated to the next stage, and will extremely degrade the scale efficiency of larger pp ranks.
+Chunked prefill with a fixed size can cause bubbles in the pipeline, especially when the pp size is large. The main reason behind this phenomenon is that the model has a non-uniform running time, even though each chunk size is identical (brought by the Transformer structure). The larger the prefix sequence length, the longer the running time of the chunk. And these bubbles will be propagated to the next stage, and will significantly degrade the scale efficiency of larger pp ranks.
 
 To address this issue, we introduce a dynamic chunking mechanism and use a quadratic function to fit this condition: Runtime(Prefix Sequence Length + Next Chunk Size) - Runtime(Prefix Sequence Length) = Runtime(Initial Chunk Size). Based on this method, we can dynamically reduce the chunk size to minimize the bubbles caused by the stage misalignment.
 
