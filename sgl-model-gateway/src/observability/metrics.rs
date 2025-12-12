@@ -30,7 +30,7 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "sgl_router_request_duration_seconds",
-        "Request duration in seconds by route"
+        "Request duration in seconds"
     );
     describe_counter!(
         "sgl_router_request_errors_total",
@@ -314,10 +314,8 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn record_request_duration(route: &str, duration: Duration) {
-        histogram!("sgl_router_request_duration_seconds",
-            "route" => route.to_string()
-        )
+    pub fn record_request_duration(duration: Duration) {
+        histogram!("sgl_router_request_duration_seconds")
         .record(duration.as_secs_f64());
     }
 
@@ -920,7 +918,7 @@ mod tests {
     #[test]
     fn test_metrics_static_methods() {
         RouterMetrics::record_request("/generate");
-        RouterMetrics::record_request_duration("/generate", Duration::from_millis(100));
+        RouterMetrics::record_request_duration(Duration::from_millis(100));
         RouterMetrics::record_request_error("/generate", "timeout");
         RouterMetrics::record_retry("/generate");
 
@@ -1079,7 +1077,7 @@ mod tests {
         RouterMetrics::set_worker_load("worker", 0);
         RouterMetrics::set_worker_load("worker", usize::MAX);
 
-        RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
-        RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
+        RouterMetrics::record_request_duration(Duration::from_nanos(1));
+        RouterMetrics::record_request_duration(Duration::from_secs(86400));
     }
 }
