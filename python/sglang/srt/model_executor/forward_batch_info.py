@@ -47,6 +47,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
+    get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -200,6 +201,26 @@ class CaptureHiddenMode(IntEnum):
 
     def __lt__(self, other):
         return self.value < other.value
+
+
+def compute_local_num_token_non_padded(
+    global_num_token_non_padded: torch.Tensor | int,
+    num_tokens_per_dp: int,
+) -> torch.Tensor:
+    """Compute local non-padded token count for this attention-TP rank.
+
+    Converts a global count (across all TP ranks) to a local count for this rank.
+    The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
+    """
+    attn_tp_rank = get_attention_tp_rank()
+    attn_tp_size = get_attention_tp_size()
+    tokens_per_rank = num_tokens_per_dp // attn_tp_size
+
+    return torch.clamp(
+        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        0,
+        tokens_per_rank,
+    )
 
 
 @dataclass
@@ -358,6 +379,7 @@ class ForwardBatch:
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
     # For matryoshka embeddings
@@ -506,6 +528,27 @@ class ForwardBatch:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
+        """Make num_token_non_padded local to this attention-TP rank."""
+        from sglang.srt.utils.common import require_mlp_tp_gather
+
+        dp_rank = get_attention_dp_rank()
+
+        if require_mlp_tp_gather(server_args):
+            num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+        else:
+            num_tokens_per_dp = self.global_num_tokens_gpu[0]
+
+        self.num_token_non_padded = compute_local_num_token_non_padded(
+            global_num_token_non_padded=self.num_token_non_padded,
+            num_tokens_per_dp=num_tokens_per_dp,
+        )
+
+        self.num_token_non_padded_cpu = compute_local_num_token_non_padded(
+            global_num_token_non_padded=self.num_token_non_padded_cpu,
+            num_tokens_per_dp=num_tokens_per_dp,
+        )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
@@ -814,6 +857,14 @@ class ForwardBatch:
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
         )
+        # TODO: The following is added to make sure sub-batch input_ids are padded
+        # to the multiple of attn_tp_size. It can likely be removed after this
+        # function is refactored and merged into the Scheduler.
+        if self.tbo_children:
+            for child in self.tbo_children:
+                child._pad_inputs_to_size(
+                    model_runner, child.tbo_padded_len, child.batch_size
+                )
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding

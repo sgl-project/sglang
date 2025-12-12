@@ -8,10 +8,13 @@ use tracing::error;
 
 use crate::{
     protocols::{common::InputIds, generate::GenerateRequest},
-    routers::grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        error, utils,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{PreparationOutput, RequestContext},
+            utils,
+        },
     },
     tokenizer::traits::Tokenizer,
 };
