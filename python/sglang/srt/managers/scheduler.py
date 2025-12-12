@@ -94,6 +94,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    ModelWorkerTask,
+    ModelWorkerTaskOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
@@ -563,6 +565,7 @@ class Scheduler(
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (ModelWorkerTask, self.execute_task_in_model_worker),
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
@@ -2511,6 +2514,39 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
+
+    def execute_task_in_model_worker(self, task_spec: ModelWorkerTask):
+        """Execute a task on all tp workers"""
+        # need gather from all tp workers since only scheduler with
+        # `self.pp_rank == 0 and self.attn_tp_rank == 0` send result back to TokenizerManager.
+        # need to use all gather to be compatible with dp attention.
+        import torch.distributed as dist
+
+        model_context = dict(
+            tp_rank=self.tp_rank,
+            pp_rank=self.pp_rank,
+            tp_size=self.tp_size,
+            pp_size=self.pp_size,
+            dp_size=self.dp_size,
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            attn_dp_rank=self.attn_dp_rank,
+            world_size=self.world_group.world_size,
+            global_rank=self.world_group.rank,
+            local_rank=self.world_group.local_rank,
+            nnodes=self.server_args.nnodes,
+            server_args=self.server_args,
+            scheduler=self,
+        )
+        task_spec.kwargs["model_context"] = model_context
+        result = self.model_worker.execute_task_in_model_worker(task_spec)
+        results = [None] * self.tp_size
+        dist.all_gather_object(
+            results,
+            result,
+            group=self.tp_cpu_group,
+        )
+        return ModelWorkerTaskOutput(result=results)
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
