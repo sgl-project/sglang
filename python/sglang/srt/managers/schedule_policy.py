@@ -577,11 +577,12 @@ class PrefillAdder:
         # therefore, the prefill-batch setting is temporarily set to 1.
         if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
+
+        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
