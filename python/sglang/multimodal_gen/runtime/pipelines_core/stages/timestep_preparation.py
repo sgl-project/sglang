@@ -127,7 +127,7 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
-        self.log_debug(f"timesteps: {timesteps}")
+        self.log_debug(f"timesteps: shape={timesteps.shape}, dtype={timesteps.dtype}")
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

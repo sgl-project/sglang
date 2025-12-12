@@ -188,6 +188,7 @@ jobs:
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
+            -e SGLANG_DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
@@ -237,6 +238,7 @@ jobs:
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA \
             -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
