@@ -383,10 +383,11 @@ void fused_add_layernorm_kernel_impl(
       const fVec scale_fvec = fVec(rsqrt_var);
 
       // Second pass: apply normalization
+      scalar_t* __restrict__ apply_norm_ptr{(residual_ptr != nullptr) ? residual_ptr : input_ptr};
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        fVec x_fvec0 = fVec::loadu(input_ptr + d);
-        fVec x_fvec1 = fVec::loadu(input_ptr + d + fVec::size());
+        fVec x_fvec0 = fVec::loadu(apply_norm_ptr + d);
+        fVec x_fvec1 = fVec::loadu(apply_norm_ptr + d + fVec::size());
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
@@ -400,7 +401,7 @@ void fused_add_layernorm_kernel_impl(
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
-        float normalized = (input_ptr[d] - mean) * rsqrt_var;
+        float normalized = (apply_norm_ptr[d] - mean) * rsqrt_var;
         float x_val = normalized * static_cast<float>(weight[d]);
         out_ptr[d] = static_cast<scalar_t>(x_val);
       }
@@ -462,17 +463,18 @@ at::Tensor layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   int64_t inp_dim{input.dim()};
   TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
-  CHECK_EQ(input.size(1), weight.size(0));
+  
   int64_t batch_size{input.size(0)}, seq_len{0}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
+    CHECK_EQ(input.size(2), weight.size(0));
     seq_len = input.size(1);
     hidden_size = input.size(2);
     input_strideN = input.stride(1);
+  } else {
+    CHECK_EQ(input.size(1), weight.size(0));
   }
   at::Tensor output = at::empty_like(input);
 
-  int64_t num_threads = at::get_num_threads();
-  at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "layernorm_kernel", [&] {
     fused_add_layernorm_kernel_impl<scalar_t>(
         output.data_ptr<scalar_t>(),
@@ -485,6 +487,7 @@ at::Tensor layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
         input_strideN,
         eps);
   });
+  return output;
 }
 
 // input : {batch_size, hidden_size}
@@ -557,8 +560,8 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
   });
 }
 
-// input   : {batch_size, hidden_size}
-// residual: {batch_size, hidden_size}
+// input   : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
+// residual: {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
 // weight  : {hidden_size}
 at::Tensor fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_add_layernorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
@@ -575,8 +578,11 @@ at::Tensor fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::
   CHECK_EQ(input.size(1), residual.size(1));
   if (inp_dim == 3) {
     CHECK_EQ(input.size(2), residual.size(2));
+    CHECK_EQ(input.size(2), weight.size(0));
+  } else {
+    CHECK_EQ(input.size(1), weight.size(0));
   }
-  CHECK_EQ(input.size(1), weight.size(0));
+  
   int64_t batch_size{input.size(0)}, seq_len{0}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
     seq_len = input.size(1);

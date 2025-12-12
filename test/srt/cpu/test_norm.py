@@ -194,13 +194,12 @@ class TestLayerNorm(CustomTestCase):
     def test_norm_input_3d(self, l: int, m: int, n: int, dtype: torch.dtype) -> None:
         x = torch.randn([l, m, n], dtype=dtype)
         x = make_non_contiguous(x)
-        ref_x = x.clone()
         hidden_size = x.size(-1)
         weight = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
 
         ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, variance_epsilon)
-        ref_ln_out = self._forward_native(ref_x, weight, variance_epsilon)
+        ref_ln_out = self._forward_native(x, weight, variance_epsilon)
 
         atol = rtol = precision[ref_ln_out.dtype]
         torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
