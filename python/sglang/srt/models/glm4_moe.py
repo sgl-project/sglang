@@ -261,6 +261,7 @@ class Glm4MoeAttention(nn.Module):
         self.alt_stream = alt_stream
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
+            and self.use_qk_norm
             and self.head_dim in (64, 128, 256)
         )
         self._used_fused_qk_norm_rope_last_call = False
@@ -293,6 +294,7 @@ class Glm4MoeAttention(nn.Module):
                 self.low,
                 self.high,
                 self.attention_factor,
+                self.rotary_emb.rotary_dim,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             self._used_fused_qk_norm_rope_last_call = True
