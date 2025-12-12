@@ -76,7 +76,6 @@ from sglang.srt.utils import (
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
     numa_utils,
-    prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
@@ -104,11 +103,6 @@ def _launch_subprocesses(
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
-
-    # If using model from www.modelscope.cn, first download the model
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
 
     # Launch scheduler processes
     scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
