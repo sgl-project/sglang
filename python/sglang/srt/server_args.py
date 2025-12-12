@@ -290,6 +290,7 @@ class ServerArgs:
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
+    enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -308,6 +309,7 @@ class ServerArgs:
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
+    pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -2517,6 +2519,12 @@ class ServerArgs:
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_chunking,
+            help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+        )
+        parser.add_argument(
             "--max-prefill-tokens",
             type=int,
             default=ServerArgs.max_prefill_tokens,
@@ -2623,6 +2631,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.pp_max_micro_batch_size,
             help="The maximum micro batch size in pipeline parallelism.",
+        )
+        parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            help="The async batch depth of pipeline parallelism.",
         )
         parser.add_argument(
             "--stream-interval",
