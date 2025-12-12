@@ -1,5 +1,3 @@
-use std::{sync::Arc, time::Instant};
-
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
@@ -13,6 +11,8 @@ use axum::{
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
+use std::future::Future;
+use std::{sync::Arc, time::Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
@@ -175,71 +175,8 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text)) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented = if policy.name() == "cache_aware" {
-                    increment_load(&worker);
-                    true
-                } else {
-                    false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
-                events::RequestSentEvent {
-                    url: worker.url().to_string(),
-                }
-                .emit();
-                let mut headers_with_trace = headers.cloned().unwrap_or_default();
-                inject_trace_context_http(&mut headers_with_trace);
-                let headers = Some(&headers_with_trace);
-
-                let response = self
-                    .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
-                    )
-                    .await;
-
-                events::RequestReceivedEvent {}.emit();
-
-                worker.record_outcome(response.status().is_success());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        decrement_load(&cleanup_worker);
-                    }
-                }
-
-                response
+                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .await
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -262,6 +199,82 @@ impl Router {
         }
 
         response
+    }
+
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text: &str,
+    ) -> Result<Response, impl Future<Output = Response> + Sized> {
+        let worker = match self.select_worker_for_model(model_id, Some(&text)) {
+            Some(w) => w,
+            None => {
+                RouterMetrics::record_request_error(route, "no_available_workers");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No available workers (all circuits open or unhealthy)",
+                )
+                    .into_response());
+            }
+        };
+
+        // Optional load tracking for cache-aware policy
+        // Get the policy for this model to check if it's cache-aware
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let load_incremented = if policy.name() == "cache_aware" {
+            increment_load(&worker);
+            true
+        } else {
+            false
+        };
+
+        // Keep a clone for potential cleanup on retry
+        let worker_for_cleanup = if load_incremented {
+            Some(worker.clone())
+        } else {
+            None
+        };
+
+        events::RequestSentEvent {
+            url: worker.url().to_string(),
+        }
+        .emit();
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        let response = self
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                worker.url(),
+                is_stream,
+                load_incremented,
+            )
+            .await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        worker.record_outcome(response.status().is_success());
+
+        // For retryable failures, we need to decrement load since send_typed_request
+        // won't have done it (it only decrements on success or non-retryable failures)
+        if is_retryable_status(response.status()) && load_incremented {
+            if let Some(cleanup_worker) = worker_for_cleanup {
+                decrement_load(&cleanup_worker);
+            }
+        }
+
+        Ok(response)
     }
 
     // Helper: return base worker URL (strips DP suffix when enabled)
