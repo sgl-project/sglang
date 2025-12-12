@@ -319,7 +319,6 @@ class ComposedPipelineBase(ABC):
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
-            logger.info("Loaded module %s from %s", module_name, component_model_path)
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
