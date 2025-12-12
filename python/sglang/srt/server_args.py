@@ -757,6 +757,14 @@ class ServerArgs:
                 self.tokenizer_path = snapshot_download(
                     self.tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
                 )
+        for key in ("image", "video", "audio"):
+            if key in self.mm_process_config and not isinstance(
+                self.mm_process_config[key], dict
+            ):
+                raise TypeError(
+                    f"mm_process_config['{key}'] must be a dict, "
+                    f"but got {type(self.mm_process_config[key])}"
+                )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
