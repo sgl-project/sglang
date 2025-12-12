@@ -391,7 +391,7 @@ class BaseMultimodalProcessor(ABC):
                     data = next(data_iterator)
                 except StopIteration:
                     logger.warning(
-                        f"Mismatch: More '{modality}' tokens found than corresponding data provided."
+                        f"Mismatch: More '{modality.name}' tokens found than corresponding data provided."
                     )
                     return futures, task_info
 
