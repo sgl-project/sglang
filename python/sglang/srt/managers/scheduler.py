@@ -901,6 +901,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                pp_rank=self.pp_rank,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
@@ -2771,7 +2772,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_decode()
             else:
-                scheduler.event_loop_normal_disagg_decode()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_decode()
+                else:
+                    scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()
