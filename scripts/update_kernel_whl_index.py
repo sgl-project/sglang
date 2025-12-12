@@ -28,7 +28,7 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
         index_dir = pathlib.Path(f"sgl-whl/cu{cuda_version}/sgl-kernel")
     else:
         index_dir = pathlib.Path(f"sgl-whl/rocm{rocm_version}/sgl-kernel")
-    index_dir.mkdir(exist_ok=True)
+    index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
     for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
