@@ -397,6 +397,16 @@ async def _get_model_info_impl():
             )
 
 
+@app.get("/model_info")
+async def model_info():
+    return await _get_model_info_impl()
+
+
+@app.get("/get_model_info")
+async def get_model_info():
+    return await _get_model_info_impl()
+
+
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
     prefill_server, bootstrap_port, decode_server = lb.select_pair()
