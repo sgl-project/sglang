@@ -1,17 +1,3 @@
-//! Local worker registration workflow steps
-//!
-//! This workflow handles registration of local inference workers (SGLang, vLLM).
-//! For external API endpoints (OpenAI, xAI, etc.), see external_worker_registration.rs.
-//!
-//! Workflow order:
-//! 1. DetectConnectionMode - Probe HTTP and gRPC to determine connection mode
-//! 2. DiscoverMetadata - Fetch metadata from /server_info or gRPC
-//! 3. DiscoverDPInfo - Fetch DP (Data Parallel) information (only for DP-aware workers)
-//! 4. CreateWorker - Build worker object(s) with merged config + metadata
-//! 5. RegisterWorker - Register worker(s) in registry
-//! 6. UpdatePolicies - Update policy registry with worker information
-//! 7. ActivateWorker - Mark worker(s) as healthy
-
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -24,11 +10,12 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     core::{
-        workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
+        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
+        HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
     },
     protocols::worker_spec::WorkerConfigRequest,
     routers::grpc::client::GrpcClient,
+    workflow::*,
 };
 
 // HTTP client for metadata fetching
@@ -288,12 +275,8 @@ pub struct DetectConnectionModeStep;
 #[async_trait]
 impl StepExecutor for DetectConnectionModeStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!(
             "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
@@ -346,12 +329,8 @@ pub struct DiscoverMetadataStep;
 #[async_trait]
 impl StepExecutor for DiscoverMetadataStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let connection_mode: Arc<ConnectionMode> = context
-            .get("connection_mode")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let connection_mode: Arc<ConnectionMode> = context.get_or_err("connection_mode")?;
 
         debug!(
             "Discovering metadata for {} ({:?})",
@@ -430,9 +409,7 @@ pub struct DiscoverDPInfoStep;
 #[async_trait]
 impl StepExecutor for DiscoverDPInfoStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
 
         if !config.dp_aware {
             debug!(
@@ -471,18 +448,11 @@ pub struct CreateWorkerStep;
 #[async_trait]
 impl StepExecutor for CreateWorkerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let connection_mode: Arc<ConnectionMode> = context
-            .get("connection_mode")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
-        let discovered_labels: Arc<HashMap<String, String>> = context
-            .get("discovered_labels")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("discovered_labels".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let connection_mode: Arc<ConnectionMode> = context.get_or_err("connection_mode")?;
+        let discovered_labels: Arc<HashMap<String, String>> =
+            context.get_or_err("discovered_labels")?;
 
         // Check if worker already exists
         if app_context
@@ -638,9 +608,7 @@ impl StepExecutor for CreateWorkerStep {
 
         // Handle DP-aware vs non-DP-aware workers
         if config.dp_aware {
-            let dp_info: Arc<DpInfo> = context
-                .get("dp_info")
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
+            let dp_info: Arc<DpInfo> = context.get_or_err("dp_info")?;
 
             debug!(
                 "Creating {} DP-aware workers for {} (dp_size: {})",
@@ -724,17 +692,11 @@ pub struct RegisterWorkerStep;
 #[async_trait]
 impl StepExecutor for RegisterWorkerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         if config.dp_aware {
-            let workers: Arc<Vec<Arc<dyn Worker>>> = context
-                .get("workers")
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+            let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
 
             let mut worker_ids = Vec::new();
             for worker in workers.iter() {
@@ -748,9 +710,7 @@ impl StepExecutor for RegisterWorkerStep {
 
             context.set("worker_ids", worker_ids);
         } else {
-            let worker: Arc<Arc<dyn Worker>> = context
-                .get("worker")
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
+            let worker: Arc<Arc<dyn Worker>> = context.get_or_err("worker")?;
 
             let worker_id = app_context
                 .worker_registry
@@ -773,22 +733,14 @@ pub struct UpdatePoliciesStep;
 #[async_trait]
 impl StepExecutor for UpdatePoliciesStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let labels: Arc<HashMap<String, String>> = context
-            .get("labels")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let labels: Arc<HashMap<String, String>> = context.get_or_err("labels")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         let policy_hint = labels.get("policy").map(|s| s.as_str());
 
         if config.dp_aware {
-            let workers: Arc<Vec<Arc<dyn Worker>>> = context
-                .get("workers")
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+            let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
 
             let model_id = workers[0].model_id().to_string();
 
@@ -815,9 +767,7 @@ impl StepExecutor for UpdatePoliciesStep {
                 model_id
             );
         } else {
-            let worker: Arc<Arc<dyn Worker>> = context
-                .get("worker")
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
+            let worker: Arc<Arc<dyn Worker>> = context.get_or_err("worker")?;
 
             let model_id = worker.model_id().to_string();
 
@@ -864,14 +814,10 @@ pub struct ActivateWorkerStep;
 #[async_trait]
 impl StepExecutor for ActivateWorkerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
 
         if config.dp_aware {
-            let workers: Arc<Vec<Arc<dyn Worker>>> = context
-                .get("workers")
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+            let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
 
             for worker in workers.iter() {
                 worker.set_healthy(true);
@@ -883,9 +829,7 @@ impl StepExecutor for ActivateWorkerStep {
                 config.url
             );
         } else {
-            let worker: Arc<Arc<dyn Worker>> = context
-                .get("worker")
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
+            let worker: Arc<Arc<dyn Worker>> = context.get_or_err("worker")?;
 
             worker.set_healthy(true);
 
@@ -943,7 +887,8 @@ pub fn create_worker_registration_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["detect_connection_mode"]),
         )
         .add_step(
             StepDefinition::new(
@@ -956,12 +901,14 @@ pub fn create_worker_registration_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["discover_metadata"]),
         )
         .add_step(
             StepDefinition::new("create_worker", "Create Worker", Arc::new(CreateWorkerStep))
                 .with_timeout(Duration::from_secs(5))
-                .with_failure_action(FailureAction::FailWorkflow),
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["discover_dp_info"]),
         )
         .add_step(
             StepDefinition::new(
@@ -970,7 +917,8 @@ pub fn create_worker_registration_workflow(
                 Arc::new(RegisterWorkerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["create_worker"]),
         )
         .add_step(
             StepDefinition::new(
@@ -979,7 +927,8 @@ pub fn create_worker_registration_workflow(
                 Arc::new(UpdatePoliciesStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["register_worker"]),
         )
         .add_step(
             StepDefinition::new(
@@ -988,6 +937,7 @@ pub fn create_worker_registration_workflow(
                 Arc::new(ActivateWorkerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["update_policies"]),
         )
 }
