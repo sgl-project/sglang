@@ -66,9 +66,9 @@ async def _openai_request(session, url, prompt, model, semaphore):
                 if resp.status != 200:
                     return "ERROR", 0
                 result = await resp.json()
-                return result["choices"][0]["message"]["content"], result.get("usage", {}).get(
-                    "completion_tokens", 0
-                )
+                return result["choices"][0]["message"]["content"], result.get(
+                    "usage", {}
+                ).get("completion_tokens", 0)
         except:
             return "ERROR", 0
 
