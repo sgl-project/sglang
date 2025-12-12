@@ -1,13 +1,3 @@
-//! MCP server registration workflow steps
-//!
-//! Each step is atomic and performs a single operation in the MCP server registration process.
-//! Updated for flat manager architecture - single McpManager manages all clients directly.
-//!
-//! Workflow order:
-//! 1. ConnectMcpServer - Establish connection to MCP server using McpManager::connect_server()
-//! 2. DiscoverMcpInventory - Discover and cache inventory using McpManager::load_server_inventory()
-//! 3. RegisterMcpServer - Register McpClient in McpManager's client map
-
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -16,8 +6,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
-    core::workflow::*,
     mcp::{config::McpServerConfig, manager::McpManager},
+    workflow::*,
 };
 
 /// MCP server connection configuration
@@ -46,12 +36,9 @@ pub struct ConnectMcpServerStep;
 #[async_trait]
 impl StepExecutor for ConnectMcpServerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!("Connecting to MCP server: {}", config_request.name);
 
@@ -100,17 +87,10 @@ pub struct DiscoverMcpInventoryStep;
 #[async_trait]
 impl StepExecutor for DiscoverMcpInventoryStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        use rmcp::{service::RunningService, RoleClient};
-
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let mcp_client: Arc<RunningService<RoleClient, ()>> = context
-            .get("mcp_client")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_client".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let mcp_client: Arc<RunningService<RoleClient, ()>> = context.get_or_err("mcp_client")?;
 
         debug!(
             "Discovering inventory for MCP server: {}",
@@ -151,17 +131,10 @@ pub struct RegisterMcpServerStep;
 #[async_trait]
 impl StepExecutor for RegisterMcpServerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        use rmcp::{service::RunningService, RoleClient};
-
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let mcp_client: Arc<RunningService<RoleClient, ()>> = context
-            .get("mcp_client")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_client".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let mcp_client: Arc<RunningService<RoleClient, ()>> = context.get_or_err("mcp_client")?;
 
         debug!("Registering MCP server: {}", config_request.name);
 
@@ -199,9 +172,8 @@ pub struct ValidateRegistrationStep;
 #[async_trait]
 impl StepExecutor for ValidateRegistrationStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<McpServerConfigRequest> = context
-            .get("mcp_server_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_server_config".to_string()))?;
+        let config_request: Arc<McpServerConfigRequest> =
+            context.get_or_err("mcp_server_config")?;
 
         let client_registered = context
             .get::<RunningService<RoleClient, ()>>("mcp_client")
@@ -281,7 +253,8 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["connect_mcp_server"]),
         )
         .add_step(
             StepDefinition::new(
@@ -290,7 +263,8 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 Arc::new(RegisterMcpServerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["discover_mcp_inventory"]),
         )
         .add_step(
             StepDefinition::new(
@@ -299,6 +273,7 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 Arc::new(ValidateRegistrationStep),
             )
             .with_timeout(Duration::from_secs(1))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["register_mcp_server"]),
         )
 }

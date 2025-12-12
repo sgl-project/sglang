@@ -1,19 +1,3 @@
-//! External worker registration workflow steps
-//!
-//! This workflow handles registration of external API endpoints (OpenAI, xAI, Anthropic, etc.)
-//!
-//! Key features:
-//! - Fetches models from /v1/models endpoint
-//! - Groups dated model variants under base model names (e.g., gpt-4o, gpt-4o-2024-08-06)
-//! - Infers ModelType from model ID patterns (LLM, embedding, image gen, audio, etc.)
-//!
-//! Workflow order:
-//! 1. DiscoverModels - Fetch available models from /v1/models endpoint
-//! 2. CreateExternalWorkers - Build worker objects for each discovered model
-//! 3. RegisterWorkers - Register workers in registry
-//! 4. UpdatePolicies - Update policy registry
-//! 5. ActivateWorkers - Mark workers as healthy
-
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -28,11 +12,11 @@ use crate::{
     core::{
         model_card::{ModelCard, ProviderType},
         model_type::ModelType,
-        workflow::*,
         BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, HealthConfig, RuntimeType,
         Worker, WorkerType,
     },
     protocols::worker_spec::WorkerConfigRequest,
+    workflow::*,
 };
 
 // HTTP client for API calls
@@ -218,9 +202,7 @@ pub struct DiscoverModelsStep;
 #[async_trait]
 impl StepExecutor for DiscoverModelsStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
 
         // If no API key is provided, skip model discovery and use wildcard mode.
         if config.api_key.as_ref().is_none_or(|k| k.is_empty()) {
@@ -316,15 +298,9 @@ pub struct CreateExternalWorkersStep;
 #[async_trait]
 impl StepExecutor for CreateExternalWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let model_cards: Arc<Vec<ModelCard>> = context
-            .get("model_cards")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("model_cards".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let model_cards: Arc<Vec<ModelCard>> = context.get_or_err("model_cards")?;
 
         // Build configs from router settings
         let circuit_breaker_config = {
@@ -459,15 +435,9 @@ pub struct RegisterExternalWorkersStep;
 #[async_trait]
 impl StepExecutor for RegisterExternalWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let workers: Arc<Vec<Arc<dyn Worker>>> = context
-            .get("workers")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
 
         let mut worker_ids = Vec::new();
         for worker in workers.iter() {
@@ -496,18 +466,10 @@ pub struct UpdateExternalPoliciesStep;
 #[async_trait]
 impl StepExecutor for UpdateExternalPoliciesStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let labels: Arc<HashMap<String, String>> = context
-            .get("labels")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let workers: Arc<Vec<Arc<dyn Worker>>> = context
-            .get("workers")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let labels: Arc<HashMap<String, String>> = context.get_or_err("labels")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
 
         let policy_hint = labels.get("policy").map(|s| s.as_str());
 
@@ -539,12 +501,8 @@ pub struct ActivateExternalWorkersStep;
 #[async_trait]
 impl StepExecutor for ActivateExternalWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context
-            .get("worker_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let workers: Arc<Vec<Arc<dyn Worker>>> = context
-            .get("workers")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+        let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
 
         for worker in workers.iter() {
             worker.set_healthy(true);
@@ -597,7 +555,8 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(CreateExternalWorkersStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow),
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["discover_models"]),
     )
     .add_step(
         StepDefinition::new(
@@ -606,7 +565,8 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(RegisterExternalWorkersStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow),
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["create_workers"]),
     )
     .add_step(
         StepDefinition::new(
@@ -615,7 +575,8 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(UpdateExternalPoliciesStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::ContinueNextStep),
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&["register_workers"]),
     )
     .add_step(
         StepDefinition::new(
@@ -624,6 +585,7 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(ActivateExternalWorkersStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow),
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["update_policies"]),
     )
 }

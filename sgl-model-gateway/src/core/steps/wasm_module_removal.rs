@@ -1,18 +1,10 @@
-//! WASM Module Removal Workflow Steps
-//!
-//! Each step is atomic and performs a single operation in the WASM module removal process.
-//!
-//! Workflow order:
-//! 1. FindModuleToRemove - Find the module to remove by UUID
-//! 2. RemoveModule - Remove module from WasmModuleManager
-
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::{app_context::AppContext, core::workflow::*};
+use crate::{app_context::AppContext, workflow::*};
 
 /// WASM module removal request
 #[derive(Debug, Clone)]
@@ -41,12 +33,8 @@ pub struct FindModuleToRemoveStep;
 impl StepExecutor for FindModuleToRemoveStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         let removal_request: Arc<WasmModuleRemovalRequest> =
-            context.get("wasm_module_removal_request").ok_or_else(|| {
-                WorkflowError::ContextValueNotFound("wasm_module_removal_request".to_string())
-            })?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+            context.get_or_err("wasm_module_removal_request")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!("Finding module to remove: {}", removal_request.module_uuid);
 
@@ -93,12 +81,8 @@ pub struct RemoveModuleStep;
 impl StepExecutor for RemoveModuleStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         let removal_request: Arc<WasmModuleRemovalRequest> =
-            context.get("wasm_module_removal_request").ok_or_else(|| {
-                WorkflowError::ContextValueNotFound("wasm_module_removal_request".to_string())
-            })?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+            context.get_or_err("wasm_module_removal_request")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!("Removing WASM module: {}", removal_request.module_uuid);
 
@@ -155,6 +139,7 @@ pub fn create_wasm_module_removal_workflow() -> WorkflowDefinition {
         .add_step(
             StepDefinition::new("remove_module", "Remove Module", Arc::new(RemoveModuleStep))
                 .with_timeout(Duration::from_secs(5))
-                .with_failure_action(FailureAction::FailWorkflow),
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["find_module_to_remove"]),
         )
 }
