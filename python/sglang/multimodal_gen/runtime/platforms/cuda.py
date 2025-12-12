@@ -155,6 +155,7 @@ class CudaPlatformBase(Platform):
                 logger.info(
                     "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
                 )
+                raise
         elif selected_backend == AttentionBackendEnum.SAGE_ATTN_3:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3 import (  # noqa: F401
@@ -169,6 +170,8 @@ class CudaPlatformBase(Platform):
                 logger.info(
                     "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Flash Attention."
                 )
+                raise
+
         elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN:
             try:
                 from vsa import block_sparse_attn  # noqa: F401

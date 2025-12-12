@@ -303,12 +303,24 @@ class PipelineConfig:
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
+
+        # Pad to next multiple of SP degree if needed
+        # if time_dim % sp_world_size != 0:
+        #     pad_len = sp_world_size - (time_dim % sp_world_size)
+        #     pad = torch.zeros(
+        #         (latents.shape[:2], pad_len, latents.shape[3:]),
+        #         dtype=latents.dtype,
+        #         device=latents.device,
+        #     )
+        #     latents = torch.cat([latents, pad], dim=2)
+
         if time_dim > 0 and time_dim % sp_world_size == 0:
             sharded_tensor = rearrange(
                 latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
             ).contiguous()
             sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
             return sharded_tensor, True
+
         return latents, False
 
     def get_pos_prompt_embeds(self, batch):
@@ -642,8 +654,6 @@ class ImagePipelineConfig(PipelineConfig):
                 device=latents.device,
             )
             latents = torch.cat([latents, pad], dim=1)
-            # Record padding length for later unpad
-            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
 
         sharded_tensor = rearrange(
             latents, "b (n s) d -> b n s d", n=sp_world_size
