@@ -29,6 +29,7 @@ register_cuda_ci(est_time=473, suite="stage-b-test-small-1-gpu")
 class TestEAGLEServerBasic(EagleServerBase):
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
+    # FIXME(lsyin): move the test methods to kits
     def test_request_abort(self):
         concurrency = 4
         threads = [
