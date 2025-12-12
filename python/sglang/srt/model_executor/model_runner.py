@@ -237,9 +237,6 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
-# Use a small KV cache pool size for tests in CI
-SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
-
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
@@ -1716,8 +1713,10 @@ class ModelRunner:
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        if SGLANG_CI_SMALL_KV_SIZE:
-            self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
+
+        if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
+            # Use a small KV cache pool size for local tests
+            self.max_total_num_tokens = small_kv_size
 
         if max_num_reqs is None:
             max_num_reqs = min(

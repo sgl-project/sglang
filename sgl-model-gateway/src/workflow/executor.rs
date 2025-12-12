@@ -84,7 +84,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::workflow::types::WorkflowInstanceId;
+    use crate::workflow::types::WorkflowInstanceId;
 
     struct TestStep {
         should_succeed: bool,
@@ -97,7 +97,7 @@ mod tests {
                 Ok(StepResult::Success)
             } else {
                 Err(WorkflowError::StepFailed {
-                    step_id: crate::core::workflow::types::StepId::new("test"),
+                    step_id: crate::workflow::types::StepId::new("test"),
                     message: "test error".to_string(),
                 })
             }
