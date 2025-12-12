@@ -135,11 +135,9 @@ test_read_bandwidth() {
         echo -e "${GREEN}✓ Disk I/O bandwidth is acceptable${NC}"
         return 0
     else
-        echo -e "${YELLOW}⚠ Disk I/O bandwidth may be degraded${NC}"
         echo "Expected >= ${MIN_BW_MB_S} MB/s, got ${bw_mb_s} MB/s"
         # Don't fail, just warn
-        return 0
-    fi
+        return 1
 }
 
 # Test safetensors-like read pattern (multiple small files)
