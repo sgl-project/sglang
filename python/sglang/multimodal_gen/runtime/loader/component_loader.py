@@ -814,7 +814,12 @@ class ControlNetLoader(ComponentLoader):
             logger.info("Loading %d ControlNet models...", len(controlnet_paths))
             controlnets = []
             for i, path in enumerate(controlnet_paths):
-                logger.info("Loading ControlNet %d/%d from %s", i + 1, len(controlnet_paths), path)
+                logger.info(
+                    "Loading ControlNet %d/%d from %s",
+                    i + 1,
+                    len(controlnet_paths),
+                    path,
+                )
                 controlnet = self._load_single_controlnet(path, server_args)
                 controlnets.append(controlnet)
 

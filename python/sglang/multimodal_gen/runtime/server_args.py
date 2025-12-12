@@ -258,8 +258,12 @@ class ServerArgs:
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
 
     # ControlNet parameters
-    controlnet_path: str | None = None  # Path to ControlNet model (optional, backwards compatible)
-    controlnet_paths: list[str] | None = None  # List of paths to multiple ControlNet models
+    controlnet_path: str | None = (
+        None  # Path to ControlNet model (optional, backwards compatible)
+    )
+    controlnet_paths: list[str] | None = (
+        None  # List of paths to multiple ControlNet models
+    )
 
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.

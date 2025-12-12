@@ -92,11 +92,17 @@ class SamplingParams:
     # ControlNet inputs (optional)
     # Single control image (backwards compatible)
     control_image_path: str | None = None  # Path or URL to control image
-    control_mask_path: str | None = None  # Path or URL to inpainting mask (white=inpaint, black=keep)
-    controlnet_conditioning_scale: float = 1.0  # Strength of ControlNet guidance (0.0-2.0)
+    control_mask_path: str | None = (
+        None  # Path or URL to inpainting mask (white=inpaint, black=keep)
+    )
+    controlnet_conditioning_scale: float = (
+        1.0  # Strength of ControlNet guidance (0.0-2.0)
+    )
     # Multiple control images (for multi-controlnet)
     control_image_paths: list[str] | None = None  # List of paths/URLs to control images
-    controlnet_conditioning_scales: list[float] | None = None  # List of scales per controlnet
+    controlnet_conditioning_scales: list[float] | None = (
+        None  # List of scales per controlnet
+    )
 
     # Text inputs
     prompt: str | list[str] | None = None

@@ -58,13 +58,21 @@ class Req:
     # ControlNet inputs (optional)
     # Single control image (backwards compatible)
     control_image_path: str | None = None  # Path or URL to pre-processed control image
-    control_mask_path: str | None = None  # Path or URL to inpainting mask (white=inpaint, black=keep)
-    control_image: torch.Tensor | None = None  # Preprocessed control tensor [1, seq, channels]
+    control_mask_path: str | None = (
+        None  # Path or URL to inpainting mask (white=inpaint, black=keep)
+    )
+    control_image: torch.Tensor | None = (
+        None  # Preprocessed control tensor [1, seq, channels]
+    )
     controlnet_conditioning_scale: float = 1.0  # Strength of ControlNet guidance
     # Multiple control images (for multi-controlnet)
     control_image_paths: list[str] | None = None  # List of paths/URLs to control images
-    control_images: list[torch.Tensor] | None = None  # List of preprocessed control tensors
-    controlnet_conditioning_scales: list[float] | None = None  # List of scales per controlnet
+    control_images: list[torch.Tensor] | None = (
+        None  # List of preprocessed control tensors
+    )
+    controlnet_conditioning_scales: list[float] | None = (
+        None  # List of scales per controlnet
+    )
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None

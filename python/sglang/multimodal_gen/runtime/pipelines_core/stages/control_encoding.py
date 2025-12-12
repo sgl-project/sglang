@@ -12,7 +12,7 @@ Supports both:
 
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 import numpy as np
 import torch
@@ -167,7 +167,9 @@ class ControlEncodingStage(PipelineStage):
 
         # Store list of control images
         batch.control_images = control_latents
-        logger.info(f"Encoded {len(control_latents)} control images for multi-controlnet")
+        logger.info(
+            f"Encoded {len(control_latents)} control images for multi-controlnet"
+        )
 
         return batch
 
@@ -214,8 +216,12 @@ class ControlEncodingStage(PipelineStage):
 
         # Convert control image to tensor [1, 3, H, W] in range [0, 1]
         image_np = np.array(control_image).astype(np.float32) / 255.0
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
-        mask_tensor = torch.from_numpy(mask_np_inverted).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        image_tensor = (
+            torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)
+        )  # [1, 3, H, W]
+        mask_tensor = (
+            torch.from_numpy(mask_np_inverted).unsqueeze(0).unsqueeze(0)
+        )  # [1, 1, H, W]
 
         # Move to device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -273,8 +279,12 @@ class ControlEncodingStage(PipelineStage):
 
         # Apply VAE normalization
         if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
-            shift_factor = self.vae.shift_factor.to(device=device, dtype=image_latents.dtype)
-            scaling_factor = self.vae.scaling_factor.to(device=device, dtype=image_latents.dtype)
+            shift_factor = self.vae.shift_factor.to(
+                device=device, dtype=image_latents.dtype
+            )
+            scaling_factor = self.vae.scaling_factor.to(
+                device=device, dtype=image_latents.dtype
+            )
             image_latents = (image_latents - shift_factor) * scaling_factor
 
         logger.info(f"Inpainting: image_latents shape={image_latents.shape}")

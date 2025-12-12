@@ -328,7 +328,9 @@ class ComposedPipelineBase(ABC):
                     os.path.join(self.model_path, load_module_name),
                 )
             # Use custom ControlNet path if provided
-            elif module_name == "controlnet" and server_args.controlnet_path is not None:
+            elif (
+                module_name == "controlnet" and server_args.controlnet_path is not None
+            ):
                 component_model_path = server_args.controlnet_path
                 # Download from HuggingFace Hub if path doesn't exist locally
                 if not os.path.exists(component_model_path):
@@ -355,7 +357,10 @@ class ComposedPipelineBase(ABC):
         # Special handling for ControlNet (loaded from external path)
         if "controlnet" in required_modules and "controlnet" not in components:
             if server_args.controlnet_path is not None:
-                logger.info("Loading ControlNet from external path: %s", server_args.controlnet_path)
+                logger.info(
+                    "Loading ControlNet from external path: %s",
+                    server_args.controlnet_path,
+                )
                 component_model_path = server_args.controlnet_path
                 # Download from HuggingFace Hub if path doesn't exist locally
                 if not os.path.exists(component_model_path):
@@ -372,7 +377,9 @@ class ComposedPipelineBase(ABC):
                 components["controlnet"] = controlnet_module
                 logger.info("Loaded ControlNet from %s", component_model_path)
             else:
-                logger.warning("ControlNet in required modules but controlnet_path not provided")
+                logger.warning(
+                    "ControlNet in required modules but controlnet_path not provided"
+                )
 
         # Check if all required modules were loaded
         for module_name in required_modules:

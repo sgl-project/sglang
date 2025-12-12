@@ -103,7 +103,13 @@ class DenoisingStage(PipelineStage):
     """
 
     def __init__(
-        self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None, controlnet=None
+        self,
+        transformer,
+        scheduler,
+        pipeline=None,
+        transformer_2=None,
+        vae=None,
+        controlnet=None,
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -1186,20 +1192,35 @@ class DenoisingStage(PipelineStage):
         controlnet_block_samples = None
         if self.controlnet is not None:
             # Get batch from forward context to access control_image
-            from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+            from sglang.multimodal_gen.runtime.managers.forward_context import (
+                get_forward_context,
+            )
+
             forward_ctx = get_forward_context()
             batch = forward_ctx.forward_batch if forward_ctx else None
 
             # Check for multi-controlnet (control_images list) or single controlnet (control_image)
-            has_multi_control = batch is not None and hasattr(batch, 'control_images') and batch.control_images is not None
-            has_single_control = batch is not None and hasattr(batch, 'control_image') and batch.control_image is not None
+            has_multi_control = (
+                batch is not None
+                and hasattr(batch, "control_images")
+                and batch.control_images is not None
+            )
+            has_single_control = (
+                batch is not None
+                and hasattr(batch, "control_image")
+                and batch.control_image is not None
+            )
 
             if has_multi_control:
                 # Multi-controlnet mode: multiple control images
-                from sglang.multimodal_gen.runtime.models.controlnets import QwenImageMultiControlNetModel
+                from sglang.multimodal_gen.runtime.models.controlnets import (
+                    QwenImageMultiControlNetModel,
+                )
 
                 # Get conditioning scales (default to 1.0 for each if not specified)
-                controlnet_scales = getattr(batch, 'controlnet_conditioning_scales', None)
+                controlnet_scales = getattr(
+                    batch, "controlnet_conditioning_scales", None
+                )
                 if controlnet_scales is None:
                     controlnet_scales = [1.0] * len(batch.control_images)
 
@@ -1210,24 +1231,30 @@ class DenoisingStage(PipelineStage):
                         hidden_states=latent_model_input,
                         controlnet_cond=batch.control_images,
                         encoder_hidden_states=prompt_embeds,
-                        encoder_hidden_states_mask=kwargs.get('encoder_hidden_states_mask', None),
+                        encoder_hidden_states_mask=kwargs.get(
+                            "encoder_hidden_states_mask", None
+                        ),
                         timestep=timestep,
-                        txt_seq_lens=kwargs.get('txt_seq_lens', None),
+                        txt_seq_lens=kwargs.get("txt_seq_lens", None),
                         conditioning_scale=controlnet_scales,
                         return_dict=False,
                     )
                 else:
                     # Single ControlNet (Union mode): iterate through images and accumulate
                     controlnet_block_samples = None
-                    for i, (cond_image, scale) in enumerate(zip(batch.control_images, controlnet_scales)):
+                    for i, (cond_image, scale) in enumerate(
+                        zip(batch.control_images, controlnet_scales)
+                    ):
                         block_samples = self.controlnet(
                             hidden_states=latent_model_input,
                             controlnet_cond=cond_image,
                             encoder_hidden_states=prompt_embeds,
-                            encoder_hidden_states_mask=kwargs.get('encoder_hidden_states_mask', None),
+                            encoder_hidden_states_mask=kwargs.get(
+                                "encoder_hidden_states_mask", None
+                            ),
                             timestep=timestep,
-                            txt_seq_lens=kwargs.get('txt_seq_lens', None),
-                            freqs_cis=kwargs.get('freqs_cis', None),
+                            txt_seq_lens=kwargs.get("txt_seq_lens", None),
+                            freqs_cis=kwargs.get("freqs_cis", None),
                             conditioning_scale=scale,
                             return_dict=False,
                         )
@@ -1236,31 +1263,42 @@ class DenoisingStage(PipelineStage):
                         else:
                             # Sum residuals from all control images
                             controlnet_block_samples = [
-                                prev + curr for prev, curr in zip(controlnet_block_samples, block_samples)
+                                prev + curr
+                                for prev, curr in zip(
+                                    controlnet_block_samples, block_samples
+                                )
                             ]
 
-                logger.debug(f"MultiControlNet residuals computed: {len(controlnet_block_samples)} blocks from {len(batch.control_images)} images")
+                logger.debug(
+                    f"MultiControlNet residuals computed: {len(controlnet_block_samples)} blocks from {len(batch.control_images)} images"
+                )
 
             elif has_single_control:
                 # Single controlnet mode (backwards compatible)
                 # Get conditioning scale (default to 1.0 if not specified)
-                controlnet_conditioning_scale = getattr(batch, 'controlnet_conditioning_scale', 1.0)
+                controlnet_conditioning_scale = getattr(
+                    batch, "controlnet_conditioning_scale", 1.0
+                )
 
                 # Call ControlNet to get block residuals
                 controlnet_block_samples = self.controlnet(
                     hidden_states=latent_model_input,
                     controlnet_cond=batch.control_image,
                     encoder_hidden_states=prompt_embeds,
-                    encoder_hidden_states_mask=kwargs.get('encoder_hidden_states_mask', None),
+                    encoder_hidden_states_mask=kwargs.get(
+                        "encoder_hidden_states_mask", None
+                    ),
                     timestep=timestep,
-                    txt_seq_lens=kwargs.get('txt_seq_lens', None),
-                    freqs_cis=kwargs.get('freqs_cis', None),
+                    txt_seq_lens=kwargs.get("txt_seq_lens", None),
+                    freqs_cis=kwargs.get("freqs_cis", None),
                     conditioning_scale=controlnet_conditioning_scale,
                     return_dict=False,
                 )
 
                 # controlnet_block_samples is a list of residuals, one per transformer block
-                logger.debug(f"ControlNet residuals computed: {len(controlnet_block_samples)} blocks")
+                logger.debug(
+                    f"ControlNet residuals computed: {len(controlnet_block_samples)} blocks"
+                )
 
         # Pass ControlNet residuals to transformer
         return current_model(
