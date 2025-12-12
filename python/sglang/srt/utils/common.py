@@ -1179,7 +1179,6 @@ def broadcast_pyobj(
     data: List[Any],
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
-    device_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     force_cpu_device: bool = True,
 ):
@@ -1196,21 +1195,6 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
-            feature_list = []
-            for idx, d in enumerate(data):
-                if hasattr(d, "mm_inputs") and d.mm_inputs is not None:
-                    if "mm_items" in d.mm_inputs.keys():
-                        for inner_idx, item in enumerate(d.mm_inputs["mm_items"]):
-                            if item.feature is not None:
-                                feature_list.append((idx, inner_idx, item.feature))
-                                item.feature = None
-
-            num_feat = len(feature_list)
-            num_dim = 0
-            if num_feat > 0:
-                num_dim = feature_list[0][2].dim()
-            num_feat_tensor = torch.tensor([num_feat, num_dim], dtype=torch.long, device=device)
-            shape_list = torch.tensor([(f[0], f[1], *f[2].shape) for f in feature_list], device=device)
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
 
@@ -1221,18 +1205,9 @@ def broadcast_pyobj(
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
             dist.broadcast(tensor_data, src=src, group=dist_group)
-            dist.broadcast(num_feat_tensor, src=src, group=dist_group)
-            if num_feat > 0:
-                dist.broadcast(shape_list, src=src, group=dist_group)
-                for i in range(num_feat):
-                    dist.broadcast(feature_list[i][2], src=src, group=device_group)
-            for item in feature_list:
-                idx, inner_idx, feature = item
-                data[idx].mm_inputs["mm_items"][inner_idx].feature = feature
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        num_feat = torch.tensor([0, 0], dtype=torch.long, device=device)
         dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
@@ -1241,29 +1216,9 @@ def broadcast_pyobj(
 
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
-        dist.broadcast(num_feat, src=src, group=dist_group)
-        feature_list = []
-        if num_feat[0].item() > 0:
-            num_tensor = num_feat[0].item()
-            num_dim = num_feat[1].item()
-            shape_list = torch.empty([num_tensor, num_dim + 2], dtype=torch.long, device=device)
-            dist.broadcast(shape_list, src=src, group=dist_group)
-            feature_list = []
-            for i in range(num_tensor):
-                idx = shape_list[i][0].item()
-                inner_idx = shape_list[i][1].item()
-                feature = torch.empty(
-                    shape_list[i][2:].tolist(), dtype=torch.float32, device="cuda"
-                )
-                dist.broadcast(feature, src=src, group=device_group)
-                feature_list.append((idx, inner_idx, feature))
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
-        if len(feature_list) > 0:
-            for i in range(len(feature_list)):
-                idx, inner_idx, feature = feature_list[i]
-                data[idx].mm_inputs["mm_items"][inner_idx].feature = feature
         return data
 
 

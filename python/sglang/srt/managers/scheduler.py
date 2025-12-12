@@ -170,7 +170,6 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     disable_request_logging,
-    distribute_requests_via_mq,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -1126,18 +1125,9 @@ class Scheduler(
                 while True:
                     try:
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        print(f"[Recv Requests] Received request from tokenizer: {recv_req}")
                     except zmq.ZMQError:
                         break
-                    if isinstance(recv_req, TokenizedGenerateReqInput):
-                        if (
-                            recv_req.mm_inputs is not None
-                            and "mm_items" in recv_req.mm_inputs.keys()
-                        ):
-                            for item in recv_req.mm_inputs["mm_items"]:
-                                if item.feature is not None:
-                                    item.feature = item.feature.to(
-                                        self.device, non_blocking=True
-                                    )
                     recv_reqs.append(recv_req)
 
                 while True:
@@ -1196,67 +1186,32 @@ class Scheduler(
                 work_reqs = None
                 control_reqs = None
 
-            # Distribute work_reqs via MessageQueue or broadcast_pyobj
+            # Distribute work_reqs via broadcast_pyobj
             if self.attn_tp_size != 1:
-                if self.attn_tp_mq is not None:
-                    # Use MessageQueue (zero-copy shared memory)
-                    work_reqs = distribute_requests_via_mq(
-                        work_reqs,
-                        self.attn_tp_mq,
-                        self.attn_tp_rank,
-                        self.attn_tp_group.device_group,
-                        self.attn_tp_group.ranks[0],
-                    )
-                else:
-                    # Fallback to broadcast_pyobj (Gloo)
-                    work_reqs = broadcast_pyobj(
-                        work_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        self.attn_tp_group.device_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-
-            # Distribute control_reqs via MessageQueue or broadcast_pyobj
-            if self.tp_size != 1:
-                if self.tp_mq is not None:
-                    # Use MessageQueue (zero-copy shared memory)
-                    control_reqs = distribute_requests_via_mq(
-                        control_reqs,
-                        self.tp_mq,
-                        self.tp_group.device_group,
-                        self.tp_rank,
-                        self.tp_group.ranks[0],
-                    )
-                else:
-                    # Fallback to broadcast_pyobj (Gloo)
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.tp_group.rank,
-                        self.tp_cpu_group,
-                        src=self.tp_group.ranks[0],
-                    )
-            recv_reqs = work_reqs + control_reqs
-        elif self.tp_size != 1:
-            # Distribute all requests via MessageQueue or broadcast_pyobj
-            if self.tp_mq is not None:
-                # Use MessageQueue (zero-copy shared memory)
-                recv_reqs = distribute_requests_via_mq(
-                    recv_reqs,
-                    self.tp_mq,
-                    self.tp_group.device_group,
-                    self.tp_rank,
-                    self.tp_group.ranks[0],
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
                 )
-            else:
-                # Fallback to broadcast_pyobj (Gloo)
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
+
+            # Distribute control_reqs via broadcast_pyobj
+            if self.tp_size != 1:
+                control_reqs = broadcast_pyobj(
+                    control_reqs,
                     self.tp_group.rank,
                     self.tp_cpu_group,
-                    self.tp_group.device_group,
                     src=self.tp_group.ranks[0],
                 )
+            recv_reqs = work_reqs + control_reqs
+        elif self.tp_size != 1:
+            # Distribute all requests via broadcast_pyobj
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
 
         if self.enable_trace:
             for req in recv_reqs:
@@ -2859,14 +2814,23 @@ def run_scheduler_process(
         prefix += f" PP{pp_rank}"
 
     # Config the process
+    scheduler_process_id = os.getpid()
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
+    parent_process_id = parent_process.pid if parent_process else None
 
-    # Configure the logger
+    # Configure the logger (must be called before logging)
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+    
+    logger.info(
+        f"[Process] Scheduler subprocess started: "
+        f"scheduler_process_id={scheduler_process_id}, "
+        f"parent_process_id={parent_process_id}, "
+        f"gpu_id={gpu_id}, tp_rank={tp_rank}, pp_rank={pp_rank}"
+    )
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):

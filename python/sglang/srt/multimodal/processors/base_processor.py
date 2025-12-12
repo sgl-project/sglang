@@ -225,7 +225,13 @@ class BaseMultimodalProcessor(ABC):
         ]
 
         if SGL_USE_CUDA_IPC:
+            logger.info(
+                f"[CUDA IPC] CUDA IPC transport enabled for multimodal processor. "
+                f"Initializing memory pool with size {MM_FEATURE_CACHE_SIZE / (1024*1024):.2f} MB"
+            )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
+        else:
+            logger.info("[CUDA IPC] CUDA IPC transport disabled, using default CPU transport")
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -250,20 +256,53 @@ class BaseMultimodalProcessor(ABC):
 
         processor = self._processor
         # Only apply default device logic if mm_processor_kwargs was not set by user
+        device_added = False
         if not self.server_args.mm_processor_kwargs:
-            if (
-                hasattr(processor, "image_processor")
+            has_image_processor = hasattr(processor, "image_processor")
+            is_fast_processor = (
+                has_image_processor
                 and isinstance(processor.image_processor, BaseImageProcessorFast)
-                and not self.server_args.disable_fast_image_processor
-            ):
+            )
+            fast_disabled = self.server_args.disable_fast_image_processor
+            
+            logger.info(
+                f"[Device Check] mm_processor_kwargs: {self.server_args.mm_processor_kwargs}, "
+                f"has_image_processor: {has_image_processor}, "
+                f"is_fast_processor: {is_fast_processor}, "
+                f"fast_disabled: {fast_disabled}, "
+                f"is_npu: {_is_npu}, "
+                f"processor_class: {processor.__class__.__name__}"
+            )
+            
+            if has_image_processor and is_fast_processor and not fast_disabled:
                 if not _is_npu:
                     kwargs["device"] = "cuda"
+                    device_added = True
+                    logger.info("[Device Check] Added device='cuda' to kwargs")
                 elif processor.__class__.__name__ not in {
                     "Qwen2_5_VLProcessor",
                     "Qwen3VLProcessor",
                 }:
                     # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                     kwargs["device"] = "npu"
+                    device_added = True
+                    logger.info("[Device Check] Added device='npu' to kwargs")
+            else:
+                logger.info(
+                    f"[Device Check] Device not added: "
+                    f"has_image_processor={has_image_processor}, "
+                    f"is_fast_processor={is_fast_processor}, "
+                    f"fast_disabled={fast_disabled}"
+                )
+        else:
+            logger.info(
+                f"[Device Check] mm_processor_kwargs is set, skipping default device logic"
+            )
+        if not _is_npu:
+            kwargs["device"] = "cuda"
+        logger.info(
+            f"process_mm_data kwargs: {kwargs}, device_added: {device_added}"
+        )
         result = processor.__call__(
             text=[input_text],
             padding=True,
@@ -692,11 +731,21 @@ class BaseMultimodalProcessor(ABC):
         3. copy tensor in scheduler and release it (use position mark)
         4. copy
         """
+        logger.info(f"process_and_combine_mm_data all_collected_items: {all_collected_items}")
+        logger.info(f"SGL_USE_CUDA_IPC: {SGL_USE_CUDA_IPC}")
 
         if SGL_USE_CUDA_IPC:
             # post-process
-            for item in all_collected_items:
+            converted_count = 0
+            fallback_count = 0
+            for item_idx, item in enumerate(all_collected_items):
+                logger.info(f"process_and_combine_mm_data item: {item.feature.is_cuda}")
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                    logger.info(
+                        f"[CUDA IPC] Processing item[{item_idx}] feature: "
+                        f"shape={item.feature.shape}, dtype={item.feature.dtype}, "
+                        f"device={item.feature.device}"
+                    )
                     sync_flag, available_slice = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.feature
@@ -711,11 +760,26 @@ class BaseMultimodalProcessor(ABC):
                             info_data=item.feature,
                             sync_buffer_meta=sync_flag,
                         )
+                        converted_count += 1
+                        logger.info(
+                            f"[CUDA IPC] Converted item[{item_idx}] feature to CudaIpcTensorTransportProxy"
+                        )
+                    else:
+                        fallback_count += 1
+                        logger.info(
+                            f"[CUDA IPC] Failed to convert item[{item_idx}] feature, "
+                            f"keeping original tensor (memory pool exhausted)"
+                        )
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
                 ):
-
+                    logger.info(
+                        f"[CUDA IPC] Processing item[{item_idx}] precomputed_embeddings: "
+                        f"shape={item.precomputed_embeddings.shape}, "
+                        f"dtype={item.precomputed_embeddings.dtype}, "
+                        f"device={item.precomputed_embeddings.device}"
+                    )
                     sync_flag, available_slice = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.precomputed_embeddings
@@ -731,5 +795,21 @@ class BaseMultimodalProcessor(ABC):
                             info_data=item.precomputed_embeddings,
                             sync_buffer_meta=sync_flag,
                         )
+                        converted_count += 1
+                        logger.info(
+                            f"[CUDA IPC] Converted item[{item_idx}] precomputed_embeddings "
+                            f"to CudaIpcTensorTransportProxy"
+                        )
+                    else:
+                        fallback_count += 1
+                        logger.info(
+                            f"[CUDA IPC] Failed to convert item[{item_idx}] precomputed_embeddings, "
+                            f"keeping original tensor (memory pool exhausted)"
+                        )
+            if converted_count > 0 or fallback_count > 0:
+                logger.info(
+                    f"[CUDA IPC] Post-processing summary: converted={converted_count}, "
+                    f"fallback={fallback_count}, total_items={len(all_collected_items)}"
+                )
 
         return all_collected_items, input_ids, ret

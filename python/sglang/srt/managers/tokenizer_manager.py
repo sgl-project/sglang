@@ -113,8 +113,12 @@ def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransport
 
     if is_cross_node:
         # Fallback to default CPU transport for multi-node
+        logger.info(
+            "[CUDA IPC] Cross-node detected, using default CPU transport mode"
+        )
         return "default"
     else:
+        logger.info("[CUDA IPC] Single-node detected, using CUDA IPC transport mode")
         return "cuda_ipc"
 
 
@@ -163,6 +167,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        logger.info(
+            f"[Process] TokenizerManager.__init__ called: "
+            f"process_id={os.getpid()}"
+        )
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics

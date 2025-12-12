@@ -817,8 +817,19 @@ def _launch_subprocesses(
                             writer,
                         ),
                     )
+                    logger.info(
+                        f"[Process] Creating scheduler subprocess: "
+                        f"main_process_id={os.getpid()}, "
+                        f"gpu_id={gpu_id}, tp_rank={tp_rank}, pp_rank={pp_rank}"
+                    )
                     with memory_saver_adapter.configure_subprocess():
                         proc.start()
+                    logger.info(
+                        f"[Process] Scheduler subprocess started: "
+                        f"main_process_id={os.getpid()}, "
+                        f"scheduler_process_id={proc.pid}, "
+                        f"gpu_id={gpu_id}, tp_rank={tp_rank}, pp_rank={pp_rank}"
+                    )
 
                 scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
@@ -867,6 +878,10 @@ def _launch_subprocesses(
     detoken_proc.start()
 
     # Init tokenizer manager first, as the bootstrap server is initialized here
+    logger.info(
+        f"[Process] Initializing TokenizerManager in main process: "
+        f"main_process_id={os.getpid()}"
+    )
     if server_args.tokenizer_worker_num > 1:
         # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
@@ -875,6 +890,11 @@ def _launch_subprocesses(
         tokenizer_manager, template_manager = _init_tokenizer_manager(
             server_args, port_args
         )
+    logger.info(
+        f"[Process] TokenizerManager initialized: "
+        f"main_process_id={os.getpid()}, "
+        f"tokenizer_manager_process_id={os.getpid()}"
+    )
 
     # Wait for the model to finish loading
     scheduler_infos = []
