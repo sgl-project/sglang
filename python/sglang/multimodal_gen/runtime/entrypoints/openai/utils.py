@@ -25,16 +25,17 @@ logger = init_logger(__name__)
 class SetLoraReq:
     lora_nickname: str
     lora_path: Optional[str] = None
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 @dataclasses.dataclass
 class MergeLoraWeightsReq:
-    pass
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 @dataclasses.dataclass
 class UnmergeLoraWeightsReq:
-    pass
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 def post_process_sample(

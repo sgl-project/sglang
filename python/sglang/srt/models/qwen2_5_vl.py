@@ -696,7 +696,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                     else:
-                        continue
+                        raise ValueError(f"Weight {name} not found in params_dict")
                 except KeyError:
                     print(params_dict.keys())
                     raise

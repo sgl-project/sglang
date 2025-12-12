@@ -64,12 +64,12 @@ use crate::{
             ResponsesUsage,
         },
     },
-    routers::grpc::{
-        common::responses::{
+    routers::{
+        error,
+        grpc::common::responses::{
             build_sse_response, ensure_mcp_connection, persist_response_if_needed,
             streaming::ResponseStreamEventEmitter,
         },
-        error,
     },
 };
 

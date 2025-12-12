@@ -432,6 +432,7 @@ jobs:
           SGLANG_ENABLE_JIT_DEEPGEMM: "0"
         run: |
           rm -rf test/performance_profiles_mistral_large3/
+          rm -rf test/performance_profiles_mistral_large3_eagle/
           cd test
           IS_BLACKWELL=1 python3 nightly/test_mistral_large3_perf.py
 
@@ -442,6 +443,7 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_mistral_large3
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_mistral_large3_eagle
 
       - name: Run DeepSeek v3.1 nightly performance test
         if: always()

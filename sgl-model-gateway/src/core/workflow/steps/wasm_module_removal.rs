@@ -41,12 +41,8 @@ pub struct FindModuleToRemoveStep;
 impl StepExecutor for FindModuleToRemoveStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         let removal_request: Arc<WasmModuleRemovalRequest> =
-            context.get("wasm_module_removal_request").ok_or_else(|| {
-                WorkflowError::ContextValueNotFound("wasm_module_removal_request".to_string())
-            })?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+            context.get_or_err("wasm_module_removal_request")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!("Finding module to remove: {}", removal_request.module_uuid);
 
@@ -93,12 +89,8 @@ pub struct RemoveModuleStep;
 impl StepExecutor for RemoveModuleStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
         let removal_request: Arc<WasmModuleRemovalRequest> =
-            context.get("wasm_module_removal_request").ok_or_else(|| {
-                WorkflowError::ContextValueNotFound("wasm_module_removal_request".to_string())
-            })?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+            context.get_or_err("wasm_module_removal_request")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
 
         debug!("Removing WASM module: {}", removal_request.module_uuid);
 

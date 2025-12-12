@@ -5,10 +5,12 @@ use axum::response::Response;
 use tracing::{error, info_span, Instrument};
 
 use super::PipelineStage;
-use crate::routers::grpc::{
-    context::{ClientSelection, ExecutionResult, RequestContext},
+use crate::routers::{
     error,
-    proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+    grpc::{
+        context::{ClientSelection, ExecutionResult, RequestContext},
+        proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+    },
 };
 
 type StreamResult = Result<ProtoStream, Box<dyn std::error::Error + Send + Sync>>;

@@ -5,12 +5,14 @@ use axum::response::Response;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::routers::grpc::{
-    client::GrpcClient,
-    common::stages::{helpers, PipelineStage},
-    context::{ClientSelection, RequestContext, WorkerSelection},
+use crate::routers::{
     error,
-    proto_wrapper::ProtoGenerateRequest,
+    grpc::{
+        client::GrpcClient,
+        common::stages::{helpers, PipelineStage},
+        context::{ClientSelection, RequestContext, WorkerSelection},
+        proto_wrapper::ProtoGenerateRequest,
+    },
 };
 
 /// Generate request building stage
