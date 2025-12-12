@@ -72,7 +72,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -87,14 +86,13 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.tracing.trace import (
-    extract_trace_headers,
-    trace_get_proc_propagate_context,
-    trace_req_finish,
-    trace_req_start,
-    trace_set_remote_propagate_context,
-    trace_slice_end,
-    trace_slice_start,
+from sglang.srt.tracing.trace import extract_trace_headers
+from sglang.srt.tracing.trace_metric_wrapper import (
+    RequestStage,
+    TraceMetricContext,
+    global_del_trace_metric_ctx,
+    global_get_trace_metric_ctx,
+    global_set_trace_metric_ctx,
 )
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -189,7 +187,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             else None
         )
         self.crash_dump_folder = server_args.crash_dump_folder
-        self.enable_trace = server_args.enable_trace
 
         # Read model args
         self.model_path = server_args.model_path
@@ -412,8 +409,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        if self.enable_trace:
-            self._trace_request_start(obj, created_time, request)
+        if self.server_args.trace_level > 0:
+            self._req_trace_metric_ctx_init(obj, created_time, request)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
         if self.log_requests:
@@ -628,7 +625,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        trace_slice_end(RequestStage.TOKENIZE, obj.rid)
+        global_get_trace_metric_ctx(obj.rid).slice_end(RequestStage.TOKENIZE)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -858,7 +855,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
-            trace_slice_end(RequestStage.TOKENIZE, req.rid)
+            global_get_trace_metric_ctx(req.rid).slice_end(RequestStage.TOKENIZE)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -914,15 +911,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
-        tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+        if self.server_args.trace_level > 0:
+            trace_metric_ctx = global_get_trace_metric_ctx(obj.rid)
+            trace_metric_ctx.slice_start(RequestStage.TOKENIZER_DISPATCH)
+            tokenized_obj.trace_metric_ctx = (
+                trace_metric_ctx.trace_get_proc_propagate_context()
+            )
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
-        trace_slice_end(
-            RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
-        )
+        if self.server_args.trace_level > 0:
+            trace_metric_ctx.slice_end(
+                RequestStage.TOKENIZER_DISPATCH, thread_finish_flag=True
+            )
         return state
 
     def _send_batch_request(
@@ -939,6 +941,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+        if self.server_args.trace_level > 0:
+            for tokenized_obj in tokenized_objs:
+                trace_metric_ctx = global_get_trace_metric_ctx(tokenized_obj.rid)
+                trace_metric_ctx.slice_start(RequestStage.TOKENIZER_DISPATCH)
+                tokenized_obj.trace_metric_ctx = (
+                    trace_metric_ctx.trace_get_proc_propagate_context()
+                )
+
         self.send_to_scheduler.send_pyobj(batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
@@ -947,6 +957,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
             self.rid_to_state[tmp_obj.rid] = state
+
+            if self.server_args.trace_level > 0:
+                trace_metric_ctx = global_get_trace_metric_ctx(tokenized_obj.rid)
+                trace_metric_ctx.slice_end(RequestStage.TOKENIZER_DISPATCH)
 
     async def _wait_one_response(
         self,
@@ -1578,7 +1592,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 if self.enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
-                trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+                trace_metric_ctx = global_get_trace_metric_ctx(rid)
+                trace_metric_ctx.trace_req_finish(ts=int(state.finished_time * 1e9))
+                global_del_trace_metric_ctx(rid)
 
                 del self.rid_to_state[rid]
 
@@ -2093,7 +2109,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             decoded = self.tokenizer.decode(obj.input_ids, skip_special_tokens=False)
             obj.text = decoded
 
-    def _trace_request_start(
+    def _req_trace_metric_ctx_init(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
@@ -2101,23 +2117,30 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         external_trace_header = None
         if request:
-            if "trace_context" in request.headers:
-                trace_set_remote_propagate_context(request.headers["trace_context"])
-            else:
-                external_trace_header = extract_trace_headers(request.headers)
+            external_trace_header = extract_trace_headers(request.headers)
 
         if obj.is_single:
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
             )
-            trace_req_start(
-                obj.rid,
-                bootstrap_room,
-                ts=int(created_time * 1e9),
-                role=self.server_args.disaggregation_mode,
-                external_trace_header=external_trace_header,
+            trace_metric_ctx = TraceMetricContext(
+                rid=obj.rid,
+                bootstrap_room=bootstrap_room,
+                module_name="request",
+                server_args=self.server_args,
             )
-            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
+            if not trace_metric_ctx.tracing_enable:
+                return
+
+            # store into global table,
+            # because trace_metric_ctx can not be passed to _handle_batch_output
+            global_set_trace_metric_ctx(trace_metric_ctx)
+            trace_metric_ctx.trace_req_start(
+                ts=int(created_time * 1e9), external_trace_header=external_trace_header
+            )
+            trace_metric_ctx.slice_start(
+                RequestStage.ANONYMOUS, ts=int(created_time * 1e9)
+            )
         else:
             for i in range(len(obj.rid)):
                 bootstrap_room = (
@@ -2125,15 +2148,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
                     else None
                 )
-                trace_req_start(
-                    obj.rid[i],
-                    bootstrap_room,
+                trace_metric_ctx = TraceMetricContext(
+                    rid=obj.rid[i],
+                    bootstrap_room=bootstrap_room,
+                    module_name="request",
+                    server_args=self.server_args,
+                )
+                if not trace_metric_ctx.tracing_enable:
+                    return
+
+                global_set_trace_metric_ctx(trace_metric_ctx)
+                trace_metric_ctx.trace_req_start(
                     ts=int(created_time * 1e9),
-                    role=self.server_args.disaggregation_mode,
                     external_trace_header=external_trace_header,
                 )
-                trace_slice_start(
-                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
+                trace_metric_ctx.slice_start(
+                    RequestStage.ANONYMOUS,
+                    ts=int(created_time * 1e9),
                 )
 
 

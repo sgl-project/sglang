@@ -97,6 +97,12 @@ diffusion = [
   "runai_model_streamer",
   "cache-dit==1.1.8"
 ]
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
+]
 
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
@@ -115,12 +121,6 @@ test = [
   "tabulate",
 ]
 dev = ["sglang[test]"]
-tracing = [
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-  "opentelemetry-sdk",
-]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

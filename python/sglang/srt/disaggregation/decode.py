@@ -47,7 +47,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -60,7 +60,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
+from sglang.srt.tracing.trace_metric_wrapper import RequestStage, trace_event_batch
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -322,8 +322,9 @@ class DecodePreallocQueue:
                 prefill_dp_rank=req.data_parallel_rank,
             )
 
-            req.add_latency(RequestStage.DECODE_PREPARE)
-            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
+            req.trace_metric_ctx.slice_end(
+                RequestStage.DECODE_PREPARE, auto_next_anon=True
+            )
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -332,6 +333,7 @@ class DecodePreallocQueue:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
+            req.trace_metric_ctx.abort(abort_info={"abort_info": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return True
@@ -451,6 +453,9 @@ class DecodePreallocQueue:
                 )
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
+                decode_req.req.trace_metric_ctx.abort(
+                    abort_info=decode_req.req.finished_reason
+                )
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -556,9 +561,9 @@ class DecodePreallocQueue:
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
                 time.perf_counter()
             )
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
-            trace_slice_end(
-                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
+
+            decode_req.req.trace_metric_ctx.slice_end(
+                RequestStage.DECODE_BOOTSTRAP, auto_next_anon=True
             )
 
         self.queue = [
@@ -740,9 +745,8 @@ class DecodeTransferQueue:
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
-        trace_slice_end(
+        decode_req.req.trace_metric_ctx.slice_end(
             RequestStage.DECODE_TRANSFERRED,
-            decode_req.req.rid,
             auto_next_anon=True,
         )
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
@@ -766,6 +770,9 @@ class DecodeTransferQueue:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.error(error_message)
+                decode_req.req.trace_metric_ctx.abort(
+                    abort_info={"abort_info": error_message}
+                )
                 prepare_abort(
                     decode_req.req,
                     error_message,
@@ -784,6 +791,7 @@ class DecodeTransferQueue:
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 transferred_reqs.append(decode_req.req)
+
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -796,7 +804,6 @@ class DecodeTransferQueue:
         for i in indices_to_remove:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
-            self.queue[i].req.add_latency(RequestStage.DECODE_TRANSFERRED)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -932,7 +939,9 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                req.add_latency(RequestStage.DECODE_WAITING)
+                req.trace_metric_ctx.slice_end(
+                    RequestStage.DECODE_WAITING, auto_next_anon=True
+                )
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)
