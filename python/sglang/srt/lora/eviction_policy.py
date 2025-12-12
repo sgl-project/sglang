@@ -70,6 +70,14 @@ class LRUEvictionPolicy(EvictionPolicy):
                 self.eviction_count += 1
                 return uid
 
+        # If no tracked UID found in candidates, check if None is available
+        # This happens when the batch consists entirely of LoRA requests
+        # and None (base model) is the only eviction candidate
+        if None in candidates:
+            logger.debug("Selected None (base model) for eviction")
+            self.eviction_count += 1
+            return None
+
         # Should never reach here if candidates is non-empty
         assert False, f"Failed to select LRU victim from candidates: {candidates}"
 
@@ -103,6 +111,14 @@ class FIFOEvictionPolicy(EvictionPolicy):
                 logger.debug(f"Selected LoRA {uid} for eviction (FIFO)")
                 self.eviction_count += 1
                 return uid
+
+        # If no tracked UID found in candidates, check if None is available
+        # This happens when the batch consists entirely of LoRA requests
+        # and None (base model) is the only eviction candidate
+        if None in candidates:
+            logger.debug("Selected None (base model) for eviction")
+            self.eviction_count += 1
+            return None
 
         # Should never reach here if candidates is non-empty
         assert False, f"Failed to select FIFO victim from candidates: {candidates}"
