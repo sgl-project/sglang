@@ -7,11 +7,13 @@ use axum::response::Response;
 use tracing::error;
 
 use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcessingStage};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{RequestContext, RequestType},
+use crate::routers::{
     error,
-    regular::{processor, streaming},
+    grpc::{
+        common::stages::PipelineStage,
+        context::{RequestContext, RequestType},
+        regular::{processor, streaming},
+    },
 };
 
 /// Response processing stage (delegates to endpoint-specific implementations)
