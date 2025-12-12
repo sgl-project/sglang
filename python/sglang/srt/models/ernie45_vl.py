@@ -23,7 +23,7 @@
 """Inference-only Ernie45-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type, TypedDict
+from typing import Iterable, List, Optional, Tuple, Type
 
 import numpy as np
 import torch
@@ -52,36 +52,6 @@ from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
-
-
-# === Vision Inputs === #
-
-
-class Ernie4_5_VLImageInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape:
-    `(num_patches, num_channels * patch_size * patch_size)`
-    """
-
-    image_grid_thw: torch.Tensor
-    """Shape: `(num_images, 3)`
-
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
-
-
-class Ernie4_5_VLVideoInputs(TypedDict):
-    pixel_values_videos: torch.Tensor
-    """Shape:
-    `(num_patches,
-      num_channels * temporal_patch_size * patch_size * patch_size)`
-    """
-
-    video_grid_thw: torch.Tensor
-    """Shape: `(num_videos, 3)`
-
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
 
 
 # === Vision Encoder === #
@@ -191,9 +161,8 @@ class Ernie4_5_VisionPatchEmbed(nn.Module):
     def __init__(
         self,
         patch_size: int = 14,
-        temporal_patch_size: int = 2,
         in_chans: int = 3,
-        embed_dim: int = 1152,
+        embed_dim: int = 1280,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -208,53 +177,6 @@ class Ernie4_5_VisionPatchEmbed(nn.Module):
         hidden_states = self.proj(hidden_states)
 
         return hidden_states
-
-
-class Ernie4_5_VisionPatchMerger(nn.Module):
-
-    def __init__(
-        self,
-        d_model: int,
-        context_dim: int,
-        norm_layer: Type[nn.Module] = None,
-        spatial_merge_size: int = 2,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.ln_q = norm_layer(context_dim)
-        self.mlp = nn.ModuleList(
-            [
-                ColumnParallelLinear(
-                    self.hidden_size,
-                    self.hidden_size,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=add_prefix("mlp.0", prefix),
-                ),
-                nn.GELU(),
-                RowParallelLinear(
-                    self.hidden_size,
-                    d_model,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=add_prefix("mlp.2", prefix),
-                ),
-            ]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ln_q(x)
-        x = x.view(-1, self.hidden_size)
-
-        mlp_fc1, mlp_act, mlp_fc2 = self.mlp
-        x_parallel, _ = mlp_fc1(x)
-        x_parallel = mlp_act(x_parallel)
-        out, _ = mlp_fc2(x_parallel)
-        return out
 
 
 class VariableResolutionResamplerModel(nn.Module):
@@ -445,35 +367,16 @@ class Ernie4_5_VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        self.dim = dim
-        self.theta = theta
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._freqs_cached = None
-
-    def update_freqs_cache(self, seqlen: int) -> None:
-        if seqlen > self._seq_len_cached:
-            seqlen *= 2
-            self._seq_len_cached = seqlen
-            self.inv_freq = 1.0 / (
-                self.theta
-                ** (
-                    torch.arange(
-                        0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device
-                    )
-                    / self.dim
-                )
-            )
-            seq = torch.arange(
-                seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-            )
-            freqs = torch.outer(seq, self.inv_freq)
-            self._freqs_cached = freqs
+        self.inv_freq = 1.0 / theta ** (
+            torch.arange(start=0, end=dim, step=2, dtype=torch.float32) / dim
+        )
 
     def forward(self, seqlen: int) -> torch.Tensor:
-        self.update_freqs_cache(seqlen)
-        return self._freqs_cached[:seqlen]
+        seq = torch.arange(
+            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(input=seq, vec2=self.inv_freq)
+        return freqs
 
 
 class Ernie4_5_VisionTransformer(nn.Module):
@@ -501,7 +404,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
 
         self.patch_embed = Ernie4_5_VisionPatchEmbed(
             patch_size=patch_size,
-            # temporal_patch_size=temporal_patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
         )
@@ -516,7 +418,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
+                    attn_implementation="flash_attention_2",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                 )
@@ -525,23 +427,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
         )
 
         self.ln = nn.LayerNorm(hidden_size, eps=1e-6)
-
-        # self.resampler_model = VariableResolutionResamplerModel(
-        #     self.config.pixel_hidden_size,
-        #     self.config.hidden_size,
-        #     self.config.spatial_conv_size,
-        #     self.config.temporal_conv_size,
-        #     config=self.config,
-        #     prefix=add_prefix("resampler_model", prefix),
-        # )
-
-        # self.merger = Ernie4_5_VisionPatchMerger(
-        #     d_model=hidden_size,
-        #     context_dim=embed_dim,
-        #     norm_layer=norm_layer,
-        #     quant_config=quant_config,
-        #     prefix=add_prefix("merger", prefix),
-        # )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -614,10 +499,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
             final_output = final_output.squeeze(dim=1)
 
         return final_output
-
-        # adapter
-        # x = self.merger(x)
-        # return x
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -754,15 +635,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         video_embeds = self.resampler_model(video_feature, video_grid_thw)
         return video_embeds
 
-    def _process_video_input(self, video_input: Ernie4_5_VLVideoInputs) -> torch.Tensor:
-        pixel_values_videos = video_input["pixel_values_videos"].type(
-            self.vision_model.dtype
-        )
-        video_embeds = self.vision_model(
-            pixel_values_videos, grid_thw=video_input["video_grid_thw"]
-        )
-        return video_embeds
-
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -810,7 +682,10 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 dtype=input_ids.dtype,
             )
             pad_values = []
-            if hasattr(forward_batch, "mm_inputs"):
+            if (
+                hasattr(forward_batch, "mm_inputs")
+                and forward_batch.mm_inputs is not None
+            ):
                 for mm_input in forward_batch.mm_inputs:
                     if mm_input is None:
                         continue

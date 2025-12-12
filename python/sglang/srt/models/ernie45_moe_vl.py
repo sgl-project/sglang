@@ -344,10 +344,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             all_visual = False
             any_visual = visual_token_mask is not None  # mixed tokens path
             any_visual = False
-        # print("orig:", orig_shape)
-        # print("hs after flatten:", hidden_states.shape)
-        # print("visual mask:", visual_token_mask.shape)
-        # print("any_visual:", any_visual, "all_visual:", all_visual)
 
         if all_visual:
             # vision modal input processing directly
@@ -367,7 +363,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             # Make sure mask has shape [N, 1] for broadcasting
             # mask = visual_token_mask.view(-1).bool().unsqueeze(-1)  # [N, 1]
 
-            # # Text branch computed on full sequence
+            # Text branch computed on full sequence
             # text_router_logits, _ = self.text_experts_gate(
             #     hidden_states.to(dtype=torch.float32)
             # )
@@ -387,8 +383,9 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             #     hidden_states=hidden_states, topk_output=vision_topk_output
             # )  # [N, H]
 
+            # mask_broadcast = visual_token_mask.expand_as(text_out)  # [N, H]
             # # Merge per-token outputs: for visual tokens take vision_out, else text_out
-            # final_hidden_states = torch.where(mask, vision_out, text_out)
+            # final_hidden_states = torch.where(mask_broadcast, vision_out, text_out)
 
             # assert visual_token_mask.shape[0] != hidden_states.shape[0]
             visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()

@@ -40,12 +40,36 @@ VIDEO_TOTAL_PIXELS = int(
     float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9))
 )
 
-VIDEO_MIN_PIXELS = 128 * 28 * 28
-VIDEO_MAX_PIXELS = 768 * 28 * 28
+VIDEO_MIN_PIXELS = 299 * 28 * 28
+VIDEO_MAX_PIXELS = 1196 * 28 * 28
 FRAME_FACTOR = 2
 FPS = 2.0
-FPS_MIN_FRAMES = 4
-FPS_MAX_FRAMES = 768
+FPS_MIN_FRAMES = 16
+FPS_MAX_FRAMES = 180
+
+
+import imageio
+import numpy as np
+
+
+def save_resized_video(video_tensor, fps, save_path="resized_debug.mp4"):
+    """
+    video_tensor: torch.Tensor, shape [T, C, H, W]
+    fps: float
+    """
+    # 转成 numpy 且转回 THWC
+    video_np = video_tensor.detach().cpu().numpy()
+
+    # 如果是 float，要 clamp & 转 uint8
+    if video_np.dtype != np.uint8:
+        video_np = (video_np.clip(0, 255)).astype(np.uint8)
+
+    writer = imageio.get_writer(save_path, fps=fps)
+    for frame in video_np:
+        writer.append_data(frame)
+    writer.close()
+
+    print(f"Resized video saved to {save_path}")
 
 
 def smart_resize(
@@ -176,53 +200,97 @@ def smart_nframes(
 async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
+    num_frame_samples: int = 16,
     # vr: VideoReader, image_factor: int = IMAGE_FACTOR
 ) -> torch.Tensor:
-    entry_time = time.perf_counter()
-    ele = {}
+
+    # --- 0. 基本信息 ---
+    # video_fps = vr.get_avg_fps()
+    # total_num_frames = len(vr)
+    # duration = total_num_frames / video_fps if video_fps else 0
+
+    # # 原视频分辨率（Decord 提供）
+    # height, width = vr[0].shape[0], vr[0].shape[1]
+
+    # # --- 1. 使用 smart_resize 计算目标 H, W ---
+    # resized_height, resized_width = smart_resize(
+    #     height,
+    #     width,
+    #     factor=image_factor,
+    #     min_pixels=VIDEO_MIN_PIXELS,
+    #     max_pixels=VIDEO_MAX_PIXELS,
+    # )
+
+    # # --- 2. 计算均匀采样的 32 帧索引 ---
+    # if total_num_frames >= num_frame_samples:
+    #     indices = np.linspace(0, total_num_frames - 1, num_frame_samples, dtype=int).tolist()
+    # else:
+    #     base_idx = np.linspace(0, total_num_frames - 1, total_num_frames, dtype=int).tolist()
+    #     repeat_factor = (num_frame_samples + total_num_frames - 1) // total_num_frames
+    #     indices = (base_idx * repeat_factor)[:num_frame_samples]
+
+    # # --- 3. 解码选取到的帧 ---
+    # frames = vr.get_batch(indices).asnumpy()       # uint8, shape (N, H, W, C)
+    # video = torch.from_numpy(frames)               # 转为 torch Tensor
+
+    # # --- 4. Resize each frame according to smart_resize output ---
+    # # (N, H, W, C) → (N, C, H, W)
+    # video = video.permute(0, 3, 1, 2)
+    # video = torchvision.transforms.functional.resize(
+    #     video,
+    #     [resized_height, resized_width],
+    #     # [height, width],
+    #     # interpolation=InterpolationMode.BILINEAR,
+    # )
+    # video = video.permute(0, 2, 3, 1)
+    # # --- 5. pin_memory 加速后续搬运到 GPU ---
+    # video = video.pin_memory()
+
+    # # --- 6. metadata ---
+    # metadata = {
+    #     "total_num_frames": int(total_num_frames),
+    #     "fps": float(video_fps),
+    #     "duration": float(duration),
+    #     "video_backend": "decord",
+    #     "frames_indices": indices,
+    #     "resized_height": resized_height,
+    #     "resized_width": resized_width,
+    # }
+
+    # return video, metadata
+
+    # return frames, metadata
     total_frames, video_fps = len(vr), vr.get_avg_fps()
-    nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
+    # nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
+    nframes = 32
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
     video_np = vr.get_batch(idx).asnumpy()
     video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
-    total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
+    min_pixels = VIDEO_MIN_PIXELS
+    total_pixels = VIDEO_TOTAL_PIXELS
     max_pixels = max(
         min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
         int(min_pixels * 1.05),
     )
 
-    get_batch_time = time.perf_counter()
-
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
-    if max_pixels_supposed > max_pixels:
-        logger.warning(
-            f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
-        )
-    max_pixels = min(max_pixels_supposed, max_pixels)
-    if "resized_height" in ele and "resized_width" in ele:
-        resized_height, resized_width = smart_resize(
-            ele["resized_height"],
-            ele["resized_width"],
-            factor=image_factor,
-        )
-    else:
-        resized_height, resized_width = smart_resize(
-            height,
-            width,
-            factor=image_factor,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-    smart_resize_time = time.perf_counter()
+    resized_height, resized_width = smart_resize(
+        height,
+        width,
+        factor=image_factor,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
     video = torchvision.transforms.functional.resize(
         video,
         [resized_height, resized_width],
+        # [height, width],
         interpolation=InterpolationMode.BILINEAR,
     )
+
+    video = video.permute(0, 2, 3, 1)
     video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
@@ -231,14 +299,9 @@ async def preprocess_video(
         "frames_indices": idx,
         "video_backend": "torchvision",
     }
-    torchvision_resize_time = time.perf_counter()
-    logger.debug(
-        f"[preprocess_video Perf], "
-        f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "
-        f"smart_resize_time: {(smart_resize_time - get_batch_time) * 1000:.2f} ms, "
-        f"torchvision_resize_time: {(torchvision_resize_time - smart_resize_time) * 1000:.2f} ms, "
-        f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
-    )
+    print(video_metadata)
+    # save_resized_video(video, video_fps, "video_resized.mp4")
+
     return video, video_metadata
 
 
@@ -261,6 +324,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>",
+            video_token="<|VIDEO_START|><|video@placeholder|><|VIDEO_END|>",
             image_token_id=hf_config.im_patch_id,
             video_token_id=hf_config.im_patch_id,  # image and video use the same token_id
         ).build(_processor)
@@ -355,6 +419,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
                     result["pixel_values"] = pixel_values_all[:image_patch_num]
                     result["pixel_values_videos"] = pixel_values_all[image_patch_num:]
                     del result["images"]
+                    del result["grid_thw"]
 
                     # del empty result
                     if result["image_grid_thw"].numel() == 0:
@@ -395,8 +460,6 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
-        load_time = time.perf_counter()
-        rid = getattr(request_obj, "rid", "anonymous_rid")
 
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
@@ -410,13 +473,9 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
-        preprocess_time = time.perf_counter()
-
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-
-        process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
 
@@ -427,15 +486,6 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             video_grid_thw=getattr(ret, "video_grid_thw", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
-        get_rope_index_time = time.perf_counter()
-        logger.debug(
-            f"[Ernie4_5_VLProcessor Perf] {rid=}, "
-            f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
-            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
-            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
-            f"get_rope_index_time: {(get_rope_index_time - process_time) * 1000:.2f} ms, "
-            f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
-        )
 
         mm_inputs = {
             "input_ids": input_ids.tolist(),
