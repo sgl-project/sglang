@@ -307,6 +307,8 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
+        RouterMetrics::record_http_request();
+
         // Log the request start
         info!(
             target: "sgl_model_gateway::request",
