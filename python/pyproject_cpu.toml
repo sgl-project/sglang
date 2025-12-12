@@ -33,7 +33,7 @@ dependencies = [
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
-  "mooncake",
+  "mooncake-transfer-engine-non-cuda",
   "msgspec",
   "ninja",
   "numpy",
