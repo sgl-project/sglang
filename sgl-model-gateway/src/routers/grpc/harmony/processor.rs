@@ -16,10 +16,12 @@ use crate::{
             ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
-    routers::grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+    routers::{
         error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+        },
     },
 };
 
