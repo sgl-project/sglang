@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -52,6 +51,8 @@ class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
             "10",
             "--attention-backend",
             "trtllm_mla",
+            "--fp8-gemm-backend",
+            "flashinfer_trtllm",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--enable-symm-mem",
@@ -61,10 +62,6 @@ class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={
-                **os.environ,
-                "SGLANG_ENABLE_FLASHINFER_FP8_GEMM": "1",
-            },
         )
 
     @classmethod
