@@ -440,7 +440,7 @@ class BaseMultimodalProcessor(ABC):
         if data_list is None:
             return
         if not isinstance(data_list, list):
-            raise TypeError(f"{modality} must be a list or None, got {type(data_list)}")
+            raise TypeError(f"{modality.name} must be a list or None, got {type(data_list)}")
 
         formatted_indices = []
         for idx, item in enumerate(data_list):
