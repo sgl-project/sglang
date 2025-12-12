@@ -1270,16 +1270,24 @@ impl Default for MockWorkerConfig {
         }
     }
 }
-// Add this handler implementation
 async fn metrics_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    // Simulate the delay
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Simulated metrics failure",
+        )
+            .into_response();
+    }
+
+
     if config.response_delay_ms > 0 {
         tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
     }
 
-    // Return fake prometheus metrics
+
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
     format!(
         "# HELP sglang_num_running_reqs The number of running requests\n\
