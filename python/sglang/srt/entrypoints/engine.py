@@ -130,13 +130,14 @@ class Engine(EngineBase):
         (
             tokenizer_manager,
             template_manager,
-            scheduler_info,
+            scheduler_infos,
             port_args,
             remote_instance_transfer_engine_info,
         ) = _launch_subprocesses(server_args=server_args)
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-        self.scheduler_info = scheduler_info
+        # Assume that all schedulers have the same info except remote_instance_transfer_engine_info.
+        self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
         self.remote_instance_transfer_engine_info = remote_instance_transfer_engine_info
 
@@ -942,14 +943,13 @@ def _launch_subprocesses(
                 data["remote_instance_transfer_engine_weights_info_dict"],
             )
 
-    # Assume all schedulers have the same scheduler_info
-    scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    # Assume all schedulers have the same max_req_input_len
+    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
     return (
         tokenizer_manager,
         template_manager,
-        scheduler_info,
+        scheduler_infos,
         port_args,
         remote_instance_transfer_engine_info,
     )

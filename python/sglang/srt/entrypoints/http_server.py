@@ -1416,11 +1416,13 @@ def launch_server(
     (
         tokenizer_manager,
         template_manager,
-        scheduler_info,
+        scheduler_infos,
         port_args,
         remote_instance_transfer_engine_info,
     ) = _launch_subprocesses(server_args=server_args)
 
+    # Assume that all schedulers have the same info except remote_instance_transfer_engine_info.
+    scheduler_info = scheduler_infos[0]
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
