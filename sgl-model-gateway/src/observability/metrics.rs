@@ -30,7 +30,7 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "sgl_router_request_duration_seconds",
-        "Request duration in seconds by route"
+        "Request duration in seconds"
     );
     describe_counter!(
         "sgl_router_request_errors_total",
@@ -270,6 +270,10 @@ pub fn init_metrics() {
     );
 
     describe_counter!(
+        "sgl_router_http_requests_total",
+        "Total number of HTTP requests"
+    );
+    describe_counter!(
         "sgl_router_http_responses_total",
         "Total number of HTTP responses by status code"
     );
@@ -313,10 +317,8 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn record_request_duration(route: &str, duration: Duration) {
-        histogram!("sgl_router_request_duration_seconds",
-            "route" => route.to_string()
-        )
+    pub fn record_request_duration(duration: Duration) {
+        histogram!("sgl_router_request_duration_seconds")
         .record(duration.as_secs_f64());
     }
 
@@ -356,10 +358,6 @@ impl RouterMetrics {
             "route" => route.to_string()
         )
         .increment(1);
-    }
-
-    pub fn set_active_workers(count: usize) {
-        gauge!("sgl_router_active_workers").set(count as f64);
     }
 
     pub fn set_worker_health(worker_url: &str, healthy: bool) {
@@ -584,6 +582,16 @@ impl RouterMetrics {
 
     pub fn record_job_shutdown_rejected() {
         counter!("sgl_router_job_shutdown_rejected_total").increment(1);
+    }
+
+    // This is different from the following:
+    // * sgl_router_requests_total: bump when a request is handled and response is to be returned, thus very different from this.
+    // * sgl_router_processed_requests_total: bump when routing decision is made.
+    // Here we want a metric to directly reflect user's experience ("I am sending a request")
+    // when viewing the router as a blackbox, and is bumped immediately when the request arrives.
+    // TODO: add route name
+    pub fn record_http_request() {
+        counter!("sgl_router_http_requests_total").increment(1);
     }
 
     pub fn record_http_status_code(status_code: u16) {
@@ -915,11 +923,10 @@ mod tests {
     #[test]
     fn test_metrics_static_methods() {
         RouterMetrics::record_request("/generate");
-        RouterMetrics::record_request_duration("/generate", Duration::from_millis(100));
+        RouterMetrics::record_request_duration(Duration::from_millis(100));
         RouterMetrics::record_request_error("/generate", "timeout");
         RouterMetrics::record_retry("/generate");
 
-        RouterMetrics::set_active_workers(5);
         RouterMetrics::set_worker_health("http://worker1", true);
         RouterMetrics::record_processed_request("http://worker1");
 
@@ -1070,10 +1077,7 @@ mod tests {
 
     #[test]
     fn test_extreme_metric_values() {
-        RouterMetrics::set_active_workers(0);
-        RouterMetrics::set_active_workers(usize::MAX);
-
-        RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
-        RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
+        RouterMetrics::record_request_duration(Duration::from_nanos(1));
+        RouterMetrics::record_request_duration(Duration::from_secs(86400));
     }
 }
