@@ -1031,3 +1031,11 @@ if _is_cuda:
             dtype=torch.int32,
         )
         return topk_weights, topk_ids
+
+    @register_fake_if_exists("sgl_kernel::moe_sum_reduce")
+    def _moe_sum_reduce(
+        input_tensor,
+        output_tensor,
+        routed_scaling_factor=0,
+    ):
+        return
