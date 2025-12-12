@@ -54,16 +54,6 @@ pub struct Router {
 impl Router {
     /// Create a new router with injected policy and client
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
-        let workers = ctx.worker_registry.get_workers_filtered(
-            None, // any model
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // include all workers
-        );
-
-        RouterMetrics::set_active_workers(workers.len());
-
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -185,71 +175,8 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text)) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented = if policy.name() == "cache_aware" {
-                    increment_load(&worker);
-                    true
-                } else {
-                    false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
-                events::RequestSentEvent {
-                    url: worker.url().to_string(),
-                }
-                .emit();
-                let mut headers_with_trace = headers.cloned().unwrap_or_default();
-                inject_trace_context_http(&mut headers_with_trace);
-                let headers = Some(&headers_with_trace);
-
-                let response = self
-                    .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
-                    )
-                    .await;
-
-                events::RequestReceivedEvent {}.emit();
-
-                worker.record_outcome(response.status().is_success());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        decrement_load(&cleanup_worker);
-                    }
-                }
-
-                response
+                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .await
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -269,6 +196,82 @@ impl Router {
             RouterMetrics::record_generate_duration(duration);
         } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
+        }
+
+        response
+    }
+
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text: &str,
+    ) -> Response {
+        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+            Some(w) => w,
+            None => {
+                RouterMetrics::record_request_error(route, "no_available_workers");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No available workers (all circuits open or unhealthy)",
+                )
+                    .into_response();
+            }
+        };
+
+        // Optional load tracking for cache-aware policy
+        // Get the policy for this model to check if it's cache-aware
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let load_incremented = if policy.name() == "cache_aware" {
+            increment_load(&worker);
+            true
+        } else {
+            false
+        };
+
+        // Keep a clone for potential cleanup on retry
+        let worker_for_cleanup = if load_incremented {
+            Some(worker.clone())
+        } else {
+            None
+        };
+
+        events::RequestSentEvent {
+            url: worker.url().to_string(),
+        }
+        .emit();
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        let response = self
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                worker.url(),
+                is_stream,
+                load_incremented,
+            )
+            .await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        worker.record_outcome(response.status().is_success());
+
+        // For retryable failures, we need to decrement load since send_typed_request
+        // won't have done it (it only decrements on success or non-retryable failures)
+        if is_retryable_status(response.status()) && load_incremented {
+            if let Some(cleanup_worker) = worker_for_cleanup {
+                decrement_load(&cleanup_worker);
+            }
         }
 
         response

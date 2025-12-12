@@ -382,6 +382,25 @@ impl WorkerRegistry {
         }
     }
 
+    /// Get counts of regular and PD workers efficiently (O(1))
+    /// This avoids the overhead of get_all() which allocates memory and iterates all workers
+    pub fn get_worker_distribution(&self) -> (usize, usize) {
+        // Use the existing type_workers index for O(1) lookup
+        let regular_count = self
+            .type_workers
+            .get(&WorkerType::Regular)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        // Get total workers count efficiently from DashMap
+        let total_workers = self.workers.len();
+
+        // PD workers are any workers that are not Regular
+        let pd_count = total_workers.saturating_sub(regular_count);
+
+        (regular_count, pd_count)
+    }
+
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
