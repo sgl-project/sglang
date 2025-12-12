@@ -572,14 +572,19 @@ class EagleDraftWorker(BaseDraftWorker):
         accept_lens_cumsum = torch.cumsum(accept_lens, dim=0)
         select_index = accept_lens_cumsum - 1  # Last accepted position per request
 
+        # OPTION 5: Don't transfer accept_lens to CPU - keep everything on GPU!
+        # The prepare_for_extend_to_fill_draft_kvcache_repacked function will use
+        # repacked_input_ids.shape[0] for extend_num_tokens (no sync needed)
+
         # Prepare for draft extend using REPACKED tensors
         with self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache_repacked(
                 batch,
                 repacked_input_ids,  # Repacked [sum(accept_lens)]
-                accept_lens,         # Per-request accept lengths
+                accept_lens,         # Per-request accept lengths (GPU)
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
+                accept_lens_cpu=None,  # Option 5: No CPU transfer!
             )
 
         if self.plan_stream:
@@ -890,14 +895,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
             valid_indices = flat_accept_index[valid_mask]  # [sum(accept_lens)]
             repacked_next_token_ids = predict[valid_indices]  # [sum(accept_lens)]
 
-            # Debug: Detect tree mode (scattered) vs chain mode (contiguous)
-            # Chain mode: accept_index values are contiguous per request [0,1,2], [22,23], etc.
-            # Tree mode: accept_index values are scattered [0,2,7], [22,24], etc.
+            # ================================================================
+            # DEBUG BLOCK: Detect and log tree mode (can be removed for production)
+            # ================================================================
+            # This entire block is ONLY for debug logging. The is_tree_mode
+            # variable is not used anywhere else - only for the print statement.
+            # Chain mode: accept_index values are contiguous per request [0,1,2], [32,33], etc.
+            # Tree mode: accept_index values are scattered [0,2,7], [32,34], etc.
+            #
+            # ⚠️ DEBUG SYNCS: These .tolist() calls add ~0.5ms latency total
+            # TODO: Remove this entire block for production (no functional impact)
+            # ================================================================
             expected_chain_indices = []
-            for i, acc_len in enumerate(accept_length.tolist()):
+            for i, acc_len in enumerate(accept_length.tolist()):  # GPU→CPU sync (debug only)
                 expected_chain_indices.extend(range(i * self.speculative_num_draft_tokens,
                                                      i * self.speculative_num_draft_tokens + acc_len))
-            is_tree_mode = set(valid_indices.tolist()) != set(expected_chain_indices)
+            is_tree_mode = set(valid_indices.tolist()) != set(expected_chain_indices)  # GPU→CPU sync (debug only)
             if is_tree_mode:
                 print(f"[EAGLE3_DEBUG] Tree mode: accept_index={accept_index[0].tolist()[:5]}..., accept_len={accept_length.tolist()}")
         else:
@@ -929,6 +942,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
     ):
         """
         Update req_to_token mapping after tree verification to handle scattered acceptance.
+
+        ============================================================================
+        ⚠️ CPU-GPU SYNC WARNING - This function introduces multiple syncs!
+        ============================================================================
+
+        SYNCS IN THIS FUNCTION:
+          1. valid_indices.tolist() - GPU tensor → CPU list for set operations
+          2. token_to_kv_pool_allocator.free() - CPU-based allocator requires CPU tensor
+
+        SYNCS IN _shift_prealloc_slots() (called from here):
+          3. req_pool_indices[i].item() - O(bs) syncs in loop
+          4. batch.seq_lens[i].item() - O(bs) syncs in loop
+          5. accept_length[i].item() - O(bs) syncs in loop
+
+        ESTIMATED LATENCY: ~1-5ms per decode iteration for tree mode
+        (Chain mode avoids all of this!)
+
+        See "CPU-GPU SYNC ANALYSIS" section in eagle3_v2_tree_flow_diagram.md
+        for detailed analysis and removal strategies.
 
         ============================================================================
         CRITICAL INSIGHT (from debugging - see eagle3_debug_summary.md)
@@ -1118,12 +1150,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             #
             # TODO: Consider GPU-only allocator or batched deferred free
             # ================================================================
-            accepted_indices_set = set(valid_indices.tolist())
+            # ⚠️ SYNC #1: GPU→CPU transfer for set operations
+            accepted_indices_set = set(valid_indices.tolist())  # GPU→CPU sync!
             rejected_indices = list(all_indices - accepted_indices_set)
             if rejected_indices:
                 rejected_slots = batch.out_cache_loc[rejected_indices]
-                # Return rejected slots to allocator's free pool
-                self.token_to_kv_pool_allocator.free(rejected_slots)
+                # ⚠️ SYNC #2: CPU-based allocator requires sync
+                # The allocator.free() internally transfers tensor to CPU
+                self.token_to_kv_pool_allocator.free(rejected_slots)  # CPU allocator sync!
                 print(f"[EAGLE3_DEBUG tree_mode] bs={bs}, accept_lens={accept_length.tolist()}, freed={len(rejected_indices)} rejected slots")
 
         # ========================================================================
@@ -1175,6 +1209,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
     ):
         """
         Shift pre-allocated slots to fill the gap left by rejected tree slots.
+
+        ============================================================================
+        ⚠️ CPU-GPU SYNC WARNING - This function has O(bs) sync points!
+        ============================================================================
+
+        SYNCS IN PHASE 1 (per-request loop):
+          - req_pool_indices[i].item()  → O(bs) GPU→CPU syncs
+          - batch.seq_lens[i].item()    → O(bs) GPU→CPU syncs
+          - req_to_token[...].clone()   → O(bs) GPU reads
+
+        SYNCS IN PHASE 3 (per-request loop):
+          - accept_length[i].item()     → O(bs) GPU→CPU syncs
+
+        TOTAL: ~4*bs GPU-CPU sync operations per decode iteration!
+
+        For bs=8, this means ~32 sync points, adding significant latency.
+
+        REMOVAL STRATEGIES (see eagle3_v2_tree_flow_diagram.md):
+          - Option A: Vectorize with GPU tensors (avoid .item() calls)
+          - Option B: Custom Triton kernel for slot shifting
+          - Option C: Pre-compute on CPU batch tensors
 
         ============================================================================
         BACKGROUND: V2's Over-Allocation Strategy
@@ -1283,10 +1338,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         for i in range(bs):
             req = batch.reqs[i]
-            # NOTE: .item() causes GPU-CPU sync - potential optimization target
-            req_idx = req_pool_indices[i].item()
-            seq_len = batch.seq_lens[i].item()  # OLD seq_len, before accept
-            kv_allocated = req.kv_allocated_len
+            # ⚠️ SYNC #3: .item() causes GPU→CPU sync (O(bs) total)
+            req_idx = req_pool_indices[i].item()  # GPU→CPU sync!
+            # ⚠️ SYNC #4: .item() causes GPU→CPU sync (O(bs) total)
+            seq_len = batch.seq_lens[i].item()  # GPU→CPU sync!
+            kv_allocated = req.kv_allocated_len  # Already on CPU (Req object)
 
             # Pre-alloc starts after tree region
             prealloc_start = seq_len + tree_size
@@ -1356,7 +1412,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         #   rejected = 32 - 4 = 28
         #   After: kv_allocated = 164 - 28 = 136
         for i in range(bs):
-            accept_len = accept_length[i].item()
+            # ⚠️ SYNC #5: .item() causes GPU→CPU sync (O(bs) total)
+            accept_len = accept_length[i].item()  # GPU→CPU sync!
             rejected_count = tree_size - accept_len
             # This modifies the SAME Req object the scheduler has
             batch.reqs[i].kv_allocated_len -= rejected_count

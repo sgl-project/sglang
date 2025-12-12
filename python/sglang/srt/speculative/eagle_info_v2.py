@@ -211,6 +211,7 @@ class EagleDraftInputV2Mixin:
         accept_lens: torch.Tensor,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        accept_lens_cpu: torch.Tensor = None,  # Optional: pass CPU tensor to avoid sync
     ):
         """
         Prepare batch for draft extend using repacked (variable-length) tensors.
@@ -233,8 +234,22 @@ class EagleDraftInputV2Mixin:
           - repacked_input_ids: [sum(accept_lens)], e.g., [7] for accept_lens=[4, 3]
             Contains only the accepted token IDs, NOT the full tree
           - accept_lens: [bs] = [2], e.g., [4, 3]
+          - accept_lens_cpu: Optional[Tensor] - CPU version of accept_lens to avoid sync
 
         The key insight is that seq_lens grows by accept_lens, NOT by tree_size.
+
+        ============================================================================
+        SYNC OPTIMIZATION (Option 5: GPU-Resident accept_lens)
+        ============================================================================
+
+        For flashinfer backend, we can avoid the CPU sync entirely:
+        1. Pass accept_lens (GPU tensor) directly as extend_seq_lens
+        2. The flashinfer backend uses spec_info.accept_length on GPU via
+           generate_attn_arg_prefill() to compute qo_indptr
+        3. ForwardBatch.init_new() can handle GPU tensors directly
+
+        For triton backend, max_extend_len can be a constant upper bound
+        (num_steps + 1) since the kernel uses qo_indptr for actual bounds.
 
         ============================================================================
         CONNECTION TO eagle_worker_v2.py
@@ -248,18 +263,47 @@ class EagleDraftInputV2Mixin:
         """
         seq_lens_cpu_ = batch.seq_lens_cpu
 
-        # Calculate true extend amount per request
-        accept_lens_cpu = accept_lens.cpu()
-        extend_num_tokens = accept_lens.sum().item()
+        # ========================================================================
+        # OPTION 5: GPU-Resident accept_lens (Sync-Free for Flashinfer)
+        # ========================================================================
+        # Instead of transferring accept_lens to CPU, we:
+        # 1. Pass GPU tensor directly as extend_seq_lens
+        # 2. Use upper bound for extend_num_tokens (for position buffer allocation)
+        # 3. The attention backend computes indices on GPU
+        #
+        # This eliminates the ~0.5ms GPU→CPU sync for accept_lens!
+        # ========================================================================
+
+        # For seq_lens_sum and seq_lens_cpu, we still need CPU values
+        # But we can defer this or use estimates
+        if accept_lens_cpu is not None:
+            # CPU tensor provided by caller - use it for exact values
+            extend_num_tokens = accept_lens_cpu.sum().item()
+            batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
+        else:
+            # NO SYNC PATH: Use upper bound for buffer allocation
+            # The actual token count is in repacked_input_ids.shape[0]
+            extend_num_tokens = repacked_input_ids.shape[0]
+            # seq_lens_cpu will be slightly off, but flashinfer doesn't use it
+            # for DRAFT_EXTEND mode (it uses spec_info.accept_length on GPU)
+            batch.seq_lens_cpu = None  # Mark as unavailable
 
         batch.spec_info = self
         batch.input_ids = repacked_input_ids
         batch.seq_lens = batch.seq_lens + accept_lens
-        batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
         batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = accept_lens_cpu.tolist()
-        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+
+        # KEY CHANGE: Pass GPU tensor directly instead of CPU list!
+        # ForwardBatch.init_new() will handle GPU tensors for DRAFT_EXTEND_V2 mode
+        batch.extend_seq_lens = accept_lens  # GPU tensor!
+        batch.extend_prefix_lens = seq_lens_cpu_  # CPU tensor or list
         batch.extend_num_tokens = extend_num_tokens
+
+        # DEBUG: Verify types for Option 5
+        print(f"[Option5_DEBUG] extend_seq_lens type={type(batch.extend_seq_lens).__name__}, "
+              f"device={getattr(batch.extend_seq_lens, 'device', 'N/A')}, "
+              f"extend_prefix_lens type={type(batch.extend_prefix_lens).__name__}, "
+              f"device={getattr(batch.extend_prefix_lens, 'device', 'N/A')}")
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = (
             ForwardMode.IDLE

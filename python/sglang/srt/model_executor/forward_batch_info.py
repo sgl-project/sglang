@@ -467,15 +467,52 @@ class ForwardBatch:
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            assert isinstance(batch.extend_seq_lens, list)
-            assert isinstance(batch.extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            # ================================================================
+            # OPTION 5: Support GPU tensors for DRAFT_EXTEND_V2 mode
+            # ================================================================
+            # For DRAFT_EXTEND_V2 (tree mode after verify), extend_seq_lens
+            # can be passed as a GPU tensor to avoid CPU sync.
+            # The flashinfer backend computes qo_indptr on GPU from
+            # spec_info.accept_length, so it doesn't need CPU values.
+            # ================================================================
+            if isinstance(batch.extend_seq_lens, torch.Tensor):
+                # GPU tensor path - ensure on correct device with correct dtype
+                ret.extend_seq_lens = batch.extend_seq_lens.to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
+                # For CPU version, compute lazily only if needed
+                ret.extend_seq_lens_cpu = None  # Will be computed on-demand
+            else:
+                # Legacy path - list input (for regular EXTEND mode)
+                assert isinstance(batch.extend_seq_lens, list)
+                ret.extend_seq_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_seq_lens_cpu = batch.extend_seq_lens
+
+            # extend_prefix_lens - ensure on GPU for Triton kernel
+            if isinstance(batch.extend_prefix_lens, torch.Tensor):
+                # Check device BEFORE moving to GPU
+                is_cpu_tensor = batch.extend_prefix_lens.device.type == 'cpu'
+                # Move to correct device
+                ret.extend_prefix_lens = batch.extend_prefix_lens.to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
+                # CPU version for places that need it
+                if is_cpu_tensor:
+                    ret.extend_prefix_lens_cpu = batch.extend_prefix_lens.tolist()
+                else:
+                    ret.extend_prefix_lens_cpu = None  # Compute lazily if needed
+            else:
+                assert isinstance(batch.extend_prefix_lens, list)
+                ret.extend_prefix_lens = torch.tensor(
+                    batch.extend_prefix_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
+
             ret.extend_num_tokens = batch.extend_num_tokens
+
+            # Compute positions - both tensors should be on GPU now
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
                 ret.extend_prefix_lens,
@@ -484,8 +521,6 @@ class ForwardBatch:
             )
             if ret.positions is None:
                 ret.positions = positions
-            ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
-            ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
