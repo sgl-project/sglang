@@ -42,7 +42,6 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
-    is_blackwell,
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
@@ -290,6 +289,7 @@ class ServerArgs:
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
+    enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -308,6 +308,7 @@ class ServerArgs:
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
+    pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -1371,7 +1372,8 @@ class ServerArgs:
 
             1. Models with MHA Architecture (e.g: Llama, QWen)
                 1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-                1.2 Use trtllm_mha for Blackwell excluding spec with topk > 1.
+                1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
+                   Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
                 1.3 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
@@ -1387,7 +1389,7 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
-                elif is_blackwell() and is_no_spec_infer_or_topk_one(self):
+                elif is_sm100_supported() and is_no_spec_infer_or_topk_one(self):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
@@ -1677,11 +1679,12 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            assert (
-                self.quantization == "modelopt_fp4"
-                or self.quantization == "modelopt_fp8"
-                or self.quantization == "fp8"
-            ), "modelopt_fp4, modelopt_fp8 or fp8 quantization is required for Flashinfer TRTLLM MoE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "fp8",
+                "modelopt_fp8",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -2223,18 +2226,25 @@ class ServerArgs:
             self.skip_server_warmup = True
 
     def _handle_remote_instance_weight_loader_support_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
+        try:
+            importlib.import_module("mooncake")
+            if importlib.util.find_spec("mooncake.engine") is None:
+                logger.warning(
+                    f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+                )
+                self.remote_instance_weight_loader_support_transfer_engine = False
+            elif self.enable_memory_saver:
+                logger.warning(
+                    "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
+                )
+                self.remote_instance_weight_loader_support_transfer_engine = False
+            else:
+                self.remote_instance_weight_loader_support_transfer_engine = True
+        except ImportError:
             logger.warning(
-                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+                f"Failed to import mooncake. Does not support using TransferEngine as remote instance weight loader backend."
             )
             self.remote_instance_weight_loader_support_transfer_engine = False
-        elif self.enable_memory_saver:
-            logger.warning(
-                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            self.remote_instance_weight_loader_support_transfer_engine = False
-        else:
-            self.remote_instance_weight_loader_support_transfer_engine = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -2517,6 +2527,12 @@ class ServerArgs:
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_chunking,
+            help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+        )
+        parser.add_argument(
             "--max-prefill-tokens",
             type=int,
             default=ServerArgs.max_prefill_tokens,
@@ -2623,6 +2639,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.pp_max_micro_batch_size,
             help="The maximum micro batch size in pipeline parallelism.",
+        )
+        parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            help="The async batch depth of pipeline parallelism.",
         )
         parser.add_argument(
             "--stream-interval",
