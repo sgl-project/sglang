@@ -1273,7 +1273,6 @@ impl Default for MockWorkerConfig {
 async fn metrics_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-
     if should_fail(&config).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1282,18 +1281,21 @@ async fn metrics_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) ->
             .into_response();
     }
 
-
     if config.response_delay_ms > 0 {
         tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
     }
 
 
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-    format!(
+    let output = format!(
         "# HELP sglang_num_running_reqs The number of running requests\n\
          # TYPE sglang_num_running_reqs gauge\n\
          sglang_num_running_reqs{{worker_port=\"{}\"}} 42\n\
+         # HELP sglang_up_timestamp Timestamp of the worker\n\
+         # TYPE sglang_up_timestamp gauge\n\
          sglang_up_timestamp {}\n",
-        config.port, timestamp
-    ).into_response()
+        config.port,
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+    );
+
+    output.into_response()
 }

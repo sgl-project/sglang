@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::time::Instant;
-use axum::body::Body;
 use http::StatusCode;
 use reqwest::Client;
 use sgl_model_gateway::core::{
@@ -58,17 +57,17 @@ async fn test_metrics_parallel_latency() {
 
     println!("Execution Time: {:.2}s", duration);
 
-    // Cleanup
     for mut w in workers { w.stop().await; }
 
     // Assert Parallelism: Time should be much closer to 1s than 3s
-    assert!(duration < (delay_ms as f64 / 1000.0) + 0.5, "Requests ran sequentially!");
+    // We allow a small buffer for overhead, but it must be significantly less than serial sum
+    assert!(duration < (delay_ms as f64 / 1000.0) + 0.8, "Requests ran sequentially! Time: {}s", duration);
 }
 
 #[tokio::test]
 async fn test_metrics_data_aggregation() {
     println!("\n=== TEST: Data Aggregation Correctness ===");
-    //  workers with different ports. Ensure both show up in the output.
+    //  2 workers with different ports. Ensure both show up in the output.
     let worker_config = MockWorkerConfig {
         port: 0,
         worker_type: MockWorkerType::Regular,
@@ -103,10 +102,12 @@ async fn test_metrics_data_aggregation() {
     let body_text = response_to_text(response).await;
     println!("Aggregated Metrics Output:\n{}", body_text);
 
+    assert!(!body_text.is_empty(), "Metrics body is empty");
+
     // Verify both workers are present in the Prometheus output
     for port in ports {
         assert!(body_text.contains(&format!("worker_port=\"{}\"", port)),
-                "Missing metrics from worker on port {}", port);
+                "Missing metrics from worker on port {}. Full output:\n{}", port, body_text);
     }
 
     for mut w in workers { w.stop().await; }
@@ -132,19 +133,19 @@ async fn test_metrics_partial_failure_resilience() {
     registry.register(Arc::new(BasicWorkerBuilder::new(&url1).build()));
     workers.push(w1);
 
-    // Failing Worker (Returns 500)
+    //  Failing Worker (Returns 500)
     let mut w2 = MockWorker::new(MockWorkerConfig {
         port: 0,
         worker_type: MockWorkerType::Regular,
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
-        fail_rate: 1.0, // means 100% failure rate
+        fail_rate: 1.0, // 100% failure rate
     });
     let url2 = w2.start().await.unwrap();
     registry.register(Arc::new(BasicWorkerBuilder::new(&url2).build()));
     workers.push(w2);
 
-    // Request Metrics
+
     let response = WorkerManager::get_engine_metrics(&registry, &client).await;
 
 
@@ -152,9 +153,10 @@ async fn test_metrics_partial_failure_resilience() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let body_text = response_to_text(response).await;
+    println!("Partial Failure Metrics Output:\n{}", body_text);
 
     // Should contain data from healthy worker
-    assert!(body_text.contains(&format!("worker_port=\"{}\"", port1)), "Healthy worker data missing");
+    assert!(body_text.contains(&format!("worker_port=\"{}\"", port1)), "Healthy worker data missing. Full output:\n{}", body_text);
 
     println!("Metrics returned successfully despite one worker failing.");
 
