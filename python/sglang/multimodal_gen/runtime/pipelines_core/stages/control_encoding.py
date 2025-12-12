@@ -598,7 +598,7 @@ class ControlEncodingStage(PipelineStage):
         image_tensor = image_tensor.unsqueeze(0)
 
         # Move to appropriate device and dtype
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_local_torch_device()
         # Get dtype from pipeline config (dit_precision: "bf16" or "fp16")
         dit_precision = server_args.pipeline_config.dit_precision
         dtype = (
