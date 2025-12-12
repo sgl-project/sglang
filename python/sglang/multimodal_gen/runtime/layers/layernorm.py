@@ -32,8 +32,13 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
-import sgl_kernel
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
+from sgl_kernel import (
+    fused_add_rmsnorm,
+    fused_layernorm_scale_shift,
+    fused_layernorm_scale_shift_no_affine,
+    fused_scale_residual_layernorm_scale_shift,
+    rmsnorm,
+)
 
 # Copied and adapted from sglang
 @CustomOp.register("rms_norm")
@@ -330,7 +335,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
               but before normalization)
         """
         can_use_cuda = (
-            x.is_cuda and (x.shape[-1] % 4 == 0) and not isinstance(self.norm, RMSNorm)
+            _is_cuda and (x.shape[-1] % 4 == 0) and not isinstance(self.norm, RMSNorm)
         )
         if can_use_cuda:
             B, L, C = x.shape
@@ -399,10 +404,8 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 raise ValueError(f"Gate type {type(gate)} not supported")
 
             # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
-            y_2d, residual_output = (
-                sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-                    residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
-                )
+            y_2d, residual_output = fused_scale_residual_layernorm_scale_shift(
+                residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
             )
             return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
@@ -500,7 +503,7 @@ class LayerNormScaleShift(nn.Module):
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
         can_use_cuda = (
-            x.is_cuda
+            _is_cuda
             and self.norm_type == "layer"
             and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
         )
@@ -522,9 +525,7 @@ class LayerNormScaleShift(nn.Module):
                 scale_arg = self._get_arg(scale, x, B, L, C, M)
                 shift_arg = self._get_arg(shift, x, B, L, C, M)
 
-                y_2d = sgl_kernel.fused_layernorm_scale_shift_no_affine(
-                    x_2d, scale_arg, shift_arg
-                )
+                y_2d = fused_layernorm_scale_shift_no_affine(x_2d, scale_arg, shift_arg)
                 return y_2d.view(B, L, C)
 
             # Standard path: use affine LayerNorm + fused scale/shift kernel.
@@ -538,9 +539,7 @@ class LayerNormScaleShift(nn.Module):
             scale_arg = self._get_arg(scale, x, B, L, C, M)
             shift_arg = self._get_arg(shift, x, B, L, C, M)
 
-            y_2d = sgl_kernel.fused_layernorm_scale_shift(
-                x_2d, gamma, beta, scale_arg, shift_arg
-            )
+            y_2d = fused_layernorm_scale_shift(x_2d, gamma, beta, scale_arg, shift_arg)
             return y_2d.view(B, L, C)
 
         else:
