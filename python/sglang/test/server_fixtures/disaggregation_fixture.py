@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 logger = logging.getLogger(__name__)
 
 
-class TestDisaggregationBase(CustomTestCase):
+class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
