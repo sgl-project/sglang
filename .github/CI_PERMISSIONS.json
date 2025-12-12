@@ -160,6 +160,13 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "MingxuZh": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "Oasis-Git": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -220,7 +227,8 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override"
+        "reason": "custom override",
+		"can_rerun_stage": true
     },
     "XiaotongJiang": {
         "can_tag_run_ci_label": true,
@@ -421,7 +429,7 @@
     "harrisonlimh": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
+        "cooldown_interval_minutes": 0,
         "reason": "custom override",
         "can_rerun_stage": true
     },
@@ -663,6 +671,13 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "pdasgup": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "ping1jing2": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -898,6 +913,13 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 60,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
+    "yinghai": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
         "reason": "custom override",
         "can_rerun_stage": true
     },

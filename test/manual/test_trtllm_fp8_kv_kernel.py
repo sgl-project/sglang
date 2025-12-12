@@ -301,6 +301,179 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
             page_size=page_size,
         )
 
+    def test_fp8_kv_kernel_accepts_tensor_scales(self):
+        """
+        Regression test for B200 Triton compilation issue.
+
+        This test ensures that fused_fp8_set_kv_buffer correctly handles
+        k_scale/v_scale when they are 0-dimensional tensors (torch.nn.Parameter).
+
+        Previously, Triton would treat 0-D tensor arguments as pointers,
+        causing a type error when performing "1.0 / k_scale" inside the kernel.
+        The fix converts tensor scales to Python floats in the wrapper.
+        """
+        device = torch.device("cuda")
+
+        num_tokens = 4
+        num_kv_heads = 2
+        head_dim = 64
+        page_size = 16
+        total_slots = page_size
+
+        k = torch.randn(
+            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+
+        k_cache = torch.empty(
+            total_slots,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        v_cache = torch.empty_like(k_cache)
+
+        cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+        # Use 0D tensor form of scale to reproduce the original bug scenario
+        k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+        v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+
+        # Old code would trigger Triton's IncompatibleTypeError here
+        # New code should handle this gracefully by converting to float
+        fused_fp8_set_kv_buffer(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            cache_loc,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            page_size=page_size,
+            use_triton=True,
+        )
+
+        # If we get here without exception, the regression is fixed
+
+    def test_fp8_kv_kernel_cuda_graph_compatible(self):
+        """
+        Regression test for CUDA graph capture compatibility.
+
+        This test ensures that fused_fp8_set_kv_buffer works correctly within
+        CUDA graph capture, which is used in production for performance.
+
+        Previously, float(k_scale) caused GPU→CPU synchronization, triggering
+        cudaErrorStreamCaptureUnsupported during graph capture. The fix computes
+        inverse scales purely on GPU using tensor operations.
+        """
+        device = torch.device("cuda")
+
+        num_tokens = 4
+        num_kv_heads = 2
+        head_dim = 64
+        page_size = 16
+        total_slots = page_size
+
+        k = torch.randn(
+            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+
+        k_cache = torch.empty(
+            total_slots,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        v_cache = torch.empty_like(k_cache)
+
+        cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+        # Use 0D tensor scales (like nn.Parameter) to reproduce production scenario
+        k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+        v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+
+        # Test that kernel works under CUDA graph capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            # Old code would fail here with cudaErrorStreamCaptureUnsupported
+            # New code should succeed because all operations stay on GPU
+            fused_fp8_set_kv_buffer(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                cache_loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                page_size=page_size,
+                use_triton=True,
+            )
+
+        # Replay the graph to verify it works
+        graph.replay()
+
+        # If we get here without exception, CUDA graph compatibility is confirmed
+
+    def test_fp8_kv_kernel_cuda_graph_compatible_no_scale(self):
+        """
+        Regression test for CUDA graph capture compatibility without scales.
+
+        This test ensures that fused_fp8_set_kv_buffer works correctly within
+        CUDA graph capture when k_scale/v_scale are None (use_provided_scale=False).
+
+        Previously, the code created new GPU tensors (torch.tensor(1.0, device=...))
+        during graph capture, triggering cudaErrorStreamCaptureUnsupported.
+        The fix passes dummy pointers when use_provided_scale=False, as the kernel
+        uses constant 1.0 and Triton optimizes away the pointer loads.
+        """
+        device = torch.device("cuda")
+
+        num_tokens = 4
+        num_kv_heads = 2
+        head_dim = 64
+        page_size = 16
+        total_slots = page_size
+
+        k = torch.randn(
+            num_tokens, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+
+        k_cache = torch.empty(
+            total_slots,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        v_cache = torch.empty_like(k_cache)
+
+        cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+        # Test that kernel works under CUDA graph capture WITHOUT scales
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            # No k_scale/v_scale provided - use_provided_scale=False branch
+            # Old code would fail here with cudaErrorStreamCaptureUnsupported
+            # New code should succeed by using dummy pointers
+            fused_fp8_set_kv_buffer(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                cache_loc,
+                page_size=page_size,
+                use_triton=True,
+            )
+
+        # Replay the graph to verify it works
+        graph.replay()
+
+        # If we get here without exception, no-scale CUDA graph compatibility is confirmed
+
 
 if __name__ == "__main__":
     unittest.main()

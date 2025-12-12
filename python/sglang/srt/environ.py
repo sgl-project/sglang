@@ -151,6 +151,7 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    IS_BLACKWELL = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
@@ -241,6 +242,8 @@ class Envs:
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
+    SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
+    SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -275,6 +278,11 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+
+    # DeepEP
+    SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -315,6 +323,7 @@ class Envs:
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+    SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -360,10 +369,22 @@ def _print_deprecated_env(new_name: str, old_name: str):
         os.environ[new_name] = os.environ[old_name]
 
 
+def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
+    """Warn when a deprecated environment variable is used.
+
+    This is for env vars that are deprecated in favor of CLI flags.
+    """
+    if env_name in os.environ:
+        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+
+
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
         "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
+    )
+    _print_deprecated_env(
+        "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
     )
 
     for key, value in os.environ.items():
@@ -376,6 +397,19 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
+
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
 
 
 def example_with_exit_stack():
