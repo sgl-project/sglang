@@ -183,7 +183,7 @@ class ModelSlimConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix_in_quant_config)
             if scheme is None:
-                return UnquantizedLinearMethod()
+                raise NotImplementedError("At the moment SGLang on Ascend supports only w4a4 dynamic, w8a8 static/dynamic linear schemes.")
             layer.scheme = scheme
             return (
                 ModelSlimLinearMethod(self)
