@@ -182,3 +182,18 @@ def register_memory_region_v2(model, transfer_engine):
     end_tic = time.time()
     logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
     return weight_mr_dict
+
+
+def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos):
+    remote_instance_transfer_engine_info = {}
+    for data in scheduler_infos:
+        if (
+            "tp_rank" in data
+            and "remote_instance_transfer_engine_session_id" in data
+            and "remote_instance_transfer_engine_weights_info_dict" in data
+        ):
+            remote_instance_transfer_engine_info[data["tp_rank"]] = (
+                data["remote_instance_transfer_engine_session_id"],
+                data["remote_instance_transfer_engine_weights_info_dict"],
+            )
+    return remote_instance_transfer_engine_info

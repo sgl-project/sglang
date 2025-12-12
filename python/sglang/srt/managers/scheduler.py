@@ -2724,30 +2724,25 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+        result_dict = {
+            "status": "ready",
+            "max_total_num_tokens": scheduler.max_total_num_tokens,
+            "max_req_input_len": scheduler.max_req_input_len,
+        }
         if server_args.remote_instance_weight_loader_support_transfer_engine:
             (
                 remote_instance_transfer_engine_session_id,
                 remote_instance_transfer_engine_weights_info_dict,
             ) = scheduler.get_remote_instance_transfer_engine_info()
-            pipe_writer.send(
+            result_dict.update(
                 {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
                     "tp_rank": tp_rank,
                     "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
                     "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
                 }
             )
-        else:
-            pipe_writer.send(
-                {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
-                }
-            )
 
+        pipe_writer.send(result_dict)
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
             if scheduler.enable_pdmux:

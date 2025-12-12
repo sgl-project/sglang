@@ -117,6 +117,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -1418,11 +1421,13 @@ def launch_server(
         template_manager,
         scheduler_infos,
         port_args,
-        remote_instance_transfer_engine_info,
     ) = _launch_subprocesses(server_args=server_args)
 
     # Assume that all schedulers have the same info except remote_instance_transfer_engine_info.
     scheduler_info = scheduler_infos[0]
+    remote_instance_transfer_engine_info = (
+        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
+    )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
