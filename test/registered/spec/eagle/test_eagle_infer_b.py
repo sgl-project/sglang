@@ -284,7 +284,7 @@ class TestEAGLEServerBasic(EagleServerBase):
         self.assertTrue(is_valid_json)
 
 
-class TestEAGLERetract(EagleServerBase):
+class TestEAGLERetract(TestEAGLEServerBasic):
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 64]
 
     @classmethod
