@@ -1718,7 +1718,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                     layer_id=self.layer_id,
                     return_indices=False,
                 )
-
+            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
+                # MXFP4: fused RMSNorm + quant
+                q, _, _, _ = fused_rms_mxfp4_quant(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    None,
+                    None,
+                    None,
+                )
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
 
                 q, _, _, _ = fused_rms_fp8_group_quant(
