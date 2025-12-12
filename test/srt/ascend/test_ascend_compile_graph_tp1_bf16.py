@@ -39,10 +39,9 @@ class TestAscendTp1Bf16(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--disable-radix-cache",
-            "--enable-torch-compile",
+            "--enable-torch-air-compile",
             "--watchdog-timeout",
             30000,
-            "--disable-cuda-graph",
         ]
 
     def test_a_gsm8k(self):
