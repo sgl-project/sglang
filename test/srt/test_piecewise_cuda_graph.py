@@ -491,6 +491,7 @@ class TestPiecewiseCudaGraphWithPP(CustomTestCase):
             f"piecewise_cuda_graph={server_info.get('enable_piecewise_cuda_graph', False)}"
         )
 
+
 @unittest.skipIf(
     get_device_count() < 2,
     f"Test requires at least 2 GPUs, but only {get_device_count()} GPU(s) available",
@@ -560,9 +561,7 @@ class TestPiecewiseCudaGraphPPConsistency(CustomTestCase):
         self.assertGreaterEqual(pp_pcg_metrics["accuracy"], 0.70)
 
         # Accuracy difference should be small (within 3%)
-        accuracy_diff = abs(
-            pp_only_metrics["accuracy"] - pp_pcg_metrics["accuracy"]
-        )
+        accuracy_diff = abs(pp_only_metrics["accuracy"] - pp_pcg_metrics["accuracy"])
         self.assertLess(
             accuracy_diff,
             0.03,
