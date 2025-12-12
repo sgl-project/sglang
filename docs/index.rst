@@ -67,6 +67,7 @@ Its core features include:
    supported_models/support_new_models.md
    supported_models/transformers_fallback.md
    supported_models/modelscope.md
+   supported_models/mindspore_models.md
 
 .. toctree::
    :maxdepth: 1

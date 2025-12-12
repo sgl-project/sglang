@@ -65,6 +65,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -304,6 +305,9 @@ class Scheduler(
 
         # Init moe config
         self.init_moe_config()
+
+        # Init GEMM config (FP8 GEMM, etc.)
+        self.init_gemm_config()
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -966,6 +970,12 @@ class Scheduler(
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
+    def init_gemm_config(self):
+        # Initialize GEMM-related configuration (currently FP8 Blockwise GEMM backend).
+        # Other GEMM backends (e.g. FP4, BF16, etc.) can be added here in the future.
+        # This is needed for FP8 quantization.
+        initialize_fp8_gemm_config(self.server_args)
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1304,7 +1314,7 @@ class Scheduler(
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
-                reasoning=recv_req.reasoning,
+                require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -1433,7 +1443,7 @@ class Scheduler(
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                    key, req.reasoning
+                    key, req.require_reasoning
                 )
                 req.grammar = value
 
@@ -2439,8 +2449,19 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
-            self.last_batch = None
-            self.cur_batch = None
+
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            chunked_req_to_exclude = set()
+            if recv_req.mode == "in_place":
+                if self.chunked_req is not None:
+                    chunked_req_to_exclude.add(self.chunked_req)
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            self.running_batch.merge_batch(self.last_batch)
+
+        self.last_batch = None
+        self.cur_batch = None
 
         if recv_req.mode == "retract":
             self.running_batch.filter_batch()
@@ -2551,6 +2572,9 @@ class Scheduler(
         freeze_gc("Scheduler")
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
+
+    def get_remote_instance_transfer_engine_info(self):
+        return self.tp_worker.get_remote_instance_transfer_engine_info()
 
 
 class IdleSleeper:
@@ -2665,13 +2689,29 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "max_total_num_tokens": scheduler.max_total_num_tokens,
-                "max_req_input_len": scheduler.max_req_input_len,
-            }
-        )
+        if server_args.remote_instance_weight_loader_support_transfer_engine:
+            (
+                remote_instance_transfer_engine_session_id,
+                remote_instance_transfer_engine_weights_info_dict,
+            ) = scheduler.get_remote_instance_transfer_engine_info()
+            pipe_writer.send(
+                {
+                    "status": "ready",
+                    "max_total_num_tokens": scheduler.max_total_num_tokens,
+                    "max_req_input_len": scheduler.max_req_input_len,
+                    "tp_rank": tp_rank,
+                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
+                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
+                }
+            )
+        else:
+            pipe_writer.send(
+                {
+                    "status": "ready",
+                    "max_total_num_tokens": scheduler.max_total_num_tokens,
+                    "max_req_input_len": scheduler.max_req_input_len,
+                }
+            )
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
