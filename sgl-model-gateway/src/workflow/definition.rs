@@ -1,6 +1,10 @@
 //! Workflow definition types
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use super::{
     executor::StepExecutor,
@@ -111,12 +115,14 @@ impl WorkflowDefinition {
     /// - A step depends on a non-existent step
     /// - There's a cycle in the dependencies
     pub fn validate(&self) -> Result<(), String> {
-        let step_ids: HashSet<_> = self.steps.iter().map(|s| &s.id).collect();
+        // Build HashMap for O(1) lookup instead of O(n) linear search
+        let steps_map: HashMap<&StepId, &StepDefinition> =
+            self.steps.iter().map(|s| (&s.id, s)).collect();
 
         // Check all dependencies exist
         for step in &self.steps {
             for dep in &step.depends_on {
-                if !step_ids.contains(dep) {
+                if !steps_map.contains_key(dep) {
                     return Err(format!(
                         "Step '{}' depends on non-existent step '{}'",
                         step.id, dep
@@ -130,7 +136,9 @@ impl WorkflowDefinition {
         let mut rec_stack = HashSet::new();
 
         for step in &self.steps {
-            if self.has_cycle(&step.id, &mut visited, &mut rec_stack) {
+            if !visited.contains(&step.id)
+                && Self::has_cycle(&step.id, &steps_map, &mut visited, &mut rec_stack)
+            {
                 return Err(format!("Cycle detected involving step '{}'", step.id));
             }
         }
@@ -138,12 +146,12 @@ impl WorkflowDefinition {
         Ok(())
     }
 
-    /// DFS helper for cycle detection
-    fn has_cycle(
-        &self,
-        step_id: &StepId,
-        visited: &mut HashSet<StepId>,
-        rec_stack: &mut HashSet<StepId>,
+    /// DFS helper for cycle detection with O(1) HashMap lookup
+    fn has_cycle<'a>(
+        step_id: &'a StepId,
+        steps_map: &HashMap<&'a StepId, &'a StepDefinition>,
+        visited: &mut HashSet<&'a StepId>,
+        rec_stack: &mut HashSet<&'a StepId>,
     ) -> bool {
         if rec_stack.contains(step_id) {
             return true; // Back edge found - cycle!
@@ -152,13 +160,13 @@ impl WorkflowDefinition {
             return false; // Already fully processed
         }
 
-        visited.insert(step_id.clone());
-        rec_stack.insert(step_id.clone());
+        visited.insert(step_id);
+        rec_stack.insert(step_id);
 
-        // Find the step and check its dependencies
-        if let Some(step) = self.steps.iter().find(|s| &s.id == step_id) {
+        // O(1) lookup instead of linear search
+        if let Some(step) = steps_map.get(step_id) {
             for dep in &step.depends_on {
-                if self.has_cycle(dep, visited, rec_stack) {
+                if Self::has_cycle(dep, steps_map, visited, rec_stack) {
                     return true;
                 }
             }
