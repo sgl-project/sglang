@@ -8,6 +8,7 @@ from utils import (
     precision,
 )
 
+from sglang.srt.layers.quantization.fp8_utils import input_to_float8
 from sglang.srt.layers.rotary_embedding import _apply_rotary_emb
 from sglang.test.test_utils import CustomTestCase
 
@@ -186,6 +187,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             None,
             None,
             None,
+            None,
             True,
             None,
         )
@@ -201,6 +203,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             eps,
             False,
             False,
+            None,
             None,
             None,
             True,
@@ -274,6 +277,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             w1_s,
             w2_s,
             w3_s,
+            None,
             True,
             None,
         )
@@ -294,6 +298,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             False,
             fused_weight_s,
             w2_s,
+            None,
             True,
             None,
             q_lora_rank,
@@ -320,6 +325,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             torch.randn(num_heads * qk_head_dim, q_lora_rank, dtype=dtype) * 0.1
         )
         w_kc = torch.randn(num_heads, kv_lora_rank, qk_nope_head_dim, dtype=dtype) * 0.1
+        w_kc_q, w_kc_s = input_to_float8(w_kc)
         kv_a_proj_weight = (
             torch.randn(kv_lora_rank + qk_rope_head_dim, hidden_size, dtype=dtype) * 0.1
         )
@@ -350,13 +356,14 @@ class TestQKVProjWithROPE(CustomTestCase):
         ) = convert_weight(
             kv_a_proj_weight, [scale_block_size_N, scale_block_size_K], torch.bfloat16
         )
+        w_kc_dq = w_kc_q.to(torch.bfloat16) * w_kc_s
         q_ref, k_ref, v_ref = native_torch(
             q_input,
             hidden_states,
             q_a_proj_weight_dq,
             norm_weight1,
             q_b_proj_weight_dq,
-            w_kc.transpose(1, 2),
+            w_kc_dq.transpose(1, 2),
             kv_a_proj_with_mqa_weight_dq,
             norm_weight2,
             pos,
@@ -367,13 +374,13 @@ class TestQKVProjWithROPE(CustomTestCase):
         fp8_kv_a_proj_with_mqa_weight_packed = convert_weight_packed(
             fp8_kv_a_proj_with_mqa_weight
         )
-        w_kc = convert_weight_packed(w_kc)
+        w_kc_q = convert_weight_packed(w_kc_q)
         q_out, k_out, v_out = qkv_proj_with_rope(
             hidden_states,
             fp8_q_a_proj_weight_packed,
             fp8_q_b_proj_weight_packed,
             fp8_kv_a_proj_with_mqa_weight_packed,
-            w_kc,
+            w_kc_q,
             norm_weight1,
             norm_weight2,
             pos,
@@ -384,6 +391,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             q_a_proj_weight_scale_inv.float(),
             q_b_proj_weight_scale_inv.float(),
             kv_a_proj_with_mqa_weight_scale_inv.float(),
+            w_kc_s,
             True,
             [scale_block_size_N, scale_block_size_K],
         )
@@ -399,7 +407,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             hidden_states,
             fused_weight_packed,
             fp8_q_b_proj_weight_packed,
-            w_kc,
+            w_kc_q,
             norm_weight1,
             norm_weight2,
             pos,
@@ -409,6 +417,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             True,
             fused_weight_s.float(),
             q_b_proj_weight_scale_inv.float(),
+            w_kc_s,
             True,
             [scale_block_size_N, scale_block_size_K],
             q_lora_rank,
