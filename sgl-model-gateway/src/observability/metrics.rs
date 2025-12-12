@@ -74,7 +74,6 @@ pub fn init_metrics() {
         "sgl_router_worker_health",
         "Worker health status (1=healthy, 0=unhealthy)"
     );
-    describe_gauge!("sgl_router_worker_load", "Current load on each worker");
     describe_counter!(
         "sgl_router_processed_requests_total",
         "Total requests processed by each worker"
@@ -368,13 +367,6 @@ impl RouterMetrics {
         .set(if healthy { 1.0 } else { 0.0 });
     }
 
-    pub fn set_worker_load(worker_url: &str, load: usize) {
-        gauge!("sgl_router_worker_load",
-            "worker" => worker_url.to_string()
-        )
-        .set(load as f64);
-    }
-
     pub fn record_processed_request(worker_url: &str) {
         counter!("sgl_router_processed_requests_total",
             "worker" => worker_url.to_string()
@@ -555,7 +547,6 @@ impl RouterMetrics {
     pub fn remove_worker_metrics(worker_url: &str) {
         gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(0.0);
-        gauge!("sgl_router_worker_load","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_running_requests","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_tree_size","worker" => worker_url.to_string()).set(0.0);
     }
@@ -937,7 +928,6 @@ mod tests {
         RouterMetrics::record_retry("/generate");
 
         RouterMetrics::set_worker_health("http://worker1", true);
-        RouterMetrics::set_worker_load("http://worker1", 10);
         RouterMetrics::record_processed_request("http://worker1");
 
         RouterMetrics::record_policy_decision("random", "http://worker1");
@@ -1039,7 +1029,6 @@ mod tests {
             let handle = thread::spawn(move || {
                 let worker = format!("http://worker{}", i);
                 while !done_clone.load(Ordering::Relaxed) {
-                    RouterMetrics::set_worker_load(&worker, i * 10);
                     RouterMetrics::record_processed_request(&worker);
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -1088,9 +1077,6 @@ mod tests {
 
     #[test]
     fn test_extreme_metric_values() {
-        RouterMetrics::set_worker_load("worker", 0);
-        RouterMetrics::set_worker_load("worker", usize::MAX);
-
         RouterMetrics::record_request_duration(Duration::from_nanos(1));
         RouterMetrics::record_request_duration(Duration::from_secs(86400));
     }
