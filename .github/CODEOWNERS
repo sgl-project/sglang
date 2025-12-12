@@ -21,7 +21,7 @@
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
-/python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @zhyncs
+/python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
 /python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py @hebiao064
