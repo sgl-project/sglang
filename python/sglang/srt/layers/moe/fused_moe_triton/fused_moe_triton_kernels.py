@@ -790,6 +790,50 @@ def invoke_fused_moe_kernel(
         )
 
 
+@triton.jit
+def silu_and_mul_triton_kernel(
+    gateup_output,
+    down_input,
+    hidden_size,
+    topk_ids,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = gateup_output.dtype.element_ty
+    OutDtype = down_input.dtype.element_ty
+
+    half_hidden_size = hidden_size // 2
+
+    pid = tl.program_id(0)
+
+    expert_id = tl.load(topk_ids + pid)
+
+    gateup_output_ptr = gateup_output + pid * hidden_size
+    down_input_ptr = down_input + pid * half_hidden_size
+
+    if expert_id == -1:
+        for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            mask = offset < half_hidden_size
+            tl.store(down_input_ptr + offset, 0, mask=mask)
+    else:
+        gate_output_ptr = gateup_output_ptr
+        up_output_ptr = gateup_output_ptr + half_hidden_size
+
+        for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            mask = offset < half_hidden_size
+
+            gate_output = tl.load(gate_output_ptr + offset, mask=mask).to(tl.float32)
+            up_output = tl.load(up_output_ptr + offset, mask=mask)
+
+            gate_output = gate_output * tl.sigmoid(gate_output)
+            gate_output = gate_output.to(InDtype)
+
+            silu_mul_output = gate_output * up_output
+            silu_mul_output = silu_mul_output.to(OutDtype)
+            tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
+
+
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(

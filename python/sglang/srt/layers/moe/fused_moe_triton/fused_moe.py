@@ -27,6 +27,7 @@ from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_c
 from .fused_moe_triton_kernels import (
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
+    silu_and_mul_triton_kernel,
     support_tensor_descriptor,
 )
 from .moe_align_block_size import moe_align_block_size
@@ -553,8 +554,16 @@ def fused_experts_impl(
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_cuda or _is_hip:
+            elif _is_hip:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            elif _is_cuda:
+                silu_and_mul_triton_kernel(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    N,
+                    curr_topk_ids,
+                    512,
+                )
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
