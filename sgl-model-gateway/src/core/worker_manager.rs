@@ -276,47 +276,60 @@ impl WorkerManager {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
 
-        let mut responses = vec![];
-        // May do parallel requests later
+        let mut tasks = Vec::new();
+
         for worker in workers {
             let worker_url = worker.url().to_string();
-
             let url = format!("{}/{}", worker_url, endpoint);
-            let mut request_builder = match method {
-                Method::GET => client.get(url),
-                Method::POST => client.post(url),
-                _ => {
-                    return Err((
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Unsupported method for simple routing",
-                    )
-                        .into_response())
+
+            // Clone variables to move into the async block
+            let client = client.clone();
+            let method = method.clone();
+            let api_key = worker.api_key().clone();
+
+            tasks.push(async move {
+                let mut request_builder = match method {
+                    Method::GET => client.get(&url),
+                    Method::POST => client.post(&url),
+                    _ => return None,
+                };
+
+                if let Some(key) = api_key {
+                    request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
                 }
-            };
 
-            if let Some(api_key) = worker.api_key() {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
-            }
-
-            match request_builder.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match res.text().await {
-                        Ok(body_text) => {
-                            if status.is_success() {
-                                responses.push((worker_url, body_text));
+                match request_builder.send().await {
+                    Ok(res) => {
+                        let status = StatusCode::from_u16(res.status().as_u16())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        match res.text().await {
+                            Ok(body_text) => {
+                                if status.is_success() {
+                                    Some((worker_url, body_text))
+                                } else {
+                                    warn!("Request to {} failed with status: {}", url, status);
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed reading text from {}: {}", url, e);
+                                None
                             }
                         }
-                        Err(e) => {
-                            warn!("fan_out_simple_request failed when reading text: {}", e)
-                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed sending request to {}: {}", url, e);
+                        None
                     }
                 }
-                Err(e) => warn!("fan_out_simple_request failed when sending: {}", e),
-            }
+            });
         }
+
+        // Execute all tasks concurrently
+        let results = future::join_all(tasks).await;
+
+        // Filter out failures (None) and collect successes
+        let responses: Vec<(String, String)> = results.into_iter().flatten().collect();
 
         Ok(responses)
     }
