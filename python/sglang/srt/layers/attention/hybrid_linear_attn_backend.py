@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -25,6 +26,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
+    JetNemotronMetadata,
     Mamba2Metadata,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -83,7 +85,7 @@ class MambaAttnBackendBase(AttentionBackend):
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
-        elif forward_batch.forward_mode.is_extend():
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
@@ -733,6 +735,201 @@ class GDNAttnBackend(MambaAttnBackendBase):
         return core_attn_out
 
 
+class JetNemotronAttnBackend(MambaAttnBackendBase):
+    """Attention backend using Jet-Nemotron kernel."""
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        metadata = self._forward_metadata(forward_batch)
+        seq_lengths = metadata.query_start_loc.diff()
+        num_sequences = metadata.query_start_loc.shape[0] - 1
+        total_tokens = int(metadata.query_start_loc[-1].item())
+        seq_idx = torch.repeat_interleave(
+            torch.arange(
+                0,
+                num_sequences,
+                dtype=torch.int32,
+                device=metadata.query_start_loc.device,
+            ),
+            seq_lengths,
+            output_size=total_tokens,
+        )
+        self.forward_metadata = JetNemotronMetadata(
+            query_start_loc=metadata.query_start_loc,
+            mamba_cache_indices=metadata.mamba_cache_indices,
+            retrieve_next_token=metadata.retrieve_next_token,
+            retrieve_next_sibling=metadata.retrieve_next_sibling,
+            retrieve_parent_token=metadata.retrieve_parent_token,
+            seq_idx=seq_idx,
+        )
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        dynamic_conv_fn = kwargs["dynamic_conv"]
+        head_v_dim = kwargs["head_v_dim"]
+        a = kwargs["a"]
+        b = kwargs["b"]
+        A_log = kwargs["A_log"]
+        dt_bias = kwargs["dt_bias"]
+        layer_id = kwargs["layer_id"]
+        hidden_states = kwargs["hidden_states"]
+
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        conv_states = layer_cache.conv[0]
+        ssm_states = layer_cache.temporal
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+
+        v, conv_state = dynamic_conv_fn(
+            x=v.unsqueeze(
+                1
+            ),  # B, D -> B, 1, D. for speculative decode, we need to support B, D, T.
+            generator_input=hidden_states.unsqueeze(1),  # B, D -> B, 1, D.
+            cache=conv_states[
+                cache_indices
+            ],  # inefficiency here, can directly fuse cache
+            output_final_state=True,
+        )
+        conv_states[cache_indices] = conv_state
+
+        v = v.squeeze(1)
+        v = v.view(1, v.shape[0], v.shape[1] // head_v_dim, head_v_dim)
+
+        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
+
+        return core_attn_out
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        dynamic_conv_fn = kwargs["dynamic_conv"]
+        head_v_dim = kwargs["head_v_dim"]
+        a = kwargs["a"]
+        b = kwargs["b"]
+        A_log = kwargs["A_log"]
+        dt_bias = kwargs["dt_bias"]
+        layer_id = kwargs["layer_id"]
+        hidden_states = kwargs["hidden_states"]
+        seq_len = hidden_states.shape[0]
+
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+        retrieve_next_token = self.forward_metadata.retrieve_next_token
+        retrieve_next_sibling = self.forward_metadata.retrieve_next_sibling
+        retrieve_parent_token = self.forward_metadata.retrieve_parent_token
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        conv_states = mamba_cache_params.conv[0]
+        ssm_states = mamba_cache_params.temporal
+        if is_target_verify:
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            intermediate_conv_window_cache = (
+                mamba_cache_params.intermediate_conv_window[0]
+            )
+            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            batch_size = seq_len // draft_token_num
+
+            v = dynamic_conv_fn(
+                x=v.view(batch_size, draft_token_num, -1),
+                cache=conv_states,
+                generator_input=hidden_states.view(batch_size, draft_token_num, -1),
+                cache_indices=cache_indices,
+                intermediate_conv_window=intermediate_conv_window_cache,
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+                is_topk1=forward_batch.spec_info.topk == 1,
+            )
+            v = v.view(seq_len, -1)
+        else:
+            has_initial_states = forward_batch.extend_prefix_lens > 0
+            v, _ = dynamic_conv_fn(
+                x=v,  # B, D (varlen)
+                generator_input=hidden_states,  # B, D
+                mask=None,
+                cache=conv_states,
+                cu_seqlens=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=has_initial_states,
+                seq_idx=self.forward_metadata.seq_idx,
+                output_final_state=True,
+                layer_id=layer_id,
+            )
+
+        v = v.view(1, v.shape[0], v.shape[1] // head_v_dim, head_v_dim)
+        g = -A_log.float().exp() * F.softplus(
+            a.float() + dt_bias
+        )  # needed for numerical stability
+        g = g.unsqueeze(0)
+        beta = F.sigmoid(b).unsqueeze(0)
+
+        if is_target_verify:
+            core_attn_out = fused_recurrent_gated_delta_rule_update(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                disable_state_update=True,
+                intermediate_states_buffer=intermediate_state_cache,
+                cache_steps=forward_batch.spec_info.draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+        else:
+            recurrent_state = ssm_states[cache_indices]
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=True,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            ssm_states[cache_indices] = last_recurrent_state
+
+        return core_attn_out
+
+
 class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 
@@ -999,3 +1196,51 @@ class HybridLinearAttnBackend(AttentionBackend):
         conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
             :, valid_state_indices, last_steps
         ].to(conv_states.dtype, copy=False)
+
+    def update_jet_nemotron_topk1_state_after_mtp_verify(self, accepted_length, model):
+        request_number = accepted_length.shape[0]
+
+        state_indices_tensor = (
+            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                :request_number
+            ]
+        )
+
+        mamba_caches = (
+            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+
+        conv_states = mamba_caches.conv[0]
+        ssm_states = mamba_caches.temporal
+        intermediate_state_cache = mamba_caches.intermediate_ssm
+        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        W = conv_states.shape[3]
+
+        valid_mask = accepted_length > 0
+
+        last_steps_all = (accepted_length - 1).to(torch.int64)
+        valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
+        last_steps = last_steps_all[valid_mask].to(torch.int64)  # [N]
+
+        ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
+            :, valid_state_indices, last_steps
+        ].to(ssm_states.dtype, copy=False)
+
+        Wm1 = W - 1
+        time_offsets = torch.arange(
+            Wm1, device=last_steps.device, dtype=last_steps.dtype
+        )
+        time_indices = last_steps.unsqueeze(-1) + time_offsets
+        # Select caches for valid_state_indices -> [L, N, T, C]
+        src = intermediate_conv_window_cache[:, valid_state_indices, :, :]
+        L_dim, N_dim, _, C_dim = src.shape
+        # Build gather index over time dim (dim=2): [L, N, W-1, C]
+        gather_idx = time_indices.view(1, N_dim, Wm1, 1).expand(
+            L_dim, N_dim, Wm1, C_dim
+        )
+        gathered = torch.gather(src, 2, gather_idx)  # [L, N, W-1, C]
+        # Match conv_states layout [L, N, C, W-1]
+        gathered = gathered.transpose(-1, -2)
+        conv_states[:, valid_state_indices, :, 1:] = gathered.to(
+            conv_states.dtype, copy=False
+        )

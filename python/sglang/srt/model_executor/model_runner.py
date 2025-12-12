@@ -1559,6 +1559,13 @@ class ModelRunner:
         return None
 
     @property
+    def jet_nemotron_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, JetNemotronConfig | JetVLMConfig):
+            return config
+        return None
+
+    @property
     def kimi_linear_config(self):
         config = self.model_config.hf_config
         if isinstance(config, KimiLinearConfig):
@@ -1843,6 +1850,7 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(

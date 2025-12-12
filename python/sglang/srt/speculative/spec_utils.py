@@ -695,3 +695,43 @@ def detect_nan(logits_output: LogitsProcessorOutput):
     if torch.any(torch.isnan(logits)):
         logger.error("Detected errors during sampling! NaN in the logits.")
         raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+def update_hybrid_gdn_state_after_verify(
+    topk: int,
+    accepted_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    model_runner,
+):
+    if topk > 1 and accepted_indices.shape[0] > 0:
+        # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
+        # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
+        # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
+        # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+        cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+        req_start_positions = torch.cat(
+            [
+                torch.zeros(
+                    1,
+                    dtype=cumulative_accepted_lengths.dtype,
+                    device=cumulative_accepted_lengths.device,
+                ),
+                cumulative_accepted_lengths[:-1],
+            ]
+        )
+        first_token_indices_per_req = accepted_indices[req_start_positions]
+        last_token_indices_per_req = accepted_indices[cumulative_accepted_lengths - 1]
+        max_relative_indices_per_req = (
+            last_token_indices_per_req - first_token_indices_per_req
+        )
+    else:
+        max_relative_indices_per_req = accepted_length - 1
+
+    if model_runner.jet_nemotron_config is not None and topk == 1:
+        model_runner.attn_backend.update_jet_nemotron_topk1_state_after_mtp_verify(
+            accepted_length, model_runner.model
+        )
+    else:
+        model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+            max_relative_indices_per_req, model_runner.model
+        )
