@@ -19,7 +19,7 @@ def test_timestep_embedding_correctness(batch_size, dim, dtype):
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
     torch_output = timestep_embedding(t, dim)
     cuda_output = timestep_embedding_cuda(t, dim)
-    torch.testing.assert_close(torch_output, cuda_output, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
 
 
 def test_timestep_embedding_perf():

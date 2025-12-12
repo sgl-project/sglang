@@ -23,58 +23,7 @@ limitations under the License.
 #include <cassert>
 #include <cmath>
 
-template <typename T>
-__device__ float convert_to_float(T x) {
-  if constexpr (std::is_same_v<T, __half>) {
-    return __half2float(x);
-  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-    return __bfloat162float(x);
-  } else if constexpr (std::is_same_v<T, float>) {
-    return x;
-  } else {
-    // int, double
-    return static_cast<float>(x);
-  }
-}
-
-template <typename T>
-__device__ __nv_bfloat16 convert_to_bfloat16(T x) {
-  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-    return x;
-  } else if constexpr (std::is_same_v<T, __half>) {
-    return __float2bfloat16(__half2float(x));
-  } else if constexpr (std::is_same_v<T, float>) {
-    return __float2bfloat16(x);
-  } else {
-    return __float2bfloat16(static_cast<float>(x));
-  }
-}
-
-template <typename T>
-__device__ __half convert_to_float16(T x) {
-  if constexpr (std::is_same_v<T, __half>) {
-    return x;
-  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-    return __float2half(__bfloat162float(x));
-  } else if constexpr (std::is_same_v<T, float>) {
-    return __float2half(x);
-  } else {
-    return __float2half(static_cast<float>(x));
-  }
-}
-
-template <typename O, typename T>
-__device__ O cast_to(T x) {
-  if constexpr (std::is_same_v<O, float>) {
-    return convert_to_float(x);
-  } else if constexpr (std::is_same_v<O, __half>) {
-    return convert_to_float16(x);
-  } else if constexpr (std::is_same_v<O, __nv_bfloat16>) {
-    return convert_to_bfloat16(x);
-  } else {
-    return static_cast<O>(convert_to_float(x));
-  }
-}
+#include "utils.h"
 
 template <typename T_IN>
 __global__ void
@@ -84,7 +33,7 @@ timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log
   if (row_idx >= batch_size) {
     return;
   }
-  float t_val = cast_to<float>(__ldg(&t_ptr[row_idx]));
+  float t_val = castToFloat(__ldg(&t_ptr[row_idx]));
   float* output_batch_base_ptr = output_ptr + row_idx * dim;
 
   // Calculate half dimension
@@ -122,8 +71,8 @@ torch::Tensor timestep_embedding(const torch::Tensor& t, torch::Tensor& output, 
   TORCH_CHECK(t.dim() == 1 and t.stride(0) == 1, "t should be 1D");
   TORCH_CHECK(output.dim() == 2 and output.is_contiguous(), "output should be a contiguous 2D tensor.");
 
-  int B = static_cast<int>(t.size(0));
-  TORCH_CHECK(output.size(0) == B, "Output batch size doesn't match t");
+  const int batch_size = static_cast<int>(t.size(0));
+  TORCH_CHECK(output.size(0) == batch_size, "Output batch size doesn't match t");
   TORCH_CHECK(output.size(1) == dim, "Output feature size doesn't match dim");
 
   TORCH_CHECK(t.device().is_cuda(), "t must be a CUDA tensor");
@@ -133,7 +82,7 @@ torch::Tensor timestep_embedding(const torch::Tensor& t, torch::Tensor& output, 
   // To align with timestep_embedding python code.
   TORCH_CHECK(output.scalar_type() == at::ScalarType::Float, "Output buffer should be float32.");
 
-  TORCH_CHECK(dim % 2 == 0 && (dim / 2) % 4 == 0, "dim should align to 8");
+  TORCH_CHECK(dim % 8 == 0, "dim should align to 8");
   auto stream = at::cuda::getCurrentCUDAStream();
 
   constexpr int MAX_THREADS_PER_BLOCK = 1024;
@@ -142,9 +91,9 @@ torch::Tensor timestep_embedding(const torch::Tensor& t, torch::Tensor& output, 
   int num_threads_per_row = min(MAX_THREADS_PER_BLOCK, half_dim / 4);
   int num_rows = (MIN_THREADS_PER_BLOCK + num_threads_per_row - 1) / num_threads_per_row;
 
-  dim3 grid((B + num_rows - 1) / num_rows, 1, 1);
+  dim3 grid((batch_size + num_rows - 1) / num_rows);
   // assert float4 vectorize output
-  dim3 block(num_threads_per_row, num_rows, 1);
+  dim3 block(num_threads_per_row, num_rows);
   float neg_log_max_period = std::log(static_cast<float>(max_period)) * (-1.0f) / static_cast<float>(half_dim);
 
   AT_DISPATCH_ALL_TYPES_AND2(
@@ -154,7 +103,7 @@ torch::Tensor timestep_embedding(const torch::Tensor& t, torch::Tensor& output, 
             reinterpret_cast<float*>(output.data_ptr()),
             dim,
             neg_log_max_period,
-            B);
+            batch_size);
       });
 
   return output;

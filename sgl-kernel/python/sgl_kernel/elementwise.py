@@ -428,6 +428,6 @@ def timestep_embedding(
     """
     dtype = torch.float32
 
-    B = t.shape[0]
-    output = torch.empty((B, dim), dtype=dtype, device=t.device)
+    batch_size = t.shape[0]
+    output = torch.empty((batch_size, dim), dtype=dtype, device=t.device)
     return torch.ops.sgl_kernel.timestep_embedding(t, output, dim, max_period)
