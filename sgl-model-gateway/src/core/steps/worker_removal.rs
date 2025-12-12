@@ -1,14 +1,3 @@
-//! Worker Removal Workflow Steps
-//!
-//! This module implements the workflow steps for removing workers from the router.
-//! Handles both single worker removal and DP-aware worker removal with prefix matching.
-//!
-//! Steps:
-//! 1. FindWorkersToRemove - Identify workers to remove based on URL (handles DP-aware prefix matching)
-//! 2. RemoveFromPolicyRegistry - Remove workers from policy registry and cache-aware policies
-//! 3. RemoveFromWorkerRegistry - Remove workers from worker registry
-//! 4. UpdateRemainingPolicies - Update cache-aware policies for remaining workers
-
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -259,7 +248,8 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition {
             .with_retry(RetryPolicy {
                 max_attempts: 1,
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            })
+            .depends_on(&["find_workers_to_remove"]),
         )
         .add_step(
             StepDefinition::new(
@@ -271,7 +261,8 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition {
             .with_retry(RetryPolicy {
                 max_attempts: 1,
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            })
+            .depends_on(&["remove_from_policy_registry"]),
         )
         .add_step(
             StepDefinition::new(
@@ -283,6 +274,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition {
             .with_retry(RetryPolicy {
                 max_attempts: 1,
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            })
+            .depends_on(&["remove_from_worker_registry"]),
         )
 }

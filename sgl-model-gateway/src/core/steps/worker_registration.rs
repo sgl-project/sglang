@@ -1,17 +1,3 @@
-//! Local worker registration workflow steps
-//!
-//! This workflow handles registration of local inference workers (SGLang, vLLM).
-//! For external API endpoints (OpenAI, xAI, etc.), see external_worker_registration.rs.
-//!
-//! Workflow order:
-//! 1. DetectConnectionMode - Probe HTTP and gRPC to determine connection mode
-//! 2. DiscoverMetadata - Fetch metadata from /server_info or gRPC
-//! 3. DiscoverDPInfo - Fetch DP (Data Parallel) information (only for DP-aware workers)
-//! 4. CreateWorker - Build worker object(s) with merged config + metadata
-//! 5. RegisterWorker - Register worker(s) in registry
-//! 6. UpdatePolicies - Update policy registry with worker information
-//! 7. ActivateWorker - Mark worker(s) as healthy
-
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -901,7 +887,8 @@ pub fn create_worker_registration_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["detect_connection_mode"]),
         )
         .add_step(
             StepDefinition::new(
@@ -914,12 +901,14 @@ pub fn create_worker_registration_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["discover_metadata"]),
         )
         .add_step(
             StepDefinition::new("create_worker", "Create Worker", Arc::new(CreateWorkerStep))
                 .with_timeout(Duration::from_secs(5))
-                .with_failure_action(FailureAction::FailWorkflow),
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["discover_dp_info"]),
         )
         .add_step(
             StepDefinition::new(
@@ -928,7 +917,8 @@ pub fn create_worker_registration_workflow(
                 Arc::new(RegisterWorkerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["create_worker"]),
         )
         .add_step(
             StepDefinition::new(
@@ -937,7 +927,8 @@ pub fn create_worker_registration_workflow(
                 Arc::new(UpdatePoliciesStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["register_worker"]),
         )
         .add_step(
             StepDefinition::new(
@@ -946,6 +937,7 @@ pub fn create_worker_registration_workflow(
                 Arc::new(ActivateWorkerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["update_policies"]),
         )
 }

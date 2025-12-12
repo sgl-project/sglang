@@ -1,19 +1,3 @@
-//! External worker registration workflow steps
-//!
-//! This workflow handles registration of external API endpoints (OpenAI, xAI, Anthropic, etc.)
-//!
-//! Key features:
-//! - Fetches models from /v1/models endpoint
-//! - Groups dated model variants under base model names (e.g., gpt-4o, gpt-4o-2024-08-06)
-//! - Infers ModelType from model ID patterns (LLM, embedding, image gen, audio, etc.)
-//!
-//! Workflow order:
-//! 1. DiscoverModels - Fetch available models from /v1/models endpoint
-//! 2. CreateExternalWorkers - Build worker objects for each discovered model
-//! 3. RegisterWorkers - Register workers in registry
-//! 4. UpdatePolicies - Update policy registry
-//! 5. ActivateWorkers - Mark workers as healthy
-
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -571,7 +555,8 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(CreateExternalWorkersStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow),
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["discover_models"]),
     )
     .add_step(
         StepDefinition::new(
@@ -580,7 +565,8 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(RegisterExternalWorkersStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow),
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["create_workers"]),
     )
     .add_step(
         StepDefinition::new(
@@ -589,7 +575,8 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(UpdateExternalPoliciesStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::ContinueNextStep),
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&["register_workers"]),
     )
     .add_step(
         StepDefinition::new(
@@ -598,6 +585,7 @@ pub fn create_external_worker_registration_workflow() -> WorkflowDefinition {
             Arc::new(ActivateExternalWorkersStep),
         )
         .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow),
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["update_policies"]),
     )
 }
