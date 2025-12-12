@@ -36,7 +36,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Backend**                | **Native Page Sizes**     | **FP8 KV Cache** | **FP4 KV Cache** | **Chunked Prefix Cache** | **Spec topk=1** | **Spec topk>1** |
 |----------------------------|---------------------------|------------------|------------------|--------------------------|-----------------|-----------------|
 | **FlashInfer MLA**         | 1                         | ❌               | ✅               | ✅                       | ✅              | ❌              |
-| **FlashMLA**               | 64                        | ✅               | ❌               | ✅                       | ✅              | ❌              |
+| **FlashMLA**               | 64                        | ✅               | ✅               | ✅                       | ✅              | ❌              |
 | **Cutlass MLA**            | 128                       | ✅               | ✅               | ✅                       | ✅              | ❌              |
 | **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅               | ✅                       | ✅              | ❌              |
 | **FA3 (FlashAttention 3)** | n/a                       | ❌               | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
