@@ -6,7 +6,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -19,6 +18,7 @@ register_cuda_ci(est_time=3600, suite="nightly-8-gpu-b200", nightly=True)
 
 # Use the latest version of DeepSeek-V3.2
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
+SERVER_LAUNCH_TIMEOUT = 1000
 
 
 class TestDeepseekV32Accuracy(CustomTestCase):
@@ -37,11 +37,13 @@ class TestDeepseekV32Accuracy(CustomTestCase):
             "deepseekv32",
             "--reasoning-parser",
             "deepseek-v3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
         )
 
