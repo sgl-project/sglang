@@ -108,6 +108,20 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.elastic.elastic_allocator import (
+    ElasticHybridLinearKVPoolAllocator,
+    ElasticSWATokenToKVPoolAllocator,
+    ElasticTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.elastic.elastic_memory_pool import (
+    ElasticHybridLinearKVPool,
+    ElasticHybridReqToTokenPool,
+    ElasticSWAKVPool,
+)
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
+    ElasticMempoolOrchestrator,
+    use_elasticmem,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
@@ -1796,6 +1810,10 @@ class ModelRunner:
                 f"Current value: {self.server_args.mem_fraction_static=}"
             )
 
+        # Initialize token_to_kv_pool
+        if use_elasticmem:
+            self.emem_orch = ElasticMempoolOrchestrator()
+
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
@@ -1833,7 +1851,12 @@ class ModelRunner:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
-                self.req_to_token_pool = HybridReqToTokenPool(
+                hybrid_req_to_token_pool_class = (
+                    ElasticHybridReqToTokenPool
+                    if use_elasticmem
+                    else HybridReqToTokenPool
+                )
+                self.req_to_token_pool = hybrid_req_to_token_pool_class(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
                     max_context_len=self.model_config.context_len
@@ -1855,7 +1878,6 @@ class ModelRunner:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
@@ -1953,7 +1975,8 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid_swa:
-                self.token_to_kv_pool = SWAKVPool(
+                swa_pool_class = ElasticSWAKVPool if use_elasticmem else SWAKVPool
+                self.token_to_kv_pool = swa_pool_class(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
@@ -1973,7 +1996,10 @@ class ModelRunner:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
-                self.token_to_kv_pool = HybridLinearKVPool(
+                hybrid_linear_kv_pool_class = (
+                    ElasticHybridLinearKVPool if use_elasticmem else HybridLinearKVPool
+                )
+                self.token_to_kv_pool = hybrid_linear_kv_pool_class(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
@@ -2054,22 +2080,42 @@ class ModelRunner:
             else:
                 if self.page_size == 1:
                     if self.is_hybrid_swa:
-                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        swa_allocator_class = SWATokenToKVPoolAllocator
+                        swa_kwargs = {}
+                        if use_elasticmem:
+                            swa_allocator_class = ElasticSWATokenToKVPoolAllocator
+                            swa_kwargs["emem_orch"] = self.emem_orch
+                        self.token_to_kv_pool_allocator = swa_allocator_class(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            **swa_kwargs,
                         )
                     else:
-                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
+                        token_to_kv_pool_allocator_class = TokenToKVPoolAllocator
+                        if use_elasticmem and (config := self.mambaish_config):
+                            token_to_kv_pool_allocator_class = (
+                                ElasticTokenToKVPoolAllocator
+                            )
+                            need_sort = True
+                        self.token_to_kv_pool_allocator = (
+                            token_to_kv_pool_allocator_class(
+                                self.max_total_num_tokens,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
                         )
+                        if use_elasticmem and (config := self.mambaish_config):
+                            self.elastic_hybrid_linear_kv_pool_allocator = (
+                                ElasticHybridLinearKVPoolAllocator(
+                                    self.emem_orch, self.token_to_kv_pool_allocator
+                                )
+                            )
                 else:
                     assert not self.is_hybrid_swa
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(

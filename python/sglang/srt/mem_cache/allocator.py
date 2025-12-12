@@ -188,28 +188,31 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
-            size,
-            dtype,
-            device,
-            kvcache.full_kv_pool,
-            need_sort,
-        )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
-            size_swa,
-            dtype,
-            device,
-            kvcache.swa_kv_pool,
-            need_sort,
-        )
-        self.full_to_swa_index_mapping = torch.empty(
-            size + size_swa + 1,
-            dtype=torch.int64,
-            device=device,
-        )
+        self._create_allocator()
         self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+
+    def _create_allocator(self):
+        self.full_attn_allocator = TokenToKVPoolAllocator(
+            self._size_full,
+            self.dtype,
+            self.device,
+            self._kvcache.full_kv_pool,
+            self.need_sort,
+        )
+        self.swa_attn_allocator = TokenToKVPoolAllocator(
+            self._size_swa,
+            self.dtype,
+            self.device,
+            self._kvcache.swa_kv_pool,
+            self.need_sort,
+        )
+        self.full_to_swa_index_mapping = torch.empty(
+            self._size_full + self._size_swa + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
 
     def available_size(self):
         raise NotImplementedError()
