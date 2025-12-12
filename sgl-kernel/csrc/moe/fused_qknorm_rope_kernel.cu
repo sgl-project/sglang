@@ -206,7 +206,7 @@ __global__ void fusedQKNormRopeKernel(
 
         int dim_idx = laneId * numElemsPerThread + i;
         int half_dim = dim_idx / 2;
-        float freq = compute_freq_yarn(base, head_dim, half_dim, factor, low, high);
+        float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
         float theta = pos_id * freq;
         __sincosf(theta, &sin_vals[i], &cos_vals[i]);
       }
@@ -216,10 +216,9 @@ __global__ void fusedQKNormRopeKernel(
     // Neox style
     // Before data exchange with in warp, we need to sync.
     __syncwarp();
-    int const half_rotary_lanes = rotary_lanes / 2;
-    unsigned int active_mask = (1u << rotary_lanes) - 1;  // 低16位为1: 0x0000FFFF
-
     if (in_rotary) {
+      int const half_rotary_lanes = rotary_lanes / 2;
+      unsigned int active_mask = (1u << rotary_lanes) - 1;  // 低16位为1: 0x0000FFFF
       for (int i = 0; i < numElemsPerThread; i++) {
         elements2[i] = __shfl_xor_sync(active_mask, elements[i], half_rotary_lanes);
         if (laneId < half_rotary_lanes) {
