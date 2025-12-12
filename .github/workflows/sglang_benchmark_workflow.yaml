@@ -132,7 +132,7 @@ jobs:
           set -ex
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3-VL-235B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/RedHatAI/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/ 8 1"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/RedHatAI/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/ 8 8"
           elif [ "$model_name" == "Qwen3-next" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1"
           elif [ "$model_name" == "Qwen3-Omni" ]; then
@@ -148,7 +148,7 @@ jobs:
         run: |
           model_name=${{ matrix.model }}
           if [ "$model_name" == "Qwen3-VL-235B" ]; then
-            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/RedHatAI/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/ 8 1"
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/RedHatAI/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/ 8 8"
           elif [ "$model_name" == "Qwen3-next" ]; then
             docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen/Qwen3-Next-80B-A3B-Instruct/ 4 1"
           elif [ "$model_name" == "Qwen3-Omni" ]; then
