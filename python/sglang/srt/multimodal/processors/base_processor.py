@@ -699,10 +699,7 @@ class BaseMultimodalProcessor(ABC):
 
         if SGL_USE_CUDA_IPC:
             # post-process
-            converted_count = 0
-            fallback_count = 0
-            for item_idx, item in enumerate(all_collected_items):
-                logger.info(f"process_and_combine_mm_data item: {item.feature.is_cuda}")
+            for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
                     sync_flag, available_slice = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
@@ -717,16 +714,6 @@ class BaseMultimodalProcessor(ABC):
                             data=available_slice,
                             info_data=item.feature,
                             sync_buffer_meta=sync_flag,
-                        )
-                        converted_count += 1
-                        logger.info(
-                            f"[CUDA IPC] Converted item[{item_idx}] feature to CudaIpcTensorTransportProxy"
-                        )
-                    else:
-                        fallback_count += 1
-                        logger.info(
-                            f"[CUDA IPC] Failed to convert item[{item_idx}] feature, "
-                            f"keeping original tensor (memory pool exhausted)"
                         )
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
@@ -746,22 +733,6 @@ class BaseMultimodalProcessor(ABC):
                             data=available_slice,
                             info_data=item.precomputed_embeddings,
                             sync_buffer_meta=sync_flag,
-                        )
-                        converted_count += 1
-                        logger.info(
-                            f"[CUDA IPC] Converted item[{item_idx}] precomputed_embeddings "
-                            f"to CudaIpcTensorTransportProxy"
-                        )
-                    else:
-                        fallback_count += 1
-                        logger.info(
-                            f"[CUDA IPC] Failed to convert item[{item_idx}] precomputed_embeddings, "
-                            f"keeping original tensor (memory pool exhausted)"
-                        )
-            if converted_count > 0 or fallback_count > 0:
-                logger.info(
-                    f"[CUDA IPC] Post-processing summary: converted={converted_count}, "
-                    f"fallback={fallback_count}, total_items={len(all_collected_items)}"
-                )
+                        )        
 
         return all_collected_items, input_ids, ret
