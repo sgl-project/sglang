@@ -8,7 +8,6 @@ use serde_json::json;
 fn create_error(
     status_code: StatusCode,
     error_type: &str,
-    code: u16,
     message: impl Into<String>,
 ) -> Response {
     let msg = message.into();
@@ -18,7 +17,7 @@ fn create_error(
             "error": {
                 "message": msg,
                 "type": error_type,
-                "code": code
+                "code": status_code.as_u16()
             }
         })),
     )
@@ -29,7 +28,6 @@ pub fn internal_error(message: impl Into<String>) -> Response {
     create_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
-        500,
         message,
     )
 }
@@ -38,7 +36,6 @@ pub fn bad_request(message: impl Into<String>) -> Response {
     create_error(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
-        400,
         message,
     )
 }
@@ -47,7 +44,6 @@ pub fn not_found(message: impl Into<String>) -> Response {
     create_error(
         StatusCode::NOT_FOUND,
         "invalid_request_error",
-        404,
         message,
     )
 }
@@ -56,7 +52,6 @@ pub fn service_unavailable(message: impl Into<String>) -> Response {
     create_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "service_unavailable",
-        503,
         message,
     )
 }
@@ -65,7 +60,6 @@ pub fn failed_dependency(message: impl Into<String>) -> Response {
     create_error(
         StatusCode::FAILED_DEPENDENCY,
         "external_connector_error",
-        424,
         message,
     )
 }
@@ -74,7 +68,6 @@ pub fn not_implemented(message: impl Into<String>) -> Response {
     create_error(
         StatusCode::NOT_IMPLEMENTED,
         "not_implemented_error",
-        501,
         message,
     )
 }
