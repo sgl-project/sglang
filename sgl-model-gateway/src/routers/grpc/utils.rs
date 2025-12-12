@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 use super::{
     client::GrpcClient,
-    error,
     proto_wrapper::{ProtoGenerateComplete, ProtoStream},
     ProcessedMessages,
 };
@@ -28,7 +27,7 @@ use crate::{
         ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
         ReasoningParser,
     },
-    routers::grpc::proto_wrapper::ProtoResponseVariant,
+    routers::{error, grpc::proto_wrapper::ProtoResponseVariant},
     tokenizer::{
         cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
