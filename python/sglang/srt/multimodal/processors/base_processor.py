@@ -440,7 +440,9 @@ class BaseMultimodalProcessor(ABC):
         if data_list is None:
             return
         if not isinstance(data_list, list):
-            raise TypeError(f"{modality.name} must be a list or None, got {type(data_list)}")
+            raise TypeError(
+                f"{modality.name} must be a list or None, got {type(data_list)}"
+            )
 
         formatted_indices = []
         for idx, item in enumerate(data_list):
@@ -480,7 +482,6 @@ class BaseMultimodalProcessor(ABC):
         BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
     def _process_loaded_mm_data(self, modality, raw_data, result):
-        """处理单个加载完成的模态数据，返回标准化的列表和是否预计算的标志。"""
         images, videos, audios = [], [], []
 
         is_precomputed = isinstance(raw_data, dict) and raw_data.get("format") in [
@@ -494,13 +495,11 @@ class BaseMultimodalProcessor(ABC):
             if is_precomputed:
                 images.append(result)
             else:
-                # FIX: 恢复处理多帧（list）的情况 (e.g. for minicpmv)
                 if isinstance(result, list):
                     images.extend(result)
                 else:
                     images.append(result)
         elif modality == Modality.VIDEO:
-            # Simplify: 预计算和普通视频目前处理方式一致，直接 append
             videos.append(result)
         elif modality == Modality.AUDIO:
             audios.append(result)
