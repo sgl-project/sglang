@@ -505,6 +505,12 @@ class LoRAManager:
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
+
+                # Skip false positives e.g. visual.blocks.0.attn.qkv_proj
+                # in Qwen 2.5 VL 3B.
+                if layer_id is None:
+                    continue
+
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
