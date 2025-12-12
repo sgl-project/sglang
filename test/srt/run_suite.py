@@ -150,7 +150,7 @@ suites = {
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
-        TestFile("test_pp_single_node.py", 481),
+        TestFile("test_pp_single_node.py", 800),
         TestFile("test_piecewise_cuda_graph.py", 1200),
     ],
     "per-commit-8-gpu-h200": [
@@ -169,14 +169,15 @@ suites = {
     ],
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
-        TestFile("test_flash_attention_4.py", 300),
-        TestFile("test_gpt_oss_4gpu.py", 600),
-        TestFile("test_llama31_fp4.py", 300),
+        TestFile("test_flash_attention_4.py", 90),
+        TestFile("test_fp8_blockwise_gemm.py", 280),
+        TestFile("test_gpt_oss_4gpu.py", 700),
+        TestFile("test_llama31_fp4.py", 90),
         TestFile("test_eagle_infer_beta_dp_attention.py", 300),
     ],
-    "per-commit-8-gpu-b200": [
-        TestFile("test_mistral_large3_basic.py", 275),
-    ],
+    # "per-commit-8-gpu-b200": [
+    #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
+    # ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
@@ -191,6 +192,7 @@ suites = {
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
+        TestFile("quant/test_marlin_moe.py", 200),
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
         TestFile("test_quantization.py", 185),
@@ -199,6 +201,7 @@ suites = {
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
+        TestFile("lora/test_lora_hf_sgl_logprob_diff.py"),  # Nightly test
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
             "rl/test_update_weights_from_disk.py"
@@ -211,6 +214,7 @@ suites = {
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
+        TestFile("test_mistral_large3_basic.py"),
     ],
 }
 
@@ -357,6 +361,7 @@ suite_xpu = {
 suite_ascend = {
     "per-commit-1-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
@@ -509,6 +514,24 @@ def main():
         default=False,
         help="Continue running remaining tests even if one fails (useful for nightly tests)",
     )
+    arg_parser.add_argument(
+        "--enable-retry",
+        action="store_true",
+        default=False,
+        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
+    )
+    arg_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum number of attempts per file including initial run (default: 2)",
+    )
+    arg_parser.add_argument(
+        "--retry-wait-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait between retries (default: 60)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -524,7 +547,14 @@ def main():
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
+    exit_code = run_unittest_files(
+        files,
+        args.timeout_per_file,
+        args.continue_on_error,
+        enable_retry=args.enable_retry,
+        max_attempts=args.max_attempts,
+        retry_wait_seconds=args.retry_wait_seconds,
+    )
     exit(exit_code)
 
 

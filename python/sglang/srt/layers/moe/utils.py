@@ -59,6 +59,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
+    MARLIN = "marlin"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -86,6 +87,9 @@ class MoeRunnerBackend(Enum):
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS
+
+    def is_marlin(self):
+        return self == MoeRunnerBackend.MARLIN
 
 
 class DeepEPMode(Enum):
@@ -284,7 +288,7 @@ def speculative_moe_a2a_backend_context():
     global MOE_A2A_BACKEND
     original_backend = MOE_A2A_BACKEND
     try:
-        MOE_A2A_BACKEND = MoeA2ABackend.NONE
+        MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
         yield
     finally:
         MOE_A2A_BACKEND = original_backend
