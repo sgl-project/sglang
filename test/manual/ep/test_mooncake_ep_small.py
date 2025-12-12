@@ -88,7 +88,7 @@ class TestPureDP(TestTP):
     ]
 
     def test_gsm8k_fault_1(self):
-        os.system("pkill -f sglang::scheduler_DP0_TP0_EP0")
+        os.system("pkill -f sglang::scheduler_DP2_TP2_EP2")
         super().test_gsm8k()
 
 
@@ -106,6 +106,7 @@ class TestHybridDPTP(TestTP):
         super().test_gsm8k()
 
 
+@unittest.skip("covered in TestTBO")
 class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
