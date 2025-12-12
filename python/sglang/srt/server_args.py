@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import importlib
-import importlib.util
 import json
 import logging
 import os
@@ -596,8 +594,6 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
-    remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
-    remote_instance_weight_loader_support_transfer_engine: bool = False
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -709,9 +705,6 @@ class ServerArgs:
 
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
-
-        # Handle remote instance weight loader.
-        self._handle_remote_instance_weight_loader_support_transfer_engine()
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -1971,26 +1964,8 @@ class ServerArgs:
             if (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
+                or self.remote_instance_weight_loader_send_weights_group_ports is None
             ):
-                logger.warning(
-                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader settings."
-                )
-                self.load_format = "auto"
-            elif (
-                self.remote_instance_weight_loader_send_weights_group_ports is None
-                and self.remote_instance_weight_loader_backend == "nccl"
-            ):
-                logger.warning(
-                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader NCCL group ports settings."
-                )
-                self.load_format = "auto"
-            elif (
-                self.enable_memory_saver
-                and self.remote_instance_weight_loader_backend == "transfer_engine"
-            ):
-                logger.warning(
-                    "Fallback load_format to 'auto' due to incompatible remote instance weight loader transfer engine backend with memory saver."
-                )
                 self.load_format = "auto"
 
     def _handle_disaggregation(self):
@@ -2224,20 +2199,6 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
-
-    def _handle_remote_instance_weight_loader_support_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
-            logger.warning(
-                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            self.remote_instance_weight_loader_support_transfer_engine = False
-        elif self.enable_memory_saver:
-            logger.warning(
-                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            self.remote_instance_weight_loader_support_transfer_engine = False
-        else:
-            self.remote_instance_weight_loader_support_transfer_engine = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -4079,18 +4040,6 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
             help="The communication group ports for loading weights from remote instance.",
-        )
-        parser.add_argument(
-            "--remote-instance-weight-loader-backend",
-            type=str,
-            choices=["transfer_engine", "nccl"],
-            default=ServerArgs.remote_instance_weight_loader_backend,
-            help="The backend for loading weights from remote instance. Can be 'transfer_engine' or 'nccl'. Default is 'nccl'.",
-        )
-        parser.add_argument(
-            "--remote-instance-weight-loader-support-transfer-engine",
-            action="store_true",
-            help="Enable transfer engine support for remote instance weight loader.",
         )
 
         # For PD-Multiplexing
