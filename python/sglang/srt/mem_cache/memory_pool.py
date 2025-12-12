@@ -243,8 +243,8 @@ class MambaPool:
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.3f} GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.3f} GB"
+                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
             self.free_slots = torch.arange(
                 self.size, dtype=torch.int64, device=self.device
