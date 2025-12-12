@@ -137,18 +137,23 @@ class KimiVLForConditionalGeneration(nn.Module):
         )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = (
-            torch.cat([item.feature for item in items], dim=0)
-            .type(self.vision_tower.dtype)
-            .to(self.vision_tower.device)
-        )
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        pixel_values = pixel_values.to(self.vision_tower.device)
+
+        # If we already have precomputed vision embeddings (2D/3D), bypass the
+        # vision tower *and* projector. These embeddings are assumed to be in the
+        # correct hidden size for downstream consumption.
+        if pixel_values.dim() <= 3:
+            return pixel_values.reshape(-1, pixel_values.shape[-1])
+
+        pixel_values = pixel_values.type(self.vision_tower.dtype)
         image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0).to(
             self.vision_tower.device
         )
         image_features = self.vision_tower(pixel_values, image_grid_hws)
         assert isinstance(image_features, list)
-        # lengths = [x.shape[0] for x in image_features]
-        res = self.multi_modal_projector(torch.cat(image_features))  # .split(lengths)
+
+        res = self.multi_modal_projector(torch.cat(image_features))
         return res
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
