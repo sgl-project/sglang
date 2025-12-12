@@ -54,16 +54,6 @@ pub struct Router {
 impl Router {
     /// Create a new router with injected policy and client
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
-        let workers = ctx.worker_registry.get_workers_filtered(
-            None, // any model
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // include all workers
-        );
-
-        RouterMetrics::set_active_workers(workers.len());
-
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),

@@ -155,7 +155,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -471,6 +471,21 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
+
+        self.enable_dynamic_chunking = (
+            server_args.enable_dynamic_chunking and self.pp_size > 1
+        )
+
+        # Init the dynamic chunking predictor for PP
+        if self.enable_dynamic_chunking:
+            try:
+                self.profile_and_init_predictor()
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    "Dynamic chunking will be disabled."
+                )
+                self.enable_dynamic_chunking = False
 
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
@@ -934,8 +949,7 @@ class Scheduler(
 
     def init_overlap(self):
         self.future_map = None
-
-        if not self.enable_overlap:
+        if not self.enable_overlap and self.pp_size == 1:
             return
 
         self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
@@ -946,6 +960,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
             self.device
         ).stream(self.copy_stream)
+
+        if not self.enable_overlap:
+            return
 
         self.future_map = FutureMap(
             self.max_running_requests,
@@ -1108,7 +1125,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.device_group,
+                    self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -1766,6 +1783,16 @@ class Scheduler(
             # in the waiting queue.
             return None
 
+        # Determine chunked_prefill_size for this batch
+        chunked_prefill_size = self.chunked_prefill_size
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            if self.enable_dynamic_chunking:
+                history_len = len(self.chunked_req.prefix_indices)
+                dynamic_size = self.predict_next_chunk_size(history_len)
+                if dynamic_size is not None:
+                    chunked_prefill_size = dynamic_size
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -1774,7 +1801,7 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )
@@ -1966,7 +1993,9 @@ class Scheduler(
         pass
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2014,6 +2043,7 @@ class Scheduler(
                     self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
+                        # here pp is not compatible with overlap
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -2047,8 +2077,13 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
+                    batch_or_worker_batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
