@@ -1,15 +1,3 @@
-//! WASM Module Registration Workflow Steps
-//!
-//! Each step is atomic and performs a single operation in the WASM module registration process.
-//!
-//! Workflow order:
-//! 1. ValidateDescriptor - Validate module descriptor (name, file_path, file existence)
-//! 2. CalculateHash - Calculate SHA256 hash of the module file
-//! 3. CheckDuplicate - Check for duplicate SHA256 hash
-//! 4. LoadWasmBytes - Load WASM bytes into memory
-//! 5. ValidateWasmComponent - Validate WASM component format
-//! 6. RegisterModule - Register module in WasmModuleManager
-
 use std::{
     path::{Component as PathComponent, Path},
     sync::Arc,
@@ -24,8 +12,8 @@ use wasmtime::{component::Component, Config, Engine};
 
 use crate::{
     app_context::AppContext,
-    core::workflow::*,
     wasm::module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
+    workflow::*,
 };
 
 /// WASM module registration request
@@ -75,9 +63,8 @@ pub struct ValidateDescriptorStep;
 #[async_trait]
 impl StepExecutor for ValidateDescriptorStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let descriptor = &config_request.descriptor;
 
@@ -235,9 +222,8 @@ pub struct CalculateHashStep;
 #[async_trait]
 impl StepExecutor for CalculateHashStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let file_path = &config_request.descriptor.file_path;
 
@@ -295,15 +281,10 @@ pub struct CheckDuplicateStep;
 #[async_trait]
 impl StepExecutor for CheckDuplicateStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash: Arc<[u8; 32]> = context
-            .get("sha256_hash")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
 
         debug!(
             "Checking for duplicate SHA256 hash for module: {}",
@@ -349,9 +330,8 @@ pub struct LoadWasmBytesStep;
 #[async_trait]
 impl StepExecutor for LoadWasmBytesStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
 
         let file_path = &config_request.descriptor.file_path;
 
@@ -386,12 +366,9 @@ pub struct ValidateWasmComponentStep;
 #[async_trait]
 impl StepExecutor for ValidateWasmComponentStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
-        let wasm_bytes: Arc<Vec<u8>> = context
-            .get("wasm_bytes")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let wasm_bytes: Arc<Vec<u8>> = context.get_or_err("wasm_bytes")?;
 
         debug!(
             "Validating WASM component format for module: {}",
@@ -441,21 +418,12 @@ pub struct RegisterModuleStep;
 #[async_trait]
 impl StepExecutor for RegisterModuleStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config_request: Arc<WasmModuleConfigRequest> = context
-            .get("wasm_module_config")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_module_config".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash: Arc<[u8; 32]> = context
-            .get("sha256_hash")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
-        let file_size_bytes: Arc<u64> = context
-            .get("file_size_bytes")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("file_size_bytes".to_string()))?;
-        let wasm_bytes: Arc<Vec<u8>> = context
-            .get("wasm_bytes")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?;
+        let config_request: Arc<WasmModuleConfigRequest> =
+            context.get_or_err("wasm_module_config")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let sha256_hash: Arc<[u8; 32]> = context.get_or_err("sha256_hash")?;
+        let file_size_bytes: Arc<u64> = context.get_or_err("file_size_bytes")?;
+        let wasm_bytes: Arc<Vec<u8>> = context.get_or_err("wasm_bytes")?;
 
         debug!(
             "Registering WASM module in manager: {}",
@@ -558,7 +526,8 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition {
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(60))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["validate_descriptor"]),
         )
         .add_step(
             StepDefinition::new(
@@ -567,7 +536,8 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition {
                 Arc::new(CheckDuplicateStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["calculate_hash"]),
         )
         .add_step(
             StepDefinition::new(
@@ -580,7 +550,8 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition {
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(60))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["check_duplicate"]),
         )
         .add_step(
             StepDefinition::new(
@@ -589,7 +560,8 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition {
                 Arc::new(ValidateWasmComponentStep),
             )
             .with_timeout(Duration::from_secs(30))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["load_wasm_bytes"]),
         )
         .add_step(
             StepDefinition::new(
@@ -598,6 +570,7 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition {
                 Arc::new(RegisterModuleStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["validate_wasm_component"]),
         )
 }

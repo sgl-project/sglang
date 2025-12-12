@@ -45,6 +45,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils.common import (
+    direct_register_custom_op,
     get_bool_env_var,
     is_cuda,
     is_sm120_supported,
@@ -100,7 +101,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
 def _sglang_fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -119,7 +119,6 @@ def _sglang_fp4_gemm(
         return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
-@torch.library.register_fake("sglang::fp4_gemm")
 def _sglang_fp4_gemm_fake(
     input,
     weight,
@@ -132,6 +131,14 @@ def _sglang_fp4_gemm_fake(
     M = input.shape[-2]
     N = int(out_features)
     return input.new_empty((M, N), dtype=out_dtype)
+
+
+direct_register_custom_op(
+    op_name="fp4_gemm",
+    op_func=_sglang_fp4_gemm,
+    mutates_args=[],
+    fake_impl=_sglang_fp4_gemm_fake,
+)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
