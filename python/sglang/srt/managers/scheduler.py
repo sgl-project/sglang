@@ -2813,23 +2813,17 @@ def run_scheduler_process(
         prefix += f" PP{pp_rank}"
 
     # Config the process
-    scheduler_process_id = os.getpid()
+
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
-    parent_process_id = parent_process.pid if parent_process else None
 
     # Configure the logger (must be called before logging)
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
     
-    logger.info(
-        f"[Process] Scheduler subprocess started: "
-        f"scheduler_process_id={scheduler_process_id}, "
-        f"parent_process_id={parent_process_id}, "
-        f"gpu_id={gpu_id}, tp_rank={tp_rank}, pp_rank={pp_rank}"
-    )
+
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):

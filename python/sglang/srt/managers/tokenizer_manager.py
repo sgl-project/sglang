@@ -167,10 +167,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        logger.info(
-            f"[Process] TokenizerManager.__init__ called: "
-            f"process_id={os.getpid()}"
-        )
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics

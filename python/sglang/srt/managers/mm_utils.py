@@ -90,12 +90,6 @@ class TransportProxyTensor(torch.Tensor):
         if transport_mode == "cuda_ipc" and self.is_cuda_alike:
             try:
                 storage = self.untyped_storage()
-                logger.info(
-                    f"[CUDA IPC] TransportProxyTensor creating CUDA IPC handle: "
-                    f"current_process_id={os.getpid()}, "
-                    f"tensor_device={self.device}, "
-                    f"current_device={torch.cuda.current_device()}"
-                )
                 handle = storage._share_cuda_()
 
                 state["ipc_extra"] = {
@@ -107,17 +101,9 @@ class TransportProxyTensor(torch.Tensor):
                     "storage_offset": self.storage_offset(),
                 }
                 state["tensor_data"] = None
-                logger.info(
-                    f"[CUDA IPC] TransportProxyTensor serialized with CUDA IPC: "
-                    f"shape={self.shape}, dtype={self.dtype}, device={self.device}, "
-                    f"storage_offset={self.storage_offset()}"
-                )
+
             except Exception as e:
                 # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
-                logger.info(
-                    f"[CUDA IPC] Failed to serialize TransportProxyTensor with CUDA IPC: {e}, "
-                    f"falling back to default transport. shape={self.shape}, device={self.device}"
-                )
                 state["metadata"]["transport_mode"] = "default"
                 state["tensor_data"] = self.as_subclass(torch.Tensor)
         else:
@@ -147,42 +133,14 @@ class TransportProxyTensor(torch.Tensor):
 
             try:
                 target_device = torch.device(f"cuda:{source_device_index}")
-                logger.info(
-                    f"[CUDA IPC] TransportProxyTensor deserializing from CUDA IPC: "
-                    f"shape={shape}, dtype={dtype}, source_device={target_device}, "
-                    f"storage_offset={s_offset}"
-                )
-                # For HIP/ROCm, explicitly set device before opening IPC handle
-                # HIP requires proper device context to be set, and device context
-                # may not be properly inherited across processes
-                if is_hip():
-                    logger.info(
-                        f"[CUDA IPC] HIP detected, explicitly setting device context "
-                        f"before opening IPC handle: device={source_device_index}"
-                    )
-                    torch.cuda.set_device(source_device_index)
-                    # Ensure device context is active
-                    _ = torch.zeros(1, device=target_device)
                 
                 with torch.cuda.device(target_device):
-                    logger.info(
-                        f"[CUDA IPC] TransportProxyTensor opening IPC handle: "
-                        f"current_process_id={os.getpid()}, "
-                        f"current_device={torch.cuda.current_device()}, "
-                        f"target_device={target_device}"
-                    )
                     storage = torch.UntypedStorage._new_shared_cuda(*handle)
                     reconstructed_tensor = torch.empty(
                         0, dtype=dtype, device=target_device
                     ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
                     self.set_(reconstructed_tensor)
-                logger.info(
-                    f"[CUDA IPC] TransportProxyTensor successfully deserialized from CUDA IPC"
-                )
             except Exception as e:
-                logger.info(
-                    f"[CUDA IPC] Error: Failed to deserialize TransportProxyTensor from CUDA IPC handle ({e})."
-                )
                 raise e
 
         elif state["tensor_data"] is not None:

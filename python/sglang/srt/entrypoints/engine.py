@@ -867,10 +867,6 @@ def _launch_subprocesses(
     detoken_proc.start()
 
     # Init tokenizer manager first, as the bootstrap server is initialized here
-    logger.info(
-        f"[Process] Initializing TokenizerManager in main process: "
-        f"main_process_id={os.getpid()}"
-    )
     if server_args.tokenizer_worker_num > 1:
         # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
@@ -879,11 +875,6 @@ def _launch_subprocesses(
         tokenizer_manager, template_manager = _init_tokenizer_manager(
             server_args, port_args
         )
-    logger.info(
-        f"[Process] TokenizerManager initialized: "
-        f"main_process_id={os.getpid()}, "
-        f"tokenizer_manager_process_id={os.getpid()}"
-    )
 
     # Wait for the model to finish loading
     scheduler_infos = []
