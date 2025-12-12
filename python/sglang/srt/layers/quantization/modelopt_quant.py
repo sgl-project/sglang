@@ -784,6 +784,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     use_routing_scales_on_input=use_routing_scales_on_input,
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 )
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

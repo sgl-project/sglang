@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
+    next_power_of_2,
     round_up,
 )
 
@@ -1187,6 +1188,7 @@ class FlashInferFP4MoE(FusedMoE):
             tile_tokens_dim=None,
             routing_method_type=routing_method_type,
             do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
         )[0]
 
