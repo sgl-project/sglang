@@ -102,6 +102,28 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
 3. Run test suite
 
+## Kernel Size Analysis
+
+Analyze CUDA kernel sizes in compiled wheel files to identify optimization opportunities:
+
+```bash
+# Install cubloaty
+pip install cubloaty
+
+# Analyze a wheel file
+python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl
+
+# Custom output file
+python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl --output my_analysis.txt
+```
+
+The tool generates:
+- Text report with kernel groups (by name prefix) and individual kernel sizes
+- JSON file with detailed structured data
+- Timing information for each analysis step
+
+Use this to identify large kernels and potential template instantiation bloat.
+
 ## FAQ
 - Q: Segmentation fault with CUDA 12.6
 - A: Update ptxas to 12.8, reference: [segment fault error](https://github.com/Dao-AILab/flash-attention/issues/1453)
