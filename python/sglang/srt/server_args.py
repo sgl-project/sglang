@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib
 import json
 import logging
 import os
@@ -40,7 +41,6 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
-    is_blackwell,
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
@@ -82,6 +82,7 @@ LOAD_FORMAT_CHOICES = [
     "flash_rl",
     "remote",
     "remote_instance",
+    "private",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -287,6 +288,7 @@ class ServerArgs:
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
+    enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -305,6 +307,7 @@ class ServerArgs:
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
+    pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -639,6 +642,9 @@ class ServerArgs:
         self._handle_cpu_backends()
         self._handle_npu_backends()
 
+        # Handle compilation config
+        self._handle_compilation_cfg()
+
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
@@ -648,6 +654,7 @@ class ServerArgs:
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
+        self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
@@ -950,6 +957,15 @@ class ServerArgs:
             if self.attention_backend is None:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
+
+    def _handle_compilation_cfg(self):
+        # NPU platform
+        if is_npu() and self.piecewise_cuda_graph_compiler != "eager":
+            logger.warning(
+                "At this moment Ascend platform only support prefill graph compilation with "
+                "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
+            )
+            self.piecewise_cuda_graph_compiler = "eager"
 
     def _handle_npu_backends(self):
         if self.device == "npu":
@@ -1350,7 +1366,8 @@ class ServerArgs:
 
             1. Models with MHA Architecture (e.g: Llama, QWen)
                 1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-                1.2 Use trtllm_mha for Blackwell excluding spec with topk > 1.
+                1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
+                   Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
                 1.3 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
@@ -1366,7 +1383,7 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
-                elif is_blackwell() and is_no_spec_infer_or_topk_one(self):
+                elif is_sm100_supported() and is_no_spec_infer_or_topk_one(self):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
@@ -1535,6 +1552,85 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+    def _handle_kv4_compatibility(self):
+        """Check FP4 KV cache compatibility with the attention backend"""
+        if self.kv_cache_dtype != "fp4_e2m1":
+            return
+
+        use_mla_backend = self.use_mla_backend()
+        # self.attention_backend didn't overwrite self.prefill/decode_attention_backend yet
+        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
+            self.get_attention_backends()
+        )
+
+        if is_cuda():
+            if (
+                self.prefill_attention_backend_str != self.decode_attention_backend_str
+                and self.prefill_attention_backend_str != "fa4"
+            ):  # Take care of prefill=fa4 later
+                logger.warning(
+                    f"Attention: Using KV4 with PREFILL = {self.prefill_attention_backend_str} "
+                    f"and DECODE = {self.decode_attention_backend_str}. "
+                    f"Compatibility issues are unlikely, but may occur in rare edge cases."
+                )
+            else:
+                if self.prefill_attention_backend_str == "fa4":
+                    if use_mla_backend:  # FA4 + MLA
+                        KV4_FA4_MLA_BACKEND_CHOICES = [
+                            "cutlass_mla",
+                            "flashinfer",
+                            "trtllm_mla",
+                        ]
+                        assert (
+                            self.decode_attention_backend_str
+                            in KV4_FA4_MLA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 FA4 MLA expects decode_attention_backend to be one of "
+                            f"{KV4_FA4_MLA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                        )
+                    else:  # FA4 + MHA
+                        KV4_FA4_MHA_BACKEND_CHOICES = [
+                            "triton",
+                            "torch_native",
+                            "flex_attention",
+                        ]
+                        assert (
+                            self.decode_attention_backend_str
+                            in KV4_FA4_MHA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 FA4 MHA expects decode_attention_backend to be one of "
+                            f"{KV4_FA4_MHA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                        )
+                else:
+                    if use_mla_backend:  # !FA4 + MLA
+                        KV4_ATTENTION_MLA_BACKEND_CHOICES = [
+                            "cutlass_mla",
+                            "flashinfer",
+                            "trtllm_mla",
+                            "flashmla",
+                        ]
+                        assert (
+                            self.attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 MLA expects attention_backend to be one of "
+                            f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                        )
+                    else:  # !FA4 + MHA
+                        KV4_ATTENTION_MHA_BACKEND_CHOICES = [
+                            "triton",
+                            "torch_native",
+                            "flex_attention",
+                            "trtllm_mha",
+                        ]
+                        assert (
+                            self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 MHA expects attention_backend to be one of "
+                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                        )
+        else:
+            raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+
     def _handle_page_size(self):
         if self.page_size is None:
             self.page_size = 1
@@ -1578,11 +1674,12 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            assert (
-                self.quantization == "modelopt_fp4"
-                or self.quantization == "modelopt_fp8"
-                or self.quantization == "fp8"
-            ), "modelopt_fp4, modelopt_fp8 or fp8 quantization is required for Flashinfer TRTLLM MoE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "fp8",
+                "modelopt_fp8",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -2105,6 +2202,20 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
+    def _handle_remote_instance_weight_loader_support_transfer_engine(self):
+        if importlib.util.find_spec("mooncake.engine") is None:
+            logger.warning(
+                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            self.remote_instance_weight_loader_support_transfer_engine = False
+        elif self.enable_memory_saver:
+            logger.warning(
+                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            self.remote_instance_weight_loader_support_transfer_engine = False
+        else:
+            self.remote_instance_weight_loader_support_transfer_engine = True
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
@@ -2386,6 +2497,12 @@ class ServerArgs:
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_chunking,
+            help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+        )
+        parser.add_argument(
             "--max-prefill-tokens",
             type=int,
             default=ServerArgs.max_prefill_tokens,
@@ -2492,6 +2609,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.pp_max_micro_batch_size,
             help="The maximum micro batch size in pipeline parallelism.",
+        )
+        parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            help="The async batch depth of pipeline parallelism.",
         )
         parser.add_argument(
             "--stream-interval",
@@ -4296,6 +4419,17 @@ class ServerArgs:
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+                    # When using the chunked SGMV backend, skip embedding / lm_head layers for now,
+                    # since it does not support these yet (TODO: implement embedding / lm_head support)
+                    if self.lora_backend == "csgmv":
+                        logger.warning(
+                            "LoRA backend 'csgmv' does not yet support embedding or lm_head layers; "
+                            "dropping 'embed_tokens' and 'lm_head' from --lora-target-modules=all. "
+                            "To apply LoRA to these, use --lora-backend triton."
+                        )
+                        self.lora_target_modules.discard("embed_tokens")
+                        self.lora_target_modules.discard("lm_head")
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
