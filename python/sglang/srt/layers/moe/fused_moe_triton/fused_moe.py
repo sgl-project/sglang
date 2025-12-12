@@ -554,10 +554,10 @@ def fused_experts_impl(
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_hip:
+            elif _is_hip or (_is_cuda and down_moe_use_tma):
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             elif _is_cuda:
-                silu_and_mul_triton_kernel(
+                silu_and_mul_triton_kernel[(intermediate_cache2.shape[0],)](
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     N,
