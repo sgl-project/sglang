@@ -612,7 +612,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/sgl_diffusion/elementwise
    */
-  m.def("timestep_embedding(Tensor input, Tensor output, int dim, int max_period) -> Tensor");
+  m.def(
+      "timestep_embedding(Tensor input,"
+      "Tensor output,"
+      "int dim,"
+      "bool flip_sin_to_cos,"
+      "float downscale_freq_shift,"
+      "float scale,"
+      "int max_period) -> Tensor");
   m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
 }
 

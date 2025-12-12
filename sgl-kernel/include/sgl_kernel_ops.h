@@ -1009,4 +1009,11 @@ std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
 /*
  * From csrc/sgl_diffusion/elementwise
  */
-torch::Tensor timestep_embedding(const torch::Tensor& input, torch::Tensor& output, int64_t dim, int64_t max_period);
+torch::Tensor timestep_embedding(
+    const torch::Tensor& t,
+    torch::Tensor& output,
+    int64_t dim,
+    bool flip_sin_to_cos,
+    double downscale_freq_shift,
+    double scale,
+    int64_t max_period);

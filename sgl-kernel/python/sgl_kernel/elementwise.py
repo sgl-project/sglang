@@ -409,6 +409,9 @@ def concat_mla_absorb_q(
 def timestep_embedding(
     t: torch.Tensor,
     dim: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 0.0,
+    scale: float = 1,
     max_period: int = 10000,
     dtype: torch.dtype = torch.float32,
 ):
@@ -430,4 +433,6 @@ def timestep_embedding(
 
     batch_size = t.shape[0]
     output = torch.empty((batch_size, dim), dtype=dtype, device=t.device)
-    return torch.ops.sgl_kernel.timestep_embedding(t, output, dim, max_period)
+    return torch.ops.sgl_kernel.timestep_embedding(
+        t, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period
+    )

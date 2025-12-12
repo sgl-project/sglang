@@ -25,9 +25,9 @@ limitations under the License.
 
 #include "utils.h"
 
-template <typename T_IN>
-__global__ void
-timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log_max_period, int batch_size) {
+template <bool flip_sin_to_cos = false, typename T_IN>
+__global__ void timestep_embedding_kernel(
+    T_IN* t_ptr, float* output_ptr, int dim, float neg_log_max_period, float scale, int batch_size) {
   // Get the timestep for this batch
   int row_idx = blockIdx.x * blockDim.y + threadIdx.y;
   if (row_idx >= batch_size) {
@@ -40,14 +40,21 @@ timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log
   int half_dim = dim / 2;
   int thread_offset = threadIdx.x % blockDim.x;
   while (thread_offset * 4 < half_dim) {
-    float4* top_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
-    float4* bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
+    float4* top_half;
+    float4* bottom_half;
+    if constexpr (flip_sin_to_cos == false) {
+      bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
+      top_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
+    } else {
+      top_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
+      bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
+    }
 
     float4 vals;
-    vals.x = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 0));
-    vals.y = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 1));
-    vals.z = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2));
-    vals.w = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3));
+    vals.x = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 0));
+    vals.y = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 1));
+    vals.z = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2));
+    vals.w = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3));
 
     float4 sin_vals;
     sin_vals.x = cosf(vals.x);
@@ -67,7 +74,14 @@ timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log
   }
 }
 
-torch::Tensor timestep_embedding(const torch::Tensor& t, torch::Tensor& output, int64_t dim, int64_t max_period) {
+torch::Tensor timestep_embedding(
+    const torch::Tensor& t,
+    torch::Tensor& output,
+    int64_t dim,
+    bool flip_sin_to_cos,
+    double downscale_freq_shift,
+    double scale,
+    int64_t max_period) {
   TORCH_CHECK(t.dim() == 1 and t.stride(0) == 1, "t should be 1D");
   TORCH_CHECK(output.dim() == 2 and output.is_contiguous(), "output should be a contiguous 2D tensor.");
 
@@ -94,16 +108,28 @@ torch::Tensor timestep_embedding(const torch::Tensor& t, torch::Tensor& output, 
   dim3 grid((batch_size + num_rows - 1) / num_rows);
   // assert float4 vectorize output
   dim3 block(num_threads_per_row, num_rows);
-  float neg_log_max_period = std::log(static_cast<float>(max_period)) * (-1.0f) / static_cast<float>(half_dim);
+  float neg_log_max_period =
+      std::log(static_cast<float>(max_period)) * (-1.0f) / (static_cast<float>(half_dim) - downscale_freq_shift);
 
   AT_DISPATCH_ALL_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, t.scalar_type(), "timestep_embedding_kernel", [&] {
-        timestep_embedding_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<scalar_t*>(t.data_ptr()),
-            reinterpret_cast<float*>(output.data_ptr()),
-            dim,
-            neg_log_max_period,
-            batch_size);
+        if (flip_sin_to_cos == true) {
+          timestep_embedding_kernel<true><<<grid, block, 0, stream>>>(
+              reinterpret_cast<scalar_t*>(t.data_ptr()),
+              reinterpret_cast<float*>(output.data_ptr()),
+              static_cast<int>(dim),
+              static_cast<float>(neg_log_max_period),
+              static_cast<float>(scale),
+              static_cast<int>(batch_size));
+        } else {
+          timestep_embedding_kernel<false><<<grid, block, 0, stream>>>(
+              reinterpret_cast<scalar_t*>(t.data_ptr()),
+              reinterpret_cast<float*>(output.data_ptr()),
+              static_cast<int>(dim),
+              static_cast<float>(neg_log_max_period),
+              static_cast<float>(scale),
+              static_cast<int>(batch_size));
+        }
       });
 
   return output;

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import tabulate
 import torch
+from diffusers.models.embeddings import get_timestep_embedding
 from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
 
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
@@ -14,11 +15,41 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embed
 @pytest.mark.parametrize(
     "dtype", [torch.int32, torch.int64, torch.bfloat16, torch.float16]
 )
-def test_timestep_embedding_correctness(batch_size, dim, dtype):
+def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
     torch_output = timestep_embedding(t, dim)
-    cuda_output = timestep_embedding_cuda(t, dim)
+    cuda_output = timestep_embedding_cuda(t, dim, flip_sin_to_cos=True)
+    torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 8, 128, 256, 512, 1536, 2048, 16384])
+@pytest.mark.parametrize("dim", [32, 256, 512, 1536, 8192])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.bfloat16])
+@pytest.mark.parametrize("flip_sin_to_cos", [False, True])
+@pytest.mark.parametrize("downscale_freq_shift", [0, 1])
+@pytest.mark.parametrize("scale", [1, 0.01])
+def test_timestep_embedding_correctness_with_diffusers(
+    batch_size, dim, flip_sin_to_cos, downscale_freq_shift, scale, dtype
+):
+    device = "cuda"
+    t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
+    torch_output = get_timestep_embedding(
+        t,
+        dim,
+        flip_sin_to_cos=flip_sin_to_cos,
+        downscale_freq_shift=downscale_freq_shift,
+        scale=scale,
+        max_period=10000,
+    )
+    cuda_output = timestep_embedding_cuda(
+        t,
+        dim,
+        flip_sin_to_cos=flip_sin_to_cos,
+        downscale_freq_shift=downscale_freq_shift,
+        scale=scale,
+        max_period=10000,
+    )
     torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
 
 
