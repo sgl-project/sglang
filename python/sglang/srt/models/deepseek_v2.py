@@ -700,6 +700,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_ascend_fuseep()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -738,7 +739,11 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -755,7 +760,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -986,7 +993,14 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag:
-                shared_output = self._forward_shared_experts(hidden_states)
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                else:
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1105,6 +1119,12 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
+        if (
+            hidden_states.shape[0] > 0
+            and not sbo_enabled_flag
+            and self.alt_stream is not None
+        ):
+            torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -2991,7 +3011,8 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_npu else None
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
