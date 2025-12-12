@@ -720,6 +720,14 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+        for key in ("image", "video", "audio"):
+            if key in self.mm_process_config and not isinstance(
+                self.mm_process_config[key], dict
+            ):
+                raise TypeError(
+                    f"mm_process_config['{key}'] must be a dict, "
+                    f"but got {type(self.mm_process_config[key])}"
+                )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
