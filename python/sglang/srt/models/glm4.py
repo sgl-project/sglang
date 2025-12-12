@@ -452,7 +452,10 @@ class Glm4ForCausalLM(nn.Module):
                 )
             else:
                 emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
+                    size=(
+                        self.lm_head.num_embeddings_per_partition,
+                        config.hidden_size,
+                    ),
                     dtype=next(self.model.parameters()).dtype,
                     src=self.pp_group.first_rank,
                 )
