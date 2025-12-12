@@ -957,7 +957,7 @@ class ModelRunner:
                 lambda name: "mlp.experts" in name and "mlp.shared_experts" not in name,
             )
         else:
-            self.expert_location_updater.update(
+            yield self.expert_location_updater.update(
                 self.model.routed_experts_weights_of_layer,
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
