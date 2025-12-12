@@ -130,7 +130,7 @@ num_heads_groups = [
     (32, 8, 8),  # Qwen3-4B, Qwen3-8B, Qwen3-30B-A3B
     (40, 8, 8),  # Qwen3-14B
     (64, 8, 8),  # Qwen3-32B, Qwen3-235B-A22B
-    (12, 1, 1),  # Qwen3-0.6B, Qwen3-1.7B
+    (12, 1, 1),  # GLM4.6 TP8
 ]
 num_tokens_list = [1, 3, 8, 32, 256]
 is_neox_list = [False, True]
