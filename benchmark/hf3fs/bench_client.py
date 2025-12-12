@@ -29,7 +29,8 @@ def test():
     file_size = 1 << 40
     bytes_per_page = 16 << 20
     entries = 32
-    file_ops = Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries)
+    client_timeout = 5
+    file_ops = Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries, client_timeout)
 
     print("test batch_read / batch_write")
     num_pages = 128
@@ -69,12 +70,13 @@ def bench():
     bytes_per_page = 16 << 20
     entries = 8
     numjobs = 16
+    client_timeout = 5
 
     dtype = torch.bfloat16
     numel = bytes_per_page // dtype.itemsize
 
     file_ops = [
-        Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries)
+        Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries, client_timeout)
         for _ in range(numjobs)
     ]
 
