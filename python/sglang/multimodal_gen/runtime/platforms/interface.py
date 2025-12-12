@@ -27,7 +27,7 @@ class AttentionBackendEnum(enum.Enum):
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
-    SAGE_ATTN_THREE = enum.auto()
+    SAGE_ATTN_3 = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()

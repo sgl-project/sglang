@@ -456,6 +456,40 @@ class TestMistralDetector(unittest.TestCase):
         self.assertEqual(params["decision"], "ANSWER")
         self.assertEqual(params["content"], "The answer is 42")
 
+    def test_detect_and_parse_compact_args_format(self):
+        """Test parsing compact format: [TOOL_CALLS]name[ARGS]{...}."""
+        test_text = '[TOOL_CALLS]make_next_step_decision[ARGS]{"decision":"TOOL", "content":"Use weather API"}'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "make_next_step_decision")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["decision"], "TOOL")
+        self.assertEqual(params["content"], "Use weather API")
+
+    def test_streaming_compact_args_format_emits_tool_calls(self):
+        """Test streaming chunks for compact format produce tool_calls items."""
+        chunks = [
+            "[TOOL_CALLS]make_next_step_decision[ARGS]",
+            '{"decision":"TOOL", ',
+            '"content":"Use weather API"}',
+        ]
+
+        emitted = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.calls:
+                emitted.extend(result.calls)
+
+        # Expect two items: name chunk + full args chunk
+        self.assertEqual(len(emitted), 2)
+        self.assertEqual(emitted[0].name, "make_next_step_decision")
+        self.assertEqual(emitted[0].parameters, "")
+        self.assertIsNone(emitted[1].name)
+        params = json.loads(emitted[1].parameters)
+        self.assertEqual(params["decision"], "TOOL")
+        self.assertEqual(params["content"], "Use weather API")
+
 
 class TestBaseFormatDetector(unittest.TestCase):
     """Test buffer management and sequential tool index assignment in BaseFormatDetector."""

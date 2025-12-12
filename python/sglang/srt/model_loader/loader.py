@@ -34,6 +34,11 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    RemoteInstanceWeightLoaderBackend,
+    get_remote_instance_transfer_engine_info_per_rank,
+    register_memory_region_v2,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # Try to import accelerate (optional dependency)
@@ -1974,6 +1979,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
             )
+        self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
@@ -1992,16 +1998,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"load format {load_config.load_format}"
         )
 
-        model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
-
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config)
 
+        if (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.NCCL
+        ):
+            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
             with create_remote_connector(model_weights, device_config.device) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.INSTANCE:
-                    self.load_model_from_remote_instance(
+                    self.load_model_from_remote_instance_by_nccl(
                         model, client, model_config, device_config
                     )
                 else:
@@ -2009,9 +2018,45 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                         f"Unsupported connector type {connector_type} for "
                         f"remote tensor model loading."
                     )
+        elif (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        ):
+            if load_config.remote_instance_weight_loader_transfer_engine is None:
+                raise RuntimeError(
+                    "Transfer engine is not initialized for remote instance "
+                    "model loader with `transfer_engine` backend. "
+                )
+            logger.info(
+                "TransferEngine registering memory regions (this may take a few seconds)..."
+            )
+            # register memory region
+            self.remote_instance_transfer_engine_weight_info = (
+                register_memory_region_v2(
+                    model, load_config.remote_instance_weight_loader_transfer_engine
+                )
+            )
+            logger.info(
+                "TransferEngine memory regions have been successfully registered."
+            )
+
+            # transfer weights
+            success = self.load_model_from_remote_instance_by_transfer_engine(
+                model,
+                load_config.remote_instance_weight_loader_transfer_engine,
+                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
+                load_config.tp_rank,
+            )
+            if not success:
+                raise RuntimeError(
+                    "Failed to load weights from remote instance via transfer engine."
+                )
+        else:
+            raise ValueError("Invalid remote instance weight loader backend.")
+
         return model.eval()
 
-    def load_model_from_remote_instance(
+    def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
@@ -2061,6 +2106,63 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client._model_update_group
         )
         torch.cuda.empty_cache()
+
+    def load_model_from_remote_instance_by_transfer_engine(
+        self, model, transfer_engine, seed_url, tp_rank
+    ) -> bool:
+        # get remote weights metadata from source instance
+        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        )
+        if (
+            seed_transfer_engine_session_id is None
+            or seed_transfer_engine_weight_info is None
+        ):
+            logger.error("Cannot get transfer engine session or weight info.")
+            return False
+
+        # prepare local/remote RDMA keys
+        seed_ptr_list = []
+        client_ptr_list = []
+        client_len_list = []
+        for name, tensor in model.named_parameters():
+            weight_info = seed_transfer_engine_weight_info.get(name, None)
+            if weight_info is None:
+                logger.error(f"Cannot find weight info for {name}.")
+                return False
+
+            seed_ptr, seed_numel, seed_element_size = weight_info
+            if (
+                seed_numel != tensor.numel()
+                or seed_element_size != tensor.element_size()
+            ):
+                logger.error(
+                    f"Weight info does not match for {name}, "
+                    f"expected ({seed_numel}, {seed_element_size}), "
+                    f"got ({tensor.numel()}, {tensor.element_size()})"
+                )
+                return False
+            client_ptr = tensor.data_ptr()
+            client_len = tensor.numel() * tensor.element_size()
+            seed_ptr_list.append(seed_ptr)
+            client_ptr_list.append(client_ptr)
+            client_len_list.append(client_len)
+
+        # load weights from source instance through TransferEngine
+        ret = transfer_engine.batch_transfer_sync_read(
+            seed_transfer_engine_session_id,
+            client_ptr_list,
+            seed_ptr_list,
+            client_len_list,
+        )
+        if ret < 0:
+            logger.error(f"batch transfer failed, error: {ret}")
+            return False
+
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
+
+        return True
 
 
 class RemoteModelLoader(BaseModelLoader):
@@ -2584,5 +2686,14 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.PRIVATE:
+        import importlib
+
+        try:
+            module = importlib.import_module("sglang.private.private_model_loader")
+            return module.PrivateModelLoader(load_config)
+        except ImportError:
+            raise ValueError("Failed to import sglang.private.private_model_loader")
 
     return DefaultModelLoader(load_config)
