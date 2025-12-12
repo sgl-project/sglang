@@ -212,6 +212,7 @@ class TestEAGLERadixCache(CustomTestCase):
             # Chunked prefill & Page Size > 1
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
             {**self.BASE_CONFIG, "page_size": 4},
+            {**self.BASE_CONFIG, "cuda_graph_bs":[5], "page_size": 4},
             # Preferred by some kernels
             {**self.BASE_CONFIG, "page_size": 64},
             # Disable CUDA Graph
