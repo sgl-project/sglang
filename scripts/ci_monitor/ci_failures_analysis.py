@@ -1151,10 +1151,10 @@ class SGLangFailuresAnalyzer:
 
                 if broken:
                     summary_lines.append(
-                        "| Job Name | Current Streak | Max | First Failure | Last Failure | Recent History |"
+                        "| Job Name | Current | Max | Runs | First | Last | Recent History |"
                     )
                     summary_lines.append(
-                        "|----------|----------------|-----|---------------|--------------|----------------|"
+                        "|----------|---------|-----|------|-------|------|----------------|"
                     )
                     for job_name, d in broken[:15]:
                         display_name = (
