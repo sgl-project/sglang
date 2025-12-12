@@ -1629,6 +1629,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -1642,13 +1643,42 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     swa_available_size = (
                         self.token_to_kv_pool_allocator.swa_available_size()
                     )
-                    assert (
-                        full_available_size > 0 and swa_available_size > 0
-                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                    if full_available_size <= 0 or swa_available_size <= 0:
+                        # The single remaining request is too large and has exhausted all KV cache.
+                        # Abort it gracefully instead of crashing.
+                        idx = sorted_indices.pop()
+                        req = self.reqs[idx]
+                        logger.error(
+                            f"Request {req.rid} exhausted all KV cache space and cannot continue. "
+                            f"Aborting. {full_available_size=}, {swa_available_size=}, "
+                            f"input_len={len(req.origin_input_ids)}, output_len={len(req.output_ids)}"
+                        )
+                        req.to_finish = FINISH_ABORT(
+                            f"Request too large: exhausted all KV cache space. "
+                            f"input_len={len(req.origin_input_ids)}, output_len={len(req.output_ids)}",
+                            status_code=HTTPStatus.INSUFFICIENT_STORAGE,
+                        )
+                        self.release_req(idx, 0, server_args)
+                        reqs_to_abort.append(req)
                 else:
-                    assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
-                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
+                    available_size = self.token_to_kv_pool_allocator.available_size()
+                    if available_size <= 0:
+                        # The single remaining request is too large and has exhausted all KV cache.
+                        # Abort it gracefully instead of crashing.
+                        idx = sorted_indices.pop()
+                        req = self.reqs[idx]
+                        logger.error(
+                            f"Request {req.rid} exhausted all KV cache space and cannot continue. "
+                            f"Aborting. {available_size=}, "
+                            f"input_len={len(req.origin_input_ids)}, output_len={len(req.output_ids)}"
+                        )
+                        req.to_finish = FINISH_ABORT(
+                            f"Request too large: exhausted all KV cache space. "
+                            f"input_len={len(req.origin_input_ids)}, output_len={len(req.output_ids)}",
+                            status_code=HTTPStatus.INSUFFICIENT_STORAGE,
+                        )
+                        self.release_req(idx, 0, server_args)
+                        reqs_to_abort.append(req)
                 break
 
             first_iter = False
@@ -1678,7 +1708,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio, []
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
