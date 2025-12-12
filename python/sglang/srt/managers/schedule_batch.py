@@ -686,6 +686,7 @@ class Req:
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
+        self.retraction_mb_id = None
 
         # For metrics
         self.metrics_collector = metrics_collector
