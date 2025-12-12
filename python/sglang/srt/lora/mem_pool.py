@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -299,6 +300,12 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Dict[str, BaseLayerWithLoRA],
         lora_lm_head_module: Dict[str, BaseLayerWithLoRA],
     ):
+        start_time = time.perf_counter()
+        num_loaded = 0
+        eviction_time = 0.0
+        loading_time = 0.0
+        sync_time = 0.0
+
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
             for buffer_id in range(self.max_loras_per_batch):
@@ -329,6 +336,7 @@ class LoRAMemoryPool:
                 )
 
             # Select victim using eviction policy
+            evict_start = time.perf_counter()
             victim_uid = self.eviction_policy.select_victim(candidates)
 
             # Evict the selected victim
@@ -336,6 +344,8 @@ class LoRAMemoryPool:
             self.uid_to_buffer_id.pop(victim_uid)
             self.eviction_policy.remove(victim_uid)
             self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
+            nonlocal eviction_time
+            eviction_time += (time.perf_counter() - evict_start) * 1000
             logger.debug(
                 f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
             )
@@ -347,6 +357,7 @@ class LoRAMemoryPool:
 
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
+                load_start = time.perf_counter()
                 buffer_id = get_available_buffer_slot()
                 lora_adapter = lora_adapters.get(uid, None)
                 self.load_lora_weight_to_buffer(
@@ -359,6 +370,20 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                num_loaded += 1
+                load_time = (time.perf_counter() - load_start) * 1000
+                loading_time += load_time
+                logger.info(f"🔴 LoRA loading: {load_time:.2f}ms, uid={uid}")
+
+        total_time = (time.perf_counter() - start_time) * 1000
+        if num_loaded > 0:
+            logger.info(
+                f"📊 prepare_lora_batch breakdown: "
+                f"total={total_time:.2f}ms, "
+                f"eviction={eviction_time:.2f}ms, "
+                f"loading={loading_time:.2f}ms, "
+                f"loaded={num_loaded} adapters"
+            )
 
     def load_lora_weight_to_buffer(
         self,
@@ -396,6 +421,7 @@ class LoRAMemoryPool:
 
         assert lora_adapter is not None
         lora_rank = lora_adapter.config.r
+
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
             temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
