@@ -71,8 +71,8 @@ class TestDeepseekV32Accuracy(CustomTestCase):
 
     def test_gpqa(self):
         args = SimpleNamespace(
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=DEEPSEEK_V32_MODEL_PATH,
             eval_name="gpqa",
             num_examples=198,
             # use enough threads to allow parallelism
