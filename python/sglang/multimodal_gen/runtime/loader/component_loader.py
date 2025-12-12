@@ -736,10 +736,10 @@ class ControlNetLoader(ComponentLoader):
         """ControlNet follows the same offload policy as the transformer."""
         return server_args.dit_cpu_offload
 
-    def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+    def _load_single_controlnet(
+        self, component_model_path: str, server_args: ServerArgs
     ):
-        """Load ControlNet based on the model path."""
+        """Load a single ControlNet model from path."""
         config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
@@ -793,6 +793,37 @@ class ControlNetLoader(ComponentLoader):
 
         model = model.eval()
         return model
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
+        """Load ControlNet based on the model path.
+
+        Supports both single path (str) and multiple paths (list).
+        For multiple paths, returns a QwenImageMultiControlNetModel wrapper.
+        """
+        # Check if we have multiple controlnet paths
+        controlnet_paths = server_args.controlnet_paths
+
+        if controlnet_paths and len(controlnet_paths) > 1:
+            # Load multiple ControlNets and wrap in MultiControlNet
+            from sglang.multimodal_gen.runtime.models.controlnets import (
+                QwenImageMultiControlNetModel,
+            )
+
+            logger.info("Loading %d ControlNet models...", len(controlnet_paths))
+            controlnets = []
+            for i, path in enumerate(controlnet_paths):
+                logger.info("Loading ControlNet %d/%d from %s", i + 1, len(controlnet_paths), path)
+                controlnet = self._load_single_controlnet(path, server_args)
+                controlnets.append(controlnet)
+
+            multi_controlnet = QwenImageMultiControlNetModel(controlnets)
+            logger.info("Created MultiControlNet with %d models", len(controlnets))
+            return multi_controlnet
+        else:
+            # Single controlnet - load normally
+            return self._load_single_controlnet(component_model_path, server_args)
 
 
 class GenericComponentLoader(ComponentLoader):

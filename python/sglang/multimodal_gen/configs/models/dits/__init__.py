@@ -5,4 +5,4 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConf
 from sglang.multimodal_gen.configs.models.dits.stepvideo import StepVideoConfig
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
-__all__ = ["HunyuanVideoConfig", "QwenImageDitConfig", "WanVideoConfig", "StepVideoConfig"]
+__all__ = ["HunyuanVideoConfig", "WanVideoConfig", "StepVideoConfig"]

@@ -252,8 +252,9 @@ class QwenImageMultiControlNetModel(nn.Module):
     """
     Wrapper class for multiple QwenImageControlNetModel instances.
 
-    Supports ControlNet-Union style multi-condition control where
-    multiple control signals are combined.
+    Supports two modes:
+    1. ControlNet-Union: Single network with multiple conditions (e.g., canny + depth)
+    2. Multi-ControlNet: Multiple separate networks, each with its own condition
     """
 
     def __init__(self, controlnets: List[QwenImageControlNetModel]):
@@ -276,12 +277,21 @@ class QwenImageMultiControlNetModel(nn.Module):
         """
         Forward pass through multiple ControlNets.
 
-        For ControlNet-Union, we use a single ControlNet and iterate over conditions.
+        Args:
+            hidden_states: Input hidden states [batch, seq_len, in_channels]
+            controlnet_cond: List of control condition tensors (one per condition/network)
+            conditioning_scale: List of scales (one per condition/network)
+            ...
+
+        Modes:
+            - Single net (Union): Iterate conditions through the same network
+            - Multiple nets: Each network processes its corresponding condition
         """
+        control_block_samples = None
+
         if len(self.nets) == 1:
             # ControlNet-Union mode: single network, multiple conditions
             controlnet = self.nets[0]
-            control_block_samples = None
 
             for i, (cond, scale) in enumerate(zip(controlnet_cond, conditioning_scale)):
                 block_samples = controlnet(
@@ -304,18 +314,47 @@ class QwenImageMultiControlNetModel(nn.Module):
                         prev + curr
                         for prev, curr in zip(control_block_samples, block_samples)
                     ]
-
-            if return_dict:
-                return QwenImageControlNetOutput(
-                    controlnet_block_samples=(
-                        tuple(control_block_samples) if control_block_samples else ()
-                    )
-                )
-            return tuple(control_block_samples) if control_block_samples else ()
         else:
-            raise ValueError(
-                "QwenImageMultiControlNetModel only supports controlnet-union (single net) for now."
+            # Multi-ControlNet mode: multiple networks, each with its own condition
+            # Number of conditions should match number of networks
+            if len(controlnet_cond) != len(self.nets):
+                raise ValueError(
+                    f"Number of conditions ({len(controlnet_cond)}) must match "
+                    f"number of ControlNets ({len(self.nets)})"
+                )
+
+            for i, (controlnet, cond, scale) in enumerate(
+                zip(self.nets, controlnet_cond, conditioning_scale)
+            ):
+                block_samples = controlnet(
+                    hidden_states=hidden_states,
+                    controlnet_cond=cond,
+                    conditioning_scale=scale,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    timestep=timestep,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=txt_seq_lens,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    return_dict=False,
+                )
+
+                if control_block_samples is None:
+                    control_block_samples = list(block_samples)
+                else:
+                    # Sum residuals from all ControlNets
+                    control_block_samples = [
+                        prev + curr
+                        for prev, curr in zip(control_block_samples, block_samples)
+                    ]
+
+        if return_dict:
+            return QwenImageControlNetOutput(
+                controlnet_block_samples=(
+                    tuple(control_block_samples) if control_block_samples else ()
+                )
             )
+        return tuple(control_block_samples) if control_block_samples else ()
 
 
 # Register as EntryClass for automatic discovery by ModelRegistry
