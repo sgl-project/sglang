@@ -36,6 +36,15 @@ find_cache_dir() {
     fi
 }
 
+# Drop page cache if possible (best effort, ignore errors)
+drop_caches() {
+    if [ "$(id -u)" = "0" ]; then
+        sync
+        # Use subshell to properly suppress redirection errors in containers
+        (echo 3 > /proc/sys/vm/drop_caches) 2>/dev/null || true
+    fi
+}
+
 # Test read bandwidth using dd
 test_read_bandwidth() {
     local test_dir="$1"
@@ -52,10 +61,7 @@ test_read_bandwidth() {
     dd if=/dev/zero of="$test_file" bs=1M count="$size_mb" conv=fdatasync 2>/dev/null
     
     # Clear page cache if running as root
-    if [ "$(id -u)" = "0" ]; then
-        sync
-        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    fi
+    drop_caches
     
     # Test read bandwidth
     echo "Testing read bandwidth..."
@@ -73,22 +79,23 @@ test_read_bandwidth() {
     # Extract bandwidth - handle different dd output formats
     local bw_value=""
     local bw_unit=""
+    local bw_mb_s="0"
     
-    # Try to extract GB/s or MB/s
+    # Try to extract GB/s or MB/s (use awk instead of bc for portability)
     if echo "$bw_line" | grep -qE '[0-9.]+ GB/s'; then
         bw_value=$(echo "$bw_line" | grep -oE '[0-9.]+ GB/s' | grep -oE '[0-9.]+')
         bw_unit="GB/s"
-        bw_mb_s=$(echo "$bw_value * 1024" | bc 2>/dev/null || echo "0")
+        bw_mb_s=$(awk "BEGIN {printf \"%.0f\", $bw_value * 1024}")
     elif echo "$bw_line" | grep -qE '[0-9.]+ MB/s'; then
         bw_value=$(echo "$bw_line" | grep -oE '[0-9.]+ MB/s' | grep -oE '[0-9.]+')
         bw_unit="MB/s"
-        bw_mb_s="$bw_value"
+        bw_mb_s=$(awk "BEGIN {printf \"%.0f\", $bw_value}")
     else
         # Fallback: calculate from bytes and time
         local bytes=$(echo "$bw_line" | grep -oE '^[0-9]+' | head -1)
         local time=$(echo "$bw_line" | grep -oE '[0-9.]+ s' | grep -oE '[0-9.]+')
         if [ -n "$bytes" ] && [ -n "$time" ]; then
-            bw_mb_s=$(echo "scale=2; $bytes / $time / 1024 / 1024" | bc 2>/dev/null || echo "0")
+            bw_mb_s=$(awk "BEGIN {printf \"%.2f\", $bytes / $time / 1024 / 1024}")
             bw_value="$bw_mb_s"
             bw_unit="MB/s"
         fi
@@ -103,8 +110,8 @@ test_read_bandwidth() {
     echo "Minimum Required: ${MIN_BW_MB_S} MB/s"
     echo "=============================================="
     
-    # Check if bandwidth is acceptable
-    if [ -n "$bw_mb_s" ] && [ "$(echo "$bw_mb_s >= $MIN_BW_MB_S" | bc 2>/dev/null)" = "1" ]; then
+    # Check if bandwidth is acceptable (use awk for float comparison)
+    if [ -n "$bw_mb_s" ] && [ "$(awk "BEGIN {print ($bw_mb_s >= $MIN_BW_MB_S) ? 1 : 0}")" = "1" ]; then
         echo -e "${GREEN}✓ Disk I/O bandwidth is acceptable${NC}"
         return 0
     else
@@ -134,10 +141,7 @@ test_safetensors_pattern() {
     done
     
     # Clear cache if root
-    if [ "$(id -u)" = "0" ]; then
-        sync
-        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    fi
+    drop_caches
     
     # Time reading all files sequentially
     local start_time=$(date +%s.%N)
@@ -149,11 +153,11 @@ test_safetensors_pattern() {
     # Clean up
     rm -rf "$test_subdir"
     
-    # Calculate bandwidth
+    # Calculate bandwidth using awk (bc may not be available in containers)
     local total_mb=$((num_files * file_size_mb))
-    local duration=$(echo "$end_time - $start_time" | bc)
-    local bw_mb_s=$(echo "scale=2; $total_mb / $duration" | bc 2>/dev/null || echo "0")
-    local time_per_shard=$(echo "scale=2; $duration / $num_files" | bc 2>/dev/null || echo "0")
+    local duration=$(awk "BEGIN {printf \"%.3f\", $end_time - $start_time}")
+    local bw_mb_s=$(awk "BEGIN {printf \"%.2f\", $total_mb / $duration}")
+    local time_per_shard=$(awk "BEGIN {printf \"%.2f\", $duration / $num_files}")
     
     echo ""
     echo "=============================================="
@@ -165,8 +169,8 @@ test_safetensors_pattern() {
     echo "Time per shard: ${time_per_shard}s"
     echo "=============================================="
     
-    # Compare with expected ~1s/shard for healthy system
-    if [ "$(echo "$time_per_shard <= 2.0" | bc 2>/dev/null)" = "1" ]; then
+    # Compare with expected ~1s/shard for healthy system (use awk for float comparison)
+    if [ "$(awk "BEGIN {print ($time_per_shard <= 2.0) ? 1 : 0}")" = "1" ]; then
         echo -e "${GREEN}✓ Safetensors loading speed is healthy (<= 2s/shard)${NC}"
     else
         echo -e "${RED}✗ Safetensors loading is SLOW (${time_per_shard}s/shard, expected <= 2s)${NC}"
