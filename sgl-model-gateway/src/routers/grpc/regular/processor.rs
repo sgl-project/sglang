@@ -16,12 +16,14 @@ use crate::{
         generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+    routers::{
         error,
-        proto_wrapper::ProtoGenerateComplete,
-        utils,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::ProtoGenerateComplete,
+            utils,
+        },
     },
     tokenizer::{
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
