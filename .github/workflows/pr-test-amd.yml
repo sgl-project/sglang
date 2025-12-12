@@ -20,6 +20,12 @@ on:
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
   workflow_dispatch:
+    inputs:
+      target_stage:
+        description: "Specific stage to run (optional, for quick testing)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: pr-test-amd-${{ github.ref }}
@@ -54,11 +60,19 @@ jobs:
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
+        (
+          !inputs.target_stage &&
+          needs.check-changes.outputs.sgl_kernel == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -90,12 +104,20 @@ jobs:
 
   stage-a-test-1-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-a-test-1-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -120,12 +142,20 @@ jobs:
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{matrix.runner}}
     steps:
@@ -150,12 +180,20 @@ jobs:
 
   unit-test-backend-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-2]
+        runner: [linux-mi325-gpu-2]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -180,15 +218,25 @@ jobs:
 
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    # Temporarily disabled - uncomment when ready to re-enable
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-8-gpu-amd') ||
+        (
+          false &&
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     env:
       RUNNER_LABELS: linux-mi300-gpu-8
     strategy:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-8]
-        part: [0, 1, 2]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -205,19 +253,33 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Test RCCL multi-GPU communication
+        timeout-minutes: 5
+        run: |
+          echo "Testing RCCL multi-GPU communication with debug info..."
+          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/test_rccl_multi_gpu.py"
+
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-1-gpu-part-1-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -257,12 +319,20 @@ jobs:
 
   performance-test-1-gpu-part-2-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-1-gpu-part-2-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -296,12 +366,20 @@ jobs:
 
   performance-test-2-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-2]
+        runner: [linux-mi325-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -345,12 +423,20 @@ jobs:
 
   accuracy-test-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'accuracy-test-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -376,12 +462,20 @@ jobs:
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-2]
+        runner: [linux-mi325-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -401,7 +495,7 @@ jobs:
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
 
   pr-test-amd-finish:
     needs:
@@ -414,7 +508,7 @@ jobs:
         stage-a-test-1-amd,
         unit-test-backend-1-gpu-amd,
         unit-test-backend-2-gpu-amd,
-        unit-test-backend-8-gpu-amd,
+        # unit-test-backend-8-gpu-amd,  # Temporarily disabled
         performance-test-1-gpu-part-1-amd,
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,

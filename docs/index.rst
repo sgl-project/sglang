@@ -41,11 +41,14 @@ Its core features include:
    advanced_features/tool_parser.ipynb
    advanced_features/separate_reasoning.ipynb
    advanced_features/quantization.md
+   advanced_features/quantized_kv_cache.md
+   advanced_features/expert_parallelism.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
    advanced_features/hicache.rst
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
+   advanced_features/dp_for_multi_modal_encoder.md
    advanced_features/router.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
@@ -57,12 +60,15 @@ Its core features include:
 
    supported_models/generative_models.md
    supported_models/multimodal_language_models.md
+   supported_models/diffusion_language_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md
+   supported_models/classify_models.md
    supported_models/support_new_models.md
    supported_models/transformers_fallback.md
    supported_models/modelscope.md
+   supported_models/mindspore_models.md
 
 .. toctree::
    :maxdepth: 1
@@ -72,7 +78,7 @@ Its core features include:
    platforms/cpu_server.md
    platforms/tpu.md
    platforms/nvidia_jetson.md
-   platforms/ascend_npu.md
+   platforms/ascend_npu_support.rst
    platforms/xpu.md
 
 .. toctree::
@@ -95,6 +101,7 @@ Its core features include:
    references/multi_node_deployment/multi_node_index.rst
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
+   references/post_training_integration.md
    references/learn_more.md
 
 .. toctree::

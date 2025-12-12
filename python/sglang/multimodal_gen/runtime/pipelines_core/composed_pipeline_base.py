@@ -110,9 +110,6 @@ class ComposedPipelineBase(ABC):
         self.post_init_called = True
 
         self.initialize_pipeline(self.server_args)
-        if self.server_args.enable_torch_compile:
-            self.modules["transformer"] = torch.compile(self.modules["transformer"])
-            logger.info("Torch Compile enabled for DiT")
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
@@ -281,7 +278,6 @@ class ComposedPipelineBase(ABC):
             transformers_or_diffusers,
             architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
-
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -304,7 +300,19 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
-            component_model_path = os.path.join(self.model_path, load_module_name)
+            # Use custom VAE path if provided, otherwise use default path
+            if module_name == "vae" and server_args.vae_path is not None:
+                component_model_path = server_args.vae_path
+                # Download from HuggingFace Hub if path doesn't exist locally
+                if not os.path.exists(component_model_path):
+                    component_model_path = maybe_download_model(component_model_path)
+                logger.info(
+                    "Using custom VAE path: %s instead of default path: %s",
+                    component_model_path,
+                    os.path.join(self.model_path, load_module_name),
+                )
+            else:
+                component_model_path = os.path.join(self.model_path, load_module_name)
             module = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,
