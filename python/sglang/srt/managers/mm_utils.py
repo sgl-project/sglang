@@ -979,18 +979,8 @@ def hash_feature(f):
             )
             metadata_bytes = pickle.dumps(metadata_tuple)
             metadata_hash = data_hash(metadata_bytes)
-            logger.info(
-                f"[CUDA IPC] hash_feature: Using metadata hash for CudaIpcTensorTransportProxy: "
-                f"shape={ipc_extra.get('recons_shape')}, dtype={ipc_extra.get('recons_dtype')}, "
-                f"process_id={os.getpid()}"
-            )
             return metadata_hash
         else:
-            # Fallback: if no IPC handle, reconstruct (shouldn't happen in normal flow)
-            logger.warning(
-                f"[CUDA IPC] hash_feature: CudaIpcTensorTransportProxy has no IPC handle, "
-                f"falling back to reconstruction. process_id={os.getpid()}"
-            )
             reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
             return tensor_hash([reconstruct_t])
     return data_hash(f)

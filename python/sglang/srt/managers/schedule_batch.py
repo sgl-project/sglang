@@ -1352,32 +1352,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        cuda_ipc_reconstruct_count = 0
-        normal_tensor_count = 0
-        for mm_input_idx, mm_input in enumerate(multimodal_inputs):
+
+        for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
-            for mm_item_idx, mm_item in enumerate(mm_input.mm_items):
+            for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
-                    normal_tensor_count += 1
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
-                    logger.info(
-                        f"[CUDA IPC] Reconstructing feature in scheduler: "
-                        f"mm_input_idx={mm_input_idx}, mm_item_idx={mm_item_idx}, "
-                        f"target_device={torch.cuda.current_device()}"
-                    )
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
                     )
-                    cuda_ipc_reconstruct_count += 1
-        if cuda_ipc_reconstruct_count > 0:
-            logger.info(
-                f"[CUDA IPC] Scheduler reconstruction summary: "
-                f"cuda_ipc_reconstructed={cuda_ipc_reconstruct_count}, "
-                f"normal_tensors={normal_tensor_count}"
-            )
+    
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)

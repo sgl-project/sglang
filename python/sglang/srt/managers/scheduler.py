@@ -1125,7 +1125,6 @@ class Scheduler(
                 while True:
                     try:
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                        print(f"[Recv Requests] Received request from tokenizer: {recv_req}")
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
