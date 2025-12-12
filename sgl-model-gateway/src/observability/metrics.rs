@@ -359,10 +359,6 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn set_active_workers(count: usize) {
-        gauge!("sgl_router_active_workers").set(count as f64);
-    }
-
     pub fn set_worker_health(worker_url: &str, healthy: bool) {
         gauge!("sgl_router_worker_health",
             "worker" => worker_url.to_string()
@@ -928,7 +924,6 @@ mod tests {
         RouterMetrics::record_request_error("/generate", "timeout");
         RouterMetrics::record_retry("/generate");
 
-        RouterMetrics::set_active_workers(5);
         RouterMetrics::set_worker_health("http://worker1", true);
         RouterMetrics::set_worker_load("http://worker1", 10);
         RouterMetrics::record_processed_request("http://worker1");
@@ -1081,9 +1076,6 @@ mod tests {
 
     #[test]
     fn test_extreme_metric_values() {
-        RouterMetrics::set_active_workers(0);
-        RouterMetrics::set_active_workers(usize::MAX);
-
         RouterMetrics::set_worker_load("worker", 0);
         RouterMetrics::set_worker_load("worker", usize::MAX);
 
