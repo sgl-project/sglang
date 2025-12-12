@@ -124,14 +124,14 @@ cd sglang
 # Install AITER from Source
 git clone https://github.com/ROCm/aiter.git
 cd aiter
-git checkout v0.1.7.post5 # Or v0.1.4 for ROCm 6.x
+git checkout v0.1.7.post5
 git submodule update --init --recursive
 GPU_ARCH_LIST="gfx950" # Or "gfx942" for MI300x/MI325x
 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop # optionally you can set PREBUILD_KERNELS=1 for gfx942 (MI300x/MI325x) to precompile kernels enabling faster server startup
 
 # Install sglang python package
 rm -rf python/pyproject.toml && mv python/pyproject_rocm.toml python/pyproject.toml
-pip install -e "python[rocm700]" # or pip install -e "python[rocm640]"
+pip install -e "python[rocm700]"
 ```
 
 ## Examples
