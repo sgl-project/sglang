@@ -19,27 +19,14 @@ Currently, the following models are supported:
 
 ## Installation
 
-> **Note**: Currently, MindSpore models are provided by an independent package `sgl-mindspore`, which needs to be installed separately.
+> **Note**: Currently, MindSpore models are provided by an independent package `sgl-mindspore`. Support for MindSpore is built upon current SGLang support for Ascend NPU platform. Please first [install SGLang for Ascend NPU](../platforms/ascend_npu.md) and then install `sgl-mindspore`:
 
 ```shell
-git clone https://github.com/chz34/sgl-mindspore.git
+git clone https://github.com/mindspore-lab/sgl-mindspore.git
 cd sgl-mindspore
 pip install -e .
 ```
 
-You will need to install the following packages.
-
-```shell
-pip install "mindspore==2.7.1"
-pip install "torch==2.8"
-pip install "torch_npu==2.8"
-pip install triton_ascend
-```
-
-```shell
-cp python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_npu]"
-```
 
 ## Run Model
 
@@ -69,7 +56,7 @@ prompts = [
     "The future of AI is"
 ]
 
-sampling_params = {"temperature": 0.01, "top_p": 0.9}
+sampling_params = {"temperature": 0, "top_p": 0.9}
 outputs = llm.generate(prompts, sampling_params)
 
 for prompt, output in zip(prompts, outputs):

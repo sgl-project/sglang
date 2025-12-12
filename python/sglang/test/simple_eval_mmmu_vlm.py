@@ -67,9 +67,7 @@ class MMMUVLMEval(Eval):
         # Prepare samples deterministically across all MMMU subjects (validation split)
         self.samples = self._prepare_mmmu_samples(self.num_examples)
         # For example, "<\|begin_of_box\|>foo<\|end_of_box\|>" could be used to extract "foo" as the answer from the response text
-        self.response_answer_regex = (
-            response_answer_regex if response_answer_regex is not None else "(.*)"
-        )
+        self.response_answer_regex = response_answer_regex
 
     @staticmethod
     def _to_data_uri(image: Image.Image) -> str:
@@ -214,14 +212,15 @@ class MMMUVLMEval(Eval):
             # Sample
             response_text = sampler(prompt_messages)
             response_text = response_text or ""
-            match = (
-                re.search(self.response_answer_regex, response_text)
-                if response_text is not None
-                else None
-            )
-            response_text = (
-                match.group(1).strip() if match is not None else response_text
-            )
+            if self.response_answer_regex:
+                match = (
+                    re.search(self.response_answer_regex, response_text)
+                    if response_text is not None
+                    else None
+                )
+                response_text = (
+                    match.group(1).strip() if match is not None else response_text
+                )
 
             # Parse and score
             gold = sample["answer"]

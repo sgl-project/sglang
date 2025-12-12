@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import jinja2
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -214,7 +215,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
-            reasoning=self._get_reasoning_from_request(request),
+            require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
@@ -362,27 +363,32 @@ class OpenAIServingChat(OpenAIServingBase):
                         else {}
                     ),
                 )
-            except Exception:
-                # This except branch will be triggered when the chosen model
-                # has a different tools input format that is not compatible
-                # with openAI's apply_chat_template tool_call format, like Mistral.
+            except Exception as e:
+                # If the first attempt fails, try transforming the tools format
+                # This handles models like Mistral that have a different tools input format
+                # that is not compatible with OpenAI's apply_chat_template tool_call format
                 tools = (
                     [t if "function" in t else {"function": t} for t in tools]
                     if tools
                     else None
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                    openai_compatible_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=tools,
-                    reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
-                )
+                try:
+                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        reasoning_effort=request.reasoning_effort,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
+                except jinja2.TemplateError as template_error:
+                    # Template errors (e.g., from raise_exception in Jinja templates)
+                    # should be treated as client errors (400 BadRequest)
+                    raise ValueError(str(template_error)) from template_error
 
             if assistant_prefix:
                 encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)

@@ -68,6 +68,14 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     import sgl_kernel_npu  # noqa: F401
+
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError:
+        logger.warning(
+            f"custom_ops not found, dsv3.2 requires this package, which includes the npu_lightning_indexer and npu_sparse_flash_attention operators."
+        )
+
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
