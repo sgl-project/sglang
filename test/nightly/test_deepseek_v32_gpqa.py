@@ -20,11 +20,8 @@ register_cuda_ci(est_time=3600, suite="nightly-8-gpu-b200", nightly=True)
 # Use the latest version of DeepSeek-V3.2
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
-# Global list to collect results
-TEST_RESULTS = []
 
-
-class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
+class TestDeepseekV32Accuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = try_cached_model(DEEPSEEK_V32_MODEL_PATH)
