@@ -2,15 +2,9 @@
 set -euo pipefail
 ROCM_VERSION=$1
 
-if [ "$ROCM_VERSION" = "700" ]; then
-  PYTHON_ROOT_PATH="/opt/venv/bin"
-  AMDGPU_TARGET="gfx942;gfx950"
-  TORCH_INSTALL_CMD="${PYTHON_ROOT_PATH}/pip install --index-url https://download.pytorch.org/whl/nightly/rocm7.0 torch==2.10.0.dev20251011+rocm7.0 torchvision==0.25.0.dev20251012+rocm7.0"
-else
-  PYTHON_ROOT_PATH="/usr/bin"
-  AMDGPU_TARGET="gfx942"
-  TORCH_INSTALL_CMD="${PYTHON_ROOT_PATH}/pip install --index-url https://download.pytorch.org/whl/rocm6.4 torch==2.9.0 torchvision==0.24.0+rocm6.4"
-fi
+PYTHON_ROOT_PATH="/opt/venv/bin"
+AMDGPU_TARGET="gfx942;gfx950"
+TORCH_INSTALL_CMD="${PYTHON_ROOT_PATH}/pip install --index-url https://download.pytorch.org/whl/nightly/rocm7.0 torch==2.10.0.dev20251011+rocm7.0 torchvision==0.25.0.dev20251012+rocm7.0"
 
 echo "Python root path is: $PYTHON_ROOT_PATH"
 
@@ -40,11 +34,7 @@ fi
 
 
 # Default base tags (can be overridden by command line arguments)
-if [ "$ROCM_VERSION" = "700" ]; then
-  DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi30x"
-else
-  DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
-fi
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
 
 # Parse command line arguments
@@ -106,12 +96,10 @@ find_latest_image() {
 
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
   echo "Using hard-coded fallback…" >&2
-  if [[ "${gpu_arch}" == "mi35x" ]] && [[ "${ROCM_VERSION}" == "700" ]]; then
+  if [[ "${gpu_arch}" == "mi35x" ]]; then
     echo "rocm/sgl-dev:v0.5.3-rocm700-mi35x-20251009"
-  elif [[ "${gpu_arch}" == "mi30x" ]] && [[ "${ROCM_VERSION}" == "700" ]]; then
-    echo "rocm/sgl-dev:v0.5.3-rocm700-mi30x-20251009"
   else
-    echo "rocm/sgl-dev:v0.5.3-rocm630-mi30x-20251009"
+    echo "rocm/sgl-dev:v0.5.3-rocm700-mi30x-20251009"
   fi
 }
 
