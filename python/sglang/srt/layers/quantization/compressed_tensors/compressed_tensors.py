@@ -31,7 +31,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
-    CompressedTensorsW8A8Int8,
+    GPUCompressedTensorsW8A8Int8,
+    NPUCompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
@@ -42,6 +43,10 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 
 logger = logging.getLogger(__name__)
 
@@ -439,18 +444,32 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
             if self._is_static_tensor_w8a8(weight_quant, input_quant):
-                return CompressedTensorsW8A8Int8(
-                    strategy=weight_quant.strategy,
-                    is_static_input_scheme=True,
-                    input_symmetric=input_quant.symmetric,
-                )
+                if _is_npu:
+                    return NPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=True,
+                        input_symmetric=input_quant.symmetric,
+                    )
+                else:
+                    return GPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=True,
+                        input_symmetric=input_quant.symmetric,
+                    )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
-                return CompressedTensorsW8A8Int8(
-                    strategy=weight_quant.strategy,
-                    is_static_input_scheme=False,
-                    input_symmetric=input_quant.symmetric,
-                )
+                if _is_npu:
+                    return NPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=False,
+                        input_symmetric=input_quant.symmetric,
+                    )
+                else:
+                    return GPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=False,
+                        input_symmetric=input_quant.symmetric,
+                    )
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
