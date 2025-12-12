@@ -120,6 +120,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
+  m.def("turbomind_rms_norm(Tensor! data, Tensor weight, float eps) -> ()");
+  m.impl("turbomind_rms_norm", torch::kCUDA, &turbomind_rms_norm);
+
   /*
    * From csrc/gemm
    */
