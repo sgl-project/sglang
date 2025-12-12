@@ -649,3 +649,236 @@ def run_dp_sharded_mrope_vision_model(
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
+
+
+def run_dp_sharded_mrope_vision_model_optimized(
+    vision_model: torch.nn.Module,
+    pixel_values_local: torch.Tensor,  # Already sliced for current GPU
+    grid_thw_list_local: list,  # Grid (T,H,W) for current GPU
+    grid_thw_list_all: list,  # Complete grid_thw list for all images
+    shuffle_indices: list[int],  # Shuffled indices from load balancing
+    gpu_sample_counts: list[int],  # Number of samples per GPU
+    *,
+    rope_type: Literal["rope_3d", "rope_2d"],
+):
+    """
+    Run vision model with DP sharding. Optimized to avoid redundant memory allocation.
+
+    Args:
+        vision_model: Vision model module
+        pixel_values_local: Pixel values for current GPU (already sliced)
+        grid_thw_list_local: Grid (T,H,W) list for current GPU
+        grid_thw_list_all: Complete grid_thw list for all images
+        shuffle_indices: Shuffled indices from load balancing
+        gpu_sample_counts: Number of samples assigned to each GPU
+        rope_type: Type of rope encoding ("rope_3d" or "rope_2d")
+
+    Returns:
+        Image embeddings in original order
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+
+    # Calculate embedding dimension reduction factor
+    if rope_type == "rope_2d":
+        embed_dim_reduction_factor = (
+            vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
+        )
+    else:
+        embed_dim_reduction_factor = (
+            vision_model.spatial_merge_size * vision_model.spatial_merge_size
+        )
+
+    # Calculate patches per image and grouped lengths
+    patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list_all]
+
+    # Calculate grouped_pixel_values_len for each GPU
+    grouped_pixel_values_len = []
+    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+    for rank in range(tp_size):
+        rank_image_indices = shuffle_indices[
+            cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
+        ]
+        rank_total_patches = sum(patches_per_image[i] for i in rank_image_indices)
+        grouped_pixel_values_len.append(rank_total_patches)
+
+    # Find max length across all ranks for padding
+    max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
+
+    # Run the vision model on local data
+    if rope_type == "rope_2d":
+        if pixel_values_local.shape[0] > 0:
+            image_embeds_local = vision_model(
+                pixel_values_local, torch.tensor(grid_thw_list_local)
+            )
+            if isinstance(image_embeds_local, list):
+                image_embeds_local = torch.cat(image_embeds_local, dim=0)
+        else:
+            out_dim = getattr(vision_model.config, "hidden_size", None)
+            image_embeds_local = torch.empty(
+                (0, embed_dim_reduction_factor, out_dim),
+                device=pixel_values_local.device,
+                dtype=pixel_values_local.dtype,
+            )
+    else:
+        if pixel_values_local.shape[0] > 0:
+            image_embeds_local = vision_model(
+                pixel_values_local, torch.tensor(grid_thw_list_local)
+            )
+        else:
+            image_embeds_local = torch.empty(
+                (0, vision_model.out_hidden_size),
+                device=pixel_values_local.device,
+                dtype=pixel_values_local.dtype,
+            )
+
+    # Pad the output for all_gather
+    current_len = image_embeds_local.shape[0]
+    if current_len < max_len_per_rank:
+        padding_size = max_len_per_rank - current_len
+        if rope_type == "rope_2d":
+            padding = torch.empty(
+                (
+                    padding_size,
+                    image_embeds_local.shape[1],
+                    image_embeds_local.shape[2],
+                ),
+                dtype=image_embeds_local.dtype,
+                device=image_embeds_local.device,
+            )
+        else:
+            padding = torch.empty(
+                (padding_size, image_embeds_local.shape[1]),
+                dtype=image_embeds_local.dtype,
+                device=image_embeds_local.device,
+            )
+        image_embeds_local_padded = torch.cat([image_embeds_local, padding], dim=0)
+    else:
+        image_embeds_local_padded = image_embeds_local
+
+    # Gather embeddings from all GPUs
+    gathered_embeds = tensor_model_parallel_all_gather(image_embeds_local_padded, dim=0)
+
+    # Remove padding and reconstruct per-rank embeddings
+    rank_embeddings = []
+    for rank in range(tp_size):
+        start_idx = rank * max_len_per_rank
+        end_idx = start_idx + (
+            grouped_pixel_values_len[rank] // embed_dim_reduction_factor
+        )
+        rank_embeddings.append(gathered_embeds[start_idx:end_idx])
+
+    # Calculate output patches per image
+    patches_per_output_image = [
+        patch_size // embed_dim_reduction_factor for patch_size in patches_per_image
+    ]
+
+    # Reconstruct embeddings in original order
+    original_order_embeddings = [None] * len(grid_thw_list_all)
+    current_idx = 0
+    for rank in range(tp_size):
+        count = gpu_sample_counts[rank]
+        if count > 0:
+            rank_images = shuffle_indices[current_idx : current_idx + count]
+            rank_embed = rank_embeddings[rank]
+
+            embed_start = 0
+            for img_idx in rank_images:
+                img_patches = patches_per_output_image[img_idx]
+                original_order_embeddings[img_idx] = rank_embed[
+                    embed_start : embed_start + img_patches
+                ]
+                embed_start += img_patches
+            current_idx += count
+
+    out_embeddings = torch.cat(original_order_embeddings, dim=0)
+    return out_embeddings
+
+
+def _prepare_local_image_data(
+    items,
+    dtype,
+) -> tuple[torch.Tensor, list, list[int], list[int], list[int]]:
+    """
+    Prepare image data for current GPU in DP mode.
+    Only load patches needed by current GPU to save memory.
+    """
+    # First pass: concatenate all grid_thw and build mapping
+    # image_grid_thw is a 2D tensor [num_images, 3]
+    image_grid_thw_all = torch.cat([item.image_grid_thw for item in items], dim=0)
+    grid_thw_list_all = image_grid_thw_all.tolist()  # [[T,H,W], [T,H,W], ...]
+
+    # Build mapping: image_idx -> (item_idx, patch_offset_in_item, num_patches)
+    image_to_item_info = []
+    current_image_idx = 0
+
+    for item_idx, item in enumerate(items):
+        num_images_in_item = item.image_grid_thw.shape[0]
+
+        # Calculate cumulative patch offset within this item
+        patch_offset_in_item = 0
+        for img_idx_in_item in range(num_images_in_item):
+            grid_thw = grid_thw_list_all[current_image_idx]
+            num_patches = math.prod(grid_thw)
+
+            image_to_item_info.append((item_idx, patch_offset_in_item, num_patches))
+
+            patch_offset_in_item += num_patches
+            current_image_idx += 1
+
+    # Calculate patches per image
+    patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list_all]
+
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+
+    # Get load balancing assignment
+    (shuffle_indices, gpu_sample_counts, grouped_pixel_values_len) = (
+        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
+    )
+
+    # Determine image indices for current GPU
+    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+    image_idxs_local = shuffle_indices[
+        cum_gpu_sample_counts[tp_rank] : cum_gpu_sample_counts[tp_rank + 1]
+    ]
+
+    if len(image_idxs_local) == 0:
+        return (
+            torch.empty(
+                (0, items[0].feature.shape[-1] if items else 0),
+                dtype=dtype,
+                device="cuda",
+            ),
+            [],
+            grid_thw_list_all,
+            shuffle_indices,
+            gpu_sample_counts,
+        )
+
+    # Second pass: only extract patches for local images
+    pixel_values_local_chunks = []
+    grid_thw_list_local = []
+
+    for img_idx in image_idxs_local:
+        item_idx, patch_offset_in_item, num_patches = image_to_item_info[img_idx]
+        item = items[item_idx]
+
+        # Extract patches from the specific item
+        pixel_chunk = item.feature[
+            patch_offset_in_item : patch_offset_in_item + num_patches
+        ]
+
+        pixel_values_local_chunks.append(pixel_chunk)
+        grid_thw_list_local.append(grid_thw_list_all[img_idx])
+
+    # Concatenate only the local chunks
+    pixel_values_local = torch.cat(pixel_values_local_chunks, dim=0).type(dtype)
+
+    return (
+        pixel_values_local,
+        grid_thw_list_local,
+        grid_thw_list_all,
+        shuffle_indices,
+        gpu_sample_counts,
+    )

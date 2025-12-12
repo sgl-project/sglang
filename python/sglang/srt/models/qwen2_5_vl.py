@@ -71,7 +71,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, permute_inv
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    _prepare_local_image_data,
+    run_dp_sharded_mrope_vision_model,
+    run_dp_sharded_mrope_vision_model_optimized,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -520,6 +524,27 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if self.use_data_parallel:
+            # Prepare local data for current GPU
+            (
+                pixel_values_local,
+                grid_thw_list_local,
+                grid_thw_list_all,
+                shuffle_indices,
+                gpu_sample_counts,
+            ) = _prepare_local_image_data(items, self.visual.dtype)
+
+            # Run DP sharded vision model
+            return run_dp_sharded_mrope_vision_model_optimized(
+                vision_model=self.visual,
+                pixel_values_local=pixel_values_local,
+                grid_thw_list_local=grid_thw_list_local,
+                grid_thw_list_all=grid_thw_list_all,
+                shuffle_indices=shuffle_indices,
+                gpu_sample_counts=gpu_sample_counts,
+                rope_type="rope_3d",
+            )
+
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -527,12 +552,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
-            )
-        else:
-            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     _lora_pattern = re.compile(
