@@ -57,7 +57,7 @@ def apply_fp8_marlin_linear(
         m=reshaped_x.size(0), n=size_n, k=size_k, device=input.device, dtype=input.dtype
     )
 
-    # TODO update gptq_marlin_gemm kernel signature to accept bias directly
+    # TODO(#14728): update gptq_marlin_gemm kernel signature to accept bias directly
     output = gptq_marlin_gemm(
         a=reshaped_x,
         c=None,
@@ -76,7 +76,7 @@ def apply_fp8_marlin_linear(
         use_fp32_reduce=use_fp32_reduce,
     )
 
-    # TODO remove this after gptq_marlin_gemm supports bias directly
+    # TODO(#14728): remove this after gptq_marlin_gemm supports bias directly
     if bias is not None:
         output.add_(bias)  # In-place add
 
@@ -169,7 +169,7 @@ def prepare_fp8_layer_for_marlin(
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
-    # TODO bias permutation should be added back after marlin kernel supports bias
+    # TODO(#14728): bias permutation should be added back after marlin kernel supports bias
     # if hasattr(layer, "bias") and layer.bias is not None:
     #     assert layer.bias.shape == (part_size_n,)
     #     bias = marlin_permute_bias(layer.bias)
@@ -288,7 +288,7 @@ def prepare_moe_fp8_layer_for_marlin(
 
         setattr(layer, name + "_weight_scale", scales)
 
-    # TODO bias permutation should be added back after marlin kernel supports bias
+    # TODO(#14728): bias permutation should be added back after marlin kernel supports bias
     # BIAS
     # Permute bias
     # for name in ["w13_bias", "w2_bias"]:
