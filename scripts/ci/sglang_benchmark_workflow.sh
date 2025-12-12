@@ -42,7 +42,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         sglang_pid=$!
     elif [[ "${model_name}" == "Qwen3-next" ]]; then
         export SGLANG_USE_AITER=1
-        export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=1
+        export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=0
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
@@ -63,6 +63,7 @@ if [[ "${TYPE}" == "launch" ]]; then
     elif [[ "${model_name}" == "Qwen3-Omni" ]]; then
         echo "Qwen3-Omni-Server Launch"
         export SGLANG_USE_AITER=1
+        export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=0
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
@@ -105,8 +106,6 @@ if [[ "${TYPE}" == "launch" ]]; then
 
     echo
     echo "========== TESTING SERVER ========"
-    echo "Downloading test image"
-    wget https://sf-maas-uat-prod.oss-cn-shanghai.aliyuncs.com/dog.png
     echo "Testing server with test image"
     curl --request POST \
         --url "http://localhost:9000/v1/chat/completions" \
