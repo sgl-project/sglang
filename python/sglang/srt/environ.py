@@ -327,6 +327,9 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
 
+    # MM splitting behavior control
+    SGLANG_ENABLE_MM_SPLITTING = EnvBool(True)
+
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
