@@ -34,9 +34,9 @@ use crate::{
             ResponsesResponse,
         },
     },
-    routers::grpc::{
-        common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
+    routers::{
         error,
+        grpc::common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
     },
 };
 

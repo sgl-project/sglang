@@ -54,16 +54,6 @@ pub struct Router {
 impl Router {
     /// Create a new router with injected policy and client
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
-        let workers = ctx.worker_registry.get_workers_filtered(
-            None, // any model
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // include all workers
-        );
-
-        RouterMetrics::set_active_workers(workers.len());
-
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -205,8 +195,7 @@ impl Router {
                 };
 
                 let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    increment_load(&worker);
                     true
                 } else {
                     false
@@ -246,11 +235,7 @@ impl Router {
                 // won't have done it (it only decrements on success or non-retryable failures)
                 if is_retryable_status(response.status()) && load_incremented {
                     if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
+                        decrement_load(&cleanup_worker);
                     }
                 }
 
@@ -518,8 +503,7 @@ impl Router {
                 // Decrement load on error if it was incremented
                 if load_incremented {
                     if let Some(ref w) = worker {
-                        w.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, w.load());
+                        decrement_load(w);
                     }
                 }
 
@@ -551,8 +535,7 @@ impl Router {
                     // IMPORTANT: Decrement load on error before returning
                     if load_incremented {
                         if let Some(ref w) = worker {
-                            w.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, w.load());
+                            decrement_load(w);
                         }
                     }
 
@@ -564,8 +547,7 @@ impl Router {
             // Decrement load counter for non-streaming requests if it was incremented
             if load_incremented {
                 if let Some(ref w) = worker {
-                    w.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, w.load());
+                    decrement_load(w);
                 }
             }
 
@@ -574,7 +556,6 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             // Clone the worker Arc for the async block instead of looking it up again
             let stream_worker = worker.clone();
-            let worker_url_owned = worker_url.to_string();
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -594,11 +575,7 @@ impl Router {
                             // Check for stream end marker using memmem for efficiency
                             if memmem::find(&bytes, b"data: [DONE]").is_some() {
                                 if let Some(ref w) = stream_worker {
-                                    w.decrement_load();
-                                    RouterMetrics::set_running_requests(
-                                        &worker_url_owned,
-                                        w.load(),
-                                    );
+                                    decrement_load(w);
                                     decremented = true;
                                 }
                             }
@@ -614,8 +591,7 @@ impl Router {
                 }
                 if !decremented {
                     if let Some(ref w) = stream_worker {
-                        w.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url_owned, w.load());
+                        decrement_load(w);
                     }
                 }
             });
@@ -683,6 +659,16 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
+}
+
+fn increment_load(w: &Arc<dyn Worker>) {
+    w.increment_load();
+    RouterMetrics::set_running_requests(w.url(), w.load());
+}
+
+fn decrement_load(w: &Arc<dyn Worker>) {
+    w.decrement_load();
+    RouterMetrics::set_running_requests(w.url(), w.load());
 }
 
 use async_trait::async_trait;

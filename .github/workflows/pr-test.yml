@@ -1214,46 +1214,47 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 3 --timeout-per-file 1800
+          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 3 --timeout-per-file 1800
 
-  unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 4-gpu-gb200
-    env:
-      RUNNER_LABELS: 4-gpu-gb200
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # TODO: Add gb200 tests back after the ci runner is fixed
+  # unit-test-backend-4-gpu-gb200:
+  #   needs: [check-changes, call-gate, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
+  #   if: |
+  #     always() &&
+  #     (
+  #       (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
+  #       (
+  #         !inputs.target_stage &&
+  #         (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  #       )
+  #     )
+  #   runs-on: 4-gpu-gb200
+  #   env:
+  #     RUNNER_LABELS: 4-gpu-gb200
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9-aarch64
+  #     - name: Download artifacts
+  #       if: needs.check-changes.outputs.sgl_kernel == 'true'
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: sgl-kernel/dist/
+  #         merge-multiple: true
+  #         pattern: wheel-python3.10-cuda12.9-aarch64
 
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
+  #     - name: Install dependencies
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
 
-      - name: Run test
-        timeout-minutes: 45
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+  #     - name: Run test
+  #       timeout-minutes: 45
+  #       run: |
+  #         cd test/srt
+  #         python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
 
   pr-test-finish:
     needs:
@@ -1287,7 +1288,7 @@ jobs:
         unit-test-deepep-4-gpu,
         unit-test-deepep-8-gpu,
         unit-test-backend-4-gpu-b200,
-        unit-test-backend-4-gpu-gb200,
+        # unit-test-backend-4-gpu-gb200,
         # unit-test-backend-8-gpu-b200,  # Moved to nightly - large models only
       ]
     if: always()
