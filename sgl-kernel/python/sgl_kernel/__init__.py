@@ -33,7 +33,7 @@ from sgl_kernel.elementwise import (
     rotary_embedding,
     silu_and_mul,
 )
-from sgl_kernel.rotary_embedding import apply_rotary_embedding, rotary_embedding_cos_sin
+from sgl_kernel.rotary_embedding import rotary_embedding_cos_sin
 from sgl_kernel.expert_specialization import (
     es_fp8_blockwise_scaled_grouped_mm,
     es_sm100_mxfp8_blockscaled_grouped_mm,
