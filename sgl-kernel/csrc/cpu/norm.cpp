@@ -466,7 +466,7 @@ at::Tensor layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   int64_t batch_size{input.size(0)}, seq_len{0}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
     seq_len = input.size(1);
-    hidden_size = input_size(2);
+    hidden_size = input.size(2);
     input_strideN = input.stride(1);
   }
   at::Tensor output = at::empty_like(input);
@@ -580,7 +580,7 @@ at::Tensor fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::
   int64_t batch_size{input.size(0)}, seq_len{0}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
     seq_len = input.size(1);
-    hidden_size = input_size(2);
+    hidden_size = input.size(2);
     input_strideN = input.stride(1);
   }
   at::Tensor output = at::empty_like(input);
