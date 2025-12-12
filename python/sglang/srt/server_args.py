@@ -320,6 +320,7 @@ class ServerArgs:
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
+    enable_force_include_usage: bool = False
 
     # Logging
     log_level: str = "info"
@@ -2584,6 +2585,12 @@ class ServerArgs:
         )
 
         # Runtime options
+        parser.add_argument(
+            "--enable-force-include-usage",
+            action="store_true",
+            default=ServerArgs.enable_force_include_usage,
+            help="Force the server to include token usage information in streaming responses",
+        )
         parser.add_argument(
             "--device",
             type=str,
