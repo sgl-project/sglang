@@ -8,7 +8,6 @@ import torch
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
     marlin_make_workspace,
-    marlin_permute_bias,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
 )
@@ -58,11 +57,11 @@ def apply_fp8_marlin_linear(
         m=reshaped_x.size(0), n=size_n, k=size_k, device=input.device, dtype=input.dtype
     )
 
+    # TODO update gptq_marlin_gemm kernel signature to accept bias directly
     output = gptq_marlin_gemm(
         a=reshaped_x,
         c=None,
         b_q_weight=weight,
-        b_bias=bias,
         b_scales=weight_scale,
         global_scale=None,
         b_zeros=None,
@@ -76,6 +75,10 @@ def apply_fp8_marlin_linear(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
     )
+
+    # TODO remove this after gptq_marlin_gemm supports bias directly
+    if bias is not None:
+        output.add_(bias)  # In-place add
 
     return output.reshape(out_shape)
 
@@ -166,10 +169,11 @@ def prepare_fp8_layer_for_marlin(
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
-    if hasattr(layer, "bias") and layer.bias is not None:
-        assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
-        layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+    # TODO bias permutation should be added back after marlin kernel supports bias
+    # if hasattr(layer, "bias") and layer.bias is not None:
+    #     assert layer.bias.shape == (part_size_n,)
+    #     bias = marlin_permute_bias(layer.bias)
+    #     layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
 
 def prepare_moe_fp8_layer_for_marlin(
@@ -284,22 +288,23 @@ def prepare_moe_fp8_layer_for_marlin(
 
         setattr(layer, name + "_weight_scale", scales)
 
+    # TODO bias permutation should be added back after marlin kernel supports bias
     # BIAS
     # Permute bias
-    for name in ["w13_bias", "w2_bias"]:
-        if not hasattr(layer, name):
-            continue
-        bias = getattr(layer, name).to(layer.orig_dtype)
+    # for name in ["w13_bias", "w2_bias"]:
+    #     if not hasattr(layer, name):
+    #         continue
+    #     bias = getattr(layer, name).to(layer.orig_dtype)
 
-        tensor_list = []
-        for i in range(e):
-            expert_bias = bias[i]
+    #     tensor_list = []
+    #     for i in range(e):
+    #         expert_bias = bias[i]
 
-            tensor_list.append(marlin_permute_bias(expert_bias))
+    #         tensor_list.append(marlin_permute_bias(expert_bias))
 
-        bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
-        bias = torch.nn.Parameter(bias, requires_grad=False)
-        setattr(layer, name, bias)
+    #     bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+    #     bias = torch.nn.Parameter(bias, requires_grad=False)
+    #     setattr(layer, name, bias)
 
 
 def pack_fp8_to_int32(
