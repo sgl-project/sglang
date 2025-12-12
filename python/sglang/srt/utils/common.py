@@ -1262,41 +1262,61 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    async_send: bool = False,
 ):
-    """Send data from src to dst in group using DeviceToDevice communication."""
-    device = torch.get_device_module().current_device()
+    """Send data from src to dst in group."""
+    from sglang.srt.distributed.parallel_state import P2PWork
+
+    if async_send:
+        send_func = dist.isend
+    else:
+        send_func = dist.send
     if rank == src:
+        p2p_works = []
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.send(tensor_size, dst=dst, group=group)
+            tensor_size = torch.tensor(
+                [0],
+                dtype=torch.long,
+            )
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(
-                device=device
-            )  # Move to GPU
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.send(tensor_size, dst=dst, group=group)
-            dist.send(tensor_data, dst=dst, group=group)
-        return data
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+            work = send_func(tensor_data, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_data))
+        return p2p_works
 
     elif rank == dst:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.recv(tensor_size, src=src, group=group)
+        tensor_size = torch.tensor(
+            [0],
+            dtype=torch.long,
+        )
+        work = dist.irecv(tensor_size, src=src, group=group)
+        work.wait()
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.recv(tensor_data, src=src, group=group)
+        tensor_data = torch.empty(
+            size,
+            dtype=torch.uint8,
+        )
+        work = dist.irecv(tensor_data, src=src, group=group)
+        work.wait()
 
-        serialized_data = bytes(
-            tensor_data.cpu().numpy()
-        )  # Move back to host for deserialization
+        serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
 
