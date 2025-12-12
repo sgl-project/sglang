@@ -291,7 +291,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
         )  # (B*S,N,1,D)
 
-        cache_mode = ("PA_NZ" if is_fia_nz() else "PA_BNSD",)
+        cache_mode = "PA_NZ" if is_fia_nz() else "PA_BNSD"
         self.kvCache = self.kvCache.view(
             -1,
             forward_batch.attn_backend.page_size,
