@@ -57,13 +57,13 @@ validate_model_cache() {
     # Check if files are actual files (not empty or broken symlinks)
     local valid_files=0
     local total_size=0
-    for f in "$snapshot_dir"/*.safetensors "$snapshot_dir"/*.bin "$snapshot_dir"/*.pt 2>/dev/null; do
+    while IFS= read -r -d '' f; do
         if [ -f "$f" ] && [ -s "$f" ]; then
             valid_files=$((valid_files + 1))
             local fsize=$(stat -c%s "$f" 2>/dev/null || echo 0)
             total_size=$((total_size + fsize))
         fi
-    done
+    done < <(find "$snapshot_dir" -maxdepth 1 \( -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print0 2>/dev/null)
     
     if [ "$valid_files" -eq 0 ]; then
         echo -e "${YELLOW}⚠ All model files are empty or broken for $model_name${NC}"
