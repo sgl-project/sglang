@@ -86,3 +86,14 @@ pub struct ToolCallItem {
     /// Incremental JSON arguments
     pub parameters: String,
 }
+
+/// Format information for building structural tags
+/// Contains the patterns needed to construct structural tags for constrained generation
+pub struct FormatInfo {
+    /// Function to generate begin pattern for a specific tool name
+    pub begin_pattern: Box<dyn Fn(&str) -> String + Send + Sync>,
+    /// End pattern string
+    pub end_pattern: String,
+    /// Trigger token that starts the tool call sequence
+    pub trigger: String,
+}

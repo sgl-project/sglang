@@ -4,7 +4,7 @@ use crate::{
     protocols::common::Tool,
     tool_parser::{
         errors::ParserResult,
-        types::{StreamingParseResult, ToolCall},
+        types::{FormatInfo, StreamingParseResult, ToolCall},
     },
 };
 
@@ -46,6 +46,24 @@ pub trait ToolParser: Send + Sync {
     /// This should clear all buffers and reset state to initial values.
     fn reset(&mut self) {
         // Default no-op implementation
+    }
+
+    /// Build a structural tag for tool call constraints
+    /// Returns None if this parser doesn't support structural tags
+    /// Default implementation returns None
+    fn build_structural_tag(
+        &self,
+        _tools: &[Tool],
+        _specific_function: Option<&str>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Get format information for building structural tags
+    /// Returns None if this parser doesn't support structural tags
+    /// Default implementation returns None
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        None
     }
 }
 

@@ -9,7 +9,6 @@ use super::super::HarmonyBuilder;
 use crate::{
     protocols::{
         chat::ChatCompletionRequest,
-        common::{Tool, ToolChoice, ToolChoiceValue},
         responses::ResponsesRequest,
     },
     routers::{
@@ -20,6 +19,7 @@ use crate::{
             utils,
         },
     },
+    tool_parser::constraints,
 };
 
 /// Harmony Preparation stage: Encode requests using Harmony protocol
@@ -102,7 +102,18 @@ impl HarmonyPreparationStage {
 
         // Step 2: Build tool constraints
         let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
-            Self::generate_tool_call_constraint(tools, &body_ref.tool_choice).map_err(|e| *e)?
+            constraints::build_tool_call_constraint(
+                tools,
+                &body_ref.tool_choice,
+                request.parallel_tool_calls.unwrap_or(true),
+                &ctx.components.tool_parser_factory,
+                None, // configured_parser not available in context yet
+                &request.model,
+            )
+            .map_err(|e| {
+                error!(function = "prepare_chat", error = %e, "Invalid tool configuration");
+                error::bad_request(format!("Invalid tool configuration: {}", e))
+            })?
         } else {
             None
         };
@@ -162,8 +173,18 @@ impl HarmonyPreparationStage {
 
         // Step 3: Generate Harmony structural tags
         let tool_constraint = if !function_tools.is_empty() {
-            Self::generate_tool_call_constraint(&function_tools, &request.tool_choice)
-                .map_err(|e| *e)?
+            constraints::build_tool_call_constraint(
+                &function_tools,
+                &request.tool_choice,
+                request.parallel_tool_calls.unwrap_or(true),
+                &ctx.components.tool_parser_factory,
+                None, // configured_parser not available in context yet
+                &request.model,
+            )
+            .map_err(|e| {
+                error!(function = "prepare_responses", error = %e, "Invalid tool configuration");
+                error::bad_request(format!("Invalid tool configuration: {}", e))
+            })?
         } else {
             None
         };
@@ -255,127 +276,6 @@ impl HarmonyPreparationStage {
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
         }
-    }
-
-    /// Generate Harmony structural tag for tool constraints
-    ///
-    /// Uses structural tags with `triggered_tags` format to force Harmony format output.
-    /// This ensures the model outputs in Harmony format (with channels) even when constrained.
-    fn generate_tool_call_constraint(
-        tools: &[Tool],
-        tool_choice: &Option<ToolChoice>,
-    ) -> Result<Option<(String, String)>, Box<Response>> {
-        let Some(choice) = tool_choice.as_ref() else {
-            return Ok(None);
-        };
-
-        match choice {
-            ToolChoice::Function { function, .. } => {
-                let tag = Self::build_tool_call_structural_tag(tools, Some(&function.name))?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-            ToolChoice::Value(ToolChoiceValue::Required) => {
-                let tag = Self::build_tool_call_structural_tag(tools, None)?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-            ToolChoice::AllowedTools { mode, .. } => {
-                if mode == "required" {
-                    let tag = Self::build_tool_call_structural_tag(tools, None)?;
-                    Ok(Some(("structural_tag".to_string(), tag)))
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Build Harmony structural tag for tool calling constraints
-    ///
-    /// Supports both reasoning-enabled and reasoning-disabled modes:
-    /// - With reasoning: triggers on `<|start|>assistant<|channel|>commentary` (waits for analysis)
-    /// - Without reasoning: triggers on `<|channel|>commentary` (goes directly to commentary)
-    fn build_tool_call_structural_tag(
-        tools: &[Tool],
-        specific_function: Option<&str>,
-    ) -> Result<String, Box<Response>> {
-        let mut tags = Vec::new();
-
-        // Filter tools if specific function requested
-        let tools_to_use: Vec<&Tool> = if let Some(func_name) = specific_function {
-            tools
-                .iter()
-                .filter(|t| t.function.name == func_name)
-                .collect()
-        } else {
-            tools.iter().collect()
-        };
-
-        // Validate specific function exists
-        match specific_function {
-            Some(tool_name) if tools_to_use.is_empty() => {
-                error!(
-                    function = "generate_tool_call_constraint",
-                    tool_name = %tool_name,
-                    "Specified tool not found in tools list"
-                );
-                return Err(Box::new(error::bad_request(
-                    "tool_not_found",
-                    format!("Tool '{}' not found in tools list", tool_name),
-                )));
-            }
-            _ => {}
-        }
-
-        // Build tags for each tool - need two patterns per tool for reasoning on/off
-        for tool in tools_to_use {
-            let tool_name = &tool.function.name;
-            let params_schema = &tool.function.parameters;
-
-            // Pattern 1: For reasoning-enabled mode (with analysis channel before commentary)
-            tags.push(json!({
-                "begin": format!("<|start|>assistant<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
-                "content": {
-                    "type": "json_schema",
-                    "json_schema": params_schema
-                },
-                "end": "" // `end` is empty because <|call|> comes naturally from Harmony stop tokens
-            }));
-
-            // Pattern 2: For reasoning-disabled mode (goes directly to commentary channel)
-            tags.push(json!({
-                "begin": format!("<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
-                "content": {
-                    "type": "json_schema",
-                    "json_schema": params_schema
-                },
-                "end": ""
-            }));
-        }
-
-        let stop_after_first = specific_function.is_some();
-
-        let structural_tag = json!({
-            "format": {
-                "type": "triggered_tags",
-                "triggers": ["<|start|>assistant<|channel|>commentary", "<|channel|>commentary"],
-                "tags": tags,
-                "at_least_one": true,
-                "stop_after_first": stop_after_first
-            }
-        });
-
-        serde_json::to_string(&structural_tag).map_err(|e| {
-            error!(
-                function = "generate_tool_call_constraint",
-                error = %e,
-                "Failed to serialize structural tag"
-            );
-            Box::new(error::internal_error(
-                "serialize_structural_tag_failed",
-                format!("Failed to serialize structural tag: {}", e),
-            ))
-        })
     }
 }
 

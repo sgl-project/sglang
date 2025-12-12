@@ -8,7 +8,7 @@ use crate::{
         parsers::helpers,
         partial_json::PartialJson,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall},
     },
 };
 
@@ -283,5 +283,15 @@ impl ToolParser for MistralParser {
             &mut self.streamed_args_for_tool,
         );
         self.array_closed = false;
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        Some(FormatInfo {
+            begin_pattern: Box::new(|name| {
+                format!(r#"[TOOL_CALLS] [{{"name":"{}", "arguments":"#, name)
+            }),
+            end_pattern: "}]".to_string(),
+            trigger: "[TOOL_CALLS]".to_string(),
+        })
     }
 }

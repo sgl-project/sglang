@@ -8,7 +8,7 @@ use crate::{
         parsers::helpers,
         partial_json::PartialJson,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall},
     },
 };
 
@@ -149,11 +149,16 @@ impl ToolParser for LlamaParser {
             self.parse_semicolon_separated(&json_content)?
         } else {
             // Try single JSON object
-            let parsed = serde_json::from_str::<Value>(json_content.trim())
-                .map_err(|e| ParserError::ParsingFailed(e.to_string()))
+            let trimmed = json_content.trim();
+            let parsed = serde_json::from_str::<Value>(trimmed)
+                .map_err(|e| {
+                    ParserError::ParsingFailed(e.to_string())
+                })
                 .and_then(|v| {
                     self.parse_single_object(&v)
-                        .map(|opt| opt.map_or_else(Vec::new, |tool| vec![tool]))
+                        .map(|opt| {
+                            opt.map_or_else(Vec::new, |tool| vec![tool])
+                        })
                 });
 
             parsed.unwrap_or_else(|e| {
@@ -241,5 +246,15 @@ impl ToolParser for LlamaParser {
             &mut self.current_tool_name_sent,
             &mut self.streamed_args_for_tool,
         );
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        Some(FormatInfo {
+            begin_pattern: Box::new(|name| {
+                format!(r#"<|python_tag|>{{"name":"{}", "parameters":"#, name)
+            }),
+            end_pattern: "}".to_string(),
+            trigger: "<|python_tag|>".to_string(),
+        })
     }
 }

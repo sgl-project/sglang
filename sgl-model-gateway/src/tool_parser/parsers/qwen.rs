@@ -9,7 +9,7 @@ use crate::{
         parsers::helpers,
         partial_json::PartialJson,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall},
     },
 };
 
@@ -254,5 +254,15 @@ impl ToolParser for QwenParser {
             &mut self.current_tool_name_sent,
             &mut self.streamed_args_for_tool,
         );
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        Some(FormatInfo {
+            begin_pattern: Box::new(|name| {
+                format!(r#"<tool_call>\n{{"name":"{}", "arguments":"#, name)
+            }),
+            end_pattern: "}\n</tool_call>".to_string(),
+            trigger: "<tool_call>".to_string(),
+        })
     }
 }
