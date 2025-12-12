@@ -22,7 +22,7 @@ class _ModelRegistry:
     def register(
         self, package_name: str, overwrite: bool = False, strict: bool = False
     ):
-        new_models = import_model_classes(package_name, strict)
+        new_models = import_model_classes(package_name, strict=strict)
         if overwrite:
             self.models.update(new_models)
         else:
@@ -103,7 +103,7 @@ def import_model_classes(package_name: str, strict: bool = False):
                 module = importlib.import_module(name)
             except Exception as e:
                 if strict:
-                    raise e
+                    raise
                 logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):
