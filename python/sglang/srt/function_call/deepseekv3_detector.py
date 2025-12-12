@@ -1,16 +1,11 @@
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    StructureInfo,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -201,9 +196,56 @@ class DeepSeekV3Detector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
 
-    def structure_info(self) -> _GetInfoFunc:
-        return lambda name: StructureInfo(
-            begin=">" + name + "\n```json\n",
-            end="\n```<",
-            trigger=">" + name + "\n```json\n",
-        )
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for DeepSeek V3 wrapper format.
+
+        Uses nested tags_with_separator structure to properly handle:
+        - Outer wrapper: <｜tool▁calls▁begin｜>...<｜tool▁calls▁end｜>
+        - Inner tool calls with newline separator
+        """
+        inner_tags = []
+        for tool in tools:
+            name = tool.function.name
+            if not name:
+                continue
+
+            schema = tool.function.parameters or {}
+
+            inner_tags.append(
+                {
+                    "begin": "<｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+                    + name
+                    + "\n```json\n",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "\n```<｜tool▁call▁end｜>",
+                }
+            )
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["<｜tool▁calls▁begin｜>"],
+                "tags": [
+                    {
+                        "begin": "<｜tool▁calls▁begin｜>",
+                        "end": "<｜tool▁calls▁end｜>",
+                        "content": {
+                            "type": "tags_with_separator",
+                            "separator": "\n",
+                            "tags": inner_tags,
+                            "stop_after_first": stop_after_first,
+                        },
+                    }
+                ],
+                "at_least_one": at_least_one,
+                "stop_after_first": True,
+            }
+        }

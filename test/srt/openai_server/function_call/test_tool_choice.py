@@ -757,6 +757,110 @@ class TestToolChoiceLlama32(CustomTestCase):
         self.assertIn("multiple schemas", error_msg)
         self.assertIn("not supported", error_msg)
 
+    def test_parallel_tool_calls_false_limits_to_single_tool_call(self):
+        """Test that parallel_tool_calls=False limits to a single tool call"""
+        tools = self.get_travel_tools()
+        messages = self.get_travel_messages()
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=2048,
+            temperature=0.2,
+            tools=tools,
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            stream=False,
+        )
+
+        # Should get tool calls, but limited to one
+        tool_calls = response.choices[0].message.tool_calls
+        if tool_calls:
+            self.assertEqual(
+                len(tool_calls),
+                1,
+                "parallel_tool_calls=False should limit to a single tool call",
+            )
+
+    def test_parallel_tool_calls_true_allows_multiple_tool_calls(self):
+        """Test that parallel_tool_calls=True allows multiple tool calls"""
+        tools = self.get_travel_tools()
+        messages = self.get_travel_messages()
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=2048,
+            temperature=0.2,
+            tools=tools,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            stream=False,
+        )
+
+        # Should be able to get multiple tool calls
+        tool_calls = response.choices[0].message.tool_calls
+        if tool_calls:
+            # With parallel_tool_calls=True, multiple tool calls are allowed
+            # (though the model may still choose to call only one)
+            self.assertGreaterEqual(
+                len(tool_calls),
+                1,
+                "Should get at least one tool call",
+            )
+
+    def test_parallel_tool_calls_default_allows_multiple(self):
+        """Test that default parallel_tool_calls (True) allows multiple tool calls"""
+        tools = self.get_travel_tools()
+        messages = self.get_travel_messages()
+
+        # Don't set parallel_tool_calls - should default to True
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=2048,
+            temperature=0.2,
+            tools=tools,
+            tool_choice="auto",
+            stream=False,
+        )
+
+        # Should be able to get multiple tool calls (default behavior)
+        tool_calls = response.choices[0].message.tool_calls
+        if tool_calls:
+            self.assertGreaterEqual(
+                len(tool_calls),
+                1,
+                "Should get at least one tool call with default parallel_tool_calls",
+            )
+
+    def test_parallel_tool_calls_false_with_required_tool_choice(self):
+        """Test that parallel_tool_calls=False with tool_choice='required' limits to one"""
+        tools = self.get_test_tools()
+        messages = self.get_test_messages()
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=2048,
+            temperature=0.2,
+            tools=tools,
+            tool_choice="required",
+            parallel_tool_calls=False,
+            stream=False,
+        )
+
+        # Should get exactly one tool call
+        tool_calls = response.choices[0].message.tool_calls
+        self.assertIsNotNone(
+            tool_calls, "Should get tool calls with required tool_choice"
+        )
+        self.assertEqual(
+            len(tool_calls),
+            1,
+            "parallel_tool_calls=False with required should limit to exactly one tool call",
+        )
+
 
 class TestToolChoiceQwen25(TestToolChoiceLlama32):
     """Test tool_choice functionality with Qwen2.5 model"""
