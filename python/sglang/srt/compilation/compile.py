@@ -87,13 +87,23 @@ class _MaybeIntermediateTensors:
 
 
 def _mark_dynamic_on_value(val, dims):
+    # Prefer maybe_mark_dynamic to avoid hard failures when Dynamo must
+    # specialize a dimension that we intended to keep dynamic.
+    #
+    # This matters for some custom ops / kernels that take shape values as
+    # Python ints (e.g. int64_t arguments), forcing specialization.
+    mark_fn = getattr(torch._dynamo, "maybe_mark_dynamic", None)
+    if mark_fn is None:
+        mark_fn = torch._dynamo.mark_dynamic
     if isinstance(val, torch.Tensor):
-        torch._dynamo.mark_dynamic(val, _normalize_dims(dims, val.ndim))
+        for d in _normalize_dims(dims, val.ndim):
+            mark_fn(val, d)
     else:
         mit = _MaybeIntermediateTensors(val)
         if mit.is_intermediate:
             for t in mit.obj.tensors.values():
-                torch._dynamo.mark_dynamic(t, _normalize_dims(dims, t.ndim))
+                for d in _normalize_dims(dims, t.ndim):
+                    mark_fn(t, d)
         # else: ignore (None or non-tensor)
 
 
