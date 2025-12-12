@@ -1,5 +1,6 @@
 import os
 import subprocess
+import threading
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -26,10 +27,14 @@ class TestEPDDisaggregationOneEncoder(TestDisaggregationBase):
             f"prefill={cls.prefill_port}, decode={cls.decode_port}"
         )
 
-        # Start servers in order: encode -> prefill -> decode
+        # Start servers in order: encode -> prefill/decode
         cls.start_encode()
-        cls.start_prefill()
-        cls.start_decode()
+        prefill_thread = threading.Thread(target=cls.start_prefill)
+        decode_thread = threading.Thread(target=cls.start_decode)
+        prefill_thread.start()
+        decode_thread.start()
+        prefill_thread.join()
+        decode_thread.join()
 
         # Wait for all servers to be ready
         cls.wait_server_ready(cls.encode_url + "/health")
@@ -128,10 +133,15 @@ class TestEPDDisaggregationOneEncoder(TestDisaggregationBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    def run_mmmu_eval(self, model_version: str, output_path: str):
+    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
         """
         Evaluate a VLM on the MMMU validation set with lmms-eval.
         Reference: test_vlm_models.py
+
+        Args:
+            model_version: Model version/checkpoint to evaluate
+            output_path: Path to save evaluation results
+            limit: Number of samples to evaluate (default: "50" for CI time constraints)
         """
         model = "openai_compatible"
         tp = 1
@@ -159,6 +169,8 @@ class TestEPDDisaggregationOneEncoder(TestDisaggregationBase):
             log_suffix,
             "--output_path",
             str(output_path),
+            "--limit",
+            limit,
         ]
 
         subprocess.run(cmd, check=True, timeout=3600)
@@ -211,11 +223,24 @@ class TestEPDDisaggregationMultiEncoders(TestDisaggregationBase):
             f"encode2={cls.encode_port2}, prefill={cls.prefill_port}, decode={cls.decode_port}"
         )
 
-        # Start two encode servers on same GPU (GPU 0)
-        cls.start_encode_server(cls.encode_port1, 0)
-        cls.start_encode_server(cls.encode_port2, 0)
-        cls.start_prefill()
-        cls.start_decode()
+        # Start two encode servers on GPU 0/1
+        encode1_thread = threading.Thread(
+            target=cls.start_encode_server, args=(cls.encode_port1, 0)
+        )
+        encode2_thread = threading.Thread(
+            target=cls.start_encode_server, args=(cls.encode_port2, 1)
+        )
+        encode1_thread.start()
+        encode2_thread.start()
+        encode1_thread.join()
+        encode2_thread.join()
+
+        prefill_thread = threading.Thread(target=cls.start_prefill)
+        decode_thread = threading.Thread(target=cls.start_decode)
+        prefill_thread.start()
+        decode_thread.start()
+        prefill_thread.join()
+        decode_thread.join()
 
         cls.wait_server_ready(cls.encode_url1 + "/health")
         cls.wait_server_ready(cls.encode_url2 + "/health")
@@ -324,10 +349,15 @@ class TestEPDDisaggregationMultiEncoders(TestDisaggregationBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    def run_mmmu_eval(self, model_version: str, output_path: str):
+    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
         """
         Evaluate a VLM on the MMMU validation set with lmms-eval.
         Reference: test_vlm_models.py
+
+        Args:
+            model_version: Model version/checkpoint to evaluate
+            output_path: Path to save evaluation results
+            limit: Number of samples to evaluate (default: "50" for CI time constraints)
         """
         model = "openai_compatible"
         tp = 1
@@ -355,6 +385,8 @@ class TestEPDDisaggregationMultiEncoders(TestDisaggregationBase):
             log_suffix,
             "--output_path",
             str(output_path),
+            "--limit",
+            limit,
         ]
 
         subprocess.run(cmd, check=True, timeout=3600)
