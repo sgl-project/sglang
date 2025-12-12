@@ -5,7 +5,11 @@ from typing import Dict, Optional
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    compute_local_num_token_non_padded,
+)
 
 
 @dataclass
@@ -124,8 +128,6 @@ class GraphInputBuffers:
         require_gathered_buffer: bool,
         num_tokens_per_bs: int,
         nsa_enable_prefill_cp: bool,
-        attn_tp_rank: int,
-        attn_tp_size: int,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[torch.Tensor]:
@@ -158,17 +160,15 @@ class GraphInputBuffers:
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
 
         if enable_num_token_non_padded_flag:
-            num_token_non_padded = forward_batch.num_token_non_padded
             if require_gathered_buffer and not nsa_enable_prefill_cp:
-                tokens_per_rank = bs // attn_tp_size * num_tokens_per_bs
-                num_local_token_non_padded = torch.clamp(
-                    num_token_non_padded - tokens_per_rank * attn_tp_rank,
-                    min=0,
-                    max=tokens_per_rank,
+                num_tokens_per_dp = bs * num_tokens_per_bs
+                local = compute_local_num_token_non_padded(
+                    global_num_token_non_padded=forward_batch.num_token_non_padded,
+                    num_tokens_per_dp=num_tokens_per_dp,
                 )
-                self.num_token_non_padded.copy_(num_local_token_non_padded)
+                self.num_token_non_padded.copy_(local)
             else:
-                self.num_token_non_padded.copy_(num_token_non_padded)
+                self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
 
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:

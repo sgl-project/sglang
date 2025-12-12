@@ -54,15 +54,17 @@ use crate::{
             ResponsesUsage, StringOrContentParts,
         },
     },
-    routers::grpc::{
-        common::responses::{
-            build_sse_response, ensure_mcp_connection, persist_response_if_needed,
-            streaming::{OutputItemType, ResponseStreamEventEmitter},
-        },
-        context::SharedComponents,
+    routers::{
         error,
-        harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
-        pipeline::RequestPipeline,
+        grpc::{
+            common::responses::{
+                build_sse_response, ensure_mcp_connection, persist_response_if_needed,
+                streaming::{OutputItemType, ResponseStreamEventEmitter},
+            },
+            context::SharedComponents,
+            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+            pipeline::RequestPipeline,
+        },
     },
 };
 

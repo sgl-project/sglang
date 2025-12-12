@@ -5,9 +5,12 @@ use axum::response::Response;
 use tracing::error;
 
 use super::PipelineStage;
-use crate::routers::grpc::{
-    context::{ClientSelection, RequestContext, WorkerSelection},
-    error, utils,
+use crate::routers::{
+    error,
+    grpc::{
+        context::{ClientSelection, RequestContext, WorkerSelection},
+        utils,
+    },
 };
 
 /// Client acquisition stage: Get gRPC clients from selected workers

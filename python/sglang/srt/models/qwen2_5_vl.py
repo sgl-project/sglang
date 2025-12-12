@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
+import re
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -534,6 +535,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
+    _lora_pattern = re.compile(
+        r"^model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
+
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
@@ -688,7 +696,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                     else:
-                        continue
+                        raise ValueError(f"Weight {name} not found in params_dict")
                 except KeyError:
                     print(params_dict.keys())
                     raise
