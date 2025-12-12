@@ -1906,6 +1906,17 @@ class ServerArgs:
             # TODO remove this environment variable as a whole
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
+            if self.rl_on_policy_target == "fsdp_tp":
+                if self.enable_dp_attention:
+                    raise ValueError(
+                        "Currently rl_on_policy_target=fsdp_tp does not support dp attention."
+                    )
+                if self.enable_flashinfer_allreduce_fusion:
+                    self.enable_flashinfer_allreduce_fusion = False
+                    logger.warning(
+                        "Disable flashinfer allreduce fusion because of rl_on_policy_target=fsdp_tp."
+                    )
+
         if self.enable_deterministic_inference:
             # Check sampling backend
             self.sampling_backend = "pytorch"

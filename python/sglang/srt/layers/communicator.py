@@ -158,6 +158,8 @@ class AttnTpContext:
             and not enable_moe_dense_fully_dp()
             and not get_global_server_args().enable_piecewise_cuda_graph
             and get_global_server_args().speculative_algorithm != "EAGLE3"
+            # TP Invariant Mode with scattered input is not supported yet.
+            and get_global_server_args().rl_on_policy_target != "fsdp_tp"
         )
         if get_global_server_args().enable_attn_tp_input_scattered:
             if not self.allow_input_scattered:
