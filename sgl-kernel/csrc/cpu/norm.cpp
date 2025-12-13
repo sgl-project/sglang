@@ -308,6 +308,7 @@ void fused_add_layernorm_kernel_impl(
     const scalar_t* __restrict__ input,
     scalar_t* __restrict__ residual,
     const scalar_t* __restrict__ weight,
+    float* __restrict__ buffer,
     int64_t batch_size,
     int64_t seq_len,
     int64_t hidden_size,
@@ -319,6 +320,11 @@ void fused_add_layernorm_kernel_impl(
   constexpr int kVecSize = bVec::size();
   int64_t parallel_size{(seq_len == 0) ? batch_size : batch_size * seq_len};
   at::parallel_for(0, parallel_size, 0, [&](int64_t begin, int64_t end) {
+    float* __restrict__ buffer_ptr{(float*)nullptr};
+    if (buffer != nullptr) {
+      buffer_ptr = buffer + at::get_thread_num() * hidden_size;
+    }
+
     for (int64_t i = begin; i < end; ++i) {
       scalar_t* __restrict__ out_ptr = output + i * hidden_size;
       const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
@@ -354,6 +360,11 @@ void fused_add_layernorm_kernel_impl(
         sum_fvec += x_fvec1;
         sum_sq_fvec += x_fvec0 * x_fvec0;
         sum_sq_fvec += x_fvec1 * x_fvec1;
+
+        if (buffer_ptr != nullptr) {
+          x_fvec0.store(buffer_ptr + d);
+          x_fvec1.store(buffer_ptr + d + fVec::size());
+        }
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
@@ -366,6 +377,10 @@ void fused_add_layernorm_kernel_impl(
 
         sum_val += x_val;
         sum_sq_val += x_val * x_val;
+
+        if (buffer_ptr != nullptr) {
+          buffer_ptr[d] = x_val;
+        }
       }
 
       // Var(X) = E(X^2) - (E(X))^2
@@ -383,12 +398,16 @@ void fused_add_layernorm_kernel_impl(
       const fVec scale_fvec = fVec(rsqrt_var);
 
       // Second pass: apply normalization
-      scalar_t* __restrict__ apply_norm_ptr{(residual_ptr != nullptr) ? residual_ptr : (scalar_t*)(input_ptr)};
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(apply_norm_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        fVec x_fvec0{fVec(0.0)}, x_fvec1{fVec(0.0)};
+        if (buffer_ptr == nullptr) {
+          bVec x_bvec = bVec::loadu(input_ptr + d);
+          std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        } else {
+          x_fvec0 = fVec::loadu(buffer_ptr + d);
+          x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
+        }
 
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
@@ -402,7 +421,8 @@ void fused_add_layernorm_kernel_impl(
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
-        float normalized = (static_cast<float>(apply_norm_ptr[d]) - mean) * rsqrt_var;
+        float element = (buffer_ptr == nullptr) ? static_cast<float>(input_ptr[d]) : buffer_ptr[d];
+        float normalized = (element - mean) * rsqrt_var;
         float x_val = normalized * static_cast<float>(weight[d]);
         out_ptr[d] = static_cast<scalar_t>(x_val);
       }
@@ -482,6 +502,7 @@ at::Tensor layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
         input.data_ptr<scalar_t>(),
         nullptr,
         weight.data_ptr<scalar_t>(),
+        nullptr,
         batch_size,
         seq_len,
         hidden_size,
@@ -592,12 +613,18 @@ at::Tensor fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::
   }
   at::Tensor output = at::empty_like(input);
 
+  // Allocate temp buffer to store x in float32 per thread
+  // It is necessary to store FP32 precision of residual-add results to pass UT acc test
+  int64_t num_threads = at::get_num_threads();
+  at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_layernorm_kernel", [&] {
     fused_add_layernorm_kernel_impl<scalar_t>(
         output.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
         residual.data_ptr<scalar_t>(),
         weight.data_ptr<scalar_t>(),
+        buffer.data_ptr<float>(),
         batch_size,
         seq_len,
         hidden_size,
