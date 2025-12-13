@@ -338,9 +338,9 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         let error_code = response
             .headers()
-            .get("x-smg-error-code")
+            .get("X-SMG-ERROR-CODE")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("none");
+            .unwrap_or_default();
 
         // TODO support `route` information
         RouterMetrics::record_http_status_code(status_code, error_code);
