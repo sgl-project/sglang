@@ -231,7 +231,7 @@ struct Router {
     enable_pyroscope: bool,
     pyroscope_url: Option<String>,
     pyroscope_app_name: Option<String>,
-    pyroscope_sample_rate: u32,
+    pyroscope_sample_rate: Option<u32>,
     pyroscope_user: Option<String>,
     pyroscope_password: Option<String>,
 }
@@ -499,7 +499,7 @@ impl Router {
         enable_pyroscope = false,
         pyroscope_url = None,
         pyroscope_app_name = None,
-        pyroscope_sample_rate = 100,
+        pyroscope_sample_rate = None,
         pyroscope_user = None,
         pyroscope_password = None,
     ))]
@@ -725,6 +725,27 @@ impl Router {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
+
+        let pyroscope_config = if self.enable_pyroscope {
+            if let (Some(url), Some(app_name)) = (self.pyroscope_url.clone(), self.pyroscope_app_name.clone()) {
+                let backend_str = format!("{:?}", self.backend);
+                Some(PyroscopeConfig {
+                    url,
+                    app_name,
+                    sample_rate: self.pyroscope_sample_rate,
+                    user: self.pyroscope_user.clone(),
+                    password: self.pyroscope_password.clone(),
+                    tags: vec![
+                        ("app".to_string(), "sgl-model-gateway".to_string()),
+                        ("backend".to_string(), backend_str),
+                    ],
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
