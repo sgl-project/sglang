@@ -318,8 +318,7 @@ void fused_add_layernorm_kernel_impl(
   using fVec = at::vec::Vectorized<float>;
   TORCH_CHECK(
       !((residual != nullptr) && (buffer == nullptr)),
-      "fused_add_layernorm_kernel_impl with a residual input requires a buffer."
-  );
+      "fused_add_layernorm_kernel_impl with a residual input requires a buffer.");
 
   constexpr int kVecSize = bVec::size();
   int64_t parallel_size{(seq_len == 0) ? batch_size : batch_size * seq_len};
