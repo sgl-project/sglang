@@ -112,9 +112,7 @@ impl Router {
                             ),
                         }
                     }
-                    Err(e) => {
-                        error::internal_error("request_failed", format!("Request failed: {}", e))
-                    }
+                    Err(e) => handle_reqwest_error(e)
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
@@ -363,10 +361,7 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    last_response = Some(error::internal_error(
-                        "request_failed",
-                        format!("Request failed: {}", e),
-                    ));
+                    last_response = Some(handle_reqwest_error(e));
                 }
             }
         }
@@ -506,7 +501,7 @@ impl Router {
                     }
                 }
 
-                return error::internal_error("request_failed", format!("Request failed: {}", e));
+                return handle_reqwest_error(e);
             }
         };
 
@@ -664,6 +659,64 @@ fn increment_load(w: &Arc<dyn Worker>) {
 fn decrement_load(w: &Arc<dyn Worker>) {
     w.decrement_load();
     RouterMetrics::set_running_requests(w.url(), w.load());
+}
+
+fn handle_reqwest_error(e: reqwest::Error) -> Response {
+    if e.is_timeout() {
+        error::gateway_timeout(
+            "request_timeout",
+            format!(
+                "Request timeout: {}. URL: {}",
+                e,
+                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    } else if e.is_connect() {
+        error::bad_gateway(
+            "connection_failed",
+            format!(
+                "Connection failed: {}. URL: {}",
+                e,
+                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    } else if e.is_request() {
+        error::bad_request(
+            "request_build_failed",
+            format!(
+                "Request build failed: {}. URL: {}",
+                e,
+                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    } else if e.is_status() {
+        error::bad_gateway(
+            "invalid_status",
+            format!(
+                "Invalid status response: {}. URL: {}",
+                e,
+                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    } else if e.is_redirect() {
+        error::bad_gateway(
+            "redirect_error",
+            format!(
+                "Redirect error: {}. URL: {}",
+                e,
+                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    } else {
+        error::internal_error(
+            "request_failed",
+            format!(
+                "Request failed: {}. URL: {}",
+                e,
+                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    }
 }
 
 use async_trait::async_trait;
