@@ -236,7 +236,7 @@ def ring_attn(
         query=query,
         key=key,
         value=value,
-        group=ring_pg,
+        group=ring_pg, # https://github.com/pytorch/pytorch/blob/c907c778f42ba2fdaf25b733dd25baf9779c6a12/torch/distributed/tensor/experimental/_context_parallel/_attention.py#L309
     )
 
     if use_segment_id:
