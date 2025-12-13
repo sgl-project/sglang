@@ -27,15 +27,14 @@ import random
 import signal
 import threading
 import time
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
-
-import zmq
+from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import torch
 import uvloop
+import zmq
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
@@ -90,6 +89,102 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _is_cuda = is_cuda()
 
 
+def _launch_subprocesses(
+    server_args: ServerArgs, port_args: Optional[PortArgs] = None
+) -> Tuple[TokenizerManager, TemplateManager, Dict, PortArgs]:
+    """
+    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    """
+    # Configure global environment
+    configure_logger(server_args)
+    _set_envs_and_config(server_args)
+    server_args.check_server_args()
+
+    # Allocate ports for inter-process communications
+    if port_args is None:
+        port_args = PortArgs.init_new(server_args)
+        logger.info(f"{server_args=}")
+
+    # If using model from www.modelscope.cn, first download the model
+    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
+        server_args.model_path, server_args.tokenizer_path
+    )
+
+    # Launch scheduler processes
+    scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
+        server_args=server_args,
+        port_args=port_args,
+    )
+
+    if server_args.node_rank >= 1:
+        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
+        # so they can just wait here.
+
+        for reader in scheduler_pipe_readers:
+            data = reader.recv()
+            assert data["status"] == "ready"
+
+        if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+            # When using `Engine` as a Python API, we don't want to block here.
+            return None, None, None, port_args
+
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
+
+        for proc in scheduler_procs:
+            proc.join()
+            logger.error(
+                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+            )
+        return None, None, None, port_args
+
+    # Launch detokenizer process
+    detoken_proc = mp.Process(
+        target=run_detokenizer_process,
+        args=(
+            server_args,
+            port_args,
+        ),
+    )
+    detoken_proc.start()
+
+    # Init tokenizer manager first, as the bootstrap server is initialized here
+    if server_args.tokenizer_worker_num == 1:
+        tokenizer_manager, template_manager = _init_tokenizer_manager(
+            server_args, port_args
+        )
+    else:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+        template_manager = None
+
+    # Wait for the model to finish loading
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+
+    # Get back some info from scheduler to tokenizer_manager
+    scheduler_info = scheduler_infos[0]
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
+    return tokenizer_manager, template_manager, scheduler_info, port_args
+
+
 class Engine(EngineBase):
     """
     The entry point to the inference engine.
@@ -103,6 +198,11 @@ class Engine(EngineBase):
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+
+    # Some fields to allow people to override the server args
+    # and launch processes for their private forks.
+    launch_subprocesses_func: Callable = staticmethod(_launch_subprocesses)
+    server_args_class: ServerArgs = ServerArgs
 
     def __init__(self, **kwargs):
         """
@@ -119,7 +219,7 @@ class Engine(EngineBase):
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
-            server_args = ServerArgs(**kwargs)
+            server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
         logger.info(f"{server_args=}")
 
@@ -128,7 +228,7 @@ class Engine(EngineBase):
 
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_info, port_args = (
-            _launch_subprocesses(server_args=server_args)
+            self.launch_subprocesses_func(server_args=server_args)
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -780,28 +880,14 @@ def _init_tokenizer_manager(
     return tokenizer_manager, template_manager
 
 
-def _launch_subprocesses(
-    server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict, PortArgs]:
-    """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
-    """
-    # Configure global environment
-    configure_logger(server_args)
-    _set_envs_and_config(server_args)
-    server_args.check_server_args()
-
-    # Allocate ports for inter-process communications
-    if port_args is None:
-        port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
-
-    # If using model from www.modelscope.cn, first download the model.
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
-
+def _launch_scheduler_processes(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+    run_data_parallel_controller_process_func: Callable = run_data_parallel_controller_process,
+):
     scheduler_procs = []
+
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -835,7 +921,7 @@ def _launch_subprocesses(
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
-                        target=run_scheduler_process,
+                        target=run_scheduler_process_func,
                         args=(
                             server_args,
                             port_args,
@@ -859,76 +945,10 @@ def _launch_subprocesses(
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_readers = [reader]
         proc = mp.Process(
-            target=run_data_parallel_controller_process,
+            target=run_data_parallel_controller_process_func,
             args=(server_args, port_args, writer),
         )
         proc.start()
         scheduler_procs.append(proc)
 
-    if server_args.node_rank >= 1:
-        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-        # so they can just wait here.
-
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
-            assert data["status"] == "ready"
-
-        if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
-            # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, None, port_args
-
-        launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
-        )
-
-        for proc in scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
-        return None, None, None, port_args
-
-    # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-        ),
-    )
-    detoken_proc.start()
-
-    # Init tokenizer manager first, as the bootstrap server is initialized here
-    if server_args.tokenizer_worker_num == 1:
-        tokenizer_manager, template_manager = _init_tokenizer_manager(
-            server_args, port_args
-        )
-    else:
-        # Launch multi-tokenizer router
-        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-        template_manager = None
-
-    # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
-
-    # Assume all schedulers have the same scheduler_info
-    scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-
-    return tokenizer_manager, template_manager, scheduler_info, port_args
+    return scheduler_procs, scheduler_pipe_readers
