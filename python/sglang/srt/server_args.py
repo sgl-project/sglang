@@ -1815,6 +1815,21 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
+        # Avoid using flashinfer_trtllm for speculative MoE runner backend by default
+        # TODO: Remove this block after verifying no accuracy regression with flashinfer_trtllm speculative backend
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        if self.speculative_moe_runner_backend is None:
+            self.speculative_moe_runner_backend = (
+                "auto"
+                if self.moe_runner_backend == "flashinfer_trtllm"
+                else self.moe_runner_backend
+            )
+        else:
+            assert not MoeRunnerBackend(
+                self.speculative_moe_runner_backend
+            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
+
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
