@@ -1686,20 +1686,10 @@ def main():
             workflow_filter=["nightly-test-npu.yml"],
         )
 
-        # Combine all runs for runner health analysis
-        all_runs = (
-            pr_test_nvidia_general_runs
-            + pr_test_amd_general_runs
-            + pr_test_xeon_general_runs
-            + pr_test_xpu_general_runs
-            + pr_test_npu_general_runs
-            + nightly_nvidia_general_runs
-            + nightly_amd_general_runs
-            + nightly_intel_general_runs
-            + nightly_npu_general_runs
-        )
+        # Choosing nvidia pr test and nightly for runner health analysis
+        runner_runs = pr_test_nvidia_general_runs + nightly_nvidia_general_runs
 
-        if not all_runs:
+        if not runner_runs:
             print("No workflow runs found")
             return
 
@@ -1809,7 +1799,7 @@ def main():
             runner_instance_data,
             runner_streak_data,
             runner_instance_streak_data,
-        ) = analyzer.analyze_runner_health(all_runs)
+        ) = analyzer.analyze_runner_health(runner_runs)
 
         # Generate report with all datasets
         report_data = analyzer.generate_failure_report(
