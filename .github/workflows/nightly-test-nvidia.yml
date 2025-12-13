@@ -172,24 +172,24 @@ jobs:
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_kimi_k2_thinking
 
-      - name: Run GLM-4.6 nightly performance test
+      - name: Run GLM-4.6 FP8 nightly performance test
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-h200"
         run: |
-          rm -rf test/performance_profiles_glm_4_6/
+          rm -rf test/performance_profiles_glm_4_6_fp8/
           cd test
-          IS_BLACKWELL=1 python3 nightly/test_glm_4_6_perf.py
+          IS_BLACKWELL=1 python3 nightly/test_glm_4_6_fp8_perf.py
 
-      - name: Publish GLM-4.6 traces to storage repo
+      - name: Publish GLM-4.6 FP8 traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6_fp8
 
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
@@ -524,26 +524,6 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_qwen3_235b
-
-      - name: Run GLM-4.6 nightly performance test
-        if: always()
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/performance_profiles_glm_4_6/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_glm_4_6_perf.py
-
-      - name: Publish GLM-4.6 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6
 
       - name: Run MiniMax-M2 nightly performance test
         if: always()
