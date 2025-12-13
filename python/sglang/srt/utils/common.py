@@ -94,6 +94,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
@@ -102,6 +103,17 @@ if TYPE_CHECKING:
     from decord import VideoReader
 
     from sglang.srt.server_args import ServerArgs
+
+if hasattr(torch, "npu") and torch.npu.is_available():
+    try:
+        import torchair
+        import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+        from torchair.configs.compiler_config import CompilerConfig
+
+        torchair_package_installed = True
+    except ImportError as e:
+        torchair_package_installed = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -1942,27 +1954,57 @@ def get_npu_compiler_config():
     return config
 
 
-def get_compiler_backend() -> str:
+@lru_cache(maxsize=1)
+def get_compiler_backend(
+    mode: str = None,
+    model_runner=None,
+    compilation_config: CompilationConfig = None,
+    compilation_context=None,
+) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        try:
-            import torchair
-            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
-            from torchair.configs.compiler_config import CompilerConfig
-        except ImportError as e:
-            raise ImportError(
-                "NPU detected, but torchair package is not installed. "
-                "Please install torchair for torch.compile support on NPU."
-            )
-        compiler_config = CompilerConfig()
-        predefined_config = get_npu_compiler_config()
-        for k, v in predefined_config.items():
-            setattr(compiler_config.experimental_config, k, v)
+        if compilation_config is None:
+            compilation_config = CompilationConfig(compiler="npugraph_ex")
 
-        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
-        return npu_backend
+        if compilation_config.compiler == "piecewise":
+            from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_graph_compiler_backend import (
+                PiecewiseNpuGraphCompilerBackend,
+            )
+
+            return PiecewiseNpuGraphCompilerBackend(
+                model_runner, compilation_config, compilation_context
+            )
+
+        if compilation_config.compiler == "npugraph":
+            from sglang.srt.hardware_backend.npu.graph_runner.compilation.npu_graph_compiler_backend import (
+                NpuGraphCompilerBackend,
+            )
+
+            return NpuGraphCompilerBackend(model_runner)
+
+        if compilation_config.compiler == "npugraph_ex":
+            if not torchair_package_installed:
+                raise ImportError(
+                    "NPU detected, but torchair package is not installed. "
+                    "Please install torchair for torch.compile support on NPU."
+                )
+            compiler_config = CompilerConfig()
+
+            # TODO(iforgetmyname): Change this default value once torch_npu version 7.2.0
+            # compiler_config.mode = "max-autotune" if mode is None else mode
+
+            predefined_config = get_npu_compiler_config()
+            for k, v in predefined_config.items():
+                setattr(compiler_config.experimental_config, k, v)
+
+            npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
+            return npu_backend
+
+        raise ValueError(
+            f"unrecognized compiler backend '{compilation_config.compiler}'"
+        )
 
     return "inductor"
 
