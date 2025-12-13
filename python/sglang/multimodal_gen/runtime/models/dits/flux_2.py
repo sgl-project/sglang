@@ -12,24 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from diffusers.models.attention import AttentionModuleMixin
-from diffusers.models.embeddings import (
-    TimestepEmbedding,
-    Timesteps,
-    get_1d_rotary_pos_embed,
-)
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    NDRotaryEmbedding,
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.models.dits.utils import (
+    delete_projection_layers,
+    fuse_linear_projections,
+)
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -190,51 +196,20 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         if self.fused_projections:
             return
 
-        device = self.to_q.weight.data.device
-        dtype = self.to_q.weight.data.dtype
-
-        concatenated_weights = torch.cat(
-            [self.to_q.weight.data, self.to_k.weight.data, self.to_v.weight.data]
+        self.to_qkv = fuse_linear_projections(
+            self.to_q, self.to_k, self.to_v, self.use_bias, torch.nn.Linear
         )
-        in_features = concatenated_weights.shape[1]
-        out_features = concatenated_weights.shape[0]
-
-        self.to_qkv = torch.nn.Linear(in_features, out_features, bias=self.use_bias)
-        self.to_qkv.weight.data = concatenated_weights.to(device=device, dtype=dtype)
-        if self.use_bias:
-            concatenated_bias = torch.cat(
-                [self.to_q.bias.data, self.to_k.bias.data, self.to_v.bias.data]
-            )
-            self.to_qkv.bias.data = concatenated_bias.to(device=device, dtype=dtype)
+        delete_projection_layers(self, ["to_q", "to_k", "to_v"])
 
         if self.added_kv_proj_dim is not None:
-            concatenated_weights = torch.cat(
-                [
-                    self.add_q_proj.weight.data,
-                    self.add_k_proj.weight.data,
-                    self.add_v_proj.weight.data,
-                ]
+            self.to_added_qkv = fuse_linear_projections(
+                self.add_q_proj,
+                self.add_k_proj,
+                self.add_v_proj,
+                self.added_proj_bias,
+                torch.nn.Linear,
             )
-            in_features = concatenated_weights.shape[1]
-            out_features = concatenated_weights.shape[0]
-
-            self.to_added_qkv = torch.nn.Linear(
-                in_features, out_features, bias=self.added_proj_bias
-            )
-            self.to_added_qkv.weight.data = concatenated_weights.to(
-                device=device, dtype=dtype
-            )
-            if self.added_proj_bias:
-                concatenated_bias = torch.cat(
-                    [
-                        self.add_q_proj.bias.data,
-                        self.add_k_proj.bias.data,
-                        self.add_v_proj.bias.data,
-                    ]
-                )
-                self.to_added_qkv.bias.data = concatenated_bias.to(
-                    device=device, dtype=dtype
-                )
+            delete_projection_layers(self, ["add_q_proj", "add_k_proj", "add_v_proj"])
 
         self.fused_projections = True
 
@@ -654,35 +629,22 @@ class Flux2Modulation(nn.Module):
 
 
 class Flux2PosEmbed(nn.Module):
-    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
-    def __init__(self, theta: int, axes_dim: list[int]):
+    def __init__(self, theta: int, axes_dim: List[int]):
         super().__init__()
-        self.theta = theta
-        self.axes_dim = axes_dim
+        self.rope = NDRotaryEmbedding(
+            rope_dim_list=axes_dim,
+            rope_theta=theta,
+            use_real=False,
+            repeat_interleave_real=False,
+            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+        )
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        # Expected ids shape: [S, len(self.axes_dim)]
-        cos_out = []
-        sin_out = []
+    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos = ids.float()
-        is_mps = ids.device.type == "mps"
-        is_npu = ids.device.type == "npu"
-        freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
-        # Unlike Flux 1, loop over len(self.axes_dim) rather than ids.shape[-1]
-        for i in range(len(self.axes_dim)):
-            cos, sin = get_1d_rotary_pos_embed(
-                self.axes_dim[i],
-                pos[..., i],
-                theta=self.theta,
-                repeat_interleave_real=True,
-                use_real=True,
-                freqs_dtype=freqs_dtype,
-            )
-            cos_out.append(cos)
-            sin_out.append(sin)
-        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
-        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
-        return freqs_cos, freqs_sin
+        # TODO: potential error: flux use n_axes = ids.shape[-1]
+        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
+        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
+        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
 class Flux2Transformer2DModel(CachableDiT):
@@ -785,13 +747,9 @@ class Flux2Transformer2DModel(CachableDiT):
         self.gradient_checkpointing = False
 
     def fuse_qkv_projections(self):
-        for block in self.transformer_blocks:
-            if hasattr(block.attn, "fuse_projections") and getattr(
-                block.attn, "_supports_qkv_fusion", True
-            ):
-                block.attn.fuse_projections()
-
-        for block in self.single_transformer_blocks:
+        for block in list(self.transformer_blocks) + list(
+            self.single_transformer_blocks
+        ):
             if hasattr(block.attn, "fuse_projections") and getattr(
                 block.attn, "_supports_qkv_fusion", True
             ):

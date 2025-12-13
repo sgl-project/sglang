@@ -6,6 +6,18 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
 
 concurrency:
   group: pr-test-xpu-${{ github.ref }}
@@ -86,7 +98,7 @@ jobs:
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
           docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run E2E Bfloat16 tests

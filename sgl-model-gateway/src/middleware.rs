@@ -1,8 +1,10 @@
 use std::{
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -13,6 +15,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use http_body::Frame;
 use rand::Rng;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
@@ -23,6 +27,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::metrics::RouterMetrics,
+    routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -35,6 +40,75 @@ use crate::{
         types::WasmComponentInput,
     },
 };
+
+/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
+/// This ensures that for streaming responses, the token is only returned after the entire
+/// stream has been sent to the client.
+pub struct TokenGuardBody {
+    inner: Body,
+    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
+    token_bucket: Option<Arc<TokenBucket>>,
+    /// Number of tokens to return.
+    tokens: f64,
+}
+
+impl TokenGuardBody {
+    /// Create a new TokenGuardBody that will return tokens when dropped.
+    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+        Self {
+            inner,
+            token_bucket: Some(token_bucket),
+            tokens,
+        }
+    }
+}
+
+impl Drop for TokenGuardBody {
+    fn drop(&mut self) {
+        if let Some(bucket) = self.token_bucket.take() {
+            let tokens = self.tokens;
+            debug!(
+                "TokenGuardBody: stream ended, returning {} tokens to bucket",
+                tokens
+            );
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    bucket.return_tokens(tokens).await;
+                });
+            } else {
+                // Runtime not available (e.g., during shutdown)
+                // Tokens will be lost, but this is acceptable during shutdown
+                warn!(
+                    "TokenGuardBody: Cannot return {} tokens - no Tokio runtime available",
+                    tokens
+                );
+            }
+        }
+    }
+}
+
+impl http_body::Body for TokenGuardBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // SAFETY: We never move the inner body, and Body is Unpin
+        // (it's a type alias for UnsyncBoxBody which is Unpin)
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -79,6 +153,9 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
+const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
     let prefix = if path.contains("/chat/completions") {
@@ -94,12 +171,12 @@ fn generate_request_id(path: &str) -> String {
     };
 
     // Generate a random string similar to OpenAI's format
-    let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    // Use byte array indexing (O(1)) instead of chars().nth() (O(n))
     let mut rng = rand::rng();
     let random_part: String = (0..24)
         .map(|_| {
-            let idx = rng.random_range(0..chars.len());
-            chars.chars().nth(idx).unwrap()
+            let idx = rng.random_range(0..REQUEST_ID_CHARS.len());
+            REQUEST_ID_CHARS[idx] as char
         })
         .collect();
 
@@ -149,14 +226,10 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
@@ -235,6 +308,8 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
+        RouterMetrics::record_http_request();
+
         // Log the request start
         info!(
             target: "sgl_model_gateway::request",
@@ -260,10 +335,18 @@ impl Default for ResponseLogger {
 impl<B> OnResponse<B> for ResponseLogger {
     fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
+        let status_code = status.as_u16();
+
+        let error_code = extract_error_code_from_response(response);
+
+        // TODO support `route` information
+        RouterMetrics::record_http_status_code(status_code, error_code);
+        RouterMetrics::record_request_duration(latency);
 
         // Record these in the span for structured logging/observability tools
-        span.record("status_code", status.as_u16());
-        span.record("latency", format!("{:?}", latency));
+        span.record("status_code", status_code);
+        // Use microseconds as integer to avoid format! string allocation
+        span.record("latency", latency.as_micros() as u64);
 
         // Log the response completion
         let _enter = span.enter();
@@ -298,62 +381,6 @@ pub fn create_logging_layer() -> TraceLayer<
         .make_span_with(RequestSpan)
         .on_request(RequestLogger)
         .on_response(ResponseLogger::default())
-}
-
-/// Structured logging data for requests
-#[derive(Debug, serde::Serialize)]
-pub struct RequestLogEntry {
-    pub timestamp: String,
-    pub request_id: String,
-    pub method: String,
-    pub uri: String,
-    pub status: u16,
-    pub latency_ms: u64,
-    pub user_agent: Option<String>,
-    pub remote_addr: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Log a request with structured data
-pub fn log_request(entry: RequestLogEntry) {
-    if entry.status >= 500 {
-        tracing::error!(
-            target: "sgl_model_gateway::http",
-            request_id = %entry.request_id,
-            method = %entry.method,
-            uri = %entry.uri,
-            status = entry.status,
-            latency_ms = entry.latency_ms,
-            user_agent = ?entry.user_agent,
-            remote_addr = ?entry.remote_addr,
-            error = ?entry.error,
-            "HTTP request failed"
-        );
-    } else if entry.status >= 400 {
-        tracing::warn!(
-            target: "sgl_model_gateway::http",
-            request_id = %entry.request_id,
-            method = %entry.method,
-            uri = %entry.uri,
-            status = entry.status,
-            latency_ms = entry.latency_ms,
-            user_agent = ?entry.user_agent,
-            remote_addr = ?entry.remote_addr,
-            "HTTP request client error"
-        );
-    } else {
-        tracing::info!(
-            target: "sgl_model_gateway::http",
-            request_id = %entry.request_id,
-            method = %entry.method,
-            uri = %entry.uri,
-            status = entry.status,
-            latency_ms = entry.latency_ms,
-            user_agent = ?entry.user_agent,
-            remote_addr = ?entry.remote_addr,
-            "HTTP request completed"
-        );
-    }
 }
 
 /// Request queue entry
@@ -492,10 +519,12 @@ pub async fn concurrency_limit_middleware(
         debug!("Acquired token immediately");
         let response = next.run(request).await;
 
-        // Return the token to the bucket
-        token_bucket.return_tokens(1.0).await;
-
-        response
+        // Wrap the response body with TokenGuardBody to return token when stream ends
+        // This ensures that for streaming responses, the token is only returned
+        // after the entire stream has been sent to the client.
+        let (parts, body) = response.into_parts();
+        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
         if let Some(queue_tx) = &app_state.concurrency_queue_tx {
@@ -531,10 +560,10 @@ pub async fn concurrency_limit_middleware(
 
                             let response = next.run(request).await;
 
-                            // Return the token to the bucket
-                            token_bucket.return_tokens(1.0).await;
-
-                            response
+                            // Wrap the response body with TokenGuardBody to return token when stream ends
+                            let (parts, body) = response.into_parts();
+                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
@@ -629,13 +658,18 @@ pub async fn wasm_middleware(
     // Process each OnRequest module
     let mut modified_body = body_bytes;
 
+    // Pre-compute strings once before the loop to avoid repeated allocations
+    let method_str = method.to_string();
+    let path_str = uri.path().to_string();
+    let query_str = uri.query().unwrap_or("").to_string();
+
     for module in modules_on_request {
         // Build WebAssembly request from collected data
         let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
         let wasm_request = WasmRequest {
-            method: method.to_string(),
-            path: uri.path().to_string(),
-            query: uri.query().unwrap_or("").to_string(),
+            method: method_str.clone(),
+            path: path_str.clone(),
+            query: query_str.clone(),
             headers: wasm_headers,
             body: modified_body.clone(),
             request_id: request_id.clone(),
