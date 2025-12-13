@@ -1088,6 +1088,7 @@ class FlashInferFusedMoE(FusedMoE):
                     local_expert_offset=self.moe_ep_rank * self.num_local_experts,
                     local_num_experts=self.num_local_experts,
                     routing_method_type=self.routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 )
 
         else:

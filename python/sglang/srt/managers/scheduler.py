@@ -18,7 +18,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 import time
 from collections import deque
 from concurrent import futures
@@ -146,6 +145,7 @@ from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
+    SchedulerWatchdog,
 )
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
@@ -524,10 +524,11 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
-        self.watchdog_timeout = server_args.watchdog_timeout
-        t = threading.Thread(target=self.watchdog_thread, daemon=True)
-        t.start()
-        self.parent_process = psutil.Process().parent()
+        self.watchdog = SchedulerWatchdog(
+            self, watchdog_timeout=server_args.watchdog_timeout
+        )
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = SchedulerWatchdog(self, watchdog_timeout=x, soft=True)
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -901,6 +902,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                pp_rank=self.pp_rank,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
@@ -1816,13 +1818,21 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
-            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
-                lora_set
-                | set([req.lora_id for req in adder.can_run_list])
-                | set([req.lora_id])
-            ):
-                self.running_batch.batch_is_full = True
-                break
+            if self.enable_lora:
+                new_lora_set = (
+                    lora_set
+                    | set([req.lora_id for req in adder.can_run_list])
+                    | set([req.lora_id])
+                )
+                if not self.tp_worker.can_run_lora_batch(new_lora_set):
+                    # If this is a LoRA request that would exceed the LoRA slot limit,
+                    # skip it and continue to try scheduling non-LoRA requests.
+                    # Non-LoRA requests (lora_id=None) share a single reserved slot
+                    # and should never cause this check to fail.
+                    if req.lora_id is not None:
+                        # Skip this LoRA request - it would trigger adapter eviction/loading
+                        # which is slow. We'll try to schedule it in a future iteration.
+                        continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -1955,7 +1965,7 @@ class Scheduler(
         ):
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args, self.decode_mem_cache_buf_multiplier
             )
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
@@ -2608,9 +2618,6 @@ class Scheduler(
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
-    def get_remote_instance_transfer_engine_info(self):
-        return self.tp_worker.get_remote_instance_transfer_engine_info()
-
 
 class IdleSleeper:
     """
@@ -2724,29 +2731,13 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
-        if server_args.remote_instance_weight_loader_support_transfer_engine:
-            (
-                remote_instance_transfer_engine_session_id,
-                remote_instance_transfer_engine_weights_info_dict,
-            ) = scheduler.get_remote_instance_transfer_engine_info()
-            pipe_writer.send(
-                {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
-                    "tp_rank": tp_rank,
-                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                }
-            )
-        else:
-            pipe_writer.send(
-                {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
-                }
-            )
+        pipe_writer.send(
+            {
+                "status": "ready",
+                "max_total_num_tokens": scheduler.max_total_num_tokens,
+                "max_req_input_len": scheduler.max_req_input_len,
+            }
+        )
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
@@ -2771,7 +2762,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_decode()
             else:
-                scheduler.event_loop_normal_disagg_decode()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_decode()
+                else:
+                    scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()

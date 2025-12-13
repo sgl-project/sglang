@@ -62,7 +62,7 @@ impl ChatResponseProcessingStage {
                 function = "ChatResponseProcessingStage::execute",
                 "No execution result"
             );
-            error::internal_error("No execution result")
+            error::internal_error("no_execution_result", "No execution result")
         })?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
@@ -75,7 +75,7 @@ impl ChatResponseProcessingStage {
                     function = "ChatResponseProcessingStage::execute",
                     "Dispatch metadata not set"
                 );
-                error::internal_error("Dispatch metadata not set")
+                error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
             })?
             .clone();
 
@@ -100,7 +100,10 @@ impl ChatResponseProcessingStage {
                 function = "ChatResponseProcessingStage::execute",
                 "Stop decoder not initialized"
             );
-            error::internal_error("Stop decoder not initialized")
+            error::internal_error(
+                "stop_decoder_not_initialized",
+                "Stop decoder not initialized",
+            )
         })?;
 
         let response = self
