@@ -311,11 +311,11 @@ class SchedulerWatchdog:
         self.scheduler = scheduler
 
         self.watchdog_timeout = watchdog_timeout
-        t = threading.Thread(target=self.watchdog_thread, daemon=True)
+        t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
 
-    def watchdog_thread(self):
+    def _watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
         self.watchdog_last_forward_ct = 0
         self.watchdog_last_time = time.perf_counter()
