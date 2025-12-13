@@ -3,7 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, prepare_server_args
@@ -40,6 +40,51 @@ health_router = APIRouter()
 async def health():
     return {"status": "ok"}
 
+@health_router.get("/models")
+async def get_models(request: Request):
+    """Get information about the model served by this server."""
+    from sglang.multimodal_gen.registry import get_model_info
+
+    server_args: ServerArgs = request.app.state.server_args
+    model_info = get_model_info(server_args.model_path)
+
+    response = {
+        "model_path": server_args.model_path,
+        "task_type": (
+            server_args.pipeline_config.task_type.name
+            if hasattr(server_args.pipeline_config, "task_type")
+            else None
+        ),
+        "workload_type": (
+            server_args.workload_type.value
+            if hasattr(server_args, "workload_type")
+            else None
+        ),
+    }
+
+    if model_info:
+        pipeline_name = getattr(model_info.pipeline_cls, "pipeline_name", None)
+        if pipeline_name:
+            response["pipeline_name"] = pipeline_name
+        response["pipeline_class"] = model_info.pipeline_cls.__name__
+
+    response.update(
+        {
+            "num_gpus": server_args.num_gpus,
+            "dit_precision": (
+                server_args.pipeline_config.dit_precision
+                if hasattr(server_args.pipeline_config, "dit_precision")
+                else None
+            ),
+            "vae_precision": (
+                server_args.pipeline_config.vae_precision
+                if hasattr(server_args.pipeline_config, "vae_precision")
+                else None
+            ),
+        }
+    )
+
+    return response
 
 @health_router.get("/health_generate")
 async def health_generate():

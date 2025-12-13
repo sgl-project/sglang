@@ -75,6 +75,10 @@ def _build_sampling_params_from_request(
         output_file_name=request_id,
         seed=request.seed,
         generator_device=request.generator_device,
+        guidance_scale=request.guidance_scale,
+        num_inference_steps=request.num_inference_steps,
+        enable_teacache=request.enable_teacache,
+        **({"negative_prompt": request.negative_prompt} if request.negative_prompt is not None else {}),
     )
 
     return sampling_params
@@ -128,6 +132,12 @@ async def create_video(
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
+    seed: Optional[int] = Form(None),
+    generator_device: Optional[str] = Form(None),
+    negative_prompt: Optional[str] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    enable_teacache: Optional[bool] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -169,6 +179,12 @@ async def create_video(
             size=size or "720x1280",
             fps=fps_val,
             num_frames=num_frames_val,
+            seed=seed if seed is not None else 1024,
+            generator_device=generator_device if generator_device is not None else "cuda",
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            enable_teacache=enable_teacache if enable_teacache is not None else False,
         )
     else:
         try:
