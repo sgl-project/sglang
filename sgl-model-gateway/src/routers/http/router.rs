@@ -112,7 +112,7 @@ impl Router {
                             ),
                         }
                     }
-                    Err(e) => convert_reqwest_error(e)
+                    Err(e) => convert_reqwest_error(e),
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
@@ -662,7 +662,10 @@ fn decrement_load(w: &Arc<dyn Worker>) {
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
-    let url = e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let url = e
+        .url()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let message = format!("{}. URL: {}", e, url);
 
     let (status, code) = if e.is_builder() {
@@ -682,7 +685,10 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     } else if e.is_connect() {
         (StatusCode::BAD_GATEWAY, "call_upstream_connection_failed")
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_request_failed")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_failed",
+        )
     };
 
     error::create_error(status, code, message)
