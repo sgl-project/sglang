@@ -203,6 +203,209 @@ class EagleDraftInputV2Mixin:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
+    def prepare_for_extend_to_fill_draft_kvcache_repacked(
+        self,
+        batch: ModelWorkerBatch,
+        repacked_input_ids: torch.Tensor,
+        accept_lens: torch.Tensor,
+        draft_model_runner: Any,
+        cuda_graph_runner: Any,
+        accept_lens_cpu: torch.Tensor = None,  # Optional: pass CPU tensor to avoid sync
+    ):
+        """
+        Prepare batch for draft extend using repacked (variable-length) tensors.
+
+        ============================================================================
+        PURPOSE: Tree Mode Draft KV Cache Update
+        ============================================================================
+
+        This function is used after tree verification when we need to commit
+        ONLY the accepted tokens (not the entire tree) to the draft model's KV cache.
+
+        Standard (non-repacked) version assumes all tree tokens are committed,
+        but tree mode has scattered acceptance, so we use this repacked version.
+
+        ============================================================================
+        TENSOR SHAPES (Example: bs=2, num_steps=5, topk=10, tree_size=32)
+        ============================================================================
+
+        Input:
+          - repacked_input_ids: [sum(accept_lens)], e.g., [7] for accept_lens=[4, 3]
+            Contains only the accepted token IDs, NOT the full tree
+          - accept_lens: [bs] = [2], e.g., [4, 3]
+          - accept_lens_cpu: Optional[Tensor] - CPU version of accept_lens to avoid sync
+
+        The key insight is that seq_lens grows by accept_lens, NOT by tree_size.
+
+        ============================================================================
+        SYNC OPTIMIZATION (Option 5: GPU-Resident accept_lens)
+        ============================================================================
+
+        For flashinfer backend, we can avoid the CPU sync entirely:
+        1. Pass accept_lens (GPU tensor) directly as extend_seq_lens
+        2. The flashinfer backend uses spec_info.accept_length on GPU via
+           generate_attn_arg_prefill() to compute qo_indptr
+        3. ForwardBatch.init_new() can handle GPU tensors directly
+
+        For triton backend, max_extend_len can be a constant upper bound
+        (num_steps + 1) since the kernel uses qo_indptr for actual bounds.
+
+        ============================================================================
+        CONNECTION TO eagle_worker_v2.py
+        ============================================================================
+
+        Called from EAGLEWorkerV2._draft_extend_for_decode() when using repacked
+        tensors for tree mode. The worker repacks the accepted tokens using
+        repack_for_draft_extend() and passes them here.
+
+        ============================================================================
+        """
+        seq_lens_cpu_ = batch.seq_lens_cpu
+
+        # ========================================================================
+        # OPTION 5: GPU-Resident accept_lens (Sync-Free for Flashinfer)
+        # ========================================================================
+        # Instead of transferring accept_lens to CPU, we:
+        # 1. Pass GPU tensor directly as extend_seq_lens
+        # 2. Use upper bound for extend_num_tokens (for position buffer allocation)
+        # 3. The attention backend computes indices on GPU
+        #
+        # This eliminates the ~0.5ms GPU→CPU sync for accept_lens!
+        # ========================================================================
+
+        # For seq_lens_sum and seq_lens_cpu, we still need CPU values
+        # But we can defer this or use estimates
+        if accept_lens_cpu is not None:
+            # CPU tensor provided by caller - use it for exact values
+            extend_num_tokens = accept_lens_cpu.sum().item()
+            batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
+        else:
+            # NO SYNC PATH: Use upper bound for buffer allocation
+            # The actual token count is in repacked_input_ids.shape[0]
+            extend_num_tokens = repacked_input_ids.shape[0]
+            # seq_lens_cpu will be slightly off, but flashinfer doesn't use it
+            # for DRAFT_EXTEND mode (it uses spec_info.accept_length on GPU)
+            batch.seq_lens_cpu = None  # Mark as unavailable
+
+        batch.spec_info = self
+        batch.input_ids = repacked_input_ids
+        batch.seq_lens = batch.seq_lens + accept_lens
+        batch.seq_lens_sum += extend_num_tokens
+
+        # KEY CHANGE: Pass GPU tensor directly instead of CPU list!
+        # ForwardBatch.init_new() will handle GPU tensors for DRAFT_EXTEND_V2 mode
+        batch.extend_seq_lens = accept_lens  # GPU tensor!
+        batch.extend_prefix_lens = seq_lens_cpu_  # CPU tensor or list
+        batch.extend_num_tokens = extend_num_tokens
+
+        # DEBUG: Verify types for Option 5
+        print(f"[Option5_DEBUG] extend_seq_lens type={type(batch.extend_seq_lens).__name__}, "
+              f"device={getattr(batch.extend_seq_lens, 'device', 'N/A')}, "
+              f"extend_prefix_lens type={type(batch.extend_prefix_lens).__name__}, "
+              f"device={getattr(batch.extend_prefix_lens, 'device', 'N/A')}")
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.DRAFT_EXTEND_V2
+        )
+
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+
+        # CRITICAL: Disable CUDA graphs for variable-length batches
+        # Variable sum(accept_lens) breaks fixed-shape CUDA graphs
+        can_cuda_graph = False
+
+        if not batch.forward_mode.is_idle() and not can_cuda_graph:
+            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        return forward_batch
+
+
+def repack_for_draft_extend(
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    num_draft_tokens: int,
+):
+    """
+    Repack sparse tensors to contain only accepted tokens for draft extend.
+
+    ============================================================================
+    PURPOSE
+    ============================================================================
+
+    In tree mode (topk > 1), the target model verifies a tree of draft tokens
+    but only SOME paths are accepted (scattered acceptance). This function
+    extracts only the accepted tokens for committing to the draft KV cache.
+
+    ============================================================================
+    TENSOR SHAPES (Example: bs=2, num_steps=5, topk=10, tree_size=32)
+    ============================================================================
+
+    Input tensors (SPARSE, from verification):
+      - predict: [bs * tree_size] = [64]
+        SPARSE: only accept_index positions contain valid token IDs
+        Other positions may contain garbage/uninitialized memory
+
+      - hidden_states: [bs * tree_size, hidden_size] = [64, hidden_size]
+        DENSE: all positions filled during verify forward pass
+
+      - out_cache_loc: [bs * tree_size] = [64]
+        Contains KV cache slot IDs allocated for the tree
+
+      - accept_index: [bs, num_steps + 1] = [2, 6]
+        FLAT indices into predict/hidden_states/out_cache_loc
+        Example: [[0, 2, 7, 15, -1, -1],    # req 0: positions 0, 2, 7, 15
+                  [32, 34, 39, -1, -1, -1]] # req 1: positions 32, 34, 39
+        Value -1 = unused slot (fewer than max accepted)
+
+      - accept_lens: [bs] = [2], e.g., [4, 3]
+        Number of accepted tokens per request (including bonus token)
+
+    Output tensors (DENSE, for draft extend):
+      - repacked_input_ids: [sum(accept_lens)] = [7]
+        Contains ONLY accepted token IDs
+
+      - repacked_hidden: [sum(accept_lens), hidden_size] = [7, hidden_size]
+        Contains ONLY accepted hidden states
+
+      - repacked_cache_loc: [sum(accept_lens)] = [7]
+        Contains ONLY accepted KV cache slot IDs
+
+    ============================================================================
+    EXAMPLE
+    ============================================================================
+
+    For accept_index = [[0, 2, 7, 15, -1, -1], [32, 34, 39, -1, -1, -1]]:
+      flat_accept_index = [0, 2, 7, 15, -1, -1, 32, 34, 39, -1, -1, -1]
+      valid_mask = [T, T, T, T, F, F, T, T, T, F, F, F]
+      valid_indices = [0, 2, 7, 15, 32, 34, 39]  # 7 elements = sum([4, 3])
+
+    Then gather from sparse tensors:
+      repacked_input_ids = predict[[0, 2, 7, 15, 32, 34, 39]]  # [7]
+      repacked_hidden = hidden_states[[0, 2, 7, 15, 32, 34, 39]]  # [7, hidden]
+      repacked_cache_loc = out_cache_loc[[0, 2, 7, 15, 32, 34, 39]]  # [7]
+
+    ============================================================================
+    """
+    # Flatten accept_index and filter out -1 (unused slots)
+    # flat_accept_index shape: [bs * (num_steps + 1)] = [12]
+    flat_accept_index = accept_index.flatten()
+    valid_mask = flat_accept_index != -1
+    # valid_indices shape: [sum(accept_lens)] = [7] in the example
+    valid_indices = flat_accept_index[valid_mask]
+
+    # Gather from predict, hidden_states, and out_cache_loc using valid_indices
+    # This extracts only the accepted positions, creating dense output tensors
+    repacked_input_ids = predict[valid_indices]      # [sum(accept_lens)]
+    repacked_hidden = hidden_states[valid_indices]   # [sum(accept_lens), hidden_size]
+    repacked_cache_loc = out_cache_loc[valid_indices]  # [sum(accept_lens)]
+
+    return repacked_input_ids, repacked_hidden, repacked_cache_loc
+
 
 @dataclass
 class EagleVerifyInputV2Mixin:
