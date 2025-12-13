@@ -57,6 +57,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
+    if server_args.ring_degree is not None:
+        extra_args += f" --ring-degree {server_args.ring_degree}"
+
     # LoRA support
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
