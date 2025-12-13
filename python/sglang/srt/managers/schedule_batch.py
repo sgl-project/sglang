@@ -472,7 +472,7 @@ class Req:
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
-        reasoning: bool = False,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -518,8 +518,8 @@ class Req:
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
-        # For reasoning
-        self.reasoning = reasoning
+        # Require reasoning for the request (hybrid reasoning model only)
+        self.require_reasoning = require_reasoning
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -677,6 +677,7 @@ class Req:
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
+        self.retraction_mb_id = None
 
         # For metrics
         self.metrics_collector = metrics_collector
@@ -1619,6 +1620,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def retract_decode(
         self,
         server_args: ServerArgs,
+        buf_multiplier: int = 1,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1640,7 +1642,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         first_iter = True
         while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
+            not self.check_decode_mem(
+                selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+            )
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left

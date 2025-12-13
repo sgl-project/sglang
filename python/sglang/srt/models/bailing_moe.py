@@ -582,12 +582,16 @@ class BailingMoEBlock(nn.Module):
         is_previous_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id - 1, is_nextn=False
         )
+        is_next_layer_sparse = self._is_layer_sparse(
+            config, layer_id=layer_id + 1, is_nextn=False
+        )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
