@@ -312,7 +312,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
 pub struct PyroscopeConfig {
     pub url: String,
     pub app_name: String,
-    pub sample_rate: u32,
+    pub sample_rate: Option<u32>,
     pub user: Option<String>,
     pub password: Option<String>,
     pub tags: Vec<(String, String)>,
@@ -323,7 +323,7 @@ impl Default for PyroscopeConfig {
         Self {
             url: "http://localhost:4040".to_string(),
             app_name: "sgl-model-gateway".to_string(),
-            sample_rate: 100,
+            sample_rate: None,
             user: None,
             password: None,
             tags: vec![],
@@ -334,7 +334,8 @@ impl Default for PyroscopeConfig {
 static PYROSCOPE_AGENT: std::sync::OnceLock<Arc<PyroscopeAgentRunning>> = std::sync::OnceLock::new();
 
 pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let pprof_config = PprofConfig::new().sample_rate(config.sample_rate);
+    let sample_rate = config.sample_rate.unwrap_or(100);
+    let pprof_config = PprofConfig::new().sample_rate(sample_rate);
     let pprof_backend = pprof_backend(pprof_config);
 
     let mut agent_builder = PyroscopeAgent::builder(config.url.clone(), config.app_name.clone())

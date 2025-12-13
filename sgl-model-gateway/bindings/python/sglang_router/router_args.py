@@ -125,7 +125,7 @@ class RouterArgs:
     enable_pyroscope: bool = False
     pyroscope_url: Optional[str] = None
     pyroscope_app_name: Optional[str] = None
-    pyroscope_sample_rate: int = 100
+    pyroscope_sample_rate: Optional[int] = None
     pyroscope_user: Optional[str] = None
     pyroscope_password: Optional[str] = None
 
@@ -682,8 +682,8 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}pyroscope-sample-rate",
             type=int,
-            default=100,
-            help="Pyroscope sampling rate in Hz (default: 100)",
+            default=None,
+            help="Pyroscope sampling rate in Hz (default: 100 if not specified)",
         )
         parser.add_argument(
             f"--{prefix}pyroscope-user",

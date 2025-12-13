@@ -727,22 +727,20 @@ impl Router {
         });
 
         let pyroscope_config = if self.enable_pyroscope {
-            if let (Some(url), Some(app_name)) = (self.pyroscope_url.clone(), self.pyroscope_app_name.clone()) {
-                let backend_str = format!("{:?}", self.backend);
-                Some(PyroscopeConfig {
-                    url,
-                    app_name,
-                    sample_rate: self.pyroscope_sample_rate,
-                    user: self.pyroscope_user.clone(),
-                    password: self.pyroscope_password.clone(),
-                    tags: vec![
-                        ("app".to_string(), "sgl-model-gateway".to_string()),
-                        ("backend".to_string(), backend_str),
-                    ],
-                })
-            } else {
-                None
-            }
+            let url = self.pyroscope_url.clone().unwrap();
+            let app_name = self.pyroscope_app_name.clone().unwrap();
+            let backend_str = format!("{:?}", self.backend);
+            Some(PyroscopeConfig {
+                url,
+                app_name,
+                sample_rate: self.pyroscope_sample_rate,
+                user: self.pyroscope_user.clone(),
+                password: self.pyroscope_password.clone(),
+                tags: vec![
+                    ("app".to_string(), "sgl-model-gateway".to_string()),
+                    ("backend".to_string(), backend_str),
+                ],
+            })
         } else {
             None
         };
