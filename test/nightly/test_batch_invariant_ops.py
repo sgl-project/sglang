@@ -11,9 +11,6 @@ register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
 from sglang.test.test_utils import CustomTestCase
 
-device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-torch.set_default_device(device_type)
-
 # Just to get the logging out of the way
 with set_batch_invariant_mode(True):
     pass
