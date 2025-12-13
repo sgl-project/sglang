@@ -530,13 +530,6 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(ref w) = worker {
-                            w.decrement_load();
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     error::internal_error("read_response_body_failed", error_msg)
                 }
