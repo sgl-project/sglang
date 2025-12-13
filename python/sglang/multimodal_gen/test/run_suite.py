@@ -117,6 +117,7 @@ def run_pytest(files):
         if not is_perf_assertion:
             return returncode
 
+    logger.info(f"Max retry exceeded")
     return returncode
 
 
