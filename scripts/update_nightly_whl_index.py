@@ -48,18 +48,26 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
     else:
         release_tag = f"nightly-{commit_hash}"
 
-    # Create nightly directory
+    # Create nightly directory structure following PEP 503
+    # /nightly/index.html -> links to sglang/
+    # /nightly/sglang/index.html -> contains wheel links
     nightly_dir = whl_repo_dir / "nightly"
     nightly_dir.mkdir(parents=True, exist_ok=True)
-    index_file = nightly_dir / "index.html"
+
+    sglang_dir = nightly_dir / "sglang"
+    sglang_dir.mkdir(parents=True, exist_ok=True)
+
+    root_index = nightly_dir / "index.html"
+    package_index = sglang_dir / "index.html"
 
     print(f"\nUpdating nightly wheel index")
-    print(f"  Index file: {index_file}")
+    print(f"  Root index: {root_index}")
+    print(f"  Package index: {package_index}")
 
-    # Read existing index if it exists
+    # Read existing package index if it exists
     existing_links = []
-    if index_file.exists():
-        with open(index_file, "r") as f:
+    if package_index.exists():
+        with open(package_index, "r") as f:
             content = f.read()
             # Extract existing links (skip header and HTML boilerplate)
             existing_links = [
@@ -102,18 +110,25 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
                 seen.add(filename)
                 unique_links.append(link)
 
-    # Write index in minimal format (matching production sgl-kernel index)
-    with open(index_file, "w") as f:
+    # Write root index (links to sglang package directory)
+    with open(root_index, "w") as f:
+        f.write("<!DOCTYPE html>\n")
+        f.write('<a href="sglang/">sglang</a>\n')
+
+    print(f"  Written root index: {root_index}")
+
+    # Write package index in minimal format (matching production sgl-kernel index)
+    with open(package_index, "w") as f:
         f.write("<!DOCTYPE html>\n")
         f.write("<h1>SGLang Nightly Wheels</h1>\n")
         # Write links only
         f.write("\n".join(unique_links))
         f.write("\n")
 
-    print(f"  Written {len(unique_links)} total wheels to {index_file}")
+    print(f"  Written {len(unique_links)} total wheels to {package_index}")
     print(f"\nDone! Users can install with:")
     print(
-        f"  pip install sglang --extra-index-url https://sgl-project.github.io/whl/nightly/"
+        f"  pip install sglang --pre --extra-index-url https://sgl-project.github.io/whl/nightly/"
     )
 
 
