@@ -3,10 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import SparseMode
-from sglang.srt.mem_cache.sparsity.algorithms.page_wise_algorithm import (
-    KnormPageAlgorithm,
-)
+from sglang.srt.mem_cache.sparsity.algorithms.knorm_algorithm import KnormPageAlgorithm
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -41,10 +38,10 @@ class MockReqToTokenPool:
 
 class MockStates:
     def __init__(self, max_reqs=32):
-        self.prompt_lens = torch.zeros(max_reqs, dtype=torch.int32, device="cuda")
+        self.prompt_lens = torch.zeros(max_reqs, dtype=torch.int64, device="cuda")
         self.repr_constructed = torch.zeros(max_reqs, dtype=torch.bool, device="cuda")
-        self.last_extracted_token = torch.zeros(
-            max_reqs, dtype=torch.int32, device="cuda"
+        self.last_constructed_page = torch.zeros(
+            max_reqs, dtype=torch.int64, device="cuda"
         )
 
 
@@ -69,9 +66,6 @@ class TestKnormPageAlgorithm(unittest.TestCase):
         )
         self.states = MockStates(max_reqs=8)
 
-    def test_get_sparse_mode(self):
-        self.assertEqual(self.algorithm.get_sparse_mode(), SparseMode.PAGE_WISE)
-
     def test_initialize_representation_pool(self):
         self.algorithm.initialize_representation_pool(
             start_layer=0,
@@ -91,7 +85,7 @@ class TestKnormPageAlgorithm(unittest.TestCase):
         )
 
         req_pool_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
-        seq_lens = torch.tensor([128, 192], dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor([128, 192], dtype=torch.int64, device="cuda")
         k_buffer = self.token_to_kv_pool.get_key_buffer(0)
         forward_batch = MockForwardBatch(mode=ForwardMode.EXTEND)
 
@@ -107,8 +101,10 @@ class TestKnormPageAlgorithm(unittest.TestCase):
 
         self.assertTrue(self.states.repr_constructed[0])
         self.assertTrue(self.states.repr_constructed[1])
-        self.assertEqual(self.states.last_extracted_token[0].item(), 128)
-        self.assertEqual(self.states.last_extracted_token[1].item(), 192)
+        # last_constructed_page stores page count, not token position
+        # 128 / 64 = 2 pages, 192 / 64 = 3 pages
+        self.assertEqual(self.states.last_constructed_page[0].item(), 2)
+        self.assertEqual(self.states.last_constructed_page[1].item(), 3)
 
     def test_update_representations(self):
         self.algorithm.initialize_representation_pool(
@@ -116,13 +112,14 @@ class TestKnormPageAlgorithm(unittest.TestCase):
         )
 
         req_pool_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
-        seq_lens = torch.tensor([192, 256], dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor([192, 256], dtype=torch.int64, device="cuda")
         k_buffer = self.token_to_kv_pool.get_key_buffer(0)
         forward_batch = MockForwardBatch(mode=ForwardMode.DECODE)
 
         self.states.repr_constructed[req_pool_indices] = True
-        self.states.last_extracted_token[req_pool_indices] = torch.tensor(
-            [128, 128], dtype=torch.int32, device="cuda"
+        # Start from page 2 (was 128 tokens)
+        self.states.last_constructed_page[req_pool_indices] = torch.tensor(
+            [2, 2], dtype=torch.int64, device="cuda"
         )
 
         self.algorithm.update_representations(
@@ -133,8 +130,9 @@ class TestKnormPageAlgorithm(unittest.TestCase):
             forward_batch=forward_batch,
         )
 
-        self.assertEqual(self.states.last_extracted_token[0].item(), 192)
-        self.assertEqual(self.states.last_extracted_token[1].item(), 256)
+        # 192 / 64 = 3 pages, 256 / 64 = 4 pages
+        self.assertEqual(self.states.last_constructed_page[0].item(), 3)
+        self.assertEqual(self.states.last_constructed_page[1].item(), 4)
 
     def test_retrieve_topk(self):
         self.algorithm.initialize_representation_pool(
