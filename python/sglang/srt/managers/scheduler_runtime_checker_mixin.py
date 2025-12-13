@@ -307,8 +307,9 @@ class SchedulerRuntimeCheckerMixin:
 
 
 class SchedulerWatchdog:
-    def __init__(self, scheduler: Scheduler, watchdog_timeout: float):
+    def __init__(self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False):
         self.scheduler = scheduler
+        self.soft = soft
 
         self.watchdog_timeout = watchdog_timeout
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
@@ -349,10 +350,11 @@ class SchedulerWatchdog:
             )
 
         pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+        logger.error(f"Watchdog timeout ({self.watchdog_timeout=}, {self.soft=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
 
-        # Wait for some time so that the parent process can print the error.
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
+        if not self.soft:
+            # Wait for some time so that the parent process can print the error.
+            time.sleep(5)
+            self.parent_process.send_signal(signal.SIGQUIT)
