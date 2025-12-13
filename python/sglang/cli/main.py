@@ -2,6 +2,7 @@ import argparse
 
 from sglang.cli.generate import generate
 from sglang.cli.serve import serve
+from sglang.cli.webui import webui
 
 
 def main():
@@ -21,6 +22,13 @@ def main():
         add_help=False,  # Defer help to the specific parser
     )
     generate_parser.set_defaults(func=generate)
+
+    webui_parser = subparsers.add_parser(
+        "webui",
+        help="Run inference on a multimodal model through webui.",
+        add_help=False,  # Defer help to the specific parser
+    )
+    webui_parser.set_defaults(func=webui)
 
     args, extra_argv = parser.parse_known_args()
     args.func(args, extra_argv)
