@@ -672,19 +672,37 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
     } else if e.is_builder() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_builder_error")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_builder_error",
+        )
     } else if e.is_request() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_request_error")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_error",
+        )
     } else if e.is_redirect() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_redirect_error")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_redirect_error",
+        )
     } else if e.is_body() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_body_error")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_body_error",
+        )
     } else if e.is_decode() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_decode_error")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_decode_error",
+        )
     } else if e.is_timeout() {
         (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
     } else if e.is_connect() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_connection_failed")
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_connection_failed",
+        )
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
