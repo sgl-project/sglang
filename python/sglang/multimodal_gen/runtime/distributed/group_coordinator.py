@@ -325,10 +325,14 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        else:
-            torch.distributed.all_reduce(
-                input_, op=op, group=self.device_group, async_op=async_op
-            )
+
+        if self.device_communicator is not None and self.use_device_communicator:
+            return self.device_communicator.all_reduce(input_, op=op)
+
+        # Fallback to PyTorch implementation
+        torch.distributed.all_reduce(
+            input_, op=op, group=self.device_group, async_op=async_op
+        )
         return input_
 
     def all_gather(
@@ -344,25 +348,33 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
-        # Allocate output tensor.
-        input_size = list(input_.size())
-        input_size[0] *= world_size
-        output_tensor = torch.empty(
-            input_size, dtype=input_.dtype, device=input_.device
-        )
-        # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
-        if dim != 0:
-            input_size[0] //= world_size
-            output_tensor = output_tensor.reshape(
-                [
-                    world_size,
-                ]
-                + input_size
+
+        if self.device_communicator is not None and self.use_device_communicator:
+            output_tensor = self.device_communicator.all_gather(input_, dim=dim)
+            if separate_tensors:
+                return list(torch.chunk(output_tensor, world_size, dim=dim))
+            
+            return output_tensor
+        else:
+            # Allocate output tensor.
+            input_size = list(input_.size())
+            input_size[0] *= world_size
+            output_tensor = torch.empty(
+                input_size, dtype=input_.dtype, device=input_.device
             )
-            output_tensor = output_tensor.movedim(0, dim)
+            # All-gather.
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+            if dim != 0:
+                input_size[0] //= world_size
+                output_tensor = output_tensor.reshape(
+                    [
+                        world_size,
+                    ]
+                    + input_size
+                )
+                output_tensor = output_tensor.movedim(0, dim)
 
         if separate_tensors:
             tensor_list = [
@@ -395,6 +407,10 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+
+        if self.device_communicator is not None and self.use_device_communicator:
+            return self.device_communicator.gather(input_, dst=dst, dim=dim)
+
         # Allocate output tensor.
         if self.rank_in_group == dst:
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]
@@ -419,6 +435,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+            
         # Broadcast.
         torch.distributed.broadcast(
             input_,
