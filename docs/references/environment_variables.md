@@ -36,8 +36,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE` | Weight increment for decode forward mode in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency during decode phase. | `1` |
 | `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_VERIFY` | Weight increment for target verify forward mode in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency during verification phase. | `1` |
 | `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE` | Weight increment when forward mode is None in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency when no specific forward mode is active. | `1` |
-
-| `SGLANG_DP_ROUND_ROBIN` | Enable DP ROUND ROBIN Schedulering for Decode instance. (set to `1` to enable) .                                                                                                                                                                                    | `0` |
+| `SGLANG_DP_ROUND_ROBIN` | Enable DP ROUND ROBIN Schedulering for Decode instance. (set to `1` to enable) | `0` |
 
 ## DeepGEMM Configuration (Advanced Optimization)
 
