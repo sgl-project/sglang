@@ -550,11 +550,6 @@ class ForwardBatch:
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
-        self.num_token_non_padded_cpu = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded_cpu,
-            num_tokens_per_dp=num_tokens_per_dp,
-        )
-
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
         Merge all multimodal inputs in the batch into a single MultiModalInputs object.
