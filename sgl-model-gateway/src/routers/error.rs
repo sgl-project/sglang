@@ -48,7 +48,10 @@ pub fn create_error(
     let message_str = message.into();
 
     let mut headers = HeaderMap::new();
-    headers.insert(HEADER_X_SMG_ERROR_CODE, HeaderValue::from_str(&code_str).unwrap());
+    headers.insert(
+        HEADER_X_SMG_ERROR_CODE,
+        HeaderValue::from_str(&code_str).unwrap(),
+    );
 
     (
         status,
@@ -139,6 +142,14 @@ fn status_code_to_str(status_code: StatusCode) -> &'static str {
 
         _ => "unknown_status_code",
     }
+}
+
+pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {
+    response
+        .headers()
+        .get(HEADER_X_SMG_ERROR_CODE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
