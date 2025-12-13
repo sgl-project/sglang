@@ -330,10 +330,11 @@ impl RouterMetrics {
     }
 
     // TODO unify metric names
-    pub fn record_upstream_http_response(route: &str, status_code: u16) {
-        counter!("sgl_router_upstream_http_responses_total",
+    pub fn record_attempt_http_response(route: &str, status_code: u16, error_code: &str) {
+        counter!("sgl_router_attempt_http_responses_total",
             "route" => route.to_string(),
-            "status_code" => status_code.to_string()
+            "status_code" => status_code.to_string(),
+            "error_code" => error_code.to_string()
         )
         .increment(1);
     }
