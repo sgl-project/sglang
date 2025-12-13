@@ -136,12 +136,12 @@ async def create_video(
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
-    seed: Optional[int] = Form(None),
-    generator_device: Optional[str] = Form(None),
+    seed: Optional[int] = Form(1024),
+    generator_device: Optional[str] = Form("cuda"),
     negative_prompt: Optional[str] = Form(None),
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
-    enable_teacache: Optional[bool] = Form(None),
+    enable_teacache: Optional[bool] = Form(False),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -183,14 +183,12 @@ async def create_video(
             size=size or "720x1280",
             fps=fps_val,
             num_frames=num_frames_val,
-            seed=seed if seed is not None else 1024,
-            generator_device=(
-                generator_device if generator_device is not None else "cuda"
-            ),
+            seed=seed,
+            generator_device=generator_device,
             negative_prompt=negative_prompt,
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
-            enable_teacache=enable_teacache if enable_teacache is not None else False,
+            enable_teacache=enable_teacache,
         )
     else:
         try:

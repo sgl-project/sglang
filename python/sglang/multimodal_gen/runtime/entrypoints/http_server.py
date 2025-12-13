@@ -51,39 +51,25 @@ async def get_models(request: Request):
 
     response = {
         "model_path": server_args.model_path,
-        "task_type": (
-            server_args.pipeline_config.task_type.name
-            if hasattr(server_args.pipeline_config, "task_type")
-            else None
-        ),
-        "workload_type": (
-            server_args.workload_type.value
-            if hasattr(server_args, "workload_type")
-            else None
-        ),
+        "num_gpus": server_args.num_gpus,
     }
 
+    if task_type_enum := getattr(server_args.pipeline_config, "task_type", None):
+        response["task_type"] = task_type_enum.name
+
+    if workload_type_enum := getattr(server_args, "workload_type", None):
+        response["workload_type"] = workload_type_enum.value
+
     if model_info:
-        pipeline_name = getattr(model_info.pipeline_cls, "pipeline_name", None)
-        if pipeline_name:
+        if pipeline_name := getattr(model_info.pipeline_cls, "pipeline_name", None):
             response["pipeline_name"] = pipeline_name
         response["pipeline_class"] = model_info.pipeline_cls.__name__
 
-    response.update(
-        {
-            "num_gpus": server_args.num_gpus,
-            "dit_precision": (
-                server_args.pipeline_config.dit_precision
-                if hasattr(server_args.pipeline_config, "dit_precision")
-                else None
-            ),
-            "vae_precision": (
-                server_args.pipeline_config.vae_precision
-                if hasattr(server_args.pipeline_config, "vae_precision")
-                else None
-            ),
-        }
-    )
+    if dit_precision := getattr(server_args.pipeline_config, "dit_precision", None):
+        response["dit_precision"] = dit_precision
+
+    if vae_precision := getattr(server_args.pipeline_config, "vae_precision", None):
+        response["vae_precision"] = vae_precision
 
     return response
 
