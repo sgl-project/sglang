@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -16,58 +17,34 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
 )
+from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.utils import (
-    delete_projection_layers,
-    fuse_linear_projections,
-)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _get_projections(
-    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
-):
-    img_query, _ = attn.to_q(hidden_states)
-    img_key, _ = attn.to_k(hidden_states)
-    img_value, _ = attn.to_v(hidden_states)
-
-    txt_query = txt_key = txt_value = None
-    if encoder_hidden_states is not None and hasattr(attn, "add_q_proj"):
-        txt_query, _ = attn.add_q_proj(encoder_hidden_states)
-        txt_key, _ = attn.add_k_proj(encoder_hidden_states)
-        txt_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return img_query, img_key, img_value, txt_query, txt_key, txt_value
-
-
-def _get_fused_projections(
+def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
 ):
     img_qkv, _ = attn.to_qkv(hidden_states)
     img_query, img_key, img_value = img_qkv.chunk(3, dim=-1)
 
     txt_query = txt_key = txt_value = None
-    if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
         txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
         txt_query, txt_key, txt_value = txt_qkv.chunk(3, dim=-1)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
-
-
-def _get_qkv_projections(
-    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
-):
-    if attn.fused_projections:
-        return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
-    return _get_projections(attn, hidden_states, encoder_hidden_states)
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -260,8 +237,6 @@ class QwenEmbedRope(nn.Module):
 
 
 class QwenImageCrossAttention(nn.Module):
-    _supports_qkv_fusion = True
-
     def __init__(
         self,
         dim: int,  # query_dim
@@ -286,27 +261,31 @@ class QwenImageCrossAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
+        self.added_kv_proj_dim = added_kv_proj_dim
 
-        # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
+        # Use QKVParallelLinear for fused QKV projections
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=head_dim,
+            total_num_heads=num_heads,
+            bias=False,
+        )
+
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
+
         if added_kv_proj_dim is not None:
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
+            # Use QKVParallelLinear for added (encoder) QKV projections
+            self.to_added_qkv = QKVParallelLinear(
+                hidden_size=added_kv_proj_dim,
+                head_size=head_dim,
+                total_num_heads=num_heads,
+                bias=True,
             )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            if context_pre_only is not None:
-                self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
-                )
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
@@ -337,31 +316,6 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.SAGE_ATTN,
             },
         )
-
-        self.fused_projections = False
-        self.added_kv_proj_dim_val = added_kv_proj_dim
-
-    @torch.no_grad()
-    def fuse_projections(self):
-        if self.fused_projections:
-            return
-
-        self.to_qkv = fuse_linear_projections(
-            self.to_q, self.to_k, self.to_v, use_bias=False, linear_cls=ReplicatedLinear
-        )
-        delete_projection_layers(self, ["to_q", "to_k", "to_v"])
-
-        if self.added_kv_proj_dim_val is not None and hasattr(self, "add_q_proj"):
-            self.to_added_qkv = fuse_linear_projections(
-                self.add_q_proj,
-                self.add_k_proj,
-                self.add_v_proj,
-                use_bias=True,
-                linear_cls=ReplicatedLinear,
-            )
-            delete_projection_layers(self, ["add_q_proj", "add_k_proj", "add_v_proj"])
-
-        self.fused_projections = True
 
     def forward(
         self,
@@ -626,11 +580,49 @@ class QwenImageTransformer2DModel(CachableDiT):
         )
 
     def fuse_qkv_projections(self):
-        for block in self.transformer_blocks:
-            if hasattr(block.attn, "fuse_projections") and getattr(
-                block.attn, "_supports_qkv_fusion", True
-            ):
-                block.attn.fuse_projections()
+        # QKV projections are already fused in __init__, this method is kept for compatibility
+        pass
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with mapping for q/k/v -> qkv fusion."""
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("to_qkv", "to_q", "q"),
+            ("to_qkv", "to_k", "k"),
+            ("to_qkv", "to_v", "v"),
+            ("to_added_qkv", "add_q_proj", "q"),
+            ("to_added_qkv", "add_k_proj", "k"),
+            ("to_added_qkv", "add_v_proj", "v"),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # Handle q/k/v -> qkv mapping
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name in name:
+                    # Replace the weight name with the parameter name
+                    model_param_name = name.replace(weight_name, param_name)
+
+                    if model_param_name in params_dict:
+                        param = params_dict[model_param_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(model_param_name)
+                    break
+            else:
+                # Use default weight loader for all other parameters
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+
+        return loaded_params
 
     def forward(
         self,

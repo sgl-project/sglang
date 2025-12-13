@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -23,15 +24,13 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import QKVParallelLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
 )
+from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.utils import (
-    delete_projection_layers,
-    fuse_linear_projections,
-)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -41,40 +40,18 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _get_projections(attn: "Flux2Attention", hidden_states, encoder_hidden_states=None):
-    query = attn.to_q(hidden_states)
-    key = attn.to_k(hidden_states)
-    value = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        encoder_query = attn.add_q_proj(encoder_hidden_states)
-        encoder_key = attn.add_k_proj(encoder_hidden_states)
-        encoder_value = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
-def _get_fused_projections(
+def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
     qkv = attn.to_qkv(hidden_states)
     query, key, value = qkv.chunk(3, dim=-1)
 
     encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
         added_qkv = attn.to_added_qkv(encoder_hidden_states)
         encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
-
-
-def _get_qkv_projections(
-    attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
-):
-    if attn.fused_projections:
-        return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
-    return _get_projections(attn, hidden_states, encoder_hidden_states)
 
 
 class Flux2SwiGLU(nn.Module):
@@ -120,8 +97,6 @@ class Flux2FeedForward(nn.Module):
 
 
 class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
-    _supports_qkv_fusion = True
-
     def __init__(
         self,
         query_dim: int,
@@ -150,9 +125,13 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
+        # Use QKVParallelLinear for fused QKV projections
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=query_dim,
+            head_size=dim_head,
+            total_num_heads=num_heads,
+            bias=bias,
+        )
 
         # QK Norm
         self.norm_q = RMSNorm(dim_head, eps=eps)
@@ -165,14 +144,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_k_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_v_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            # Use QKVParallelLinear for added (encoder) QKV projections
+            self.to_added_qkv = QKVParallelLinear(
+                hidden_size=added_kv_proj_dim,
+                head_size=dim_head,
+                total_num_heads=num_heads,
+                bias=added_proj_bias,
             )
             self.to_add_out = torch.nn.Linear(self.inner_dim, query_dim, bias=out_bias)
 
@@ -188,30 +165,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 AttentionBackendEnum.SAGE_ATTN,
             },
         )
-
-        self.fused_projections = False
-
-    @torch.no_grad()
-    def fuse_projections(self):
-        if self.fused_projections:
-            return
-
-        self.to_qkv = fuse_linear_projections(
-            self.to_q, self.to_k, self.to_v, self.use_bias, torch.nn.Linear
-        )
-        delete_projection_layers(self, ["to_q", "to_k", "to_v"])
-
-        if self.added_kv_proj_dim is not None:
-            self.to_added_qkv = fuse_linear_projections(
-                self.add_q_proj,
-                self.add_k_proj,
-                self.add_v_proj,
-                self.added_proj_bias,
-                torch.nn.Linear,
-            )
-            delete_projection_layers(self, ["add_q_proj", "add_k_proj", "add_v_proj"])
-
-        self.fused_projections = True
 
     def forward(
         self,
@@ -747,13 +700,49 @@ class Flux2Transformer2DModel(CachableDiT):
         self.gradient_checkpointing = False
 
     def fuse_qkv_projections(self):
-        for block in list(self.transformer_blocks) + list(
-            self.single_transformer_blocks
-        ):
-            if hasattr(block.attn, "fuse_projections") and getattr(
-                block.attn, "_supports_qkv_fusion", True
-            ):
-                block.attn.fuse_projections()
+        # QKV projections are already fused in __init__, this method is kept for compatibility
+        pass
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with mapping for q/k/v -> qkv fusion."""
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("to_qkv", "to_q", "q"),
+            ("to_qkv", "to_k", "k"),
+            ("to_qkv", "to_v", "v"),
+            ("to_added_qkv", "add_q_proj", "q"),
+            ("to_added_qkv", "add_k_proj", "k"),
+            ("to_added_qkv", "add_v_proj", "v"),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # Handle q/k/v -> qkv mapping
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name in name:
+                    # Replace the weight name with the parameter name
+                    model_param_name = name.replace(weight_name, param_name)
+
+                    if model_param_name in params_dict:
+                        param = params_dict[model_param_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight, shard_id)
+                        loaded_params.add(model_param_name)
+                    break
+            else:
+                # Use default weight loader for all other parameters
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+
+        return loaded_params
 
     def forward(
         self,

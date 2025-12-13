@@ -42,10 +42,10 @@ sglang generate \
 
 ### Output Location
 
-Trace files are saved to `./logs/` directory by default with the naming format:
-```
-{request_id}-{num_steps}_steps-global-rank{rank}.trace.json.gz
-```
+Trace files are saved to the `./logs/` directory by default. The file name format depends on the profiling mode:
+
+- **Denoising Stage Profiling**: `{request_id}-{num_steps}_steps-global-rank{rank}.trace.json.gz`
+- **Full Pipeline Profiling**: `{request_id}-full_stages-global-rank{rank}.trace.json.gz`
 
 Example: `mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz`
 
