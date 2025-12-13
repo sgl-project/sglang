@@ -27,7 +27,7 @@ It learns from [Copybara](https://github.com/google/copybara), a tool used at Go
 - This action currently needs a manual trigger in order to prevent incidental code leaks. One can also consider making it automatic.
 
 ## Examples
-- If you want to have some private server arguments, you can do create a new file `python/sglang/private/server_args.py`. It defines a class that inherits the oss ServerArgs.
+- If you want to have some private server arguments, you can create a new file `python/sglang/private/server_args.py`. It defines a class that inherits the oss ServerArgs.
     ```python
     from sglang.srt.server_args import ServerArgs as ServerArgsOSS
 
@@ -47,5 +47,5 @@ It learns from [Copybara](https://github.com/google/copybara), a tool used at Go
                 default=ServerArgs.private_flag,
             )
     ```
-- Similarly, you can also inherit `Engine` and override `launch_subprocesses_func`, `server_args_class`.
-- You can also pass your own launch functions to `launch_server.py::launch_server`
+- Similarly, you can inherit `Engine` and override `launch_subprocesses_func`, `server_args_class`.
+- You can pass your own subprocesses launch functions to `launch_server.py::launch_server`
