@@ -63,7 +63,7 @@ class SGLangFailuresAnalyzer:
         self,
         limit: int = 500,
         workflow_filter: List[str] = None,
-        event_filter: Optional[str] = None,
+        filters: Optional[Dict[str, str]] = None,
     ) -> List[Dict]:
         """
         Fetch recent workflow runs from GitHub API using workflow file names.
@@ -71,11 +71,11 @@ class SGLangFailuresAnalyzer:
         Args:
             limit: Number of runs to fetch per workflow
             workflow_filter: List of workflow filenames (uses self.target_workflows if None)
-            event_filter: Filter by event type (e.g., 'schedule', 'pull_request')
+            filters: Optional dict of API filters (e.g., {"event": "schedule"}, {"branch": "main"})
         """
         filter_desc = f"workflows: {', '.join(workflow_filter)}"
-        if event_filter:
-            filter_desc += f", event: {event_filter}"
+        if filters:
+            filter_desc += f", filters: {filters}"
 
         print(f"Fetching {limit} runs per workflow ({filter_desc})...")
 
@@ -88,9 +88,9 @@ class SGLangFailuresAnalyzer:
             url = f"{self.base_url}/repos/{self.repo}/actions/workflows/{workflow_file}/runs"
             params = {"per_page": min(limit, 100), "status": "completed"}
 
-            # Server-side filter by event type
-            if event_filter:
-                params["event"] = event_filter
+            # Apply any additional filters
+            if filters:
+                params.update(filters)
 
             try:
                 response = self.session.get(url, params=params, timeout=30)
@@ -714,17 +714,35 @@ class SGLangFailuresAnalyzer:
     # print statements here mainly for local testing
     def generate_failure_report(
         self,
-        pr_test_main_data: Dict[str, Dict],
-        nightly_main_data: Dict[str, Dict],
-        pr_test_general_data: Dict[str, Dict],
-        nightly_general_data: Dict[str, Dict],
+        # Scheduled runs (9 workflows)
+        pr_test_nvidia_scheduled_data: Dict[str, Dict],
+        pr_test_amd_scheduled_data: Dict[str, Dict],
+        pr_test_xeon_scheduled_data: Dict[str, Dict],
+        pr_test_xpu_scheduled_data: Dict[str, Dict],
+        pr_test_npu_scheduled_data: Dict[str, Dict],
+        nightly_nvidia_scheduled_data: Dict[str, Dict],
+        nightly_amd_scheduled_data: Dict[str, Dict],
+        nightly_intel_scheduled_data: Dict[str, Dict],
+        nightly_npu_scheduled_data: Dict[str, Dict],
+        # General runs (9 workflows)
+        pr_test_nvidia_general_data: Dict[str, Dict],
+        pr_test_amd_general_data: Dict[str, Dict],
+        pr_test_xeon_general_data: Dict[str, Dict],
+        pr_test_xpu_general_data: Dict[str, Dict],
+        pr_test_npu_general_data: Dict[str, Dict],
+        nightly_nvidia_general_data: Dict[str, Dict],
+        nightly_amd_general_data: Dict[str, Dict],
+        nightly_intel_general_data: Dict[str, Dict],
+        nightly_npu_general_data: Dict[str, Dict],
+        # Runners
         runner_stats: Optional[Dict[str, Dict]] = None,
         runner_instance_data: Optional[Dict[str, Dict]] = None,
         runner_streak_data: Optional[Dict[str, Dict]] = None,
         runner_instance_streak_data: Optional[Dict[str, Dict]] = None,
+        # Config
         output_file: Optional[str] = None,
-        pr_test_main_limit: int = 12,
-        nightly_main_limit: int = 6,
+        pr_test_scheduled_limit: int = 12,
+        nightly_scheduled_limit: int = 6,
         general_limit: int = 100,
     ):
         """Generate detailed failure analysis report."""
@@ -732,8 +750,18 @@ class SGLangFailuresAnalyzer:
         print("SGLang Consecutive Failures Analysis Report")
         print("=" * 80)
 
-        # Combine general data for summary stats
-        combined_general_data = {**pr_test_general_data, **nightly_general_data}
+        # Combine all general data for summary stats
+        combined_general_data = {
+            **pr_test_nvidia_general_data,
+            **pr_test_amd_general_data,
+            **pr_test_xeon_general_data,
+            **pr_test_xpu_general_data,
+            **pr_test_npu_general_data,
+            **nightly_nvidia_general_data,
+            **nightly_amd_general_data,
+            **nightly_intel_general_data,
+            **nightly_npu_general_data,
+        }
 
         # Sort jobs by current streak (descending)
         sorted_jobs = sorted(
@@ -747,22 +775,6 @@ class SGLangFailuresAnalyzer:
         print(f"Total (unique) jobs analyzed: {len(sorted_jobs)}")
         print(
             f"Jobs with Active Failure Streaks: {sum(1 for j in sorted_jobs if j[1]['current_streak'] > 0)}"
-        )
-
-        # Add counter for main branch scheduled jobs
-        pr_main_count = len(pr_test_main_data)
-        pr_main_with_streaks = sum(
-            1 for j in pr_test_main_data.values() if j["current_streak"] > 0
-        )
-        nightly_main_count = len(nightly_main_data)
-        nightly_main_with_streaks = sum(
-            1 for j in nightly_main_data.values() if j["current_streak"] > 0
-        )
-        print(
-            f"PR Test Jobs on Main (scheduled): {pr_main_count} ({pr_main_with_streaks} with active streaks)"
-        )
-        print(
-            f"Nightly Test Jobs on Main (scheduled): {nightly_main_count} ({nightly_main_with_streaks} with active streaks)"
         )
 
         if runner_stats:
@@ -875,33 +887,118 @@ class SGLangFailuresAnalyzer:
                         f"   {display_name:<38} {d['total_failures']:<12} {d['failure_rate']:.1f}%{'':<7} {d['total_runs']:<12} {history_str:<30}"
                     )
 
-        # 1. PR Test - Main (scheduled runs only) - RED
+        # ========== SCHEDULED/MAIN BRANCH RUNS (9 sections) ==========
+        print("\n" + "█" * 130)
+        print("SCHEDULED RUNS (Main Branch)")
+        print("█" * 130)
+
+        # PR Tests - Scheduled (5 workflows)
         print_job_section(
-            f"1. PR Test - Scheduled (latest {pr_test_main_limit} runs)",
-            pr_test_main_data,
+            f"1. PR Test NVIDIA - Scheduled (latest {pr_test_scheduled_limit} runs)",
+            pr_test_nvidia_scheduled_data,
+            color_failures=True,
+        )
+        print_job_section(
+            f"2. PR Test AMD - Scheduled (latest {pr_test_scheduled_limit} runs)",
+            pr_test_amd_scheduled_data,
+            color_failures=True,
+        )
+        print_job_section(
+            f"3. PR Test Xeon - Scheduled (latest {pr_test_scheduled_limit} runs)",
+            pr_test_xeon_scheduled_data,
+            color_failures=True,
+        )
+        print_job_section(
+            f"4. PR Test XPU - Scheduled (latest {pr_test_scheduled_limit} runs)",
+            pr_test_xpu_scheduled_data,
+            color_failures=True,
+        )
+        print_job_section(
+            f"5. PR Test NPU - Scheduled (latest {pr_test_scheduled_limit} runs)",
+            pr_test_npu_scheduled_data,
             color_failures=True,
         )
 
-        # 2. Nightly Test - Main (scheduled runs only) - RED
+        # Nightly Tests - Scheduled (4 workflows)
         print_job_section(
-            f"2. Nightly - Scheduled (latest {nightly_main_limit} runs)",
-            nightly_main_data,
+            f"6. Nightly NVIDIA - Scheduled (latest {nightly_scheduled_limit} runs)",
+            nightly_nvidia_scheduled_data,
+            color_failures=True,
+        )
+        print_job_section(
+            f"7. Nightly AMD - Scheduled (latest {nightly_scheduled_limit} runs)",
+            nightly_amd_scheduled_data,
+            color_failures=True,
+        )
+        print_job_section(
+            f"8. Nightly Intel - Scheduled (latest {nightly_scheduled_limit} runs)",
+            nightly_intel_scheduled_data,
+            color_failures=True,
+        )
+        print_job_section(
+            f"9. Nightly NPU - Scheduled (latest {nightly_scheduled_limit} runs)",
+            nightly_npu_scheduled_data,
             color_failures=True,
         )
 
-        # 3. PR Test - General (all runs)
+        # ========== GENERAL RUNS (9 sections) ==========
+        print("\n" + "█" * 130)
+        print("GENERAL RUNS (All Branches)")
+        print("█" * 130)
+
+        # PR Tests - General (5 workflows)
         print_job_section(
-            f"3. PR Test - General (latest {general_limit} runs)",
-            pr_test_general_data,
+            f"10. PR Test NVIDIA - General (latest {general_limit} runs)",
+            pr_test_nvidia_general_data,
+            color_failures=False,
+        )
+        print_job_section(
+            f"11. PR Test AMD - General (latest {general_limit} runs)",
+            pr_test_amd_general_data,
+            color_failures=False,
+        )
+        print_job_section(
+            f"12. PR Test Xeon - General (latest {general_limit} runs)",
+            pr_test_xeon_general_data,
+            color_failures=False,
+        )
+        print_job_section(
+            f"13. PR Test XPU - General (latest {general_limit} runs)",
+            pr_test_xpu_general_data,
+            color_failures=False,
+        )
+        print_job_section(
+            f"14. PR Test NPU - General (latest {general_limit} runs)",
+            pr_test_npu_general_data,
             color_failures=False,
         )
 
-        # 4. Nightly Test - General (all runs)
+        # Nightly Tests - General (4 workflows)
         print_job_section(
-            f"4. Nightly - General (latest {general_limit} runs)",
-            nightly_general_data,
+            f"15. Nightly NVIDIA - General (latest {general_limit} runs)",
+            nightly_nvidia_general_data,
             color_failures=False,
         )
+        print_job_section(
+            f"16. Nightly AMD - General (latest {general_limit} runs)",
+            nightly_amd_general_data,
+            color_failures=False,
+        )
+        print_job_section(
+            f"17. Nightly Intel - General (latest {general_limit} runs)",
+            nightly_intel_general_data,
+            color_failures=False,
+        )
+        print_job_section(
+            f"18. Nightly NPU - General (latest {general_limit} runs)",
+            nightly_npu_general_data,
+            color_failures=False,
+        )
+
+        # ========== RUNNERS ==========
+        print("\n" + "█" * 130)
+        print("RUNNER HEALTH")
+        print("█" * 130)
 
         # 5. Workers (at the very bottom) - Use machine names from runner instances (streak >= 2)
         if runner_instance_data and runner_instance_streak_data:
@@ -1018,18 +1115,30 @@ class SGLangFailuresAnalyzer:
                 "analysis_timestamp": datetime.now().isoformat(),
                 "avg_queue_time_seconds": overall_avg_queue,
                 "p90_queue_time_seconds": overall_p90_queue,
-                "pr_main_count": pr_main_count,
-                "pr_main_with_streaks": pr_main_with_streaks,
-                "nightly_main_count": nightly_main_count,
-                "nightly_main_with_streaks": nightly_main_with_streaks,
             },
-            "pr_test_main_limit": pr_test_main_limit,
-            "nightly_main_limit": nightly_main_limit,
+            "pr_test_scheduled_limit": pr_test_scheduled_limit,
+            "nightly_scheduled_limit": nightly_scheduled_limit,
             "general_limit": general_limit,
-            "pr_test_main_data": pr_test_main_data,
-            "nightly_main_data": nightly_main_data,
-            "pr_test_general_data": pr_test_general_data,
-            "nightly_general_data": nightly_general_data,
+            # Scheduled data
+            "pr_test_nvidia_scheduled_data": pr_test_nvidia_scheduled_data,
+            "pr_test_amd_scheduled_data": pr_test_amd_scheduled_data,
+            "pr_test_xeon_scheduled_data": pr_test_xeon_scheduled_data,
+            "pr_test_xpu_scheduled_data": pr_test_xpu_scheduled_data,
+            "pr_test_npu_scheduled_data": pr_test_npu_scheduled_data,
+            "nightly_nvidia_scheduled_data": nightly_nvidia_scheduled_data,
+            "nightly_amd_scheduled_data": nightly_amd_scheduled_data,
+            "nightly_intel_scheduled_data": nightly_intel_scheduled_data,
+            "nightly_npu_scheduled_data": nightly_npu_scheduled_data,
+            # General data
+            "pr_test_nvidia_general_data": pr_test_nvidia_general_data,
+            "pr_test_amd_general_data": pr_test_amd_general_data,
+            "pr_test_xeon_general_data": pr_test_xeon_general_data,
+            "pr_test_xpu_general_data": pr_test_xpu_general_data,
+            "pr_test_npu_general_data": pr_test_npu_general_data,
+            "nightly_nvidia_general_data": nightly_nvidia_general_data,
+            "nightly_amd_general_data": nightly_amd_general_data,
+            "nightly_intel_general_data": nightly_intel_general_data,
+            "nightly_npu_general_data": nightly_npu_general_data,
             "runner_stats": runner_stats if runner_stats else {},
             "runner_instance_data": (
                 runner_instance_data if runner_instance_data else {}
@@ -1240,32 +1349,106 @@ class SGLangFailuresAnalyzer:
                     summary_lines.append("</details>")
                     summary_lines.append("")
 
-            # 1. PR Test - Main (scheduled runs only)
-            pr_main_limit = report_data.get("pr_test_main_limit", 12)
+            # ========== SCHEDULED RUNS (9 sections) ==========
+            summary_lines.append("---")
+            summary_lines.append("# 📅 SCHEDULED RUNS (Main Branch)")
+            summary_lines.append("")
+
+            # Get limits
+            pr_sched_limit = report_data.get("pr_test_scheduled_limit", 12)
+            nightly_sched_limit = report_data.get("nightly_scheduled_limit", 6)
+
+            # PR Tests - Scheduled (5 workflows)
             generate_job_section_md(
-                f"1. PR Test - Scheduled (latest {pr_main_limit} runs)",
-                report_data.get("pr_test_main_data", {}),
+                f"1. PR Test NVIDIA - Scheduled (latest {pr_sched_limit} runs)",
+                report_data.get("pr_test_nvidia_scheduled_data", {}),
+            )
+            generate_job_section_md(
+                f"2. PR Test AMD - Scheduled (latest {pr_sched_limit} runs)",
+                report_data.get("pr_test_amd_scheduled_data", {}),
+            )
+            generate_job_section_md(
+                f"3. PR Test Xeon - Scheduled (latest {pr_sched_limit} runs)",
+                report_data.get("pr_test_xeon_scheduled_data", {}),
+            )
+            generate_job_section_md(
+                f"4. PR Test XPU - Scheduled (latest {pr_sched_limit} runs)",
+                report_data.get("pr_test_xpu_scheduled_data", {}),
+            )
+            generate_job_section_md(
+                f"5. PR Test NPU - Scheduled (latest {pr_sched_limit} runs)",
+                report_data.get("pr_test_npu_scheduled_data", {}),
             )
 
-            # 2. Nightly Test - Main (scheduled runs only)
-            nightly_limit = report_data.get("nightly_main_limit", 6)
+            # Nightly Tests - Scheduled (4 workflows)
             generate_job_section_md(
-                f"2. Nightly - Scheduled (latest {nightly_limit} runs)",
-                report_data.get("nightly_main_data", {}),
+                f"6. Nightly NVIDIA - Scheduled (latest {nightly_sched_limit} runs)",
+                report_data.get("nightly_nvidia_scheduled_data", {}),
+            )
+            generate_job_section_md(
+                f"7. Nightly AMD - Scheduled (latest {nightly_sched_limit} runs)",
+                report_data.get("nightly_amd_scheduled_data", {}),
+            )
+            generate_job_section_md(
+                f"8. Nightly Intel - Scheduled (latest {nightly_sched_limit} runs)",
+                report_data.get("nightly_intel_scheduled_data", {}),
+            )
+            generate_job_section_md(
+                f"9. Nightly NPU - Scheduled (latest {nightly_sched_limit} runs)",
+                report_data.get("nightly_npu_scheduled_data", {}),
             )
 
-            # 3. PR Test - General (all runs)
+            # ========== GENERAL RUNS (9 sections) ==========
+            summary_lines.append("---")
+            summary_lines.append("# 🌍 GENERAL RUNS (All Branches)")
+            summary_lines.append("")
+
             gen_limit = report_data.get("general_limit", 100)
+
+            # PR Tests - General (5 workflows)
             generate_job_section_md(
-                f"3. PR Test - General (latest {gen_limit} runs)",
-                report_data.get("pr_test_general_data", {}),
+                f"10. PR Test NVIDIA - General (latest {gen_limit} runs)",
+                report_data.get("pr_test_nvidia_general_data", {}),
+            )
+            generate_job_section_md(
+                f"11. PR Test AMD - General (latest {gen_limit} runs)",
+                report_data.get("pr_test_amd_general_data", {}),
+            )
+            generate_job_section_md(
+                f"12. PR Test Xeon - General (latest {gen_limit} runs)",
+                report_data.get("pr_test_xeon_general_data", {}),
+            )
+            generate_job_section_md(
+                f"13. PR Test XPU - General (latest {gen_limit} runs)",
+                report_data.get("pr_test_xpu_general_data", {}),
+            )
+            generate_job_section_md(
+                f"14. PR Test NPU - General (latest {gen_limit} runs)",
+                report_data.get("pr_test_npu_general_data", {}),
             )
 
-            # 4. Nightly Test - General (all runs)
+            # Nightly Tests - General (4 workflows)
             generate_job_section_md(
-                f"4. Nightly - General (latest {gen_limit} runs)",
-                report_data.get("nightly_general_data", {}),
+                f"15. Nightly NVIDIA - General (latest {gen_limit} runs)",
+                report_data.get("nightly_nvidia_general_data", {}),
             )
+            generate_job_section_md(
+                f"16. Nightly AMD - General (latest {gen_limit} runs)",
+                report_data.get("nightly_amd_general_data", {}),
+            )
+            generate_job_section_md(
+                f"17. Nightly Intel - General (latest {gen_limit} runs)",
+                report_data.get("nightly_intel_general_data", {}),
+            )
+            generate_job_section_md(
+                f"18. Nightly NPU - General (latest {gen_limit} runs)",
+                report_data.get("nightly_npu_general_data", {}),
+            )
+
+            # ========== RUNNERS ==========
+            summary_lines.append("---")
+            summary_lines.append("# 🖥️ RUNNER HEALTH")
+            summary_lines.append("")
 
             # 5. Workers section
             if report_data.get("runner_instance_data") and report_data.get(
@@ -1407,40 +1590,114 @@ def main():
         print("FETCHING WORKFLOW RUNS")
         print("=" * 80)
 
-        # Fixed limits for main branch scheduled runs
-        pr_test_main_limit = 12  # Past 12 scheduled PR Test runs on main (testing)
-        nightly_main_limit = 6  # Past 6 scheduled Nightly Test runs on main (testing)
+        # Fixed limits for scheduled runs
+        pr_test_scheduled_limit = 12  # Past 12 scheduled PR Test runs
+        nightly_scheduled_limit = 6  # Past 6 scheduled Nightly Test runs
 
-        # 1. PR Test - Main (scheduled runs only) - Fixed 5 runs
-        pr_test_main_runs = analyzer.get_recent_runs(
-            limit=pr_test_main_limit,
+        # === SCHEDULED RUNS (9 workflows) ===
+        # PR Tests - Scheduled (5 workflows)
+        pr_test_nvidia_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
             workflow_filter=["pr-test.yml"],
-            event_filter="schedule",
+            filters={"event": "schedule"},
+        )
+        # These 4 don't have scheduled events, so filter by main branch instead
+        pr_test_amd_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-amd.yml"],
+            filters={"branch": "main"},
+        )
+        pr_test_xeon_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-xeon.yml"],
+            filters={"branch": "main"},
+        )
+        pr_test_xpu_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-xpu.yml"],
+            filters={"branch": "main"},
+        )
+        pr_test_npu_scheduled_runs = analyzer.get_recent_runs(
+            limit=pr_test_scheduled_limit,
+            workflow_filter=["pr-test-npu.yml"],
+            filters={"branch": "main"},
         )
 
-        # 2. Nightly Test - Main (scheduled runs only) - Fixed 5 runs
-        nightly_main_runs = analyzer.get_recent_runs(
-            limit=nightly_main_limit,
+        # Nightly Tests - Scheduled (4 workflows)
+        nightly_nvidia_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
             workflow_filter=["nightly-test-nvidia.yml"],
-            event_filter="schedule",
+            filters={"event": "schedule"},
+        )
+        nightly_amd_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
+            workflow_filter=["nightly-test-amd.yml"],
+            filters={"event": "schedule"},
+        )
+        nightly_intel_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
+            workflow_filter=["nightly-test-intel.yml"],
+            filters={"event": "schedule"},
+        )
+        nightly_npu_scheduled_runs = analyzer.get_recent_runs(
+            limit=nightly_scheduled_limit,
+            workflow_filter=["nightly-test-npu.yml"],
+            filters={"event": "schedule"},
         )
 
-        # 3. PR Test - General (all runs)
-        pr_test_general_runs = analyzer.get_recent_runs(
+        # === GENERAL RUNS (9 workflows) ===
+        # PR Tests - General (5 workflows)
+        pr_test_nvidia_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
             workflow_filter=["pr-test.yml"],
-            event_filter=None,
+        )
+        pr_test_amd_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-amd.yml"],
+        )
+        pr_test_xeon_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-xeon.yml"],
+        )
+        pr_test_xpu_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-xpu.yml"],
+        )
+        pr_test_npu_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["pr-test-npu.yml"],
         )
 
-        # 4. Nightly Test - General (all runs)
-        nightly_general_runs = analyzer.get_recent_runs(
+        # Nightly Tests - General (4 workflows)
+        nightly_nvidia_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
             workflow_filter=["nightly-test-nvidia.yml"],
-            event_filter=None,
+        )
+        nightly_amd_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["nightly-test-amd.yml"],
+        )
+        nightly_intel_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["nightly-test-intel.yml"],
+        )
+        nightly_npu_general_runs = analyzer.get_recent_runs(
+            limit=args.limit,
+            workflow_filter=["nightly-test-npu.yml"],
         )
 
         # Combine all runs for runner health analysis
-        all_runs = pr_test_general_runs + nightly_general_runs
+        all_runs = (
+            pr_test_nvidia_general_runs
+            + pr_test_amd_general_runs
+            + pr_test_xeon_general_runs
+            + pr_test_xpu_general_runs
+            + pr_test_npu_general_runs
+            + nightly_nvidia_general_runs
+            + nightly_amd_general_runs
+            + nightly_intel_general_runs
+            + nightly_npu_general_runs
+        )
 
         if not all_runs:
             print("No workflow runs found")
@@ -1450,28 +1707,99 @@ def main():
         print("ANALYZING CONSECUTIVE FAILURES")
         print("=" * 80)
 
-        # Analyze each category separately
-        pr_test_main_data, pr_test_main_streaks = (
-            analyzer.analyze_consecutive_failures(pr_test_main_runs)
-            if pr_test_main_runs
+        # Analyze SCHEDULED runs
+        pr_test_nvidia_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_nvidia_scheduled_runs)
+            if pr_test_nvidia_scheduled_runs
+            else ({}, {})
+        )
+        pr_test_amd_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_amd_scheduled_runs)
+            if pr_test_amd_scheduled_runs
+            else ({}, {})
+        )
+        pr_test_xeon_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_xeon_scheduled_runs)
+            if pr_test_xeon_scheduled_runs
+            else ({}, {})
+        )
+        pr_test_xpu_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_xpu_scheduled_runs)
+            if pr_test_xpu_scheduled_runs
+            else ({}, {})
+        )
+        pr_test_npu_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_npu_scheduled_runs)
+            if pr_test_npu_scheduled_runs
             else ({}, {})
         )
 
-        nightly_main_data, nightly_main_streaks = (
-            analyzer.analyze_consecutive_failures(nightly_main_runs)
-            if nightly_main_runs
+        nightly_nvidia_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_nvidia_scheduled_runs)
+            if nightly_nvidia_scheduled_runs
+            else ({}, {})
+        )
+        nightly_amd_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_amd_scheduled_runs)
+            if nightly_amd_scheduled_runs
+            else ({}, {})
+        )
+        nightly_intel_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_intel_scheduled_runs)
+            if nightly_intel_scheduled_runs
+            else ({}, {})
+        )
+        nightly_npu_scheduled_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_npu_scheduled_runs)
+            if nightly_npu_scheduled_runs
             else ({}, {})
         )
 
-        pr_test_general_data, pr_test_general_streaks = (
-            analyzer.analyze_consecutive_failures(pr_test_general_runs)
-            if pr_test_general_runs
+        # Analyze GENERAL runs
+        pr_test_nvidia_general_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_nvidia_general_runs)
+            if pr_test_nvidia_general_runs
+            else ({}, {})
+        )
+        pr_test_amd_general_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_amd_general_runs)
+            if pr_test_amd_general_runs
+            else ({}, {})
+        )
+        pr_test_xeon_general_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_xeon_general_runs)
+            if pr_test_xeon_general_runs
+            else ({}, {})
+        )
+        pr_test_xpu_general_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_xpu_general_runs)
+            if pr_test_xpu_general_runs
+            else ({}, {})
+        )
+        pr_test_npu_general_data, _ = (
+            analyzer.analyze_consecutive_failures(pr_test_npu_general_runs)
+            if pr_test_npu_general_runs
             else ({}, {})
         )
 
-        nightly_general_data, nightly_general_streaks = (
-            analyzer.analyze_consecutive_failures(nightly_general_runs)
-            if nightly_general_runs
+        nightly_nvidia_general_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_nvidia_general_runs)
+            if nightly_nvidia_general_runs
+            else ({}, {})
+        )
+        nightly_amd_general_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_amd_general_runs)
+            if nightly_amd_general_runs
+            else ({}, {})
+        )
+        nightly_intel_general_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_intel_general_runs)
+            if nightly_intel_general_runs
+            else ({}, {})
+        )
+        nightly_npu_general_data, _ = (
+            analyzer.analyze_consecutive_failures(nightly_npu_general_runs)
+            if nightly_npu_general_runs
             else ({}, {})
         )
 
@@ -1483,19 +1811,37 @@ def main():
             runner_instance_streak_data,
         ) = analyzer.analyze_runner_health(all_runs)
 
-        # Generate report with all 4 datasets
+        # Generate report with all datasets
         report_data = analyzer.generate_failure_report(
-            pr_test_main_data,
-            nightly_main_data,
-            pr_test_general_data,
-            nightly_general_data,
+            # Scheduled runs (9 workflows)
+            pr_test_nvidia_scheduled_data,
+            pr_test_amd_scheduled_data,
+            pr_test_xeon_scheduled_data,
+            pr_test_xpu_scheduled_data,
+            pr_test_npu_scheduled_data,
+            nightly_nvidia_scheduled_data,
+            nightly_amd_scheduled_data,
+            nightly_intel_scheduled_data,
+            nightly_npu_scheduled_data,
+            # General runs (9 workflows)
+            pr_test_nvidia_general_data,
+            pr_test_amd_general_data,
+            pr_test_xeon_general_data,
+            pr_test_xpu_general_data,
+            pr_test_npu_general_data,
+            nightly_nvidia_general_data,
+            nightly_amd_general_data,
+            nightly_intel_general_data,
+            nightly_npu_general_data,
+            # Runners
             runner_stats,
             runner_instance_data,
             runner_streak_data,
             runner_instance_streak_data,
+            # Config
             args.output,
-            pr_test_main_limit,
-            nightly_main_limit,
+            pr_test_scheduled_limit,
+            nightly_scheduled_limit,
             args.limit,
         )
 
