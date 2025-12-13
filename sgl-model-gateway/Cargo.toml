@@ -147,6 +147,10 @@ harness = false
 path = "benches/request_processing.rs"
 
 [[bench]]
+name = "router_registry_bench"
+harness = false
+
+[[bench]]
 name = "tokenizer_benchmark"
 harness = false
 path = "benches/tokenizer_benchmark.rs"

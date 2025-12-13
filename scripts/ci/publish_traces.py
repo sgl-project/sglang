@@ -14,12 +14,8 @@ from urllib.request import Request, urlopen
 
 
 def is_rate_limit_error(e):
-    """Check if an exception is a rate limit error"""
-    return (
-        isinstance(e, HTTPError)
-        and e.code in [403, 429]
-        and "rate limit exceeded" in getattr(e, "error_body", "").lower()
-    )
+    """Check if an exception is a GitHub permission/quota error that should not be retried"""
+    return isinstance(e, HTTPError) and e.code in [403, 429]
 
 
 def make_github_request(url, token, method="GET", data=None):

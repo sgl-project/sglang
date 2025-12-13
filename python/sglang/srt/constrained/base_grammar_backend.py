@@ -155,7 +155,7 @@ class BaseGrammarBackend:
         return self._not_supported("structural_tag", key_string)
 
     def _init_value_dispatch(
-        self, key: Tuple[str, str], reasoning: bool
+        self, key: Tuple[str, str], require_reasoning: bool
     ) -> Optional[BaseGrammarObject]:
         s = time.perf_counter()
         key_type, key_string = key
@@ -179,14 +179,14 @@ class BaseGrammarBackend:
         return grammar
 
     def get_cached_or_future_value(
-        self, key: Tuple[str, str], reasoning: bool
+        self, key: Tuple[str, str], require_reasoning: bool
     ) -> Optional[BaseGrammarObject]:
         value = self.cache.get(key)
         if value:
             copied_value = value.copy()
-            copied_value.maybe_init_reasoning(reasoning)
+            copied_value.maybe_init_reasoning(require_reasoning)
             return copied_value, True
-        value = self.executor.submit(self._init_value_dispatch, key, reasoning)
+        value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
         return value, False
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
