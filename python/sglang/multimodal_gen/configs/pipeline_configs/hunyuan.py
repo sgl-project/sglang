@@ -98,26 +98,6 @@ class HunyuanConfig(PipelineConfig):
         default_factory=lambda: ("fp16", "fp16")
     )
 
-    def get_supported_resolutions(self) -> list[tuple[int, int]] | None:
-        """
-        HunyuanVideo supported resolutions based on official documentation.
-        Supports 540p and 720p (recommended) in various aspect ratios.
-        """
-        return [
-            # 540p resolutions
-            (960, 544),  # 9:16
-            (544, 960),  # 16:9
-            (832, 624),  # 4:3
-            (624, 832),  # 3:4
-            (720, 720),  # 1:1
-            # 720p resolutions (recommended)
-            (1280, 720),  # 9:16
-            (720, 1280),  # 16:9
-            (832, 1104),  # 4:3
-            (1104, 832),  # 3:4
-            (960, 960),  # 1:1
-        ]
-
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
