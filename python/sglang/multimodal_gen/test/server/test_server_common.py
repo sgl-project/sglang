@@ -52,9 +52,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     server_args = case.server_args
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    extra_args += (
-        f" --num-gpus {server_args.num_gpus} --ulysses-degree {server_args.num_gpus}"
-    )
+    extra_args += f" --num-gpus {server_args.num_gpus}"
+
+    if server_args.ulysses_degree is not None:
+        extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
+
     # LoRA support
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"

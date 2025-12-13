@@ -119,6 +119,7 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    ulysses_degree: int | None = None
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
@@ -492,6 +493,8 @@ TWO_GPU_CASES_B = [
             warmup_text=1,
             warmup_edit=0,
             num_gpus=2,
+            # test ring attn
+            ulysses_degree=1,
         ),
         T2I_sampling_params,
     ),
