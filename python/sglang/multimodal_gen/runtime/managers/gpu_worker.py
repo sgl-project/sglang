@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import multiprocessing as mp
 import os
+import time
 from typing import List
 
 import torch
@@ -16,14 +17,18 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
-from sglang.multimodal_gen.runtime.pipelines import Req, build_pipeline
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core import Req, build_pipeline
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
     suppress_other_loggers,
+)
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    PerformanceLogger,
+    RequestTimings,
 )
 
 logger = init_logger(__name__)
@@ -62,7 +67,7 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        setproctitle(f"sgl_diffusion::scheduler:{self.local_rank}")
+        setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
         torch.cuda.set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
@@ -86,50 +91,69 @@ class GPUWorker:
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
 
-    def execute_forward(self, batch: List[Req], server_args: ServerArgs) -> OutputBatch:
+    def execute_forward(self, batch: List[Req]) -> OutputBatch:
         """
         Execute a forward pass.
         """
         assert self.pipeline is not None
         # TODO: dealing with first req for now
         req = batch[0]
-        output_batch = self.pipeline.forward(req, server_args)
-        if req.perf_logger:
-            logging_info = getattr(output_batch, "logging_info", None) or getattr(
-                req, "logging_info", None
-            )
-            if logging_info:
-                try:
-                    req.perf_logger.log_stage_metrics(logging_info)
-                except Exception:
-                    logger.exception(
-                        "Failed to log stage metrics for request %s", req.request_id
-                    )
-            req.perf_logger.log_total_duration("total_inference_time")
-        return output_batch
+        output_batch = None
+        try:
+            start_time = time.monotonic()
+            timings = RequestTimings(request_id=req.request_id)
+            req.timings = timings
 
-    def set_lora_adapter(
-        self, lora_nickname: str, lora_path: str | None = None
+            output_batch = self.pipeline.forward(req, self.server_args)
+            duration_ms = (time.monotonic() - start_time) * 1000
+
+            if output_batch.timings:
+                output_batch.timings.total_duration_ms = duration_ms
+                PerformanceLogger.log_request_summary(timings=output_batch.timings)
+        except Exception as e:
+            if output_batch is None:
+                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+                    OutputBatch,
+                )
+
+                output_batch = OutputBatch()
+            output_batch.error = f"Error executing request {req.request_id}: {e}"
+        finally:
+            return output_batch
+
+    def set_lora(
+        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
     ) -> None:
         """
         Set the LoRA adapter for the pipeline.
+
+        Args:
+            lora_nickname: The nickname of the adapter.
+            lora_path: Path to the LoRA adapter.
+            target: Which transformer(s) to apply the LoRA to.
         """
         assert self.pipeline is not None
-        self.pipeline.set_lora_adapter(lora_nickname, lora_path)
+        self.pipeline.set_lora(lora_nickname, lora_path, target)
 
-    def merge_lora_weights(self) -> None:
+    def merge_lora_weights(self, target: str = "all") -> None:
         """
         Merge LoRA weights.
+
+        Args:
+            target: Which transformer(s) to merge.
         """
         assert self.pipeline is not None
-        self.pipeline.merge_lora_weights()
+        self.pipeline.merge_lora_weights(target)
 
-    def unmerge_lora_weights(self) -> None:
+    def unmerge_lora_weights(self, target: str = "all") -> None:
         """
         Unmerge LoRA weights.
+
+        Args:
+            target: Which transformer(s) to unmerge.
         """
         assert self.pipeline is not None
-        self.pipeline.unmerge_lora_weights()
+        self.pipeline.unmerge_lora_weights(target)
 
 
 def run_scheduler_process(

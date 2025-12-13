@@ -145,37 +145,44 @@ def smart_nframes(
 async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
-    # vr: VideoReader, image_factor: int = IMAGE_FACTOR
+    video_config: dict = {},
 ) -> torch.Tensor:
     entry_time = time.perf_counter()
-    ele = {}
+
     total_frames, video_fps = len(vr), vr.get_avg_fps()
-    nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
+    nframes = smart_nframes(
+        video_config, total_frames=total_frames, video_fps=video_fps
+    )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
     video_np = vr.get_batch(idx).asnumpy()
     video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
+
     nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
-    total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
+    min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
+    total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
     max_pixels = max(
-        min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+        min(
+            video_config.get("max_pixels", VIDEO_MAX_PIXELS),
+            total_pixels / nframes * FRAME_FACTOR,
+        ),
         int(min_pixels * 1.05),
     )
 
     get_batch_time = time.perf_counter()
 
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
+    max_pixels_supposed = video_config.get("max_pixels", max_pixels)
+
     if max_pixels_supposed > max_pixels:
         logger.warning(
             f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}]."
         )
     max_pixels = min(max_pixels_supposed, max_pixels)
-    if "resized_height" in ele and "resized_width" in ele:
+    if "resized_height" in video_config and "resized_width" in video_config:
         resized_height, resized_width = smart_resize(
-            ele["resized_height"],
-            ele["resized_width"],
+            video_config["resized_height"],
+            video_config["resized_width"],
             factor=image_factor,
         )
     else:
@@ -228,13 +235,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
-        self.vision_end_token_id = hf_config.vision_end_token_id
+        self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
 
         self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
+
+        self.image_config = server_args.mm_process_config.get("image", {})
+        self.video_config = server_args.mm_process_config.get("video", {})
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
@@ -269,7 +277,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         video_metadata = None
         if base_output.videos:
             videos_processed = [
-                await preprocess_video(video) for video in base_output.videos
+                await preprocess_video(video, video_config=self.video_config)
+                for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
@@ -340,8 +349,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_start_id": self.vision_start_token_id,
+            "im_end_id": self.vision_end_token_id,
             "im_token_id": self.mm_tokens.image_token_id,
             "video_token_id": self.mm_tokens.video_token_id,
             "audio_token_id": self.mm_tokens.audio_token_id,

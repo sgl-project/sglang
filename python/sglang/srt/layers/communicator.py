@@ -56,9 +56,9 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_npu,
     is_sm90_supported,
     is_sm100_supported,
-    prepare_weight_cache,
 )
 
 _is_cuda = is_cuda()
@@ -67,11 +67,14 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_npu = is_npu()
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+elif _is_npu:
+    from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
@@ -214,14 +217,16 @@ class _LayerModeComputationContext:
     layer_id: int
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
+    is_next_layer_sparse: Optional[bool]
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
         return _LayerModeComputationContext(
+            num_layers=self.num_layers,
             layer_id=self.layer_id - 1,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
-            num_layers=self.num_layers,
+            is_next_layer_sparse=self.is_layer_sparse,
         )
 
 
@@ -271,6 +276,15 @@ class LayerScatterModes:
             )
 
     @classmethod
+    def _should_gather_for_tbo(cls, context: _LayerModeComputationContext):
+        return (
+            not context.is_layer_sparse
+            and context.is_next_layer_sparse
+            and enable_moe_dense_fully_dp()
+            and get_global_server_args().enable_two_batch_overlap
+        )
+
+    @classmethod
     def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
         mlp_mode = cls._compute_mlp_mode(context)
         if mlp_mode == ScatterMode.SCATTERED:
@@ -285,6 +299,8 @@ class LayerScatterModes:
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.model_input_output()
         if mlp_mode == ScatterMode.SCATTERED:
+            if cls._should_gather_for_tbo(context):
+                return ScatterMode.TP_ATTN_FULL
             return ScatterMode.SCATTERED
         if mlp_mode == ScatterMode.FULL:
             return ScatterMode.TP_ATTN_FULL
@@ -776,7 +792,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                if context.cache is not None:
+                if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual

@@ -1,8 +1,11 @@
 # DeepSeek V3.2 Usage
 
-[DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
+DeepSeek-V3.2 model family equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
 
 For reporting issues or tracking upcoming features, please refer to this [Roadmap](https://github.com/sgl-project/sglang/issues/11060).
+
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser.
+
 
 ## Installation
 
@@ -31,31 +34,35 @@ pip3 install -e "python"
 ```
 ## Launch DeepSeek V3.2 with SGLang
 
-To serve DeepSeek-V3.2-Exp on 8xH200/B200 GPUs:
+To serve [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) on 8xH200/B200 GPUs:
 
 ```bash
-# Launch with TP + DP
+# Launch with TP + DP (Recommended)
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention
 
 # Launch with EP + DP
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep 8 --dp 8 --enable-dp-attention
+
+# Launch with Pure TP
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 ```
 
 ### Configuration Tips
-- **DP Attention**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`, so DP attention is enabled by default for better stability and performance. The feature of launching with pure TP is still under development.
+- **DP Attention (Recommended)**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`, so DP attention (`--dp 8 --enable-dp-attention`) is the recommended configuration for better stability and performance. All test cases use this configuration by default.
+- **Pure TP Mode**: Launching with pure TP (without `--dp` and `--enable-dp-attention`) is also supported. Note that this mode has not been fully validated in PD disaggregation scenarios.
 - **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance. `MHA_ONE_SHOT` computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
 - **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
   - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, kv inputs.
   - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
-  - `alter`: Alter kernel on AMD HPUs. Can only be used as decode kernel.
+  - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
 - On the basis of performance benchmarks, the default configuration on H200 and B200 are set as follows :
   - H200: `flashmla_sparse` prefill attention (short-seq prefill uses MHA via FlashAttention varlen), `fa3` decode attention, `bf16` kv cache dtype.
   - B200: `flashmla_auto` prefill attention (short-seq prefill uses MHA via TRT-LLM ragged), `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype. `flashmla_auto` enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
 
 ## Multi-token Prediction
-SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
+SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
 
 Example usage:
 ```bash
@@ -66,7 +73,39 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 
 
 ## Function Calling and Reasoning Parser
-The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoning.html) and [Tool Parser](https://docs.sglang.ai/advanced_features/tool_parser.html) documents.
+The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](https://docs.sglang.io/advanced_features/separate_reasoning.html) and [Tool Parser](https://docs.sglang.io/advanced_features/tool_parser.html) documents.
+
+To launch `DeepSeek-V3.2-Exp` with function calling and reasoning parser:
+> Note: It is recommended to specify the chat-template, ensuring that you are within the sglang's root directory.
+```bash
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser deepseekv31 \
+  --reasoning-parser deepseek-v3 \
+  --chat-template ./examples/chat_template/tool_chat_template_deepseekv32.jinja
+```
+
+To launch `DeepSeek-V3.2` with function calling and reasoning parser:
+```bash
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2 \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser deepseekv32 \
+  --reasoning-parser deepseek-v3
+```
+
+`DeepSeek-V3.2-Speciale` doesn't support tool calling, so can only be launched with reasoning parser:
+```bash
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Speciale \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --reasoning-parser deepseek-v3
+```
+
 
 ## PD Disaggregation
 
@@ -129,6 +168,13 @@ Latency: 25.109 s
 Output throughput: 5226.235 token/s
 ```
 
+To test long-context accuracy, run gsm8k with `--num-shots 20`. The results are very close to the 8 shots results:
+```
+Accuracy: 0.956
+Invalid: 0.000
+Latency: 29.545 s
+Output throughput: 4418.617 token/s
+```
 
 ### Accuracy Test with `gpqa-diamond`
 
@@ -142,6 +188,78 @@ The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in offi
 Repeat: 8, mean: 0.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
+
+### Accuracy Test with `aime 2025`
+
+Prepare the environment by installing NeMo-Skills in the docker or your own virtual environment:
+
+  ```
+  pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
+  ```
+
+Then launch the SGLang server:
+```
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention
+```
+
+**For `DeepSeek-V3.2` and `DeepSeek-V3.2-Speciale`**:
+
+```
+python3 -m sglang.launch_server   --model-path deepseek-ai/DeepSeek-V3.2   --trust-remote-code   --tp-size 8 --dp-size 8 --enable-dp-attention   --tool-call-parser deepseekv32   --reasoning-parser deepseek-v3
+```
+
+Run the following script to evaluate AIME 2025:
+```
+#! /bin/bash
+export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
+
+ns prepare_data aime25
+
+PORT=30000
+BACKEND=sglang
+MODEL="deepseek-ai/DeepSeek-V3.2-Exp" # Should be changed to the model name
+MODEL_NAME="dsv32-fp8"
+
+echo "Starting AIME25 evaluation with model $MODEL on port $PORT using backend $BACKEND..."
+ns eval \
+  --benchmarks=aime25:4 \
+  --server_type=$BACKEND \
+  --model=$MODEL \
+  --server_address=http://localhost:${PORT}/v1 \
+  --output_dir=nemo_skills_aime25_${MODEL_NAME}_output_${BACKEND}_$(date +%Y%m%d_%H%M%S) \
+  ++chat_template_kwargs.thinking=true \
+  ++inference.temperature=1.0 \
+  ++inference.top_p=0.95 \
+  ++inference.tokens_to_generate=64000
+  # ++inference.tokens_to_generate=120000 for Speciale model
+```
+
+Test results (8*B200):
+
+DeepSeek-V3.2-Exp：
+
+| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
+|--------------------|-------------|------------|-------------|-----------------------|-----------|
+| pass@1[avg-of-4]   | 30          | 15040      | 1673        | 87.50% ± 1.67%        | 0.00%     |
+| majority@4         | 30          | 15040      | 1673        | 90.00%                | 0.00%     |
+| pass@4             | 30          | 15040      | 1673        | 90.00%                | 0.00%     |
+
+
+DeepSeek-V3.2:
+| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
+|--------------------|-------------|------------|-------------|-----------------------|-----------|
+| pass@1[avg-of-4]   | 30          | 13550      | 1632        | 92.50% ± 1.67%        | 0.00%     |
+| majority@4         | 30          | 13550      | 1632        | 94.71%                | 0.00%     |
+| pass@4             | 30          | 13550      | 1632        | 96.67%                | 0.00%     |
+
+
+DeepSeek-V3.2-Speciale:
+| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
+|--------------------|-------------|------------|-------------|-----------------------|-----------|
+| pass@1[avg-of-4]   | 30          | 24155      | 3583        | 95.00% ± 1.92%        | 0.00%     |
+| majority@4         | 30          | 24155      | 3583        | 95.83%                | 0.00%     |
+| pass@4             | 30          | 24155      | 3583        | 100.00%               | 0.00%     |
+
 
 
 ## DSA long sequence context parallel optimization(experimental)

@@ -96,7 +96,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 if forward_batch.spec_info.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
-                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                    # retrieve_next_token is None during dummy run so skip tensor creation
+                    if retrieve_next_token is not None:
+                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -641,22 +643,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            conv_states_to_use = conv_states.clone()
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-                .contiguous()
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states_to_use,
+                conv_states,
                 conv_weights,
                 bias,
                 activation,
@@ -666,16 +664,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use,
+                conv_states=conv_states,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -749,8 +745,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
-            metadata.query_start_loc,
-            metadata.mamba_cache_indices,
+            metadata,
             self.mamba_chunk_size,
             forward_batch,
         )
@@ -766,8 +761,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
+            metadata,
+            seq_lens,
+            is_target_verify=forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -784,8 +783,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
+            metadata,
+            seq_lens,
+            is_target_verify=forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
         )
 
     def forward(

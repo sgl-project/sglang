@@ -16,6 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial, wraps
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
@@ -25,9 +26,11 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -54,6 +57,9 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
+
+# VL test models
+DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -115,7 +121,7 @@ DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 
 # Nightly tests
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it,jet-ai/Jet-Nemotron-2B"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
@@ -123,10 +129,26 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+
+
+def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Image:
+    for i in range(max_retries):
+        try:
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+            image = Image.open(BytesIO(response.content))
+            image.load()
+            return image
+        except Exception as e:
+            if i == max_retries - 1:
+                raise RuntimeError(
+                    f"Failed to download image after {max_retries} retries: {image_url}"
+                ) from e
+            time.sleep(2**i)
 
 
 def is_in_ci():
@@ -141,7 +163,7 @@ def is_in_amd_ci():
 
 def is_blackwell_system():
     """Return whether it is running on a Blackwell (B200) system."""
-    return get_bool_env_var("IS_BLACKWELL")
+    return envs.IS_BLACKWELL.get()
 
 
 def _use_cached_default_models(model_repo: str):
@@ -844,6 +866,79 @@ def run_bench_serving(
     return res
 
 
+async def _run_api_benchmark_requests(
+    base_url: str,
+    endpoint: str,
+    test_requests: List[dict],
+    num_requests: int,
+    response_validator: Callable[[dict], bool],
+):
+    """
+    Helper function to run API benchmark requests and collect metrics.
+
+    Args:
+        base_url: The base URL of the server
+        endpoint: The API endpoint to test (e.g., "/v1/score", "/v1/embeddings")
+        test_requests: List of request payloads to send
+        num_requests: Total number of requests expected
+        response_validator: Function to validate if response contains expected data
+
+    Returns:
+        Dictionary with benchmark metrics
+    """
+    start_time = time.monotonic()
+    successful_requests = 0
+    total_latency = 0
+    latencies = []
+
+    async with aiohttp.ClientSession() as session:
+        for request_data in test_requests:
+            try:
+                request_start = time.monotonic()
+                async with session.post(
+                    f"{base_url}{endpoint}",
+                    json=request_data,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status == 200:
+                        response_data = await response.json()
+                        request_end = time.monotonic()
+
+                        if response_validator(response_data):
+                            latency_ms = (request_end - request_start) * 1000
+                            latencies.append(latency_ms)
+                            total_latency += latency_ms
+                            successful_requests += 1
+            except Exception:
+                continue
+
+    end_time = time.monotonic()
+    total_time = end_time - start_time
+
+    if successful_requests > 0:
+        throughput = successful_requests / total_time
+        avg_latency = total_latency / successful_requests
+        p95_latency = np.percentile(latencies, 95) if latencies else 0
+
+        return {
+            "completed": successful_requests,
+            "total_requests": num_requests,
+            "throughput": throughput,
+            "avg_latency_ms": avg_latency,
+            "p95_latency_ms": p95_latency,
+            "successful_requests": successful_requests,
+        }
+    else:
+        return {
+            "completed": 0,
+            "total_requests": num_requests,
+            "throughput": 0,
+            "avg_latency_ms": 0,
+            "p95_latency_ms": 0,
+            "successful_requests": 0,
+        }
+
+
 def run_score_benchmark(
     model,
     num_requests=100,
@@ -929,58 +1024,109 @@ def run_score_benchmark(
             }
             test_requests.append(score_data)
 
-        start_time = time.monotonic()
-        successful_requests = 0
-        total_latency = 0
-        latencies = []
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/score",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "scores" in resp or "logprobs" in resp,
+        )
 
-        async with aiohttp.ClientSession() as session:
-            for request_data in test_requests:
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+
+    assert res["completed"] == res["successful_requests"]
+    return res
+
+
+def run_embeddings_benchmark(
+    model,
+    num_requests=100,
+    batch_size=1,
+    input_tokens=500,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """Embeddings API benchmark function compatible with run_bench_serving pattern"""
+    if other_server_args is None:
+        other_server_args = []
+
+    if device == "auto":
+        device = auto_config_device()
+
+    # Add --is-embedding flag for embedding models
+    server_args = ["--is-embedding"] + other_server_args
+
+    # Launch the server (consistent with run_bench_serving)
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=server_args,
+    )
+
+    async def _run_benchmark():
+
+        # Load tokenizer for generating test data
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+
+        def generate_text_with_token_count(num_tokens):
+            """Generate text with precise token count using special tokens."""
+            # Use a token that reliably produces 1 token
+            special_token = "<|im_start|>"
+            # Verify it's a single token
+            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
+            text = special_token * num_tokens
+            return text
+
+        # Generate input text
+        input_text = generate_text_with_token_count(input_tokens)
+
+        if need_warmup:
+            warmup_data = {
+                "input": input_text,
+                "model": model,
+            }
+
+            async with aiohttp.ClientSession() as session:
                 try:
-                    request_start = time.monotonic()
-                    async with session.post(
-                        f"{base_url}/v1/score",
-                        json=request_data,
+                    await session.post(
+                        f"{base_url}/v1/embeddings",
+                        json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
-                    ) as response:
-                        if response.status == 200:
-                            response_data = await response.json()
-                            request_end = time.monotonic()
+                    )
+                except:
+                    pass  # Ignore warmup errors
 
-                            if "scores" in response_data or "logprobs" in response_data:
-                                latency_ms = (request_end - request_start) * 1000
-                                latencies.append(latency_ms)
-                                total_latency += latency_ms
-                                successful_requests += 1
-                except Exception:
-                    continue
+        test_requests = []
+        for i in range(num_requests):
+            if batch_size == 1:
+                input_data = input_text
+            else:
+                input_data = [input_text for _ in range(batch_size)]
 
-        end_time = time.monotonic()
-        total_time = end_time - start_time
-
-        if successful_requests > 0:
-            throughput = successful_requests / total_time
-            avg_latency = total_latency / successful_requests
-            latencies.sort()
-            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
-
-            return {
-                "completed": successful_requests,
-                "total_requests": num_requests,
-                "throughput": throughput,
-                "avg_latency_ms": avg_latency,
-                "p95_latency_ms": p95_latency,
-                "successful_requests": successful_requests,
+            embeddings_data = {
+                "input": input_data,
+                "model": model,
             }
-        else:
-            return {
-                "completed": 0,
-                "total_requests": num_requests,
-                "throughput": 0,
-                "avg_latency_ms": 0,
-                "p95_latency_ms": 0,
-                "successful_requests": 0,
-            }
+
+            test_requests.append(embeddings_data)
+
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/embeddings",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "data" in resp,
+        )
 
     try:
         res = asyncio.run(_run_benchmark())
@@ -1056,21 +1202,20 @@ def run_bench_one_batch(model, other_args):
 
     try:
         stdout, stderr = process.communicate()
-        output = stdout.decode()
-        error = stderr.decode()
+        output = stdout.decode(errors="backslashreplace")
+        error = stderr.decode(errors="backslashreplace")
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
         # Return prefill_latency, decode_throughput, decode_latency
-        prefill_line = output.split("\n")[-9]
-        decode_line = output.split("\n")[-3]
-        pattern = (
-            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
-        )
-        match = re.search(pattern, prefill_line)
+        pattern = r"Benchmark[\s\S]*Total"
+        match = re.search(pattern, output)
+        bench_output = match[0] if match else ""
+        pattern = r".*?latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        match = re.search(r"Prefill." + pattern, bench_output)
         if match:
             prefill_latency = float(match.group("latency"))
-        match = re.search(pattern, decode_line)
+        match = re.search(r"Decode." + pattern, bench_output)
         if match:
             decode_latency = float(match.group("latency"))
             decode_throughput = float(match.group("throughput"))
@@ -1103,8 +1248,8 @@ def run_bench_offline_throughput(model, other_args):
 
     try:
         stdout, stderr = process.communicate()
-        output = stdout.decode()
-        error = stderr.decode()
+        output = stdout.decode(errors="backslashreplace")
+        error = stderr.decode(errors="backslashreplace")
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 

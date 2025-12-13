@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
+import dataclasses
 import os
+import time
+from typing import Optional
 
 import imageio
 import numpy as np
@@ -9,10 +11,31 @@ import torchvision
 from einops import rearrange
 from fastapi import UploadFile
 
-from sglang.multimodal_gen.configs.sample.base import DataType
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    log_batch_completion,
+    log_generation_timer,
+)
 
 logger = init_logger(__name__)
+
+
+@dataclasses.dataclass
+class SetLoraReq:
+    lora_nickname: str
+    lora_path: Optional[str] = None
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+
+
+@dataclasses.dataclass
+class MergeLoraWeightsReq:
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+
+
+@dataclasses.dataclass
+class UnmergeLoraWeightsReq:
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 def post_process_sample(
@@ -75,3 +98,29 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     with open(target_path, "wb") as f:
         f.write(content)
     return target_path
+
+
+async def process_generation_batch(
+    scheduler_client,
+    batch,
+):
+    total_start_time = time.perf_counter()
+    with log_generation_timer(logger, batch.prompt):
+        result = await scheduler_client.forward([batch])
+
+        if result.output is None:
+            raise RuntimeError("Model generation returned no output.")
+
+        save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
+        post_process_sample(
+            result.output[0],
+            batch.data_type,
+            batch.fps,
+            batch.save_output,
+            save_file_path,
+        )
+
+    total_time = time.perf_counter() - total_start_time
+    log_batch_completion(logger, 1, total_time)
+
+    return save_file_path

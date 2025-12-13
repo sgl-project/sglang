@@ -44,25 +44,38 @@ class SGLangFailuresAnalyzer:
         self.session.headers.update(self.headers)
 
         # Target workflows to monitor
-        self.target_workflows = ["PR Test"]
+        self.target_workflows = [
+            "PR Test",  # Nvidia GPU tests
+            "PR Test (AMD)",  # AMD GPU tests
+            "PR Test (Xeon)",  # Intel Xeon CPU tests
+        ]
 
         # Jobs to EXCLUDE from analysis (administrative/setup jobs, not actual tests)
         self.excluded_jobs = [
             "check-changes",
-            "pr-test-finish",
+            "pr-test-finish",  # Nvidia workflow teardown
+            "pr-test-amd-finish",  # AMD workflow teardown
+            "call-gate",
+            "pr-gate",
         ]
 
     def get_recent_runs(self, limit: int = 500) -> List[Dict]:
-        """Fetch recent workflow runs from GitHub API."""
-        print(f"Fetching {limit} recent workflow runs...")
+        """
+        Fetch recent workflow runs from GitHub API.
+        Keeps fetching until we have 'limit' runs from target workflows.
+        """
+        print(
+            f"Fetching until we have {limit} runs from target workflows (PR Test, PR Test AMD, PR Test Xeon)..."
+        )
 
-        all_runs = []
+        filtered_runs = []
         page = 1
         per_page = 100
+        max_pages = 100  # Safety limit to prevent infinite loops (10,000 total runs)
 
-        while len(all_runs) < limit:
+        while len(filtered_runs) < limit and page <= max_pages:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
-            params = {"per_page": min(per_page, limit - len(all_runs)), "page": page}
+            params = {"per_page": per_page, "page": page}
 
             try:
                 response = self.session.get(url, params=params, timeout=30)
@@ -70,12 +83,25 @@ class SGLangFailuresAnalyzer:
                 data = response.json()
 
                 if not data.get("workflow_runs"):
+                    print("No more workflow runs available")
                     break
 
-                all_runs.extend(data["workflow_runs"])
-                print(f"Fetched {len(all_runs)} runs so far...")
+                # Filter this batch to target workflows
+                batch_filtered = [
+                    run
+                    for run in data["workflow_runs"]
+                    if run.get("name") in self.target_workflows
+                    and run.get("status") == "completed"
+                ]
 
+                filtered_runs.extend(batch_filtered)
+                print(
+                    f"Fetched {len(filtered_runs)} target workflow runs so far (scanned page {page})..."
+                )
+
+                # If GitHub returned fewer than per_page, we've reached the end
                 if len(data["workflow_runs"]) < per_page:
+                    print("Reached end of available workflow runs")
                     break
 
                 page += 1
@@ -85,15 +111,12 @@ class SGLangFailuresAnalyzer:
                 print(f"Error fetching workflow runs: {e}")
                 break
 
-        # Filter to target workflows only
-        filtered_runs = [
-            run
-            for run in all_runs
-            if run.get("name") in self.target_workflows
-            and run.get("status") == "completed"
-        ]
+        if page > max_pages:
+            print(
+                f"Warning: Reached max pages limit ({max_pages}). Consider reducing --limit or increasing max_pages."
+            )
 
-        print(f"Filtered to {len(filtered_runs)} completed target workflow runs")
+        print(f"Collected {len(filtered_runs)} completed target workflow runs")
         return filtered_runs[:limit]
 
     def get_jobs_for_run(self, run_id: int) -> List[Dict]:
@@ -111,21 +134,23 @@ class SGLangFailuresAnalyzer:
 
     def analyze_runner_health(
         self, runs: List[Dict]
-    ) -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
+    ) -> Tuple[Dict[str, Dict], Dict[str, Dict], Dict[str, Dict], Dict[str, Dict]]:
         """
-        Analyze runner health by tracking failures per runner.
+        Analyze runner health by tracking failures per runner and consecutive failure streaks.
 
         Returns:
-            Tuple of (runner_stats, runner_job_failures)
+            Tuple of (runner_stats, runner_instance_data, runner_streak_data, runner_instance_streak_data)
             - runner_stats: Overall stats per runner (failure rate, total jobs, etc.)
-            - runner_job_failures: Per-runner breakdown of which jobs failed
+            - runner_instance_data: Per-instance breakdown of failures
+            - runner_streak_data: Consecutive failure streaks per runner label
+            - runner_instance_streak_data: Consecutive failure streaks per runner instance
         """
-        print("\nAnalyzing runner health...")
+        print("\nAnalyzing runner health and consecutive failures...")
 
         # Sort runs by created_at (oldest first)
         sorted_runs = sorted(runs, key=lambda x: x.get("created_at", ""))
 
-        # Track runner statistics
+        # Track runner statistics (overall)
         runner_total_jobs: Dict[str, int] = defaultdict(int)
         runner_failed_jobs: Dict[str, int] = defaultdict(int)
         runner_job_failures: Dict[str, Dict[str, int]] = defaultdict(
@@ -135,9 +160,32 @@ class SGLangFailuresAnalyzer:
             lambda: defaultdict(int)
         )
 
+        # Track queue times per runner instance (can aggregate for runner labels if needed)
+        runner_instance_queue_times: Dict[str, List[float]] = defaultdict(list)
+
         # Track individual runner instances (runner_name + runner_id)
         runner_instance_stats: Dict[str, Dict] = defaultdict(
             lambda: {"total_jobs": 0, "failed_jobs": 0, "jobs_failed": defaultdict(int)}
+        )
+
+        # Track consecutive failures per runner (by labels)
+        runner_current_streak: Dict[str, int] = defaultdict(int)
+        runner_max_streak: Dict[str, int] = defaultdict(int)
+        runner_first_failure_in_streak: Dict[str, Optional[Dict]] = {}
+        runner_last_failure_in_streak: Dict[str, Optional[Dict]] = {}
+        runner_recovery_info: Dict[str, Optional[Dict]] = {}
+        runner_error_signatures: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
+        # Track consecutive failures per runner instance
+        runner_instance_current_streak: Dict[str, int] = defaultdict(int)
+        runner_instance_max_streak: Dict[str, int] = defaultdict(int)
+        runner_instance_first_failure: Dict[str, Optional[Dict]] = {}
+        runner_instance_last_failure: Dict[str, Optional[Dict]] = {}
+        runner_instance_recovery: Dict[str, Optional[Dict]] = {}
+        runner_instance_error_signatures: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
         )
 
         total_runs_processed = len(sorted_runs)
@@ -147,8 +195,31 @@ class SGLangFailuresAnalyzer:
                     f"Processing run {i}/{total_runs_processed} for runner analysis: #{run.get('run_number')}"
                 )
 
+            head_commit = run.get("head_commit") or {}
+            run_info = {
+                "run_number": run.get("run_number"),
+                "run_id": run.get("id"),
+                "created_at": run.get("created_at"),
+                "head_sha": run.get("head_sha", "")[:8],
+                "author": head_commit.get("author", {}).get("name", "Unknown"),
+                "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
+            }
+
+            pull_requests = run.get("pull_requests", [])
+            if pull_requests:
+                run_info["pr_number"] = pull_requests[0].get("number")
+
             # Get jobs for this run
             jobs = self.get_jobs_for_run(run.get("id"))
+
+            # Track whether each runner had at least one failure in this run
+            runner_had_failure: Dict[str, bool] = defaultdict(bool)
+            runner_had_success: Dict[str, bool] = defaultdict(bool)
+            runner_instance_had_failure: Dict[str, bool] = defaultdict(bool)
+            runner_instance_had_success: Dict[str, bool] = defaultdict(bool)
+            # Track first failed job for each runner in this run (for linking)
+            runner_first_failed_job: Dict[str, Dict] = {}
+            runner_instance_first_failed_job: Dict[str, Dict] = {}
 
             for job in jobs:
                 job_name = job.get("name", "")
@@ -193,18 +264,175 @@ class SGLangFailuresAnalyzer:
                         "runner_name"
                     ] = runner_name
 
+                    # Calculate queue time (time from created to started) per instance
+                    created_at = job.get("created_at")
+                    started_at = job.get("started_at")
+                    if created_at and started_at:
+                        try:
+                            from datetime import datetime
+
+                            created_time = datetime.fromisoformat(
+                                created_at.replace("Z", "+00:00")
+                            )
+                            started_time = datetime.fromisoformat(
+                                started_at.replace("Z", "+00:00")
+                            )
+                            queue_time_seconds = (
+                                started_time - created_time
+                            ).total_seconds()
+                            if queue_time_seconds >= 0:  # Sanity check
+                                runner_instance_queue_times[runner_instance_key].append(
+                                    queue_time_seconds
+                                )
+                        except (ValueError, AttributeError):
+                            pass  # Skip if timestamp parsing fails
+
                 conclusion = job.get("conclusion")
 
                 if conclusion == "failure":
                     # Failure detected
                     runner_failed_jobs[runner_key] += 1
                     runner_job_failures[runner_key][job_name] += 1
+                    runner_had_failure[runner_key] = True
+
+                    # Track first failed job for this runner in this run (for linking)
+                    if runner_key not in runner_first_failed_job:
+                        runner_first_failed_job[runner_key] = {
+                            "job_id": job.get("id"),
+                            "job_url": job.get("html_url", run_info["url"]),
+                            "job_name": job_name,
+                        }
+
+                    # Extract error signature for runner
+                    error_signature = self._extract_error_signature(job)
+                    if error_signature:
+                        runner_error_signatures[runner_key][error_signature] += 1
 
                     if runner_id:
                         runner_instance_stats[runner_instance_key]["failed_jobs"] += 1
                         runner_instance_stats[runner_instance_key]["jobs_failed"][
                             job_name
                         ] += 1
+                        runner_instance_had_failure[runner_instance_key] = True
+
+                        # Track first failed job for this runner instance in this run
+                        if runner_instance_key not in runner_instance_first_failed_job:
+                            runner_instance_first_failed_job[runner_instance_key] = {
+                                "job_id": job.get("id"),
+                                "job_url": job.get("html_url", run_info["url"]),
+                                "job_name": job_name,
+                            }
+
+                        # Extract error signature for runner instance
+                        if error_signature:
+                            runner_instance_error_signatures[runner_instance_key][
+                                error_signature
+                            ] += 1
+
+                elif conclusion == "success":
+                    runner_had_success[runner_key] = True
+                    if runner_id:
+                        runner_instance_had_success[runner_instance_key] = True
+
+            # Update consecutive failure streaks based on run-level results
+            # A runner is considered "failing" if it had at least one failure in the run
+            for runner_key in set(
+                list(runner_had_failure.keys()) + list(runner_had_success.keys())
+            ):
+                if runner_had_failure[runner_key]:
+                    runner_current_streak[runner_key] += 1
+                    failure_info = {
+                        **run_info,
+                        "runner_key": runner_key,
+                    }
+
+                    # Include job URL if we have it
+                    if runner_key in runner_first_failed_job:
+                        failure_info.update(runner_first_failed_job[runner_key])
+
+                    # Track if this is the first failure in a new streak
+                    if runner_current_streak[runner_key] == 1:
+                        runner_first_failure_in_streak[runner_key] = failure_info
+                    # Always update last failure to the most recent one
+                    runner_last_failure_in_streak[runner_key] = failure_info
+
+                    # Update max streak
+                    if (
+                        runner_current_streak[runner_key]
+                        > runner_max_streak[runner_key]
+                    ):
+                        runner_max_streak[runner_key] = runner_current_streak[
+                            runner_key
+                        ]
+
+                elif runner_had_success[runner_key]:
+                    # Success - streak broken
+                    if runner_current_streak[runner_key] > 0:
+                        runner_recovery_info[runner_key] = {
+                            **run_info,
+                            "runner_key": runner_key,
+                            "streak_length": runner_current_streak[runner_key],
+                        }
+
+                    runner_current_streak[runner_key] = 0
+                    runner_first_failure_in_streak[runner_key] = None
+                    runner_last_failure_in_streak[runner_key] = None
+
+            # Update instance streaks
+            for runner_instance_key in set(
+                list(runner_instance_had_failure.keys())
+                + list(runner_instance_had_success.keys())
+            ):
+                if runner_instance_had_failure[runner_instance_key]:
+                    runner_instance_current_streak[runner_instance_key] += 1
+
+                    if runner_instance_current_streak[runner_instance_key] == 1:
+                        failure_info = {
+                            **run_info,
+                            "runner_instance": runner_instance_key,
+                        }
+                        # Include job URL if we have it
+                        if runner_instance_key in runner_instance_first_failed_job:
+                            failure_info.update(
+                                runner_instance_first_failed_job[runner_instance_key]
+                            )
+                        runner_instance_first_failure[runner_instance_key] = (
+                            failure_info
+                        )
+
+                    # Always update last failure to the most recent one
+                    failure_info = {
+                        **run_info,
+                        "runner_instance": runner_instance_key,
+                    }
+                    # Include job URL if we have it
+                    if runner_instance_key in runner_instance_first_failed_job:
+                        failure_info.update(
+                            runner_instance_first_failed_job[runner_instance_key]
+                        )
+                    runner_instance_last_failure[runner_instance_key] = failure_info
+
+                    if (
+                        runner_instance_current_streak[runner_instance_key]
+                        > runner_instance_max_streak[runner_instance_key]
+                    ):
+                        runner_instance_max_streak[runner_instance_key] = (
+                            runner_instance_current_streak[runner_instance_key]
+                        )
+
+                elif runner_instance_had_success[runner_instance_key]:
+                    if runner_instance_current_streak[runner_instance_key] > 0:
+                        runner_instance_recovery[runner_instance_key] = {
+                            **run_info,
+                            "runner_instance": runner_instance_key,
+                            "streak_length": runner_instance_current_streak[
+                                runner_instance_key
+                            ],
+                        }
+
+                    runner_instance_current_streak[runner_instance_key] = 0
+                    runner_instance_first_failure[runner_instance_key] = None
+                    runner_instance_last_failure[runner_instance_key] = None
 
             time.sleep(0.05)
 
@@ -215,6 +443,34 @@ class SGLangFailuresAnalyzer:
             failed = runner_failed_jobs[runner_key]
             failure_rate = (failed / total * 100) if total > 0 else 0
 
+            # Calculate queue time statistics by aggregating from runner instances
+            # Find all instances that match this runner label
+            aggregated_queue_times = []
+            for instance_key, queue_times in runner_instance_queue_times.items():
+                # Extract the labels part from "labels_id"
+                instance_labels = (
+                    instance_key.rsplit("_", 1)[0]
+                    if "_" in instance_key
+                    else instance_key
+                )
+                if instance_labels == runner_key:
+                    aggregated_queue_times.extend(queue_times)
+
+            avg_queue_time = (
+                sum(aggregated_queue_times) / len(aggregated_queue_times)
+                if aggregated_queue_times
+                else 0
+            )
+            p90_queue_time = 0
+            if aggregated_queue_times:
+                sorted_queue_times = sorted(aggregated_queue_times)
+                p90_index = int(len(sorted_queue_times) * 0.9)
+                p90_queue_time = (
+                    sorted_queue_times[p90_index]
+                    if p90_index < len(sorted_queue_times)
+                    else sorted_queue_times[-1]
+                )
+
             runner_stats[runner_key] = {
                 "total_jobs": total,
                 "failed_jobs": failed,
@@ -222,11 +478,27 @@ class SGLangFailuresAnalyzer:
                 "unique_jobs_with_failures": len(runner_job_failures[runner_key]),
                 "jobs_failed": dict(runner_job_failures[runner_key]),
                 "jobs_total": dict(runner_job_totals[runner_key]),
+                "avg_queue_time_seconds": avg_queue_time,
+                "p90_queue_time_seconds": p90_queue_time,
+                "queue_time_samples": len(aggregated_queue_times),
             }
 
-        # Convert runner instance stats to regular dicts
+        # Convert runner instance stats to regular dicts with queue time stats
         runner_instance_data = {}
         for instance_key, stats in runner_instance_stats.items():
+            # Calculate queue time statistics for this instance
+            queue_times = runner_instance_queue_times[instance_key]
+            avg_queue_time = sum(queue_times) / len(queue_times) if queue_times else 0
+            p90_queue_time = 0
+            if queue_times:
+                sorted_queue_times = sorted(queue_times)
+                p90_index = int(len(sorted_queue_times) * 0.9)
+                p90_queue_time = (
+                    sorted_queue_times[p90_index]
+                    if p90_index < len(sorted_queue_times)
+                    else sorted_queue_times[-1]
+                )
+
             runner_instance_data[instance_key] = {
                 "total_jobs": stats["total_jobs"],
                 "failed_jobs": stats["failed_jobs"],
@@ -237,9 +509,287 @@ class SGLangFailuresAnalyzer:
                 ),
                 "jobs_failed": dict(stats["jobs_failed"]),
                 "runner_name": stats.get("runner_name", "unknown"),
+                "avg_queue_time_seconds": avg_queue_time,
+                "p90_queue_time_seconds": p90_queue_time,
+                "queue_time_samples": len(queue_times),
             }
 
-        return runner_stats, runner_instance_data
+        # Build runner streak data
+        runner_streak_data = {}
+        for runner_key in runner_total_jobs.keys():
+            # Get top 3 error signatures for this runner
+            error_sigs = runner_error_signatures.get(runner_key, {})
+            top_errors = sorted(error_sigs.items(), key=lambda x: x[1], reverse=True)[
+                :3
+            ]
+
+            runner_streak_data[runner_key] = {
+                "current_streak": runner_current_streak[runner_key],
+                "max_streak": runner_max_streak[runner_key],
+                "total_failures": runner_failed_jobs[runner_key],
+                "total_jobs": runner_total_jobs[runner_key],
+                "failure_rate": (
+                    runner_failed_jobs[runner_key] / runner_total_jobs[runner_key] * 100
+                    if runner_total_jobs[runner_key] > 0
+                    else 0
+                ),
+                "jobs_failed": dict(runner_job_failures[runner_key]),
+                "first_failure_in_streak": runner_first_failure_in_streak.get(
+                    runner_key
+                ),
+                "last_failure_in_streak": runner_last_failure_in_streak.get(runner_key),
+                "recovery_info": runner_recovery_info.get(runner_key),
+                "top_error_signatures": top_errors,
+            }
+
+        # Build runner instance streak data
+        runner_instance_streak_data = {}
+        for instance_key in runner_instance_stats.keys():
+            # Get top 3 error signatures for this runner instance
+            error_sigs = runner_instance_error_signatures.get(instance_key, {})
+            top_errors = sorted(error_sigs.items(), key=lambda x: x[1], reverse=True)[
+                :3
+            ]
+
+            runner_instance_streak_data[instance_key] = {
+                "current_streak": runner_instance_current_streak[instance_key],
+                "max_streak": runner_instance_max_streak[instance_key],
+                "total_failures": runner_instance_stats[instance_key]["failed_jobs"],
+                "total_jobs": runner_instance_stats[instance_key]["total_jobs"],
+                "failure_rate": (
+                    runner_instance_stats[instance_key]["failed_jobs"]
+                    / runner_instance_stats[instance_key]["total_jobs"]
+                    * 100
+                    if runner_instance_stats[instance_key]["total_jobs"] > 0
+                    else 0
+                ),
+                "runner_name": runner_instance_stats[instance_key].get(
+                    "runner_name", "unknown"
+                ),
+                "jobs_failed": dict(runner_instance_stats[instance_key]["jobs_failed"]),
+                "first_failure_in_streak": runner_instance_first_failure.get(
+                    instance_key
+                ),
+                "last_failure_in_streak": runner_instance_last_failure.get(
+                    instance_key
+                ),
+                "recovery_info": runner_instance_recovery.get(instance_key),
+                "top_error_signatures": top_errors,
+            }
+
+        return (
+            runner_stats,
+            runner_instance_data,
+            runner_streak_data,
+            runner_instance_streak_data,
+        )
+
+    def _extract_error_signature(self, job: Dict) -> str:
+        """
+        Extract error signature from a failed job.
+
+        Returns a simplified error type string.
+        """
+        # Check if job has steps with failures
+        steps = job.get("steps", [])
+        if not steps:
+            return "Unknown Error"
+
+        # Look for failed steps
+        failed_steps = [s for s in steps if s.get("conclusion") == "failure"]
+        if not failed_steps:
+            return "Unknown Error"
+
+        # Try to fetch and parse logs for the first failed step
+        first_failed_step = failed_steps[0]
+        step_number = first_failed_step.get("number")
+
+        # Attempt to get detailed error from logs
+        if step_number is not None:
+            try:
+                job_id = job.get("id")
+                # Fetch logs for this specific step
+                log_url = (
+                    f"{self.base_url}/repos/{self.repo}/actions/jobs/{job_id}/logs"
+                )
+                response = self.session.get(log_url, timeout=10)
+
+                if response.status_code == 200:
+                    log_text = response.text
+
+                    # Check for specific error patterns in logs (case-insensitive)
+                    log_lower = log_text.lower()
+
+                    # CUDA/GPU Memory errors (most common for GPU clusters)
+                    if (
+                        "cuda out of memory" in log_lower
+                        or "cudaerror: out of memory" in log_lower
+                    ):
+                        return "CUDA OOM"
+                    elif "out of memory" in log_lower and (
+                        "gpu" in log_lower or "device" in log_lower
+                    ):
+                        return "GPU OOM"
+                    elif "out of memory" in log_lower and "cuda" not in log_lower:
+                        return "Out of Memory"
+
+                    # CUDA/GPU device errors
+                    if (
+                        "cuda error: device-side assert" in log_lower
+                        or "device-side assert" in log_lower
+                    ):
+                        return "CUDA Device Assert"
+                    elif (
+                        "cuda error: an illegal memory access" in log_lower
+                        or "illegal memory access" in log_lower
+                    ):
+                        return "CUDA Illegal Memory Access"
+                    elif "cuda error" in log_lower or "cudaerror" in log_lower:
+                        return "CUDA Error"
+                    elif "gpu" in log_lower and (
+                        "hang" in log_lower or "hung" in log_lower
+                    ):
+                        return "GPU Hang"
+                    elif (
+                        "no cuda-capable device" in log_lower
+                        or "cuda device count" in log_lower
+                        and "0" in log_lower
+                    ):
+                        return "No GPU Available"
+
+                    # ROCm/AMD GPU errors
+                    if (
+                        "hipoutofmemoryerror" in log_lower
+                        or "hip out of memory" in log_lower
+                    ):
+                        return "ROCm OOM"
+                    elif "hiperror" in log_lower or "rocm error" in log_lower:
+                        return "ROCm/HIP Error"
+
+                    # NCCL/collective communication errors (multi-GPU)
+                    if "nccl error" in log_lower or "ncclerror" in log_lower:
+                        return "NCCL Error"
+                    elif "timeout after" in log_lower and "nccl" in log_lower:
+                        return "NCCL Timeout"
+
+                    # Process/system errors
+                    if "killed" in log_lower and (
+                        "oom" in log_lower or "out of memory" in log_lower
+                    ):
+                        return "Process Killed (OOM)"
+                    elif "killed" in log_lower or "sigkill" in log_lower:
+                        return "Process Killed"
+                    elif "segmentation fault" in log_lower or "sigsegv" in log_lower:
+                        return "Segmentation Fault"
+
+                    # Timeout errors
+                    if "timeout" in log_lower or "timed out" in log_lower:
+                        return "Timeout"
+
+                    # Connection/network errors
+                    if (
+                        "connection refused" in log_lower
+                        or "connection reset" in log_lower
+                    ):
+                        return "Connection Error"
+                    elif "ssh" in log_lower and (
+                        "failed" in log_lower or "error" in log_lower
+                    ):
+                        return "SSH Error"
+
+                    # Import/module errors
+                    if "modulenotfounderror" in log_lower or "importerror" in log_lower:
+                        return "Import Error"
+
+                    # Assertion errors
+                    if "assertionerror" in log_lower:
+                        return "Assertion Error"
+
+                    # Pytest-specific errors
+                    if (
+                        "pytest" in log_lower
+                        and "error" in log_lower
+                        and "collection" in log_lower
+                    ):
+                        return "Pytest Collection Error"
+
+            except Exception:
+                # If log fetching fails, fall back to step name analysis
+                pass
+
+        # Fallback to step name analysis if we couldn't get logs or didn't find specific errors
+        step_name = first_failed_step.get("name", "Unknown Step")
+
+        # Simplify common patterns based on step name
+        if "timeout" in step_name.lower():
+            return "Timeout"
+        elif "setup" in step_name.lower() or "install" in step_name.lower():
+            return "Setup/Installation Error"
+        elif "test" in step_name.lower():
+            return f"Test Failure: {step_name[:50]}"
+        elif "build" in step_name.lower():
+            return "Build Error"
+        else:
+            return f"Step Failed: {step_name[:50]}"
+
+    def construct_cron_failures_on_main(
+        self, runs: List[Dict], overall_job_streak_data: Dict[str, Dict]
+    ) -> Tuple[Dict[str, Dict], Dict[str, int]]:
+        """
+        Analyses consecutive failures for each job triggered by cron on main branch only.
+        Compares error signatures with overall data to detect if main-branch failures
+        have same or different error patterns than PR-triggered failures.
+
+        Args:
+            runs: All workflow runs (will be filtered to cron-triggered only)
+            overall_job_streak_data: Overall job streak data (from all runs) for comparison
+
+        Returns:
+            Tuple of (main_streak_data, job_current_streaks_main)
+            - main_streak_data: Same structure as job_streak_data, plus 'matches_overall_error' field
+            - job_current_streaks_main: Dict mapping job name to current streak count on main
+        """
+        print(
+            "\nAnalyzing consecutive failures on main branch (cron-triggered runs only)..."
+        )
+
+        # Filter to only cron-triggered runs (scheduled runs)
+        # Scheduled/cron runs have event == 'schedule'
+        cron_runs = [run for run in runs if run.get("event") == "schedule"]
+
+        print(
+            f"Found {len(cron_runs)} cron-triggered runs out of {len(runs)} total runs"
+        )
+
+        if not cron_runs:
+            print("No cron-triggered runs found")
+            return {}, {}
+
+        # Reuse existing analyze_consecutive_failures on filtered runs
+        main_streak_data, job_current_streaks_main = self.analyze_consecutive_failures(
+            cron_runs
+        )
+
+        # Now add comparison with overall data for at-a-glance diagnostics
+        for job_name, main_data in main_streak_data.items():
+            matches_overall_error = False
+
+            if job_name in overall_job_streak_data:
+                main_top_errors = main_data.get("top_error_signatures", [])
+                overall_top_errors = overall_job_streak_data[job_name].get(
+                    "top_error_signatures", []
+                )
+
+                if main_top_errors and overall_top_errors:
+                    # Check if the most common error on main matches the most common overall error
+                    main_top_error = main_top_errors[0][0]
+                    overall_top_error = overall_top_errors[0][0]
+                    matches_overall_error = main_top_error == overall_top_error
+
+            # Add comparison flag to the data
+            main_data["matches_overall_error"] = matches_overall_error
+
+        return main_streak_data, job_current_streaks_main
 
     def analyze_consecutive_failures(
         self, runs: List[Dict]
@@ -256,13 +806,16 @@ class SGLangFailuresAnalyzer:
         sorted_runs = sorted(runs, key=lambda x: x.get("created_at", ""))
 
         # Track current streak for each job
-        job_streaks: Dict[str, List[Dict]] = defaultdict(list)
         job_current_streak: Dict[str, int] = defaultdict(int)
         job_max_streak: Dict[str, int] = defaultdict(int)
         job_total_failures: Dict[str, int] = defaultdict(int)
         job_total_runs: Dict[str, int] = defaultdict(int)
         job_first_failure_in_streak: Dict[str, Optional[Dict]] = {}
+        job_last_failure_in_streak: Dict[str, Optional[Dict]] = {}
         job_recovery_info: Dict[str, Optional[Dict]] = {}
+        job_error_signatures: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
 
         total_runs_processed = len(sorted_runs)
         for i, run in enumerate(sorted_runs, 1):
@@ -271,14 +824,13 @@ class SGLangFailuresAnalyzer:
                     f"Processing run {i}/{total_runs_processed}: #{run.get('run_number')}"
                 )
 
+            head_commit = run.get("head_commit") or {}
             run_info = {
                 "run_number": run.get("run_number"),
                 "run_id": run.get("id"),
                 "created_at": run.get("created_at"),
                 "head_sha": run.get("head_sha", "")[:8],
-                "author": run.get("head_commit", {})
-                .get("author", {})
-                .get("name", "Unknown"),
+                "author": head_commit.get("author", {}).get("name", "Unknown"),
                 "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
             }
 
@@ -311,8 +863,24 @@ class SGLangFailuresAnalyzer:
                         job_first_failure_in_streak[job_name] = {
                             **run_info,
                             "job_name": job_name,
+                            "job_id": job.get("id"),
+                            "job_url": job.get("html_url", run_info["url"]),
                             "conclusion": conclusion,
                         }
+
+                    # Always update last failure to the most recent one
+                    job_last_failure_in_streak[job_name] = {
+                        **run_info,
+                        "job_name": job_name,
+                        "job_id": job.get("id"),
+                        "job_url": job.get("html_url", run_info["url"]),
+                        "conclusion": conclusion,
+                    }
+
+                    # Extract error signature from job
+                    error_signature = self._extract_error_signature(job)
+                    if error_signature:
+                        job_error_signatures[job_name][error_signature] += 1
 
                     # Update max streak
                     if job_current_streak[job_name] > job_max_streak[job_name]:
@@ -330,12 +898,19 @@ class SGLangFailuresAnalyzer:
 
                     job_current_streak[job_name] = 0
                     job_first_failure_in_streak[job_name] = None
+                    job_last_failure_in_streak[job_name] = None
 
             time.sleep(0.05)
 
         # Build final results
         job_streak_data = {}
         for job_name in job_current_streak.keys():
+            # Get top 3 error signatures
+            error_sigs = job_error_signatures.get(job_name, {})
+            top_errors = sorted(error_sigs.items(), key=lambda x: x[1], reverse=True)[
+                :3
+            ]
+
             job_streak_data[job_name] = {
                 "current_streak": job_current_streak[job_name],
                 "max_streak": job_max_streak[job_name],
@@ -347,86 +922,12 @@ class SGLangFailuresAnalyzer:
                     else 0
                 ),
                 "first_failure_in_streak": job_first_failure_in_streak.get(job_name),
+                "last_failure_in_streak": job_last_failure_in_streak.get(job_name),
                 "recovery_info": job_recovery_info.get(job_name),
+                "top_error_signatures": top_errors,
             }
 
         return job_streak_data, job_current_streak
-
-    def aggregate_matrix_jobs(
-        self, job_streak_data: Dict[str, Dict]
-    ) -> Dict[str, Dict]:
-        """
-        Aggregate matrix jobs (e.g., 'job-name (0)', 'job-name (1)') into a single entry.
-
-        Returns:
-            Dictionary with aggregated job data
-        """
-        import re
-
-        # Identify base job names (strip matrix suffix like " (0)", " (1)")
-        base_jobs: Dict[str, List[Tuple[str, Dict]]] = defaultdict(list)
-
-        for job_name, data in job_streak_data.items():
-            # Match pattern like "job-name (0)" or "job-name (1)"
-            match = re.match(r"^(.+?)\s*\((\d+)\)$", job_name)
-            if match:
-                base_name = match.group(1)
-                base_jobs[base_name].append((job_name, data))
-            else:
-                # Not a matrix job, keep as-is
-                base_jobs[job_name].append((job_name, data))
-
-        # Aggregate stats for matrix jobs
-        aggregated_data = {}
-
-        for base_name, job_list in base_jobs.items():
-            if len(job_list) == 1:
-                # Single job, no aggregation needed
-                job_name, data = job_list[0]
-                aggregated_data[job_name] = data
-            else:
-                # Multiple matrix jobs - aggregate them
-                total_runs = sum(data["total_runs"] for _, data in job_list)
-                total_failures = sum(data["total_failures"] for _, data in job_list)
-
-                # Current streak: take the max across all matrix jobs
-                # (if any partition is broken, the whole job is considered broken)
-                current_streak = max(data["current_streak"] for _, data in job_list)
-                max_streak = max(data["max_streak"] for _, data in job_list)
-
-                # Get the first failure from the job with the longest current streak
-                first_failure_in_streak = None
-                for _, data in job_list:
-                    if (
-                        data["current_streak"] == current_streak
-                        and data["first_failure_in_streak"]
-                    ):
-                        first_failure_in_streak = data["first_failure_in_streak"]
-                        break
-
-                # Recovery info from most recent recovery
-                recovery_info = None
-                for _, data in job_list:
-                    if data["recovery_info"]:
-                        recovery_info = data["recovery_info"]
-                        break
-
-                aggregated_data[base_name] = {
-                    "current_streak": current_streak,
-                    "max_streak": max_streak,
-                    "total_failures": total_failures,
-                    "total_runs": total_runs,
-                    "failure_rate": (
-                        (total_failures / total_runs * 100) if total_runs > 0 else 0
-                    ),
-                    "first_failure_in_streak": first_failure_in_streak,
-                    "recovery_info": recovery_info,
-                    "is_aggregated": True,
-                    "partition_count": len(job_list),
-                    "partitions": [job_name for job_name, _ in job_list],
-                }
-
-        return aggregated_data
 
     def detect_alerts(
         self,
@@ -434,6 +935,8 @@ class SGLangFailuresAnalyzer:
         job_current_streaks: Dict[str, int],
         runner_stats: Optional[Dict[str, Dict]] = None,
         runner_instance_data: Optional[Dict[str, Dict]] = None,
+        runner_streak_data: Optional[Dict[str, Dict]] = None,
+        runner_instance_streak_data: Optional[Dict[str, Dict]] = None,
     ) -> Tuple[List[Dict], List[Dict]]:
         """
         Detect jobs and runners that need alerts based on thresholds.
@@ -455,6 +958,8 @@ class SGLangFailuresAnalyzer:
                         "max_streak": data["max_streak"],
                         "failure_rate": data["failure_rate"],
                         "first_failure": data["first_failure_in_streak"],
+                        "last_failure": data["last_failure_in_streak"],
+                        "top_error_signatures": data.get("top_error_signatures", []),
                         "alert_type": "consecutive_failures",
                         "severity": "high" if current_streak >= 5 else "medium",
                     }
@@ -462,6 +967,67 @@ class SGLangFailuresAnalyzer:
 
         # Detect runner alerts
         runner_alerts = []
+
+        # Alert for runners with consecutive failures
+        if runner_streak_data:
+            for runner_labels, streak_data in runner_streak_data.items():
+                if streak_data["current_streak"] >= self.alert_threshold:
+                    runner_alerts.append(
+                        {
+                            "runner_labels": runner_labels,
+                            "current_streak": streak_data["current_streak"],
+                            "max_streak": streak_data["max_streak"],
+                            "failure_rate": streak_data["failure_rate"],
+                            "total_failures": streak_data["total_failures"],
+                            "total_jobs": streak_data["total_jobs"],
+                            "jobs_failed": streak_data.get("jobs_failed", {}),
+                            "first_failure": streak_data["first_failure_in_streak"],
+                            "last_failure": streak_data["last_failure_in_streak"],
+                            "top_error_signatures": streak_data.get(
+                                "top_error_signatures", []
+                            ),
+                            "alert_type": "runner_consecutive_failures",
+                            "severity": (
+                                "high"
+                                if streak_data["current_streak"] >= 5
+                                else "medium"
+                            ),
+                        }
+                    )
+
+        # Alert for runner instances with consecutive failures
+        if runner_instance_streak_data:
+            for instance_key, streak_data in runner_instance_streak_data.items():
+                if streak_data["current_streak"] >= self.alert_threshold:
+                    # Get queue time info from runner_instance_data
+                    instance_data = runner_instance_data.get(instance_key, {})
+                    avg_queue = instance_data.get("avg_queue_time_seconds", 0)
+
+                    runner_alerts.append(
+                        {
+                            "runner_instance": instance_key,
+                            "runner_name": streak_data.get("runner_name", "unknown"),
+                            "current_streak": streak_data["current_streak"],
+                            "max_streak": streak_data["max_streak"],
+                            "failure_rate": streak_data["failure_rate"],
+                            "total_failures": streak_data["total_failures"],
+                            "total_jobs": streak_data["total_jobs"],
+                            "jobs_failed": streak_data.get("jobs_failed", {}),
+                            "first_failure": streak_data["first_failure_in_streak"],
+                            "last_failure": streak_data["last_failure_in_streak"],
+                            "top_error_signatures": streak_data.get(
+                                "top_error_signatures", []
+                            ),
+                            "avg_queue_time_seconds": avg_queue,
+                            "alert_type": "runner_instance_consecutive_failures",
+                            "severity": (
+                                "high"
+                                if streak_data["current_streak"] >= 5
+                                else "medium"
+                            ),
+                        }
+                    )
+
         if runner_stats:
             # Alert if runner has high failure rate (>30%) and multiple jobs failing
             for runner_labels, stats in runner_stats.items():
@@ -513,6 +1079,9 @@ class SGLangFailuresAnalyzer:
         runner_stats: Optional[Dict[str, Dict]] = None,
         runner_instance_data: Optional[Dict[str, Dict]] = None,
         runner_alerts: Optional[List[Dict]] = None,
+        runner_streak_data: Optional[Dict[str, Dict]] = None,
+        runner_instance_streak_data: Optional[Dict[str, Dict]] = None,
+        main_streak_data: Optional[Dict[str, Dict]] = None,
         output_file: Optional[str] = None,
     ):
         """Generate detailed failure analysis report."""
@@ -527,128 +1096,421 @@ class SGLangFailuresAnalyzer:
             reverse=True,
         )
 
+        # Summary Statistics
+        print("\n## Summary Statistics")
         print(
-            f"\nTotal (unique) jobs analyzed across PR Test workflows: {len(sorted_jobs)}"
+            f"Total (unique) jobs analyzed across PR Test workflows: {len(sorted_jobs)}"
         )
         print(
-            f"Jobs with active failure streaks: {sum(1 for j in sorted_jobs if j[1]['current_streak'] > 0)}"
+            f"Jobs with Active Failure Streaks: {sum(1 for j in sorted_jobs if j[1]['current_streak'] > 0)}"
         )
-        print(
-            f"Job alerts triggered (>={self.alert_threshold} consecutive failures): {len(job_alerts)}"
-        )
+        print(f"Job Alerts Triggered: {len(job_alerts)}")
 
-        if runner_stats:
-            print(f"Total runners analyzed: {len(runner_stats)}")
-            print(
-                f"Runner alerts triggered: {len(runner_alerts) if runner_alerts else 0}"
+        # Add counter for main branch cron jobs
+        if main_streak_data:
+            main_jobs_count = len(main_streak_data)
+            main_jobs_with_streaks = sum(
+                1 for j in main_streak_data.values() if j["current_streak"] > 0
             )
-
-        # Section 1: Currently Broken Jobs (Consecutive Failures) - URGENT
-        print("\n" + "=" * 100)
-        print("SECTION 1: Currently Broken Jobs (Active Consecutive Failures)")
-        print("=" * 100)
-
-        broken_jobs = [
-            (name, data) for name, data in sorted_jobs if data["current_streak"] > 0
-        ]
-
-        if broken_jobs:
             print(
-                f"\n{'Rank':<4} {'Job Name':<50} {'Current Streak':<16} {'Max Streak':<12}"
+                f"Jobs on Main Branch (cron-triggered): {main_jobs_count} ({main_jobs_with_streaks} with active streaks)"
             )
-            print("-" * 100)
-            for i, (job_name, data) in enumerate(broken_jobs[:20], 1):
-                print(
-                    f"{i:<4} {job_name:<50} {data['current_streak']:<16} {data['max_streak']:<12}"
-                )
         else:
-            print("\n✓ No jobs are currently in a failure streak!")
+            print(f"Jobs on Main Branch (cron-triggered): 0 (no cron runs found)")
 
-        # Print job alerts
-        if job_alerts:
-            print("\n" + "!" * 40)
-            print("ALERTS: Jobs with Consecutive Failures Exceeding Threshold")
-            print("!" * 40)
-
-            for alert in sorted(
-                job_alerts, key=lambda x: x["current_streak"], reverse=True
-            ):
-                print(f"\n  {alert['job_name']}")
-                print(
-                    f"   Current Streak: {alert['current_streak']} consecutive failures"
-                )
-                print(f"   Max Streak: {alert['max_streak']}")
-                print(f"   Severity: {alert['severity'].upper()}")
-
-                if alert["first_failure"]:
-                    first = alert["first_failure"]
-                    print(
-                        f"   First Failure in Streak: Run #{first['run_number']} ({first['created_at']})"
-                    )
-                    print(f"   Link: {first['url']}")
-
-        # Section 3: Runner Health Analysis
         if runner_stats:
-            print("\n" + "=" * 100)
-            print("SECTION 2: Runner Health Analysis")
-            print("=" * 100)
+            print(f"Total Runners Analyzed: {len(runner_stats)}")
+            print(
+                f"Runner Alerts Triggered: {len(runner_alerts) if runner_alerts else 0}"
+            )
 
-            # Sort runners by failure rate
-            sorted_runners = sorted(
-                runner_stats.items(),
-                key=lambda x: (x[1]["failure_rate"], x[1]["failed_jobs"]),
+        # Queue Time Summary
+        if runner_stats:
+            all_avg_queue_times = []
+            all_p90_queue_times = []
+            for stats in runner_stats.values():
+                if stats["queue_time_samples"] > 0:
+                    all_avg_queue_times.append(stats["avg_queue_time_seconds"])
+                    all_p90_queue_times.append(stats["p90_queue_time_seconds"])
+
+            if all_avg_queue_times:
+                overall_avg = sum(all_avg_queue_times) / len(all_avg_queue_times)
+                overall_p90 = sum(all_p90_queue_times) / len(all_p90_queue_times)
+                print("\n## Queue Time Summary")
+                print(
+                    f"Average Queue Time (across all runners): {overall_avg / 60:.1f} minutes ({overall_avg:.0f}s)"
+                )
+                print(
+                    f"P90 Queue Time (across all runners): {overall_p90 / 60:.1f} minutes ({overall_p90:.0f}s)"
+                )
+
+        # ALERTS: Critical Consecutive Job Failures (streak >= 2)
+        if job_alerts:
+            # Filter alerts with streak >= 2
+            filtered_job_alerts = [a for a in job_alerts if a["current_streak"] >= 2]
+
+            if filtered_job_alerts:
+                print("\n" + "=" * 150)
+                print(
+                    "## ALERTS: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                )
+                print("=" * 150)
+                print(
+                    f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First Failure':<16} {'Last Failure':<16} {'Top Errors':<60}"
+                )
+                print("-" * 150)
+
+                for alert in sorted(
+                    filtered_job_alerts, key=lambda x: x["current_streak"], reverse=True
+                ):
+                    job_name = alert["job_name"]
+                    display_name = (
+                        job_name if len(job_name) <= 38 else job_name[:35] + "..."
+                    )
+
+                    first_failure = alert.get("first_failure")
+                    first_failure_str = (
+                        f"Run #{first_failure['run_number']}"
+                        if first_failure
+                        else "N/A"
+                    )
+
+                    last_failure = alert.get("last_failure")
+                    last_failure_str = (
+                        f"Run #{last_failure['run_number']}" if last_failure else "N/A"
+                    )
+
+                    # Format top errors - don't truncate
+                    top_errors = alert.get("top_error_signatures", [])
+                    if top_errors:
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
+                        )
+                    else:
+                        error_display = "N/A"
+
+                    print(
+                        f"{display_name:<40} {alert['current_streak']:<8} {alert['max_streak']:<6} {first_failure_str:<16} {last_failure_str:<16} {error_display:<60}"
+                    )
+            else:
+                print("\n" + "=" * 100)
+                print(
+                    "## ALERTS: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                )
+                print("=" * 100)
+                print(
+                    "\nNothing to display (no jobs with consecutive failure streak >= 2)"
+                )
+
+        # ALERTS: Runners with Issues (streak >= 2)
+        if runner_alerts:
+            # Only show consecutive failure alerts with streak >= 2, and only machine instances
+            instance_alerts = [
+                a
+                for a in runner_alerts
+                if a["alert_type"] == "runner_instance_consecutive_failures"
+                and a.get("current_streak", 0) >= 2
+            ]
+
+            if instance_alerts:
+                print("\n" + "=" * 170)
+                print("## ALERTS: Runners with Issues (streak >= 2)")
+                print("=" * 170)
+                print("\n### Runner Consecutive Failures")
+                print(
+                    f"\n{'Runner':<30} {'Str':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Jobs Failed':<40}"
+                )
+                print("-" * 170)
+
+                for alert in sorted(
+                    instance_alerts,
+                    key=lambda x: x.get("current_streak", 0),
+                    reverse=True,
+                ):
+                    # Use the actual machine name instead of labels or instance key
+                    runner_name = alert.get("runner_name", "unknown")
+                    display_name = (
+                        runner_name
+                        if len(runner_name) <= 28
+                        else runner_name[:25] + "..."
+                    )
+
+                    # Get all failed jobs - don't truncate
+                    jobs_failed = alert.get("jobs_failed", {})
+                    top_jobs = sorted(
+                        jobs_failed.items(), key=lambda x: x[1], reverse=True
+                    )
+                    jobs_display = (
+                        ", ".join([f"{job} ({count})" for job, count in top_jobs])
+                        if top_jobs
+                        else "N/A"
+                    )
+
+                    # Format queue time
+                    avg_queue = alert.get("avg_queue_time_seconds", 0)
+                    avg_queue_str = f"{avg_queue / 60:.1f}m" if avg_queue > 0 else "N/A"
+
+                    first_failure = alert.get("first_failure")
+                    first_failure_str = (
+                        f"Run #{first_failure['run_number']}"
+                        if first_failure
+                        else "N/A"
+                    )
+
+                    last_failure = alert.get("last_failure")
+                    last_failure_str = (
+                        f"Run #{last_failure['run_number']}" if last_failure else "N/A"
+                    )
+
+                    # Format top errors - don't truncate
+                    top_errors = alert.get("top_error_signatures", [])
+                    if top_errors:
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
+                        )
+                    else:
+                        error_display = "N/A"
+
+                    print(
+                        f"{display_name:<30} {alert['current_streak']:<5} {alert['max_streak']:<5} {alert['failure_rate']:>5.1f}% {avg_queue_str:<7} {first_failure_str:<13} {last_failure_str:<13} {error_display:<45} {jobs_display:<40}"
+                    )
+            else:
+                print("\n" + "=" * 100)
+                print("## ALERTS: Runners with Issues (streak >= 2)")
+                print("=" * 100)
+                print(
+                    "\nNothing to display (no runners with consecutive failure streak >= 2)"
+                )
+
+        # Main Branch Health Section: Jobs failing on cron-triggered main branch runs
+        if main_streak_data:
+            # Sort by current streak (descending)
+            sorted_main_jobs = sorted(
+                main_streak_data.items(),
+                key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
                 reverse=True,
             )
 
-            print(f"\nTop 15 Runners by Failure Rate:")
-            print("-" * 100)
-            print(
-                f"{'Rank':<4} {'Runner Labels':<45} {'Fail Rate':<12} {'Failed':<10} {'Total':<10} {'Unique Jobs':<12}"
-            )
-            print("-" * 100)
+            # Show only jobs with streak >= 2
+            broken_main_jobs = [
+                (name, data)
+                for name, data in sorted_main_jobs
+                if data["current_streak"] >= 2
+            ]
 
-            for i, (runner_labels, stats) in enumerate(sorted_runners[:15], 1):
-                # Truncate labels if too long for display
-                display_labels = (
-                    runner_labels
-                    if len(runner_labels) <= 43
-                    else runner_labels[:40] + "..."
-                )
+            if broken_main_jobs:
+                print("\n" + "=" * 140)
                 print(
-                    f"{i:<4} {display_labels:<45} {stats['failure_rate']:>10.1f}% "
-                    f"{stats['failed_jobs']:<10} {stats['total_jobs']:<10} {stats['unique_jobs_with_failures']:<12}"
+                    f"## MAIN BRANCH HEALTH: Failing Jobs on Scheduled Main Branch Runs ({len(broken_main_jobs)} jobs)"
+                )
+                print("=" * 140)
+                print(
+                    f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Top Errors':<50}"
+                )
+                print("-" * 140)
+                for job_name, data in broken_main_jobs[:15]:
+                    display_name = (
+                        job_name if len(job_name) <= 38 else job_name[:35] + "..."
+                    )
+
+                    # Get first and last failure info
+                    first_failure = data.get("first_failure_in_streak")
+                    first_failure_str = (
+                        f"Run #{first_failure['run_number']}"
+                        if first_failure
+                        else "N/A"
+                    )
+
+                    last_failure = data.get("last_failure_in_streak")
+                    last_failure_str = (
+                        f"Run #{last_failure['run_number']}" if last_failure else "N/A"
+                    )
+
+                    # Format top errors - don't truncate
+                    top_errors = data.get("top_error_signatures", [])
+                    if top_errors:
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
+                        )
+                    else:
+                        error_display = "N/A"
+
+                    print(
+                        f"{display_name:<40} {data['current_streak']:<8} {data['max_streak']:<6} {first_failure_str:<13} {last_failure_str:<13} {error_display:<50}"
+                    )
+            else:
+                print("\n" + "=" * 100)
+                print("## MAIN BRANCH HEALTH: Scheduled Main Branch Runs")
+                print("=" * 100)
+                print(
+                    "\n  No consecutive failing jobs (streak >= 2) on main branch scheduled runs"
                 )
 
-        # Print runner alerts
-        if runner_alerts:
-            print("\n" + "!" * 40)
-            print("ALERTS: Runners with High Failure Rates")
-            print("!" * 40)
+        # Section 1: Currently Broken Jobs (streak >= 2)
+        broken_jobs = [
+            (name, data) for name, data in sorted_jobs if data["current_streak"] >= 2
+        ]
 
-            for alert in sorted(
-                runner_alerts, key=lambda x: x.get("failure_rate", 0), reverse=True
-            ):
-                if alert["alert_type"] == "runner_health":
-                    print(f"\n  Runner Labels: {alert['runner_labels']}")
-                    print(f"   Failure Rate: {alert['failure_rate']:.1f}%")
-                    print(
-                        f"   Failed Jobs: {alert['failed_jobs']} / {alert['total_jobs']}"
+        if broken_jobs:
+            print("\n" + "=" * 140)
+            print(
+                "## Section 1: Top 15 Consecutively Failing Jobs (PR + Scheduled, streak >= 2)"
+            )
+            print("=" * 140)
+            print(
+                f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Top Errors':<50}"
+            )
+            print("-" * 140)
+            for job_name, data in broken_jobs[:20]:
+                display_name = (
+                    job_name if len(job_name) <= 38 else job_name[:35] + "..."
+                )
+
+                # Get first and last failure info
+                first_failure = data.get("first_failure_in_streak")
+                first_failure_str = (
+                    f"Run #{first_failure['run_number']}" if first_failure else "N/A"
+                )
+
+                last_failure = data.get("last_failure_in_streak")
+                last_failure_str = (
+                    f"Run #{last_failure['run_number']}" if last_failure else "N/A"
+                )
+
+                # Format top errors - don't truncate
+                top_errors = data.get("top_error_signatures", [])
+                if top_errors:
+                    error_display = ", ".join(
+                        [f"{err[0]} ({err[1]})" for err in top_errors]
                     )
-                    print(
-                        f"   Unique Jobs with Failures: {alert['unique_jobs_with_failures']}"
+                else:
+                    error_display = "N/A"
+
+                print(
+                    f"{display_name:<40} {data['current_streak']:<8} {data['max_streak']:<6} {first_failure_str:<13} {last_failure_str:<13} {error_display:<50}"
+                )
+
+        # Section 2: Runner Health Analysis - Use machine names from runner instances (streak >= 2)
+        if runner_instance_data and runner_instance_streak_data:
+            # Combine instance stats with streak data and sort by consecutive failures first
+            combined_data = []
+            for instance_key, stats in runner_instance_data.items():
+                streak_data = runner_instance_streak_data.get(instance_key, {})
+                combined_data.append(
+                    {
+                        "runner_name": stats.get("runner_name", "unknown"),
+                        "instance_key": instance_key,
+                        "current_streak": streak_data.get("current_streak", 0),
+                        "max_streak": streak_data.get("max_streak", 0),
+                        "failure_rate": stats["failure_rate"],
+                        "total_jobs": stats["total_jobs"],
+                        "unique_jobs": len(stats.get("jobs_failed", {})),
+                        "avg_queue": stats.get("avg_queue_time_seconds", 0),
+                        "p90_queue": stats.get("p90_queue_time_seconds", 0),
+                        "queue_samples": stats.get("queue_time_samples", 0),
+                        "first_failure": streak_data.get("first_failure_in_streak"),
+                        "last_failure": streak_data.get("last_failure_in_streak"),
+                        "top_error_signatures": streak_data.get(
+                            "top_error_signatures", []
+                        ),
+                    }
+                )
+
+            # Sort by current streak (descending), then max streak, then failure rate
+            sorted_runners = sorted(
+                combined_data,
+                key=lambda x: (x["current_streak"], x["max_streak"], x["failure_rate"]),
+                reverse=True,
+            )
+
+            # Only show runners with streak >= 2
+            runners_with_issues = [
+                r for r in sorted_runners if r["current_streak"] >= 2
+            ]
+
+            if runners_with_issues:
+                print("\n" + "=" * 160)
+                print(
+                    "## Section 2: Top 15 Workers by Consecutive Failures (streak >= 2)"
+                )
+                print("=" * 160)
+                print(
+                    f"\n{'Machine Name':<30} {'Str':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Total Jobs':<11} {'Unique Jobs':<12}"
+                )
+                print("-" * 160)
+
+                for runner_data in runners_with_issues[:15]:
+                    # Truncate machine name if too long for display
+                    display_name = (
+                        runner_data["runner_name"]
+                        if len(runner_data["runner_name"]) <= 28
+                        else runner_data["runner_name"][:25] + "..."
                     )
-                    print(f"   Severity: {alert['severity'].upper()}")
-                elif alert["alert_type"] == "runner_instance_health":
-                    print(f"\n  Runner Instance: {alert['runner_instance']}")
-                    print(f"   Runner Name: {alert['runner_name']}")
-                    print(f"   Failure Rate: {alert['failure_rate']:.1f}%")
-                    print(
-                        f"   Failed Jobs: {alert['failed_jobs']} / {alert['total_jobs']}"
+
+                    # Format streaks
+                    streak_str = str(runner_data["current_streak"])
+                    max_str = str(runner_data["max_streak"])
+
+                    # Format queue time
+                    avg_queue_str = (
+                        f"{runner_data['avg_queue'] / 60:.1f}m"
+                        if runner_data["queue_samples"] > 0
+                        else "N/A"
                     )
-                    print(f"   Jobs Failed: {list(alert['jobs_failed'].keys())}")
-                    print(f"   Severity: {alert['severity'].upper()}")
+
+                    # Get first and last failure info
+                    first_failure = runner_data.get("first_failure")
+                    first_failure_str = (
+                        f"Run #{first_failure['run_number']}"
+                        if first_failure
+                        else "N/A"
+                    )
+
+                    last_failure = runner_data.get("last_failure")
+                    last_failure_str = (
+                        f"Run #{last_failure['run_number']}" if last_failure else "N/A"
+                    )
+
+                    # Format top errors - don't truncate
+                    top_errors = runner_data.get("top_error_signatures", [])
+                    if top_errors:
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
+                        )
+                    else:
+                        error_display = "N/A"
+
+                    print(
+                        f"{display_name:<30} {streak_str:<5} {max_str:<5} {runner_data['failure_rate']:>5.1f}% {avg_queue_str:<7} {first_failure_str:<13} {last_failure_str:<13} {error_display:<45} {runner_data['total_jobs']:<11} {runner_data['unique_jobs']:<12}"
+                    )
 
         # Build report data (always needed for GitHub summary)
+        # Calculate overall queue time for summary
+        overall_avg_queue = 0
+        overall_p90_queue = 0
+        if runner_stats:
+            all_avg_queue_times = [
+                stats["avg_queue_time_seconds"]
+                for stats in runner_stats.values()
+                if stats["queue_time_samples"] > 0
+            ]
+            all_p90_queue_times = [
+                stats["p90_queue_time_seconds"]
+                for stats in runner_stats.values()
+                if stats["queue_time_samples"] > 0
+            ]
+            if all_avg_queue_times:
+                overall_avg_queue = sum(all_avg_queue_times) / len(all_avg_queue_times)
+                overall_p90_queue = sum(all_p90_queue_times) / len(all_p90_queue_times)
+
+        # Calculate main branch stats
+        main_jobs_count = len(main_streak_data) if main_streak_data else 0
+        main_jobs_with_streaks = (
+            sum(1 for j in main_streak_data.values() if j["current_streak"] > 0)
+            if main_streak_data
+            else 0
+        )
+
         report_data = {
             "summary": {
                 "total_jobs": len(sorted_jobs),
@@ -660,6 +1522,10 @@ class SGLangFailuresAnalyzer:
                 "total_runners": len(runner_stats) if runner_stats else 0,
                 "alert_threshold": self.alert_threshold,
                 "analysis_timestamp": datetime.now().isoformat(),
+                "avg_queue_time_seconds": overall_avg_queue,
+                "p90_queue_time_seconds": overall_p90_queue,
+                "main_jobs_count": main_jobs_count,
+                "main_jobs_with_streaks": main_jobs_with_streaks,
             },
             "job_streak_data": {
                 job_name: {
@@ -675,7 +1541,12 @@ class SGLangFailuresAnalyzer:
             "runner_instance_data": (
                 runner_instance_data if runner_instance_data else {}
             ),
+            "runner_streak_data": runner_streak_data if runner_streak_data else {},
+            "runner_instance_streak_data": (
+                runner_instance_streak_data if runner_instance_streak_data else {}
+            ),
             "runner_alerts": runner_alerts if runner_alerts else [],
+            "main_streak_data": main_streak_data if main_streak_data else {},
         }
 
         # Save to JSON only if output file is specified
@@ -723,6 +1594,21 @@ class SGLangFailuresAnalyzer:
             summary_lines.append(
                 f"| Job Alerts Triggered | {report_data['summary']['job_alerts_triggered']} |"
             )
+
+            # Add main branch job counter
+            main_jobs_count = report_data["summary"].get("main_jobs_count", 0)
+            main_jobs_with_streaks = report_data["summary"].get(
+                "main_jobs_with_streaks", 0
+            )
+            if main_jobs_count > 0:
+                summary_lines.append(
+                    f"| Jobs on Main Branch (cron-triggered) | {main_jobs_count} ({main_jobs_with_streaks} with active streaks) |"
+                )
+            else:
+                summary_lines.append(
+                    f"| Jobs on Main Branch (cron-triggered) | 0 (no cron runs found) |"
+                )
+
             summary_lines.append(
                 f"| Total Runners Analyzed | {report_data['summary']['total_runners']} |"
             )
@@ -731,148 +1617,408 @@ class SGLangFailuresAnalyzer:
             )
             summary_lines.append("")
 
-            # Job Alerts section
+            # Queue Time Summary
+            if report_data.get("summary", {}).get("avg_queue_time_seconds") is not None:
+                summary_lines.append("## Queue Time Summary")
+                summary_lines.append("")
+                summary_lines.append("| Metric | Value |")
+                summary_lines.append("|--------|-------|")
+                avg_queue = report_data["summary"]["avg_queue_time_seconds"]
+                p90_queue = report_data["summary"]["p90_queue_time_seconds"]
+                summary_lines.append(
+                    f"| Average Queue Time (across all runners) | {avg_queue / 60:.1f} minutes ({avg_queue:.0f}s) |"
+                )
+                summary_lines.append(
+                    f"| P90 Queue Time (across all runners) | {p90_queue / 60:.1f} minutes ({p90_queue:.0f}s) |"
+                )
+                summary_lines.append("")
+
+            # Job Alerts section (streak >= 2)
             if report_data.get("job_alerts"):
-                summary_lines.append("## ALERTS: Critical Consecutive Job Failures")
-                summary_lines.append("")
-                summary_lines.append(
-                    "| Job Name | Current Streak | Max Streak | First Failure | Link |"
-                )
-                summary_lines.append(
-                    "|----------|----------------|------------|---------------|------|"
-                )
+                # Filter alerts with streak >= 2
+                filtered_job_alerts = [
+                    a for a in report_data["job_alerts"] if a["current_streak"] >= 2
+                ]
 
-                for alert in sorted(
-                    report_data["job_alerts"],
-                    key=lambda x: x["current_streak"],
-                    reverse=True,
-                ):
-                    job_name = alert["job_name"]
-                    if len(job_name) > 40:
-                        job_name = job_name[:37] + "..."
-
-                    first_failure = alert.get("first_failure")
-                    first_failure_str = (
-                        f"Run #{first_failure['run_number']}"
-                        if first_failure
-                        else "N/A"
-                    )
-                    first_failure_link = first_failure["url"] if first_failure else ""
-
+                if filtered_job_alerts:
                     summary_lines.append(
-                        f"| `{job_name}` | {alert['current_streak']} | {alert['max_streak']} | "
-                        f"{first_failure_str} | [View]({first_failure_link}) |"
+                        "## Alerts: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
+                    )
+                    summary_lines.append(
+                        "|----------|--------|-----|---------------|--------------|------------|"
                     )
 
-                summary_lines.append("")
+                    for alert in sorted(
+                        filtered_job_alerts,
+                        key=lambda x: x["current_streak"],
+                        reverse=True,
+                    ):
+                        job_name = alert["job_name"]
+                        if len(job_name) > 35:
+                            job_name = job_name[:32] + "..."
 
-            # Runner Alerts section
+                        first_failure = alert.get("first_failure")
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                        else:
+                            first_failure_str = "N/A"
+
+                        last_failure = alert.get("last_failure")
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                        else:
+                            last_failure_str = "N/A"
+
+                        # Format top errors as bullet list
+                        top_errors = alert.get("top_error_signatures", [])
+                        if top_errors:
+                            error_str = "<br>".join(
+                                [f"• {err[0]} ({err[1]})" for err in top_errors]
+                            )
+                        else:
+                            error_str = "N/A"
+
+                        summary_lines.append(
+                            f"| `{job_name}` | {alert['current_streak']} | {alert['max_streak']} | "
+                            f"{first_failure_str} | {last_failure_str} | {error_str} |"
+                        )
+
+                    summary_lines.append("")
+                else:
+                    summary_lines.append(
+                        "## Alerts: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "Nothing to display (no jobs with consecutive failure streak >= 2)"
+                    )
+                    summary_lines.append("")
+
+            # Runner Alerts section (streak >= 2)
             if report_data.get("runner_alerts"):
-                summary_lines.append("## ALERTS: Runners with High Failure Rates")
-                summary_lines.append("")
-                summary_lines.append(
-                    "| Runner Labels | Failure Rate | Failed Jobs | Total Jobs | Unique Jobs Failed | Severity |"
-                )
-                summary_lines.append(
-                    "|---------------|--------------|-------------|------------|-------------------|----------|"
-                )
+                # Only show consecutive failure alerts with streak >= 2, and only machine instances
+                instance_alerts = [
+                    a
+                    for a in report_data["runner_alerts"]
+                    if a["alert_type"] == "runner_instance_consecutive_failures"
+                    and a.get("current_streak", 0) >= 2
+                ]
 
-                for alert in sorted(
-                    report_data["runner_alerts"],
-                    key=lambda x: x.get("failure_rate", 0),
+                if instance_alerts:
+                    summary_lines.append("## Alerts: Workers with Issues (streak >= 2)")
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Runner | Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors | Jobs Failed |"
+                    )
+                    summary_lines.append(
+                        "|--------|--------|-----|-----------|-----------|---------------|--------------|------------|-------------|"
+                    )
+
+                    for alert in sorted(
+                        instance_alerts,
+                        key=lambda x: x.get("current_streak", 0),
+                        reverse=True,
+                    ):
+                        # Use the actual machine name instead of labels or instance key
+                        runner_name = alert.get("runner_name", "unknown")
+                        if len(runner_name) > 28:
+                            runner_name = runner_name[:25] + "..."
+
+                        # Get all failed jobs as bullet list
+                        jobs_failed = alert.get("jobs_failed", {})
+                        top_jobs = sorted(
+                            jobs_failed.items(), key=lambda x: x[1], reverse=True
+                        )
+                        jobs_str = (
+                            "<br>".join(
+                                [f"• {job} ({count})" for job, count in top_jobs]
+                            )
+                            if top_jobs
+                            else "N/A"
+                        )
+
+                        # Format queue time
+                        avg_queue = alert.get("avg_queue_time_seconds", 0)
+                        avg_queue_str = (
+                            f"{avg_queue / 60:.1f}m" if avg_queue > 0 else "N/A"
+                        )
+
+                        first_failure = alert.get("first_failure")
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                        else:
+                            first_failure_str = "N/A"
+
+                        last_failure = alert.get("last_failure")
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                        else:
+                            last_failure_str = "N/A"
+
+                        # Format top errors as bullet list
+                        top_errors = alert.get("top_error_signatures", [])
+                        if top_errors:
+                            error_str = "<br>".join(
+                                [f"• {err[0]} ({err[1]})" for err in top_errors]
+                            )
+                        else:
+                            error_str = "N/A"
+
+                        summary_lines.append(
+                            f"| `{runner_name}` | {alert['current_streak']} | {alert['max_streak']} | "
+                            f"{alert['failure_rate']:.1f}% | {avg_queue_str} | {first_failure_str} | {last_failure_str} | "
+                            f"{error_str} | {jobs_str} |"
+                        )
+
+                    summary_lines.append("")
+                    summary_lines.append("")
+                else:
+                    summary_lines.append("## Alerts: Runners with Issues (streak >= 2)")
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "Nothing to display (no runners with consecutive failure streak >= 2)"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append("")
+
+            # Main Branch Health Section: Jobs failing on cron-triggered main branch runs
+            if report_data.get("main_streak_data"):
+                # Sort by current streak (descending)
+                sorted_main_jobs = sorted(
+                    report_data["main_streak_data"].items(),
+                    key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
                     reverse=True,
-                ):
-                    if alert["alert_type"] == "runner_health":
-                        runner_labels = alert["runner_labels"]
-                        if len(runner_labels) > 35:
-                            runner_labels = runner_labels[:32] + "..."
+                )
+
+                # Show only jobs with streak >= 2
+                broken_main_jobs = [
+                    (name, data)
+                    for name, data in sorted_main_jobs
+                    if data["current_streak"] >= 2
+                ]
+
+                if broken_main_jobs:
+                    summary_lines.append(
+                        f"## Main Branch Health: Consecutive Failing Jobs on Scheduled Main Branch Runs (streak >= 2)"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
+                    )
+                    summary_lines.append(
+                        "|----------|--------|-----|---------------|--------------|------------|"
+                    )
+                    for job_name, data in broken_main_jobs[:15]:
+                        display_name = (
+                            job_name if len(job_name) <= 35 else job_name[:32] + "..."
+                        )
+
+                        # Get first and last failure info
+                        first_failure = data.get("first_failure_in_streak")
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                        else:
+                            first_failure_str = "N/A"
+
+                        last_failure = data.get("last_failure_in_streak")
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                        else:
+                            last_failure_str = "N/A"
+
+                        # Format top errors as bullet list
+                        top_errors = data.get("top_error_signatures", [])
+                        if top_errors:
+                            error_str = "<br>".join(
+                                [f"• {err[0]} ({err[1]})" for err in top_errors]
+                            )
+                        else:
+                            error_str = "N/A"
 
                         summary_lines.append(
-                            f"| `{runner_labels}` | {alert['failure_rate']:.1f}% | {alert['failed_jobs']} | "
-                            f"{alert['total_jobs']} | {alert['unique_jobs_with_failures']} | {alert['severity'].upper()} |"
+                            f"| `{display_name}` | {data['current_streak']} | {data['max_streak']} | "
+                            f"{first_failure_str} | {last_failure_str} | {error_str} |"
                         )
-                    elif alert["alert_type"] == "runner_instance_health":
-                        instance = alert["runner_instance"]
-                        runner_name = alert["runner_name"]
-                        if len(instance) > 35:
-                            instance = instance[:32] + "..."
 
-                        summary_lines.append(
-                            f"| `{instance}` | {alert['failure_rate']:.1f}% | {alert['failed_jobs']} | "
-                            f"{alert['total_jobs']} | {len(alert['jobs_failed'])} | {alert['severity'].upper()} |"
-                        )
-                        summary_lines.append(f"| (Runner: {runner_name}) | | | | | |")
+                    summary_lines.append("")
+                else:
+                    summary_lines.append(
+                        "## Main Branch Health: Scheduled Main Branch Runs"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "No consecutive failing jobs (streak >= 2) on main branch scheduled runs"
+                    )
+                    summary_lines.append("")
 
-                summary_lines.append("")
-
-            # Section 1: Currently Broken Jobs
-            summary_lines.append(
-                "## Section 1: Currently Broken Jobs (Active Failures)"
-            )
-            summary_lines.append("")
-
+            # Section 1: Currently Broken Jobs - Only show if there are broken jobs
             sorted_jobs = sorted(
                 report_data["job_streak_data"].items(),
                 key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
                 reverse=True,
             )
 
+            # Only show jobs with streak >= 2
             broken_jobs = [
-                (name, data) for name, data in sorted_jobs if data["current_streak"] > 0
+                (name, data)
+                for name, data in sorted_jobs
+                if data["current_streak"] >= 2
             ]
 
             if broken_jobs:
                 summary_lines.append(
-                    "| Rank | Job Name | Current Streak | Max Streak |"
+                    "## Section 1: Top 15 Consecutively Failing Jobs (PR + Scheduled, streak >= 2)"
+                )
+                summary_lines.append("")
+                summary_lines.append(
+                    "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
                 )
                 summary_lines.append(
-                    "|------|----------|----------------|------------|"
+                    "|----------|--------|-----|---------------|--------------|------------|"
                 )
-                for i, (job_name, data) in enumerate(broken_jobs[:20], 1):
+                for job_name, data in broken_jobs[:20]:
                     display_name = (
-                        job_name if len(job_name) <= 40 else job_name[:37] + "..."
+                        job_name if len(job_name) <= 35 else job_name[:32] + "..."
                     )
+
+                    # Get first and last failure info
+                    first_failure = data.get("first_failure_in_streak")
+                    if first_failure:
+                        first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                    else:
+                        first_failure_str = "N/A"
+
+                    last_failure = data.get("last_failure_in_streak")
+                    if last_failure:
+                        last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                    else:
+                        last_failure_str = "N/A"
+
+                    # Format top errors as bullet list
+                    top_errors = data.get("top_error_signatures", [])
+                    if top_errors:
+                        error_str = "<br>".join(
+                            [f"• {err[0]} ({err[1]})" for err in top_errors]
+                        )
+                    else:
+                        error_str = "N/A"
+
                     summary_lines.append(
-                        f"| {i} | `{display_name}` | {data['current_streak']} | {data['max_streak']} |"
+                        f"| `{display_name}` | {data['current_streak']} | {data['max_streak']} | "
+                        f"{first_failure_str} | {last_failure_str} | {error_str} |"
                     )
-            else:
-                summary_lines.append("No jobs are currently in a failure streak!")
 
-            summary_lines.append("")
-
-            # Section 2: Runner Health Analysis
-            if report_data.get("runner_stats"):
-                summary_lines.append("## Section 2: Runner Health Analysis")
                 summary_lines.append("")
 
-                # Sort runners by failure rate
+            # Section 2: Runner Health Analysis - Use machine names from runner instances
+            if report_data.get("runner_instance_data") and report_data.get(
+                "runner_instance_streak_data"
+            ):
+                # Combine instance stats with streak data and sort by consecutive failures first
+                combined_data = []
+                for instance_key, stats in report_data["runner_instance_data"].items():
+                    streak_data = report_data["runner_instance_streak_data"].get(
+                        instance_key, {}
+                    )
+                    combined_data.append(
+                        {
+                            "runner_name": stats.get("runner_name", "unknown"),
+                            "instance_key": instance_key,
+                            "current_streak": streak_data.get("current_streak", 0),
+                            "max_streak": streak_data.get("max_streak", 0),
+                            "failure_rate": stats["failure_rate"],
+                            "total_jobs": stats["total_jobs"],
+                            "unique_jobs": len(stats.get("jobs_failed", {})),
+                            "avg_queue": stats.get("avg_queue_time_seconds", 0),
+                            "p90_queue": stats.get("p90_queue_time_seconds", 0),
+                            "queue_samples": stats.get("queue_time_samples", 0),
+                            "first_failure": streak_data.get("first_failure_in_streak"),
+                            "last_failure": streak_data.get("last_failure_in_streak"),
+                            "top_error_signatures": streak_data.get(
+                                "top_error_signatures", []
+                            ),
+                        }
+                    )
+
+                # Sort by current streak (descending), then max streak, then failure rate
                 sorted_runners = sorted(
-                    report_data["runner_stats"].items(),
-                    key=lambda x: (x[1]["failure_rate"], x[1]["failed_jobs"]),
+                    combined_data,
+                    key=lambda x: (
+                        x["current_streak"],
+                        x["max_streak"],
+                        x["failure_rate"],
+                    ),
                     reverse=True,
                 )
 
-                summary_lines.append("### Top 15 Runners by Failure Rate")
-                summary_lines.append("")
-                summary_lines.append(
-                    "| Rank | Runner Labels | Failure Rate | Failed Jobs | Total Jobs | Unique Jobs Failed |"
-                )
-                summary_lines.append(
-                    "|------|---------------|--------------|-------------|------------|--------------------|"
-                )
+                # Only show runners with streak >= 2
+                runners_with_issues = [
+                    r for r in sorted_runners if r["current_streak"] >= 2
+                ]
 
-                for i, (runner_labels, stats) in enumerate(sorted_runners[:15], 1):
-                    display_labels = (
-                        runner_labels
-                        if len(runner_labels) <= 35
-                        else runner_labels[:32] + "..."
+                if runners_with_issues:
+                    summary_lines.append(
+                        "## Section 2: Top 15 Consecutively Failing Workers (streak >= 2)"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Machine Name | Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors | Total Jobs | Unique Jobs |"
                     )
                     summary_lines.append(
-                        f"| {i} | `{display_labels}` | {stats['failure_rate']:.1f}% | "
-                        f"{stats['failed_jobs']} | {stats['total_jobs']} | {stats['unique_jobs_with_failures']} |"
+                        "|--------------|--------|-----|-----------|-----------|---------------|--------------|------------|------------|-------------|"
                     )
 
-                summary_lines.append("")
+                    for runner_data in runners_with_issues[:15]:
+                        display_name = (
+                            runner_data["runner_name"]
+                            if len(runner_data["runner_name"]) <= 28
+                            else runner_data["runner_name"][:25] + "..."
+                        )
+
+                        # Format streaks
+                        streak_str = str(runner_data["current_streak"])
+                        max_str = str(runner_data["max_streak"])
+
+                        # Format queue time
+                        avg_queue_str = (
+                            f"{runner_data['avg_queue'] / 60:.1f}m"
+                            if runner_data["queue_samples"] > 0
+                            else "N/A"
+                        )
+
+                        # Get first and last failure info
+                        first_failure = runner_data.get("first_failure")
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                        else:
+                            first_failure_str = "N/A"
+
+                        last_failure = runner_data.get("last_failure")
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                        else:
+                            last_failure_str = "N/A"
+
+                        # Format top errors as bullet list
+                        top_errors = runner_data.get("top_error_signatures", [])
+                        if top_errors:
+                            error_str = "<br>".join(
+                                [f"• {err[0]} ({err[1]})" for err in top_errors]
+                            )
+                        else:
+                            error_str = "N/A"
+
+                        summary_lines.append(
+                            f"| `{display_name}` | {streak_str} | {max_str} | {runner_data['failure_rate']:.1f}% | "
+                            f"{avg_queue_str} | {first_failure_str} | {last_failure_str} | {error_str} | "
+                            f"{runner_data['total_jobs']} | {runner_data['unique_jobs']} |"
+                        )
+
+                    summary_lines.append("")
 
             # Write summary
             with open(github_step_summary, "a", encoding="utf-8") as f:
@@ -893,8 +2039,8 @@ def main():
     parser.add_argument(
         "--limit",
         type=int,
-        default=500,
-        help="Number of workflow runs to analyze (default: 500)",
+        default=1000,
+        help="Number of workflow runs to analyze across all monitored workflows (default: 1000)",
     )
     parser.add_argument(
         "--threshold",
@@ -929,17 +2075,30 @@ def main():
             print("No job data found")
             return
 
-        # Aggregate matrix jobs (e.g., "job (0)", "job (1)" -> "job")
-        print("\nAggregating matrix jobs...")
-        job_streak_data = analyzer.aggregate_matrix_jobs(job_streak_data)
-        print(f"After aggregation: {len(job_streak_data)} unique jobs")
+        # Skip aggregation to show individual job shards
+        print(f"\nTotal jobs (including shards): {len(job_streak_data)}")
 
-        # Analyze runner health
-        runner_stats, runner_instance_data = analyzer.analyze_runner_health(runs)
+        # Analyze consecutive failures on main branch (cron-triggered only)
+        main_streak_data, main_current_streaks = (
+            analyzer.construct_cron_failures_on_main(runs, job_streak_data)
+        )
+
+        # Analyze runner health and consecutive failures
+        (
+            runner_stats,
+            runner_instance_data,
+            runner_streak_data,
+            runner_instance_streak_data,
+        ) = analyzer.analyze_runner_health(runs)
 
         # Detect alerts
         job_alerts, runner_alerts = analyzer.detect_alerts(
-            job_streak_data, job_current_streaks, runner_stats, runner_instance_data
+            job_streak_data,
+            job_current_streaks,
+            runner_stats,
+            runner_instance_data,
+            runner_streak_data,
+            runner_instance_streak_data,
         )
 
         # Generate report
@@ -949,6 +2108,9 @@ def main():
             runner_stats,
             runner_instance_data,
             runner_alerts,
+            runner_streak_data,
+            runner_instance_streak_data,
+            main_streak_data,
             args.output,
         )
 

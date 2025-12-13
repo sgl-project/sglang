@@ -13,9 +13,16 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 class DiTArchConfig(ArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=list)
     _compile_conditions: list = field(default_factory=list)
+
+    # convert weights name from HF-format to SGLang-dit-format
     param_names_mapping: dict = field(default_factory=dict)
-    reverse_param_names_mapping: dict = field(default_factory=dict)
+
+    # convert weights name from misc-format to HF-format
+    # usually applicable if the LoRA is trained with official repo implementation
     lora_param_names_mapping: dict = field(default_factory=dict)
+
+    # Reverse mapping for saving checkpoints: custom -> hf
+    reverse_param_names_mapping: dict = field(default_factory=dict)
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
@@ -24,7 +31,7 @@ class DiTArchConfig(ArchConfig):
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
-            AttentionBackendEnum.SAGE_ATTN_THREE,
+            AttentionBackendEnum.SAGE_ATTN_3,
         }
     )
 
@@ -43,7 +50,7 @@ class DiTArchConfig(ArchConfig):
 class DiTConfig(ModelConfig):
     arch_config: DiTArchConfig = field(default_factory=DiTArchConfig)
 
-    # sgl-diffusionDiT-specific parameters
+    # sglang-diffusion DiT-specific parameters
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
 

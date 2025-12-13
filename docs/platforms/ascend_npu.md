@@ -1,37 +1,7 @@
-# Ascend NPUs
+
+# SGLang installation with NPUs support
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
-
-## System Settings
-
-### CPU performance power scheme
-
-The default power scheme on Ascend hardware is `ondemand` which could affect performance, changing it to `performance` is recommended.
-
-```shell
-echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Make sure changes are applied successfully
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
-```
-
-### Disable NUMA balancing
-
-```shell
-sudo sysctl -w kernel.numa_balancing=0
-
-# Check
-cat /proc/sys/kernel/numa_balancing # shows 0
-```
-
-### Prevent swapping out system memory
-
-```shell
-sudo sysctl -w vm.swappiness=10
-
-# Check
-cat /proc/sys/vm/swappiness # shows 10
-```
 
 ## Installing SGLang
 
@@ -46,63 +16,84 @@ conda create --name sglang_npu python=3.11
 conda activate sglang_npu
 ```
 
+#### CANN
+
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC2 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
+
 #### MemFabric Adaptor
 
-_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel package for now._
-
-_Notice: Prebuilt wheel package is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
-
-MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+If you want to use PD disaggregation mode, you need to install MemFabric Adaptor. MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
-MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
-wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
+pip install mf-adapter==1.0.0
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
-Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release by the end of September, 2025.
+At the moment NPUGraph optimizations are supported only in `torch_npu==2.6.0.post3` that requires 'torch==2.6.0'.
+_TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0_
 
 ```shell
 PYTORCH_VERSION=2.6.0
 TORCHVISION_VERSION=0.21.0
+TORCH_NPU_VERSION=2.6.0.post3
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
-
-PTA_VERSION="v7.1.0.1-pytorch2.6.0"
-PTA_NAME="torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
-PTA_URL="https://gitee.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
-wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
+pip install torch_npu==$TORCH_NPU_VERSION
 ```
 
-#### vLLM
-
-vLLM is still a major prerequisite on Ascend NPU. Because of `torch==2.6.0` limitation, only vLLM v0.8.5 is supported.
+While there is no resleased versions of 'torch_npu' for 'torch==2.7.1' and 'torch==2.8.0' we provide custom builds of 'torch_npu'. PLATFORM can be 'aarch64' or 'x86_64'
 
 ```shell
-VLLM_TAG=v0.8.5
-git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
+PLATFORM="aarch64"
+PYTORCH_VERSION=2.8.0
+TORCHVISION_VERSION=0.23.0
+pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
+pip install torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
 ```
+
+If you are using other versions of 'torch' install 'torch_npu' from sources, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
 
 #### Triton on Ascend
 
-_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for know. This problem will be solved on Sep. 2025, afterwards `pip install` would be the one and only installing method.
+We provide our own implementation of Triton for Ascend.
 
-Please follow Triton-on-Ascend's [installation guide from source](https://gitee.com/ascend/triton-ascend#2%E6%BA%90%E4%BB%A3%E7%A0%81%E5%AE%89%E8%A3%85-triton-ascend) to install the latest `triton-ascend` package.
+```shell
+BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64_20251121.run"
+BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
+wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
+```
+```shell
+pip install triton-ascend==3.2.0rc4
+```
+For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
+
+#### SGLang Kernels NPU
+We provide our own set of SGL kernels, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
 #### DeepEP-compatible Library
+We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
-We are also providing a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+#### CustomOps
+_TODO: to be removed once merged into sgl-kernel-npu._
+Additional package with custom operations. DEVICE_TYPE can be "a3" for Atlas A3 server or "910b" for Atlas A2 server.
+
+```shell
+DEVICE_TYPE="a3"
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
+chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
+./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+```
 
 #### Installing SGLang from source
 
 ```shell
 # Use the last release branch
-git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
 cd sglang
-
-pip install --upgrade pip
+mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
 ```
 
@@ -136,72 +127,33 @@ drun --env "HF_TOKEN=<secret>" \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
 ```
 
-## Examples
+## System Settings
 
-### Running DeepSeek-V3
+### CPU performance power scheme
 
-Running DeepSeek with PD disaggregation on 2 x Atlas 800I A3.
-Model weights could be found [here](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).
-
-Prefill:
+The default power scheme on Ascend hardware is `ondemand` which could affect performance, changing it to `performance` is recommended.
 
 ```shell
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 
-drun <image_name> \
-    python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
-    --trust-remote-code \
-    --attention-backend ascend \
-    --mem-fraction-static 0.8 \
-    --quantization w8a8_int8 \
-    --tp-size 16 \
-    --dp-size 1 \
-    --nnodes 1 \
-    --node-rank 0 \
-    --disaggregation-mode prefill \
-    --disaggregation-bootstrap-port 6657 \
-    --disaggregation-transfer-backend ascend \
-    --dist-init-addr <PREFILL_HOST_IP>:6688 \
-    --host <PREFILL_HOST_IP> \
-    --port 8000
+# Make sure changes are applied successfully
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 ```
 
-Decode:
+### Disable NUMA balancing
 
 ```shell
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
-export HCCL_BUFFSIZE=200
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
-export SGLANG_NPU_USE_MLAPO=1
+sudo sysctl -w kernel.numa_balancing=0
 
-drun <image_name> \
-    python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
-    --trust-remote-code \
-    --attention-backend ascend \
-    --mem-fraction-static 0.8 \
-    --quantization w8a8_int8 \
-    --enable-deepep-moe \
-    --deepep-mode low_latency \
-    --tp-size 16 \
-    --dp-size 1 \
-    --ep-size 16 \
-    --nnodes 1 \
-    --node-rank 0 \
-    --disaggregation-mode decode \
-    --disaggregation-transfer-backend ascend \
-    --dist-init-addr <DECODE_HOST_IP>:6688 \
-    --host <DECODE_HOST_IP> \
-    --port 8001
+# Check
+cat /proc/sys/kernel/numa_balancing # shows 0
 ```
 
-Mini_LB:
+### Prevent swapping out system memory
 
 ```shell
-drun <image_name> \
-    python -m sglang.srt.disaggregation.launch_lb \
-    --prefill http://<PREFILL_HOST_IP>:8000 \
-    --decode http://<DECODE_HOST_IP>:8001 \
-    --host 127.0.0.1 --port 5000
+sudo sysctl -w vm.swappiness=10
+
+# Check
+cat /proc/sys/vm/swappiness # shows 10
 ```

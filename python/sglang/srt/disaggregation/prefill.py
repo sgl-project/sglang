@@ -55,7 +55,6 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
-from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -252,8 +251,6 @@ class PrefillBootstrapQueue:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
                     continue
-                # Either waiting for input or failed
-                assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
 
             if poll == KVPoll.Bootstrapping:
                 continue
@@ -597,27 +594,38 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def process_prefill_chunk(self: Scheduler) -> None:
+        chunked_req_to_exclude = set()
+        if self.chunked_req:
+            chunked_req_to_exclude.add(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            if self.enable_overlap:
+                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                self.chunked_req.tmp_end_idx = min(
+                    len(self.chunked_req.fill_ids),
+                    len(self.chunked_req.origin_input_ids),
+                )
+            else:
+                self.send_kv_chunk(self.chunked_req)
+            # chunked request keeps its rid but will get a new req_pool_idx
+            if self.tp_worker.model_runner.mambaish_config is not None:
+                self.req_to_token_pool.free(
+                    self.chunked_req.req_pool_idx, free_mamba_cache=False
+                )
+            else:
+                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+            self.running_batch.batch_is_full = False
+
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.chunked_req:
-                # Move the chunked request out of the batch so that we can merge
-                # only finished requests to running_batch.
-                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-                if self.enable_overlap:
-                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                    self.chunked_req.tmp_end_idx = min(
-                        len(self.chunked_req.fill_ids),
-                        len(self.chunked_req.origin_input_ids),
-                    )
-                else:
-                    self.send_kv_chunk(self.chunked_req)
-                # chunked request keeps its rid but will get a new req_pool_idx
-                if self.tp_worker.model_runner.mambaish_config is not None:
-                    self.req_to_token_pool.free(
-                        self.chunked_req.req_pool_idx, free_mamba_cache=False
-                    )
-                else:
-                    self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+            if self.last_batch.chunked_req:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                # We need to discard it.
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
     def send_kv_chunk(
@@ -699,36 +707,3 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
-
-    def send_pyobj_to_next_stage(self, data):
-        if self.attn_tp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            point_to_point_pyobj(
-                data,
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
-                self.pp_rank * self.tp_size + dp_offset,
-                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
-            )
-
-    def recv_pyobj_from_prev_stage(self):
-        if self.attn_tp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
-            data = point_to_point_pyobj(
-                [],
-                self.pp_rank * self.tp_size + dp_offset,
-                self.world_group.device_group,
-                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                self.pp_rank * self.tp_size + dp_offset,
-            )
-        else:
-            data = None
-
-        if self.attn_tp_size != 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_tp_group.rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_group.ranks[0],
-            )
-        return data
