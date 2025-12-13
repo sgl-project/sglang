@@ -16,6 +16,7 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
+import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -927,6 +928,8 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        if self.attention_backend is None:
+            self._set_default_attention_backend()
 
         # parallelism
         self.check_server_dp_args()
@@ -938,6 +941,26 @@ class ServerArgs:
                 raise ValueError(
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
                 )
+
+    def _set_default_attention_backend(self) -> None:
+        """Configure ROCm defaults when users do not specify an attention backend."""
+        if current_platform.is_rocm():
+            # Check env var first, then fall back to AITER default
+            env_backend = envs.SGLANG_DIFFUSION_ATTENTION_BACKEND
+            if env_backend is not None:
+                default_backend = env_backend.lower()
+                logger.info(
+                    "Using attention backend '%s' from SGLANG_DIFFUSION_ATTENTION_BACKEND env var.",
+                    default_backend,
+                )
+            else:
+                default_backend = AttentionBackendEnum.AITER.name.lower()
+                logger.info(
+                    "Attention backend not specified. Using '%s' by default on ROCm "
+                    "to match SGLang SRT defaults.",
+                    default_backend,
+                )
+            self.attention_backend = default_backend
 
 
 @dataclasses.dataclass

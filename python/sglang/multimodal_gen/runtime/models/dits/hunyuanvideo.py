@@ -886,6 +886,7 @@ class IndividualTokenRefinerBlock(nn.Module):
             # TODO: remove hardcode; remove STA
             supported_attention_backends=(
                 AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
