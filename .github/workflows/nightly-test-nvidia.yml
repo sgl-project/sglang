@@ -236,7 +236,7 @@ jobs:
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:

@@ -18,7 +18,7 @@ register_cuda_ci(est_time=3600, suite="nightly-8-gpu-b200", nightly=True)
 
 # Use the latest version of DeepSeek-V3.2
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
-SERVER_LAUNCH_TIMEOUT = 2000
+SERVER_LAUNCH_TIMEOUT = 1200
 
 
 class TestDeepseekV32Accuracy(CustomTestCase):
