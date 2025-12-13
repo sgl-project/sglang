@@ -145,6 +145,10 @@ class BaseLayerWithLoRA(nn.Module):
             lora_delta = self.slice_lora_b_weights(self.lora_B).to(
                 data
             ) @ self.slice_lora_a_weights(self.lora_A).to(data)
+            # Apply lora_alpha / lora_rank scaling for consistency with forward()
+            if self.lora_alpha is not None and self.lora_rank is not None:
+                if self.lora_alpha != self.lora_rank:
+                    lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
             data += self.strength * lora_delta
             unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
@@ -171,6 +175,10 @@ class BaseLayerWithLoRA(nn.Module):
             lora_delta = self.slice_lora_b_weights(
                 self.lora_B.to(data)
             ) @ self.slice_lora_a_weights(self.lora_A.to(data))
+            # Apply lora_alpha / lora_rank scaling for consistency with forward()
+            if self.lora_alpha is not None and self.lora_rank is not None:
+                if self.lora_alpha != self.lora_rank:
+                    lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
             data += self.strength * lora_delta
             self.base_layer.weight.data = data.to(current_device, non_blocking=True)
 
