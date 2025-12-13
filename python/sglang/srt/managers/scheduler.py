@@ -128,6 +128,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    ChunkedReqs,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -469,7 +470,7 @@ class Scheduler(
             self.chunked_prefill_size = self.dllm_config.block_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
-        self.chunked_req = None
+        self.chunked_reqs = ChunkedReqs(dllm_config=self.dllm_config)
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -1217,7 +1218,7 @@ class Scheduler(
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None
+                self.chunked_reqs.has_running_reqs()
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
             ):
@@ -1678,28 +1679,25 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.dllm_config is not None:
-            if self.chunked_req is not None and self.chunked_req.finished():
-                self.chunked_req = None
+            self.chunked_reqs.flush_finished_reqs()
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
-        if self.chunked_req:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-            # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.model_runner.mambaish_config is not None:
-                self.req_to_token_pool.free(
-                    self.chunked_req.req_pool_idx, free_mamba_cache=False
-                )
-            else:
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+        if self.chunked_reqs.has_running_reqs():
+            chunked_req_to_exclude.update(self.chunked_reqs)
+            for req in self.chunked_reqs:
+                self.tree_cache.cache_unfinished_req(req, chunked=True)
+                # chunked request keeps its rid but will get a new req_pool_idx
+                if self.tp_worker.model_runner.mambaish_config is not None:
+                    self.req_to_token_pool.free(
+                        req.req_pool_idx, free_mamba_cache=False
+                    )
+                else:
+                    self.req_to_token_pool.free(req.req_pool_idx)
+
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+            if self.last_batch.chunked_reqs.has_running_reqs():
+                chunked_req_to_exclude.update(self.last_batch.chunked_reqs)
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
@@ -1772,18 +1770,18 @@ class Scheduler(
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not self.chunked_reqs.has_running_reqs():
             return None
 
         running_bs = len(self.running_batch.reqs)
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked request has just been released.
-        # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
+        # Ignore the check if self.chunked_reqs is not None.
+        # In the non-PP case, when self.chunked_reqs is not None, num_allocatable_reqs should always be greater than 0,
+        # as the space for the chunked requests has just been released.
+        # In PP case, a chunked reqs can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and not self.chunked_req
+            and not self.chunked_reqs.has_running_reqs()
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -1822,11 +1820,18 @@ class Scheduler(
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            self.dllm_config,
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        if self.chunked_reqs.has_running_reqs():
+            self.chunked_reqs.init_next_round()
+            for req in self.chunked_reqs:
+                adder.add_chunked_req(req)
+
+            if self.dllm_config is not None:
+                self.chunked_reqs.add_reqs(adder.block_diffusion_reqs)
+            elif adder.new_chunked_req is not None:
+                self.chunked_reqs.add_reqs(adder.new_chunked_req)
 
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
@@ -1874,7 +1879,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=(self.chunked_reqs.has_running_reqs()),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -1906,12 +1911,16 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+        if self.dllm_config is not None:
+            if adder.block_diffusion_reqs.has_running_reqs():
+                self.chunked_reqs.add_reqs(adder.block_diffusion_reqs)
+        else:
+            assert not self.chunked_reqs.has_running_reqs()
+            if adder.new_chunked_req:
+                self.chunked_reqs.add_reqs(adder.new_chunked_req)
 
-        if self.chunked_req:
-            self.chunked_req.is_chunked += 1
+        if self.chunked_reqs.has_running_reqs():
+            self.chunked_reqs.update_chunked_status()
 
         # Print stats
         if self.current_scheduler_metrics_enabled():
@@ -1935,7 +1944,7 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_reqs=self.chunked_reqs,
             dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:

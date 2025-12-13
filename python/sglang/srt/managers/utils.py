@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[torch.Tensor] = None
+    next_token_ids: Union[Optional[torch.Tensor], List[torch.Tensor]] = None
     num_accepted_tokens: Optional[int] = None
     can_run_cuda_graph: bool = False
 

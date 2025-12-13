@@ -876,7 +876,7 @@ class SchedulerDisaggregationDecodeMixin:
         last_batch = self.last_batch
         if last_batch and last_batch.forward_mode.is_prebuilt():
             # chunked prefill doesn't happen in decode instance.
-            assert self.chunked_req is None
+            assert not self.chunked_reqs.has_running_reqs()
             # Filter finished batches.
             last_batch.filter_batch()
             if not last_batch.is_empty():

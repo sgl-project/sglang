@@ -1078,6 +1078,68 @@ class Req:
         )
 
 
+class ChunkedReqs:
+    def __init__(self, dllm_config: Optional[DllmConfig] = None):
+        self.dllm_config = dllm_config
+        # Maximum number of concurrent diffusion LLM requests, if disabling diffusion LLM, only 1 request is allowed for chunked prefilling, else fetch the value from dllm_config
+        self.max_running_reqs = (
+            dllm_config.max_running_requests if dllm_config is not None else 1
+        )
+        self.reqs: List[Req] = []
+
+    def add_reqs(self, req: Union[Req, List[Req], "ChunkedReqs"]):
+        if isinstance(req, ChunkedReqs):
+            reqs_to_add = req.reqs
+        elif isinstance(req, list):
+            reqs_to_add = req
+        else:
+            reqs_to_add = [req]
+
+        num_to_add = len(reqs_to_add)
+
+        # Sanity check:
+        if self.check_redundant_reqs(reqs_to_add):
+            raise RuntimeError("Redundant requests detected in chunked requests.")
+
+        # Maximum number of concurrent diffusion LLM requests, if disabling diffusion LLM, only 1 request is allowed for chunked prefilling, else fetch the value from dllm_config
+        if len(self.reqs) + num_to_add > self.max_running_reqs:
+            if self.dllm_config:
+                raise RuntimeError(
+                    f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Exceeding maximum number of chunked prefill requests: 1"
+                )
+
+        self.reqs.extend(reqs_to_add)
+
+    def check_redundant_reqs(self, reqs: List[Req]) -> bool:
+        existing_rids = {req.rid for req in self.reqs}
+        for req in reqs:
+            if req.rid in existing_rids:
+                return True
+
+        return False
+
+    def init_next_round(self):
+        for req in self.reqs:
+            req.init_next_round_input()
+
+    def has_running_reqs(self) -> bool:
+        return len(self.reqs) > 0
+
+    def update_chunked_status(self):
+        for req in self.reqs:
+            req.is_chunked += 1
+
+    def flush_finished_reqs(self):
+        self.reqs = [req for req in self.reqs if not req.finished()]
+
+    def __iter__(self):
+        return iter(self.reqs)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1099,7 +1161,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     batch_is_full: bool = False
 
     # For chunked prefill in PP
-    chunked_req: Optional[Req] = None
+    chunked_reqs: Optional[ChunkedReqs] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1202,7 +1264,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        chunked_req: Optional[Req] = None,
+        chunked_reqs: Optional[ChunkedReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1231,7 +1293,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
+            chunked_reqs=chunked_reqs,
             dllm_config=dllm_config,
         )
 
