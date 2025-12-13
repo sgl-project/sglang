@@ -30,12 +30,19 @@ class DllmConfig:
             model_revision=server_args.revision,
         )
 
-        if model_config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
+        # Detect architecture from config
+        architecture = model_config.hf_config.architectures[0] if model_config.hf_config.architectures else None
+
+        # Set defaults based on architecture (like LLADA2)
+        if architecture == "LLaDA2MoeModelLM":
             block_size = 32
             mask_id = 156895
+        elif architecture == "DiffEncoderModel":
+            block_size = 32
+            mask_id = 151662
         else:
             raise RuntimeError(
-                f"Unknown diffusion LLM: {model_config.hf_config.architectures[0]}"
+                f"Unknown diffusion LLM: {architecture}. Config has architectures={model_config.hf_config.architectures}"
             )
 
         algorithm_config = {}
