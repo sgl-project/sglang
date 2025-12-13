@@ -40,6 +40,7 @@ health_router = APIRouter()
 async def health():
     return {"status": "ok"}
 
+
 @health_router.get("/models")
 async def get_models(request: Request):
     """Get information about the model served by this server."""
@@ -85,6 +86,7 @@ async def get_models(request: Request):
     )
 
     return response
+
 
 @health_router.get("/health_generate")
 async def health_generate():

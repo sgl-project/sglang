@@ -78,7 +78,11 @@ def _build_sampling_params_from_request(
         guidance_scale=request.guidance_scale,
         num_inference_steps=request.num_inference_steps,
         enable_teacache=request.enable_teacache,
-        **({"negative_prompt": request.negative_prompt} if request.negative_prompt is not None else {}),
+        **(
+            {"negative_prompt": request.negative_prompt}
+            if request.negative_prompt is not None
+            else {}
+        ),
     )
 
     return sampling_params
@@ -180,7 +184,9 @@ async def create_video(
             fps=fps_val,
             num_frames=num_frames_val,
             seed=seed if seed is not None else 1024,
-            generator_device=generator_device if generator_device is not None else "cuda",
+            generator_device=(
+                generator_device if generator_device is not None else "cuda"
+            ),
             negative_prompt=negative_prompt,
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
