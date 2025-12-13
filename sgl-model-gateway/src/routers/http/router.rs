@@ -234,7 +234,7 @@ impl Router {
         };
 
         let load_incremented = if policy.name() == "cache_aware" {
-            increment_load(&worker);
+            worker.increment_load();
             true
         } else {
             false
@@ -274,7 +274,7 @@ impl Router {
         // won't have done it (it only decrements on success or non-retryable failures)
         if is_retryable_status(response.status()) && load_incremented {
             if let Some(cleanup_worker) = worker_for_cleanup {
-                decrement_load(&cleanup_worker);
+                cleanup_worker.decrement_load();
             }
         }
 
@@ -507,7 +507,7 @@ impl Router {
                 // Decrement load on error if it was incremented
                 if load_incremented {
                     if let Some(ref w) = worker {
-                        decrement_load(w);
+                        w.decrement_load();
                     }
                 }
 
@@ -533,7 +533,7 @@ impl Router {
                     // IMPORTANT: Decrement load on error before returning
                     if load_incremented {
                         if let Some(ref w) = worker {
-                            decrement_load(w);
+                            w.decrement_load();
                         }
                     }
 
@@ -545,7 +545,7 @@ impl Router {
             // Decrement load counter for non-streaming requests if it was incremented
             if load_incremented {
                 if let Some(ref w) = worker {
-                    decrement_load(w);
+                    w.decrement_load();
                 }
             }
 
@@ -573,7 +573,7 @@ impl Router {
                             // Check for stream end marker using memmem for efficiency
                             if memmem::find(&bytes, b"data: [DONE]").is_some() {
                                 if let Some(ref w) = stream_worker {
-                                    decrement_load(w);
+                                    w.decrement_load();
                                     decremented = true;
                                 }
                             }
@@ -589,7 +589,7 @@ impl Router {
                 }
                 if !decremented {
                     if let Some(ref w) = stream_worker {
-                        decrement_load(w);
+                        w.decrement_load();
                     }
                 }
             });
@@ -657,16 +657,6 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
-}
-
-fn increment_load(w: &Arc<dyn Worker>) {
-    w.increment_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
-}
-
-fn decrement_load(w: &Arc<dyn Worker>) {
-    w.decrement_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
