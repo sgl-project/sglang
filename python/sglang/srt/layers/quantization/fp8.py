@@ -247,7 +247,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
             if skip_block_quant_check:
-                logger.warning(
+                logger.warning_once(
                     f"Skipping block quantization checks for weight partition."
                 )
             else:
