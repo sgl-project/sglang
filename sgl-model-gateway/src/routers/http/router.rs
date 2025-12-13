@@ -37,7 +37,7 @@ use crate::{
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{header_utils, RouterTrait},
+    routers::{error, header_utils, RouterTrait},
 };
 
 /// Regular router that uses injected load balancing policies
@@ -106,21 +106,16 @@ impl Router {
                                 *response.headers_mut() = response_headers;
                                 response
                             }
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
+                            Err(e) => error::internal_error(
+                                "read_response_failed",
                                 format!("Failed to read response: {}", e),
-                            )
-                                .into_response(),
+                            ),
                         }
                     }
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request failed: {}", e),
-                    )
-                        .into_response(),
+                    Err(e) => convert_reqwest_error(e),
                 }
             }
-            Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+            Err(e) => error::service_unavailable("no_workers", e),
         }
     }
 
@@ -175,71 +170,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text)) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented = if policy.name() == "cache_aware" {
-                    increment_load(&worker);
-                    true
-                } else {
-                    false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
-                events::RequestSentEvent {
-                    url: worker.url().to_string(),
-                }
-                .emit();
-                let mut headers_with_trace = headers.cloned().unwrap_or_default();
-                inject_trace_context_http(&mut headers_with_trace);
-                let headers = Some(&headers_with_trace);
-
-                let response = self
-                    .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
-                    )
+                let res = self
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
                     .await;
 
-                events::RequestReceivedEvent {}.emit();
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                RouterMetrics::record_attempt_http_response(
+                    route,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
 
-                worker.record_outcome(response.status().is_success());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        decrement_load(&cleanup_worker);
-                    }
-                }
-
-                response
+                res
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -259,6 +201,81 @@ impl Router {
             RouterMetrics::record_generate_duration(duration);
         } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
+        }
+
+        response
+    }
+
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text: &str,
+    ) -> Response {
+        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+            Some(w) => w,
+            None => {
+                RouterMetrics::record_request_error(route, "no_available_workers");
+                return error::service_unavailable(
+                    "no_available_workers",
+                    "No available workers (all circuits open or unhealthy)",
+                );
+            }
+        };
+
+        // Optional load tracking for cache-aware policy
+        // Get the policy for this model to check if it's cache-aware
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let load_incremented = if policy.name() == "cache_aware" {
+            worker.increment_load();
+            true
+        } else {
+            false
+        };
+
+        // Keep a clone for potential cleanup on retry
+        let worker_for_cleanup = if load_incremented {
+            Some(worker.clone())
+        } else {
+            None
+        };
+
+        events::RequestSentEvent {
+            url: worker.url().to_string(),
+        }
+        .emit();
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        let response = self
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                worker.url(),
+                is_stream,
+                load_incremented,
+            )
+            .await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        worker.record_outcome(response.status().is_success());
+
+        // For retryable failures, we need to decrement load since send_typed_request
+        // won't have done it (it only decrements on success or non-retryable failures)
+        if is_retryable_status(response.status()) && load_incremented {
+            if let Some(cleanup_worker) = worker_for_cleanup {
+                cleanup_worker.decrement_load();
+            }
         }
 
         response
@@ -285,7 +302,7 @@ impl Router {
         // Eventually, we need to have router to manage the chat history with a proper database, will update this implementation accordingly.
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+            return error::service_unavailable("no_workers", "No available workers");
         }
 
         // Pre-filter headers once before the loop to avoid repeated lowercasing
@@ -310,11 +327,10 @@ impl Router {
                 Method::GET => self.client.get(url),
                 Method::POST => self.client.post(url),
                 _ => {
-                    return (
-                        StatusCode::METHOD_NOT_ALLOWED,
+                    return error::method_not_allowed(
+                        "unsupported_method",
                         "Unsupported method for simple routing",
                     )
-                        .into_response()
                 }
             };
 
@@ -347,30 +363,21 @@ impl Router {
                             last_response = Some(response);
                         }
                         Err(e) => {
-                            last_response = Some(
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("Failed to read response: {}", e),
-                                )
-                                    .into_response(),
-                            );
+                            last_response = Some(error::internal_error(
+                                "read_response_failed",
+                                format!("Failed to read response: {}", e),
+                            ));
                         }
                     }
                 }
                 Err(e) => {
-                    last_response = Some(
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Request failed: {}", e),
-                        )
-                            .into_response(),
-                    );
+                    last_response = Some(convert_reqwest_error(e));
                 }
             }
         }
 
         last_response
-            .unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "No worker response").into_response())
+            .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
     }
 
     // Route a GET request with provided headers to a specific endpoint
@@ -428,22 +435,20 @@ impl Router {
                 Ok(tup) => tup,
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                    return error::internal_error(
+                        "dp_rank_extraction_failed",
                         format!("Failed to extract dp_rank: {}", e),
-                    )
-                        .into_response();
+                    );
                 }
             };
 
             let mut json_val = match serde_json::to_value(typed_req) {
                 Ok(j) => j,
                 Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
+                    return error::bad_request(
+                        "serialization_failed",
                         format!("Convert into serde_json::Value failed: {}", e),
-                    )
-                        .into_response();
+                    );
                 }
             };
 
@@ -458,11 +463,10 @@ impl Router {
                     );
                 }
             } else {
-                return (
-                    StatusCode::BAD_REQUEST,
+                return error::bad_request(
+                    "dp_rank_insertion_failed",
                     "Failed to insert the data_parallel_rank field into the request body",
-                )
-                    .into_response();
+                );
             }
 
             self.client
@@ -503,19 +507,13 @@ impl Router {
                 // Decrement load on error if it was incremented
                 if load_incremented {
                     if let Some(ref w) = worker {
-                        decrement_load(w);
+                        w.decrement_load();
                     }
                 }
 
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Request failed: {}", e),
-                )
-                    .into_response();
+                return convert_reqwest_error(e);
             }
         };
-
-        RouterMetrics::record_upstream_http_response(route, res.status().as_u16());
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -532,22 +530,15 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(ref w) = worker {
-                            decrement_load(w);
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
+                    error::internal_error("read_response_body_failed", error_msg)
                 }
             };
 
             // Decrement load counter for non-streaming requests if it was incremented
             if load_incremented {
                 if let Some(ref w) = worker {
-                    decrement_load(w);
+                    w.decrement_load();
                 }
             }
 
@@ -575,7 +566,7 @@ impl Router {
                             // Check for stream end marker using memmem for efficiency
                             if memmem::find(&bytes, b"data: [DONE]").is_some() {
                                 if let Some(ref w) = stream_worker {
-                                    decrement_load(w);
+                                    w.decrement_load();
                                     decremented = true;
                                 }
                             }
@@ -591,7 +582,7 @@ impl Router {
                 }
                 if !decremented {
                     if let Some(ref w) = stream_worker {
-                        decrement_load(w);
+                        w.decrement_load();
                     }
                 }
             });
@@ -661,17 +652,61 @@ impl Router {
     }
 }
 
-fn increment_load(w: &Arc<dyn Worker>) {
-    w.increment_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
-}
+fn convert_reqwest_error(e: reqwest::Error) -> Response {
+    let url = e
+        .url()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let message = format!("{}. URL: {}", e, url);
 
-fn decrement_load(w: &Arc<dyn Worker>) {
-    w.decrement_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
+    // TODO improve error status code
+    let (status, code) = if let Some(upstream_status) = e.status() {
+        (upstream_status, "call_upstream_status_error")
+    } else if e.is_builder() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_builder_error",
+        )
+    } else if e.is_request() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_error",
+        )
+    } else if e.is_redirect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_redirect_error",
+        )
+    } else if e.is_body() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_body_error",
+        )
+    } else if e.is_decode() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_decode_error",
+        )
+    } else if e.is_timeout() {
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
+    } else if e.is_connect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_connection_failed",
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_failed",
+        )
+    };
+
+    error::create_error(status, code, message)
 }
 
 use async_trait::async_trait;
+
+use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
 impl RouterTrait for Router {
@@ -812,11 +847,10 @@ impl RouterTrait for Router {
                 Ok(rerank_response) => rerank_response,
                 Err(e) => {
                     error!("Failed to build rerank response: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to build rerank response".to_string(),
-                    )
-                        .into_response();
+                    return error::internal_error(
+                        "rerank_response_build_failed",
+                        "Failed to build rerank response",
+                    );
                 }
             }
         } else {
