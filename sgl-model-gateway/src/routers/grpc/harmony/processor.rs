@@ -72,7 +72,7 @@ impl HarmonyResponseProcessor {
                     error = %e,
                     "Failed to create Harmony parser"
                 );
-                error::internal_error("failed_to_create_harmony_parser", format!("Failed to create Harmony parser: {}", e))
+                error::internal_error("create_harmony_parser_failed", format!("Failed to create Harmony parser: {}", e))
             })?;
 
             // Parse Harmony channels with finish_reason and matched_stop
@@ -202,7 +202,7 @@ impl HarmonyResponseProcessor {
                 error = %e,
                 "Failed to create Harmony parser"
             );
-            error::internal_error("failed_to_create_harmony_parser", format!("Failed to create Harmony parser: {}", e))
+            error::internal_error("create_harmony_parser_failed", format!("Failed to create Harmony parser: {}", e))
         })?;
 
         // Convert matched_stop from proto to JSON

@@ -233,7 +233,7 @@ impl HarmonyPreparationStage {
                             error = %e,
                             "Failed to build text format structural tag for JsonObject"
                         );
-                        Box::new(error::internal_error("failed_to_build_text_format_tag", e))
+                        Box::new(error::internal_error("build_text_format_tag_failed", e))
                     })?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
@@ -244,7 +244,7 @@ impl HarmonyPreparationStage {
                         error = %e,
                         "Failed to build text format structural tag for JsonSchema"
                     );
-                    Box::new(error::internal_error("failed_to_build_text_format_tag", e))
+                    Box::new(error::internal_error("build_text_format_tag_failed", e))
                 })?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
@@ -369,7 +369,7 @@ impl HarmonyPreparationStage {
                 "Failed to serialize structural tag"
             );
             Box::new(error::internal_error(
-                "failed_to_serialize_structural_tag",
+                "serialize_structural_tag_failed",
                 format!(
                     "Failed to serialize structural tag: {}",
                     e

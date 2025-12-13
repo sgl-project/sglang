@@ -279,7 +279,7 @@ impl ResponseProcessor {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
                     return Err(error::internal_error(
-                        "failed_to_process_choice",
+                        "process_choice_failed",
                         format!(
                             "Failed to process choice {}: {}",
                             index, e
@@ -384,7 +384,7 @@ impl ResponseProcessor {
                 Ok(outputs) => outputs,
                 Err(e) => {
                     return Err(error::internal_error(
-                        "failed_to_process_tokens",
+                        "process_tokens_failed",
                         format!(
                             "Failed to process tokens: {}",
                             e

@@ -54,7 +54,7 @@ impl ChatPreparationStage {
             Ok(msgs) => msgs,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request("failed_to_process_messages", e));
+                return Err(error::bad_request("process_messages_failed", e));
             }
         };
 

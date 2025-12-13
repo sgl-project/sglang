@@ -73,7 +73,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
-                        error::bad_request("failed_to_build_request", e)
+                        error::bad_request("build_request_failed", e)
                     })?;
                 ProtoGenerateRequest::Sglang(Box::new(req))
             }
@@ -87,7 +87,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build vLLM generate request");
-                        error::bad_request("failed_to_build_request", e)
+                        error::bad_request("build_request_failed", e)
                     })?;
                 ProtoGenerateRequest::Vllm(Box::new(req))
             }
