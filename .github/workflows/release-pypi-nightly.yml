@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build-nightly-wheel:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'dougyster/sglang'
     runs-on: ubuntu-latest
     outputs:
       nightly_version: ${{ steps.gen_version.outputs.nightly_version }}
@@ -110,51 +110,9 @@ jobs:
           echo "Downloaded wheel:"
           ls -lh dist/
 
-      - name: Create GitHub Release for nightly wheel
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly-${{ needs.build-nightly-wheel.outputs.commit_hash }}
-          name: Nightly Build (${{ needs.build-nightly-wheel.outputs.commit_hash }})
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          prerelease: true
-          body: |
-            Nightly build from commit ${{ github.sha }}
-            Version: ${{ needs.build-nightly-wheel.outputs.nightly_version }}
-
-            ## Installation
-
-            **Quick install (uses default CUDA 12.9):**
-            ```bash
-            pip install sglang --extra-index-url https://sgl-project.github.io/whl/nightly/
-            ```
-
-            **For specific CUDA versions:**
-            ```bash
-            # CUDA 12.9
-            pip install sglang \
-              --extra-index-url https://sgl-project.github.io/whl/nightly/ \
-              --extra-index-url https://sgl-project.github.io/whl/cu129/sgl-kernel/
-
-            # CUDA 13.0
-            pip install sglang \
-              --extra-index-url https://sgl-project.github.io/whl/nightly/ \
-              --extra-index-url https://sgl-project.github.io/whl/cu130/sgl-kernel/
-            ```
-
-            **Note:** This is a pure Python wheel that works on all platforms (x86_64, aarch64, Windows, macOS, Linux).
-            CUDA version and architecture are selected via dependencies (sgl-kernel).
-
-            Or install directly:
-            ```bash
-            pip install https://github.com/sgl-project/whl/releases/download/nightly-${{ needs.build-nightly-wheel.outputs.commit_hash }}/sglang-${{ needs.build-nightly-wheel.outputs.nightly_version }}-py3-none-any.whl
-            ```
-          files: |
-            dist/*.whl
-
       - name: Clone wheel index repository
         run: |
-          git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+          git clone https://oauth2:${WHL_TOKEN}@github.com/dougyster/test-whl.git sgl-whl
           cd sgl-whl
           git config --local user.name "sglang-bot"
           git config --local user.email "sglangbot@gmail.com"
