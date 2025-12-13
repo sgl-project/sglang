@@ -306,7 +306,7 @@ class SchedulerRuntimeCheckerMixin:
         self.maybe_sleep_on_idle()
 
 
-class SchedulerWatchdog
+class SchedulerWatchdog:
     """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
 
     def __init__(
