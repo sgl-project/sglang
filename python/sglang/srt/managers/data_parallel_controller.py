@@ -16,7 +16,6 @@
 import faulthandler
 import logging
 import multiprocessing as mp
-import os
 import signal
 import threading
 import time
@@ -28,6 +27,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -480,7 +480,7 @@ class DataParallelController:
                 self.workers
             )
         else:
-            dp_round_robin = os.getenv("SGLANG_DP_ROUND_ROBIN", "0") == "1"
+            dp_round_robin = envs.SGLANG_DP_ROUND_ROBIN.get()
             if dp_round_robin and self.server_args.disaggregation_mode == "decode":
                 self.total_req_num = (
                     1

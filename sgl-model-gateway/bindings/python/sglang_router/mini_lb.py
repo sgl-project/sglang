@@ -65,8 +65,9 @@ class MiniLoadBalancer:
         self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
         self.enable_trace = router_args.enable_trace
         self.dp_attention_round_robin_size_dict = dict.fromkeys(self.prefill_urls, 0)
-        for i in range(len(self.prefill_urls)):
-            self.dp_attention_round_robin_size_dict[self.prefill_urls[i]] = i * 20000
+        self.dp_attention_round_robin_size_dict = {
+            url: i * 20000 for i, url in enumerate(self.prefill_urls)
+        }
         if self.enable_trace and not trace_package_imported:
             logger.warning(
                 "Tracing is not supported in this environment. Please install sglang."
@@ -119,8 +120,8 @@ class MiniLoadBalancer:
         assert len(self.decode_urls) > 0, "No decode servers available"
         is_instance_round_robin = os.getenv("SGLANG_INSTANCE_ROUND_ROBIN", "0") == "1"
         if is_instance_round_robin:
-            pidx = self.prefill_urls[self.req_nums % len(self.prefill_urls)]
-            didx = self.decode_urls[self.req_nums % len(self.decode_urls)]
+            pidx = self.req_nums % len(self.prefill_urls)
+            didx = self.req_nums % len(self.decode_urls)
             self.req_nums = self.req_nums + 1
         else:
             pidx = random.randint(0, len(self.prefill_urls) - 1)
