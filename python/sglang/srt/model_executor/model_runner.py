@@ -1666,7 +1666,9 @@ class ModelRunner:
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
-            # Use a small KV cache pool size for local tests
+            logger.info(
+                f"Use a small KV cache pool size ({small_kv_size}) for local tests"
+            )
             self.max_total_num_tokens = small_kv_size
 
         if max_num_reqs is None:
