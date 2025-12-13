@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{self, StatusCode},
+    http,
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -85,18 +85,10 @@ pub async fn route_responses(
     // 1. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
     if is_background {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "error": {
-                    "message": "Background mode is not supported. Please set 'background' to false or omit it.",
-                    "type": "invalid_request_error",
-                    "param": "background",
-                    "code": "unsupported_parameter"
-                }
-            })),
-        )
-            .into_response();
+        return error::bad_request(
+            "unsupported_parameter",
+            "Background mode is not supported. Please set 'background' to false or omit it.",
+        );
     }
 
     // 2. Route based on execution mode
@@ -219,16 +211,10 @@ async fn route_responses_streaming(
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(json!({
-                    "error": {
-                        "message": format!("Failed to convert request: {}", e),
-                        "type": "invalid_request_error"
-                    }
-                })),
-            )
-                .into_response();
+            return error::bad_request(
+                "convert_request_failed",
+                format!("Failed to convert request: {}", e),
+            );
         }
     };
 
