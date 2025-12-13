@@ -24,7 +24,7 @@ jobs:
   maturin-build-test:
     if: |
       github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci') ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     steps:
@@ -77,7 +77,7 @@ jobs:
   router-unit-tests:
     if: |
       github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci') ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     steps:
