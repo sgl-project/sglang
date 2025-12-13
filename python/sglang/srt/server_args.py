@@ -1825,9 +1825,6 @@ class ServerArgs:
                 if self.moe_runner_backend == "flashinfer_trtllm"
                 else self.moe_runner_backend
             )
-            logger.warning(
-                "Speculative MoE runner backend is adjusted to 'auto' to avoid using flashinfer_trtllm for speculative decoding by default."
-            )
         else:
             assert not MoeRunnerBackend(
                 self.speculative_moe_runner_backend
