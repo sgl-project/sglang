@@ -460,8 +460,8 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
     mamba_full_memory_ratio: float = 0.9
-    mamba_track_interval: int = 256
     mamba_radix_cache_strategy: str = "auto"
+    mamba_track_interval: int = 256
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -3473,17 +3473,17 @@ class ServerArgs:
             help="The ratio of mamba state memory to full kv cache memory.",
         )
         parser.add_argument(
-            "--mamba-track-interval",
-            type=int,
-            default=ServerArgs.mamba_track_interval,
-            help="The interval to track the mamba state during decode.",
-        )
-        parser.add_argument(
             "--mamba-radix-cache-strategy",
             type=str,
             choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
             default=ServerArgs.mamba_radix_cache_strategy,
             help="The strategy to use for mamba radix cache.",
+        )
+        parser.add_argument(
+            "--mamba-track-interval",
+            type=int,
+            default=ServerArgs.mamba_track_interval,
+            help="The interval to track the mamba state during decode.",
         )
 
         # Hierarchical cache

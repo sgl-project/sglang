@@ -303,8 +303,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--max-mamba-cache-size` | The maximum size of the mamba cache. | `None` | Type: int |
 | `--mamba-ssm-dtype` | The data type of the SSM states in mamba cache. | `float32` | `float32`, `bfloat16` |
 | `--mamba-full-memory-ratio` | The ratio of mamba state memory to full kv cache memory. | `0.2` | Type: float |
-| `--mamba-track-interval` | The interval (in tokens) to track the mamba state during decode. Only used when `--mamba-radix-cache-strategy` is `extra_buffer`. Must be divisible by page_size if set, and must be >= speculative_num_draft_tokens when using speculative decoding. | `256` | Type: int |
 | `--mamba-radix-cache-strategy` | The strategy to use for mamba radix cache. `auto` currently defaults to `no_buffer`. 1. `no_buffer` does not allocate extra state buffers and does not support overlap schedule. 2. `extra_buffer` allocates extra mamba state buffers to support overlap schedule (increases mamba state usage per running req by 2 for non-speculative decoding, 1 for speculative decoding). 2a. `extra_buffer` is strictly better for non-KV-cache-bound cases; for KV-cache-bound cases, the tradeoff depends on whether enabling overlap outweighs reduced max running requests. 2b. mamba caching at radix cache branching point is strictly better than non-branch but requires kernel support (currently only FLA backend), currently only extra_buffer supports branching. | `auto` | `auto`, `no_buffer`, `extra_buffer` |
+| `--mamba-track-interval` | The interval (in tokens) to track the mamba state during decode. Only used when `--mamba-radix-cache-strategy` is `extra_buffer`. Must be divisible by page_size if set, and must be >= speculative_num_draft_tokens when using speculative decoding. | `256` | Type: int |
 
 ## Args for multi-item scoring
 | Argument | Description | Defaults | Options |
