@@ -29,15 +29,18 @@ pub fn not_implemented(message: impl Into<String>) -> Response {
     create_error(StatusCode::NOT_IMPLEMENTED, message)
 }
 
-fn create_error(status_code: StatusCode, message: impl Into<String>) -> Response {
-    let msg = message.into();
+fn create_error(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Response {
     (
-        status_code,
+        status,
         Json(json!({
             "error": {
-                "message": msg,
-                "type": status_code_to_str(status_code),
-                "code": status_code.as_u16()
+                "message": message.into(),
+                "type": status_code_to_str(status),
+                "code": code.into(),
             }
         })),
     )
