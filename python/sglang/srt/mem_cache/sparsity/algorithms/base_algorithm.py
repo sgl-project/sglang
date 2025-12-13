@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -8,20 +7,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class SparseMode(Enum):
-    """Sparse attention granularity mode."""
-
-    PAGE_WISE = "page_wise"
-    TOKEN_WISE = "token_wise"
-    DEEPSEEK_TOKEN_WISE = "deepseek_token_wise"
-
-
 class BaseSparseAlgorithm(ABC):
     """
     Abstract base class for sparse attention algorithms.
 
     This class provides a unified interface for implementing various retrievable KVCache
-    compression algorithms, supporting both page-wise and token-wise sparsity.
+    compression algorithms. Token-wise sparsity is treated as page-wise with page_size=1.
 
     References:
         - ChunkKV: https://arxiv.org/abs/2502.00299
@@ -59,25 +50,6 @@ class BaseSparseAlgorithm(ABC):
             - SnapKV: Allocate voting scores [num_tokens] and selected positions mask for retention strategy
             - Look-ahead QCache: Allocate importance scores [num_tokens], eviction mask, and optional pseudo query cache [cache_size, hidden_dim]
         """
-        self.req_to_token_pool = req_to_token_pool
-        self.states = states
-
-    @abstractmethod
-    def get_sparse_mode(self) -> SparseMode:
-        """
-        Return the sparsity granularity mode.
-
-        Returns:
-            SparseMode.PAGE_WISE: Selection operates on page/chunk level
-            SparseMode.TOKEN_WISE: Selection operates on individual token level
-
-        Algorithm-specific modes:
-            - ChunkKV: PAGE_WISE (selects important semantic chunks while preserving linguistic structures)
-            - Quest: PAGE_WISE (selects important pages/blocks)
-            - PQCache: TOKEN_WISE (selects important tokens via centroid similarity)
-            - SnapKV: TOKEN_WISE (retention-based: keeps voted important prefix tokens + observation window)
-            - Look-ahead QCache: TOKEN_WISE (eviction-based: removes tokens with low pseudo query importance)
-        """
         pass
 
     def construct_representations(
@@ -92,7 +64,7 @@ class BaseSparseAlgorithm(ABC):
         Construct initial representations during prefill phase.
 
         Called at every layer during forward pass. Algorithm internally decides
-        whether to perform construction based on self.states.repr_constructed.
+        whether to perform construction.
         Typically only constructs once per request during prefill/extend phase.
 
         Algorithm-specific implementations:
@@ -118,7 +90,7 @@ class BaseSparseAlgorithm(ABC):
         Called at every layer during forward pass. Algorithm internally decides
         whether to update based on:
         - self.states.repr_constructed[req_id]: Whether initial construction done
-        - self.states.last_extracted_token[req_id]: Last processed position
+        - self.states.last_constructed_page[req_id]: Last constructed page index
         - Current seq_lens: To detect new tokens/pages
 
 
@@ -160,16 +132,240 @@ class BaseSparseAlgorithm(ABC):
             selected_indices: [bs, max_selected] Selected page/token indices, padded with -1
             valid_lengths: [bs] Actual number of selected indices per request
 
+        Note:
+            - Indices are logical positions that will be mapped to physical KV cache by BackendAdaptor
+
         Algorithm-specific implementations:
             - ChunkKV: Select top-k chunks based on pre-computed importance scores with layer-wise index reuse
             - Quest: Compute query-page similarity using current query and stored page representations, select top-k pages
             - PQCache: Calculate query-centroid similarity, use centroid scores to rank tokens, select top-k tokens
             - SnapKV: Return union of voted important prefix positions (with clustered neighbors) and observation window tokens
             - Look-ahead QCache: Return KVs not marked for eviction (eviction based on pseudo query importance evaluation)
-
-        Note:
-            - For PAGE_WISE mode: Returns page indices
-            - For TOKEN_WISE mode: Returns token indices
-            - Indices are logical positions that will be mapped to physical KV cache by BackendAdaptor
         """
         pass
+
+
+class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
+    """
+    Implementation base class for sparse attention algorithms.
+
+    Provides common infrastructure for algorithms that operate at page/chunk granularity
+    (token-wise is simply page_size=1):
+    - Generic construct/update flow with state tracking
+    - TopK retrieval with recent page retention (can be overridden)
+
+    Subclasses need to implement:
+    - _initialize_representation_pools(): Initialize algorithm-specific representation pools
+    - _compute_page_representations(): Compute page scores/representations
+    - _retrieve_page_scores(): Retrieve page scores for TopK selection
+
+    Subclasses can also override any method for specialized behavior
+    """
+
+    def __init__(self, config, device: torch.device, **kwargs):
+        super().__init__(config, device, **kwargs)
+        self.compression_ratio = getattr(config, "compression_ratio", 0.2)
+        self.page_size = getattr(config, "page_size", 64)
+        self.num_recent_pages = getattr(config, "num_recent_pages", 4)
+
+    def initialize_representation_pool(
+        self,
+        start_layer: int,
+        end_layer: int,
+        token_to_kv_pool,
+        req_to_token_pool,
+        states,
+    ):
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool = token_to_kv_pool
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.states = states
+
+        total_num_tokens = token_to_kv_pool.get_key_buffer(start_layer).shape[0]
+        total_num_pages = (total_num_tokens + self.page_size - 1) // self.page_size
+
+        # Initialize algorithm-specific representation pools
+        self._initialize_representation_pools(start_layer, end_layer, total_num_pages)
+
+    def construct_representations(
+        self,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        k_buffer,
+        forward_batch,
+    ) -> torch.Tensor:
+
+        if not forward_batch.forward_mode.is_extend():
+            return
+
+        num_pages = seq_lens // self.page_size
+        valid_mask = (
+            ~self.states.repr_constructed[req_pool_indices]
+            & (seq_lens >= self.states.prompt_lens[req_pool_indices])
+            & (num_pages > 0)
+        )
+
+        if not valid_mask.any():
+            return
+
+        # Compute page representations by subclass
+        self._compute_page_representations(
+            layer_id,
+            req_pool_indices[valid_mask],
+            seq_lens[valid_mask],
+            0,
+            num_pages[valid_mask],
+            k_buffer,
+        )
+
+        # Update tracking states
+        if layer_id == self.end_layer - 1:
+            success_indices = req_pool_indices[valid_mask]
+            self.states.repr_constructed[success_indices] = True
+            self.states.last_constructed_page[success_indices] = num_pages[valid_mask]
+
+    def update_representations(
+        self,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        k_buffer,
+        forward_batch,
+    ) -> torch.Tensor:
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+
+        start_page = self.states.last_constructed_page[req_pool_indices]
+        end_page = seq_lens // self.page_size
+        valid_mask = self.states.repr_constructed[req_pool_indices] & (
+            start_page < end_page
+        )
+
+        if not valid_mask.any():
+            return
+
+        # Compute page representations by subclass
+        self._compute_page_representations(
+            layer_id,
+            req_pool_indices[valid_mask],
+            seq_lens[valid_mask],
+            start_page[valid_mask],
+            end_page[valid_mask],
+            k_buffer,
+        )
+
+        # Update tracking states
+        if layer_id == self.end_layer - 1:
+            success_indices = req_pool_indices[valid_mask]
+            self.states.last_constructed_page[success_indices] = end_page[valid_mask]
+
+    def retrieve_topk(
+        self,
+        queries: torch.Tensor,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        attn_metadata: Optional[Any],
+        **kwargs,
+    ) -> tuple:
+        """
+        Default TopK retrieval: score-based selection + recent pages.
+        Subclasses can override for query-dependent retrieval.
+
+        TODO:
+            1. Using triton kernel to speed up this function
+            2. Support CUDA Graph
+        """
+        bs, device = queries.shape[0], queries.device
+        seq_lens = attn_metadata.cache_seqlens_int32
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
+        max_pages = max(int(num_pages.max().item()), 1)
+
+        out_indices = torch.full((bs, max_pages), -1, dtype=torch.int32, device=device)
+        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
+
+        mask = sparse_mask & (num_pages > self.num_recent_pages)
+        if not mask.any():
+            return out_indices, out_lengths
+
+        # Map logical page indices to physical page indices
+        # page_idx -> logical page indices [0, 1, 2, ...]
+        # phys_pages: [bs, max_pages] -> physical page indices in KV cache
+        page_idx = torch.arange(max_pages, device=device).unsqueeze(0)
+        page_start_token = self.req_to_token_pool.req_to_token[
+            req_pool_indices.unsqueeze(1).expand(bs, max_pages),
+            (page_idx * self.page_size).clamp(
+                0, self.req_to_token_pool.req_to_token.shape[1] - 1
+            ),
+        ]
+        phys_pages = page_start_token // self.page_size
+
+        # Get pre-computed page scores from subclass
+        scores = self._retrieve_page_scores(
+            layer_id, phys_pages, req_pool_indices, queries
+        )
+
+        # Mask out recent pages from TopK selection (they will be added separately)
+        # Layout: [history pages ... | recent pages (always kept)]
+        recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
+        scores.masked_fill_(page_idx >= recent_start.unsqueeze(1), float("-inf"))
+
+        # Select TopK from history pages based on compression_ratio
+        k = max(
+            int((recent_start.float() * (1 - self.compression_ratio)).max().item()), 1
+        )
+        topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1]
+        topk_mask = torch.arange(k, device=device).unsqueeze(0) < (
+            recent_start * (1 - self.compression_ratio)
+        ).int().clamp(min=1).unsqueeze(1)
+
+        recent_idx = recent_start.unsqueeze(1) + torch.arange(
+            self.num_recent_pages, device=device
+        )
+        recent_mask = recent_idx < num_pages.unsqueeze(1)
+
+        # Combine TopK history pages + recent pages, sort for sequential access
+        combined = torch.cat(
+            [
+                torch.where(topk_mask, topk_idx, -1),
+                torch.where(recent_mask, recent_idx, -1),
+            ],
+            dim=1,
+        ).sort(dim=1)[0]
+
+        out_lengths[:] = torch.where(mask, (combined >= 0).sum(dim=1).int(), 0)
+        out_indices[:, : combined.shape[1]] = torch.where(
+            mask.unsqueeze(1), combined, -1
+        )
+
+        return out_indices, out_lengths
+
+    def _initialize_representation_pools(
+        self, start_layer: int, end_layer: int, total_num_pages: int
+    ):
+        """Initialize algorithm-specific representation pools for all layers."""
+        raise NotImplementedError
+
+    def _compute_page_representations(
+        self,
+        layer_id: int,
+        reqs: torch.Tensor,
+        seq_lens: torch.Tensor,
+        start_page,
+        end_page: torch.Tensor,
+        k_buffer: torch.Tensor,
+    ):
+        """Compute and store page representations for given page range."""
+        raise NotImplementedError
+
+    def _retrieve_page_scores(
+        self,
+        layer_id: int,
+        phys_pages: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        queries: torch.Tensor,
+    ) -> torch.Tensor:
+        """Retrieve page scores for TopK selection."""
+        raise NotImplementedError

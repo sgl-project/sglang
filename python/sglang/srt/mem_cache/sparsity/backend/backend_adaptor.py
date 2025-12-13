@@ -14,9 +14,8 @@ logger = logging.getLogger(__name__)
 class BackendAdaptor(ABC):
     """Base class for attention backend adaptors."""
 
-    def __init__(self, device: torch.device, sparse_mode):
+    def __init__(self, device: torch.device):
         self.device = device
-        self.sparse_mode = sparse_mode
         self._original_metadata = None
 
     def save_original_metadata(self, metadata: Any) -> None:
@@ -46,11 +45,10 @@ class NSABackendAdaptor(BackendAdaptor):
     def __init__(
         self,
         device: torch.device,
-        sparse_mode,
         req_to_token_pool,
         kvcache_manager,
     ):
-        super().__init__(device, sparse_mode)
+        super().__init__(device)
         self.req_to_token_pool = req_to_token_pool
         self.kvcache_manager = kvcache_manager
 
@@ -71,17 +69,15 @@ class NSABackendAdaptor(BackendAdaptor):
         req_pool_indices = forward_batch.req_pool_indices
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
         page_table = self.req_to_token_pool.req_to_token[:, :max_seqlen_k]
-        transformed_indices = (
-            self.kvcache_manager.transfer_sparse_top_k_cache(
-                req_pool_indices=req_pool_indices,
-                top_k_result=selected_indices,
-                out_cache_loc=forward_batch.out_cache_loc,
-                seq_lens=forward_batch.seq_lens,
-                sparse_mask=sparse_mask,
-                page_table=page_table,
-                layer_id=layer_id,
-                page_size=1,
-            )
+        transformed_indices = self.kvcache_manager.transfer_sparse_top_k_cache(
+            req_pool_indices=req_pool_indices,
+            top_k_result=selected_indices,
+            out_cache_loc=forward_batch.out_cache_loc,
+            seq_lens=forward_batch.seq_lens,
+            sparse_mask=sparse_mask,
+            page_table=page_table,
+            layer_id=layer_id,
+            page_size=1,
         )
         return transformed_indices
 
@@ -109,44 +105,9 @@ class FlashAttentionAdaptor(BackendAdaptor):
         layer_id: int,
         **kwargs,
     ) -> Any:
-        from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import SparseMode
-
-        if self.sparse_mode == SparseMode.PAGE_WISE:
-            return self._adapt_for_page_wise(
-                selected_indices,
-                valid_lengths,
-                sparse_mask,
-                current_metadata,
-                forward_batch,
-                req_to_token,
-                page_size,
-                layer_id,
-            )
-        elif self.sparse_mode == SparseMode.TOKEN_WISE:
-            return self._adapt_for_token_wise(
-                selected_indices,
-                valid_lengths,
-                sparse_mask,
-                current_metadata,
-                forward_batch,
-                req_to_token,
-                page_size,
-                layer_id,
-            )
-        else:
-            return current_metadata
-
-    def _adapt_for_page_wise(
-        self,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: Any,
-        forward_batch: "ForwardBatch",
-        req_to_token: torch.Tensor,
-        page_size: int,
-        layer_id: int,
-    ) -> Any:
+        """
+        Adapt metadata for sparse attention.
+        """
         if self._original_metadata is None:
             return current_metadata
 
@@ -165,7 +126,6 @@ class FlashAttentionAdaptor(BackendAdaptor):
             page_size,
         )
 
-        # Only update valid pages based on valid_lengths
         max_selected = physical_pages.shape[1]
         valid_mask = torch.arange(max_selected, device=physical_pages.device).unsqueeze(
             0
@@ -181,11 +141,6 @@ class FlashAttentionAdaptor(BackendAdaptor):
         diff = page_size - positions_in_page - 1
         sparse_seq_lens = (valid_lengths * page_size - diff).to(torch.int32)
 
-        # if layer_id == 0 and sparse_mask.any():
-        #     logger.info(
-        #         f"Adapt_for_page_wise called: layer_id={layer_id}, original_seq={seq_lens}, sparse_seq={sparse_seq_lens}, page_table={current_metadata.page_table}"
-        #     )
-
         current_metadata.cache_seqlens_int32 = torch.where(
             sparse_mask, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]
         )
@@ -197,21 +152,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
             (1, 0),
         )
         current_metadata.max_seq_len_k = int(current_metadata.cache_seqlens_int32.max())
-
         return current_metadata
-
-    def _adapt_for_token_wise(
-        self,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: Any,
-        forward_batch: "ForwardBatch",
-        req_to_token: torch.Tensor,
-        page_size: int,
-        layer_id: int,
-    ) -> Any:
-        raise NotImplementedError("Token-wise sparse attention is not implemented yet.")
 
     def _logical_to_physical_pages_batch(
         self,

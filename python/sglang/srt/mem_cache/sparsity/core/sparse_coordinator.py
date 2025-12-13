@@ -6,8 +6,8 @@ import nvtx
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.mem_cache.sparsity.algorithms import SparseMode
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
+from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
 from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
     SparseKVCacheManager,
@@ -40,7 +40,7 @@ class RequestTrackers:
             max_pool_size, dtype=torch.bool, device=device
         )
         self.prompt_lens = torch.zeros(max_pool_size, dtype=torch.int64, device=device)
-        self.last_extracted_token = torch.zeros(
+        self.last_constructed_page = torch.zeros(
             max_pool_size, dtype=torch.int64, device=device
         )
 
@@ -87,7 +87,7 @@ class RequestTrackers:
     def register(self, idx: int, prompt_len: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
-        self.last_extracted_token[idx] = 0
+        self.last_constructed_page[idx] = 0
         self.full_host_indices[idx].fill_(-1)
         self.curr_device_indices[idx].fill_(-1)
         self.should_load_device_indices[idx].fill_(-1)
@@ -98,7 +98,7 @@ class RequestTrackers:
     def clear(self, idx: int) -> torch.Tensor:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
-        self.last_extracted_token[idx] = 0
+        self.last_constructed_page[idx] = 0
         host_indices = self.full_host_indices[idx][self.full_host_indices[idx] != -1]
         self.full_host_indices[idx].fill_(-1)
         self.curr_device_indices[idx].fill_(-1)
@@ -168,8 +168,7 @@ class SparseCoordinator:
         )
 
         logger.info(
-            f"SparseCoordinator initialized: algorithm={type(algorithm).__name__}, "
-            f"mode={algorithm.get_sparse_mode().value}"
+            f"SparseCoordinator initialized: algorithm={type(algorithm).__name__}"
         )
 
     def on_request_begin(self, req: "Req") -> None:
@@ -300,10 +299,8 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
-        sparse_mode = self.algorithm.get_sparse_mode()
-
         # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices, sparse_mode)
+        sparse_mask = self._compute_sparse_mask(req_pool_indices)
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer.layer_id,
@@ -326,12 +323,12 @@ class SparseCoordinator:
             layer_id=layer.layer_id,
         )
 
-    def _compute_sparse_mask(self, req_pool_indices, sparse_mode):
+    def _compute_sparse_mask(self, req_pool_indices):
         mask = (
             self.states.prompt_lens[req_pool_indices]
             >= self.config.min_sparse_prompt_len
         )
 
-        if sparse_mode != SparseMode.DEEPSEEK_TOKEN_WISE:
+        if not isinstance(self.algorithm, DeepSeekNSAAlgorithm):
             mask &= self.states.repr_constructed[req_pool_indices]
         return mask

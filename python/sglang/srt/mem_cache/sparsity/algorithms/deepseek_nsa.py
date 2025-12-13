@@ -1,33 +1,23 @@
-import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
-import nvtx
 import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
-    BaseSparseAlgorithm,
-    SparseMode,
+    BaseSparseAlgorithmImpl,
 )
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-logger = logging.getLogger(__name__)
+class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
+    """
+    Sparse attention algorithm for DeepSeek NSA.
 
-
-class DeepSeekNSAAlgorithm(BaseSparseAlgorithm):
-    """Sparse attention algorithm for DeepSeek NSA."""
+    This algorithm uses NSA's native indexer for TopK retrieval.
+    Overrides all parent methods as NSA has its own specialized flow.
+    """
 
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
-        self.index_topk = getattr(config, "index_topk", 2048)
-        logger.info(f"DeepSeekNSAAlgorithm initialized: index_topk={self.index_topk}")
 
-    def get_sparse_mode(self) -> SparseMode:
-        return SparseMode.DEEPSEEK_TOKEN_WISE
-
-    @nvtx.annotate("DeepSeekNSAAlgorithm.retrieve_topk", color="green")
     def retrieve_topk(
         self,
         queries: torch.Tensor,
@@ -37,38 +27,54 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithm):
         attn_metadata: Optional[Any],
         **kwargs,
     ) -> tuple:
-        indexer: Optional["Indexer"] = kwargs.get("indexer")
-        forward_batch: Optional["ForwardBatch"] = kwargs.get("forward_batch")
-        x, q_lora, positions = (
+        indexer, forward_batch, x, q_lora, positions = (
+            kwargs.get("indexer"),
+            kwargs.get("forward_batch"),
             kwargs.get("x"),
             kwargs.get("q_lora"),
             kwargs.get("positions"),
         )
 
         if any(v is None for v in [indexer, x, q_lora, positions, forward_batch]):
-            raise ValueError("Required: indexer, x, q_lora, positions, forward_batch")
+            raise ValueError("Required: indexer, forward_batch, x, q_lora, positions")
 
-        try:
-            # Using the nsa's original indexer to get the topk indices.
-            topk_indices = indexer(
+        return (
+            indexer(
                 x=x,
                 q_lora=q_lora,
                 positions=positions,
                 forward_batch=forward_batch,
                 layer_id=layer_id,
-            )
-
-            if topk_indices is None:
-                return self._empty_result(queries.shape[0], queries.device)
-
-            return topk_indices, None
-        except Exception as e:
-            logger.error(f"Layer {layer_id} NSA indexer failed: {e}", exc_info=True)
-            return self._empty_result(queries.shape[0], queries.device)
-
-    def _empty_result(self, batch_size: int, device: torch.device) -> tuple:
-        selected_indices = torch.full(
-            (batch_size, self.index_topk), -1, dtype=torch.int32, device=device
+            ),
+            None,
         )
-        valid_lengths = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        return selected_indices, valid_lengths
+
+    def initialize_representation_pool(
+        self,
+        start_layer: int,
+        end_layer: int,
+        token_to_kv_pool,
+        req_to_token_pool,
+        states,
+    ):
+        pass
+
+    def construct_representations(
+        self,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        k_buffer,
+        forward_batch,
+    ):
+        pass
+
+    def update_representations(
+        self,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        k_buffer,
+        forward_batch,
+    ):
+        pass

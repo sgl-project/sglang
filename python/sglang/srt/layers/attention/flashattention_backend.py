@@ -11,7 +11,7 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.sparsity import SparseMode, get_sparse_coordinator
+from sglang.srt.mem_cache.sparsity import DeepSeekNSAAlgorithm, get_sparse_coordinator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
@@ -366,10 +366,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Sparse attention coordinator
         self.sparse_coordinator = get_sparse_coordinator()
         if self.sparse_coordinator is not None:
-            if (
-                self.sparse_coordinator.algorithm.get_sparse_mode()
-                == SparseMode.DEEPSEEK_TOKEN_WISE
-            ):
+            if isinstance(self.sparse_coordinator.algorithm, DeepSeekNSAAlgorithm):
                 self.sparse_coordinator = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

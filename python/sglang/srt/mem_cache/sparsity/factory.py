@@ -3,14 +3,9 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
-    BaseSparseAlgorithm,
-    SparseMode,
-)
+from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
-from sglang.srt.mem_cache.sparsity.algorithms.page_wise_algorithm import (
-    KnormPageAlgorithm,
-)
+from sglang.srt.mem_cache.sparsity.algorithms.knorm_algorithm import KnormPageAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
     NSABackendAdaptor,
@@ -58,16 +53,13 @@ def _create_backend_adaptor(
     decode_offload_manager,
 ):
     """Create backend adaptor."""
-    sparse_mode = sparse_algorithm.get_sparse_mode()
     if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
         logger.info("Creating NSA backend adaptor")
-        return NSABackendAdaptor(
-            device, sparse_mode, req_to_token_pool, decode_offload_manager
-        )
+        return NSABackendAdaptor(device, req_to_token_pool, decode_offload_manager)
 
     if backend in ["fa3", "flashattention"]:
         logger.info("Creating FlashAttention backend adaptor")
-        return FlashAttentionAdaptor(device, sparse_mode)
+        return FlashAttentionAdaptor(device)
 
     raise ValueError(f"Unknown backend: {backend}")
 
@@ -86,10 +78,6 @@ def create_sparse_coordinator(
 ) -> SparseCoordinator:
     config = SparseConfig(page_size=page_size, algorithm="deepseek_nsa")
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
-    sparse_mode = algorithm.get_sparse_mode()
-
-    if sparse_mode == SparseMode.TOKEN_WISE:
-        assert page_size == 1, "TOKEN_WISE sparse requires page_size=1"
 
     sparse_kv_cache_manager = SparseKVCacheManager(
         req_to_token_pool=req_to_token_pool,
@@ -114,9 +102,7 @@ def create_sparse_coordinator(
         device=device,
     )
     register_sparse_coordinator(coordinator)
-    logger.info(
-        f"SparseCoordinator created: algorithm={config.algorithm}, mode={sparse_mode.value}"
-    )
+    logger.info(f"SparseCoordinator created: algorithm={config.algorithm}")
     return coordinator
 
 
