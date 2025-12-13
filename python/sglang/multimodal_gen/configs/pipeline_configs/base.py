@@ -642,6 +642,8 @@ class ImagePipelineConfig(PipelineConfig):
                 device=latents.device,
             )
             latents = torch.cat([latents, pad], dim=1)
+            # Record padding length for later unpad
+            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
 
         sharded_tensor = rearrange(
             latents, "b (n s) d -> b n s d", n=sp_world_size
