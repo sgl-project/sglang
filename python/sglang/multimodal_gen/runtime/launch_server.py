@@ -134,7 +134,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         app = create_app(server_args)
         uvicorn.run(
             app,
-            log_config=None,
+            use_colors=True,
             log_level=server_args.log_level,
             host=server_args.host,
             port=server_args.port,

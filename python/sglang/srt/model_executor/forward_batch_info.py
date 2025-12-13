@@ -47,11 +47,13 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
+    get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -90,6 +92,9 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    # Used in diffusion LLM inference
+    DLLM_EXTEND = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -101,6 +106,7 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.DLLM_EXTEND
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
@@ -152,6 +158,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
+            or self == ForwardMode.DLLM_EXTEND
         )
 
     def is_cpu_graph(self):
@@ -169,6 +176,9 @@ class ForwardMode(IntEnum):
 
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
+
+    def is_dllm_extend(self):
+        return self == ForwardMode.DLLM_EXTEND
 
 
 @total_ordering
@@ -191,6 +201,26 @@ class CaptureHiddenMode(IntEnum):
 
     def __lt__(self, other):
         return self.value < other.value
+
+
+def compute_local_num_token_non_padded(
+    global_num_token_non_padded: torch.Tensor | int,
+    num_tokens_per_dp: int,
+) -> torch.Tensor:
+    """Compute local non-padded token count for this attention-TP rank.
+
+    Converts a global count (across all TP ranks) to a local count for this rank.
+    The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
+    """
+    attn_tp_rank = get_attention_tp_rank()
+    attn_tp_size = get_attention_tp_size()
+    tokens_per_rank = num_tokens_per_dp // attn_tp_size
+
+    return torch.clamp(
+        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        0,
+        tokens_per_rank,
+    )
 
 
 @dataclass
@@ -346,6 +376,7 @@ class ForwardBatch:
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
     # For matryoshka embeddings
@@ -360,8 +391,6 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
-
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -436,9 +465,6 @@ class ForwardBatch:
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            TboForwardBatchPreparer.prepare(
-                ret, is_draft_worker=model_runner.is_draft_worker
-            )
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -446,8 +472,9 @@ class ForwardBatch:
             block_size = batch.dllm_config.block_size
             ret.positions = torch.tensor(
                 [
-                    [i for i in range(block_offset, block_offset + block_size)]
+                    i
                     for block_offset in batch.dllm_block_offsets
+                    for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=torch.int32,
             ).to(device, non_blocking=True)
@@ -496,11 +523,23 @@ class ForwardBatch:
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        TboForwardBatchPreparer.prepare(
-            ret, is_draft_worker=model_runner.is_draft_worker
-        )
-
         return ret
+
+    def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
+        """Make num_token_non_padded local to this attention-TP rank."""
+        from sglang.srt.utils.common import require_mlp_tp_gather
+
+        dp_rank = get_attention_dp_rank()
+
+        if require_mlp_tp_gather(server_args):
+            num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+        else:
+            num_tokens_per_dp = self.global_num_tokens_gpu[0]
+
+        self.num_token_non_padded = compute_local_num_token_non_padded(
+            global_num_token_non_padded=self.num_token_non_padded,
+            num_tokens_per_dp=num_tokens_per_dp,
+        )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
@@ -728,6 +767,8 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+        from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -738,9 +779,7 @@ class ForwardBatch:
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = (
-                (global_num_tokens[i] - 1) // attn_tp_size + 1
-            ) * attn_tp_size
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -771,7 +810,12 @@ class ForwardBatch:
 
         bs = self.batch_size
 
-        if self.forward_mode.is_decode():
+        if (
+            self.forward_mode.is_decode()
+            or self.forward_mode.is_target_verify()
+            or self.forward_mode.is_draft_extend(include_v2=True)
+            or self.forward_mode.is_idle()
+        ):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
@@ -792,6 +836,8 @@ class ForwardBatch:
                     )
                 else:
                     bs = self.batch_size = num_tokens
+        elif self.forward_mode.is_extend():
+            self.extend_num_tokens = num_tokens
 
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
@@ -799,10 +845,23 @@ class ForwardBatch:
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
+        TboForwardBatchPreparer.prepare(
+            batch=self, is_draft_worker=model_runner.is_draft_worker
+        )
+        # TODO: The following is added to make sure sub-batch input_ids are padded
+        # to the multiple of attn_tp_size. It can likely be removed after this
+        # function is refactored and merged into the Scheduler.
+        if self.tbo_children:
+            for child in self.tbo_children:
+                child._pad_inputs_to_size(
+                    model_runner, child.tbo_padded_len, child.batch_size
+                )
+
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()

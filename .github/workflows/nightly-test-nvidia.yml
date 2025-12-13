@@ -47,6 +47,9 @@ concurrency:
   group: nightly-test-nvidia-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   # General tests - 1 GPU
   nightly-test-general-1-gpu-runner:
@@ -112,6 +115,25 @@ jobs:
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
 
+      - name: Run MiniMax-M2 nightly performance test
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-h200"
+        run: |
+          rm -rf test/performance_profiles_minimax_m2/
+          cd test
+          python3 nightly/test_minimax_m2_perf.py
+
+      - name: Publish MiniMax-M2 traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_minimax_m2
+
       - name: Run Qwen3-235B nightly performance test
         timeout-minutes: 180
         env:
@@ -168,25 +190,6 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6
-
-      - name: Run MiniMax-M2 nightly performance test
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-h200"
-        run: |
-          rm -rf test/performance_profiles_minimax_m2/
-          cd test
-          python3 nightly/test_minimax_m2_perf.py
-
-      - name: Publish MiniMax-M2 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_minimax_m2
 
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
@@ -420,7 +423,30 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
+      - name: Run Mistral-Large-3 nightly performance test
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-b200"
+          SGLANG_ENABLE_JIT_DEEPGEMM: "0"
+        run: |
+          rm -rf test/performance_profiles_mistral_large3/
+          rm -rf test/performance_profiles_mistral_large3_eagle/
+          cd test
+          IS_BLACKWELL=1 python3 nightly/test_mistral_large3_perf.py
+
+      - name: Publish Mistral-Large-3 traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_mistral_large3
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_mistral_large3_eagle
+
       - name: Run DeepSeek v3.1 nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -440,6 +466,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v31
 
       - name: Run DeepSeek v3.2 nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -459,6 +486,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v32
 
       - name: Run Kimi-K2-Thinking nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -478,6 +506,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_kimi_k2_thinking
 
       - name: Run Qwen3-235B nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -497,6 +526,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_qwen3_235b
 
       - name: Run GLM-4.6 nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -516,6 +546,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6
 
       - name: Run MiniMax-M2 nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}

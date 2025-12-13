@@ -359,10 +359,10 @@ class PrefillAdder:
                 ]
             )
 
-        self.is_hybrid = isinstance(
+        self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
-        self.is_hybrid_gdn_cache = isinstance(self.tree_cache, MambaRadixCache)
+        self.is_ssm_radix_cache = isinstance(self.tree_cache, MambaRadixCache)
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -380,14 +380,14 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size(),
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
-        elif self.is_hybrid_gdn_cache:
+        elif self.is_ssm_radix_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
@@ -402,14 +402,14 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size(),
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
-        elif self.is_hybrid_gdn_cache:
+        elif self.is_ssm_radix_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
@@ -472,7 +472,7 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             try:
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
                 yield None
@@ -485,7 +485,7 @@ class PrefillAdder:
             finally:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
+    def add_one_req_ignore_eos(self, req: Req):
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -525,7 +525,7 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid:
+        if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
@@ -576,7 +576,7 @@ class PrefillAdder:
         if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req, has_chunked_req)
+            return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
@@ -616,7 +616,7 @@ class PrefillAdder:
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
-                if self.is_hybrid:
+                if self.is_hybrid_swa:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
@@ -652,7 +652,7 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
-                if self.is_hybrid:
+                if self.is_hybrid_swa:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
@@ -667,14 +667,17 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
+        valid_running_reqs = (
+            r for r in self.running_batch.reqs if r not in self.preempt_list
+        )
         if server_args.schedule_low_priority_values_first:
-            sorted_running_reqs = sorted(
-                self.running_batch.reqs,
+            sorted_valid_running_reqs = sorted(
+                valid_running_reqs,
                 key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
             )
         else:
-            sorted_running_reqs = sorted(
-                self.running_batch.reqs,
+            sorted_valid_running_reqs = sorted(
+                valid_running_reqs,
                 key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
             )
         preemptible_reqs = []
@@ -683,9 +686,7 @@ class PrefillAdder:
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
-        for running_req in sorted_running_reqs:
-            if running_req in self.preempt_list:
-                continue
+        for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
             priority_diff = req.priority - running_req.priority
             if server_args.schedule_low_priority_values_first:
@@ -695,6 +696,10 @@ class PrefillAdder:
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req
                 )
+                if min_tokens_to_remove <= 0:
+                    break
+            else:
+                break
 
         # Check max token count limit can be met
         if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:

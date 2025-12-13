@@ -283,7 +283,7 @@ class MooncakeKVManager(CommonKVManager):
 
         layers_params = None
 
-        # pp is not supported on the decode side yet
+        # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -807,13 +807,12 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                 )
 
-                            if self.pp_group.is_last_rank:
-                                # Only the last chunk we need to send the aux data
-                                ret = self.send_aux(
-                                    req,
-                                    kv_chunk.prefill_aux_index,
-                                    target_rank_registration_info.dst_aux_ptrs,
-                                )
+                            # Only the last chunk we need to send the aux data
+                            ret = self.send_aux(
+                                req,
+                                kv_chunk.prefill_aux_index,
+                                target_rank_registration_info.dst_aux_ptrs,
+                            )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1199,7 +1198,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
             )
-            # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
+            # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
             dst_tp_rank = str(tp_rank).encode("ascii")
