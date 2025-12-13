@@ -38,7 +38,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 function = "HarmonyRequestBuildingStage::execute",
                 "Preparation stage not completed"
             );
-            error::internal_error("Preparation not completed")
+            error::internal_error("preparation_not_completed", "Preparation not completed")
         })?;
 
         // Get clients
@@ -47,7 +47,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 function = "HarmonyRequestBuildingStage::execute",
                 "Client acquisition stage not completed"
             );
-            error::internal_error("Client acquisition not completed")
+            error::internal_error(
+                "client_acquisition_not_completed",
+                "Client acquisition not completed",
+            )
         })?;
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
@@ -57,6 +60,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         // Harmony model support not yet implemented for vLLM
         if builder_client.is_vllm() {
             return Err(error::not_implemented(
+                "harmony_vllm_not_supported",
                 "Harmony model support is not yet implemented for vLLM backend. \
                  Please use runtime_type: sglang for Harmony models.",
             ));
@@ -72,6 +76,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     "Generate request type not supported for Harmony models"
                 );
                 return Err(error::bad_request(
+                    "harmony_generate_not_supported",
                     "Generate requests are not supported with Harmony models".to_string(),
                 ));
             }
@@ -102,7 +107,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                             error = %e,
                             "Failed to build generate request from chat"
                         );
-                        error::bad_request(format!("Invalid request parameters: {}", e))
+                        error::bad_request(
+                            "invalid_request_parameters",
+                            format!("Invalid request parameters: {}", e),
+                        )
                     })?
             }
             RequestType::Responses(request) => sglang_client
@@ -120,7 +128,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                         error = %e,
                         "Failed to build generate request from responses"
                     );
-                    error::bad_request(format!("Invalid request parameters: {}", e))
+                    error::bad_request(
+                        "invalid_request_parameters",
+                        format!("Invalid request parameters: {}", e),
+                    )
                 })?,
             _ => unreachable!(),
         };
