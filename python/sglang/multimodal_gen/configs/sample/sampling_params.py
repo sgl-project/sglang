@@ -229,6 +229,13 @@ class SamplingParams:
             )
 
         # Validate resolution against pipeline-specific supported resolutions
+        if self.height is None and self.width is None:
+            if self.supported_resolutions is not None:
+                self.width, self.height = self.supported_resolutions[0]
+                logger.info(
+                    f"Resolution unspecified, using default: {self.supported_resolutions[0]}"
+                )
+
         if self.height is not None and self.width is not None:
             if self.supported_resolutions is not None:
                 if (self.width, self.height) not in self.supported_resolutions:
