@@ -112,7 +112,7 @@ impl Router {
                             ),
                         }
                     }
-                    Err(e) => handle_reqwest_error(e)
+                    Err(e) => convert_reqwest_error(e)
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
@@ -361,7 +361,7 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    last_response = Some(handle_reqwest_error(e));
+                    last_response = Some(convert_reqwest_error(e));
                 }
             }
         }
@@ -501,7 +501,7 @@ impl Router {
                     }
                 }
 
-                return handle_reqwest_error(e);
+                return convert_reqwest_error(e);
             }
         };
 
@@ -661,62 +661,25 @@ fn decrement_load(w: &Arc<dyn Worker>) {
     RouterMetrics::set_running_requests(w.url(), w.load());
 }
 
-fn handle_reqwest_error(e: reqwest::Error) -> Response {
-    if e.is_timeout() {
-        error::gateway_timeout(
-            "request_timeout",
-            format!(
-                "Request timeout: {}. URL: {}",
-                e,
-                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
-            ),
-        )
+fn convert_reqwest_error(e: reqwest::Error) -> Response {
+    let url = e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let message = format!("{}. URL: {}", e, url);
+
+    let (status, code) = if e.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "request_timeout")
     } else if e.is_connect() {
-        error::bad_gateway(
-            "connection_failed",
-            format!(
-                "Connection failed: {}. URL: {}",
-                e,
-                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
-            ),
-        )
+        (StatusCode::BAD_GATEWAY, "connection_failed")
     } else if e.is_request() {
-        error::bad_request(
-            "request_build_failed",
-            format!(
-                "Request build failed: {}. URL: {}",
-                e,
-                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
-            ),
-        )
+        (StatusCode::BAD_REQUEST, "request_build_failed")
     } else if e.is_status() {
-        error::bad_gateway(
-            "invalid_status",
-            format!(
-                "Invalid status response: {}. URL: {}",
-                e,
-                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
-            ),
-        )
+        (StatusCode::BAD_GATEWAY, "invalid_status")
     } else if e.is_redirect() {
-        error::bad_gateway(
-            "redirect_error",
-            format!(
-                "Redirect error: {}. URL: {}",
-                e,
-                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
-            ),
-        )
+        (StatusCode::BAD_GATEWAY, "redirect_error")
     } else {
-        error::internal_error(
-            "request_failed",
-            format!(
-                "Request failed: {}. URL: {}",
-                e,
-                e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string())
-            ),
-        )
-    }
+        (StatusCode::INTERNAL_SERVER_ERROR, "request_failed")
+    };
+
+    error::create_error(status, code, message)
 }
 
 use async_trait::async_trait;
