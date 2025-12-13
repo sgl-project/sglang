@@ -173,11 +173,14 @@ impl Router {
                 let res = self
                     .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
                     .await;
-                RouterMetrics::record_upstream_http_response(
+
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                RouterMetrics::record_attempt_http_response(
                     route,
                     res.status().as_u16(),
                     extract_error_code_from_response(&res),
                 );
+
                 res
             },
             // should_retry predicate
@@ -718,8 +721,9 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     error::create_error(status, code, message)
 }
 
-use crate::routers::error::extract_error_code_from_response;
 use async_trait::async_trait;
+
+use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
 impl RouterTrait for Router {
