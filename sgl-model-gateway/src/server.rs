@@ -6,7 +6,7 @@ use std::{
     },
     time::Duration,
 };
-
+use rustls::crypto::ring;
 use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
@@ -941,13 +941,48 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);
     info!("Starting server on {}", bind_addr);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
-    serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    if config.router_config.server_cert.is_some() && config.router_config.server_key.is_some() {
+        ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls ring provider (must be called once early in startup)");
+    }
+
+    if let (Some(cert), Some(key)) = (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        info!("TLS enabled");
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+                .await
+                .map_err(|e| format!("Failed to create TLS config: {}", e))?;
+
+        let addr: std::net::SocketAddr = bind_addr
+            .parse()
+            .map_err(|e| format!("Invalid address: {}", e))?;
+
+        let handle = axum_server::Handle::new();
+        let handle_clone = handle.clone();
+        spawn(async move {
+            shutdown_signal().await;
+            handle_clone.graceful_shutdown(None);
+        });
+
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    } else {
+        let listener = TcpListener::bind(&bind_addr)
+            .await
+            .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
+        serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    }
 
     Ok(())
 }
