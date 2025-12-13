@@ -32,11 +32,6 @@ inline constexpr auto default_unit_size(std::size_t x) -> std::size_t {
 template <std::size_t kBytes, std::size_t kUnit>
 using mem_package_t = decltype(get_mem_package<kUnit>());
 
-template <typename T, std::size_t N>
-struct storage_vec {
-  T data[N];
-};
-
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
   uint32_t tmp;
   asm volatile("ld.global.cs.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
@@ -79,7 +74,7 @@ __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
 template <
     std::size_t kBytes,
     std::size_t kUnit = details::default_unit_size(kBytes),
-    std::size_t kThreads = ::device::kWarpThreads>
+    std::size_t kThreads = kWarpThreads>
 __always_inline __device__ void copy(void* __restrict__ dst, const void* __restrict__ src) {
   using Package = details::mem_package_t<kBytes, kUnit>;
   constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
@@ -100,7 +95,7 @@ __always_inline __device__ void copy(void* __restrict__ dst, const void* __restr
 template <
     std::size_t kBytes,
     std::size_t kUnit = details::default_unit_size(kBytes),
-    std::size_t kThreads = ::device::kWarpThreads>
+    std::size_t kThreads = kWarpThreads>
 __always_inline __device__ auto load_vec(const void* __restrict__ src) {
   using Package = details::mem_package_t<kBytes, kUnit>;
   constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
@@ -109,7 +104,7 @@ __always_inline __device__ auto load_vec(const void* __restrict__ src) {
 
   const auto src_packed = static_cast<const Package*>(src);
   const auto lane_id = threadIdx.x % kThreads;
-  details::storage_vec<Package, kLoopCount> vec;
+  device_vec<Package, kLoopCount> vec;
 
 #pragma unroll kLoopCount
   for (std::size_t i = 0; i < kLoopCount; ++i) {
@@ -123,14 +118,14 @@ __always_inline __device__ auto load_vec(const void* __restrict__ src) {
 template <
     std::size_t kBytes,
     std::size_t kUnit = details::default_unit_size(kBytes),
-    std::size_t kThreads = ::device::kWarpThreads,
+    std::size_t kThreads = kWarpThreads,
     typename Tp>
 __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
   using Package = details::mem_package_t<kBytes, kUnit>;
   constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
   constexpr auto kLoopCount = kBytes / kBytesPerLoop;
   static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
-  static_assert(std::is_same_v<Tp, details::storage_vec<Package, kLoopCount>>);
+  static_assert(std::is_same_v<Tp, device_vec<Package, kLoopCount>>);
 
   const auto dst_packed = static_cast<Package*>(dst);
   const auto lane_id = threadIdx.x % kThreads;
