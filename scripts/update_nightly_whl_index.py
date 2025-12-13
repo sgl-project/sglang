@@ -23,7 +23,7 @@ def compute_sha256(file_path: pathlib.Path) -> str:
     return sha256_hash.hexdigest()
 
 
-def update_wheel_index(commit_hash: str, nightly_version: str):
+def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str = None):
     """Update the wheel index for nightly releases.
 
     Creates a single index at nightly/index.html containing all historical nightlies.
@@ -31,6 +31,7 @@ def update_wheel_index(commit_hash: str, nightly_version: str):
     Args:
         commit_hash: Short git commit hash (e.g., 'c5f1e86')
         nightly_version: Full nightly version string (e.g., '0.5.6.post1.dev7716+gc5f1e86')
+        build_date: Build date in YYYY-MM-DD format (e.g., '2025-12-13')
     """
     dist_dir = pathlib.Path("dist")
     whl_repo_dir = pathlib.Path("sgl-whl")
@@ -41,7 +42,11 @@ def update_wheel_index(commit_hash: str, nightly_version: str):
 
     # Base URL for wheels stored in GitHub Releases
     base_url = "https://github.com/sgl-project/whl/releases/download"
-    release_tag = f"nightly-{commit_hash}"
+    # Use date-based tag if build_date is provided, otherwise fall back to commit-only
+    if build_date:
+        release_tag = f"nightly-{build_date}-{commit_hash}"
+    else:
+        release_tag = f"nightly-{commit_hash}"
 
     # Create nightly directory
     nightly_dir = whl_repo_dir / "nightly"
@@ -152,14 +157,22 @@ def main():
         required=True,
         help="Full nightly version string (e.g., '0.5.6.post1.dev7716+gc5f1e86')",
     )
+    parser.add_argument(
+        "--build-date",
+        type=str,
+        required=False,
+        help="Build date in YYYY-MM-DD format (e.g., '2025-12-13')",
+    )
 
     args = parser.parse_args()
 
     print(f"Updating nightly wheel index")
     print(f"  Commit: {args.commit_hash}")
     print(f"  Version: {args.nightly_version}")
+    if args.build_date:
+        print(f"  Build date: {args.build_date}")
 
-    update_wheel_index(args.commit_hash, args.nightly_version)
+    update_wheel_index(args.commit_hash, args.nightly_version, args.build_date)
 
 
 if __name__ == "__main__":
