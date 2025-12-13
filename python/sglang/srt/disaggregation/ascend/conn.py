@@ -48,15 +48,36 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        num_layers = len(self.kv_args.kv_data_ptrs)
-        layers_params = [
-            (
-                self.kv_args.kv_data_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
-                self.kv_args.kv_item_lens[layer_id],
+        if self.pp_size > 1:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
-            for layer_id in range(num_layers)
-        ]
+
+            layers_params = [
+                                (
+                                    src_k_ptrs[layer_id],
+                                    dst_k_ptrs[layer_id],
+                                    self.kv_args.kv_item_lens[layer_id],
+                                )
+                                for layer_id in range(layers_current_pp_stage)
+                            ] + [
+                                (
+                                    src_v_ptrs[layer_id],
+                                    dst_v_ptrs[layer_id],
+                                    self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
+                                )
+                                for layer_id in range(layers_current_pp_stage)
+                            ]
+        else:
+            num_layers = len(self.kv_args.kv_data_ptrs)
+            layers_params = [
+                (
+                    self.kv_args.kv_data_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    self.kv_args.kv_item_lens[layer_id],
+                )
+                for layer_id in range(num_layers)
+            ]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
