@@ -115,11 +115,6 @@ class SamplingParams:
     width_not_provided: bool = False
     fps: int = 24
 
-    # Resolution validation
-    supported_resolutions: list[tuple[int, int]] | None = (
-        None  # None means all resolutions allowed
-    )
-
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = None
@@ -230,17 +225,11 @@ class SamplingParams:
 
         # Validate resolution against pipeline-specific supported resolutions
         if self.height is not None and self.width is not None:
-            if self.supported_resolutions is not None:
-                if (self.width, self.height) not in self.supported_resolutions:
-                    supported_str = ", ".join(
-                        [f"{w}x{h}" for w, h in self.supported_resolutions]
-                    )
-                    error_msg = (
-                        f"Unsupported resolution: {self.width}x{self.height}. "
-                        f"Supported resolutions: {supported_str}"
-                    )
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
+            try:
+                pipeline_config.validate_resolution(self.width, self.height)
+            except ValueError as e:
+                logger.error(str(e))
+                raise
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -577,9 +566,7 @@ class SamplingParams:
             args.width = 1280
             args.height = 720
 
-        sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
-        args_attrs = set(vars(args).keys())
-        attrs = sampling_params_fields & args_attrs
+        attrs = [attr.name for attr in dataclasses.fields(cls)]
         args.height_not_provided = False
         args.width_not_provided = False
         return {attr: getattr(args, attr) for attr in attrs}
