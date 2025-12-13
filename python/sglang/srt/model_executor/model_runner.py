@@ -1439,7 +1439,56 @@ class ModelRunner:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
+
+        layout_label = "MLA" if self.use_mla_backend else "MHA"
+        if self.use_mla_backend:
+            layout_detail = (
+                f"kv_lora={self.model_config.kv_lora_rank}, "
+                f"rope={self.model_config.qk_rope_head_dim}"
+            )
+        else:
+            kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            layout_detail = f"heads={kv_heads}, dim={self.model_config.head_dim}"
+
+        self._log_kv_profile(
+            layout_label=layout_label,
+            layout_detail=layout_detail,
+            num_layers=num_layers,
+            dtype=self.kv_cache_dtype,
+            cell_size=cell_size,
+            available_mem_gb=available_gpu_memory,
+            total_mem_gb=total_gpu_memory,
+            rest_mem_gb=rest_memory,
+            max_tokens=max_num_token,
+            dp_size=(
+                self.server_args.dp_size
+                if self.server_args.enable_dp_attention
+                else None
+            ),
+        )
         return max_num_token
+
+    def _log_kv_profile(
+        self,
+        *,
+        layout_label: str,
+        layout_detail: str,
+        num_layers: int,
+        dtype: torch.dtype,
+        cell_size: int,
+        available_mem_gb: float,
+        total_mem_gb: float,
+        rest_mem_gb: float,
+        max_tokens: int,
+        dp_size: Optional[int] = None,
+    ):
+        kb_per_token = cell_size / 1024
+        dp_suffix = f" dp={dp_size}" if dp_size else ""
+        log_info_on_rank0(
+            logger,
+            f"KV cache: {layout_label}({layout_detail}) layers={num_layers} dtype={dtype} {kb_per_token:.2f}KB/tok "
+            f"mem={available_mem_gb:.1f}/{total_mem_gb:.1f}GB rest={rest_mem_gb:.1f}GB max_tokens={max_tokens}{dp_suffix}",
+        )
 
     def handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
@@ -1618,7 +1667,7 @@ class ModelRunner:
     def init_memory_pool(
         self,
         total_gpu_memory: int,
-        max_num_reqs: Optional[int] = None,
+        max_running_requests: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
         # Determine the kv cache dtype
@@ -1671,15 +1720,22 @@ class ModelRunner:
             )
             self.max_total_num_tokens = small_kv_size
 
-        if max_num_reqs is None:
-            max_num_reqs = min(
-                max(
-                    int(
-                        self.max_total_num_tokens / self.model_config.context_len * 512
-                    ),
-                    2048,
-                ),
-                4096,
+        if max_running_requests is None:
+            heuristic = int(
+                self.max_total_num_tokens / self.model_config.context_len * 512
+            )
+            max_running_requests = min(max(heuristic, 2048), 4096)
+            log_info_on_rank0(
+                logger,
+                f"req_to_token_pool: size={max_running_requests} "
+                f"(heuristic={heuristic}, clamp=[2048,4096]), "
+                f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
+            )
+        else:
+            log_info_on_rank0(
+                logger,
+                f"req_to_token_pool: size={max_running_requests} (from arg), "
+                f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
 
         if self.mambaish_config is not None:
@@ -1688,34 +1744,39 @@ class ModelRunner:
                 if not self.server_args.disable_radix_cache
                 else 1
             )
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+            max_running_requests = min(
+                max_running_requests, self.server_args.max_mamba_cache_size // ratio
             )
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
+                max_running_requests = self.server_args.max_num_reqs
             else:
                 # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
                 # can be concurrently allocated, so we should give a headroom for it.
                 self.server_args.draft_runner_cache_size = (
                     self.max_total_num_tokens
                     # draft
-                    + max_num_reqs
+                    + max_running_requests
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
+                    + max_running_requests
+                    * self.server_args.speculative_num_draft_tokens
                     # buffer
                     + 100
                 )
                 # Target worker and draft worker shares the same indices for the
                 # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                self.server_args.max_num_reqs = max_num_reqs
+                self.server_args.max_num_reqs = max_running_requests
 
         if max_total_tokens is not None:
+            log_info_on_rank0(
+                logger,
+                f"max_total_num_tokens: arg={max_total_tokens} vs profiled={self.max_total_num_tokens}, using min",
+            )
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
                     f"max_total_tokens={max_total_tokens} is larger than the profiled value "
@@ -1763,11 +1824,13 @@ class ModelRunner:
                 )
 
                 # subscribe memory for pre-allocated requests
-                # if max_num_reqs <= 32, we pre-allocate 2x requests
-                pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+                # if max_running_requests <= 32, we pre-allocate 2x requests
+                pre_alloc_size = (
+                    max_running_requests * 2 if max_running_requests <= 32 else 0
+                )
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
-                        size=max_num_reqs,
+                        size=max_running_requests,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
                         device=self.device,
@@ -1778,7 +1841,7 @@ class ModelRunner:
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(
-                        size=max_num_reqs,
+                        size=max_running_requests,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
                         device=self.device,
@@ -1787,7 +1850,7 @@ class ModelRunner:
                     )
             elif config := self.mambaish_config:
                 self.req_to_token_pool = HybridReqToTokenPool(
-                    size=max_num_reqs,
+                    size=max_running_requests,
                     mamba_size=self.server_args.max_mamba_cache_size,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -1798,7 +1861,7 @@ class ModelRunner:
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
+                    size=max_running_requests,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
