@@ -363,9 +363,9 @@ class GroupCoordinator:
                     for i in range(world_size)
                 ]
                 return tensor_list
-            
+
             return output_tensor
-        
+
         # Allocate output tensor.
         input_size = list(input_.size())
         input_size[0] *= world_size
@@ -385,7 +385,7 @@ class GroupCoordinator:
                 + input_size
             )
             output_tensor = output_tensor.movedim(0, dim)
-    
+
         if separate_tensors:
             tensor_list = [
                 output_tensor.reshape(-1)
@@ -445,7 +445,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-            
+
         # Broadcast.
         torch.distributed.broadcast(
             input_,
