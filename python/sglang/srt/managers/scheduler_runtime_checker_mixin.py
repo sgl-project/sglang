@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 import psutil
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -335,7 +336,9 @@ class SchedulerWatchdog:
             # Print batch size and memory pool info to check whether there are de-sync issues.
             if self.scheduler.is_hybrid_swa:
                 _, info_msg = self.scheduler._check_hybrid_memory()
-            elif self.scheduler.is_ssm_model and isinstance(self.scheduler.tree_cache, MambaRadixCache):
+            elif self.scheduler.is_ssm_model and isinstance(
+                self.scheduler.tree_cache, MambaRadixCache
+            ):
                 _, info_msg = self.scheduler._check_mamba_memory()
             else:
                 _, info_msg = self.scheduler._check_radix_cache_memory()
@@ -353,4 +356,3 @@ class SchedulerWatchdog:
         # Wait for some time so that the parent process can print the error.
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
-

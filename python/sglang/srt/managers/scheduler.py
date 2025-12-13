@@ -18,7 +18,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 import time
 from collections import deque
 from concurrent import futures
@@ -525,7 +524,9 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
-        self.watchdog = SchedulerWatchdog(self, watchdog_timeout=server_args.watchdog_timeout)
+        self.watchdog = SchedulerWatchdog(
+            self, watchdog_timeout=server_args.watchdog_timeout
+        )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
