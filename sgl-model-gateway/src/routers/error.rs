@@ -5,28 +5,28 @@ use axum::{
 };
 use serde_json::json;
 
-pub fn internal_error(message: impl Into<String>) -> Response {
-    create_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+pub fn internal_error(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::INTERNAL_SERVER_ERROR, code, message)
 }
 
-pub fn bad_request(message: impl Into<String>) -> Response {
-    create_error(StatusCode::BAD_REQUEST, message)
+pub fn bad_request(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::BAD_REQUEST, code, message)
 }
 
-pub fn not_found(message: impl Into<String>) -> Response {
-    create_error(StatusCode::NOT_FOUND, message)
+pub fn not_found(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::NOT_FOUND, code, message)
 }
 
-pub fn service_unavailable(message: impl Into<String>) -> Response {
-    create_error(StatusCode::SERVICE_UNAVAILABLE, message)
+pub fn service_unavailable(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::SERVICE_UNAVAILABLE, code, message)
 }
 
-pub fn failed_dependency(message: impl Into<String>) -> Response {
-    create_error(StatusCode::FAILED_DEPENDENCY, message)
+pub fn failed_dependency(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::FAILED_DEPENDENCY, code, message)
 }
 
-pub fn not_implemented(message: impl Into<String>) -> Response {
-    create_error(StatusCode::NOT_IMPLEMENTED, message)
+pub fn not_implemented(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::NOT_IMPLEMENTED, code, message)
 }
 
 fn create_error(
@@ -130,31 +130,31 @@ mod tests {
 
     #[test]
     fn test_internal_error_string() {
-        let response = internal_error("Test error");
+        let response = internal_error("test_error", "Test error");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn test_internal_error_format() {
-        let response = internal_error(format!("Error: {}", 42));
+        let response = internal_error("test_error", format!("Error: {}", 42));
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn test_bad_request() {
-        let response = bad_request("Invalid input");
+        let response = bad_request("invalid_input", "Invalid input");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn test_not_found() {
-        let response = not_found("Resource not found");
+        let response = not_found("resource_not_found", "Resource not found");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn test_service_unavailable() {
-        let response = service_unavailable("No workers");
+        let response = service_unavailable("no_workers", "No workers");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
