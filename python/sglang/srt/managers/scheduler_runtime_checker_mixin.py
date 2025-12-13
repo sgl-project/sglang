@@ -307,6 +307,8 @@ class SchedulerRuntimeCheckerMixin:
 
 
 class SchedulerWatchdog:
+    """A watch dog that will try to kill the server itself if one forward batch takes too long."""
+
     def __init__(self, scheduler: Scheduler, watchdog_timeout: float):
         self.scheduler = scheduler
 
@@ -316,7 +318,6 @@ class SchedulerWatchdog:
         self.parent_process = psutil.Process().parent()
 
     def _watchdog_thread(self):
-        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
         self.watchdog_last_forward_ct = 0
         self.watchdog_last_time = time.perf_counter()
 
