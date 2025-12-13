@@ -87,7 +87,6 @@ def run_all_gather_test(coord_custom, coord_torch, device, num_elements, label, 
              raise TypeError(f"[All-Gather Separate dim={dim_to_test}] Expected list return type")
         for i in range(world_size):
             if not torch.allclose(res_custom[i], res_torch[i]):
-                # 打印详细的调试信息
                 print(f"\n[DEBUG] Mismatch details for dim={dim_to_test}, rank {i}:")
                 print(f"  Input shape: {t_in.shape}")
                 print(f"  Custom result[{i}] shape: {res_custom[i].shape}")
