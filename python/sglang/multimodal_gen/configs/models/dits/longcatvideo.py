@@ -27,7 +27,6 @@ class LongCatVideoArchConfig(DiTArchConfig):
         default_factory=lambda: [is_longcat_blocks])
 
     # Parameter name mapping for weight conversion
-    # Maps original LongCat third_party names -> native FastVideo names
     param_names_mapping: dict = field(
         default_factory=lambda: {
             # Embedders

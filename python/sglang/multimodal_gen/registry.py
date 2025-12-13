@@ -364,10 +364,9 @@ def _register_configs():
         ],
     )
     register_configs(
-        model_name="LongCat-Video",
         sampling_param_cls=LongCatVideoSamplingParams,
         pipeline_config_cls=LongCatT2V480PConfig,
-        model_paths=[
+        hf_model_paths=[
             "meituan-longcat/LongCat-Video",
         ],
         model_detectors=[lambda id: "longcat" in id.lower()],

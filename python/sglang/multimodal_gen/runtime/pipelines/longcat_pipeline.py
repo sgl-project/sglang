@@ -12,12 +12,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
+    DenoisingStage,
     InputValidationStage,
     LatentPreparationStage,
     TextEncodingStage,
     TimestepPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.LongCatDenoisingStage import LongCatDenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.LongCatRefineInitStage import LongCatRefineInitStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.LongCatRefineTimestepStage import LongCatRefineTimestepStage
 
@@ -133,12 +133,13 @@ class LongCatPipeline(LoRAPipeline, ComposedPipelineBase):
                            transformer=self.get_module("transformer", None)))
 
         self.add_stage(stage_name="denoising_stage",
-                       stage=LongCatDenoisingStage(
+                       stage=DenoisingStage(
                            transformer=self.get_module("transformer"),
-                           transformer_2=self.get_module("transformer_2", None),
                            scheduler=self.get_module("scheduler"),
+                           pipeline=self,
+                           transformer_2=self.get_module("transformer_2", None),
                            vae=self.get_module("vae"),
-                           pipeline=self))
+                       ))
 
         self.add_stage(stage_name="decoding_stage",
                        stage=DecodingStage(vae=self.get_module("vae"),

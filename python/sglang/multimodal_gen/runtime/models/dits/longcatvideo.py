@@ -18,8 +18,12 @@ from sglang.multimodal_gen.configs.models.dits.longcatvideo import LongCatVideoC
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, FP32LayerNorm
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.rotary_embedding_3d import RotaryPositionalEmbedding3D
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    NDRotaryEmbedding,
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.layers.attention.layer import UlyssesAttention, LocalAttention
+from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.third_party.longcatvideo.block_sparse_attention.bsa_interface import flash_attn_bsa_3d
@@ -27,51 +31,6 @@ from sglang.multimodal_gen.third_party.longcatvideo.block_sparse_attention.bsa_i
 # ============================================================================
 # Embeddings
 # ============================================================================
-
-class PatchEmbed3D(nn.Module):
-    """
-    3D patch embedding using Conv3d.
-    """
-
-    def __init__(
-        self,
-        patch_size: tuple[int, int, int] = (1, 2, 2),
-        in_channels: int = 16,
-        embed_dim: int = 4096,
-    ):
-        super().__init__()
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-
-        self.proj = nn.Conv3d(
-            in_channels,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-            bias=True,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C, T, H, W]
-        Returns:
-            [B, N, C] where N = (T/pt) * (H/ph) * (W/pw)
-        """
-        # Padding if needed
-        _, _, T, H, W = x.shape
-        if W % self.patch_size[2] != 0:
-            x = F.pad(x, (0, self.patch_size[2] - W % self.patch_size[2]))
-        if H % self.patch_size[1] != 0:
-            x = F.pad(x, (0, 0, 0, self.patch_size[1] - H % self.patch_size[1]))
-        if T % self.patch_size[0] != 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, self.patch_size[0] - T % self.patch_size[0]))
-
-        x = self.proj(x)  # [B, C, T', H', W']
-        x = x.flatten(2).transpose(1, 2)  # [B, N, C]
-        return x
-
 
 class TimestepEmbedder(nn.Module):
     """
@@ -147,7 +106,6 @@ class TimestepEmbedder(nn.Module):
             t_emb = t_emb.reshape(B, T, -1)
 
         return t_emb
-
 
 class CaptionEmbedder(nn.Module):
     """
@@ -249,8 +207,20 @@ class LongCatSelfAttention(nn.Module):
         # Output projection
         self.to_out = ReplicatedLinear(dim, dim, bias=True, params_dtype=dtype)
 
-        # 3D RoPE
-        self.rope_3d = RotaryPositionalEmbedding3D(head_dim=self.head_dim)
+        # 3D RoPE using NDRotaryEmbedding (matching RotaryPositionalEmbedding3D's dimension split)
+        # Calculate rope_dim_list: same logic as RotaryPositionalEmbedding3D
+        dim_t = self.head_dim - 4 * (self.head_dim // 6)
+        dim_h = 2 * (self.head_dim // 6)
+        dim_w = 2 * (self.head_dim // 6)
+        self.rope_dim_list = [dim_t, dim_h, dim_w]
+
+        self.rope_nd = NDRotaryEmbedding(
+            rope_dim_list=self.rope_dim_list,
+            rope_theta=10000.0,
+            theta_rescale_factor=1.0,
+            interpolation_factor=1.0,
+            dtype=dtype or torch.float32,
+        )
 
         # BSA configuration
         self.enable_bsa = getattr(config, 'enable_bsa', False)
@@ -289,16 +259,19 @@ class LongCatSelfAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # For RoPE: need [B, num_heads, N, head_dim]
-        q_rope = q.transpose(1, 2)
-        k_rope = k.transpose(1, 2)
+        # Apply 3D RoPE using NDRotaryEmbedding (matching WanVideo style)
+        # Get rotary embeddings from grid
+        freqs_cos, freqs_sin = self.rope_nd.forward_from_grid(
+            latent_shape,  # (T, H, W)
+            shard_dim=0,
+            start_frame=0,
+            device=q.device,
+        )
 
-        # Apply 3D RoPE
-        q_rope, k_rope = self.rope_3d(q_rope, k_rope, grid_size=latent_shape)
-
-        # Transpose back: [B, N, num_heads, head_dim] or [B, H, N, D] for BSA
-        q = q_rope.transpose(1, 2)
-        k = k_rope.transpose(1, 2)
+        # Apply rotary embeddings to q and k
+        # _apply_rotary_emb expects [B, N, num_heads, head_dim]
+        q = _apply_rotary_emb(q, freqs_cos, freqs_sin, is_neox_style=False)
+        k = _apply_rotary_emb(k, freqs_cos, freqs_sin, is_neox_style=False)
 
         # === Attention: BSA or standard ===
         if self.enable_bsa and T > 1:  # Only use BSA for multi-frame videos
@@ -733,9 +706,9 @@ class LongCatTransformer3DModel(CachableDiT):
         self.patch_size = config.patch_size  # [1, 2, 2]
 
         # Embeddings
-        self.patch_embed = PatchEmbed3D(
+        self.patch_embed = PatchEmbed(
             patch_size=self.patch_size,
-            in_channels=self.in_channels,
+            in_chans=self.in_channels,
             embed_dim=self.hidden_size,
         )
 
