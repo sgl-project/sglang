@@ -62,7 +62,6 @@ def init_process(
     seed_instance_group_base_port,
     event_seed_ready,
     event_dst_ready_list,
-    remote_instance_loader_backend,
 ):
     torch.cuda.set_device(rank)
 
@@ -91,7 +90,6 @@ def init_process(
             tp_size,
             event_seed_ready,
             event_dst_ready_list,
-            remote_instance_loader_backend,
         )
 
 
@@ -161,7 +159,6 @@ def init_process_dst(
     tp_size,
     event_seed_ready,
     event_dst_ready_list,
-    remote_instance_loader_backend,
 ):
     torch.cuda.set_device(rank * tp_size)
     torch.cuda.synchronize()
@@ -189,7 +186,6 @@ def init_process_dst(
             remote_instance_weight_loader_seed_instance_service_port=seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=ports,
             load_format="remote_instance",
-            remote_instance_weight_loader_backend=remote_instance_loader_backend,
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -217,8 +213,6 @@ def init_process_dst(
                 f"[{','.join(str(port) for port in ports)}]",
                 "--load-format",
                 "remote_instance",
-                "--remote-instance-weight-loader-backend",
-                remote_instance_loader_backend,
             ),
         )
     torch.cuda.synchronize()
@@ -256,10 +250,9 @@ def test_load_weights_from_remote_instance(
     seed_instance_ip,
     seed_instance_service_port,
     seed_instance_group_base_port,
-    remote_instance_loader_backend,
 ):
     print(
-        f"Testing model: {model_name} tp_size: {tp_size}, dp_size: {dp_size} backend: {backends} remote_instance_loader_backend: {remote_instance_loader_backend}"
+        f"Testing model: {model_name} tp_size: {tp_size}, dp_size: {dp_size} backend: {backends}"
     )
     param_queue = mp.Queue()
     results = {}
@@ -283,7 +276,6 @@ def test_load_weights_from_remote_instance(
             seed_instance_group_base_port,
             event_seed_ready,
             event_dst_ready_list,
-            remote_instance_loader_backend,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -348,36 +340,14 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
             mode = random.choice(["Engine", "Server"])
-            remote_instance_loader_backend = random.choice(["nccl", "transfer_engine"])
             test_suits = [
-                (
-                    1,
-                    1,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    [mode],
-                    remote_instance_loader_backend,
-                ),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, [mode]),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine"], "nccl"),
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Sever"], "nccl"),
-                (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine", "Server"], "nccl"),
-                (
-                    1,
-                    1,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    ["Engine"],
-                    "transfer_engine",
-                ),
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Sever"], "transfer_engine"),
-                (
-                    2,
-                    2,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    ["Engine", "Server"],
-                    "transfer_engine",
-                ),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine"]),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Sever"]),
+                (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine", "Server"]),
             ]
 
         truncate_size = 10
@@ -395,13 +365,7 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
             "model.norm.weight",
         ]
 
-        for (
-            tp_size,
-            dp_size,
-            model_name,
-            backends,
-            remote_instance_loader_backend,
-        ) in test_suits:
+        for tp_size, dp_size, model_name, backends in test_suits:
             test_load_weights_from_remote_instance(
                 tp_size,
                 dp_size,
@@ -412,7 +376,6 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
                 "127.0.0.1",
                 DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000,
                 60000,
-                remote_instance_loader_backend,
             )
 
 
