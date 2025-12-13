@@ -583,7 +583,7 @@ impl Router {
         enable_pyroscope: bool,
         pyroscope_url: Option<String>,
         pyroscope_app_name: Option<String>,
-        pyroscope_sample_rate: u32,
+        pyroscope_sample_rate: Option<u32>,
         pyroscope_user: Option<String>,
         pyroscope_password: Option<String>,
     ) -> PyResult<Self> {
