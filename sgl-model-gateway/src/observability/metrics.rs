@@ -6,7 +6,7 @@ use std::{
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use pyroscope::{PyroscopeAgent, PyroscopeAgentRunning};
+use pyroscope::{PyroscopeAgent, pyroscope::PyroscopeAgentRunning};
 use pyroscope_pprofrs::{pprof_backend, PprofConfig};
 
 #[derive(Debug, Clone)]
@@ -331,7 +331,7 @@ impl Default for PyroscopeConfig {
     }
 }
 
-static PYROSCOPE_AGENT: std::sync::OnceLock<Arc<PyroscopeAgentRunning>> =
+static PYROSCOPE_AGENT: std::sync::OnceLock<Arc<PyroscopeAgent<PyroscopeAgentRunning>>> =
     std::sync::OnceLock::new();
 
 pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error::Error>> {
