@@ -6,49 +6,37 @@ use axum::{
 use serde_json::json;
 
 pub fn internal_error(message: impl Into<String>) -> Response {
-    create_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+    create_error(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 pub fn bad_request(message: impl Into<String>) -> Response {
-    create_error(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+    create_error(StatusCode::BAD_REQUEST, message)
 }
 
 pub fn not_found(message: impl Into<String>) -> Response {
-    create_error(StatusCode::NOT_FOUND, "invalid_request_error", message)
+    create_error(StatusCode::NOT_FOUND, message)
 }
 
 pub fn service_unavailable(message: impl Into<String>) -> Response {
-    create_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "service_unavailable",
-        message,
-    )
+    create_error(StatusCode::SERVICE_UNAVAILABLE, message)
 }
 
 pub fn failed_dependency(message: impl Into<String>) -> Response {
-    create_error(
-        StatusCode::FAILED_DEPENDENCY,
-        "external_connector_error",
-        message,
-    )
+    create_error(StatusCode::FAILED_DEPENDENCY, message)
 }
 
 pub fn not_implemented(message: impl Into<String>) -> Response {
-    create_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented_error",
-        message,
-    )
+    create_error(StatusCode::NOT_IMPLEMENTED, message)
 }
 
-fn create_error(status_code: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
+fn create_error(status_code: StatusCode, message: impl Into<String>) -> Response {
     let msg = message.into();
     (
         status_code,
         Json(json!({
             "error": {
                 "message": msg,
-                "type": error_type,
+                "type": status_code_to_str(status_code),
                 "code": status_code.as_u16()
             }
         })),
