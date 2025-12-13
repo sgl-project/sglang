@@ -178,11 +178,18 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
+            self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
+            global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
-            self.enable_dp_attention = is_dp_attention_enabled()
+            # current persist a16w16 mla_decode kernel does not support head_num = 128
+            # need to fall back to non-persist
+            if self.kv_cache_dtype is not fp8_dtype and self.enable_dp_attention:
+                _use_mla_ps_kernel = False
+                fast_mode = False
+                intra_batch_mode = False
 
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
 
