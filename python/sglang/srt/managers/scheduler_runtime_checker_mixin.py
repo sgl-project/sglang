@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING
 
+import psutil
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -302,7 +304,17 @@ class SchedulerRuntimeCheckerMixin:
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
 
-    def watchdog_thread(self: Scheduler):
+
+class SchedulerWatchdog:
+    def __init__(self, scheduler: Scheduler, watchdog_timeout: float):
+        self.scheduler = scheduler
+
+        self.watchdog_timeout = watchdog_timeout
+        t = threading.Thread(target=self.watchdog_thread, daemon=True)
+        t.start()
+        self.parent_process = psutil.Process().parent()
+
+    def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
         self.watchdog_last_forward_ct = 0
         self.watchdog_last_time = time.perf_counter()
@@ -340,3 +352,4 @@ class SchedulerRuntimeCheckerMixin:
         # Wait for some time so that the parent process can print the error.
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
+
