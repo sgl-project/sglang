@@ -1662,7 +1662,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     "Failed to retract any request. No space left for only one request."
                 )
 
-        self.filter_batch(keep_indices=sorted_indices, chunked_req_to_exclude=[])
+        self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
@@ -1792,11 +1792,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
+        # FIXME(lsyin): deprecate this API after spec v1 is deprecated
+        v1_spec_info_filtered: Optional[bool] = False,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
-        is_extend_filter = chunked_req_to_exclude is not None
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -1849,10 +1850,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        # NOTE: spec_info filtered before batch filtering only happens in:
+        # - Spec v1's verify phase
+        # - Only for decode batch (running_batch)
+        has_been_filtered = v1_spec_info_filtered and not self.is_v2_eagle
+
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=not is_extend_filter,
+                has_been_filtered=has_been_filtered,
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
