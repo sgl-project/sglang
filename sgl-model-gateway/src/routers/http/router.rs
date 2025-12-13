@@ -668,22 +668,23 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         .unwrap_or_else(|| "unknown".to_string());
     let message = format!("{}. URL: {}", e, url);
 
+    // TODO improve error status code
     let (status, code) = if e.is_builder() {
         (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_builder_error")
     } else if e.is_request() {
-        (StatusCode::SERVICE_UNAVAILABLE, "call_upstream_request_error")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_request_error")
     } else if e.is_redirect() {
-        (StatusCode::BAD_GATEWAY, "call_upstream_redirect_error")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_redirect_error")
     } else if e.is_status() {
-        (StatusCode::BAD_GATEWAY, "call_upstream_status_error")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_status_error")
     } else if e.is_body() {
         (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_body_error")
     } else if e.is_decode() {
-        (StatusCode::BAD_GATEWAY, "call_upstream_decode_error")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_decode_error")
     } else if e.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
     } else if e.is_connect() {
-        (StatusCode::BAD_GATEWAY, "call_upstream_connection_failed")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_connection_failed")
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
