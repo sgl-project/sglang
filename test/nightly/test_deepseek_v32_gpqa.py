@@ -89,12 +89,12 @@ class TestDeepseekV32Accuracy(CustomTestCase):
         print(f"Evaluation start for gpqa")
         metrics = run_eval(args)
         print(f"Evaluation end for gpqa: {metrics=}, expected_score=0.835")
-        self.assertGreaterEqual(metrics["mean_score"], 0.835)
+        mean_score = metrics["mean_score"]
+        self.assertGreaterEqual(mean_score, 0.835)
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gpqa (deepseek-v32)\n"
-                f"Mean Score: {metrics["mean_score"]:.3f}\n"
+                f"### test_gpqa (deepseek-v32)\n" f"Mean Score: {mean_score:.3f}\n"
             )
 
 
