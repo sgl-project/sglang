@@ -236,7 +236,7 @@ class SamplingParams:
                         [f"{w}x{h}" for w, h in self.supported_resolutions]
                     )
                     error_msg = (
-                        f"Unsupported resolution {self.width}x{self.height}. "
+                        f"Unsupported resolution: {self.width}x{self.height}. "
                         f"Supported resolutions: {supported_str}"
                     )
                     logger.error(error_msg)
