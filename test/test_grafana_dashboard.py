@@ -46,7 +46,7 @@ class TestGrafanaDashboard(unittest.TestCase):
         All Prometheus queries should use the new prefix.
         """
         dashboard_str = json.dumps(self.dashboard)
-        old_prefix_matches = re.findall(r"sglang:[a-z_]+", dashboard_str)
+        old_prefix_matches = re.findall(r"sglang:[a-zA-Z0-9_]+", dashboard_str)
 
         self.assertEqual(
             len(old_prefix_matches),
@@ -59,7 +59,7 @@ class TestGrafanaDashboard(unittest.TestCase):
     def test_new_metric_prefix_exists(self):
         """Test that the new 'sglang_' prefix is used in the dashboard."""
         dashboard_str = json.dumps(self.dashboard)
-        new_prefix_matches = re.findall(r"sglang_[a-z_]+", dashboard_str)
+        new_prefix_matches = re.findall(r"sglang_[a-zA-Z0-9_]+", dashboard_str)
 
         self.assertGreater(
             len(new_prefix_matches),
