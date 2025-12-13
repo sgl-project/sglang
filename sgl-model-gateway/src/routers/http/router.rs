@@ -677,8 +677,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         (StatusCode::BAD_GATEWAY, "body_error")
     } else if e.is_decode() {
         (StatusCode::BAD_GATEWAY, "decode_error")
-    } else if e.is_upgrade() {
-        (StatusCode::BAD_GATEWAY, "upgrade_error")
     } else if e.is_timeout() {
         (StatusCode::GATEWAY_TIMEOUT, "timeout")
     } else if e.is_connect() {
