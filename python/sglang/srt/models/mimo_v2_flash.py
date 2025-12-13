@@ -489,6 +489,7 @@ class MiMoV2DecoderLayer(nn.Module):
 
         self.is_layer_sparse = self.is_moe_layer(layer_id)
         is_previous_layer_sparse = self.is_moe_layer(layer_id - 1)
+        is_next_layer_sparse = self.is_moe_layer(layer_id + 1)
 
         if self.is_layer_sparse:
             self.mlp = MiMoV2MoE(
@@ -522,6 +523,7 @@ class MiMoV2DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -563,7 +565,7 @@ class MiMoV2DecoderLayer(nn.Module):
     def is_moe_layer(self, layer_idx: int) -> bool:
         return (
             hasattr(self.config, "moe_layer_freq")
-            and layer_idx >= 0
+            and 0 <= layer_idx < len(self.config.moe_layer_freq)
             and not isinstance(self.config.moe_layer_freq, int)
             and self.config.moe_layer_freq[layer_idx]
         )
