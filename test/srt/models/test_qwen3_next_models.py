@@ -148,6 +148,8 @@ class TestQwen3NextMTP(CustomTestCase):
                 "4",
                 "--chunked-prefill-size",
                 "2048",
+                "--mamba-radix-cache-strategy",
+                "no_buffer",
             ],
         )
 
