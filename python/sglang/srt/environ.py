@@ -151,6 +151,7 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    IS_BLACKWELL = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
@@ -172,6 +173,7 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    SGLANG_CI_SMALL_KV_SIZE = EnvInt(-1)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -192,6 +194,7 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
