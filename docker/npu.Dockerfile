@@ -6,13 +6,16 @@ ARG PYTHON_VERSION=py3.11
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
 
 # Update pip & apt sources
+ARG TARGETARCH
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
 ARG APTMIRROR=""
 ARG PYTORCH_VERSION="2.8.0"
 ARG TORCHVISION_VERSION="0.23.0"
-ARG PTA_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-2.8.0.post2.dev20251113-cp311-cp311-manylinux_2_28_aarch64.whl"
-ARG TRITON_ASCEND_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
-ARG BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64_20251121.run"
+ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v7.2.0-pytorch2.8.0/torch_npu-2.8.0-cp311-cp311-manylinux_2_28_aarch64.whl"
+ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v7.2.0-pytorch2.8.0/torch_npu-2.8.0-cp311-cp311-manylinux_2_28_x86_64.whl"
+ARG BISHENG_NAME=""
+ARG BISHENG_NAME_ARM64="Ascend-BiSheng-toolkit_aarch64_20251121.run"
+ARG BISHENG_NAME_AMD64="Ascend-BiSheng-toolkit_x86_20251121.run"
 ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
@@ -20,6 +23,18 @@ ARG SGLANG_KERNEL_NPU_TAG=main
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
+
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      echo "Using x86_64 dependencies"; \
+      echo "PTA_URL=$PTA_URL_AMD64" >> /etc/environment_new; \
+      echo "BISHENG_NAME=$BISHENG_NAME_AMD64" >> /etc/environment_new; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+      echo "Using aarch64 dependencies"; \
+      echo "PTA_URL=$PTA_URL_ARM64" >> /etc/environment_new; \
+      echo "BISHENG_NAME=$BISHENG_NAME_ARM64" >> /etc/environment_new; \
+    else \
+      echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
+    fi
 
 WORKDIR /workspace
 
@@ -63,13 +78,13 @@ RUN ${PIP_INSTALL} sglang-router
 
 
 ### Install PyTorch and PTA
-RUN (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
+RUN . /etc/environment_new && \
+    (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
     && (${PIP_INSTALL} ${PTA_URL})
 
 
-# TODO: install from pypi released triton-ascend
-RUN (${PIP_INSTALL} pybind11) \
-    && (${PIP_INSTALL} ${TRITON_ASCEND_URL})
+## Install triton-ascend
+RUN (${PIP_INSTALL} pybind11 triton-ascend)
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
@@ -87,14 +102,8 @@ RUN ${PIP_INSTALL} wheel==0.45.1 && git clone --branch $SGLANG_KERNEL_NPU_TAG ht
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -s deep_ep/deep_ep_cpp*.so
 
-# Install CustomOps
-RUN wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp && \
-    wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl && \
-    ${PIP_INSTALL} ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
-
 # Install Bisheng
-RUN wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
+RUN . /etc/environment_new && \
+    wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
 
 CMD ["/bin/bash"]
