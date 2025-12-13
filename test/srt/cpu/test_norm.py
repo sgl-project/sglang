@@ -217,5 +217,6 @@ class TestLayerNorm(CustomTestCase):
         torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
+
 if __name__ == "__main__":
     unittest.main()

@@ -484,7 +484,7 @@ at::Tensor layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   int64_t inp_dim{input.dim()};
   TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
-  
+
   int64_t batch_size{input.size(0)}, seq_len{0}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
     CHECK_EQ(input.size(2), weight.size(0));
@@ -604,7 +604,7 @@ at::Tensor fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::
   } else {
     CHECK_EQ(input.size(1), weight.size(0));
   }
-  
+
   int64_t batch_size{input.size(0)}, seq_len{0}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
     seq_len = input.size(1);
