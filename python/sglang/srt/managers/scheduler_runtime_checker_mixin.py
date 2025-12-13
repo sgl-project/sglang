@@ -307,10 +307,13 @@ class SchedulerRuntimeCheckerMixin:
 
 
 class SchedulerWatchdog:
-    """A watch dog that will try to kill the server itself if one forward batch takes too long."""
+    """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
 
-    def __init__(self, scheduler: Scheduler, watchdog_timeout: float):
+    def __init__(
+        self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
+    ):
         self.scheduler = scheduler
+        self.soft = soft
 
         self.watchdog_timeout = watchdog_timeout
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
@@ -318,6 +321,10 @@ class SchedulerWatchdog:
         self.parent_process = psutil.Process().parent()
 
     def _watchdog_thread(self):
+        while True:
+            self._watchdog_once()
+
+    def _watchdog_once(self):
         watchdog_last_forward_ct = 0
         watchdog_last_time = time.perf_counter()
 
@@ -350,10 +357,11 @@ class SchedulerWatchdog:
             )
 
         pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+        logger.error(f"Watchdog timeout ({self.watchdog_timeout=}, {self.soft=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
 
-        # Wait for some time so that the parent process can print the error.
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
+        if not self.soft:
+            # Wait for some time so that the parent process can print the error.
+            time.sleep(5)
+            self.parent_process.send_signal(signal.SIGQUIT)

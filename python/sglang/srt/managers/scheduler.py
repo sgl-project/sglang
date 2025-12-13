@@ -527,6 +527,8 @@ class Scheduler(
         self.watchdog = SchedulerWatchdog(
             self, watchdog_timeout=server_args.watchdog_timeout
         )
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = SchedulerWatchdog(self, watchdog_timeout=x, soft=True)
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
