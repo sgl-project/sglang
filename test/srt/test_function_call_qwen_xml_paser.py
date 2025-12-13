@@ -1,16 +1,10 @@
 import json
 import unittest
 
-from xgrammar import GrammarCompiler, TokenizerInfo
-
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 
 # from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen3_coder_new_detector import Qwen3CoderDetector
-from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
