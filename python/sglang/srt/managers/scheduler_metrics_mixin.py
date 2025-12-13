@@ -324,6 +324,8 @@ class SchedulerMetricsMixin:
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
+            self.stats.decode_sum_seq_lens = batch.seq_lens.sum().item()
+
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
