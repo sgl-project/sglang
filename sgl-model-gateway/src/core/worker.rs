@@ -561,6 +561,10 @@ impl BasicWorker {
             Ok(self.url())
         }
     }
+
+    fn update_running_requests_metrics(&self) {
+        RouterMetrics::set_running_requests(self.url(), self.load());
+    }
 }
 
 #[async_trait]
