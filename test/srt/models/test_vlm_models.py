@@ -3,6 +3,7 @@ import random
 import sys
 import unittest
 from types import SimpleNamespace
+import tempfile
 
 from sglang.srt.utils import is_hip
 from sglang.test.mmmu_vlm_mixin import DEFAULT_MEM_FRACTION_STATIC, MMMUVLMMixin
@@ -28,8 +29,9 @@ class TestVLMModels(MMMUVLMMixin, CustomTestCase):
         if is_in_ci():
             models_to_test = [random.choice(MODELS)]
 
-        for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
+        with tempfile.TemporaryDirectory() as log_dir:
+            for model in models_to_test:
+                self._run_vlm_mmmu_test(model, log_dir)
 
 
 if __name__ == "__main__":
@@ -50,3 +52,5 @@ if __name__ == "__main__":
 
     # Pass args to unittest
     unittest.main(argv=[sys.argv[0]])
+
+
