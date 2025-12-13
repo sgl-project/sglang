@@ -25,7 +25,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 # from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
@@ -149,6 +149,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 class NSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: NSAMetadata
     topk_transform_method: TopkTransformMethod
+    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -1492,9 +1493,44 @@ class NativeSparseAttnBackend(AttentionBackend):
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
+        paged_mqa_schedule_metadata = None
+        # Build DeepGEMM schedule metadata at metadata-construction time so the
+        # hot decode path in `nsa_indexer` can directly reuse it.
+        if is_cuda() and self.nsa_kv_cache_store_fp8:
+            # Only compute for decode-like modes (decode, target_verify, draft_extend)
+            # Skip for extend (prefill) mode which uses _get_topk_ragged instead
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            ):
+                try:
+                    import deep_gemm
+
+                    # For DeepGEMM paged MQA logits, the schedule depends on context
+                    # lengths (int32) and SM count.
+                    # target_verify/draft_extend use seqlens_expanded, decode uses cache_seqlens_int32
+                    if (
+                        forward_batch.forward_mode.is_target_verify()
+                        or forward_batch.forward_mode.is_draft_extend()
+                    ):
+                        seqlens_32 = self.forward_metadata.nsa_seqlens_expanded
+                    else:
+                        seqlens_32 = self.forward_metadata.cache_seqlens_int32
+                    # NOTE(dark): block_size is fixed to 64 in DeepGEMM paged path.
+                    paged_mqa_schedule_metadata = (
+                        deep_gemm.get_paged_mqa_logits_metadata(
+                            seqlens_32, 64, deep_gemm.get_num_sms()
+                        )
+                    )
+                except Exception:
+                    # If deep_gemm is not available, keep metadata as None and
+                    # allow downstream code to fall back.
+                    paged_mqa_schedule_metadata = None
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(),
+            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
