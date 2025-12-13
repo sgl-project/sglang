@@ -1,8 +1,8 @@
 import argparse
 
+from sglang.apps.sgl_diffusion_webui import sgl_diffusion_webui
 from sglang.cli.generate import generate
 from sglang.cli.serve import serve
-from sglang.cli.webui import webui
 
 
 def main():
@@ -28,7 +28,7 @@ def main():
         help="Run inference on a multimodal model through webui.",
         add_help=False,  # Defer help to the specific parser
     )
-    webui_parser.set_defaults(func=webui)
+    webui_parser.set_defaults(func=sgl_diffusion_webui)
 
     args, extra_argv = parser.parse_known_args()
     args.func(args, extra_argv)

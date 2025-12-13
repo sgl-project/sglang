@@ -127,16 +127,18 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     if launch_http_server:
         logger.info("Starting FastAPI server.")
+        launch_http_server_only(server_args)
 
-        # set for endpoints to access global_server_args
-        set_global_server_args(server_args)
 
-        app = create_app(server_args)
-        uvicorn.run(
-            app,
-            log_config=None,
-            log_level=server_args.log_level,
-            host=server_args.host,
-            port=server_args.port,
-            reload=False,
-        )
+def launch_http_server_only(server_args):
+    # set for endpoints to access global_server_args
+    set_global_server_args(server_args)
+    app = create_app(server_args)
+    uvicorn.run(
+        app,
+        log_config=None,
+        log_level=server_args.log_level,
+        host=server_args.host,
+        port=server_args.port,
+        reload=False,
+    )
