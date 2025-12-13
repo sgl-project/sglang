@@ -5,6 +5,7 @@ when only the LazyImport class is needed.
 """
 
 import importlib
+from threading import Lock
 
 
 class LazyImport:
@@ -31,11 +32,15 @@ class LazyImport:
         self.module_name = module_name
         self.class_name = class_name
         self._module = None
+        self._lock = Lock()
 
     def _load(self):
         if self._module is None:
-            module = importlib.import_module(self.module_name)
-            self._module = getattr(module, self.class_name)
+            with self._lock:
+                # Double-checked locking for thread safety
+                if self._module is None:
+                    module = importlib.import_module(self.module_name)
+                    self._module = getattr(module, self.class_name)
         return self._module
 
     def __getattr__(self, name: str):
