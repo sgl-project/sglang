@@ -665,20 +665,24 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     let url = e.url().map(|u| u.to_string()).unwrap_or_else(|| "unknown".to_string());
     let message = format!("{}. URL: {}", e, url);
 
-    let (status, code) = if e.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "request_timeout")
-    } else if e.is_connect() {
-        (StatusCode::BAD_GATEWAY, "connection_failed")
+    let (status, code) = if e.is_builder() {
+        (StatusCode::BAD_REQUEST, "builder_error")
     } else if e.is_request() {
-        (StatusCode::BAD_REQUEST, "request_build_failed")
-    } else if e.is_status() {
-        (StatusCode::BAD_GATEWAY, "invalid_status")
+        (StatusCode::BAD_REQUEST, "request_error")
     } else if e.is_redirect() {
         (StatusCode::BAD_GATEWAY, "redirect_error")
+    } else if e.is_status() {
+        (StatusCode::BAD_GATEWAY, "status_error")
     } else if e.is_body() {
         (StatusCode::BAD_GATEWAY, "body_error")
     } else if e.is_decode() {
         (StatusCode::BAD_GATEWAY, "decode_error")
+    } else if e.is_upgrade() {
+        (StatusCode::BAD_GATEWAY, "upgrade_error")
+    } else if e.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "timeout")
+    } else if e.is_connect() {
+        (StatusCode::BAD_GATEWAY, "connection_failed")
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, "request_failed")
     };
