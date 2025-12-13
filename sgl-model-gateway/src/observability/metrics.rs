@@ -348,7 +348,9 @@ pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error
     }
 
     if !config.tags.is_empty() {
-        agent_builder = agent_builder.tags(config.tags.clone());
+        agent_builder = agent_builder.tags(
+            config.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        );
     }
 
     let agent = agent_builder.build()?;
