@@ -6,8 +6,6 @@ use std::{
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use pyroscope::{PyroscopeAgent, PyroscopeAgentRunning};
-use pyroscope_pprof_rs::{pprof_backend, PprofConfig};
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
