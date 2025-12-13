@@ -121,6 +121,13 @@ class RouterArgs:
     # Trace
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    # Pyroscope
+    enable_pyroscope: bool = False
+    pyroscope_url: Optional[str] = None
+    pyroscope_app_name: Optional[str] = None
+    pyroscope_sample_rate: int = 100
+    pyroscope_user: Optional[str] = None
+    pyroscope_password: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -654,6 +661,41 @@ class RouterArgs:
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-pyroscope",
+            action="store_true",
+            help="Enable Pyroscope continuous profiling",
+        )
+        parser.add_argument(
+            f"--{prefix}pyroscope-url",
+            type=str,
+            default=None,
+            help="Pyroscope server URL (required if --enable-pyroscope is set)",
+        )
+        parser.add_argument(
+            f"--{prefix}pyroscope-app-name",
+            type=str,
+            default=None,
+            help="Application name for Pyroscope (required if --enable-pyroscope is set)",
+        )
+        parser.add_argument(
+            f"--{prefix}pyroscope-sample-rate",
+            type=int,
+            default=100,
+            help="Pyroscope sampling rate in Hz (default: 100)",
+        )
+        parser.add_argument(
+            f"--{prefix}pyroscope-user",
+            type=str,
+            default=None,
+            help="Pyroscope authentication user (for Grafana Cloud)",
+        )
+        parser.add_argument(
+            f"--{prefix}pyroscope-password",
+            type=str,
+            default=None,
+            help="Pyroscope authentication password/token (for Grafana Cloud)",
         )
 
     @classmethod

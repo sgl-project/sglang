@@ -228,6 +228,12 @@ struct Router {
     ca_cert_paths: Vec<String>,
     enable_trace: bool,
     otlp_traces_endpoint: String,
+    enable_pyroscope: bool,
+    pyroscope_url: Option<String>,
+    pyroscope_app_name: Option<String>,
+    pyroscope_sample_rate: u32,
+    pyroscope_user: Option<String>,
+    pyroscope_password: Option<String>,
 }
 
 impl Router {
@@ -490,6 +496,12 @@ impl Router {
         ca_cert_paths = vec![],
         enable_trace = false,
         otlp_traces_endpoint = String::from("localhost:4317"),
+        enable_pyroscope = false,
+        pyroscope_url = None,
+        pyroscope_app_name = None,
+        pyroscope_sample_rate = 100,
+        pyroscope_user = None,
+        pyroscope_password = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -568,6 +580,12 @@ impl Router {
         ca_cert_paths: Vec<String>,
         enable_trace: bool,
         otlp_traces_endpoint: String,
+        enable_pyroscope: bool,
+        pyroscope_url: Option<String>,
+        pyroscope_app_name: Option<String>,
+        pyroscope_sample_rate: u32,
+        pyroscope_user: Option<String>,
+        pyroscope_password: Option<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -660,11 +678,17 @@ impl Router {
             ca_cert_paths,
             enable_trace,
             otlp_traces_endpoint,
+            enable_pyroscope,
+            pyroscope_url,
+            pyroscope_app_name,
+            pyroscope_sample_rate,
+            pyroscope_user,
+            pyroscope_password,
         })
     }
 
     fn start(&self) -> PyResult<()> {
-        use observability::metrics::PrometheusConfig;
+        use observability::metrics::{PrometheusConfig, PyroscopeConfig};
 
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
@@ -715,6 +739,7 @@ impl Router {
                 log_level: self.log_level.clone(),
                 service_discovery_config,
                 prometheus_config,
+                pyroscope_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
             })

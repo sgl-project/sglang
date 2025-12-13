@@ -33,7 +33,7 @@ use crate::{
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
-        metrics::{self, PrometheusConfig},
+        metrics::{self, PrometheusConfig, PyroscopeConfig},
         otel_trace,
     },
     protocols::{
@@ -597,6 +597,7 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
+    pub pyroscope_config: Option<PyroscopeConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
 }
@@ -740,6 +741,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     if let Some(prometheus_config) = &config.prometheus_config {
         metrics::start_prometheus(prometheus_config.clone());
+    }
+
+    if let Some(pyroscope_config) = &config.pyroscope_config {
+        if let Err(e) = metrics::start_pyroscope(pyroscope_config.clone()) {
+            warn!("Failed to start Pyroscope agent: {}", e);
+        }
     }
 
     info!(
