@@ -317,7 +317,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
-            output_size="480x320",
             num_frames=8,
         ),
     ),
@@ -353,7 +352,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
         ),
     ),
     # === Text and Image to Video (TI2V) ===
