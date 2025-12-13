@@ -420,7 +420,6 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
-            output_size="720x480",
         ),
     ),
     DiffusionTestCase(

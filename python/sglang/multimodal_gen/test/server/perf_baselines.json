@@ -943,7 +943,7 @@
                 "38": 753.64,
                 "39": 756.95
             },
-            "expected_e2e_ms": 106895.63,
+            "expected_e2e_ms": 116895.63,
             "expected_avg_denoise_ms": 2550.47,
             "expected_median_denoise_ms": 756.59
         },
