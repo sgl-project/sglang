@@ -708,7 +708,10 @@ impl RouterConfigBuilder {
         match (&self.server_cert_path, &self.server_key_path) {
             (Some(cert_path), Some(key_path)) => {
                 let cert = std::fs::read(cert_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read server certificate from {}: {}", cert_path, e),
+                    reason: format!(
+                        "Failed to read server certificate from {}: {}",
+                        cert_path, e
+                    ),
                 })?;
                 let key = std::fs::read(key_path).map_err(|e| ConfigError::ValidationFailed {
                     reason: format!("Failed to read server key from {}: {}", key_path, e),

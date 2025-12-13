@@ -6,7 +6,7 @@ use std::{
     },
     time::Duration,
 };
-use rustls::crypto::ring;
+
 use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
@@ -14,6 +14,7 @@ use axum::{
     routing::{delete, get, post},
     serve, Json, Router,
 };
+use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, signal, spawn};
