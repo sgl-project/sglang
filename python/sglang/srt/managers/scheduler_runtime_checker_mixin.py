@@ -321,6 +321,10 @@ class SchedulerWatchdog
         self.parent_process = psutil.Process().parent()
 
     def _watchdog_thread(self):
+        while True:
+            self._watchdog_once()
+
+    def _watchdog_once(self):
         self.watchdog_last_forward_ct = 0
         self.watchdog_last_time = time.perf_counter()
 
