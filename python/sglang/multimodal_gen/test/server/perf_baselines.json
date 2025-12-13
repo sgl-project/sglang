@@ -825,7 +825,7 @@
         },
         "wan2_1_i2v_14b_720P_2gpu": {
             "stages_ms": {
-                "InputValidationStage": 53.67,
+                "InputValidationStage": 153.67,
                 "TextEncodingStage": 2838,
                 "ImageEncodingStage": 3123.99,
                 "ConditioningStage": 0.01,
