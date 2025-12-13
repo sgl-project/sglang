@@ -58,9 +58,13 @@ fn create_error(status_code: StatusCode, error_type: &str, message: impl Into<St
 
 fn status_code_to_str(status_code: StatusCode) -> &'static str {
     match status_code {
+        // 1xx
         StatusCode::CONTINUE => "continue",
         StatusCode::SWITCHING_PROTOCOLS => "switching_protocols",
         StatusCode::PROCESSING => "processing",
+        StatusCode::EARLY_HINTS => "early_hints",
+
+        // 2xx
         StatusCode::OK => "ok",
         StatusCode::CREATED => "created",
         StatusCode::ACCEPTED => "accepted",
@@ -72,6 +76,7 @@ fn status_code_to_str(status_code: StatusCode) -> &'static str {
         StatusCode::ALREADY_REPORTED => "already_reported",
         StatusCode::IM_USED => "im_used",
 
+        // 3xx
         StatusCode::MULTIPLE_CHOICES => "multiple_choices",
         StatusCode::MOVED_PERMANENTLY => "moved_permanently",
         StatusCode::FOUND => "found",
@@ -81,6 +86,7 @@ fn status_code_to_str(status_code: StatusCode) -> &'static str {
         StatusCode::TEMPORARY_REDIRECT => "temporary_redirect",
         StatusCode::PERMANENT_REDIRECT => "permanent_redirect",
 
+        // 4xx
         StatusCode::BAD_REQUEST => "bad_request",
         StatusCode::UNAUTHORIZED => "unauthorized",
         StatusCode::PAYMENT_REQUIRED => "payment_required",
@@ -110,6 +116,7 @@ fn status_code_to_str(status_code: StatusCode) -> &'static str {
         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE => "request_header_fields_too_large",
         StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => "unavailable_for_legal_reasons",
 
+        // 5xx
         StatusCode::INTERNAL_SERVER_ERROR => "internal_server_error",
         StatusCode::NOT_IMPLEMENTED => "not_implemented",
         StatusCode::BAD_GATEWAY => "bad_gateway",
