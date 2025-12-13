@@ -666,23 +666,23 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     let message = format!("{}. URL: {}", e, url);
 
     let (status, code) = if e.is_builder() {
-        (StatusCode::BAD_REQUEST, "builder_error")
+        (StatusCode::BAD_REQUEST, "call_upstream_builder_error")
     } else if e.is_request() {
-        (StatusCode::BAD_REQUEST, "request_error")
+        (StatusCode::BAD_REQUEST, "call_upstream_request_error")
     } else if e.is_redirect() {
-        (StatusCode::BAD_GATEWAY, "redirect_error")
+        (StatusCode::BAD_GATEWAY, "call_upstream_redirect_error")
     } else if e.is_status() {
-        (StatusCode::BAD_GATEWAY, "status_error")
+        (StatusCode::BAD_GATEWAY, "call_upstream_status_error")
     } else if e.is_body() {
-        (StatusCode::BAD_GATEWAY, "body_error")
+        (StatusCode::BAD_GATEWAY, "call_upstream_body_error")
     } else if e.is_decode() {
-        (StatusCode::BAD_GATEWAY, "decode_error")
+        (StatusCode::BAD_GATEWAY, "call_upstream_decode_error")
     } else if e.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "timeout")
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
-        (StatusCode::BAD_GATEWAY, "connection_failed")
+        (StatusCode::BAD_GATEWAY, "call_upstream_connection_failed")
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, "request_failed")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_request_failed")
     };
 
     error::create_error(status, code, message)
