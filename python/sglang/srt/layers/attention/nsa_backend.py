@@ -107,6 +107,9 @@ class NSAMetadata:
     nsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
     flashmla_metadata: Optional[NSAFlashMLAMetadata] = None
+    # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
+    # Precomputed once per forward batch and reused across layers.
+    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -503,6 +506,36 @@ class NativeSparseAttnBackend(AttentionBackend):
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
 
+        paged_mqa_schedule_metadata = None
+        # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
+        # Compute it once per forward batch and reuse it across layers.
+        if (
+            is_cuda()
+            and self.nsa_kv_cache_store_fp8
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            )
+        ):
+            try:
+                import deep_gemm
+
+                # NOTE: DeepGEMM paged path uses block_size=64.
+                seqlens_32 = (
+                    seqlens_expanded
+                    if (
+                        forward_batch.forward_mode.is_target_verify()
+                        or forward_batch.forward_mode.is_draft_extend()
+                    )
+                    else cache_seqlens_int32
+                )
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32, 64, deep_gemm.get_num_sms()
+                )
+            except (ImportError, ModuleNotFoundError):
+                paged_mqa_schedule_metadata = None
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -521,6 +554,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 if self.nsa_decode_impl == "flashmla_kv"
                 else None
             ),
+            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -681,6 +715,33 @@ class NativeSparseAttnBackend(AttentionBackend):
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
+        paged_mqa_schedule_metadata = None
+        if (
+            is_cuda()
+            and self.nsa_kv_cache_store_fp8
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend()
+            )
+        ):
+            try:
+                import deep_gemm
+
+                seqlens_32 = (
+                    seqlens_expanded
+                    if (
+                        forward_mode.is_target_verify()
+                        or forward_mode.is_draft_extend()
+                    )
+                    else cache_seqlens_int32
+                )
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32, 64, deep_gemm.get_num_sms()
+                )
+            except (ImportError, ModuleNotFoundError):
+                paged_mqa_schedule_metadata = None
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -690,6 +751,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table_1,
             flashmla_metadata=flashmla_metadata,
+            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -825,6 +887,37 @@ class NativeSparseAttnBackend(AttentionBackend):
             metadata.nsa_cache_seqlens_int32[: seqlens_expanded.shape[0]].copy_(
                 nsa_cache_seqlens
             )
+
+        # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
+        if (
+            is_cuda()
+            and self.nsa_kv_cache_store_fp8
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend()
+            )
+        ):
+            try:
+                import deep_gemm
+
+                seqlens_32 = (
+                    seqlens_expanded
+                    if (
+                        forward_mode.is_target_verify()
+                        or forward_mode.is_draft_extend()
+                    )
+                    else metadata.cache_seqlens_int32
+                )
+                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32, 64, deep_gemm.get_num_sms()
+                )
+                if metadata.paged_mqa_schedule_metadata is None:
+                    metadata.paged_mqa_schedule_metadata = new_schedule
+                else:
+                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            except (ImportError, ModuleNotFoundError):
+                metadata.paged_mqa_schedule_metadata = None
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1493,44 +1586,10 @@ class NativeSparseAttnBackend(AttentionBackend):
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        paged_mqa_schedule_metadata = None
-        # Build DeepGEMM schedule metadata at metadata-construction time so the
-        # hot decode path in `nsa_indexer` can directly reuse it.
-        if is_cuda() and self.nsa_kv_cache_store_fp8:
-            # Only compute for decode-like modes (decode, target_verify, draft_extend)
-            # Skip for extend (prefill) mode which uses _get_topk_ragged instead
-            if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
-                try:
-                    import deep_gemm
-
-                    # For DeepGEMM paged MQA logits, the schedule depends on context
-                    # lengths (int32) and SM count.
-                    # target_verify/draft_extend use seqlens_expanded, decode uses cache_seqlens_int32
-                    if (
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend()
-                    ):
-                        seqlens_32 = self.forward_metadata.nsa_seqlens_expanded
-                    else:
-                        seqlens_32 = self.forward_metadata.cache_seqlens_int32
-                    # NOTE: block_size is fixed to 64 in DeepGEMM paged path.
-                    paged_mqa_schedule_metadata = (
-                        deep_gemm.get_paged_mqa_logits_metadata(
-                            seqlens_32, 64, deep_gemm.get_num_sms()
-                        )
-                    )
-                except (ImportError, ModuleNotFoundError):
-                    # If deep_gemm is not available, keep metadata as None and
-                    # allow downstream code to fall back.
-                    paged_mqa_schedule_metadata = None
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(),
-            paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
