@@ -654,7 +654,7 @@ impl JobQueue {
         // Select workflow based on runtime field
         let workflow_id = match config.runtime.as_deref() {
             Some("external") => WorkflowId::new("external_worker_registration"),
-            _ => WorkflowId::new("worker_registration"),
+            _ => WorkflowId::new("local_worker_registration"),
         };
 
         engine
