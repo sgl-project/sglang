@@ -338,7 +338,7 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         let error_code = response
             .headers()
-            .get("X-SMG-ERROR-CODE")
+            .get("X-SMG-Error-Code")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
 
