@@ -275,7 +275,7 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "sgl_router_http_responses_total",
-        "Total number of HTTP responses by status code"
+        "Total number of HTTP responses by status code and error code"
     );
 }
 
@@ -330,10 +330,11 @@ impl RouterMetrics {
     }
 
     // TODO unify metric names
-    pub fn record_upstream_http_response(route: &str, status_code: u16) {
-        counter!("sgl_router_upstream_http_responses_total",
+    pub fn record_attempt_http_response(route: &str, status_code: u16, error_code: &str) {
+        counter!("sgl_router_attempt_http_responses_total",
             "route" => route.to_string(),
-            "status_code" => status_code.to_string()
+            "status_code" => status_code.to_string(),
+            "error_code" => error_code.to_string()
         )
         .increment(1);
     }
@@ -593,9 +594,10 @@ impl RouterMetrics {
         counter!("sgl_router_http_requests_total").increment(1);
     }
 
-    pub fn record_http_status_code(status_code: u16) {
+    pub fn record_http_status_code(status_code: u16, error_code: &str) {
         counter!("sgl_router_http_responses_total",
-            "status_code" => status_code.to_string()
+            "status_code" => status_code.to_string(),
+            "error_code" => error_code.to_string()
         )
         .increment(1);
     }

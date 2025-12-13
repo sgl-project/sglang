@@ -13,6 +13,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -38,6 +39,10 @@ class TestEAGLEServerBasic(EagleServerBase):
             worker.start()
         for p in threads:
             p.join()
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        self.assertIsNone(self.process.poll())
 
     def test_max_token_one(self):
         requests.get(self.base_url + "/flush_cache")
@@ -292,7 +297,8 @@ class TestEAGLERetract(TestEAGLEServerBasic):
         # These config helps find a leak.
         # FIXME(lsyin): use override context manager
         envs.SGLANG_CI_SMALL_KV_SIZE.set(4500)
-        super().setUpClass()
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            super().setUpClass()
 
 
 class TestEAGLEServerTriton(TestEAGLEServerBasic):
