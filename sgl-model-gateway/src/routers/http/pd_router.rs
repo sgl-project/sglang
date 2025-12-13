@@ -162,7 +162,10 @@ impl PDRouter {
     fn handle_server_selection_error(error: String) -> Response {
         error!("Failed to select PD pair error={}", error);
         RouterMetrics::record_pd_error("server_selection");
-        error::service_unavailable("server_selection_failed", format!("No available servers: {}", error))
+        error::service_unavailable(
+            "server_selection_failed",
+            format!("No available servers: {}", error),
+        )
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -392,10 +395,17 @@ impl PDRouter {
             match res.bytes().await {
                 Ok(error_body) => {
                     // Try to parse error message from body, fallback to status-based error
-                    let error_message = if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
-                        if let Some(msg) = error_json.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                    let error_message = if let Ok(error_json) =
+                        serde_json::from_slice::<Value>(&error_body)
+                    {
+                        if let Some(msg) = error_json
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                        {
                             msg.to_string()
-                        } else if let Some(msg) = error_json.get("message").and_then(|m| m.as_str()) {
+                        } else if let Some(msg) = error_json.get("message").and_then(|m| m.as_str())
+                        {
                             msg.to_string()
                         } else {
                             String::from_utf8_lossy(&error_body).to_string()
@@ -403,15 +413,25 @@ impl PDRouter {
                     } else {
                         String::from_utf8_lossy(&error_body).to_string()
                     };
-                    
+
                     let status_code = StatusCode::from_u16(status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     match status_code {
-                        StatusCode::BAD_REQUEST => error::bad_request("decode_bad_request", error_message),
-                        StatusCode::NOT_FOUND => error::not_found("decode_not_found", error_message),
-                        StatusCode::INTERNAL_SERVER_ERROR => error::internal_error("decode_internal_error", error_message),
-                        StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable("decode_unavailable", error_message),
-                        StatusCode::BAD_GATEWAY => error::bad_gateway("decode_bad_gateway", error_message),
+                        StatusCode::BAD_REQUEST => {
+                            error::bad_request("decode_bad_request", error_message)
+                        }
+                        StatusCode::NOT_FOUND => {
+                            error::not_found("decode_not_found", error_message)
+                        }
+                        StatusCode::INTERNAL_SERVER_ERROR => {
+                            error::internal_error("decode_internal_error", error_message)
+                        }
+                        StatusCode::SERVICE_UNAVAILABLE => {
+                            error::service_unavailable("decode_unavailable", error_message)
+                        }
+                        StatusCode::BAD_GATEWAY => {
+                            error::bad_gateway("decode_bad_gateway", error_message)
+                        }
                         _ => error::internal_error("decode_error", error_message),
                     }
                 }
@@ -420,11 +440,21 @@ impl PDRouter {
                     let status_code = StatusCode::from_u16(status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     match status_code {
-                        StatusCode::BAD_REQUEST => error::bad_request("decode_read_failed", error_message),
-                        StatusCode::NOT_FOUND => error::not_found("decode_read_failed", error_message),
-                        StatusCode::INTERNAL_SERVER_ERROR => error::internal_error("decode_read_failed", error_message),
-                        StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable("decode_read_failed", error_message),
-                        StatusCode::BAD_GATEWAY => error::bad_gateway("decode_read_failed", error_message),
+                        StatusCode::BAD_REQUEST => {
+                            error::bad_request("decode_read_failed", error_message)
+                        }
+                        StatusCode::NOT_FOUND => {
+                            error::not_found("decode_read_failed", error_message)
+                        }
+                        StatusCode::INTERNAL_SERVER_ERROR => {
+                            error::internal_error("decode_read_failed", error_message)
+                        }
+                        StatusCode::SERVICE_UNAVAILABLE => {
+                            error::service_unavailable("decode_read_failed", error_message)
+                        }
+                        StatusCode::BAD_GATEWAY => {
+                            error::bad_gateway("decode_read_failed", error_message)
+                        }
                         _ => error::internal_error("decode_read_failed", error_message),
                     }
                 }
@@ -583,7 +613,10 @@ impl PDRouter {
                             }
                             Err(e) => {
                                 error!("Failed to read decode response: {}", e);
-                                error::internal_error("read_response_failed", "Failed to read response")
+                                error::internal_error(
+                                    "read_response_failed",
+                                    "Failed to read response",
+                                )
                             }
                         }
                     }

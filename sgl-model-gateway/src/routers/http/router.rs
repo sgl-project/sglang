@@ -112,10 +112,9 @@ impl Router {
                             ),
                         }
                     }
-                    Err(e) => error::internal_error(
-                        "request_failed",
-                        format!("Request failed: {}", e),
-                    ),
+                    Err(e) => {
+                        error::internal_error("request_failed", format!("Request failed: {}", e))
+                    }
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
@@ -507,10 +506,7 @@ impl Router {
                     }
                 }
 
-                return error::internal_error(
-                    "request_failed",
-                    format!("Request failed: {}", e),
-                );
+                return error::internal_error("request_failed", format!("Request failed: {}", e));
             }
         };
 
