@@ -102,21 +102,13 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
                 seen.add(filename)
                 unique_links.append(link)
 
-    # Write index following PyPI simple repository format
-    # https://peps.python.org/pep-0503/
+    # Write index in minimal format (matching production sgl-kernel index)
     with open(index_file, "w") as f:
         f.write("<!DOCTYPE html>\n")
-        f.write("<html>\n")
-        f.write("<head>\n")
-        f.write('  <meta name="pypi:repository-version" content="1.0">\n')
-        f.write("  <title>Links for sglang</title>\n")
-        f.write("</head>\n")
-        f.write("<body>\n")
-        f.write("  <h1>Links for sglang</h1>\n")
-        # Write links only, following PEP 503
+        f.write("<h1>SGLang Nightly Wheels</h1>\n")
+        # Write links only
         f.write("\n".join(unique_links))
-        f.write("\n</body>\n")
-        f.write("</html>\n")
+        f.write("\n")
 
     print(f"  Written {len(unique_links)} total wheels to {index_file}")
     print(f"\nDone! Users can install with:")
