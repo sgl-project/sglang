@@ -376,14 +376,16 @@ def maybe_download_model(
         logger.info(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
-        with suppress_other_loggers(not_suppress_on_main_rank=False):
-            with get_lock(model_name_or_path).acquire(poll_interval=2):
-                local_path = snapshot_download(
-                    repo_id=model_name_or_path,
-                    ignore_patterns=["*.onnx", "*.msgpack"],
-                    local_dir=local_dir,
-                )
-                logger.info("Downloaded model to %s", local_path)
+        with (
+            suppress_other_loggers(not_suppress_on_main_rank=False),
+            get_lock(model_name_or_path).acquire(poll_interval=2),
+        ):
+            local_path = snapshot_download(
+                repo_id=model_name_or_path,
+                ignore_patterns=["*.onnx", "*.msgpack"],
+                local_dir=local_dir,
+            )
+            logger.info("Downloaded model to %s", local_path)
         return str(local_path)
     except Exception as e:
         raise ValueError(

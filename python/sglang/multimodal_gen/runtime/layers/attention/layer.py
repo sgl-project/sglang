@@ -370,26 +370,9 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
             # -> [B, S, H_local, D]
-            # Fused All-to-All allows better bandwidth utilization and reduced latency
-            # compared to launching 3 separate small all-to-all kernels.
-            # 1. Try full fusion Q+K+V (Self-Attention MHA)
-            if (
-                q.shape[1] == k.shape[1] == v.shape[1]  # Seq Len check
-                and q.shape[2] == k.shape[2] == v.shape[2]  # Head Dim check
-            ):
-                qkv = torch.cat([q, k, v], dim=2)
-                qkv = _usp_input_all_to_all(qkv, head_dim=2)
-                q, k, v = qkv.chunk(3, dim=2)
-            else:
-                # 2. Fallback: Separate Q, try fusing K+V
-                q = _usp_input_all_to_all(q, head_dim=2)
-                if k.shape[1] == v.shape[1] and k.shape[2] == v.shape[2]:
-                    kv = torch.cat([k, v], dim=2)
-                    kv = _usp_input_all_to_all(kv, head_dim=2)
-                    k, v = kv.chunk(2, dim=2)
-                else:
-                    k = _usp_input_all_to_all(k, head_dim=2)
-                    v = _usp_input_all_to_all(v, head_dim=2)
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k = _usp_input_all_to_all(k, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:

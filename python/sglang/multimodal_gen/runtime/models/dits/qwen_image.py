@@ -331,6 +331,11 @@ class QwenImageCrossAttention(nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
+            },
         )
 
         self.fused_projections = False

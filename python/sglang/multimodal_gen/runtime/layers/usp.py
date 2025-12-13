@@ -41,8 +41,7 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     x = ft_c.all_to_all_single(
         x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
     )
-    # x = _maybe_wait(x)
-    # x = _maybe_wait(x)
+    x = _maybe_wait(x)
     x = x.reshape(x_shape)
     return x
 
