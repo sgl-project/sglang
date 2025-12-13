@@ -404,7 +404,7 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        self.is_hybrid_gdn = (
+        self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
         )
@@ -797,7 +797,7 @@ class Scheduler(
                 self.tree_cache = SWARadixCache(
                     params=params, sliding_window_size=self.sliding_window_size
                 )
-            elif self.is_hybrid_gdn:
+            elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
