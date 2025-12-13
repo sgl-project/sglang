@@ -70,7 +70,7 @@ class SGLangFailuresAnalyzer:
 
         Args:
             limit: Number of runs to fetch per workflow
-            workflow_filter: List of workflow filenames (uses self.target_workflows if None)
+            workflow_filter: List of workflow filenames
             filters: Optional dict of API filters (e.g., {"event": "schedule"}, {"branch": "main"})
         """
         filter_desc = f"workflows: {', '.join(workflow_filter)}"
