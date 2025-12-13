@@ -46,10 +46,10 @@ pub fn create_error(
 ) -> Response {
     let code_str = code.into();
     let message_str = message.into();
-    
+
     let mut headers = HeaderMap::new();
     headers.insert(X_SMG_ERROR_CODE, HeaderValue::from_str(&code_str).unwrap());
-    
+
     (
         status,
         headers,
