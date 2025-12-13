@@ -316,6 +316,10 @@ void fused_add_layernorm_kernel_impl(
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
+  TORCH_CHECK(
+      !((residual != nullptr) && (buffer == nullptr)),
+      "fused_add_layernorm_kernel_impl with a residual input requires a buffer."
+  );
 
   constexpr int kVecSize = bVec::size();
   int64_t parallel_size{(seq_len == 0) ? batch_size : batch_size * seq_len};
@@ -416,8 +420,8 @@ void fused_add_layernorm_kernel_impl(
         x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
         x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
 
-        bVec x_ovec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        x_ovec.store(out_ptr + d);
+        bVec o_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        o_bvec.store(out_ptr + d);
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
