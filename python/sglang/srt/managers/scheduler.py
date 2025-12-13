@@ -58,7 +58,12 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tp_active_ranks,
+    get_tp_active_ranks_cpu,
+    get_world_group,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -67,6 +72,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -155,6 +161,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -2123,6 +2130,17 @@ class Scheduler(
             batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
+            if (
+                self.server_args.enable_dp_attention
+                and self.server_args.elastic_ep_backend == "mooncake"
+            ):
+                # Get the tensors indicating rank activeness
+                tp_active_ranks = get_tp_active_ranks().detach().cpu().numpy()
+                tp_active_ranks_cpu = get_tp_active_ranks_cpu().detach().numpy()
+                tp_active_ranks &= tp_active_ranks_cpu
+                self.send_to_tokenizer.send_output(
+                    ActiveRanksOutput(status=tp_active_ranks.tolist())
+                )
             ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
