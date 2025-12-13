@@ -233,6 +233,7 @@ docker run --rm \
       echo \"\"
       echo \"==================================\"
       echo \"ccache Statistics\"
+      echo \"ccache Statistics\"
       echo \"==================================\"
       ccache -s
       echo \"\"
