@@ -1,12 +1,12 @@
+import datetime
 import os
+import socket
 import subprocess
 import sys
 import time
 from contextlib import closing
-import datetime
 
 import requests
-import socket
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -46,7 +46,9 @@ def generate_self_signed_cert(cert_path: str, key_path: str) -> None:
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.datetime.utcnow())
         .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=10))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
+        )
         .sign(key, hashes.SHA256())
     )
 
@@ -76,7 +78,7 @@ def test_tls_server() -> None:
         "-m",
         "sglang_router.launch_router",
         "--worker-urls",
-        "http://127.0.0.1:9999",  # Dummy worker 
+        "http://127.0.0.1:9999",  # Dummy worker
         "--host",
         "127.0.0.1",
         "--port",
@@ -89,14 +91,18 @@ def test_tls_server() -> None:
         "info",
     ]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
 
     try:
         # Wait for server to start and respond to health check
         start_time = time.time()
         while time.time() - start_time < 15:
             try:
-                response = requests.get(f"https://localhost:{port}/health", verify=False, timeout=2)
+                response = requests.get(
+                    f"https://localhost:{port}/health", verify=False, timeout=2
+                )
                 if response.status_code == 200:
                     break
             except requests.RequestException:
@@ -104,20 +110,36 @@ def test_tls_server() -> None:
 
             if proc.poll() is not None:
                 stdout, stderr = proc.communicate()
-                raise RuntimeError(f"Router process died early.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
+                raise RuntimeError(
+                    f"Router process died early.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+                )
 
             time.sleep(0.5)
         else:
             raise TimeoutError("Server did not become healthy within 15 seconds")
 
         # Verify basic endpoints work over TLS
-        models_resp = requests.get(f"https://localhost:{port}/v1/models", verify=False, timeout=2)
-        assert models_resp.status_code in (200, 503)  # 503 expected with no healthy workers
+        models_resp = requests.get(
+            f"https://localhost:{port}/v1/models", verify=False, timeout=2
+        )
+        assert models_resp.status_code in (
+            200,
+            503,
+        )  # 503 expected with no healthy workers
 
         # Minimal generate request (should be rejected or queued)
         gen_payload = {"model": "dummy", "prompt": "test", "max_new_tokens": 1}
-        gen_resp = requests.post(f"https://localhost:{port}/generate", json=gen_payload, verify=False, timeout=2)
-        assert gen_resp.status_code in (200, 400, 503)  # Various valid responses with dummy worker
+        gen_resp = requests.post(
+            f"https://localhost:{port}/generate",
+            json=gen_payload,
+            verify=False,
+            timeout=2,
+        )
+        assert gen_resp.status_code in (
+            200,
+            400,
+            503,
+        )  # Various valid responses with dummy worker
 
     finally:
         proc.terminate()
@@ -129,4 +151,3 @@ def test_tls_server() -> None:
         for path in (cert_path, key_path):
             if os.path.exists(path):
                 os.remove(path)
-
