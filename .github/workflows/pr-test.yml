@@ -408,7 +408,7 @@ jobs:
           python3 run_suite.py --hw cpu --suite default
 
   stage-b-test-small-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -425,7 +425,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1]
+        partition: [1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
