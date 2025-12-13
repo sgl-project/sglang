@@ -37,7 +37,7 @@ pub fn method_not_allowed(code: impl Into<String>, message: impl Into<String>) -
     create_error(StatusCode::METHOD_NOT_ALLOWED, code, message)
 }
 
-fn create_error(
+pub fn create_error(
     status: StatusCode,
     code: impl Into<String>,
     message: impl Into<String>,

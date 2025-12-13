@@ -112,9 +112,7 @@ impl Router {
                             ),
                         }
                     }
-                    Err(e) => {
-                        error::internal_error("request_failed", format!("Request failed: {}", e))
-                    }
+                    Err(e) => convert_reqwest_error(e),
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
@@ -363,10 +361,7 @@ impl Router {
                     }
                 }
                 Err(e) => {
-                    last_response = Some(error::internal_error(
-                        "request_failed",
-                        format!("Request failed: {}", e),
-                    ));
+                    last_response = Some(convert_reqwest_error(e));
                 }
             }
         }
@@ -506,7 +501,7 @@ impl Router {
                     }
                 }
 
-                return error::internal_error("request_failed", format!("Request failed: {}", e));
+                return convert_reqwest_error(e);
             }
         };
 
@@ -664,6 +659,58 @@ fn increment_load(w: &Arc<dyn Worker>) {
 fn decrement_load(w: &Arc<dyn Worker>) {
     w.decrement_load();
     RouterMetrics::set_running_requests(w.url(), w.load());
+}
+
+fn convert_reqwest_error(e: reqwest::Error) -> Response {
+    let url = e
+        .url()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let message = format!("{}. URL: {}", e, url);
+
+    // TODO improve error status code
+    let (status, code) = if let Some(upstream_status) = e.status() {
+        (upstream_status, "call_upstream_status_error")
+    } else if e.is_builder() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_builder_error",
+        )
+    } else if e.is_request() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_error",
+        )
+    } else if e.is_redirect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_redirect_error",
+        )
+    } else if e.is_body() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_body_error",
+        )
+    } else if e.is_decode() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_decode_error",
+        )
+    } else if e.is_timeout() {
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
+    } else if e.is_connect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_connection_failed",
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_failed",
+        )
+    };
+
+    error::create_error(status, code, message)
 }
 
 use async_trait::async_trait;
