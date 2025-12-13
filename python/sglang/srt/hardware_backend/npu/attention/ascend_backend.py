@@ -573,8 +573,12 @@ class AscendAttnBackend(AttentionBackend):
                 key_rope=k_pe,
                 sparse_indices=topk_indices,
                 scale_value=layer.scaling,
-                actual_seq_lengths_query=actual_seq_qlen,
-                actual_seq_lengths_kv=actual_seq_lengths_kv.to(q.device),
+                actual_seq_lengths_query=actual_seq_qlen.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
                 block_table=self.forward_metadata.block_tables,
                 sparse_block_size=1,
                 layout_query="TND",
