@@ -10,6 +10,7 @@ from torch.nn import functional as F
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.utils import is_cutedsl_version_ge_4_3_0
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -296,6 +297,11 @@ def check_moe(
     torch.testing.assert_close(torch_output, test_output, atol=1e-1, rtol=1e-1)
 
 
+# TODO: Remove this skip once the driver on gb200 ci runner is updated
+@unittest.skipIf(
+    is_cutedsl_version_ge_4_3_0(),
+    "Driver on GB200 CI runner not supporting cutedsl 4.3.0",
+)
 class TestFlashinferCutedslMoe(unittest.TestCase):
     @unittest.skipIf(SKIP_TEST, SKIP_REASON)
     def test_flashinfer_cutedsl_moe_masked(self):
