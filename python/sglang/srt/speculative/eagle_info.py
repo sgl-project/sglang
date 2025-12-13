@@ -183,6 +183,27 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kv_indices,
             req_to_token.size(1),
         )
+        mask_numel = (
+            paged_kernel_lens_sum * self.draft_token_num
+            + (self.draft_token_num**2) * batch_size
+        )
+        if self.custom_mask.numel() < mask_numel:
+            logger.warning(
+                f"Custom mask size mismatch: expected {mask_numel}, got {self.custom_mask.numel()}. Padding with True."
+            )
+            self.custom_mask = torch.cat(
+                [
+                    self.custom_mask,
+                    torch.full(
+                        (mask_numel - self.custom_mask.numel(),),
+                        True,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ],
+                dim=0,
+            )
+
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(
