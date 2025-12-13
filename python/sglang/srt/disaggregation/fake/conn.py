@@ -25,6 +25,7 @@ class FakeKVSender(BaseKVSender):
         pp_rank: int,
     ):
         self.has_sent = False
+        self.transfer_context = None
 
     def poll(self) -> KVPoll:
         if self.has_sent is False:
