@@ -1,0 +1,130 @@
+name: Release Rust Crates to crates.io
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - sgl-model-gateway/**/Cargo.toml
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: 'Specific crate to publish (leave empty for auto-detect)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run (check only, no publish)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  detect-changes:
+    name: Detect crate changes
+    runs-on: ubuntu-latest
+    if: github.repository == 'sgl-project/sglang'
+    outputs:
+      crates_to_publish: ${{ steps.detect.outputs.crates_to_publish }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed crates
+        id: detect
+        run: |
+          # Define publishable crates in dependency order (dependencies first)
+          # Add new crates here as they are extracted
+          CRATES=(
+            "amg-workflow"
+            # Future crates (uncomment as extracted):
+            # "amg-tokenizer"
+            # "amg-tool-parser"
+          )
+
+          # If specific crate requested via workflow_dispatch
+          if [ -n "${{ inputs.crate }}" ]; then
+            echo "Manual trigger for crate: ${{ inputs.crate }}"
+            echo "crates_to_publish=[\"${{ inputs.crate }}\"]" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHANGED_CRATES=()
+
+          for CRATE in "${CRATES[@]}"; do
+            CRATE_DIR="sgl-model-gateway/${CRATE}"
+
+            # Skip if directory doesn't exist
+            if [ ! -d "$CRATE_DIR" ]; then
+              continue
+            fi
+
+            # Get local version
+            LOCAL_VERSION=$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+
+            # Check if version exists on crates.io
+            PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/${CRATE}" | jq -r '.versions[].num' 2>/dev/null | grep -x "$LOCAL_VERSION" || true)
+
+            if [ -z "$PUBLISHED" ]; then
+              echo "Crate $CRATE v$LOCAL_VERSION needs publishing"
+              CHANGED_CRATES+=("$CRATE")
+            else
+              echo "Crate $CRATE v$LOCAL_VERSION already published"
+            fi
+          done
+
+          if [ ${#CHANGED_CRATES[@]} -eq 0 ]; then
+            echo "No crates need publishing"
+            echo "crates_to_publish=[]" >> $GITHUB_OUTPUT
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            # Convert to JSON array
+            JSON_ARRAY=$(printf '%s\n' "${CHANGED_CRATES[@]}" | jq -R . | jq -s -c .)
+            echo "Crates to publish: $JSON_ARRAY"
+            echo "crates_to_publish=$JSON_ARRAY" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+  publish:
+    name: Publish ${{ matrix.crate }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      max-parallel: 1  # Publish sequentially to respect dependency order
+      matrix:
+        crate: ${{ fromJson(needs.detect-changes.outputs.crates_to_publish) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Run tests
+        working-directory: sgl-model-gateway/${{ matrix.crate }}
+        run: cargo test
+
+      - name: Dry run publish
+        if: inputs.dry_run == true
+        working-directory: sgl-model-gateway/${{ matrix.crate }}
+        run: |
+          echo "Dry run - would publish ${{ matrix.crate }}"
+          cargo publish --dry-run
+
+      - name: Publish to crates.io
+        if: inputs.dry_run != true
+        working-directory: sgl-model-gateway/${{ matrix.crate }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          echo "Publishing ${{ matrix.crate }}..."
+          cargo publish
+
+      - name: Wait for crates.io index update
+        if: inputs.dry_run != true
+        run: |
+          echo "Waiting for crates.io index to update..."
+          sleep 30

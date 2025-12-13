@@ -15,7 +15,7 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use tokio::{sync::mpsc, time::timeout};
 
-use super::{
+use crate::{
     definition::{StepDefinition, WorkflowDefinition},
     event::{EventBus, WorkflowEvent},
     state::WorkflowStateStore,

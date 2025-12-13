@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use super::types::{StepId, WorkflowId, WorkflowInstanceId};
+use crate::types::{StepId, WorkflowId, WorkflowInstanceId};
 
 /// Events emitted by the workflow engine
 #[derive(Debug, Clone)]

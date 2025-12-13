@@ -35,7 +35,7 @@ build: ## Build the project in release mode
 
 test: ## Run all tests
 	@echo "Running tests..."
-	@cargo test
+	@cargo test --workspace
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
@@ -47,13 +47,13 @@ docs: ## Generate and open documentation
 
 check: ## Run cargo check and clippy
 	@echo "Running cargo check..."
-	@cargo check
+	@cargo check --workspace
 	@echo "Running clippy..."
-	@cargo clippy --all-targets --all-features -- -D warnings
+	@cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 fmt: ## Format code with rustfmt
 	@echo "Formatting code..."
-	@rustup run nightly cargo fmt
+	@rustup run nightly cargo fmt --all
 
 # Development workflow shortcuts
 dev-setup: build test ## Set up development environment

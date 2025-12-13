@@ -17,4 +17,4 @@ pub mod tokenizer;
 pub mod tool_parser;
 pub mod version;
 pub mod wasm;
-pub mod workflow;
+pub use amg_workflow as workflow;

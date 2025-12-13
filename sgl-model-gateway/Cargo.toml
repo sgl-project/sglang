@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "amg-workflow"]
+resolver = "2"
+
 [package]
 name = "sgl-model-gateway"
 version = "0.2.4"
@@ -121,6 +125,7 @@ sha2 = "0.10"
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
 wasmtime-wasi = "38.0"
 async-channel = "2.5"
+amg-workflow = { path = "amg-workflow" }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

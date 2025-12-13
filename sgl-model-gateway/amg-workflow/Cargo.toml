@@ -1,0 +1,35 @@
+[package]
+name = "amg-workflow"
+version = "0.1.0"
+edition = "2021"
+description = "Workflow engine for managing multi-step operations with DAG-based parallel execution"
+license = "Apache-2.0"
+repository = "https://github.com/sgl-project/sglang"
+keywords = ["workflow", "dag", "orchestration", "async"]
+categories = ["asynchronous", "concurrency"]
+authors = [
+    "Simo Lin <linsimo.mark@gmail.com>",
+    "Chang Su <mckvtl@gmail.com>",
+    "Keyang Ru <rukeyang@gmail.com>",
+]
+
+[lints.rust]
+unused_qualifications = "warn"
+
+[lib]
+name = "amg_workflow"
+crate-type = ["rlib"]
+
+[dependencies]
+async-trait = "0.1"
+backoff = { version = "0.4", features = ["tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }

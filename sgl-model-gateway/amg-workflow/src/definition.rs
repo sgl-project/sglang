@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use super::{
+use crate::{
     executor::StepExecutor,
     types::{FailureAction, RetryPolicy, StepId, WorkflowId},
 };

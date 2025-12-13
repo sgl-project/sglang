@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use super::types::{StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use crate::types::{StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 /// Trait for executing individual workflow steps
 #[async_trait]
@@ -84,7 +84,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::types::WorkflowInstanceId;
+    use crate::types::WorkflowInstanceId;
 
     struct TestStep {
         should_succeed: bool,
@@ -97,7 +97,7 @@ mod tests {
                 Ok(StepResult::Success)
             } else {
                 Err(WorkflowError::StepFailed {
-                    step_id: crate::workflow::types::StepId::new("test"),
+                    step_id: crate::types::StepId::new("test"),
                     message: "test error".to_string(),
                 })
             }

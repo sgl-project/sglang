@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 
-use super::types::{
+use crate::types::{
     WorkflowError, WorkflowInstanceId, WorkflowResult, WorkflowState, WorkflowStatus,
 };
 
@@ -91,7 +91,7 @@ impl WorkflowStateStore {
     pub fn get_context(
         &self,
         instance_id: WorkflowInstanceId,
-    ) -> WorkflowResult<super::types::WorkflowContext> {
+    ) -> WorkflowResult<crate::types::WorkflowContext> {
         self.states
             .read()
             .get(&instance_id)
