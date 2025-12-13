@@ -334,7 +334,7 @@ impl RouterMetrics {
         counter!("sgl_router_attempt_http_responses_total",
             "route" => route.to_string(),
             "status_code" => status_code.to_string(),
-            "error_code" => error_code
+            "error_code" => error_code.to_string()
         )
         .increment(1);
     }
