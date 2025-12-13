@@ -287,6 +287,22 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         TI2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "qwen_image_edit_2509_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit-2509",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        DiffusionSamplingParams(
+            prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+            image_path=[
+                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+            ],
+        ),
+    ),
 ]
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [

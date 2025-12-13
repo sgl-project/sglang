@@ -278,23 +278,31 @@ class WarmupRunner:
         if count <= 0:
             return
 
-        if not image_path.exists():
-            logger.warning(
-                "[server-test] Skipping edit warmup: image missing at %s", image_path
-            )
-            return
+        if not isinstance(image_path, list):
+            image_path = [image_path]
+
+        for image in image_path:
+            if not image.exists():
+                logger.warning(
+                    "[server-test] Skipping edit warmup: image missing at %s", image
+                )
+                return
 
         logger.info("[server-test] Running %s edit warm-up(s)", count)
         for _ in range(count):
-            with image_path.open("rb") as fh:
+            images = [open(image, "rb") for image in image_path]
+            try:
                 result = self.client.images.edit(
                     model=self.model,
-                    image=fh,
+                    image=images,
                     prompt=edit_prompt,
                     n=1,
                     size=self.output_size,
                     response_format="b64_json",
                 )
+            finally:
+                for img in images:
+                    img.close()
             validate_image(result.data[0].b64_json)
 
 
@@ -585,22 +593,36 @@ def get_generate_fn(
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
-        if is_image_url(sampling_params.image_path):
-            image_path = download_image_from_url(str(sampling_params.image_path))
-        else:
-            image_path = Path(sampling_params.image_path)
-            if not image_path.exists():
-                pytest.skip(f"{id}: file missing: {image_path}")
+        image_paths = sampling_params.image_path
 
-        with image_path.open("rb") as fh:
+        if not isinstance(image_paths, list):
+            image_paths = [image_paths]
+
+        new_image_paths = []
+        for image_path in image_paths:
+            if is_image_url(image_path):
+                new_image_paths.append(download_image_from_url(str(image_path)))
+            else:
+                new_image_paths.append(Path(image_path))
+                if not image_path.exists():
+                    pytest.skip(f"{id}: file missing: {image_path}")
+
+        image_paths = new_image_paths
+
+        images = [open(image_path, "rb") for image_path in image_paths]
+        try:
             response = client.images.with_raw_response.edit(
                 model=model_path,
-                image=fh,
+                image=images,
                 prompt=sampling_params.prompt,
                 n=1,
                 size=sampling_params.output_size,
                 response_format="b64_json",
             )
+        finally:
+            for img in images:
+                img.close()
+
         rid = response.headers.get("x-request-id", "")
 
         result = response.parse()
