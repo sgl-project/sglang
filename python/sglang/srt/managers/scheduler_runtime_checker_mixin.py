@@ -325,18 +325,18 @@ class SchedulerWatchdog
             self._watchdog_once()
 
     def _watchdog_once(self):
-        self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.perf_counter()
+        watchdog_last_forward_ct = 0
+        watchdog_last_time = time.perf_counter()
 
         while True:
             current = time.perf_counter()
             if self.scheduler.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.scheduler.forward_ct:
-                    if current > self.watchdog_last_time + self.watchdog_timeout:
+                if watchdog_last_forward_ct == self.scheduler.forward_ct:
+                    if current > watchdog_last_time + self.watchdog_timeout:
                         break
                 else:
-                    self.watchdog_last_forward_ct = self.scheduler.forward_ct
-                    self.watchdog_last_time = current
+                    watchdog_last_forward_ct = self.scheduler.forward_ct
+                    watchdog_last_time = current
             time.sleep(self.watchdog_timeout // 2)
 
         if not disable_request_logging():
