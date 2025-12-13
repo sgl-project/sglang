@@ -168,7 +168,10 @@ from sglang.srt.utils.offloader import (
     get_offloader,
     set_offloader,
 )
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.patch_torch import (
+    monkey_patch_torch_reductions,
+    register_sgl_tp_rank,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -711,6 +714,8 @@ class ModelRunner:
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
+            if is_npu():
+                register_sgl_tp_rank(self.gpu_id)
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
