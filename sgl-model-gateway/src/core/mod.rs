@@ -6,7 +6,7 @@
 //! - Error types
 //! - Circuit breaker for reliability
 //! - Token buckets for rate limiting
-//! - Workflow engine for multi-step operations
+//! - Workflow steps for multi-step operations
 //! - Common utilities
 
 pub mod circuit_breaker;
@@ -16,12 +16,12 @@ pub mod metrics_aggregator;
 pub mod model_card;
 pub mod model_type;
 pub mod retry;
+pub mod steps;
 pub mod token_bucket;
 pub mod worker;
 pub mod worker_builder;
 pub mod worker_manager;
 pub mod worker_registry;
-pub mod workflow;
 
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,

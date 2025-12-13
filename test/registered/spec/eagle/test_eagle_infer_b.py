@@ -292,7 +292,8 @@ class TestEAGLERetract(TestEAGLEServerBasic):
         # These config helps find a leak.
         # FIXME(lsyin): use override context manager
         envs.SGLANG_CI_SMALL_KV_SIZE.set(4500)
-        super().setUpClass()
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            super().setUpClass()
 
 
 class TestEAGLEServerTriton(TestEAGLEServerBasic):

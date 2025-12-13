@@ -312,15 +312,15 @@ class LoRAMemoryPool:
                 uid = self.buffer_id_to_uid[buffer_id]
 
                 # Skip if this adapter is needed by current batch
-                # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
                 if uid in cur_uids:
                     continue
 
-                # Skip if this adapter is pinned (base model cannot be pinned, so can be evicted)
+                # Skip if this adapter is pinned
                 if uid is not None:
                     lora_ref = lora_refs.get(uid)
                     if lora_ref and lora_ref.pinned:
                         continue
+
                 candidates.add(uid)
 
             if not candidates:
@@ -328,8 +328,19 @@ class LoRAMemoryPool:
                     "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
                 )
 
+            # Prefer evicting LoRA adapters over the base model (None).
+            # Only evict None when the batch consists entirely of LoRA requests
+            # and no other adapters can be evicted.
+            non_none_candidates = candidates - {None}
+            if non_none_candidates:
+                # Prioritize evicting actual LoRA adapters
+                candidates_to_use = non_none_candidates
+            else:
+                # Only None is available for eviction (batch is all LoRA requests)
+                candidates_to_use = candidates
+
             # Select victim using eviction policy
-            victim_uid = self.eviction_policy.select_victim(candidates)
+            victim_uid = self.eviction_policy.select_victim(candidates_to_use)
 
             # Evict the selected victim
             victim_buffer_id = self.uid_to_buffer_id[victim_uid]

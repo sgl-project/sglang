@@ -278,10 +278,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         return sample
 
-    # Copied from diffusers.schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteScheduler._sigma_to_t
-    def _sigma_to_t(self, sigma):
-        return sigma * self.config.num_train_timesteps
-
     def _sigma_to_alpha_sigma_t(self, sigma) -> tuple[Any, Any]:
         return 1 - sigma, sigma
 
@@ -323,9 +319,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 "1.0.0",
                 "Passing `timesteps` is deprecated and has no effect as model output conversion is now handled via an internal counter `self.step_index`",
             )
-
-        sigma = self.sigmas[self.step_index]
-        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
 
         if self.predict_x0:
             if self.config.prediction_type == "flow_prediction":
@@ -845,9 +838,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
         noisy_samples = alpha_t * original_samples + sigma_t * noise
         return noisy_samples
-
-    def __len__(self):
-        return self.config.num_train_timesteps
 
 
 EntryClass = FlowUniPCMultistepScheduler
