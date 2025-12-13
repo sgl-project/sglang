@@ -1141,10 +1141,12 @@ class FlashInferFP4MoE(FusedMoE):
             False,  # is_sf_swizzled_layout
         )
 
-        hs_fp4 = hs_fp4_bytes.reshape(
-            hidden_states.shape[0], hidden_states.shape[1] // 2
+        seq_len, hidden_size = hidden_states.shape
+        hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
+        # TRT-LLM expects hidden state scales shaped as [seq_len, hidden_size // 16]
+        hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // 16
         )
-        hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
 
         return hs_fp4, hs_sf
 
@@ -1226,7 +1228,13 @@ class FlashInferFP4MoE(FusedMoE):
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             tile_tokens_dim=None,
-            routing_method_type=routing_method_type,
+            # Respect the routing method configured for this layer (e.g., Renormalize for Qwen3),
+            # instead of always assuming DeepSeekV3.
+            routing_method_type=(
+                self.routing_method_type
+                if self.routing_method_type is not None
+                else RoutingMethodType.Default
+            ),
             do_finalize=True,
             output=symm_output,
         )[0]

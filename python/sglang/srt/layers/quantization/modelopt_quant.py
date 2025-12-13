@@ -45,7 +45,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils.common import (
-    direct_register_custom_op,
     get_bool_env_var,
     is_cuda,
     is_sm120_supported,
@@ -101,6 +100,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
 def _sglang_fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -119,6 +119,7 @@ def _sglang_fp4_gemm(
         return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
+@torch.library.register_fake("sglang::fp4_gemm")
 def _sglang_fp4_gemm_fake(
     input,
     weight,
@@ -131,14 +132,6 @@ def _sglang_fp4_gemm_fake(
     M = input.shape[-2]
     N = int(out_features)
     return input.new_empty((M, N), dtype=out_dtype)
-
-
-direct_register_custom_op(
-    op_name="fp4_gemm",
-    op_func=_sglang_fp4_gemm,
-    mutates_args=[],
-    fake_impl=_sglang_fp4_gemm_fake,
-)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -953,12 +946,22 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if not kv_cache_quant_algo:
                 # For config.json format, derive from kv_cache_scheme if available
                 kv_cache_scheme = config.get("kv_cache_scheme")
-                if (
-                    kv_cache_scheme
-                    and kv_cache_scheme.get("type") == "float"
-                    and kv_cache_scheme.get("num_bits") == 8
-                ):
-                    kv_cache_quant_algo = "FP8"
+                if isinstance(kv_cache_scheme, dict):
+                    if (
+                        kv_cache_scheme.get("type") == "float"
+                        and kv_cache_scheme.get("num_bits") == 8
+                    ):
+                        kv_cache_quant_algo = "FP8"
+                    else:
+                        kv_cache_quant_algo = "auto"
+                elif isinstance(kv_cache_scheme, str):
+                    scheme_name = kv_cache_scheme.strip().upper()
+                    if scheme_name in ("FP8", "FLOAT8"):
+                        kv_cache_quant_algo = "FP8"
+                    elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
+                        kv_cache_quant_algo = "NVFP4"
+                    else:
+                        kv_cache_quant_algo = "auto"
                 else:
                     kv_cache_quant_algo = "auto"
 
@@ -1634,15 +1637,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
+        block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
             ("w2", layer.w2_weight_scale),
         ]:
-            assert (
-                weight_scale.shape[assert_dim] % 16 == 0
-            ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by 16"
+            # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
+            if get_moe_runner_backend().is_flashinfer_trtllm():
+                expected_blocks = {
+                    "w13": layer.w13_weight.shape[2] * 2 // block_size,
+                    "w2": layer.w2_weight.shape[2] * 2 // block_size,
+                }
+                assert (
+                    weight_scale.shape[-1] == expected_blocks[name]
+                ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
+            else:
+                # For other backends, ensure the per-input block dimension is aligned to 16.
+                assert (
+                    weight_scale.shape[assert_dim] % block_size == 0
+                ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by {block_size}"
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
