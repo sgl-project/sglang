@@ -670,10 +670,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 
     // TODO improve error status code
     let (status, code) = if let Some(upstream_status) = e.status() {
-        (
-            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            "call_upstream_status_error",
-        )
+        (upstream_status, "call_upstream_status_error")
     } else if e.is_builder() {
         (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_builder_error")
     } else if e.is_request() {
