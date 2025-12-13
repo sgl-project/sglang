@@ -110,6 +110,20 @@ jobs:
           echo "Downloaded wheel:"
           ls -lh dist/
 
+      - name: Create GitHub Release for nightly wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-${{ needs.build-nightly-wheel.outputs.commit_hash }}
+          name: Nightly Build (${{ needs.build-nightly-wheel.outputs.commit_hash }})
+          repository: dougyster/test-whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          prerelease: true
+          body: |
+            Test nightly build from commit ${{ github.sha }}
+            Version: ${{ needs.build-nightly-wheel.outputs.nightly_version }}
+          files: |
+            dist/*.whl
+
       - name: Clone wheel index repository
         run: |
           git clone https://oauth2:${WHL_TOKEN}@github.com/dougyster/test-whl.git sgl-whl
