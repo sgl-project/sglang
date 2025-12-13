@@ -407,6 +407,12 @@ jobs:
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default
 
+      - name: Fail
+        if: always()
+        run: |
+          echo "Stage A Test 1 completed."
+          exit 1
+
   stage-b-test-small-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
