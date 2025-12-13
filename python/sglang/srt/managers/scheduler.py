@@ -1965,7 +1965,7 @@ class Scheduler(
         ):
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args, self.decode_mem_cache_buf_multiplier
             )
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
