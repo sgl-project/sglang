@@ -211,7 +211,7 @@ class PipelineConfig:
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
 
-    def prepare_image_processor_kwargs(self, batch, neg):
+    def prepare_image_processor_kwargs(self, batch, neg=False):
         return {}
 
     def postprocess_image_latent(self, latent_condition, batch):
