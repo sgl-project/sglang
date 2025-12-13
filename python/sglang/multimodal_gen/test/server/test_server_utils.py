@@ -97,6 +97,38 @@ class ServerContext:
         except Exception:
             pass
 
+        # ROCm/AMD: Extra cleanup to ensure GPU memory is released between tests
+        # This is needed because ROCm memory release can be slower than CUDA
+        if is_hip():
+            self._cleanup_rocm_gpu_memory()
+
+    def _cleanup_rocm_gpu_memory(self) -> None:
+        """ROCm-specific cleanup to ensure GPU memory is fully released."""
+        import gc
+
+        # Wait for process to fully terminate
+        try:
+            self.process.wait(timeout=10)
+        except Exception:
+            pass
+
+        # Force garbage collection
+        gc.collect()
+
+        # Clear HIP memory on all GPUs
+        try:
+            import torch
+
+            for i in range(torch.cuda.device_count()):
+                with torch.cuda.device(i):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+        except Exception:
+            pass
+
+        # Wait for GPU memory to be released (ROCm can be slower)
+        time.sleep(5)
+
 
 class ServerManager:
     """Manages diffusion server lifecycle."""
@@ -113,8 +145,53 @@ class ServerManager:
         self.wait_deadline = wait_deadline
         self.extra_args = extra_args
 
+    def _wait_for_rocm_gpu_memory_clear(self, max_wait: float = 30.0) -> None:
+        """ROCm-specific: Wait for GPU memory to be mostly free before starting."""
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return
+
+            start_time = time.time()
+            while time.time() - start_time < max_wait:
+                # Check GPU memory usage
+                total_used = 0
+                for i in range(torch.cuda.device_count()):
+                    mem_info = torch.cuda.mem_get_info(i)
+                    free, total = mem_info
+                    used = total - free
+                    total_used += used
+
+                # If less than 5GB is used across all GPUs, we're good
+                if total_used < 5 * 1024 * 1024 * 1024:  # 5GB
+                    logger.info(
+                        "[server-test] ROCm GPU memory is clear (used: %.2f GB)",
+                        total_used / (1024**3),
+                    )
+                    return
+
+                logger.info(
+                    "[server-test] ROCm: Waiting for GPU memory to clear (used: %.2f GB)",
+                    total_used / (1024**3),
+                )
+                time.sleep(2)
+
+            logger.warning(
+                "[server-test] ROCm GPU memory not fully cleared after %.0fs (used: %.2f GB)",
+                max_wait,
+                total_used / (1024**3),
+            )
+        except Exception as e:
+            logger.debug("[server-test] Could not check ROCm GPU memory: %s", e)
+
     def start(self) -> ServerContext:
         """Start the diffusion server and wait for readiness."""
+        # ROCm/AMD: Wait for GPU memory to be clear before starting
+        # This prevents OOM when running sequential tests on ROCm
+        if is_hip():
+            self._wait_for_rocm_gpu_memory_clear()
+
         log_dir, perf_log_path = prepare_perf_log()
 
         safe_model_name = self.model.replace("/", "_")
