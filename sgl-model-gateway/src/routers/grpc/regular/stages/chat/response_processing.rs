@@ -100,7 +100,10 @@ impl ChatResponseProcessingStage {
                 function = "ChatResponseProcessingStage::execute",
                 "Stop decoder not initialized"
             );
-            error::internal_error("stop_decoder_not_initialized", "Stop decoder not initialized")
+            error::internal_error(
+                "stop_decoder_not_initialized",
+                "Stop decoder not initialized",
+            )
         })?;
 
         let response = self

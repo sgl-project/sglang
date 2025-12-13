@@ -63,7 +63,10 @@ impl ChatPreparationStage {
             Ok(encoding) => encoding,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error("tokenization_failed", format!("Tokenization failed: {}", e)));
+                return Err(error::internal_error(
+                    "tokenization_failed",
+                    format!("Tokenization failed: {}", e),
+                ));
             }
         };
 

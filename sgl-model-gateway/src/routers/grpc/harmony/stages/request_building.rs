@@ -47,7 +47,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 function = "HarmonyRequestBuildingStage::execute",
                 "Client acquisition stage not completed"
             );
-            error::internal_error("client_acquisition_not_completed", "Client acquisition not completed")
+            error::internal_error(
+                "client_acquisition_not_completed",
+                "Client acquisition not completed",
+            )
         })?;
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
@@ -104,7 +107,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                             error = %e,
                             "Failed to build generate request from chat"
                         );
-                        error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {}", e))
+                        error::bad_request(
+                            "invalid_request_parameters",
+                            format!("Invalid request parameters: {}", e),
+                        )
                     })?
             }
             RequestType::Responses(request) => sglang_client
@@ -122,7 +128,10 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                         error = %e,
                         "Failed to build generate request from responses"
                     );
-                    error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {}", e))
+                    error::bad_request(
+                        "invalid_request_parameters",
+                        format!("Invalid request parameters: {}", e),
+                    )
                 })?,
             _ => unreachable!(),
         };

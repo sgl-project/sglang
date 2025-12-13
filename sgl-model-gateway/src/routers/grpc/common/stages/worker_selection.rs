@@ -52,7 +52,10 @@ impl PipelineStage for WorkerSelectionStage {
                 function = "WorkerSelectionStage::execute",
                 "Preparation stage not completed"
             );
-            error::internal_error("preparation_stage_not_completed", "Preparation stage not completed")
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
         })?;
 
         // For Harmony, use selection_text produced during Harmony encoding
@@ -76,10 +79,7 @@ impl PipelineStage for WorkerSelectionStage {
                         );
                         return Err(error::service_unavailable(
                             "no_available_workers",
-                            format!(
-                                "No available workers for model: {:?}",
-                                ctx.input.model_id
-                            )
+                            format!("No available workers for model: {:?}", ctx.input.model_id),
                         ));
                     }
                 }
@@ -99,7 +99,7 @@ impl PipelineStage for WorkerSelectionStage {
                             format!(
                                 "No available PD worker pairs for model: {:?}",
                                 ctx.input.model_id
-                            )
+                            ),
                         ));
                     }
                 }

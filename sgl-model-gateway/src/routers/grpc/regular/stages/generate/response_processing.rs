@@ -97,7 +97,10 @@ impl GenerateResponseProcessingStage {
                 function = "GenerateResponseProcessingStage::execute",
                 "Stop decoder not initialized"
             );
-            error::internal_error("stop_decoder_not_initialized", "Stop decoder not initialized")
+            error::internal_error(
+                "stop_decoder_not_initialized",
+                "Stop decoder not initialized",
+            )
         })?;
 
         let result_array = self

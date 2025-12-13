@@ -44,7 +44,10 @@ impl PipelineStage for ChatRequestBuildingStage {
                 function = "ChatRequestBuildingStage::execute",
                 "Client acquisition not completed"
             );
-            error::internal_error("client_acquisition_not_completed", "Client acquisition not completed")
+            error::internal_error(
+                "client_acquisition_not_completed",
+                "Client acquisition not completed",
+            )
         })?;
 
         let chat_request = ctx.chat_request_arc();

@@ -280,10 +280,7 @@ impl ResponseProcessor {
                 Err(e) => {
                     return Err(error::internal_error(
                         "process_choice_failed",
-                        format!(
-                            "Failed to process choice {}: {}",
-                            index, e
-                        )
+                        format!("Failed to process choice {}: {}", index, e),
                     ));
                 }
             }
@@ -385,10 +382,7 @@ impl ResponseProcessor {
                 Err(e) => {
                     return Err(error::internal_error(
                         "process_tokens_failed",
-                        format!(
-                            "Failed to process tokens: {}",
-                            e
-                        )
+                        format!("Failed to process tokens: {}", e),
                     ))
                 }
             };

@@ -114,7 +114,10 @@ impl HarmonyPreparationStage {
                 error = %e,
                 "Harmony build failed for chat request"
             );
-            error::bad_request("harmony_build_failed", format!("Harmony build failed: {}", e))
+            error::bad_request(
+                "harmony_build_failed",
+                format!("Harmony build failed: {}", e),
+            )
         })?;
 
         // Step 4: Store results
@@ -191,7 +194,10 @@ impl HarmonyPreparationStage {
                 error = %e,
                 "Harmony build failed for responses request"
             );
-            error::bad_request("harmony_build_failed", format!("Harmony build failed: {}", e))
+            error::bad_request(
+                "harmony_build_failed",
+                format!("Harmony build failed: {}", e),
+            )
         })?;
 
         // Step 4: Store results with constraint
@@ -315,10 +321,7 @@ impl HarmonyPreparationStage {
                 );
                 return Err(Box::new(error::bad_request(
                     "tool_not_found",
-                    format!(
-                        "Tool '{}' not found in tools list",
-                        tool_name
-                    )
+                    format!("Tool '{}' not found in tools list", tool_name),
                 )));
             }
             _ => {}
@@ -370,10 +373,7 @@ impl HarmonyPreparationStage {
             );
             Box::new(error::internal_error(
                 "serialize_structural_tag_failed",
-                format!(
-                    "Failed to serialize structural tag: {}",
-                    e
-                )
+                format!("Failed to serialize structural tag: {}", e),
             ))
         })
     }

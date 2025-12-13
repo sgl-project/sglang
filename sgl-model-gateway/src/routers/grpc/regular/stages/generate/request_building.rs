@@ -44,7 +44,10 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 function = "GenerateRequestBuildingStage::execute",
                 "Client acquisition not completed"
             );
-            error::internal_error("client_acquisition_not_completed", "Client acquisition not completed")
+            error::internal_error(
+                "client_acquisition_not_completed",
+                "Client acquisition not completed",
+            )
         })?;
 
         let generate_request = ctx.generate_request_arc();
