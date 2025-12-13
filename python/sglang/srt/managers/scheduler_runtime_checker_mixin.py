@@ -307,7 +307,9 @@ class SchedulerRuntimeCheckerMixin:
 
 
 class SchedulerWatchdog:
-    def __init__(self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False):
+    def __init__(
+        self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
+    ):
         self.scheduler = scheduler
         self.soft = soft
 
