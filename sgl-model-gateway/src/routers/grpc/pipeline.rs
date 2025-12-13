@@ -338,14 +338,20 @@ impl RequestPipeline {
                     function = "execute_chat_for_responses",
                     "Wrong response type: expected Chat, got Generate"
                 );
-                Err(error::internal_error("wrong_response_type", "Internal error: wrong response type"))
+                Err(error::internal_error(
+                    "wrong_response_type",
+                    "Internal error: wrong response type",
+                ))
             }
             None => {
                 error!(
                     function = "execute_chat_for_responses",
                     "No response produced by pipeline"
                 );
-                Err(error::internal_error("no_response_produced", "No response produced"))
+                Err(error::internal_error(
+                    "no_response_produced",
+                    "No response produced",
+                ))
             }
         }
     }
@@ -416,7 +422,10 @@ impl RequestPipeline {
                     function = "execute_harmony_responses",
                     "No ResponsesIterationResult produced by pipeline"
                 );
-                error::internal_error("no_responses_iteration_result", "No ResponsesIterationResult produced by pipeline")
+                error::internal_error(
+                    "no_responses_iteration_result",
+                    "No ResponsesIterationResult produced by pipeline",
+                )
             })
     }
 
@@ -466,7 +475,10 @@ impl RequestPipeline {
                 function = "execute_harmony_responses_streaming",
                 "No ExecutionResult produced by pipeline"
             );
-            error::internal_error("no_execution_result_produced", "No ExecutionResult produced by pipeline")
+            error::internal_error(
+                "no_execution_result_produced",
+                "No ExecutionResult produced by pipeline",
+            )
         })
     }
 }

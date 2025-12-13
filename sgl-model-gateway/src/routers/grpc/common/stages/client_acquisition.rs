@@ -24,7 +24,10 @@ impl PipelineStage for ClientAcquisitionStage {
                 function = "ClientAcquisitionStage::execute",
                 "Worker selection stage not completed"
             );
-            error::internal_error("worker_selection_not_completed", "Worker selection not completed")
+            error::internal_error(
+                "worker_selection_not_completed",
+                "Worker selection not completed",
+            )
         })?;
 
         let clients = match workers {
