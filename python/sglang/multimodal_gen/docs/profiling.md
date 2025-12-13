@@ -63,7 +63,7 @@ Nsight Systems provides low-level CUDA profiling with kernel details, register u
 
 ### Installation
 
-See the [SGLang profiling guide](../../../../docs/developer_guide/benchmark_and_profiling.md#profile-with-nsight) for installation instructions.
+See the [SGLang profiling guide](../../../docs/developer_guide/benchmark_and_profiling.md#profile-with-nsight) for installation instructions.
 
 ### Basic Profiling
 
