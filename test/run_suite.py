@@ -3,6 +3,8 @@ import glob
 import sys
 from typing import List
 
+import tabulate
+
 from sglang.test.ci.ci_register import CIRegistry, HWBackend, collect_tests
 from sglang.test.ci.ci_utils import run_unittest_files
 
@@ -107,16 +109,18 @@ def pretty_print_tests(
     else:
         partition_info = "full"
 
-    print("Test run info:")
-    print(f"  hw={hw.name}")
-    print(f"  suite={suite} (nightly={nightly})")
-    print(f"  partition={partition_info}")
+    headers = ["Hardware", "Suite", "Nightly", "Partition"]
+    rows = [[hw.name, suite, str(nightly), partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql")
+    print(msg + "\n")
 
     if skipped_tests:
         print(f"⚠️  Skipped {len(skipped_tests)} test(s):")
         for t in skipped_tests:
             reason = t.disabled or "disabled"
             print(f"  - {t.filename} (reason: {reason})")
+
+        print()
 
     if len(ci_tests) == 0:
         print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
