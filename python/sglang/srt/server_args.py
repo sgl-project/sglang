@@ -314,6 +314,7 @@ class ServerArgs:
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
+    soft_watchdog_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
@@ -2649,6 +2650,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.watchdog_timeout,
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
+        parser.add_argument(
+            "--soft-watchdog-timeout",
+            type=float,
+            default=ServerArgs.soft_watchdog_timeout,
+            help="Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
         )
         parser.add_argument(
             "--dist-timeout",
