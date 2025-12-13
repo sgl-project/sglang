@@ -642,7 +642,7 @@ def generate_token_bitmask(
     assert len(reqs) == retrieve_next_token_cpu.shape[0]
     grammar = None
     for i, req in enumerate(reqs):
-        if req.grammar is not None:
+        if req.grammar is not None and not req.grammar.is_terminated():
             if allocate_token_bitmask is None:
                 allocate_token_bitmask = req.grammar.allocate_vocab_mask(
                     vocab_size=vocab_size,
