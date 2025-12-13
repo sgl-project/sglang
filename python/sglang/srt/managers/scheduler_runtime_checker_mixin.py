@@ -321,26 +321,27 @@ class SchedulerWatchdog:
 
         while True:
             current = time.perf_counter()
-            if self.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.forward_ct:
+            if self.scheduler.cur_batch is not None:
+                if self.watchdog_last_forward_ct == self.scheduler.forward_ct:
                     if current > self.watchdog_last_time + self.watchdog_timeout:
                         break
                 else:
-                    self.watchdog_last_forward_ct = self.forward_ct
+                    self.watchdog_last_forward_ct = self.scheduler.forward_ct
                     self.watchdog_last_time = current
             time.sleep(self.watchdog_timeout // 2)
 
         if not disable_request_logging():
+            # TODO extract this duplicated logic w/ another place
             # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid_swa:
-                _, info_msg = self._check_hybrid_memory()
-            elif self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache):
-                _, info_msg = self._check_mamba_memory()
+            if self.scheduler.is_hybrid_swa:
+                _, info_msg = self.scheduler._check_hybrid_memory()
+            elif self.scheduler.is_ssm_model and isinstance(self.scheduler.tree_cache, MambaRadixCache):
+                _, info_msg = self.scheduler._check_mamba_memory()
             else:
-                _, info_msg = self._check_radix_cache_memory()
+                _, info_msg = self.scheduler._check_radix_cache_memory()
             logger.error(
-                f"{self.cur_batch.batch_size()=}\n"
-                f"{self.cur_batch.reqs=}\n"
+                f"{self.scheduler.cur_batch.batch_size()=}\n"
+                f"{self.scheduler.cur_batch.reqs=}\n"
                 f"{info_msg}"
             )
 
