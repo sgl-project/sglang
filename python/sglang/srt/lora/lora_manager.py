@@ -44,7 +44,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.lora_moe import FusedMoEWithLoRA
+from sglang.srt.lora.layers import FusedMoEWithLoRA
 
 logger = logging.getLogger(__name__)
 

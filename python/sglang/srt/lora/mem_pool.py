@@ -504,7 +504,7 @@ class LoRAMemoryPool:
                 for module_name, module in cur_layer_modules.items():
                     # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
                     # Handle FusedMoEWithLoRA specially - it contains multiple target modules
-                    from sglang.srt.layers.moe.lora_moe import FusedMoEWithLoRA
+                    from sglang.srt.lora.layers import FusedMoEWithLoRA
                     if isinstance(module, FusedMoEWithLoRA):
                         # FusedMoEWithLoRA contains both gate_up_proj and down_proj
                         moe_target_modules = ['gate_up_proj_moe', 'down_proj_moe']
