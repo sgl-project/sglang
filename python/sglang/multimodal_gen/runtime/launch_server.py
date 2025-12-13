@@ -127,7 +127,17 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     if launch_http_server:
         logger.info("Starting FastAPI server.")
-        launch_http_server_only(server_args)
+        if server_args.webui:
+            logger.info("Launch FastAPI server in another process because of webui.")
+            http_server_process = mp.Process(
+                target=launch_http_server_only,
+                args=(server_args,),
+                name=f"sglang-diffusion-webui",
+                daemon=True,
+            )
+            http_server_process.start()
+        else:
+            launch_http_server_only(server_args)
 
 
 def launch_http_server_only(server_args):
