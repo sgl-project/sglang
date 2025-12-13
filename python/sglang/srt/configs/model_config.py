@@ -100,7 +100,6 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
-        speculative_draft_model_quantization: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -110,7 +109,6 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
-        self.speculative_draft_model_quantization = speculative_draft_model_quantization
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -231,8 +229,14 @@ class ModelConfig:
         server_args: ServerArgs,
         model_path: str = None,
         model_revision: str = None,
+        is_draft_model: bool = False,
         **kwargs,
     ):
+        quantization = (
+            server_args.speculative_draft_model_quantization
+            if is_draft_model
+            else server_args.quantization
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -242,13 +246,12 @@ class ModelConfig:
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
-            quantization=server_args.quantization,
+            quantization=quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
-            speculative_draft_model_quantization=server_args.speculative_draft_model_quantization,
             **kwargs,
         )
 

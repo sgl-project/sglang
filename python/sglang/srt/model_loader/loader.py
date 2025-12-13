@@ -187,21 +187,8 @@ def _get_quantization_config(
     packed_modules_mapping: Dict[str, List[str]],
     remap_prefix: Dict[str, str] | None = None,
 ) -> Optional[QuantizationConfig]:
-    # In speculative scenario:
-    # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
-    # - Otherwise, the draft model defaults to the same quantization as the target model.
-    if model_config.is_draft_model:
-        draft_quant = model_config.speculative_draft_model_quantization
-        quantization = (
-            None
-            if draft_quant == "unquant"
-            else draft_quant or model_config.quantization
-        )
-    else:
-        quantization = model_config.quantization
-
     """Get the quantization config."""
-    if quantization is not None:
+    if model_config.quantization is not None:
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping, remap_prefix
         )
@@ -216,7 +203,7 @@ def _get_quantization_config(
                 capability = major * 10 + minor
                 if capability < quant_config.get_min_capability():
                     raise ValueError(
-                        f"The quantization method {quantization} "
+                        f"The quantization method {model_config.quantization} "
                         "is not supported for the current GPU. "
                         f"Minimum capability: {quant_config.get_min_capability()}. "
                         f"Current capability: {capability}."
@@ -225,7 +212,7 @@ def _get_quantization_config(
         if model_config.dtype not in supported_dtypes:
             raise ValueError(
                 f"{model_config.dtype} is not supported for quantization "
-                f"method {quantization}. Supported dtypes: "
+                f"method {model_config.quantization}. Supported dtypes: "
                 f"{supported_dtypes}"
             )
         return quant_config

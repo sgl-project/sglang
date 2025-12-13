@@ -33,12 +33,11 @@ Speculative model weights could be found [here](https://huggingface.co/Zhihu-ai/
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
+python -m sglang.launch_server \
    --device npu \
    --attention-backend ascend \
    --trust-remote-code \

@@ -727,8 +727,15 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+        # In speculative scenario:
+        # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
+        # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self.speculative_draft_model_quantization is None:
+            self.speculative_draft_model_quantization = self.quantization
+        elif self.speculative_draft_model_quantization == "unquant":
+            self.speculative_draft_model_quantization = None
 
-        # Handle ModelScope model downloads
+            # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             if not os.path.exists(self.model_path):
                 from modelscope import snapshot_download
