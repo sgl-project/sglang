@@ -53,9 +53,9 @@ pub fn create_error(
         headers,
         Json(json!({
             "error": {
-                "message": message_str,
                 "type": status_code_to_str(status),
                 "code": code_str,
+                "message": message_str,
             }
         })),
     )
