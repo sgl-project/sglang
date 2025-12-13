@@ -84,6 +84,7 @@ class InputValidationStage(PipelineStage):
                 batch.condition_image = [batch.condition_image]
 
             processed_images = []
+            final_image = batch.condition_image[-1]
             config = server_args.pipeline_config
             config.preprocess_vae_image(batch, self.vae_image_processor)
 
@@ -98,7 +99,6 @@ class InputValidationStage(PipelineStage):
                 processed_images.append(img)
 
             batch.condition_image = processed_images
-            final_image = batch.condition_image[-1]
             calculated_size = config.prepare_calculated_size(final_image)
 
             # adjust output image size
