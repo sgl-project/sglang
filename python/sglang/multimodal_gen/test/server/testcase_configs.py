@@ -440,7 +440,7 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
+            output_size="832x480",
         ),
     ),
 ]
