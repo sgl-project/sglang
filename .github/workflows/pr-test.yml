@@ -445,8 +445,21 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
+          export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1
+          export CUDA_COREDUMP_SHOW_PROGRESS=1
+          export CUDA_COREDUMP_GENERATION_FLAGS="skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory"
+          export CUDA_COREDUMP_FILE="$PWD/cuda_coredump_%h.%p.%t"
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2
+
+      - name: Upload CUDA core dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-coredump-partition-${{ matrix.partition }}
+          path: |
+            test/cuda_coredump_*
+          if-no-files-found: ignore
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
