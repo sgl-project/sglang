@@ -93,6 +93,10 @@ class RequestTimingMetricsMixin:
     # Calculated as: prefill_end_time_host - prefill_start_time_host
     prefill_launch_latency: Optional[List[Optional[float]]]
 
+    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
+    # This marks when the prefill computation finishes.
+    prefill_finished_ts: Optional[List[Optional[float]]]
+
 
 @dataclass
 class SpeculativeDecodingMetricsMixin:
