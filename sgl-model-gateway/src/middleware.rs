@@ -27,7 +27,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::metrics::RouterMetrics,
-    routers::error::X_SMG_ERROR_CODE,
+    routers::error::HEADER_X_SMG_ERROR_CODE,
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -339,7 +339,7 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         let error_code = response
             .headers()
-            .get(X_SMG_ERROR_CODE)
+            .get(HEADER_X_SMG_ERROR_CODE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
 

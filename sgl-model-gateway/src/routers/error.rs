@@ -5,7 +5,7 @@ use axum::{
 };
 use serde_json::json;
 
-pub const X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
+pub const HEADER_X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
 
 pub fn internal_error(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::INTERNAL_SERVER_ERROR, code, message)
@@ -48,7 +48,7 @@ pub fn create_error(
     let message_str = message.into();
 
     let mut headers = HeaderMap::new();
-    headers.insert(X_SMG_ERROR_CODE, HeaderValue::from_str(&code_str).unwrap());
+    headers.insert(HEADER_X_SMG_ERROR_CODE, HeaderValue::from_str(&code_str).unwrap());
 
     (
         status,
