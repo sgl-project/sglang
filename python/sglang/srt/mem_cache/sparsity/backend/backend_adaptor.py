@@ -213,7 +213,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         page_size: int,
         layer_id: int,
     ) -> Any:
-        return current_metadata
+        raise NotImplementedError("Token-wise sparse attention is not implemented yet.")
 
     def _logical_to_physical_pages_batch(
         self,

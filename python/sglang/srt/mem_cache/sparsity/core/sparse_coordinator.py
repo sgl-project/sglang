@@ -238,7 +238,6 @@ class SparseCoordinator:
                 forward_batch.out_cache_loc[offload_mask],
                 forward_batch.seq_lens[offload_mask] - 1,
             )
-            # self.sparse_kv_cache_manager.check_sparse_offload_progress()
 
     def _should_check_offload(self, forward_batch: "ForwardBatch") -> bool:
         return (
@@ -258,11 +257,8 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[Any]:
         """Handle attention begin."""
-        if layer.layer_id == self.start_layer and self.backend_adaptor is not None:
+        if layer.layer_id == self.start_layer:
             self.backend_adaptor.save_original_metadata(attn_metadata)
-
-        if forward_batch.forward_mode.is_extend():
-            return attn_metadata
 
         return self._handle_sparse_retrieve(
             query, layer, forward_batch, attn_metadata, **kwargs
