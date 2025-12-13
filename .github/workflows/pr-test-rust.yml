@@ -152,7 +152,7 @@ jobs:
   router-http-tests:
     if: |
       github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci') ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: 4-gpu-a10
     timeout-minutes: 32
@@ -224,7 +224,7 @@ jobs:
   router-grpc-response-api-tests:
     if: |
       github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci') ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: 4-gpu-a10
     timeout-minutes: 32
@@ -333,7 +333,7 @@ jobs:
   docker-build-test:
     if: |
       github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci') ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-24.04
     steps:
