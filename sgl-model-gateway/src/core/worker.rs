@@ -634,7 +634,8 @@ impl Worker for BasicWorker {
     }
 
     fn decrement_load(&self) {
-        if self.load_counter
+        if self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
