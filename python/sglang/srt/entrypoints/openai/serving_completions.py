@@ -116,6 +116,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
@@ -271,6 +272,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[choice_data],
                     model=request.model,
                 )
+
+                # Add usage stats if continuous_usage_stats is enabled
+                if (
+                    request.stream_options
+                    and request.stream_options.continuous_usage_stats
+                ):
+                    chunk.usage = UsageProcessor.calculate_token_usage(
+                        prompt_tokens=prompt_tokens.get(index, 0),
+                        completion_tokens=completion_tokens.get(index, 0),
+                    )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
 

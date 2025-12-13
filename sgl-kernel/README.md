@@ -9,10 +9,10 @@
 
 </div>
 
-SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernels for operations.
+SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernel operations.
 
 ## Installation
-Requires torch == 2.8.0
+Requires torch == 2.9.1
 
 ```bash
 # Latest version
@@ -52,8 +52,8 @@ make build
    ```cpp
    // We need def with schema here for torch.compile
    m.def(
-    "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
-    "cublas_handle, int cuda_stream) -> ()");
+    "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
+    "int cublas_handle) -> ()");
    m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
    ```
 
@@ -101,6 +101,28 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
    - More realistic performance data on PDL-supported architectures (SM >= 90)
 
 3. Run test suite
+
+## Kernel Size Analysis
+
+Analyze CUDA kernel sizes in compiled wheel files to identify optimization opportunities:
+
+```bash
+# Install cubloaty
+pip install cubloaty
+
+# Analyze a wheel file
+python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl
+
+# Custom output file
+python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl --output my_analysis.txt
+```
+
+The tool generates:
+- Text report with kernel groups (by name prefix) and individual kernel sizes
+- JSON file with detailed structured data
+- Timing information for each analysis step
+
+Use this to identify large kernels and potential template instantiation bloat.
 
 ## FAQ
 - Q: Segmentation fault with CUDA 12.6

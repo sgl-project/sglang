@@ -15,6 +15,7 @@
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 import warnings
@@ -23,11 +24,18 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
+
+from sglang.srt.utils import get_bool_env_var
+
+# Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+    from modelscope import AutoConfig, GenerationConfig
+else:
+    from transformers import AutoConfig, GenerationConfig
+
 from transformers import (
-    AutoConfig,
     AutoProcessor,
     AutoTokenizer,
-    GenerationConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -43,9 +51,13 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    JetNemotronConfig,
+    JetVLMConfig,
+    KimiLinearConfig,
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Olmo3Config,
     Qwen3NextConfig,
@@ -54,7 +66,8 @@ from sglang.srt.configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -67,12 +80,16 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     Step3VLConfig,
     LongcatFlashConfig,
     Olmo3Config,
+    KimiLinearConfig,
     Qwen3NextConfig,
     FalconH1Config,
     DotsVLMConfig,
     DotsOCRConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     DeepseekVLV2Config,
+    JetNemotronConfig,
+    JetVLMConfig,
 ]
 
 _CONFIG_REGISTRY = {
@@ -136,6 +153,8 @@ def get_hf_text_config(config: PretrainedConfig):
             )
             return thinker_config.text_config
         return thinker_config
+    if hasattr(config, "llm_config"):
+        return config.llm_config
     else:
         return config
 
@@ -172,6 +191,47 @@ def _load_deepseek_v32_model(
     )
 
 
+# Temporary hack for Mistral Large
+def _load_mistral_large_3_for_causal_LM(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    # first get the local path
+    local_path = download_from_hf(model_path)
+    # then load the config file in json
+    parser = mistral_utils.MistralConfigParser()
+    config_dict, _ = parser.parse(local_path)
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as f:
+        json.dump(config_dict, f)
+        f.flush()
+        loaded_config = AutoConfig.from_pretrained(
+            f.name, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    text_config = getattr(loaded_config, "text_config", None)
+    if text_config is not None and isinstance(text_config, dict):
+        text_config = AutoConfig.for_model(**text_config)
+        setattr(loaded_config, "text_config", text_config)
+    vision_config = getattr(loaded_config, "vision_config", None)
+    if vision_config is not None and isinstance(vision_config, dict):
+        vision_config = AutoConfig.for_model(**vision_config)
+        setattr(loaded_config, "vision_config", vision_config)
+
+    return loaded_config
+
+
+def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
+    # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
+    # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
+    return (
+        getattr(config, "auto_map", None) is not None
+        and config.auto_map.get("AutoModel")
+        == "modeling_deepseekocr.DeepseekOCRForCausalLM"
+    )
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -193,25 +253,21 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    try:
-        config = AutoConfig.from_pretrained(
+    if "mistral-large-3" in str(model).lower():
+        config = _load_mistral_large_3_for_causal_LM(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-        if (
-            getattr(config, "auto_map", None) is not None
-            and config.auto_map.get("AutoModel")
-            == "modeling_deepseekocr.DeepseekOCRForCausalLM"
-        ):
-            config.model_type = "deepseek-ocr"
-            # TODO: Remove this workaround when AutoConfig correctly identifies deepseek-ocr.
-            # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
-
-    except ValueError as e:
-        if not "deepseek_v32" in str(e):
-            raise e
-        config = _load_deepseek_v32_model(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
+    else:
+        try:
+            config = AutoConfig.from_pretrained(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
+        except ValueError as e:
+            if not "deepseek_v32" in str(e):
+                raise e
+            config = _load_deepseek_v32_model(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
 
     if (
         config.architectures is not None
@@ -241,7 +297,11 @@ def get_config(
                 setattr(config, key, val)
 
     if config.model_type in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[config.model_type]
+        model_type = config.model_type
+        if model_type == "deepseek_vl_v2":
+            if _is_deepseek_ocr_model(config):
+                model_type = "deepseek-ocr"
+        config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
@@ -339,6 +399,12 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
+# Filter warnings like: https://github.com/sgl-project/sglang/issues/8082
+class TokenizerWarningsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Calling super().encode with" not in record.getMessage()
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -383,6 +449,10 @@ def get_tokenizer(
             tokenizer_revision=tokenizer_revision,
             clean_up_tokenization_spaces=False,
             **kwargs,
+        )
+        # Filter tokenizer warnings
+        logging.getLogger(tokenizer.__class__.__module__).addFilter(
+            TokenizerWarningsFilter()
         )
     except TypeError as e:
         # The LLaMA tokenizer causes a protobuf error in some environments.
@@ -437,13 +507,23 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
-
-    config = AutoConfig.from_pretrained(
-        tokenizer_name,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        **kwargs,
-    )
+    if "mistral-large-3" in str(tokenizer_name).lower():
+        config = _load_mistral_large_3_for_causal_LM(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+    else:
+        config = AutoConfig.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+    if _is_deepseek_ocr_model(config):
+        # Temporary hack for load deepseek-ocr
+        config.model_type = "deepseek-ocr"
 
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
@@ -462,13 +542,22 @@ def get_processor(
                 **kwargs,
             )
         else:
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
+            if config.model_type in _CUSTOMIZED_MM_PROCESSOR:
+                processor = _CUSTOMIZED_MM_PROCESSOR[config.model_type].from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
+                processor = AutoProcessor.from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
 
     except ValueError as e:
         error_message = str(e)

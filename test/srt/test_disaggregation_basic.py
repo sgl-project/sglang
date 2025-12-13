@@ -3,10 +3,14 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import openai
 import requests
+from transformers import AutoTokenizer
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_disaggregation_utils import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -16,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDisaggregationAccuracy(TestDisaggregationBase):
+class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -136,8 +140,54 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
         # ensure the output is a valid JSON
         json.loads(output)
 
+    def test_first_token_finish(self):
+        client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")
+        tokenizer = AutoTokenizer.from_pretrained(self.model)
+        eos_token = tokenizer.eos_token_id
+        prompt = "The best programming language for AI is"
 
-class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
+        # First token EOS
+        res = client.completions.create(
+            model="dummy", prompt=prompt, logit_bias={eos_token: 42}
+        ).model_dump()
+        print(f"{res=}")
+
+        assert res["usage"]["completion_tokens"] == 1, (
+            "Expected completion_tokens to be 1 when first token is EOS, "
+            f"but got {res['usage']['completion_tokens']}"
+        )
+
+        # First token EOS with ignore_eos
+        res = client.completions.create(
+            model="dummy",
+            prompt=prompt,
+            logit_bias={eos_token: 42},
+            extra_body={"ignore_eos": True},
+        ).model_dump()
+        print(f"{res=}")
+
+        assert res["usage"]["completion_tokens"] > 1, (
+            "Expected completion_tokens to be greater than 1 when ignore_eos is True, "
+            f"but got {res['usage']['completion_tokens']}"
+        )
+
+        # First token with specified stop token
+        stop_token_id = tokenizer.encode(" hello", add_special_tokens=False)[0]
+        res = client.completions.create(
+            model="dummy",
+            prompt=prompt,
+            logit_bias={stop_token_id: 42},
+            stop=[" hello"],
+        ).model_dump()
+        print(f"{res=}")
+
+        assert res["usage"]["completion_tokens"] == 1, (
+            "Expected completion_tokens to be 1 when first token is stop token, "
+            f"but got {res['usage']['completion_tokens']}"
+        )
+
+
+class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -225,7 +275,7 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
                 raise e from health_check_error
 
 
-class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
+class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
 
     @classmethod
     def setUpClass(cls):
@@ -310,7 +360,7 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
 
-class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
+class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

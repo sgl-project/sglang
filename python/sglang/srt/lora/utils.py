@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional, Set, Tuple
@@ -19,9 +18,6 @@ class LoRABatchInfo:
     # Number of segments. For triton backend, it is equal to batch size.
     num_segments: int
 
-    # Maximum segment length of current batch
-    max_len: int
-
     # Indice pointers of each segment in shape (num_segments + 1, )
     seg_indptr: torch.Tensor
 
@@ -33,6 +29,9 @@ class LoRABatchInfo:
 
     # scaling of each lora adapter, in shape (lora_num,)
     scalings: torch.Tensor
+
+    # Maximum segment length of current batch
+    max_len: Optional[int]
 
     # Lengths of each segments in shape (num_segments,)
     seg_lens: Optional[torch.Tensor]
@@ -46,18 +45,12 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
-def get_layer_id(name: str) -> int:
-    """
-    Extract integer id of layer from its name in string.
-    """
-    match = re.search(r"layers\.(\d+)\.", name)
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
 def get_hidden_dim(
-    module_name: str, config: AutoConfig, base_model: torch.nn.Module, layer_idx: int
+    module_name: str,
+    config: AutoConfig,
+    base_model: torch.nn.Module,
+    layer_idx: int,
+    lora_added_vocab_size: int = 0,
 ) -> Tuple[int]:
     """
     Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
@@ -89,6 +82,14 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+        elif module_name == "embed_tokens":
+            # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
+            # if contain extra tokens will be added; otherwise is 0.
+            return config.vocab_size + lora_added_vocab_size, config.hidden_size
+        elif module_name == "lm_head":
+            # For lm_head: input is hidden_size, output is vocab_size
+            # if contain extra tokens will be added; otherwise is 0.
+            return config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
             raise NotImplementedError()
 
@@ -106,6 +107,12 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "embed_tokens": "embed_tokens",
+        "vocab_emb": "embed_tokens",
+        "embeddings": "embed_tokens",
+        "word_embeddings": "embed_tokens",
+        "lm_head": "lm_head",
+        "output": "lm_head",
     }
 
     result = set()
@@ -142,4 +149,5 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
     )
 
 
+EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]

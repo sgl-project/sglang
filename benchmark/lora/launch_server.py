@@ -53,7 +53,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lora-backend",
         type=str,
-        default="triton",
+        default="csgmv",
     )
     parser.add_argument(
         "--tp-size",

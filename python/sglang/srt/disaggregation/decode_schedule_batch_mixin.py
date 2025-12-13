@@ -7,26 +7,27 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
-    def prepare_for_prebuilt_extend(self: ScheduleBatch):
+    def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
         Adapted from .prepare_for_extend().
         """
 
-        self.forward_mode = ForwardMode.EXTEND
+        self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
@@ -60,8 +61,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     seq_len - pre_len == req.extend_input_len
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
+            if not req.retracted_stain:
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
             req.extend_logprob_start_len = 0
@@ -100,8 +102,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
-    def process_prebuilt_extend(
-        self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
+    def process_prebuilt(
+        self: ScheduleBatch,
+        server_args: ServerArgs,
+        future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
@@ -119,7 +123,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
-                    self.tree_cache.cache_finished_req(req)
+                    release_kv_cache(req, self.tree_cache)
                     prepare_abort(
                         req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                     )
@@ -165,7 +169,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 verified_id=self.output_ids,
+                new_seq_lens=self.seq_lens,
             )
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            if self.enable_overlap:
+                spec_info.future_indices = future_map.alloc_future_indices(
+                    len(self.seq_lens)
+                )
+                future_map.store_to_map_for_new_batch(
+                    spec_info.future_indices, spec_info
+                )
             self.spec_info = spec_info

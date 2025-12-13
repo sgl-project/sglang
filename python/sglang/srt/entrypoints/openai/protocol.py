@@ -37,7 +37,11 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
-from xgrammar import StructuralTag
+
+try:
+    from xgrammar import StructuralTag
+except:
+    StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
 
@@ -54,6 +58,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    parent: Optional[str] = None
     max_model_len: Optional[int] = None
 
 
@@ -108,6 +113,7 @@ class UsageInfo(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    continuous_usage_stats: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -251,6 +257,9 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
@@ -381,23 +390,24 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool", "function"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
+    role: Literal["system", "assistant", "tool", "function", "developer"]
+    content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool", "function"}:
+            if v_lower not in {"system", "assistant", "tool", "function", "developer"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
+                    "'role' must be one of 'system', 'developer', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -523,6 +533,9 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
