@@ -11,7 +11,7 @@ use tracing::error;
 use super::{
     common::stages::*,
     context::*,
-    error, harmony,
+    harmony,
     regular::{processor, stages::*, streaming},
 };
 use crate::{
@@ -22,6 +22,7 @@ use crate::{
         generate::GenerateRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::error,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
