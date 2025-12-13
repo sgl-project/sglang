@@ -93,7 +93,8 @@ class TestDeepseekV32Accuracy(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gpqa (deepseek-v32)\n" f"Score: {metrics['score']:.3f}\n"
+                f"### test_gpqa (deepseek-v32)\n"
+                f"Mean Score: {metrics["mean_score"]:.3f}\n"
             )
 
 
