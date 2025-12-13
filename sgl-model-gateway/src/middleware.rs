@@ -336,8 +336,14 @@ impl<B> OnResponse<B> for ResponseLogger {
         let status = response.status();
         let status_code = status.as_u16();
 
+        let error_code = response
+            .headers()
+            .get("x-smg-error-code")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("none");
+
         // TODO support `route` information
-        RouterMetrics::record_http_status_code(status_code);
+        RouterMetrics::record_http_status_code(status_code, error_code);
         RouterMetrics::record_request_duration(latency);
 
         // Record these in the span for structured logging/observability tools
