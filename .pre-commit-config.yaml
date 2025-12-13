@@ -75,3 +75,12 @@ repos:
         args:
           - '--keep-output'
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (nightly)
+        entry: cargo +nightly fmt --manifest-path sgl-model-gateway/Cargo.toml --
+        language: system
+        types: [rust]
+        files: ^sgl-model-gateway/
+        pass_filenames: false
