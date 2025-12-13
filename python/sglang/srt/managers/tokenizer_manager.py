@@ -425,7 +425,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
             and obj.contains_mm_input()
         ):
-            self.mm_receiver.send_encode_requset(obj)
+            self.mm_receiver.send_encode_request(obj)
 
         if self.enable_trace:
             self._trace_request_start(obj, created_time, request)

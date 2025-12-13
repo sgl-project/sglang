@@ -314,7 +314,7 @@ class MMEncoder:
 
         try:
             while True:
-                with rid_lock:
+                async with rid_lock:
                     current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
                     expected_count = rid_to_receive_count.get(req_id)
 
@@ -367,7 +367,7 @@ class MMEncoder:
 
         finally:
             logger.info(f"Cleaning up resources for req_id {req_id}")
-            with rid_lock:
+            async with rid_lock:
                 rid_to_receive_endpoint.pop(req_id, None)
                 rid_to_receive_count.pop(req_id, None)
             self.embedding_to_send.pop(req_id, None)
@@ -506,7 +506,7 @@ async def handle_send_request(request: dict):
 @app.post("/scheduler_receive_url")
 async def handle_scheduler_receive_url_request(request: dict):
     rid = request["req_id"]
-    with rid_lock:
+    async with rid_lock:
         global rid_to_receive_endpoint
         if rid not in rid_to_receive_endpoint:
             rid_to_receive_endpoint[rid] = set()
