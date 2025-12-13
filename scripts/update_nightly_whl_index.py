@@ -102,34 +102,18 @@ def update_wheel_index(commit_hash: str, nightly_version: str, build_date: str =
                 seen.add(filename)
                 unique_links.append(link)
 
-    # Write index
+    # Write index following PyPI simple repository format
+    # https://peps.python.org/pep-0503/
     with open(index_file, "w") as f:
         f.write("<!DOCTYPE html>\n")
         f.write("<html>\n")
         f.write("<head>\n")
-        f.write("  <title>SGLang Nightly Wheels</title>\n")
+        f.write('  <meta name="pypi:repository-version" content="1.0">\n')
+        f.write("  <title>Links for sglang</title>\n")
         f.write("</head>\n")
         f.write("<body>\n")
-        f.write("  <h1>SGLang Nightly Wheels</h1>\n")
-        f.write(
-            f"  <p><strong>Latest:</strong> {nightly_version} (commit {commit_hash})</p>\n"
-        )
-        f.write("  <p><strong>Installation:</strong></p>\n")
-        f.write(
-            "  <pre><code>pip install sglang --extra-index-url https://sgl-project.github.io/whl/nightly/</code></pre>\n"
-        )
-        f.write("  <hr>\n")
-        f.write("  <h2>Available Wheels</h2>\n")
-        f.write(
-            "  <p>Wheels are listed newest first. Pip will automatically select the latest version.</p>\n"
-        )
-        f.write(
-            "  <p>This is a pure Python wheel that works on all platforms (x86_64, aarch64, Windows, macOS, Linux).</p>\n"
-        )
-        f.write(
-            "  <p>CUDA version and architecture are selected via dependencies (e.g., sgl-kernel).</p>\n"
-        )
-        f.write("  <hr>\n")
+        f.write("  <h1>Links for sglang</h1>\n")
+        # Write links only, following PEP 503
         f.write("\n".join(unique_links))
         f.write("\n</body>\n")
         f.write("</html>\n")
