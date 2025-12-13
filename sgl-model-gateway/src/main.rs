@@ -832,7 +832,5 @@ Provide --worker-urls or PD flags as usual.",
     if is_otel_enabled() {
         shutdown_otel();
     }
-    use sgl_model_gateway::observability::metrics::stop_pyroscope;
-    stop_pyroscope();
     Ok(())
 }

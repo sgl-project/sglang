@@ -334,6 +334,7 @@ impl Default for PyroscopeConfig {
 static PYROSCOPE_AGENT: std::sync::OnceLock<Arc<PyroscopeAgent<PyroscopeAgentRunning>>> =
     std::sync::OnceLock::new();
 
+// TODO handle stopping
 pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate = config.sample_rate.unwrap_or(100);
     let pprof_config = PprofConfig::new().sample_rate(sample_rate);
@@ -363,15 +364,6 @@ pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error
         config.url
     );
     Ok(())
-}
-
-pub fn stop_pyroscope() {
-    if let Some(agent_running) = PYROSCOPE_AGENT.get() {
-        if let Ok(agent_ready) = agent_running.stop() {
-            agent_ready.shutdown();
-            tracing::info!("Pyroscope agent stopped");
-        }
-    }
 }
 
 pub struct RouterMetrics;
