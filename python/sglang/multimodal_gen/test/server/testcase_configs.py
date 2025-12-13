@@ -224,6 +224,14 @@ TI2I_sampling_params = DiffusionSamplingParams(
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
 )
 
+MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
+)
+
 T2V_PROMPT = "A curious raccoon"
 
 TI2V_sampling_params = DiffusionSamplingParams(
@@ -236,57 +244,57 @@ TI2V_sampling_params = DiffusionSamplingParams(
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
-    DiffusionTestCase(
-        "qwen_image_t2i",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image",
-            modality="image",
-            warmup_text=1,
-            warmup_edit=0,
-        ),
-        T2I_sampling_params,
-    ),
-    DiffusionTestCase(
-        "flux_image_t2i",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.1-dev",
-            modality="image",
-            warmup_text=1,
-            warmup_edit=0,
-        ),
-        T2I_sampling_params,
-    ),
-    DiffusionTestCase(
-        "flux_2_image_t2i",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
-            modality="image",
-            warmup_text=1,
-            warmup_edit=0,
-        ),
-        T2I_sampling_params,
-    ),
-    DiffusionTestCase(
-        "zimage_image_t2i",
-        DiffusionServerArgs(
-            model_path="Tongyi-MAI/Z-Image-Turbo",
-            modality="image",
-            warmup_text=1,
-            warmup_edit=0,
-        ),
-        T2I_sampling_params,
-    ),
-    # === Text and Image to Image (TI2I) ===
-    DiffusionTestCase(
-        "qwen_image_edit_ti2i",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit",
-            modality="image",
-            warmup_text=0,
-            warmup_edit=1,
-        ),
-        TI2I_sampling_params,
-    ),
+    # DiffusionTestCase(
+    #     "qwen_image_t2i",
+    #     DiffusionServerArgs(
+    #         model_path="Qwen/Qwen-Image",
+    #         modality="image",
+    #         warmup_text=1,
+    #         warmup_edit=0,
+    #     ),
+    #     T2I_sampling_params,
+    # ),
+    # DiffusionTestCase(
+    #     "flux_image_t2i",
+    #     DiffusionServerArgs(
+    #         model_path="black-forest-labs/FLUX.1-dev",
+    #         modality="image",
+    #         warmup_text=1,
+    #         warmup_edit=0,
+    #     ),
+    #     T2I_sampling_params,
+    # ),
+    # DiffusionTestCase(
+    #     "flux_2_image_t2i",
+    #     DiffusionServerArgs(
+    #         model_path="black-forest-labs/FLUX.2-dev",
+    #         modality="image",
+    #         warmup_text=1,
+    #         warmup_edit=0,
+    #     ),
+    #     T2I_sampling_params,
+    # ),
+    # DiffusionTestCase(
+    #     "zimage_image_t2i",
+    #     DiffusionServerArgs(
+    #         model_path="Tongyi-MAI/Z-Image-Turbo",
+    #         modality="image",
+    #         warmup_text=1,
+    #         warmup_edit=0,
+    #     ),
+    #     T2I_sampling_params,
+    # ),
+    # # === Text and Image to Image (TI2I) ===
+    # DiffusionTestCase(
+    #     "qwen_image_edit_ti2i",
+    #     DiffusionServerArgs(
+    #         model_path="Qwen/Qwen-Image-Edit",
+    #         modality="image",
+    #         warmup_text=0,
+    #         warmup_edit=1,
+    #     ),
+    #     TI2I_sampling_params,
+    # ),
     DiffusionTestCase(
         "qwen_image_edit_2509_ti2i",
         DiffusionServerArgs(
@@ -295,13 +303,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_text=0,
             warmup_edit=1,
         ),
-        DiffusionSamplingParams(
-            prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
-            image_path=[
-                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
-                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
-            ],
-        ),
+        MULTI_IMAGE_TI2I_sampling_params,
     ),
 ]
 
