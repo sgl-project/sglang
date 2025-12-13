@@ -597,7 +597,7 @@ impl RouterMetrics {
     pub fn record_http_status_code(status_code: u16, error_code: &str) {
         counter!("sgl_router_http_responses_total",
             "status_code" => status_code.to_string(),
-            "error_code" => error_code
+            "error_code" => error_code.to_string()
         )
         .increment(1);
     }
