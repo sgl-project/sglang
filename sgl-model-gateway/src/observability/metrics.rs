@@ -331,15 +331,16 @@ impl Default for PyroscopeConfig {
     }
 }
 
-static PYROSCOPE_AGENT: std::sync::OnceLock<Arc<PyroscopeAgentRunning>> = std::sync::OnceLock::new();
+static PYROSCOPE_AGENT: std::sync::OnceLock<Arc<PyroscopeAgentRunning>> =
+    std::sync::OnceLock::new();
 
 pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate = config.sample_rate.unwrap_or(100);
     let pprof_config = PprofConfig::new().sample_rate(sample_rate);
     let pprof_backend = pprof_backend(pprof_config);
 
-    let mut agent_builder = PyroscopeAgent::builder(config.url.clone(), config.app_name.clone())
-        .backend(pprof_backend);
+    let mut agent_builder =
+        PyroscopeAgent::builder(config.url.clone(), config.app_name.clone()).backend(pprof_backend);
 
     if let (Some(user), Some(password)) = (config.user.clone(), config.password.clone()) {
         agent_builder = agent_builder.basic_auth(user, password);
@@ -356,7 +357,11 @@ pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error
         .set(Arc::new(agent_running))
         .map_err(|_| "Pyroscope agent already initialized")?;
 
-    tracing::info!("Pyroscope profiling enabled: {} -> {}", config.app_name, config.url);
+    tracing::info!(
+        "Pyroscope profiling enabled: {} -> {}",
+        config.app_name,
+        config.url
+    );
     Ok(())
 }
 
