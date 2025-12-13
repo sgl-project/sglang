@@ -41,9 +41,8 @@ class TestEAGLEServerBasic(EagleServerBase):
             p.join()
 
     def test_radix_attention(self):
-        # python -m unittest test_eagle_infer_b.TestEAGLERetract.test_radix_attention
         run_radix_attention_test(self.base_url)
-        assert self.process.poll() is None
+        self.assertIsNone(self.process.poll())
 
     def test_max_token_one(self):
         requests.get(self.base_url + "/flush_cache")
