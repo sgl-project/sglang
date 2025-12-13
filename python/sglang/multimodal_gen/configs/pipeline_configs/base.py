@@ -308,10 +308,10 @@ class PipelineConfig:
         time_dim = latents.shape[2]
 
         # Pad to next multiple of SP degree if needed
-        if time_dim % sp_world_size != 0:
+        if time_dim > 0 and time_dim % sp_world_size != 0:
             pad_len = sp_world_size - (time_dim % sp_world_size)
             pad = torch.zeros(
-                (latents.shape[:2], pad_len, latents.shape[3:]),
+                (*latents.shape[:2], pad_len, *latents.shape[3:]),
                 dtype=latents.dtype,
                 device=latents.device,
             )
