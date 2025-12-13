@@ -56,6 +56,13 @@ fn create_error(status_code: StatusCode, error_type: &str, message: impl Into<St
         .into_response()
 }
 
+fn status_code_to_str(status_code: StatusCode) -> &'static str {
+    match status_code {
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::INTERNAL_SERVER_ERROR => "internal_server_error",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
