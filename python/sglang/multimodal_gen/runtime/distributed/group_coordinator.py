@@ -356,30 +356,36 @@ class GroupCoordinator:
         if self.device_communicator is not None and self.use_device_communicator:
             output_tensor = self.device_communicator.all_gather(input_, dim=dim)
             if separate_tensors:
-                return list(torch.chunk(output_tensor, world_size, dim=dim))
+                tensor_list = [
+                    output_tensor.reshape(-1)
+                    .narrow(0, input_.numel() * i, input_.numel())
+                    .view_as(input_)
+                    for i in range(world_size)
+                ]
+                return tensor_list
             
             return output_tensor
-        else:
-            # Allocate output tensor.
-            input_size = list(input_.size())
-            input_size[0] *= world_size
-            output_tensor = torch.empty(
-                input_size, dtype=input_.dtype, device=input_.device
+        
+        # Allocate output tensor.
+        input_size = list(input_.size())
+        input_size[0] *= world_size
+        output_tensor = torch.empty(
+            input_size, dtype=input_.dtype, device=input_.device
+        )
+        # All-gather.
+        torch.distributed.all_gather_into_tensor(
+            output_tensor, input_, group=self.device_group
+        )
+        if dim != 0:
+            input_size[0] //= world_size
+            output_tensor = output_tensor.reshape(
+                [
+                    world_size,
+                ]
+                + input_size
             )
-            # All-gather.
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
-            )
-            if dim != 0:
-                input_size[0] //= world_size
-                output_tensor = output_tensor.reshape(
-                    [
-                        world_size,
-                    ]
-                    + input_size
-                )
-                output_tensor = output_tensor.movedim(0, dim)
-
+            output_tensor = output_tensor.movedim(0, dim)
+    
         if separate_tensors:
             tensor_list = [
                 output_tensor.reshape(-1)
