@@ -1039,7 +1039,8 @@ class AscendAttnBackend(AttentionBackend):
                     [
                         attn_output,
                         attn_output.new_zeros(
-                            num_token_padding - attn_output.shape[0], *attn_output.shape[1:]
+                            num_token_padding - attn_output.shape[0],
+                            *attn_output.shape[1:],
                         ),
                     ],
                     dim=0,
