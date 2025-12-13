@@ -23,7 +23,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import orjson
 
@@ -252,7 +252,6 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
-    rl_quant_profile: Optional[str] = None  # For flash_rl load format
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
@@ -281,6 +280,7 @@ class ServerArgs:
     modelopt_checkpoint_save_path: Optional[str] = None
     modelopt_export_path: Optional[str] = None
     quantize_and_serve: bool = False
+    rl_quant_profile: Optional[str] = None  # For flash_rl load format
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -314,12 +314,13 @@ class ServerArgs:
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
+    soft_watchdog_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
-    mm_process_config: Optional[Dict[str, Any]] = None
+    custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
     log_level: str = "info"
@@ -605,13 +606,12 @@ class ServerArgs:
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
+    mm_enable_dp_encoder: bool = False
+    mm_process_config: Optional[Dict[str, Any]] = None
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
-
-    # For encoder dp
-    mm_enable_dp_encoder: bool = False
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
@@ -641,9 +641,6 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
-
-        # Handle compilation config
-        self._handle_compilation_cfg()
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -708,7 +705,7 @@ class ServerArgs:
         self._handle_elastic_ep()
 
     def _handle_deprecated_args(self):
-        # handle deprecated tool call parsers
+        # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
         if self.tool_call_parser in deprecated_tool_call_parsers:
             logger.warning(
@@ -727,6 +724,16 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+
+        # Handle ModelScope model downloads
+        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+            if not os.path.exists(self.model_path):
+                from modelscope import snapshot_download
+
+                self.model_path = snapshot_download(self.model_path)
+                self.tokenizer_path = snapshot_download(
+                    self.tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -907,7 +914,7 @@ class ServerArgs:
         if self.disable_cuda_graph_padding:
             capture_bs = list(range(1, self.cuda_graph_max_bs + 1))
         elif self.speculative_algorithm is None:
-            # Normal case: [1, 2, 4, 8, 12] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, cuda_graph_max_bs + 1))
+            # Normal case:
             capture_bs = (
                 [1, 2, 4, 8, 12]
                 + list(range(16, 257, 8))
@@ -915,7 +922,7 @@ class ServerArgs:
                 + list(range(512, self.cuda_graph_max_bs + 1, 32))
             )
         else:
-            # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
+            # Spec decoding case: less padding for smaller batch sizes
             capture_bs = (
                 list(range(1, 9, 1))
                 + list(range(10, 33, 2))
@@ -958,20 +965,18 @@ class ServerArgs:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
 
-    def _handle_compilation_cfg(self):
-        # NPU platform
-        if is_npu() and self.piecewise_cuda_graph_compiler != "eager":
-            logger.warning(
-                "At this moment Ascend platform only support prefill graph compilation with "
-                "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
-            )
-            self.piecewise_cuda_graph_compiler = "eager"
-
     def _handle_npu_backends(self):
         if self.device == "npu":
             from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
             set_default_server_args(self)
+
+            if self.piecewise_cuda_graph_compiler != "eager":
+                logger.warning(
+                    "At this moment Ascend platform only support prefill graph compilation with "
+                    "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
+                )
+                self.piecewise_cuda_graph_compiler = "eager"
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -2283,12 +2288,6 @@ class ServerArgs:
             default=ServerArgs.model_loader_extra_config,
         )
         parser.add_argument(
-            "--rl-quant-profile",
-            type=str,
-            default=ServerArgs.rl_quant_profile,
-            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
-        )
-        parser.add_argument(
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
@@ -2462,6 +2461,12 @@ class ServerArgs:
             help="Quantize the model with ModelOpt and immediately serve it without exporting. "
             "This is useful for development and prototyping. For production, it's recommended "
             "to use separate quantization and deployment steps.",
+        )
+        parser.add_argument(
+            "--rl-quant-profile",
+            type=str,
+            default=ServerArgs.rl_quant_profile,
+            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
         )
 
         # Memory and scheduling
@@ -2651,6 +2656,12 @@ class ServerArgs:
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
         )
         parser.add_argument(
+            "--soft-watchdog-timeout",
+            type=float,
+            default=ServerArgs.soft_watchdog_timeout,
+            help="Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
+        )
+        parser.add_argument(
             "--dist-timeout",
             type=int,
             default=ServerArgs.dist_timeout,
@@ -2680,10 +2691,8 @@ class ServerArgs:
             help="Reduce CPU usage when sglang is idle.",
         )
         parser.add_argument(
-            "--mm-process-config",
-            type=json.loads,
-            default=ServerArgs.mm_process_config,
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            "--custom-sigquit-handler",
+            help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
 
         # Logging
@@ -4103,6 +4112,18 @@ class ServerArgs:
             default=ServerArgs.enable_broadcast_mm_inputs_process,
             help="Enable broadcast mm-inputs process in scheduler.",
         )
+        parser.add_argument(
+            "--mm-process-config",
+            type=json.loads,
+            default=ServerArgs.mm_process_config,
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+        )
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
 
         # For checkpoint decryption
         parser.add_argument(
@@ -4116,12 +4137,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
-        )
-        parser.add_argument(
-            "--mm-enable-dp-encoder",
-            action="store_true",
-            default=ServerArgs.mm_enable_dp_encoder,
-            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
 
         # For registering hooks

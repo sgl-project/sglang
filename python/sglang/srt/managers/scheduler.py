@@ -18,7 +18,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 import time
 from collections import deque
 from concurrent import futures
@@ -146,6 +145,7 @@ from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
+    SchedulerWatchdog,
 )
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
@@ -524,10 +524,11 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
-        self.watchdog_timeout = server_args.watchdog_timeout
-        t = threading.Thread(target=self.watchdog_thread, daemon=True)
-        t.start()
-        self.parent_process = psutil.Process().parent()
+        self.watchdog = SchedulerWatchdog(
+            self, watchdog_timeout=server_args.watchdog_timeout
+        )
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = SchedulerWatchdog(self, watchdog_timeout=x, soft=True)
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1964,7 +1965,7 @@ class Scheduler(
         ):
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args, self.decode_mem_cache_buf_multiplier
             )
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
