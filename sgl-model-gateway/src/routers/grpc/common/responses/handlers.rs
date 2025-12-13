@@ -10,7 +10,8 @@ use serde_json::json;
 use tracing::{debug, error, warn};
 
 use crate::{
-    data_connector::ResponseId, routers::grpc::regular::responses::context::ResponsesContext,
+    data_connector::ResponseId,
+    routers::{error, grpc::regular::responses::context::ResponsesContext},
 };
 
 /// Implementation for GET /v1/responses/{response_id}
@@ -23,27 +24,14 @@ pub async fn get_response_impl(ctx: &ResponsesContext, response_id: &str) -> Res
     // Retrieve response from storage
     match ctx.response_storage.get_response(&resp_id).await {
         Ok(Some(stored_response)) => axum::Json(stored_response.raw_response).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Response with id '{}' not found", response_id),
-                    "type": "not_found_error",
-                    "code": "response_not_found"
-                }
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Failed to retrieve response: {}", e),
-                    "type": "internal_error"
-                }
-            })),
-        )
-            .into_response(),
+        Ok(None) => error::not_found(
+            "response_not_found",
+            format!("Response with id '{}' not found", response_id),
+        ),
+        Err(e) => error::internal_error(
+            "retrieve_response_failed",
+            format!("Failed to retrieve response: {}", e),
+        ),
     }
 }
 
@@ -112,41 +100,19 @@ pub async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> 
                             "Response {} has status '{}' but task handle is missing. Task may have crashed or storage update failed.",
                             response_id, current_status
                         );
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            axum::Json(json!({
-                                "error": {
-                                    "message": "Internal error: background task completed but failed to update status in storage",
-                                    "type": "internal_error",
-                                    "code": "status_update_failed"
-                                }
-                            })),
+                        error::internal_error(
+                            "status_update_failed",
+                            "Internal error: background task completed but failed to update status in storage",
                         )
-                            .into_response()
                     }
                 }
-                "completed" => (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({
-                        "error": {
-                            "message": "Cannot cancel completed response",
-                            "type": "invalid_request_error",
-                            "code": "response_already_completed"
-                        }
-                    })),
-                )
-                    .into_response(),
-                "failed" => (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({
-                        "error": {
-                            "message": "Cannot cancel failed response",
-                            "type": "invalid_request_error",
-                            "code": "response_already_failed"
-                        }
-                    })),
-                )
-                    .into_response(),
+                "completed" => error::bad_request(
+                    "response_already_completed",
+                    "Cannot cancel completed response",
+                ),
+                "failed" => {
+                    error::bad_request("response_already_failed", "Cannot cancel failed response")
+                }
                 "cancelled" => (
                     StatusCode::OK,
                     axum::Json(json!({
@@ -158,39 +124,20 @@ pub async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> 
                     .into_response(),
                 _ => {
                     // Unknown status
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        axum::Json(json!({
-                            "error": {
-                                "message": format!("Unknown response status: {}", current_status),
-                                "type": "internal_error"
-                            }
-                        })),
+                    error::internal_error(
+                        "unknown_response_status",
+                        format!("Unknown response status: {}", current_status),
                     )
-                        .into_response()
                 }
             }
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Response with id '{}' not found", response_id),
-                    "type": "not_found_error",
-                    "code": "response_not_found"
-                }
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({
-                "error": {
-                    "message": format!("Failed to retrieve response: {}", e),
-                    "type": "internal_error"
-                }
-            })),
-        )
-            .into_response(),
+        Ok(None) => error::not_found(
+            "response_not_found",
+            format!("Response with id '{}' not found", response_id),
+        ),
+        Err(e) => error::internal_error(
+            "retrieve_response_failed",
+            format!("Failed to retrieve response: {}", e),
+        ),
     }
 }

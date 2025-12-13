@@ -14,6 +14,7 @@ suites = {
         TestFile("test_lora_eviction_policy.py", 200),
         TestFile("test_lora_openai_api.py", 30),
         TestFile("test_lora_openai_compatible.py", 150),
+        TestFile("test_lora_hf_sgl_logprob_diff.py", 300),
         TestFile("test_batch_invariant_ops.py", 10),
         TestFile("test_cpp_radix_cache.py", 60),
         TestFile("test_deepseek_v3_deterministic.py", 240),
@@ -29,6 +30,8 @@ suites = {
     ],
     "nightly-8-gpu-b200": [
         TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+        TestFile("test_deepseek_v32_gpqa.py", 3600),
+        TestFile("test_mistral_large3_basic.py", 600),
     ],
     "nightly-4-gpu": [
         TestFile("test_encoder_dp.py", 500),

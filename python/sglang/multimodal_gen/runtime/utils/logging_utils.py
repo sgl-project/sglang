@@ -4,6 +4,7 @@
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/logger.py
 """Logging configuration for sglang.multimodal_gen."""
 import argparse
+import contextlib
 import datetime
 import logging
 import os
@@ -382,13 +383,13 @@ def configure_logger(server_args, prefix: str = ""):
     set_uvicorn_logging_configs()
 
 
-def suppress_loggers(loggers_to_suppress: list[str]):
+def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
     original_levels = {}
 
     for logger_name in loggers_to_suppress:
         logger = logging.getLogger(logger_name)
         original_levels[logger_name] = logger.level
-        logger.setLevel(logging.WARNING)
+        logger.setLevel(level)
 
     return original_levels
 
@@ -409,11 +410,21 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
 
     should_suppress = True
     if not_suppress_on_main_rank:
-        if get_is_main_process() == 0:
+        if get_is_main_process():
             should_suppress = False
 
-    loggers_to_suppress = ["urllib3", "imageio", "imageio_ffmpeg", "PIL", "PIL_Image"]
+    loggers_to_suppress = [
+        "urllib3",
+        "imageio",
+        "imageio_ffmpeg",
+        "PIL",
+        "PIL_Image",
+    ]
+    filelock_loggers = [
+        "filelock",
+    ]
     original_levels = suppress_loggers(loggers_to_suppress)
+    original_levels.update(suppress_loggers(filelock_loggers, level=logging.ERROR))
 
     try:
         yield
@@ -421,6 +432,35 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
         if should_suppress:
             for logger_name, level in original_levels.items():
                 logging.getLogger(logger_name).setLevel(level)
+
+
+# source: https://github.com/vllm-project/vllm/blob/a11f4a81e027efd9ef783b943489c222950ac989/vllm/utils/system_utils.py#L60
+@contextlib.contextmanager
+def suppress_stdout():
+    """
+    Suppress stdout from C libraries at the file descriptor level.
+
+    Only suppresses stdout, not stderr, to preserve error messages.
+    Example:
+        with suppress_stdout():
+            # C library calls that would normally print to stdout
+            torch.distributed.new_group(ranks, backend="gloo")
+    """
+    # Don't suppress if logging level is DEBUG
+
+    stdout_fd = sys.stdout.fileno()
+    stdout_dup = os.dup(stdout_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+
+    try:
+        sys.stdout.flush()
+        os.dup2(devnull_fd, stdout_fd)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(stdout_dup, stdout_fd)
+        os.close(stdout_dup)
+        os.close(devnull_fd)
 
 
 class GenerationTimer:

@@ -56,6 +56,14 @@ pub enum ChatMessage {
     },
     #[serde(rename = "function")]
     Function { content: String, name: String },
+    #[serde(rename = "developer")]
+    Developer {
+        content: MessageContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<Tool>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -638,7 +646,10 @@ impl GenerationRequest for ChatCompletionRequest {
 
         for msg in &self.messages {
             match msg {
-                ChatMessage::System { content, .. } | ChatMessage::User { content, .. } => {
+                ChatMessage::System { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Tool { content, .. }
+                | ChatMessage::Developer { content, .. } => {
                     if has_content && content.has_text() {
                         buffer.push(' ');
                     }
@@ -669,14 +680,6 @@ impl GenerationRequest for ChatCompletionRequest {
                             buffer.push_str(reasoning);
                             has_content = true;
                         }
-                    }
-                }
-                ChatMessage::Tool { content, .. } => {
-                    if has_content && content.has_text() {
-                        buffer.push(' ');
-                    }
-                    if content.append_text_to(&mut buffer) {
-                        has_content = true;
                     }
                 }
                 ChatMessage::Function { content, .. } => {

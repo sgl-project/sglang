@@ -343,25 +343,18 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.to(self.dtype)
-
-        mean = x.mean(dim=-1, keepdim=True)
-        variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-        x = (x - mean) * torch.rsqrt(variance + self.variance_epsilon)
-
-        if self.elementwise_affine:
-            x = x * self.weight.to(self.dtype)
-            if self.use_bias:
-                x = x + self.bias.to(self.dtype)
-
-        return x.to(orig_dtype)
+        return self.forward_native(x)
 
     def forward_cpu(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.layernorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        else:
+            return self.forward_native(x)
 
 
 class GemmaRMSNorm(CustomOp):

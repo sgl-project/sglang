@@ -45,6 +45,7 @@ Its core features include:
    advanced_features/expert_parallelism.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
+   advanced_features/pipeline_parallelism.md
    advanced_features/hicache.rst
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
@@ -60,6 +61,7 @@ Its core features include:
 
    supported_models/generative_models.md
    supported_models/multimodal_language_models.md
+   supported_models/diffusion_language_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md
@@ -67,6 +69,7 @@ Its core features include:
    supported_models/support_new_models.md
    supported_models/transformers_fallback.md
    supported_models/modelscope.md
+   supported_models/mindspore_models.md
 
 .. toctree::
    :maxdepth: 1

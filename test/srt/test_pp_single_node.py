@@ -19,6 +19,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -316,6 +317,50 @@ class TestFixedBugs(unittest.TestCase):
             bench_args,
             other_server_args,
         )
+
+
+@unittest.skipIf(
+    is_in_ci(), "Skipping GLM41V PP accuracy test before it gets more stable"
+)
+class TestGLM41VPPAccuracy(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                1,
+                "--pp-size",
+                2,
+                "--chunked-prefill-size",
+                8192,
+                "--enable-multimodal",
+                "--reasoning-parser",
+                "glm45",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mmmu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmmu",
+            num_examples=None,
+            num_threads=32,
+            response_answer_regex="<\|begin_of_box\|>(.*)<\|end_of_box\|>",
+        )
+
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.45)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 //! L0 Cache: Whole-string exact match cache
 //!
 //! This is the simplest and most effective cache layer.
-//! Key: input string → Value: full encoding result
+//! Key: input string → Value: full encoding result (Arc-wrapped for zero-copy cache hits)
 //!
 //! Expected hit rate: 60-90% for workloads with repeated system prompts
 
@@ -15,9 +15,10 @@ use dashmap::DashMap;
 use super::super::traits::Encoding;
 
 /// L0 cache implementation using DashMap for lock-free reads
+/// Uses Arc<Encoding> internally to provide zero-copy cache hits
 pub struct L0Cache {
-    /// The cache map: input string → encoding
-    map: Arc<DashMap<String, Encoding>>,
+    /// The cache map: input string → Arc-wrapped encoding for cheap cloning
+    map: Arc<DashMap<String, Arc<Encoding>>>,
     /// Maximum number of entries before eviction
     max_entries: usize,
     /// Cache hit counter
@@ -37,12 +38,14 @@ impl L0Cache {
         }
     }
 
-    /// Get an encoding from the cache
-    pub fn get(&self, key: &str) -> Option<Encoding> {
+    /// Get an encoding from the cache (returns Arc for zero-copy access)
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<Arc<Encoding>> {
         match self.map.get(key) {
             Some(entry) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(entry.value().clone())
+                // Arc::clone is cheap (just increment reference count)
+                Some(Arc::clone(entry.value()))
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -65,6 +68,17 @@ impl L0Cache {
             }
         }
 
+        self.map.insert(key, Arc::new(value));
+    }
+
+    /// Insert a pre-wrapped Arc encoding into the cache (avoids double-wrapping)
+    pub fn insert_arc(&self, key: String, value: Arc<Encoding>) {
+        if self.map.len() >= self.max_entries {
+            let key_to_remove = { self.map.iter().next().map(|entry| entry.key().clone()) };
+            if let Some(k) = key_to_remove {
+                self.map.remove(&k);
+            }
+        }
         self.map.insert(key, value);
     }
 
@@ -139,7 +153,7 @@ mod tests {
         // Insert
         cache.insert("hello".to_string(), mock_encoding(vec![1, 2, 3]));
 
-        // Hit
+        // Hit - now returns Arc<Encoding>
         let result = cache.get("hello");
         assert!(result.is_some());
         assert_eq!(result.unwrap().token_ids(), &[1, 2, 3]);
@@ -216,5 +230,18 @@ mod tests {
 
         // Should have 10 entries
         assert_eq!(cache.len(), 10);
+    }
+
+    #[test]
+    fn test_arc_reuse() {
+        // Test that multiple gets return the same Arc (reference counting)
+        let cache = L0Cache::new(10);
+        cache.insert("test".to_string(), mock_encoding(vec![1, 2, 3]));
+
+        let arc1 = cache.get("test").unwrap();
+        let arc2 = cache.get("test").unwrap();
+
+        // Both should point to the same allocation
+        assert!(Arc::ptr_eq(&arc1, &arc2));
     }
 }

@@ -352,8 +352,8 @@ mod tests {
         let worker = BasicWorkerBuilder::new("http://localhost:8080").build();
 
         assert_eq!(worker.url(), "http://localhost:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
-        assert_eq!(worker.connection_mode(), ConnectionMode::Http);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert!(worker.is_healthy());
     }
 
@@ -364,8 +364,8 @@ mod tests {
             .build();
 
         assert_eq!(worker.url(), "http://localhost:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Decode);
-        assert_eq!(worker.connection_mode(), ConnectionMode::Http);
+        assert_eq!(worker.worker_type(), &WorkerType::Decode);
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert!(worker.is_healthy());
     }
 
@@ -403,13 +403,13 @@ mod tests {
         assert_eq!(worker.url(), "http://localhost:8080");
         assert_eq!(
             worker.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: None
             }
         );
         assert_eq!(
             worker.connection_mode(),
-            ConnectionMode::Grpc { port: Some(50051) }
+            &ConnectionMode::Grpc { port: Some(50051) }
         );
         assert_eq!(worker.metadata().labels, labels);
         assert_eq!(
@@ -459,7 +459,7 @@ mod tests {
         assert_eq!(worker.url(), "http://localhost:8080@2");
         assert_eq!(worker.dp_rank(), Some(2));
         assert_eq!(worker.dp_size(), Some(8));
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
     }
 
     #[test]
@@ -522,10 +522,10 @@ mod tests {
         assert_eq!(worker.url(), "grpc://cluster.local@1");
         assert_eq!(worker.dp_rank(), Some(1));
         assert_eq!(worker.dp_size(), Some(4));
-        assert_eq!(worker.worker_type(), WorkerType::Decode);
+        assert_eq!(worker.worker_type(), &WorkerType::Decode);
         assert_eq!(
             worker.connection_mode(),
-            ConnectionMode::Grpc { port: Some(50051) }
+            &ConnectionMode::Grpc { port: Some(50051) }
         );
         assert_eq!(
             worker.metadata().labels.get("transport"),
