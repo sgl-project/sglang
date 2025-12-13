@@ -7,11 +7,13 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import jinja2
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -74,6 +76,24 @@ class OpenAIServingChat(OpenAIServingBase):
             logger.info(
                 f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
             )
+
+        # Check if the model is a GPT-OSS model
+        self.is_gpt_oss = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
+        )
+
+        self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+    def _use_dpsk_v32_encoding(self) -> bool:
+        has_chat_template = (
+            self.tokenizer_manager.tokenizer is not None
+            and self.tokenizer_manager.tokenizer.chat_template is not None
+        )
+        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
+        return not has_chat_template and is_dpsk_v32
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -191,9 +211,11 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
+            require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
@@ -205,14 +227,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
-        is_gpt_oss = (
-            hasattr(self.tokenizer_manager.model_config, "hf_config")
-            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
-        )
-
         # GptOss model needs to keep special tokens for harmony parsing
-        if is_gpt_oss:
+        if self.is_gpt_oss:
             request.skip_special_tokens = False
 
         tool_call_constraint = None
@@ -269,92 +285,117 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        for message in request.messages:
-            if message.content is None:
-                message.content = ""
-            msg_dict = message.model_dump()
-
-            # Process content based on detected template format
-            processed_msg = process_content_for_template_format(
-                msg_dict,
-                template_content_format,
-                image_data,
-                video_data,
-                audio_data,
-                modalities,
+        if self.use_dpsk_v32_encoding:
+            thinking_mode = (
+                "thinking"
+                if (request.chat_template_kwargs or {}).get("thinking")
+                else "chat"
             )
+            messages = request.messages
+            messages = [msg.model_dump() for msg in messages]
+            if request.tools:
+                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+            real_input = encode_messages(
+                messages, thinking_mode=thinking_mode, drop_thinking=False
+            )
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+        else:
+            for message in request.messages:
+                if message.content is None:
+                    message.content = ""
+                msg_dict = message.model_dump()
 
-            # per the Transformers docs & maintainers, tool call arguments in
-            # assistant-role messages with tool_calls need to be dicts not JSON str -
-            # this is how tool-use chat templates will expect them moving forwards
-            # so, for messages that have tool_calls, parse the string (which we get
-            # from openAI format) to dict
+                # Process content based on detected template format
+                processed_msg = process_content_for_template_format(
+                    msg_dict,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                )
+
+                # per the Transformers docs & maintainers, tool call arguments in
+                # assistant-role messages with tool_calls need to be dicts not JSON str -
+                # this is how tool-use chat templates will expect them moving forwards
+                # so, for messages that have tool_calls, parse the string (which we get
+                # from openAI format) to dict
+                if (
+                    processed_msg["role"] == "assistant"
+                    and "tool_calls" in processed_msg
+                    and isinstance(processed_msg["tool_calls"], list)
+                ):
+                    for item in processed_msg["tool_calls"]:
+                        if "arguments" in item["function"] and isinstance(
+                            item["function"]["arguments"], str
+                        ):
+                            item["function"]["arguments"] = orjson.loads(
+                                item["function"]["arguments"]
+                            )
+
+                openai_compatible_messages.append(processed_msg)
+
+            # Handle assistant prefix for continue_final_message
+            assistant_prefix = None
             if (
-                processed_msg["role"] == "assistant"
-                and "tool_calls" in processed_msg
-                and isinstance(processed_msg["tool_calls"], list)
+                openai_compatible_messages
+                and openai_compatible_messages[-1]["role"] == "assistant"
             ):
-                for item in processed_msg["tool_calls"]:
-                    if "arguments" in item["function"] and isinstance(
-                        item["function"]["arguments"], str
-                    ):
-                        item["function"]["arguments"] = orjson.loads(
-                            item["function"]["arguments"]
-                        )
+                if request.continue_final_message:
+                    assistant_prefix = openai_compatible_messages[-1]["content"]
+                    openai_compatible_messages = openai_compatible_messages[:-1]
 
-            openai_compatible_messages.append(processed_msg)
+            try:
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    reasoning_effort=request.reasoning_effort,
+                    **(
+                        request.chat_template_kwargs
+                        if request.chat_template_kwargs
+                        else {}
+                    ),
+                )
+            except Exception as e:
+                # If the first attempt fails, try transforming the tools format
+                # This handles models like Mistral that have a different tools input format
+                # that is not compatible with OpenAI's apply_chat_template tool_call format
+                tools = (
+                    [t if "function" in t else {"function": t} for t in tools]
+                    if tools
+                    else None
+                )
+                try:
+                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        reasoning_effort=request.reasoning_effort,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
+                except jinja2.TemplateError as template_error:
+                    # Template errors (e.g., from raise_exception in Jinja templates)
+                    # should be treated as client errors (400 BadRequest)
+                    raise ValueError(str(template_error)) from template_error
 
-        # Handle assistant prefix for continue_final_message
-        assistant_prefix = None
-        if (
-            openai_compatible_messages
-            and openai_compatible_messages[-1]["role"] == "assistant"
-        ):
-            if request.continue_final_message:
-                assistant_prefix = openai_compatible_messages[-1]["content"]
-                openai_compatible_messages = openai_compatible_messages[:-1]
+            if assistant_prefix:
+                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+                if (
+                    encoded
+                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
+                ):
+                    encoded = encoded[1:]
+                prompt_ids += encoded
 
-        try:
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                openai_compatible_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=tools,
-                reasoning_effort=request.reasoning_effort,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
-                return_dict=False,
-            )
-        except Exception:
-            # This except branch will be triggered when the chosen model
-            # has a different tools input format that is not compatible
-            # with openAI's apply_chat_template tool_call format, like Mistral.
-            tools = (
-                [t if "function" in t else {"function": t} for t in tools]
-                if tools
-                else None
-            )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                openai_compatible_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=tools,
-                reasoning_effort=request.reasoning_effort,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
-                return_dict=False,
-            )
-
-        if assistant_prefix:
-            encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-            if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
-                encoded = encoded[1:]
-            prompt_ids += encoded
-
-        if is_multimodal:
-            prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -405,7 +446,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
-            if self._get_enable_thinking_from_request(request):
+            if self._get_reasoning_from_request(
+                request
+            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
+                # qwen3 and glm4 think internally without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
@@ -737,7 +781,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
-                    or self._get_enable_thinking_from_request(request)
+                    or self._get_reasoning_from_request(request)
                 )
                 try:
                     parser = ReasoningParser(
@@ -984,7 +1028,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
-                or self._get_enable_thinking_from_request(request)
+                or self._get_reasoning_from_request(request)
             )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
@@ -1014,27 +1058,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
-    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
-
-        NOTE: This parameter is only useful for models that support enable_thinking
-        flag, such as Qwen3.
-
-        Args:
-            request_obj: The request object (or an item from a list of requests).
-        Returns:
-            The boolean value of 'enable_thinking' if found, otherwise False.
-        """
-        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
-            # For Qwen3 models, `enable_thinking` is supported.
-            if self.reasoning_parser in ["qwen3", "glm45"]:
-                return request.chat_template_kwargs.get("enable_thinking", False)
-            # For DeepSeek-V3.1 models, `thinking` is supported.
-            elif self.reasoning_parser in ["deepseek-v3"]:
-                return request.chat_template_kwargs.get("thinking", False)
-            else:
-                return False
-        return False
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Judge whether the request needs reasoning"""
+        if not self.reasoning_parser:
+            return False
+        if self.reasoning_parser in ["deepseek-v3"]:
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser in ["qwen3", "glm45"]:
+            # qwen3 and glm45 are reasoning by default
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking", True) is True
+            )
+        return True  # default
 
     async def _process_tool_call_stream(
         self,

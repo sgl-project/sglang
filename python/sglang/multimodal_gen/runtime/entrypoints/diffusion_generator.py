@@ -4,14 +4,13 @@
 """
 DiffGenerator module for sglang-diffusion.
 
-This module provides a consolidated interface for generating videos using
+This module provides a consolidated interface for generating images/videos using
 diffusion models.
 """
 
 import multiprocessing as mp
 import os
 import time
-from copy import deepcopy
 from typing import Any
 
 import imageio
@@ -20,7 +19,10 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -34,6 +36,8 @@ from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
+    log_batch_completion,
+    log_generation_timer,
     suppress_loggers,
     suppress_other_loggers,
 )
@@ -78,9 +82,6 @@ class DiffGenerator:
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
-        self._current_lora_path: str | None = None
-        self._current_lora_nickname: str | None = None
-        self._is_lora_merged: bool = False
 
     @classmethod
     def from_pretrained(
@@ -206,32 +207,18 @@ class DiffGenerator:
 
     def generate(
         self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
-        **kwargs,
+        sampling_params_kwargs: dict | None = None,
     ) -> dict[str, Any] | list[np.ndarray] | list[dict[str, Any]] | None:
         """
         Generate a image/video based on the given prompt.
 
         Args:
-            prompt: The prompt to use for generation (optional if prompt_txt is provided)
-            output_file_name: Name of the file to save. Default is the first 100 characters of the prompt.
-            save_output: Whether to save the output to disk
-            return_frames: Whether to return the raw frames
-            num_inference_steps: Number of denoising steps (overrides server_args)
-            guidance_scale: Classifier-free guidance scale (overrides server_args)
-            num_frames: Number of frames to generate (overrides server_args)
-            height: Height of generated file (overrides server_args)
-            width: Width of generated file (overrides server_args)
-            fps: Frames per second for saved file (overrides server_args)
-            seed: Random seed for generation (overrides server_args)
-            callback: Callback function called after each step
-            callback_steps: Number of steps between each callback
 
         Returns:
             Either the output dictionary, list of frames, or list of results for batch processing
         """
         # 1. prepare requests
+        prompt = sampling_params_kwargs.get("prompt", None)
         prompts: list[str] = []
         # Handle batch processing from text file
         if self.server_args.prompt_file_path is not None:
@@ -256,29 +243,19 @@ class DiffGenerator:
         else:
             raise ValueError("Either prompt or prompt_txt must be provided")
 
-        pretrained_sampling_params = SamplingParams.from_pretrained(
-            self.server_args.model_path, **kwargs
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs,
         )
-        pretrained_sampling_params._merge_with_user_params(sampling_params)
-        # TODO: simplify
-        data_type = (
-            DataType.IMAGE
-            if self.server_args.pipeline_config.task_type.is_image_gen()
-            or pretrained_sampling_params.num_frames == 1
-            else DataType.VIDEO
-        )
-        pretrained_sampling_params.data_type = data_type
-        pretrained_sampling_params._set_output_file_name()
-        pretrained_sampling_params.adjust(self.server_args)
 
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
-            current_sampling_params = deepcopy(pretrained_sampling_params)
-            current_sampling_params.prompt = p
+            sampling_params.prompt = p
             requests.append(
                 prepare_request(
                     server_args=self.server_args,
-                    sampling_params=current_sampling_params,
+                    sampling_params=sampling_params,
                 )
             )
 
@@ -287,73 +264,54 @@ class DiffGenerator:
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
-            logger.info(
-                "Processing prompt %d/%d: %s",
-                request_idx + 1,
-                len(requests),
-                req.prompt[:100],
-            )
             try:
-                start_time = time.perf_counter()
-                output_batch = self._send_to_scheduler_and_wait_for_response([req])
-                gen_time = time.perf_counter() - start_time
-                if output_batch.error:
-                    raise Exception(f"{output_batch.error}")
+                with log_generation_timer(
+                    logger, req.prompt, request_idx + 1, len(requests)
+                ) as timer:
+                    output_batch = self._send_to_scheduler_and_wait_for_response([req])
+                    if output_batch.error:
+                        raise Exception(f"{output_batch.error}")
 
-                # FIXME: in generate mode, an internal assertion error won't raise an error
-                logger.info(
-                    "Pixel data generated successfully in %.2f seconds",
-                    gen_time,
-                )
+                    if output_batch.output is None:
+                        logger.error(
+                            "Received empty output from scheduler for prompt %d",
+                            request_idx + 1,
+                        )
+                        continue
+                    for output_idx, sample in enumerate(output_batch.output):
+                        num_outputs = len(output_batch.output)
+                        frames = self.post_process_sample(
+                            sample,
+                            fps=req.fps,
+                            save_output=req.save_output,
+                            save_file_path=req.output_file_path(
+                                num_outputs, output_idx
+                            ),
+                            data_type=req.data_type,
+                        )
 
-                if output_batch.output is None:
-                    logger.error(
-                        "Received empty output from scheduler for prompt %d",
-                        request_idx + 1,
-                    )
-                    continue
-                for output_idx, sample in enumerate(output_batch.output):
-                    num_outputs = len(output_batch.output)
-                    frames = self.post_process_sample(
-                        sample,
-                        fps=req.fps,
-                        save_output=req.save_output,
-                        save_file_path=req.output_file_path(num_outputs, output_idx),
-                        data_type=req.data_type,
-                    )
-
-                    result_item: dict[str, Any] = {
-                        "samples": sample,
-                        "frames": frames,
-                        "prompts": req.prompt,
-                        "size": (req.height, req.width, req.num_frames),
-                        "generation_time": gen_time,
-                        "timings": (
-                            output_batch.timings.to_dict()
-                            if output_batch.timings
-                            else {}
-                        ),
-                        "trajectory": output_batch.trajectory_latents,
-                        "trajectory_timesteps": output_batch.trajectory_timesteps,
-                        "trajectory_decoded": output_batch.trajectory_decoded,
-                        "prompt_index": output_idx,
-                    }
-                    results.append(result_item)
-            except Exception as e:
-                logger.error(
-                    "Failed to generate output for prompt %d: %s",
-                    request_idx + 1,
-                    e,
-                    exc_info=True,
-                )
+                        result_item: dict[str, Any] = {
+                            "samples": sample,
+                            "frames": frames,
+                            "prompts": req.prompt,
+                            "size": (req.height, req.width, req.num_frames),
+                            "generation_time": timer.duration,
+                            "timings": (
+                                output_batch.timings.to_dict()
+                                if output_batch.timings
+                                else {}
+                            ),
+                            "trajectory": output_batch.trajectory_latents,
+                            "trajectory_timesteps": output_batch.trajectory_timesteps,
+                            "trajectory_decoded": output_batch.trajectory_decoded,
+                            "prompt_index": output_idx,
+                        }
+                        results.append(result_item)
+            except Exception:
                 continue
 
         total_gen_time = time.perf_counter() - total_start_time
-        logger.info(
-            "Completed batch processing. Generated %d outputs in %.2f seconds.",
-            len(results),
-            total_gen_time,
-        )
+        log_batch_completion(logger, len(results), total_gen_time)
 
         if len(results) == 0:
             return None
@@ -383,29 +341,57 @@ class DiffGenerator:
             )
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
-    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
-        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
+    def set_lora(
+        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+    ) -> None:
+        """
+        Set a LoRA adapter for the specified transformer(s).
+
+        Args:
+            lora_nickname: The nickname of the adapter.
+            lora_path: Path to the LoRA adapter.
+            target: Which transformer(s) to apply the LoRA to. One of:
+                - "all": Apply to all transformers (default)
+                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
+                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
+                - "critic": Apply only to the critic model
+        """
+        req = SetLoraReq(
+            lora_nickname=lora_nickname, lora_path=lora_path, target=target
+        )
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname}",
+            f"Successfully set LoRA adapter: {lora_nickname} (target: {target})",
             "Failed to set LoRA adapter",
         )
 
-    def unmerge_lora_weights(self) -> None:
-        req = UnmergeLoraWeightsReq()
+    def unmerge_lora_weights(self, target: str = "all") -> None:
+        """
+        Unmerge LoRA weights from the base model.
+
+        Args:
+            target: Which transformer(s) to unmerge.
+        """
+        req = UnmergeLoraWeightsReq(target=target)
         self._send_lora_request(
             req,
-            "Successfully unmerged LoRA weights",
+            f"Successfully unmerged LoRA weights (target: {target})",
             "Failed to unmerge LoRA weights",
         )
-        self._is_lora_merged = False
 
-    def merge_lora_weights(self) -> None:
-        req = MergeLoraWeightsReq()
+    def merge_lora_weights(self, target: str = "all") -> None:
+        """
+        Merge LoRA weights into the base model.
+
+        Args:
+            target: Which transformer(s) to merge.
+        """
+        req = MergeLoraWeightsReq(target=target)
         self._send_lora_request(
-            req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
+            req,
+            f"Successfully merged LoRA weights (target: {target})",
+            "Failed to merge LoRA weights",
         )
-        self._is_lora_merged = True
 
     def _ensure_lora_state(
         self,
@@ -413,29 +399,27 @@ class DiffGenerator:
         lora_nickname: str | None = None,
         merge_lora: bool = True,
     ) -> None:
+        """
+        Ensure the LoRA state matches the desired configuration.
+
+        Note: This method does not cache client-side state. The server handles
+        idempotent operations, so redundant calls are safe but may have minor overhead.
+        """
         if lora_path is None:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-            self._current_lora_path = None
-            self._current_lora_nickname = None
-            self._is_lora_merged = False
+            # Unmerge all LoRA weights when no lora_path is provided
+            self.unmerge_lora_weights()
             return
 
         lora_nickname = lora_nickname or self.server_args.lora_nickname
 
-        if self._current_lora_path != lora_path:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-                self._is_lora_merged = False
-            self.set_lora(lora_nickname, lora_path)
-            self._current_lora_path = lora_path
-            self._current_lora_nickname = lora_nickname
-            self._is_lora_merged = False
+        # Set the LoRA adapter (server handles idempotent logic)
+        self.set_lora(lora_nickname, lora_path)
 
-        if merge_lora and not self._is_lora_merged:
+        # Merge or unmerge based on the merge_lora flag
+        if merge_lora:
             self.merge_lora_weights()
-        elif not merge_lora:
-            self._is_lora_merged = False
+        else:
+            self.unmerge_lora_weights()
 
     def generate_with_lora(
         self,

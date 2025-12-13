@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import dataclasses
 import os
+import time
 from typing import Optional
 
 import imageio
@@ -10,8 +11,12 @@ import torchvision
 from einops import rearrange
 from fastapi import UploadFile
 
-from sglang.multimodal_gen.configs.sample.base import DataType
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    log_batch_completion,
+    log_generation_timer,
+)
 
 logger = init_logger(__name__)
 
@@ -20,16 +25,17 @@ logger = init_logger(__name__)
 class SetLoraReq:
     lora_nickname: str
     lora_path: Optional[str] = None
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 @dataclasses.dataclass
 class MergeLoraWeightsReq:
-    pass
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 @dataclasses.dataclass
 class UnmergeLoraWeightsReq:
-    pass
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 def post_process_sample(
@@ -98,16 +104,23 @@ async def process_generation_batch(
     scheduler_client,
     batch,
 ):
-    result = await scheduler_client.forward([batch])
-    if result.output is None:
-        raise RuntimeError("Model generation returned no output.")
+    total_start_time = time.perf_counter()
+    with log_generation_timer(logger, batch.prompt):
+        result = await scheduler_client.forward([batch])
 
-    save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
-    post_process_sample(
-        result.output[0],
-        batch.data_type,
-        batch.fps,
-        batch.save_output,
-        save_file_path,
-    )
+        if result.output is None:
+            raise RuntimeError("Model generation returned no output.")
+
+        save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
+        post_process_sample(
+            result.output[0],
+            batch.data_type,
+            batch.fps,
+            batch.save_output,
+            save_file_path,
+        )
+
+    total_time = time.perf_counter() - total_start_time
+    log_batch_completion(logger, 1, total_time)
+
     return save_file_path

@@ -10,13 +10,15 @@ HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
+    "npu": HWBackend.NPU,
 }
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
     HWBackend.CPU: ["default"],
     HWBackend.AMD: ["stage-a-test-1"],
-    HWBackend.CUDA: ["stage-a-test-1"],
+    HWBackend.CUDA: ["stage-a-test-1", "stage-b-test-small-1-gpu"],
+    HWBackend.NPU: [],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -33,6 +35,12 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.AMD: ["nightly-amd"],
     HWBackend.CPU: [],
+    HWBackend.NPU: [
+        "nightly-1-npu-a3",
+        "nightly-2-npu-a3",
+        "nightly-4-npu-a3",
+        "nightly-16-npu-a3",
+    ],
 }
 
 
@@ -97,9 +105,18 @@ def run_a_suite(args):
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
-    files = glob.glob("**/*.py", recursive=True)
+    # Temporary: search broadly for nightly tests during migration to registered/
+    if nightly:
+        files = glob.glob("**/*.py", recursive=True)
+        sanity_check = False  # Allow files without registration during migration
+    else:
+        files = glob.glob("registered/**/*.py", recursive=True)
+        sanity_check = (
+            True  # Strict: all registered files must have proper registration
+        )
+
     ci_tests = filter_tests(
-        collect_tests(files, sanity_check=False), hw, suite, nightly
+        collect_tests(files, sanity_check=sanity_check), hw, suite, nightly
     )
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
