@@ -669,15 +669,15 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     let message = format!("{}. URL: {}", e, url);
 
     let (status, code) = if e.is_builder() {
-        (StatusCode::BAD_REQUEST, "call_upstream_builder_error")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_builder_error")
     } else if e.is_request() {
-        (StatusCode::BAD_REQUEST, "call_upstream_request_error")
+        (StatusCode::SERVICE_UNAVAILABLE, "call_upstream_request_error")
     } else if e.is_redirect() {
         (StatusCode::BAD_GATEWAY, "call_upstream_redirect_error")
     } else if e.is_status() {
         (StatusCode::BAD_GATEWAY, "call_upstream_status_error")
     } else if e.is_body() {
-        (StatusCode::BAD_GATEWAY, "call_upstream_body_error")
+        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_body_error")
     } else if e.is_decode() {
         (StatusCode::BAD_GATEWAY, "call_upstream_decode_error")
     } else if e.is_timeout() {
