@@ -229,7 +229,6 @@ def ring_attn(
     use_segment_id = parse(torch.__version__).release >= parse("2.6.0").release
 
     attn_kwargs = dict(
-        mesh=ring_pg,
         op=attn_callable_adapter,
         dropout_p=dropout_p,
         is_causal=is_causal,
