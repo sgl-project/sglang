@@ -61,39 +61,33 @@ class CausalConv3d(nn.Conv3d):
         if isinstance(self.prev_cache, torch.Tensor):
             self.prev_cache = None
 
+    def _forward_with_cache(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, t, h, w = x.shape
+        x_with_cache = torch.cat([self.prev_cache, x], dim=2)
+        x_with_cache = (
+            x_with_cache.to(self.weight.dtype)
+            if current_platform.is_mps()
+            else x_with_cache
+        )
+        x = super().forward(x_with_cache)
+        self.prev_cache = x_with_cache.narrow(2, t, self.pad_t)
+        return x
+
 
 class QwenImageCausalConv3d(CausalConv3d):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, t, h, w = x.shape
         if self.prev_cache is None:
             self.prev_cache = x.new_zeros((b, c, self.pad_t, h, w))
-        x_with_cache = torch.cat([self.prev_cache, x], dim=2)
-        x_with_cache = (
-            x_with_cache.to(self.weight.dtype)
-            if current_platform.is_mps()
-            else x_with_cache
-        )  # casting needed for mps since amp isn't supported
-        x = super().forward(x_with_cache)
-        self.prev_cache = x_with_cache.narrow(2, t, self.pad_t)
-        return x
+        return self._forward_with_cache(x)
 
 
 class QwenImageCausalEncodeTimeConv3d(CausalConv3d):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, t, h, w = x.shape
-
         if self.prev_cache is None:
             self.prev_cache = x
             return x
-        x_with_cache = torch.cat([self.prev_cache, x], dim=2)
-        x_with_cache = (
-            x_with_cache.to(self.weight.dtype)
-            if current_platform.is_mps()
-            else x_with_cache
-        )  # casting needed for mps since amp isn't supported
-        x = super().forward(x_with_cache)
-        self.prev_cache = x_with_cache.narrow(2, t, self.pad_t)
-        return x
+        return self._forward_with_cache(x)
 
 
 class QwenImageCausalDecodeTimeConv3d(CausalConv3d):
@@ -102,16 +96,8 @@ class QwenImageCausalDecodeTimeConv3d(CausalConv3d):
         if self.prev_cache is None:
             self.prev_cache = x.new_zeros((b, c, self.pad_t, h, w))
             return x
-        x_with_cache = torch.cat([self.prev_cache, x], dim=2)
-        x_with_cache = (
-            x_with_cache.to(self.weight.dtype)
-            if current_platform.is_mps()
-            else x_with_cache
-        )  # casting needed for mps since amp isn't supported
-        x = super().forward(x_with_cache)
-        x = rearrange(x, "b (r c) t h w -> b c (t r) h w", r=2)
-        self.prev_cache = x_with_cache.narrow(2, t, self.pad_t)
-        return x
+        x = self._forward_with_cache(x)
+        return rearrange(x, "b (r c) t h w -> b c (t r) h w", r=2)
 
 
 class QwenImageRMS_norm(nn.Module):
@@ -832,10 +818,7 @@ class AutoencoderKLQwenImage(nn.Module):
         x = self.post_quant_conv(z)
         out = []
         for i in range(num_frame):
-            if i == 0:
-                out_ = self.decoder(x[:, :, i: i + 1, :, :])
-            else:
-                out_ = self.decoder(x[:, :, i: i + 1, :, :])
+            out_ = self.decoder(x[:, :, i: i + 1, :, :])
             out.append(out_)
         out = torch.cat(out, 2)
 
