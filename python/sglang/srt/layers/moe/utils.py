@@ -151,21 +151,10 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
-
-    # TODO: Remove this check after verifying no accuracy regression with flashinfer_trtllm speculative backend
-    if server_args.speculative_moe_runner_backend is not None:
-        assert not MoeRunnerBackend(
-            server_args.speculative_moe_runner_backend
-        ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
-
     SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
-        else (
-            MoeRunnerBackend.AUTO
-            if MOE_RUNNER_BACKEND == MoeRunnerBackend.FLASHINFER_TRTLLM
-            else MOE_RUNNER_BACKEND
-        )
+        else MOE_RUNNER_BACKEND
     )
     SPECULATIVE_MOE_A2A_BACKEND = (
         MoeA2ABackend(server_args.speculative_moe_a2a_backend)
