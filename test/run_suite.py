@@ -111,9 +111,8 @@ def run_a_suite(args):
         sanity_check = False  # Allow files without registration during migration
     else:
         files = glob.glob("registered/**/*.py", recursive=True)
-        sanity_check = (
-            True  # Strict: all registered files must have proper registration
-        )
+        # Strict: all registered files must have proper registration
+        sanity_check = True
 
     ci_tests = filter_tests(
         collect_tests(files, sanity_check=sanity_check), hw, suite, nightly
