@@ -42,7 +42,7 @@ impl PipelineStage for RequestExecutionStage {
                 function = "RequestExecutionStage::execute",
                 "Proto request not built"
             );
-            error::internal_error("Proto request not built")
+            error::internal_error("proto_request_not_built", "Proto request not built")
         })?;
 
         let clients = ctx.state.clients.as_mut().ok_or_else(|| {
@@ -50,7 +50,7 @@ impl PipelineStage for RequestExecutionStage {
                 function = "RequestExecutionStage::execute",
                 "Client acquisition not completed"
             );
-            error::internal_error("Client acquisition not completed")
+            error::internal_error("client_acquisition_not_completed", "Client acquisition not completed")
         })?;
 
         // Extract dispatch metadata for tracing span
@@ -108,7 +108,7 @@ impl RequestExecutionStage {
                 function = "execute_single",
                 "Expected single client but got dual"
             );
-            error::internal_error("Expected single client but got dual")
+            error::internal_error("expected_single_client_got_dual", "Expected single client but got dual")
         })?;
 
         let stream = client.generate(proto_request).await.map_err(|e| {
@@ -117,7 +117,7 @@ impl RequestExecutionStage {
                 error = %e,
                 "Failed to start generation"
             );
-            error::internal_error(format!("Failed to start generation: {}", e))
+            error::internal_error("failed_to_start_generation", format!("Failed to start generation: {}", e))
         })?;
 
         Ok(ExecutionResult::Single { stream })
@@ -133,7 +133,7 @@ impl RequestExecutionStage {
                 function = "execute_dual_dispatch",
                 "Expected dual clients but got single"
             );
-            error::internal_error("Expected dual clients but got single")
+            error::internal_error("expected_dual_clients_got_single", "Expected dual clients but got single")
         })?;
 
         let prefill_request = proto_request.clone_inner();
@@ -153,10 +153,13 @@ impl RequestExecutionStage {
                     error = %e,
                     "Prefill worker failed to start"
                 );
-                return Err(error::internal_error(format!(
-                    "Prefill worker failed to start: {}",
-                    e
-                )));
+                return Err(error::internal_error(
+                    "prefill_worker_failed_to_start",
+                    format!(
+                        "Prefill worker failed to start: {}",
+                        e
+                    )
+                ));
             }
         };
 
@@ -169,10 +172,13 @@ impl RequestExecutionStage {
                     error = %e,
                     "Decode worker failed to start"
                 );
-                return Err(error::internal_error(format!(
-                    "Decode worker failed to start: {}",
-                    e
-                )));
+                return Err(error::internal_error(
+                    "decode_worker_failed_to_start",
+                    format!(
+                        "Decode worker failed to start: {}",
+                        e
+                    )
+                ));
             }
         };
 

@@ -607,7 +607,7 @@ async fn execute_without_mcp(
             error = %e,
             "Failed to convert ResponsesRequest to ChatCompletionRequest"
         );
-        error::bad_request(format!("Failed to convert request: {}", e))
+        error::bad_request("failed_to_convert_request", format!("Failed to convert request: {}", e))
     })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
@@ -628,7 +628,7 @@ async fn execute_without_mcp(
             error = %e,
             "Failed to convert ChatCompletionResponse to ResponsesResponse"
         );
-        error::internal_error(format!("Failed to convert to responses format: {}", e))
+        error::internal_error("failed_to_convert_to_responses_format", format!("Failed to convert to responses format: {}", e))
     })
 }
 
@@ -713,14 +713,17 @@ async fn load_conversation_history(
                     error = %e,
                     "Failed to check conversation existence in storage"
                 );
-                error::internal_error(format!("Failed to check conversation: {}", e))
+                error::internal_error("failed_to_check_conversation", format!("Failed to check conversation: {}", e))
             })?;
 
         if conversation.is_none() {
-            return Err(error::not_found(format!(
-                "Conversation '{}' not found. Please create the conversation first using the conversations API.",
-                conv_id_str
-            )));
+            return Err(error::not_found(
+                "conversation_not_found",
+                format!(
+                    "Conversation '{}' not found. Please create the conversation first using the conversations API.",
+                    conv_id_str
+                )
+            ));
         }
 
         // Load conversation history

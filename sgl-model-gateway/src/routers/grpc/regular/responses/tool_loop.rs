@@ -257,7 +257,7 @@ pub(super) async fn execute_tool_loop(
                 error = %e,
                 "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
             );
-            error::bad_request(format!("Failed to convert request: {}", e))
+            error::bad_request("failed_to_convert_request", format!("Failed to convert request: {}", e))
         })?;
 
         // Prepare tools and tool_choice for this iteration
@@ -315,7 +315,7 @@ pub(super) async fn execute_tool_loop(
                         context = "function_tool_calls",
                         "Failed to convert ChatCompletionResponse to ResponsesResponse"
                     );
-                    error::internal_error(format!("Failed to convert to responses format: {}", e))
+                    error::internal_error("failed_to_convert_to_responses_format", format!("Failed to convert to responses format: {}", e))
                 })?;
 
                 // Return response with function tool calls to caller
@@ -352,7 +352,7 @@ pub(super) async fn execute_tool_loop(
                         context = "max_tool_calls_limit",
                         "Failed to convert ChatCompletionResponse to ResponsesResponse"
                     );
-                    error::internal_error(format!("Failed to convert to responses format: {}", e))
+                    error::internal_error("failed_to_convert_to_responses_format", format!("Failed to convert to responses format: {}", e))
                 })?;
 
                 // Mark as completed but with incomplete details
@@ -481,7 +481,7 @@ pub(super) async fn execute_tool_loop(
                     context = "final_response",
                     "Failed to convert ChatCompletionResponse to ResponsesResponse"
                 );
-                error::internal_error(format!("Failed to convert to responses format: {}", e))
+                error::internal_error("failed_to_convert_to_responses_format", format!("Failed to convert to responses format: {}", e))
             })?;
 
             // Inject MCP metadata into output

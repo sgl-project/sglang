@@ -332,10 +332,13 @@ async fn execute_with_mcp_loop(
                 max_iterations = MAX_TOOL_ITERATIONS,
                 "Maximum tool iterations exceeded"
             );
-            return Err(error::internal_error(format!(
-                "Maximum tool iterations ({}) exceeded",
-                MAX_TOOL_ITERATIONS
-            )));
+            return Err(error::internal_error(
+                "maximum_tool_iterations_exceeded",
+                format!(
+                    "Maximum tool iterations ({}) exceeded",
+                    MAX_TOOL_ITERATIONS
+                )
+            ));
         }
 
         debug!(
@@ -1176,10 +1179,13 @@ async fn execute_mcp_tools(
                 error = %e,
                 "Failed to parse tool arguments JSON"
             );
-            error::internal_error(format!(
-                "Invalid tool arguments JSON for tool '{}': {}",
-                tool_call.function.name, e
-            ))
+            error::internal_error(
+                "invalid_tool_arguments_json",
+                format!(
+                    "Invalid tool arguments JSON for tool '{}': {}",
+                    tool_call.function.name, e
+                )
+            )
         })?;
 
         // Execute tool via MCP manager
@@ -1544,10 +1550,13 @@ async fn load_previous_messages(
                 error = %e,
                 "Failed to load previous response chain from storage"
             );
-            error::internal_error(format!(
-                "Failed to load previous response chain for {}: {}",
-                prev_id_str, e
-            ))
+            error::internal_error(
+                "failed_to_load_previous_response_chain",
+                format!(
+                    "Failed to load previous response chain for {}: {}",
+                    prev_id_str, e
+                )
+            )
         })?;
 
     // Build conversation history from stored responses
