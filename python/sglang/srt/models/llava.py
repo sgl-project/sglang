@@ -21,7 +21,14 @@ from typing import Dict, Iterable, List, Optional, Tuple, Type, Union
 import numpy as np
 import torch
 from torch import nn
-from transformers import CLIPVisionConfig, LlavaConfig, MistralConfig, Qwen2Config
+from transformers import (
+    CLIPVisionConfig,
+    CLIPVisionModel,
+    LlavaConfig,
+    MistralConfig,
+    Qwen2Config,
+    SiglipVisionModel,
+)
 from transformers.models.auto.modeling_auto import AutoModel, AutoModelForCausalLM
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
@@ -431,47 +438,61 @@ class LlavaBaseForCausalLM(nn.Module):
             return self.language_model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Load clip vision model by cfg['mm_vision_tower']:
+        # huggingface_name or path_of_clip_relative_to_llava_model_dir
+        # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
+        vision_path = self.config.mm_vision_tower
+        if "clip" in vision_path:
+            self.vision_tower = CLIPVisionModel.from_pretrained(
+                vision_path, torch_dtype=torch.float16
+            ).cuda()
+        elif "siglip" in vision_path:
+            self.vision_tower = SiglipVisionModel.from_pretrained(
+                vision_path, torch_dtype=torch.float16
+            ).cuda()
+            # Siglip needs all feature tokens
+            self.config.mm_vision_select_feature = "full"
+        self.vision_tower.eval()
 
+        self.vision_feature_layer = self.config.mm_vision_select_layer
+        self.vision_feature_select_strategy = self.config.mm_vision_select_feature
+        self.image_size = self.vision_tower.config.image_size
+        self.patch_size = self.vision_tower.config.patch_size
+
+        self.mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
+        self.image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
+        self.image_grid_pinpoints = getattr(self.config, "image_grid_pinpoints", None)
+
+        self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
+        if (
+            self.vision_feature_select_strategy == "patch"
+            or self.vision_feature_select_strategy == "full"
+        ):
+            pass
+        elif self.vision_feature_select_strategy == "cls_patch":
+            self.image_feature_len += 1
+        else:
+            raise ValueError(f"Unexpected select feature: {self.select_feature}")
+
+        # load mm_projector
         projector_weights = {
-            "model.mm_projector": "multi_modal_projector",
-            "model.vision_tower": "vision_tower",
-            "model.image_newline": "image_newline",
+            "model.mm_projector.0": "multi_modal_projector.linear_1",
+            "model.mm_projector.2": "multi_modal_projector.linear_2",
+            "model.vision_tower.vision_tower": "vision_tower",
+            # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }
-
-        if self.vision_feature_select_strategy == "cls_patch":
-            self.image_feature_len += 1
-        elif self.vision_feature_select_strategy not in ("default", "patch", "full"):
-            raise ValueError(
-                f"Unexpected select feature: {self.vision_feature_select_strategy}"
-            )
-
         params_dict = dict(self.named_parameters())
-
         for name, loaded_weight in weights:
-
-            # 1. Handle Language Model weights
-            if name.startswith("language_model."):
-                child_name = name[len("language_model.") :]
-                self.language_model.load_weights([(child_name, loaded_weight)])
-                continue
-
-            # 2. Handle Vision Tower weights
-            if name.startswith("vision_tower."):
-                child_name = name[len("vision_tower.") :]
-                self.vision_tower.load_weights([(child_name, loaded_weight)])
-                continue
-
-            # 3. Handle Direct Parameter Loading (Projector / Others)
-            if name in params_dict:
+            if "projector" in name or "vision_tower" in name or "image_newline" in name:
+                for weight_name, param_name in projector_weights.items():
+                    if weight_name in name:
+                        name = name.replace(weight_name, param_name)
                 param = params_dict[name]
-
-                if hasattr(param, "weight_loader"):
-                    weight_loader = param.weight_loader
-                else:
-                    weight_loader = default_weight_loader
-
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+            else:
+                self.language_model.load_weights([(name, loaded_weight)])
 
     @property
     def num_patches_per_side(self):
@@ -788,14 +809,11 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
-        # FIX: Explicitly allow "default" which is common in HF configs
         if (
-            self.vision_feature_select_strategy == "default"
-            or self.vision_feature_select_strategy == "patch"
+            self.vision_feature_select_strategy == "patch"
             or self.vision_feature_select_strategy == "full"
         ):
             pass
-        # -------------------------------------------------------------
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1
         else:
