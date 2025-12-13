@@ -675,6 +675,10 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         (StatusCode::BAD_GATEWAY, "invalid_status")
     } else if e.is_redirect() {
         (StatusCode::BAD_GATEWAY, "redirect_error")
+    } else if e.is_body() {
+        (StatusCode::BAD_GATEWAY, "body_error")
+    } else if e.is_decode() {
+        (StatusCode::BAD_GATEWAY, "decode_error")
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, "request_failed")
     };
