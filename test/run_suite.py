@@ -114,9 +114,8 @@ def run_a_suite(args):
         # Strict: all registered files must have proper registration
         sanity_check = True
 
-    ci_tests = filter_tests(
-        collect_tests(files, sanity_check=sanity_check), hw, suite, nightly
-    )
+    all_tests = collect_tests(files, sanity_check=sanity_check)
+    ci_tests = filter_tests(all_tests, hw, suite, nightly)
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
     if not test_files:
