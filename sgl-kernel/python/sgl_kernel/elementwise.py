@@ -404,3 +404,58 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
+
+
+def fused_layernorm_scale_shift(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    LayerNorm(x; gamma, beta) followed by fused scale/shift.
+    Expects:
+      - x: [M, N], contiguous on last dim
+      - gamma/beta: [N]
+      - scale/shift: [M, N] or [B, F, 1, N]
+    """
+    return torch.ops.sgl_kernel.fused_layernorm_scale_shift.default(
+        x, gamma, beta, scale, shift
+    )
+
+
+def fused_layernorm_scale_shift_no_affine(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    LayerNorm(x; gamma=1, beta=0) followed by fused scale/shift.
+    Expects:
+      - x: [M, N], contiguous on last dim
+      - scale/shift: [M, N] or [B, F, 1, N]
+    """
+    return torch.ops.sgl_kernel.fused_layernorm_scale_shift_no_affine(x, scale, shift)
+
+
+def fused_scale_residual_layernorm_scale_shift(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    gate: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Fused: (residual + gate * x) -> LayerNorm(gamma, beta) -> scale/shift.
+    Expects:
+      - residual/x: [M, N], contiguous on last dim
+      - gamma/beta: [N]
+      - scale/shift: [M, N] or [B, F, 1, N]
+      - gate: None, [M, N], [B, 1, N], or [B, F, 1, N]
+    """
+    return torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift.default(
+        residual, x, gamma, beta, scale, shift, gate
+    )
