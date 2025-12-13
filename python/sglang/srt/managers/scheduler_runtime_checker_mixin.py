@@ -3,8 +3,11 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING
+
+import psutil
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -302,33 +305,47 @@ class SchedulerRuntimeCheckerMixin:
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
 
-    def watchdog_thread(self: Scheduler):
-        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
-        self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.perf_counter()
+
+class SchedulerWatchdog:
+    """A watch dog that will try to kill the server itself if one forward batch takes too long."""
+
+    def __init__(self, scheduler: Scheduler, watchdog_timeout: float):
+        self.scheduler = scheduler
+
+        self.watchdog_timeout = watchdog_timeout
+        t = threading.Thread(target=self._watchdog_thread, daemon=True)
+        t.start()
+        self.parent_process = psutil.Process().parent()
+
+    def _watchdog_thread(self):
+        watchdog_last_forward_ct = 0
+        watchdog_last_time = time.perf_counter()
 
         while True:
             current = time.perf_counter()
-            if self.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.forward_ct:
-                    if current > self.watchdog_last_time + self.watchdog_timeout:
+            if self.scheduler.cur_batch is not None:
+                if watchdog_last_forward_ct == self.scheduler.forward_ct:
+                    if current > watchdog_last_time + self.watchdog_timeout:
                         break
                 else:
-                    self.watchdog_last_forward_ct = self.forward_ct
-                    self.watchdog_last_time = current
+                    watchdog_last_forward_ct = self.scheduler.forward_ct
+                    watchdog_last_time = current
             time.sleep(self.watchdog_timeout // 2)
 
         if not disable_request_logging():
+            # TODO extract this duplicated logic w/ another place
             # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid_swa:
-                _, info_msg = self._check_hybrid_memory()
-            elif self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache):
-                _, info_msg = self._check_mamba_memory()
+            if self.scheduler.is_hybrid_swa:
+                _, info_msg = self.scheduler._check_hybrid_memory()
+            elif self.scheduler.is_ssm_model and isinstance(
+                self.scheduler.tree_cache, MambaRadixCache
+            ):
+                _, info_msg = self.scheduler._check_mamba_memory()
             else:
-                _, info_msg = self._check_radix_cache_memory()
+                _, info_msg = self.scheduler._check_radix_cache_memory()
             logger.error(
-                f"{self.cur_batch.batch_size()=}\n"
-                f"{self.cur_batch.reqs=}\n"
+                f"{self.scheduler.cur_batch.batch_size()=}\n"
+                f"{self.scheduler.cur_batch.reqs=}\n"
                 f"{info_msg}"
             )
 
