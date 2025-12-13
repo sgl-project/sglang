@@ -68,7 +68,6 @@ def get_wave_kernel(
         use_scheduling_barriers=False,
         dynamic_symbols=dynamic_symbols,
         use_buffer_ops=True,
-        waves_per_eu=2,
         denorm_fp_math_f32="preserve-sign",
         wave_runtime=True,
     )
