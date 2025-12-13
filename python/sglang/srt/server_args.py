@@ -4215,12 +4215,6 @@ class ServerArgs:
             help="The path of the decrypted draft config file.",
         )
         parser.add_argument(
-            "--mm-enable-dp-encoder",
-            action="store_true",
-            default=ServerArgs.mm_enable_dp_encoder,
-            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
-        )
-        parser.add_argument(
             "--enable-prefix-mm-cache",
             action="store_true",
             default=ServerArgs.enable_prefix_mm_cache,
