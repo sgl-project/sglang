@@ -8,10 +8,13 @@ use tracing::error;
 
 use crate::{
     protocols::{common::InputIds, generate::GenerateRequest},
-    routers::grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        error, utils,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{PreparationOutput, RequestContext},
+            utils,
+        },
     },
     tokenizer::traits::Tokenizer,
 };
@@ -46,7 +49,7 @@ impl GeneratePreparationStage {
             Ok(res) => res,
             Err(msg) => {
                 error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
-                return Err(error::bad_request(msg));
+                return Err(error::bad_request("resolve_input_failed", msg));
             }
         };
 
