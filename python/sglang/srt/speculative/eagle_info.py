@@ -188,9 +188,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             + (self.draft_token_num**2) * batch_size
         )
         if self.custom_mask.numel() < mask_numel:
-            logger.warning(
-                f"Custom mask size mismatch: expected {mask_numel}, got {self.custom_mask.numel()}. Padding with True."
-            )
+            # FIXME(attn): temporary fix for custom mask padding with cuda graph
             self.custom_mask = torch.cat(
                 [
                     self.custom_mask,
