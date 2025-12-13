@@ -151,6 +151,7 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    IS_BLACKWELL = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
@@ -172,6 +173,7 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    SGLANG_CI_SMALL_KV_SIZE = EnvInt(-1)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -192,6 +194,7 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -322,6 +325,7 @@ class Envs:
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+    SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -367,6 +371,15 @@ def _print_deprecated_env(new_name: str, old_name: str):
         os.environ[new_name] = os.environ[old_name]
 
 
+def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
+    """Warn when a deprecated environment variable is used.
+
+    This is for env vars that are deprecated in favor of CLI flags.
+    """
+    if env_name in os.environ:
+        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+
+
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
@@ -386,6 +399,19 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
+
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
 
 
 def example_with_exit_stack():

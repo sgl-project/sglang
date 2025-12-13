@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 use super::{
     client::GrpcClient,
-    error,
     proto_wrapper::{ProtoGenerateComplete, ProtoStream},
     ProcessedMessages,
 };
@@ -28,7 +27,7 @@ use crate::{
         ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
         ReasoningParser,
     },
-    routers::grpc::proto_wrapper::ProtoResponseVariant,
+    routers::{error, grpc::proto_wrapper::ProtoResponseVariant},
     tokenizer::{
         cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
@@ -53,14 +52,20 @@ pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<Grp
                 error = %e,
                 "Failed to get gRPC client from worker"
             );
-            error::internal_error(format!("Failed to get gRPC client: {}", e))
+            error::internal_error(
+                "get_grpc_client_failed",
+                format!("Failed to get gRPC client: {}", e),
+            )
         })?
         .ok_or_else(|| {
             error!(
                 function = "get_grpc_client_from_worker",
                 "Selected worker not configured for gRPC"
             );
-            error::internal_error("Selected worker is not configured for gRPC")
+            error::internal_error(
+                "worker_not_configured_for_grpc",
+                "Selected worker is not configured for gRPC",
+            )
         })?;
 
     Ok((*client_arc).clone())
@@ -197,7 +202,7 @@ pub fn generate_tool_constraints(
             // Return the tool's parameters schema directly (not wrapped in array)
             let params_schema = serde_json::to_string(&tool.function.parameters)
                 .map_err(|e| format!("Failed to serialize tool parameters: {}", e))?;
-            Ok(Some(("json_schema".to_string(), params_schema)))
+            Ok(Some((String::from("json_schema"), params_schema)))
         }
 
         // Required: Array of tool calls with minItems: 1
@@ -613,11 +618,10 @@ pub async fn collect_stream_responses(
                     ProtoResponseVariant::Error(err) => {
                         error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message(), "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
-                        return Err(error::internal_error(format!(
-                            "{} generation failed: {}",
-                            worker_name,
-                            err.message()
-                        )));
+                        return Err(error::internal_error(
+                            "worker_generation_failed",
+                            format!("{} generation failed: {}", worker_name, err.message()),
+                        ));
                     }
                     ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
@@ -630,10 +634,10 @@ pub async fn collect_stream_responses(
             Err(e) => {
                 error!(function = "collect_stream_responses", worker = %worker_name, error = ?e, "Worker stream error");
                 // Don't mark as completed - let Drop send abort for error cases
-                return Err(error::internal_error(format!(
-                    "{} stream failed: {}",
-                    worker_name, e
-                )));
+                return Err(error::internal_error(
+                    "worker_stream_failed",
+                    format!("{} stream failed: {}", worker_name, e),
+                ));
             }
         }
     }
@@ -673,7 +677,13 @@ pub fn generate_tool_call_id(
     tool_index: usize,
     history_count: usize,
 ) -> String {
-    if model.to_lowercase().contains("kimi") {
+    // Case-insensitive check without allocation (search for "kimi" substring)
+    let is_kimi = model
+        .as_bytes()
+        .windows(4) // "kimi".len()
+        .any(|window| window.eq_ignore_ascii_case(b"kimi"));
+
+    if is_kimi {
         // KimiK2 format: functions.{name}:{global_index}
         format!("functions.{}:{}", tool_name, history_count + tool_index)
     } else {
@@ -685,7 +695,7 @@ pub fn generate_tool_call_id(
 /// Check if a reasoning parser is available for the given model
 pub fn check_reasoning_parser_availability(
     reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&String>,
+    configured_parser: Option<&str>,
     model: &str,
 ) -> bool {
     if let Some(parser_name) = configured_parser {
@@ -700,7 +710,7 @@ pub fn check_reasoning_parser_availability(
 /// Check if a tool parser is available for the given model
 pub fn check_tool_parser_availability(
     tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&String>,
+    configured_parser: Option<&str>,
     model: &str,
 ) -> bool {
     if let Some(parser_name) = configured_parser {
@@ -717,7 +727,7 @@ pub fn check_tool_parser_availability(
 /// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
     reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&String>,
+    configured_parser: Option<&str>,
     model: &str,
 ) -> ReasoningPooledParser {
     if let Some(parser_name) = configured_parser {
@@ -741,7 +751,7 @@ pub fn get_reasoning_parser(
 /// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
 pub fn create_reasoning_parser(
     reasoning_parser_factory: &ReasoningParserFactory,
-    configured_parser: Option<&String>,
+    configured_parser: Option<&str>,
     model: &str,
 ) -> Option<Box<dyn ReasoningParser>> {
     if let Some(parser_name) = configured_parser {
@@ -769,7 +779,7 @@ pub fn create_reasoning_parser(
 /// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
     tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&String>,
+    configured_parser: Option<&str>,
     model: &str,
 ) -> ToolPooledParser {
     if let Some(parser_name) = configured_parser {
@@ -793,7 +803,7 @@ pub fn get_tool_parser(
 /// Create a fresh tool parser instance (for streaming where state isolation is needed)
 pub fn create_tool_parser(
     tool_parser_factory: &ToolParserFactory,
-    configured_parser: Option<&String>,
+    configured_parser: Option<&str>,
     model: &str,
 ) -> Option<Box<dyn ToolParser>> {
     if let Some(parser_name) = configured_parser {

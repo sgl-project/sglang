@@ -23,11 +23,13 @@ class LoadFormat(str, enum.Enum):
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
+    FLASH_RL = "flash_rl"  # For RL training with quantized models
     JAX = "jax"
     REMOTE = "remote"
     REMOTE_INSTANCE = "remote_instance"
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
+    PRIVATE = "private"
 
 
 @dataclass
@@ -46,6 +48,8 @@ class LoadConfig:
         "dummy" will initialize the weights with random values, which is
             mainly for profiling.
         "bitsandbytes" will load nf4 type weights.
+        "flash_rl" will load weights with support for RL training
+            with quantized models, enabling efficient weight reloading.
     ignore_patterns: The list of patterns to ignore when loading the model.
         Default to "original/**/*" to avoid repeated loading of llama's
         checkpoints.
@@ -77,6 +81,11 @@ class LoadConfig:
 
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
+
+    # QuantizedRL-specific options (for FlashRL-style quantization)
+    rl_quant_profile: Optional[str] = (
+        None  # Path to rollout quantization profile (e.g., /root/profile.7b.pt)
+    )
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

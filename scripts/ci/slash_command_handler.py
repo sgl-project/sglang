@@ -143,6 +143,7 @@ def handle_rerun_stage(
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
         "stage-a-test-1",
+        "stage-b-test-small-1-gpu",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
@@ -228,7 +229,7 @@ def handle_rerun_stage(
                 comment.create_reaction("+1")
                 pr.create_issue_comment(
                     f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
-                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                    f"It will not be shown in this page. Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
             return True
         else:
