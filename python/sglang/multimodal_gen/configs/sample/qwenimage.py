@@ -13,3 +13,10 @@ class QwenImageSamplingParams(SamplingParams):
     # Denoising stage
     guidance_scale: float = 4.0
     num_inference_steps: int = 50
+
+
+@dataclass
+class QwenImageEditPlusSamplingParams(QwenImageSamplingParams):
+    guidance_scale = None
+    true_cfg_scale: float = 4.0
+    num_inference_steps: int = 40
