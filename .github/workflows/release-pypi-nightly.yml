@@ -126,6 +126,10 @@ jobs:
 
       - name: Update wheel index
         run: |
+          # Patch the script to use test repos
+          sed -i 's|https://github.com/sgl-project/whl|https://github.com/dougyster/test-whl|g' scripts/update_nightly_whl_index.py
+          sed -i 's|https://sgl-project.github.io/whl|https://dougyster.github.io/test-whl|g' scripts/update_nightly_whl_index.py
+
           python3 scripts/update_nightly_whl_index.py \
             --commit-hash ${{ needs.build-nightly-wheel.outputs.commit_hash }} \
             --nightly-version ${{ needs.build-nightly-wheel.outputs.nightly_version }}
