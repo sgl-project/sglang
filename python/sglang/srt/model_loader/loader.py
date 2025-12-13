@@ -93,6 +93,7 @@ from sglang.srt.model_loader.weight_utils import (
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
+    fastsafetensors_weights_iterator,
     set_runai_streamer_env,
 )
 from sglang.srt.utils import (
@@ -373,7 +374,8 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format == LoadFormat.SAFETENSORS:
+        elif (load_format == LoadFormat.SAFETENSORS
+              or load_format == LoadFormat.FASTSAFETENSORS):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == LoadFormat.MISTRAL:
@@ -461,7 +463,11 @@ class DefaultModelLoader(BaseModelLoader):
                 get_global_server_args().weight_loader_disable_mmap
             )
 
-            if extra_config.get("enable_multithread_load"):
+            if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                weights_iterator = fastsafetensors_weights_iterator(
+                    hf_weights_files,
+                )
+            elif extra_config.get("enable_multithread_load"):
                 weights_iterator = multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(

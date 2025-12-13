@@ -81,6 +81,7 @@ LOAD_FORMAT_CHOICES = [
     "layered",
     "remote",
     "remote_instance",
+    "fastsafetensors",
 ]
 
 QUANTIZATION_CHOICES = [
