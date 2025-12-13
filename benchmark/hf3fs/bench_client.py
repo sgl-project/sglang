@@ -74,7 +74,7 @@ def bench():
     numel = bytes_per_page // dtype.itemsize
 
     file_ops = [
-        Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries)
+        Hf3fsUsrBioClient(file_path, file_size, bytes_per_page, entries, 5)
         for _ in range(numjobs)
     ]
 
