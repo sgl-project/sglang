@@ -466,12 +466,12 @@ class FluxTransformer2DModel(CachableDiT):
         """Load weights with mapping for q/k/v -> qkv fusion."""
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("to_qkv", "to_q", "q"),
-            ("to_qkv", "to_k", "k"),
-            ("to_qkv", "to_v", "v"),
-            ("to_added_qkv", "add_q_proj", "q"),
-            ("to_added_qkv", "add_k_proj", "k"),
-            ("to_added_qkv", "add_v_proj", "v"),
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            (".to_added_qkv", ".add_q_proj", "q"),
+            (".to_added_qkv", ".add_k_proj", "k"),
+            (".to_added_qkv", ".add_v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -479,18 +479,19 @@ class FluxTransformer2DModel(CachableDiT):
         for name, loaded_weight in weights:
             # Handle q/k/v -> qkv mapping
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name in name:
-                    # Replace the weight name with the parameter name
-                    model_param_name = name.replace(weight_name, param_name)
+                if weight_name not in name:
+                    continue
 
-                    if model_param_name in params_dict:
-                        param = params_dict[model_param_name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight, shard_id)
-                        loaded_params.add(model_param_name)
-                    break
+                name = name.replace(weight_name, param_name)
+
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
             else:
                 # Use default weight loader for all other parameters
                 if name in params_dict:
