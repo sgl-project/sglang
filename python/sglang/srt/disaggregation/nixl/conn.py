@@ -97,7 +97,9 @@ class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
 
     # KV chunks received per pp_rank: {pp_rank: set of chunk_ids}
-    received_kvs_per_pp: Dict[int, Set[int]] = dataclasses.field(default_factory=lambda: defaultdict(set))
+    received_kvs_per_pp: Dict[int, Set[int]] = dataclasses.field(
+        default_factory=lambda: defaultdict(set)
+    )
     # Expected chunk count per pp_rank (set when is_last=True): {pp_rank: expected_count}
     expected_kvs_per_pp: Dict[int, int] = dataclasses.field(default_factory=dict)
     # Number of PP ranks expected to send data.
@@ -644,10 +646,14 @@ class NixlKVManager(CommonKVManager):
                     is_last = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
                     # Track received chunks per pp_rank
-                    self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(chunk_id)
+                    self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(
+                        chunk_id
+                    )
                     if is_last:
                         # Record expected chunk count for this pp_rank
-                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = chunk_id + 1
+                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = (
+                            chunk_id + 1
+                        )
                         # Set num_pp_ranks_expected from table (or default to 1)
                         if self.transfer_statuses[room].num_pp_ranks_expected is None:
                             self.transfer_statuses[room].num_pp_ranks_expected = (
