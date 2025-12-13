@@ -486,6 +486,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                     page_table_1_flattened.shape[0] == forward_batch.seq_lens_sum
                 ), f"{page_table_1_flattened.shape[0] = } must be the same as {forward_batch.seq_lens_sum = }"
 
+                # Validate page table indices (once per batch)
+                kv_cache_size = forward_batch.token_to_kv_pool.size
+                if page_table_1_flattened.numel() > 0:
+                    max_idx = page_table_1_flattened.max().item()
+                    assert (
+                        max_idx < kv_cache_size
+                    ), f"Invalid page table index: max={max_idx}, kv_cache_size={kv_cache_size}"
+
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = torch.repeat_interleave(
                     cu_seqlens_k[:-1],
