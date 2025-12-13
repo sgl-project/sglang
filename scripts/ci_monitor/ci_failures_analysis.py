@@ -43,12 +43,6 @@ class SGLangFailuresAnalyzer:
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
-        # Target workflows to monitor
-        self.target_workflows = [
-            "pr-test.yml",  # Nvidia GPU tests
-            "nightly-test-nvidia.yml",  # Nightly Nvidia GPU tests
-        ]
-
         # Jobs to EXCLUDE from analysis (administrative/setup jobs, not actual tests)
         self.excluded_jobs = [
             "check-changes",
