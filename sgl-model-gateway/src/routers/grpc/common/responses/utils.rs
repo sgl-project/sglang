@@ -49,6 +49,7 @@ pub async fn ensure_mcp_connection(
                     "Failed to connect to MCP server"
                 );
                 return Err(error::failed_dependency(
+                    "connect_mcp_server_failed",
                     "Failed to connect to MCP server. Check server_url and authorization.",
                 ));
             }
