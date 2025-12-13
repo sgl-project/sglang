@@ -665,9 +665,11 @@ class ForwardBatch:
     ):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens.shape[0]
-        mrope_positions_list = [[]] * batch_size
+        mrope_positions_list: list[Optional[torch.Tensor]] = [None] * batch_size
+
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
+
             if self.forward_mode.is_decode():
                 # 3 * N
                 if mm_input is None:
@@ -699,7 +701,9 @@ class ForwardBatch:
                                 )
                             ]
                         ]
-                        * 3
+                        * 3,
+                        dtype=torch.int64,
+                        device=model_runner.device,
                     )
                 else:
                     mrope_positions = mm_input.mrope_positions[
@@ -711,6 +715,21 @@ class ForwardBatch:
                             mm_input, self.seq_lens[batch_idx], model_runner.device
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
+            else:
+                # default: handle other forward_mode
+                mrope_positions_list[batch_idx] = (
+                    torch.arange(
+                        self.seq_lens[batch_idx],
+                        dtype=torch.int64,
+                        device=model_runner.device,
+                    )
+                    .unsqueeze(0)
+                    .repeat(3, 1)
+                )
+
+        assert all(
+            pos is not None for pos in mrope_positions_list
+        ), "Some mrope_positions were not computed"
 
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
