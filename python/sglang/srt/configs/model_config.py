@@ -100,6 +100,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        device: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -114,7 +115,7 @@ class ModelConfig:
         self._validate_quantize_and_serve_config()
 
         # Get hf config
-        self._maybe_pull_model_tokenizer_from_remote()
+        self._maybe_pull_model_tokenizer_from_remote(device)
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
@@ -124,6 +125,7 @@ class ModelConfig:
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            device=device,
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
@@ -245,6 +247,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
+            device=server_args.device,
             override_config_file=server_args.decrypted_config_file,
             **kwargs,
         )
@@ -825,7 +828,7 @@ class ModelConfig:
 
         return default_sampling_params
 
-    def _maybe_pull_model_tokenizer_from_remote(self) -> None:
+    def _maybe_pull_model_tokenizer_from_remote(self, device: str) -> None:
         """
         Pull the model config files to a temporary
         directory in case of remote.
@@ -842,7 +845,7 @@ class ModelConfig:
             # BaseConnector implements __del__() to clean up the local dir.
             # Since config files need to exist all the time, so we DO NOT use
             # with statement to avoid closing the client.
-            client = create_remote_connector(self.model_path)
+            client = create_remote_connector(self.model_path, device)
             if is_remote_url(self.model_path):
                 client.pull_files(allow_pattern=["*config.json"])
                 self.model_weights = self.model_path
