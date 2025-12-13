@@ -57,7 +57,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         // Harmony model support not yet implemented for vLLM
         if builder_client.is_vllm() {
             return Err(error::not_implemented(
-                "harmony_not_implemented_for_vllm",
+                "harmony_vllm_not_supported",
                 "Harmony model support is not yet implemented for vLLM backend. \
                  Please use runtime_type: sglang for Harmony models.",
             ));
@@ -73,7 +73,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     "Generate request type not supported for Harmony models"
                 );
                 return Err(error::bad_request(
-                    "generate_not_supported_with_harmony",
+                    "harmony_generate_not_supported",
                     "Generate requests are not supported with Harmony models".to_string(),
                 ));
             }

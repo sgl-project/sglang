@@ -52,7 +52,7 @@ pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<Grp
                 error = %e,
                 "Failed to get gRPC client from worker"
             );
-            error::internal_error("failed_to_get_grpc_client", format!("Failed to get gRPC client: {}", e))
+            error::internal_error("get_grpc_client_failed", format!("Failed to get gRPC client: {}", e))
         })?
         .ok_or_else(|| {
             error!(

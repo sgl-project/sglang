@@ -333,7 +333,7 @@ async fn execute_with_mcp_loop(
                 "Maximum tool iterations exceeded"
             );
             return Err(error::internal_error(
-                "maximum_tool_iterations_exceeded",
+                "tool_iterations_exceeded",
                 format!(
                     "Maximum tool iterations ({}) exceeded",
                     MAX_TOOL_ITERATIONS
@@ -1180,7 +1180,7 @@ async fn execute_mcp_tools(
                 "Failed to parse tool arguments JSON"
             );
             error::internal_error(
-                "invalid_tool_arguments_json",
+                "invalid_tool_args",
                 format!(
                     "Invalid tool arguments JSON for tool '{}': {}",
                     tool_call.function.name, e
@@ -1551,7 +1551,7 @@ async fn load_previous_messages(
                 "Failed to load previous response chain from storage"
             );
             error::internal_error(
-                "failed_to_load_previous_response_chain",
+                "load_previous_response_chain_failed",
                 format!(
                     "Failed to load previous response chain for {}: {}",
                     prev_id_str, e

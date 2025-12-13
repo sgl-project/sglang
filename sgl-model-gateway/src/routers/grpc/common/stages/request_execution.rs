@@ -117,7 +117,7 @@ impl RequestExecutionStage {
                 error = %e,
                 "Failed to start generation"
             );
-            error::internal_error("failed_to_start_generation", format!("Failed to start generation: {}", e))
+            error::internal_error("start_generation_failed", format!("Failed to start generation: {}", e))
         })?;
 
         Ok(ExecutionResult::Single { stream })

@@ -65,7 +65,7 @@ impl PipelineStage for HarmonyPreparationStage {
                 "Unsupported request type for Harmony pipeline"
             );
             return Err(error::bad_request(
-                "unsupported_request_type_for_harmony",
+                "harmony_request_type_invalid",
                 "Only Chat and Responses requests supported in Harmony pipeline".to_string(),
             ));
         }
@@ -92,7 +92,7 @@ impl HarmonyPreparationStage {
                 "logprobs requested but not supported for Harmony models"
             );
             return Err(error::bad_request(
-                "logprobs_not_supported_for_harmony",
+                "harmony_logprobs_not_supported",
                 "logprobs are not supported for Harmony models".to_string(),
             ));
         }

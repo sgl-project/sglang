@@ -43,7 +43,7 @@ impl PipelineStage for ClientAcquisitionStage {
                         "vLLM backend does not support dual (PD disaggregated) mode"
                     );
                     return Err(error::bad_request(
-                        "vllm_backend_does_not_support_pd_mode",
+                        "vllm_pd_mode_not_supported",
                         "vLLM backend does not support prefill/decode disaggregated mode. \
                          Please use runtime_type: sglang for PD mode, or use a regular (non-PD) worker configuration."
                     ));
