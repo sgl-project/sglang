@@ -33,7 +33,7 @@ DEFAULT_SERVER_ARGS = [
     "--speculative-eagle-topk",
     "1",
     "--speculative-num-draft-tokens",
-    "7",
+    "5",
     "--mem-fraction-static",
     0.7,
 ]
