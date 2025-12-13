@@ -7,7 +7,6 @@ mod executor;
 mod state;
 pub mod types;
 
-// Re-export main types
 pub use definition::{StepDefinition, WorkflowDefinition};
 pub use engine::WorkflowEngine;
 pub use event::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
