@@ -52,14 +52,20 @@ pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<Grp
                 error = %e,
                 "Failed to get gRPC client from worker"
             );
-            error::internal_error(format!("Failed to get gRPC client: {}", e))
+            error::internal_error(
+                "get_grpc_client_failed",
+                format!("Failed to get gRPC client: {}", e),
+            )
         })?
         .ok_or_else(|| {
             error!(
                 function = "get_grpc_client_from_worker",
                 "Selected worker not configured for gRPC"
             );
-            error::internal_error("Selected worker is not configured for gRPC")
+            error::internal_error(
+                "worker_not_configured_for_grpc",
+                "Selected worker is not configured for gRPC",
+            )
         })?;
 
     Ok((*client_arc).clone())
@@ -612,11 +618,10 @@ pub async fn collect_stream_responses(
                     ProtoResponseVariant::Error(err) => {
                         error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message(), "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
-                        return Err(error::internal_error(format!(
-                            "{} generation failed: {}",
-                            worker_name,
-                            err.message()
-                        )));
+                        return Err(error::internal_error(
+                            "worker_generation_failed",
+                            format!("{} generation failed: {}", worker_name, err.message()),
+                        ));
                     }
                     ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
@@ -629,10 +634,10 @@ pub async fn collect_stream_responses(
             Err(e) => {
                 error!(function = "collect_stream_responses", worker = %worker_name, error = ?e, "Worker stream error");
                 // Don't mark as completed - let Drop send abort for error cases
-                return Err(error::internal_error(format!(
-                    "{} stream failed: {}",
-                    worker_name, e
-                )));
+                return Err(error::internal_error(
+                    "worker_stream_failed",
+                    format!("{} stream failed: {}", worker_name, e),
+                ));
             }
         }
     }
