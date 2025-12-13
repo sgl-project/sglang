@@ -1,32 +1,24 @@
-//! Worker Removal Workflow Steps
-//!
-//! This module implements the workflow steps for removing workers from the router.
-//! Handles both single worker removal and DP-aware worker removal with prefix matching.
-//!
-//! Steps:
-//! 1. FindWorkersToRemove - Identify workers to remove based on URL (handles DP-aware prefix matching)
-//! 2. RemoveFromPolicyRegistry - Remove workers from policy registry and cache-aware policies
-//! 3. RemoveFromWorkerRegistry - Remove workers from worker registry
-//! 4. UpdateRemainingPolicies - Update cache-aware policies for remaining workers
+//! Worker removal step implementations.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::{
     app_context::AppContext,
-    core::{workflow::*, Worker},
+    core::Worker,
+    workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
-/// Request structure for worker removal
+/// Request structure for worker removal.
 #[derive(Debug, Clone)]
 pub struct WorkerRemovalRequest {
     pub url: String,
     pub dp_aware: bool,
 }
 
-/// Step 1: Find workers to remove based on URL
+/// Step 1: Find workers to remove based on URL.
 pub struct FindWorkersToRemoveStep;
 
 #[async_trait]
@@ -95,11 +87,11 @@ impl StepExecutor for FindWorkersToRemoveStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Worker not found is not retryable
+        false
     }
 }
 
-/// Step 2: Remove workers from policy registry
+/// Step 2: Remove workers from policy registry.
 pub struct RemoveFromPolicyRegistryStep;
 
 #[async_trait]
@@ -136,11 +128,11 @@ impl StepExecutor for RemoveFromPolicyRegistryStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Policy removal is not retryable
+        false
     }
 }
 
-/// Step 3: Remove workers from worker registry
+/// Step 3: Remove workers from worker registry.
 pub struct RemoveFromWorkerRegistryStep;
 
 #[async_trait]
@@ -181,11 +173,11 @@ impl StepExecutor for RemoveFromWorkerRegistryStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Worker removal is not retryable
+        false
     }
 }
 
-/// Step 4: Update cache-aware policies for remaining workers
+/// Step 4: Update cache-aware policies for remaining workers.
 pub struct UpdateRemainingPoliciesStep;
 
 #[async_trait]
@@ -233,59 +225,6 @@ impl StepExecutor for UpdateRemainingPoliciesStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Policy update is not retryable
+        false
     }
-}
-
-/// Create a worker removal workflow definition
-pub fn create_worker_removal_workflow() -> WorkflowDefinition {
-    WorkflowDefinition::new("worker_removal", "Remove worker from router")
-        .add_step(
-            StepDefinition::new(
-                "find_workers_to_remove",
-                "Find workers to remove",
-                Arc::new(FindWorkersToRemoveStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
-        )
-        .add_step(
-            StepDefinition::new(
-                "remove_from_policy_registry",
-                "Remove workers from policy registry",
-                Arc::new(RemoveFromPolicyRegistryStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
-        )
-        .add_step(
-            StepDefinition::new(
-                "remove_from_worker_registry",
-                "Remove workers from worker registry",
-                Arc::new(RemoveFromWorkerRegistryStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
-        )
-        .add_step(
-            StepDefinition::new(
-                "update_remaining_policies",
-                "Update cache-aware policies for remaining workers",
-                Arc::new(UpdateRemainingPoliciesStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
-        )
 }
