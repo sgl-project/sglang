@@ -20,6 +20,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
@@ -587,10 +588,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
     def __init__(
         self,
-        base_moe: FusedMoE,
+        base_layer: nn.Module,
         lora_backend: BaseLoRABackend,
     ):
-        super().__init__(base_moe, lora_backend)
+        super().__init__(base_layer, lora_backend)
         # LoRA tensors will be set by LoRAManager
         self.lora_a_weights = None
         self.lora_b_weights = None
@@ -615,7 +616,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         3. Return modified base_output
         """
         # Run base MoE
-        base_output = self.base_moe.forward(hidden_states, topk_output, **kwargs)
+        base_output = self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # If LoRA is enabled, compute delta and add in-place for memory efficiency
         if self.set_lora and self.lora_a_weights is not None:
@@ -651,7 +652,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Use precomputed per-token LoRA indices from forward batch
         lora_indices = self.lora_backend.forward_batch.token_lora_indices
 
-        num_experts = self.base_moe.num_experts
+        num_experts = self.base_layer.num_experts
         num_loras = self.lora_a_weights.shape[0]
 
         # Dispatch tokens to experts
@@ -691,7 +692,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(
     layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    # FusedMoE is now imported at the top of the file
     # FusedMoEWithLoRA is now defined in this file
 
     supported_layer_types = {
