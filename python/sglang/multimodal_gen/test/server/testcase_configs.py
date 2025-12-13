@@ -301,7 +301,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="848x480",
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -407,7 +406,6 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
         ),
     ),
     # LoRA test case for transformer_2 support
