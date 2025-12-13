@@ -11,10 +11,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     data_connector::ResponseId,
-    routers::{
-        error,
-        grpc::regular::responses::context::ResponsesContext,
-    },
+    routers::{error, grpc::regular::responses::context::ResponsesContext},
 };
 
 /// Implementation for GET /v1/responses/{response_id}
@@ -113,10 +110,9 @@ pub async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> 
                     "response_already_completed",
                     "Cannot cancel completed response",
                 ),
-                "failed" => error::bad_request(
-                    "response_already_failed",
-                    "Cannot cancel failed response",
-                ),
+                "failed" => {
+                    error::bad_request("response_already_failed", "Cannot cancel failed response")
+                }
                 "cancelled" => (
                     StatusCode::OK,
                     axum::Json(json!({
