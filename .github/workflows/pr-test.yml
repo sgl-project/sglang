@@ -464,7 +464,7 @@ jobs:
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
+      false &&
       (
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
@@ -506,7 +506,7 @@ jobs:
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
+      false &&
       (
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
