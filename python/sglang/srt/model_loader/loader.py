@@ -192,7 +192,11 @@ def _get_quantization_config(
     # - Otherwise, the draft model defaults to the same quantization as the target model.
     if model_config.is_draft_model:
         draft_quant = model_config.speculative_draft_model_quantization
-        quantization = None if draft_quant == "unquant" else draft_quant or model_config.quantization
+        quantization = (
+            None
+            if draft_quant == "unquant"
+            else draft_quant or model_config.quantization
+        )
     else:
         quantization = model_config.quantization
 

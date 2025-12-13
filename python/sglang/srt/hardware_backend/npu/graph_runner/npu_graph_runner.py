@@ -101,7 +101,7 @@ class NPUGraphRunner(CudaGraphRunner):
             cpu_update_input=[{self.update_attr_name: seq_lens}]
         )
 
-    def get_cache_loc_dtype(self):
+    def _cache_loc_dtype(self):
         return torch.int32
 
     def _init_profile_context_and_memory_record(self):

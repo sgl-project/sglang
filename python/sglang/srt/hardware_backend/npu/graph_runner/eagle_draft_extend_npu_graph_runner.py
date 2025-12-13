@@ -37,7 +37,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
     def _create_graph(self):
         return torch.npu.NPUGraph()
 
-    def get_cache_loc_dtype(self):
+    def _cache_loc_dtype(self):
         return torch.int32
 
     def _capture_init(self, run_once_fn):

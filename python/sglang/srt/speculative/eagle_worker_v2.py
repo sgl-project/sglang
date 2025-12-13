@@ -1,6 +1,5 @@
 import contextlib
 import logging
-import os
 import time
 from typing import List, Optional, Tuple
 
