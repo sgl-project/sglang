@@ -18,9 +18,9 @@ from typing import Iterable, Optional, Union
 import torch
 from torch import nn
 from transformers import Cache, DynamicCache, LlavaConfig, Mistral3Config, MistralConfig
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3CausalLMOutputWithPast,
     Mistral3ModelOutputWithPast,
@@ -32,7 +32,9 @@ from transformers.models.mistral.modeling_mistral import (
     apply_rotary_pos_emb,
 )
 
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -89,6 +91,17 @@ class MistralAttention(nn.Module):
         self.is_causal = True
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
+        self.attn = USPAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            },
+        )
 
     def forward(
         self,
@@ -118,7 +131,7 @@ class MistralAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
+        attention_interface = sdpa_attention_forward
         attn_output, attn_weights = attention_interface(
             self,
             query_states,

@@ -7,8 +7,9 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
 from typing import Any
 
+import numpy as np
+import PIL
 import torch
-from diffusers.image_processor import VaeImageProcessor
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models import (
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
@@ -100,6 +102,14 @@ def shard_rotary_emb_for_sp(emb):
         return emb
 
 
+def maybe_unpad_latents(latents, batch):
+    # If SP padding was applied, remove extra tokens before reshaping
+    target_tokens = batch.raw_latent_shape[-1] * batch.raw_latent_shape[-2]
+    if latents.shape[1] > target_tokens:
+        latents = latents[:, :target_tokens, :]
+    return latents
+
+
 # config for a single pipeline
 @dataclass
 class PipelineConfig:
@@ -174,14 +184,65 @@ class PipelineConfig:
     # Compilation
     # enable_torch_compile: bool = False
 
+    # calculate the adjust size for condition image
+    # width: original condition image width
+    # height: original condition image height
+    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
+        vae_scale_factor = self.vae_config.arch_config.spatial_compression_ratio
+        height, width = get_default_height_width(image, vae_scale_factor, height, width)
+        return width, height
+
+    ## For timestep preparation stage
+
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        return sigmas
+
+    ## For ImageVAEEncodingStage
+    def preprocess_condition_image(
+        self, image, target_width, target_height, _vae_image_processor
+    ):
+        """
+        preprocess the condition image, returns (image, final_image_width, final_image_height)
+        """
+        return image.resize(
+            (target_width, target_height), PIL.Image.Resampling.LANCZOS
+        ), (target_width, target_height)
+
+    def prepare_image_processor_kwargs(self, batch):
+        return {}
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        vae_arch_config = self.vae_config.arch_config
+        spatial_compression_ratio = vae_arch_config.spatial_compression_ratio
+        temporal_compression_ratio = vae_arch_config.temporal_compression_ratio
+        num_frames = batch.num_frames
+        latent_height = batch.height // spatial_compression_ratio
+        latent_width = batch.width // spatial_compression_ratio
+        mask_lat_size = torch.ones(1, 1, num_frames, latent_height, latent_width)
+        mask_lat_size[:, :, 1:] = 0
+        first_frame_mask = mask_lat_size[:, :, 0:1]
+        first_frame_mask = torch.repeat_interleave(
+            first_frame_mask,
+            repeats=temporal_compression_ratio,
+            dim=2,
+        )
+        mask_lat_size = torch.concat(
+            [first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2
+        )
+        mask_lat_size = mask_lat_size.view(
+            1,
+            -1,
+            temporal_compression_ratio,
+            latent_height,
+            latent_width,
+        )
+        mask_lat_size = mask_lat_size.transpose(1, 2)
+        mask_lat_size = mask_lat_size.to(latent_condition.device)
+        image_latents = torch.concat([mask_lat_size, latent_condition], dim=1)
+        return image_latents
+
     def slice_noise_pred(self, noise, latents):
         return noise
-
-    def maybe_resize_condition_image(self, width, height, image):
-        """
-        image: input image
-        """
-        return image, width, height
 
     def adjust_num_frames(self, num_frames):
         return num_frames
@@ -189,10 +250,6 @@ class PipelineConfig:
     # tokenize the prompt
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
-
-    # called in ImageEncodingStage, preprocess the image
-    def preprocess_image(self, image, image_processor: VaeImageProcessor):
-        return image
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio
@@ -228,11 +285,11 @@ class PipelineConfig:
         return None
 
     # called after vae encode
-    def post_process_vae_encode(self, image_latents, vae):
+    def postprocess_vae_encode(self, image_latents, vae):
         return image_latents
 
     # called after scale_and_shift, before vae decoding
-    def preprocess_decoding(self, latents):
+    def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
     def gather_latents_for_sp(self, latents):
@@ -261,6 +318,7 @@ class PipelineConfig:
         return batch.negative_prompt_embeds
 
     def post_denoising_loop(self, latents, batch):
+        latents = maybe_unpad_latents(latents, batch)
         return latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -438,20 +496,32 @@ class PipelineConfig:
             raise ValueError("model_path is required in kwargs")
 
         # 1. Get the pipeline config class from the registry
+        from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+            Flux2PipelineConfig,
+        )
+
         model_info = get_model_info(model_path)
 
-        # 2. Instantiate PipelineConfig
-        if model_info is None:
-            # The error is already logged in get_model_info.
-            # We raise an exception here to stop the execution.
-            raise ValueError(
-                f"Failed to get model info for '{model_path}'. "
-                "Please check the model path and ensure it is registered correctly."
+        # 1.5. Adjust pipeline config for fine-tuned VAE if needed
+        pipeline_config_cls = model_info.pipeline_config_cls
+        vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+
+        # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
+        if (
+            isinstance(pipeline_config_cls, type)
+            and issubclass(pipeline_config_cls, Flux2PipelineConfig)
+            and vae_path is not None
+            and "FLUX.2-Tiny-AutoEncoder" in vae_path
+        ):
+            from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
+                Flux2FinetunedPipelineConfig,
             )
 
-        pipeline_config = model_info.pipeline_config_cls()
+            pipeline_config_cls = Flux2FinetunedPipelineConfig
 
-        # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
+        pipeline_config = pipeline_config_cls()
+
+        # 2. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
             pipeline_config.load_from_json(pipeline_config_or_path)
             kwargs[prefix_with_dot + "pipeline_config_path"] = pipeline_config_or_path
@@ -460,7 +530,7 @@ class PipelineConfig:
         elif isinstance(pipeline_config_or_path, dict):
             pipeline_config.update_pipeline_config(pipeline_config_or_path)
 
-        # 4. Update PipelineConfig from CLI arguments if provided
+        # 3. Update PipelineConfig from CLI arguments if provided
         kwargs[prefix_with_dot + "model_path"] = model_path
         pipeline_config.update_config_from_dict(kwargs, config_cli_prefix)
         return pipeline_config
@@ -551,6 +621,14 @@ class PipelineConfig:
 class ImagePipelineConfig(PipelineConfig):
     """Base config for image generation pipelines with token-like latents [B, S, D]."""
 
+    def _prepare_sigmas(self, sigmas, num_inference_steps):
+        sigmas = (
+            np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+            if sigmas is None
+            else sigmas
+        )
+        return sigmas
+
     def shard_latents_for_sp(self, batch, latents):
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         seq_len = latents.shape[1]
@@ -586,10 +664,7 @@ class ImagePipelineConfig(PipelineConfig):
         height = 2 * (int(batch.height) // (vae_scale_factor * 2))
         width = 2 * (int(batch.width) // (vae_scale_factor * 2))
 
-        # If SP padding was applied, remove extra tokens before reshaping
-        target_tokens = (height // 2) * (width // 2)
-        if latents.shape[1] > target_tokens:
-            latents = latents[:, :target_tokens, :]
+        latents = maybe_unpad_latents(latents, batch)
 
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
