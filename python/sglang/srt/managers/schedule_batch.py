@@ -1426,7 +1426,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.already_computed = seq_len
             req.is_retracted = False
 
-            if get_global_server_args().enable_mamba_radix_cache_v2:
+            if get_global_server_args().enable_mamba_extra_buffer():
                 self._mamba_radix_cache_v2_req_prepare_for_extend(
                     req,
                     mamba_track_mask_cpu,
@@ -1543,7 +1543,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        if get_global_server_args().enable_mamba_radix_cache_v2:
+        if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -1888,7 +1888,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
-        if get_global_server_args().enable_mamba_radix_cache_v2:
+        if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
                 [
                     req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]

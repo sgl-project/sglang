@@ -760,7 +760,7 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
-            enable_mamba_radix_cache_v2=server_args.enable_mamba_radix_cache_v2,
+            enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         )
 
         if (

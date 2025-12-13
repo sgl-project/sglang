@@ -369,9 +369,9 @@ class MambaRadixCache(BasePrefixCache):
 
         self.page_size = params.page_size
         self.disable = params.disable
-        self.enable_mamba_radix_cache_v2 = params.enable_mamba_radix_cache_v2
+        self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
 
-        if not self.enable_mamba_radix_cache_v2:
+        if not self.enable_mamba_extra_buffer:
             assert (
                 self.page_size == 1
             ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
@@ -504,7 +504,7 @@ class MambaRadixCache(BasePrefixCache):
         if is_insert:
             cache_len = (
                 req.mamba_last_track_seqlen
-                if self.enable_mamba_radix_cache_v2
+                if self.enable_mamba_extra_buffer
                 else len(token_ids)
             )
             if cache_len is None:
@@ -530,7 +530,7 @@ class MambaRadixCache(BasePrefixCache):
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
-            if self.enable_mamba_radix_cache_v2:
+            if self.enable_mamba_extra_buffer:
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
@@ -563,7 +563,7 @@ class MambaRadixCache(BasePrefixCache):
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
 
-        free_mamba_cache = True if self.enable_mamba_radix_cache_v2 else mamba_exist
+        free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
 
         self.req_to_token_pool.free(
             req.req_pool_idx,
@@ -588,7 +588,7 @@ class MambaRadixCache(BasePrefixCache):
         token_ids = req.fill_ids
         cache_len = (
             req.mamba_last_track_seqlen
-            if self.enable_mamba_radix_cache_v2
+            if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
         if self.disable or cache_len is None:
@@ -614,7 +614,7 @@ class MambaRadixCache(BasePrefixCache):
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        if self.enable_mamba_radix_cache_v2:
+        if self.enable_mamba_extra_buffer:
             # copy from the ping pong track buffer
             mamba_ping_pong_track_buffer_to_keep = (
                 self.req_to_token_pool.get_mamba_ping_pong_other_idx(

@@ -322,7 +322,7 @@ class CudaGraphRunner:
             )
 
         enable_mamba_track = (
-            self.model_runner.server_args.enable_mamba_radix_cache_v2
+            self.model_runner.server_args.enable_mamba_extra_buffer()
             and self.model_runner.spec_algorithm.is_none()
         )
 

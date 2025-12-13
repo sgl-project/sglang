@@ -86,7 +86,7 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
-            enable_mamba_radix_cache_v2=False,
+            enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )
 
@@ -166,7 +166,7 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
-            enable_mamba_radix_cache_v2=False,
+            enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )
         # setup kv pool

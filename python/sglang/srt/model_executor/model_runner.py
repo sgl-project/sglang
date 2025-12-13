@@ -1701,7 +1701,7 @@ class ModelRunner:
         if self.mambaish_config is not None:
             additional_ratio = 0
             if (
-                self.server_args.enable_mamba_radix_cache_v2
+                self.server_args.enable_mamba_extra_buffer()
                 and not self.spec_algorithm.is_none()
             ):
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
@@ -1818,7 +1818,7 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
-                    enable_mamba_radix_cache_v2=self.server_args.enable_mamba_radix_cache_v2,
+                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
