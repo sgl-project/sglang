@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -42,13 +42,20 @@ pub fn create_error(
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Response {
+    let code_str = code.into();
+    let message_str = message.into();
+    
+    let mut headers = HeaderMap::new();
+    headers.insert("X-SMG-Error-Code", HeaderValue::from_str(&code_str).unwrap());
+    
     (
         status,
+        headers,
         Json(json!({
             "error": {
-                "message": message.into(),
+                "message": message_str,
                 "type": status_code_to_str(status),
-                "code": code.into(),
+                "code": code_str,
             }
         })),
     )
