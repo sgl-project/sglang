@@ -29,6 +29,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.attention.nsa.utils import (
+    enable_prefill_cp,
+    is_nsa_enable_prefill_cp,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -95,6 +99,8 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
+        if is_nsa_enable_prefill_cp():
+            return ScatterMode.SCATTERED
         return ScatterMode.TP_ATTN_FULL
 
 
@@ -330,6 +336,12 @@ class LayerCommunicator:
         self.qkv_latent_func = qkv_latent_func
 
         self._context = CommunicateContext.init_new()
+        self._post_init_communicate()
+        self._speculative_algo = SpeculativeAlgorithm.from_string(
+            get_global_server_args().speculative_algorithm
+        )
+
+    def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
             output_mode=self.layer_scatter_modes.attn_mode,
@@ -351,10 +363,6 @@ class LayerCommunicator:
                 output_mode=self.layer_scatter_modes.layer_output_mode,
                 context=self._context,
             )
-        )
-
-        self._speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
         )
 
     def prepare_attn_and_capture_last_layer_outputs(
@@ -540,6 +548,8 @@ class LayerCommunicator:
             is CommunicateSummableTensorPairFn._scatter_hidden_states
             and forward_batch.dp_padding_mode.is_max_len()
         ):
+            return True
+        if enable_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
