@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from typing import Optional
 
 import torch
 
@@ -138,7 +137,7 @@ class KVNVFP4QuantizeUtil:
     @staticmethod
     def batched_quantize(
         tensor: torch.Tensor,
-        global_scale: Optional[torch.Tensor] = None,
+        global_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Quantize tensor to NVFP4 format using flashinfer's nvfp4_batched_quantize.
@@ -175,7 +174,7 @@ class KVNVFP4QuantizeUtil:
     def batched_dequantize(
         quant_tensor: torch.Tensor,
         scale_factors: torch.Tensor,
-        global_scale: Optional[torch.Tensor] = None,
+        global_scale: torch.Tensor | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """
