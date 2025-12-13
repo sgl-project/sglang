@@ -1817,13 +1817,21 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
-            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
-                lora_set
-                | set([req.lora_id for req in adder.can_run_list])
-                | set([req.lora_id])
-            ):
-                self.running_batch.batch_is_full = True
-                break
+            if self.enable_lora:
+                new_lora_set = (
+                    lora_set
+                    | set([req.lora_id for req in adder.can_run_list])
+                    | set([req.lora_id])
+                )
+                if not self.tp_worker.can_run_lora_batch(new_lora_set):
+                    # If this is a LoRA request that would exceed the LoRA slot limit,
+                    # skip it and continue to try scheduling non-LoRA requests.
+                    # Non-LoRA requests (lora_id=None) share a single reserved slot
+                    # and should never cause this check to fail.
+                    if req.lora_id is not None:
+                        # Skip this LoRA request - it would trigger adapter eviction/loading
+                        # which is slow. We'll try to schedule it in a future iteration.
+                        continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -2609,9 +2617,6 @@ class Scheduler(
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
-    def get_remote_instance_transfer_engine_info(self):
-        return self.tp_worker.get_remote_instance_transfer_engine_info()
-
 
 class IdleSleeper:
     """
@@ -2725,29 +2730,13 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
-        if server_args.remote_instance_weight_loader_support_transfer_engine:
-            (
-                remote_instance_transfer_engine_session_id,
-                remote_instance_transfer_engine_weights_info_dict,
-            ) = scheduler.get_remote_instance_transfer_engine_info()
-            pipe_writer.send(
-                {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
-                    "tp_rank": tp_rank,
-                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                }
-            )
-        else:
-            pipe_writer.send(
-                {
-                    "status": "ready",
-                    "max_total_num_tokens": scheduler.max_total_num_tokens,
-                    "max_req_input_len": scheduler.max_req_input_len,
-                }
-            )
+        pipe_writer.send(
+            {
+                "status": "ready",
+                "max_total_num_tokens": scheduler.max_total_num_tokens,
+                "max_req_input_len": scheduler.max_req_input_len,
+            }
+        )
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
