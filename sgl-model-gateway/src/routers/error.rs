@@ -1,9 +1,11 @@
 use axum::{
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
+
+pub const HEADER_X_SMG_ERROR_CODE: &str = "X-SMG-Error-Code";
 
 pub fn internal_error(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::INTERNAL_SERVER_ERROR, code, message)
@@ -42,13 +44,23 @@ pub fn create_error(
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Response {
+    let code_str = code.into();
+    let message_str = message.into();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HEADER_X_SMG_ERROR_CODE,
+        HeaderValue::from_str(&code_str).unwrap(),
+    );
+
     (
         status,
+        headers,
         Json(json!({
             "error": {
-                "message": message.into(),
                 "type": status_code_to_str(status),
-                "code": code.into(),
+                "code": code_str,
+                "message": message_str,
             }
         })),
     )
@@ -130,6 +142,14 @@ fn status_code_to_str(status_code: StatusCode) -> &'static str {
 
         _ => "unknown_status_code",
     }
+}
+
+pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {
+    response
+        .headers()
+        .get(HEADER_X_SMG_ERROR_CODE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
