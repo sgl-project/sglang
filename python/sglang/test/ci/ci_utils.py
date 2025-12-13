@@ -22,9 +22,13 @@ def run_with_timeout(
 ):
     """Run a function with timeout."""
     ret_value = []
+    exception_info = [None]
 
     def _target_func():
-        ret_value.append(func(*args, **(kwargs or {})))
+        try:
+            ret_value.append(func(*args, **(kwargs or {})))
+        except Exception as e:
+            exception_info[0] = e
 
     t = threading.Thread(target=_target_func)
     t.start()
@@ -32,8 +36,11 @@ def run_with_timeout(
     if t.is_alive():
         raise TimeoutError()
 
+    if exception_info[0] is not None:
+        raise exception_info[0]
+
     if not ret_value:
-        raise RuntimeError()
+        raise RuntimeError("Thread completed but returned no value")
 
     return ret_value[0]
 
