@@ -33,10 +33,6 @@ pub fn bad_gateway(code: impl Into<String>, message: impl Into<String>) -> Respo
     create_error(StatusCode::BAD_GATEWAY, code, message)
 }
 
-pub fn gateway_timeout(code: impl Into<String>, message: impl Into<String>) -> Response {
-    create_error(StatusCode::GATEWAY_TIMEOUT, code, message)
-}
-
 pub fn method_not_allowed(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::METHOD_NOT_ALLOWED, code, message)
 }
