@@ -489,6 +489,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ), f"{page_table_1_flattened.shape[0] = } must be the same as {forward_batch.seq_lens_sum = }"
 
                 # Validate indices when logical tokens exceed physical capacity
+                # This is likely to be triggered by PP with high kv reuse & parallelism
                 kv_cache_capacity = (
                     forward_batch.token_to_kv_pool.size
                     + forward_batch.token_to_kv_pool.page_size
