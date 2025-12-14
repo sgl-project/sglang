@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_sm100_supported,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -139,6 +140,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        if is_sm100_supported():
+            if (
+                x.dtype == torch.bfloat16
+                and layer.weight.dtype == torch.bfloat16
+                and x.dim() == 2
+            ):
+                m = x.shape[0]
+                if m <= 32:
+                    from flashinfer import tgv_gemm_sm100
+
+                    w_col_major = layer.weight.t().contiguous()
+                    bias_cast = (
+                        bias.to(x.dtype)
+                        if (bias is not None and bias.dtype != x.dtype)
+                        else bias
+                    )
+                    return tgv_gemm_sm100(x, w_col_major, bias_cast, pdl=True)
 
         return F.linear(x, layer.weight, bias)
 
