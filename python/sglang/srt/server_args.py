@@ -1436,7 +1436,14 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
-                elif is_sm100_supported() and is_no_spec_infer_or_topk_one(self):
+                elif (
+                    is_sm100_supported()
+                    and is_no_spec_infer_or_topk_one(self)
+                    and (
+                        self.speculative_algorithm is None
+                        or self.speculative_eagle_topk is not None
+                    )
+                ):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
