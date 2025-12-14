@@ -64,7 +64,9 @@ def is_layer_skipped(
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
-            is_shard_skipped = shard_prefix in ignored_layers
+            is_shard_skipped = any(
+                ignored in shard_prefix for ignored in ignored_layers
+            )
 
             if is_skipped is None:
                 is_skipped = is_shard_skipped
@@ -75,7 +77,7 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = prefix in ignored_layers
+        is_skipped = any(ignored in prefix for ignored in ignored_layers)
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")
@@ -560,4 +562,33 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
         q_w.to(device=orig_device),
         g_idx.to(device=orig_device),
         sort_indices.to(device=orig_device),
+    )
+
+
+def swizzle_blockscale(scale: torch.Tensor):
+    """
+    Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
+    """
+    assert scale.dtype == torch.float8_e4m3fn
+    # Pad and blockwise interleave weight_scale
+    scale_ndim = scale.ndim
+    if scale.ndim == 2:
+        scale = scale.unsqueeze(0)
+    assert scale.ndim == 3
+    B, M, K = scale.shape
+    round_up_multiple = lambda x, m: (x + m - 1) // m * m
+    M_padded = round_up_multiple(M, 128)
+    K_padded = round_up_multiple(K, 4)
+    padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
+    padded_scale[:B, :M, :K] = scale
+    batches, rows, cols = padded_scale.shape
+    assert rows % 128 == 0
+    assert cols % 4 == 0
+    padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
+    swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
+    swizzled_scale = swizzled_scale.contiguous().cuda()
+    return (
+        swizzled_scale.reshape(M_padded, K_padded)
+        if scale_ndim == 2
+        else swizzled_scale.reshape(B, M_padded, K_padded)
     )

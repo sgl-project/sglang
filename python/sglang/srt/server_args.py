@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib
 import json
 import logging
 import os
 import random
 import tempfile
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import orjson
 
@@ -78,8 +79,10 @@ LOAD_FORMAT_CHOICES = [
     "gguf",
     "bitsandbytes",
     "layered",
+    "flash_rl",
     "remote",
     "remote_instance",
+    "private",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -103,6 +106,7 @@ QUANTIZATION_CHOICES = [
     "mxfp4",
     "auto-round",
     "compressed-tensors",  # for Ktransformers
+    "modelslim",  # for NPU
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -129,7 +133,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend"]
+LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
@@ -166,6 +170,17 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
+MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
+
+FP8_GEMM_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "deep_gemm",
+    "flashinfer_trtllm",
+    "cutlass",
+    "triton",
+    "aiter",
+]
+
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 
@@ -192,6 +207,10 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_fp8_gemm_runner_backend_choices(choices):
+    FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -261,6 +280,7 @@ class ServerArgs:
     modelopt_checkpoint_save_path: Optional[str] = None
     modelopt_export_path: Optional[str] = None
     quantize_and_serve: bool = False
+    rl_quant_profile: Optional[str] = None  # For flash_rl load format
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -268,6 +288,7 @@ class ServerArgs:
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
+    enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -286,18 +307,20 @@ class ServerArgs:
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
+    pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
+    soft_watchdog_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
-    mm_process_config: Optional[Dict[str, Any]] = None
+    custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
     log_level: str = "info"
@@ -376,8 +399,10 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
+    fp8_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
+    enable_flashinfer_autotune: bool = False
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -392,6 +417,7 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
+    speculative_moe_a2a_backend: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -455,7 +481,7 @@ class ServerArgs:
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
-    dllm_block_size: Optional[int] = None
+    dllm_algorithm_config: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -536,6 +562,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    enable_fused_qk_norm_rope: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -579,13 +606,12 @@ class ServerArgs:
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
+    mm_enable_dp_encoder: bool = False
+    mm_process_config: Optional[Dict[str, Any]] = None
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
-
-    # For encoder dp
-    mm_enable_dp_encoder: bool = False
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
@@ -614,6 +640,7 @@ class ServerArgs:
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
+        self._handle_npu_backends()
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -624,6 +651,7 @@ class ServerArgs:
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
+        self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
@@ -677,7 +705,7 @@ class ServerArgs:
         self._handle_elastic_ep()
 
     def _handle_deprecated_args(self):
-        # handle deprecated tool call parsers
+        # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
         if self.tool_call_parser in deprecated_tool_call_parsers:
             logger.warning(
@@ -696,6 +724,16 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+
+        # Handle ModelScope model downloads
+        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+            if not os.path.exists(self.model_path):
+                from modelscope import snapshot_download
+
+                self.model_path = snapshot_download(self.model_path)
+                self.tokenizer_path = snapshot_download(
+                    self.tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -876,7 +914,7 @@ class ServerArgs:
         if self.disable_cuda_graph_padding:
             capture_bs = list(range(1, self.cuda_graph_max_bs + 1))
         elif self.speculative_algorithm is None:
-            # Normal case: [1, 2, 4, 8, 12] + list(range(16, 257, 8)) + list(range(272, 512, 16)) + list(range(512, cuda_graph_max_bs + 1))
+            # Normal case:
             capture_bs = (
                 [1, 2, 4, 8, 12]
                 + list(range(16, 257, 8))
@@ -884,7 +922,7 @@ class ServerArgs:
                 + list(range(512, self.cuda_graph_max_bs + 1, 32))
             )
         else:
-            # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
+            # Spec decoding case: less padding for smaller batch sizes
             capture_bs = (
                 list(range(1, 9, 1))
                 + list(range(10, 33, 2))
@@ -927,6 +965,19 @@ class ServerArgs:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
 
+    def _handle_npu_backends(self):
+        if self.device == "npu":
+            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
+
+            set_default_server_args(self)
+
+            if self.piecewise_cuda_graph_compiler != "eager":
+                logger.warning(
+                    "At this moment Ascend platform only support prefill graph compilation with "
+                    "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
+                )
+                self.piecewise_cuda_graph_compiler = "eager"
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
 
@@ -935,7 +986,18 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["DeepseekV3ForCausalLM"]:
+
+        if model_arch in [
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
+            self.dtype = "bfloat16"
+
+        if model_arch in [
+            "DeepseekV3ForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
             if is_deepseek_nsa(hf_config):
                 if (
                     self.attention_backend is None
@@ -962,7 +1024,12 @@ class ServerArgs:
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
                         )
                     else:
-                        self.dp_size = self.tp_size
+                        # Pure TP and partial DP Attention mode is active for NSA, logging a warning
+                        if self.dp_size < self.tp_size:
+                            logger.warning(
+                                f"NSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
+                                f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
+                            )
 
                     self.page_size = 64
                     logger.warning("Setting page size to 64 for DeepSeek NSA.")
@@ -1036,7 +1103,7 @@ class ServerArgs:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
                     # flashinfer_trtllm MoE runner backend.
-                    if quant_method is None:
+                    if quant_method is None and model_arch == "DeepseekV3ForCausalLM":
                         self.quantization = "fp8"
                         logger.info(
                             "Quantization not specified, default to fp8 for DeepSeek on sm100"
@@ -1188,6 +1255,24 @@ class ServerArgs:
                 f"Disabling Radix Cache for {model_arch} as it is not yet supported."
             )
             self.disable_radix_cache = True
+        elif model_arch in ["NemotronHForCausalLM"]:
+            model_config = self.get_model_config()
+            if model_config.quantization in [
+                "modelopt",
+                "modelopt_fp8",
+                "modelopt_fp4",
+            ]:
+                assert model_config.hf_config.mlp_hidden_act == "relu2"
+                if model_config.quantization == "modelopt":
+                    self.quantization = (
+                        "modelopt_fp4"
+                        if model_config.hf_config.quantization_config["quant_algo"]
+                        == "NVFP4"
+                        else "modelopt_fp8"
+                    )
+                else:
+                    self.quantization = model_config.quantization
+                self.moe_runner_backend = "flashinfer_cutlass"
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -1219,7 +1304,6 @@ class ServerArgs:
                 )
                 self.disable_overlap_schedule = True
             if is_sm100_supported():
-                self.attention_backend = "triton"
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1237,6 +1321,33 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+                if self.attention_backend is None:
+                    self.attention_backend = "triton"
+                    logger.info(
+                        "Use triton as attention backend on sm100 for Qwen3NextForCausalLM"
+                    )
+                if (
+                    not self.disable_radix_cache
+                    and self.attention_backend == "trtllm_mha"
+                ):
+                    logger.warning(
+                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                        "Try to use --attention-backend triton if radix cache is necessary."
+                    )
+                    self.disable_radix_cache = True
+                    self.disable_overlap_schedule = False
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "FalconH1ForCausalLM",
+            "JetNemotronForCausalLM",
+            "JetVLMForConditionalGeneration",
+        ]:
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
+                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1260,7 +1371,9 @@ class ServerArgs:
 
             1. Models with MHA Architecture (e.g: Llama, QWen)
                 1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-                1.2 In other cases, we will use flashinfer if available, otherwise use triton.
+                1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
+                   Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
+                1.3 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
                 2.2 We will use Flashinfer backend on blackwell.
@@ -1275,10 +1388,10 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
+                elif is_sm100_supported() and is_no_spec_infer_or_topk_one(self):
+                    self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
-                elif is_npu():
-                    self.attention_backend = "ascend"
                 else:
                     self.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -1296,8 +1409,6 @@ class ServerArgs:
                         self.attention_backend = "aiter"
                     else:
                         self.attention_backend = "triton"
-                elif is_npu():
-                    self.attention_backend = "ascend"
                 else:
                     self.attention_backend = "triton"
 
@@ -1398,13 +1509,6 @@ class ServerArgs:
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
-        # NPU platforms backends
-        if is_npu() and self.attention_backend in ["ascend"]:
-            logger.warning(
-                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
-            )
-            self.page_size = 128
-
         # Other platforms backends
         if (
             self.attention_backend == "intel_amx"
@@ -1453,6 +1557,85 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+    def _handle_kv4_compatibility(self):
+        """Check FP4 KV cache compatibility with the attention backend"""
+        if self.kv_cache_dtype != "fp4_e2m1":
+            return
+
+        use_mla_backend = self.use_mla_backend()
+        # self.attention_backend didn't overwrite self.prefill/decode_attention_backend yet
+        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
+            self.get_attention_backends()
+        )
+
+        if is_cuda():
+            if (
+                self.prefill_attention_backend_str != self.decode_attention_backend_str
+                and self.prefill_attention_backend_str != "fa4"
+            ):  # Take care of prefill=fa4 later
+                logger.warning(
+                    f"Attention: Using KV4 with PREFILL = {self.prefill_attention_backend_str} "
+                    f"and DECODE = {self.decode_attention_backend_str}. "
+                    f"Compatibility issues are unlikely, but may occur in rare edge cases."
+                )
+            else:
+                if self.prefill_attention_backend_str == "fa4":
+                    if use_mla_backend:  # FA4 + MLA
+                        KV4_FA4_MLA_BACKEND_CHOICES = [
+                            "cutlass_mla",
+                            "flashinfer",
+                            "trtllm_mla",
+                        ]
+                        assert (
+                            self.decode_attention_backend_str
+                            in KV4_FA4_MLA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 FA4 MLA expects decode_attention_backend to be one of "
+                            f"{KV4_FA4_MLA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                        )
+                    else:  # FA4 + MHA
+                        KV4_FA4_MHA_BACKEND_CHOICES = [
+                            "triton",
+                            "torch_native",
+                            "flex_attention",
+                        ]
+                        assert (
+                            self.decode_attention_backend_str
+                            in KV4_FA4_MHA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 FA4 MHA expects decode_attention_backend to be one of "
+                            f"{KV4_FA4_MHA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                        )
+                else:
+                    if use_mla_backend:  # !FA4 + MLA
+                        KV4_ATTENTION_MLA_BACKEND_CHOICES = [
+                            "cutlass_mla",
+                            "flashinfer",
+                            "trtllm_mla",
+                            "flashmla",
+                        ]
+                        assert (
+                            self.attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 MLA expects attention_backend to be one of "
+                            f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                        )
+                    else:  # !FA4 + MHA
+                        KV4_ATTENTION_MHA_BACKEND_CHOICES = [
+                            "triton",
+                            "torch_native",
+                            "flex_attention",
+                            "trtllm_mha",
+                        ]
+                        assert (
+                            self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 MHA expects attention_backend to be one of "
+                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                        )
+        else:
+            raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+
     def _handle_page_size(self):
         if self.page_size is None:
             self.page_size = 1
@@ -1485,20 +1668,23 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
-            assert (
-                self.quantization == "modelopt_fp4" or self.quantization is None
-            ), "modelopt_fp4 quantization or bf16 is required for Flashinfer Cutlass MOE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "modelopt_fp8",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
-            assert (
-                self.quantization == "modelopt_fp4"
-                or self.quantization == "modelopt_fp8"
-                or self.quantization == "fp8"
-            ), "modelopt_fp4, modelopt_fp8 or fp8 quantization is required for Flashinfer TRTLLM MoE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "fp8",
+                "modelopt_fp8",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -1516,11 +1702,6 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8 Cutlass MoE is only supported with ep_size == 1"
-
-        if self.moe_runner_backend == "deep_gemm":
-            assert (
-                self.ep_size > 1 and self.moe_a2a_backend == "deepep"
-            ), "DeepGemm MoE runner is only supported when ep is enabled and moe_a2a_backend is deepep"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
@@ -1600,13 +1781,16 @@ class ServerArgs:
                 )
 
         if self.hicache_mem_layout == "page_first_direct":
-            if self.hicache_io_backend != "direct":
+            if self.hicache_io_backend not in ["direct", "kernel_ascend"]:
                 self.hicache_io_backend = "direct"
                 logger.warning(
                     "Page first direct layout only support direct io backend"
                 )
 
-        if self.enable_hierarchical_cache and self.hicache_io_backend == "kernel":
+        if (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ) and self.hicache_io_backend == "kernel":
             # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
             if self.decode_attention_backend is None:
                 if not self.use_mla_backend():
@@ -1624,26 +1808,27 @@ class ServerArgs:
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
-        # Below are the only parameters currently supported on Ascend
-        if self.enable_hierarchical_cache and is_npu():
-            # FIXME(iforgetmyname) fix decode_attention_backend on ascend
-            self.decode_attention_backend = "ascend"
-            self.hicache_io_backend = "kernel_ascend"
-            if self.use_mla_backend():
-                self.hicache_mem_layout = "page_first_kv_split"
-            else:
-                self.hicache_mem_layout = "page_first_direct"
-            logger.warning(
-                f"Ascend NPU Platform detected, change `hicache_io_backend` to `kernel_ascend` and "
-                f"`hicache_mem_layout` to `{self.hicache_mem_layout}`"
-            )
-
     def _handle_speculative_decoding(self):
         if (
             self.speculative_draft_model_path is not None
             and self.speculative_draft_model_revision is None
         ):
             self.speculative_draft_model_revision = "main"
+
+        # Avoid using flashinfer_trtllm for speculative MoE runner backend by default
+        # TODO: Remove this block after verifying no accuracy regression with flashinfer_trtllm speculative backend
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        if self.speculative_moe_runner_backend is None:
+            self.speculative_moe_runner_backend = (
+                "auto"
+                if self.moe_runner_backend == "flashinfer_trtllm"
+                else self.moe_runner_backend
+            )
+        else:
+            assert not MoeRunnerBackend(
+                self.speculative_moe_runner_backend
+            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
@@ -1690,14 +1875,20 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
+                "MistralLarge3ForCausalLM",
+                "PixtralForConditionalGeneration",
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
                 else:
-                    logger.warning(
-                        "DeepSeek MTP does not require setting speculative_draft_model_path."
-                    )
+                    if model_arch not in [
+                        "MistralLarge3ForCausalLM",
+                        "PixtralForConditionalGeneration",
+                    ]:
+                        logger.warning(
+                            "DeepSeek MTP does not require setting speculative_draft_model_path."
+                        )
 
             if self.speculative_num_steps is None:
                 assert (
@@ -1825,8 +2016,12 @@ class ServerArgs:
 
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
-            self.disable_cuda_graph = True
-            logger.warning("Cuda graph is disabled for prefill server")
+
+            if not self.enable_piecewise_cuda_graph:
+                self.disable_cuda_graph = True
+                logger.warning(
+                    "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
+                )
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
@@ -1926,6 +2121,8 @@ class ServerArgs:
                         "DeepseekV2ForCausalLM",
                         "DeepseekV3ForCausalLM",
                         "DeepseekV32ForCausalLM",
+                        "MistralLarge3ForCausalLM",
+                        "PixtralForConditionalGeneration",
                     ]
                 except Exception:
                     pass
@@ -1990,10 +2187,16 @@ class ServerArgs:
         if self.dllm_algorithm is None:
             return
         if not self.disable_cuda_graph:
-            logger.warning(
-                "Cuda graph is disabled because of using diffusion LLM inference"
-            )
-            self.disable_cuda_graph = True
+            if self.cuda_graph_bs != [1]:
+                logger.warning(
+                    "Cuda graph bs is set to [1] because of using diffusion LLM inference"
+                )
+                self.cuda_graph_bs = [1]
+            if self.attention_backend != "flashinfer":
+                logger.warning(
+                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                )
+                self.attention_backend = "flashinfer"
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"
@@ -2018,6 +2221,20 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
+
+    def _handle_remote_instance_weight_loader_support_transfer_engine(self):
+        if importlib.util.find_spec("mooncake.engine") is None:
+            logger.warning(
+                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            self.remote_instance_weight_loader_support_transfer_engine = False
+        elif self.enable_memory_saver:
+            logger.warning(
+                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            self.remote_instance_weight_loader_support_transfer_engine = False
+        else:
+            self.remote_instance_weight_loader_support_transfer_engine = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -2260,6 +2477,12 @@ class ServerArgs:
             "This is useful for development and prototyping. For production, it's recommended "
             "to use separate quantization and deployment steps.",
         )
+        parser.add_argument(
+            "--rl-quant-profile",
+            type=str,
+            default=ServerArgs.rl_quant_profile,
+            help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
+        )
 
         # Memory and scheduling
         parser.add_argument(
@@ -2292,6 +2515,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_chunking,
+            help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -2402,6 +2631,12 @@ class ServerArgs:
             help="The maximum micro batch size in pipeline parallelism.",
         )
         parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            help="The async batch depth of pipeline parallelism.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
@@ -2436,6 +2671,12 @@ class ServerArgs:
             help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
         )
         parser.add_argument(
+            "--soft-watchdog-timeout",
+            type=float,
+            default=ServerArgs.soft_watchdog_timeout,
+            help="Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
+        )
+        parser.add_argument(
             "--dist-timeout",
             type=int,
             default=ServerArgs.dist_timeout,
@@ -2465,10 +2706,8 @@ class ServerArgs:
             help="Reduce CPU usage when sglang is idle.",
         )
         parser.add_argument(
-            "--mm-process-config",
-            type=json.loads,
-            default=ServerArgs.mm_process_config,
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            "--custom-sigquit-handler",
+            help="Register a custom sigquit handler so you can do additional cleanup after the server is shutdown. This is only available for Engine, not for CLI.",
         )
 
         # Logging
@@ -2883,6 +3122,28 @@ class ServerArgs:
             type=str,
             choices=NSA_CHOICES,
         )
+        parser.add_argument(
+            "--fp8-gemm-backend",
+            type=str,
+            choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp8_gemm_runner_backend,
+            dest="fp8_gemm_runner_backend",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. "
+            "Options: 'auto' (default, auto-selects based on hardware), "
+            "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
+            "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
+            "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
+            "'triton' (fallback, widely compatible), "
+            "'aiter' (ROCm only). "
+            "NOTE: This replaces the deprecated environment variables "
+            "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-autotune",
+            default=ServerArgs.enable_flashinfer_autotune,
+            action="store_true",
+            help="Enable FlashInfer autotuning for optimal kernel selection.",
+        )
 
         # Speculative decoding
         parser.add_argument(
@@ -2964,6 +3225,13 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
+        parser.add_argument(
+            "--speculative-moe-a2a-backend",
+            type=str,
+            choices=MOE_A2A_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_a2a_backend,
+            help="Choose the backend for MoE A2A in speculative decoding",
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -3022,7 +3290,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake", "ascend_fuseep"],
+            choices=MOE_A2A_BACKEND_CHOICES,
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
@@ -3280,13 +3548,13 @@ class ServerArgs:
             "--dllm-algorithm",
             type=str,
             default=ServerArgs.dllm_algorithm,
-            help="The diffusion LLM algorithm.",
+            help="The diffusion LLM algorithm, such as LowConfidence.",
         )
         parser.add_argument(
-            "--dllm-block-size",
-            type=int,
-            default=ServerArgs.dllm_block_size,
-            help="The number of tokens processed in each iteration of the block diffusion LLM.",
+            "--dllm-algorithm-config",
+            type=str,
+            default=ServerArgs.dllm_algorithm_config,
+            help="The diffusion LLM algorithm configurations. Must be a YAML file.",
         )
 
         # Double Sparsity
@@ -3666,6 +3934,11 @@ class ServerArgs:
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
+        parser.add_argument(
+            "--enable-fused-qk-norm-rope",
+            action="store_true",
+            help="Enable fused qk normalization and rope rotary embedding.",
+        )
 
         # Dynamic batch tokenizer
         parser.add_argument(
@@ -3854,6 +4127,18 @@ class ServerArgs:
             default=ServerArgs.enable_broadcast_mm_inputs_process,
             help="Enable broadcast mm-inputs process in scheduler.",
         )
+        parser.add_argument(
+            "--mm-process-config",
+            type=json.loads,
+            default=ServerArgs.mm_process_config,
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+        )
+        parser.add_argument(
+            "--mm-enable-dp-encoder",
+            action="store_true",
+            default=ServerArgs.mm_enable_dp_encoder,
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
 
         # For checkpoint decryption
         parser.add_argument(
@@ -3867,12 +4152,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
-        )
-        parser.add_argument(
-            "--mm-enable-dp-encoder",
-            action="store_true",
-            default=ServerArgs.mm_enable_dp_encoder,
-            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         )
 
         # For registering hooks
@@ -3973,6 +4252,11 @@ class ServerArgs:
         # Check LoRA
         self.check_lora_server_args()
 
+        # torch 2.9.1 has compatibility issues with cuDNN 9.14 and below,
+        # causing extremely slow nn.Conv3d performance.
+        # TODO(yhyang201): Remove this check when sglang no longer uses torch 2.9.1.
+        self.check_torch_2_9_1_cudnn_compatibility()
+
         # Check speculative decoding
         if self.speculative_algorithm is not None:
             assert (
@@ -4048,6 +4332,50 @@ class ServerArgs:
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 
+    def check_torch_2_9_1_cudnn_compatibility(self):
+        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
+            return
+
+        if self.get_model_config().is_multimodal:
+            import torch
+
+            torch_version = torch.__version__.split("+", 1)[0]
+            if torch_version == "2.9.1":
+                cudnn_version = None
+                try:
+                    cudnn_version = torch.backends.cudnn.version()
+                except Exception:
+                    cudnn_version = None
+                if cudnn_version is not None:
+                    version_float = float(str(cudnn_version)[:3]) / 100
+                    if version_float < 9.15:
+                        RED = "\033[91m"
+                        BOLD = "\033[1m"
+                        RESET = "\033[0m"
+                        msg = (
+                            f"{RED}{BOLD}"
+                            "CRITICAL WARNING: PyTorch 2.9.1 & CuDNN Compatibility Issue Detected\n"
+                            "--------------------------------------------------------------------------------\n"
+                            f"Current Environment: PyTorch {torch.__version__} | CuDNN {version_float:.2f}\n\n"
+                            "Issue:     There is a KNOWN BUG in PyTorch 2.9.1's `nn.Conv3d` implementation\n"
+                            "           when used with CuDNN versions older than 9.15. This can cause\n"
+                            "           SEVERE PERFORMANCE DEGRADATION and EXCESSIVE MEMORY USAGE.\n\n"
+                            "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
+                            "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
+                            "Run the following command immediately to fix:\n"
+                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
+                            "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
+                            "--------------------------------------------------------------------------------\n"
+                            f"{RESET}"
+                        )
+                        raise RuntimeError(msg)
+                else:
+                    RED = "\033[91m"
+                    RESET = "\033[0m"
+                    logger.warning(
+                        f"{RED}WARNING: Could not determine CuDNN version for torch==2.9.1. Please ensure CuDNN >= 9.15 to avoid nn.Conv3d bugs.{RESET}"
+                    )
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -4121,6 +4449,17 @@ class ServerArgs:
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+                    # When using the chunked SGMV backend, skip embedding / lm_head layers for now,
+                    # since it does not support these yet (TODO: implement embedding / lm_head support)
+                    if self.lora_backend == "csgmv":
+                        logger.warning(
+                            "LoRA backend 'csgmv' does not yet support embedding or lm_head layers; "
+                            "dropping 'embed_tokens' and 'lm_head' from --lora-target-modules=all. "
+                            "To apply LoRA to these, use --lora-backend triton."
+                        )
+                        self.lora_target_modules.discard("embed_tokens")
+                        self.lora_target_modules.discard("lm_head")
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
@@ -4466,8 +4805,11 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
+        "Glm4MoeForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "PixtralForConditionalGeneration",
     ]:
         # The default value for deepseek and gpt-oss
         return (3, 1, 4)

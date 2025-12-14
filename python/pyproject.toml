@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.5.post3"
+version = "0.5.6.post2"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +18,7 @@ dependencies = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
+  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -38,6 +39,7 @@ dependencies = [
   "ninja",
   "numpy",
   "nvidia-cutlass-dsl==4.2.1",
+  "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
   "orjson",
@@ -50,22 +52,20 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
-  "nvidia-ml-py",
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.18.post1",
+  "sgl-kernel==0.3.19",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "torch_memory_saver==0.0.9",
   "torch==2.9.1",
-  "torchcodec==0.7.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
   "torchaudio==2.9.1",
+  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision",
   "torchao==0.9.0",
   "tqdm",
@@ -73,6 +73,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
+
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
@@ -82,41 +83,47 @@ dependencies = [
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
-    "diffusers==0.35.2",
-    "yunchang==0.6.3.post1",
-    "opencv-python==4.10.0.84",
-    "imageio==2.36.0",
-    "imageio-ffmpeg==0.5.1",
-    "PyYAML==6.0.1",
-    "moviepy>=2.0.0",
-    "cloudpickle",
-    "remote-pdb",
-    "st_attn ==0.0.7",
-    "vsa==0.0.4",
+  "PyYAML==6.0.1",
+  "cloudpickle",
+  "diffusers==0.36.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python==4.10.0.84",
+  "remote-pdb",
+  "st_attn ==0.0.7",
+  "vsa==0.0.4",
+  "yunchang==0.6.3.post1",
+  "runai_model_streamer",
+  "cache-dit==1.1.8"
 ]
 
-[tool.uv.extra-build-dependencies]
-st-attn = ["torch", "setuptools"]
-vsa = ["torch", "setuptools"]
-
-test = [
-  "accelerate",
-  "expecttest",
-  "jsonlines",
-  "matplotlib",
-  "pandas",
-  "peft",
-  "pytest",
-  "sentence_transformers",
-  "tabulate",
-]
-dev = ["sglang[test]"]
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-sdk",
 ]
+
+test = [
+  "accelerate",
+  "bitsandbytes",
+  "expecttest",
+  "jsonlines",
+  "matplotlib",
+  "pandas",
+  "parameterized",
+  "peft",
+  "pytest",
+  "sentence_transformers",
+  "tabulate",
+]
+
+dev = ["sglang[test]"]
+
+[tool.uv.extra-build-dependencies]
+st-attn = ["torch", "setuptools"]
+vsa = ["torch", "setuptools"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
@@ -130,6 +137,8 @@ sglang = "sglang.cli.main:main"
   "srt/layers/moe/fused_moe_triton/configs/*/*.json",
   "srt/layers/quantization/configs/*.json",
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
+  "srt/mem_cache/cpp_radix_tree/*.cpp",
+  "srt/mem_cache/cpp_radix_tree/*.h",
   "srt/speculative/cpp_ngram/*.cpp",
   "srt/speculative/cpp_ngram/*.h",
   "jit_kernel/include/sgl_kernel/*.h",

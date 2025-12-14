@@ -178,11 +178,14 @@ class SchedulerStats:
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
+    decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
+
+    max_total_num_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -263,6 +266,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.decode_sum_seq_lens = Gauge(
+            name="sglang:decode_sum_seq_lens",
+            documentation="The sum of all sequence lengths in decode.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
             documentation="The generation throughput (token/s).",
@@ -290,6 +299,13 @@ class SchedulerMetricsCollector:
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.max_total_num_tokens = Gauge(
+            name="sglang:max_total_num_tokens",
+            documentation="Maximum total number of tokens in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -632,6 +648,7 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
+        self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
@@ -639,6 +656,8 @@ class SchedulerMetricsCollector:
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+
+        self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

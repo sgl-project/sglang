@@ -96,7 +96,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 if forward_batch.spec_info.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
-                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                    # retrieve_next_token is None during dummy run so skip tensor creation
+                    if retrieve_next_token is not None:
+                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -743,8 +745,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
-            metadata.query_start_loc,
-            metadata.mamba_cache_indices,
+            metadata,
             self.mamba_chunk_size,
             forward_batch,
         )
@@ -760,8 +761,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
+            metadata,
+            seq_lens,
+            is_target_verify=forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -778,8 +783,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
+            metadata,
+            seq_lens,
+            is_target_verify=forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
         )
 
     def forward(
