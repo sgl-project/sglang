@@ -6,8 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::observability::metrics::RouterMetrics;
 use tracing::info;
+
+use crate::observability::metrics::RouterMetrics;
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
