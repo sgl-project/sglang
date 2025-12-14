@@ -416,6 +416,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+    speculative_draft_attention_backend: Optional[str] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
 
@@ -1881,6 +1882,9 @@ class ServerArgs:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
+                elif self.speculative_algorithm == "EAGLE3":
+                    # Use EAGLE3 with model families that already support MTP requires setting speculative_draft_model_path.
+                    pass
                 else:
                     if model_arch not in [
                         "MistralLarge3ForCausalLM",
@@ -3217,6 +3221,12 @@ class ServerArgs:
             choices=["prefill", "decode"],
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
+        )
+        parser.add_argument(
+            "--speculative-draft-attention-backend",
+            type=str,
+            help="Attention backend for speculative decoding drafting.",
+            default=ServerArgs.speculative_draft_attention_backend,
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
