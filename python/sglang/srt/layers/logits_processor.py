@@ -515,7 +515,10 @@ class LogitsProcessor(nn.Module):
             # Set the last token of the last sequence
             token_to_seq_idx.append(len(logits_metadata.extend_seq_lens_cpu) - 1)
             pruned_states = torch.cat(pruned_states)
-            pruned_states_before_norm = torch.cat(pruned_states_before_norm)
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = torch.cat(pruned_states_before_norm)
+            else:
+                pruned_states_before_norm = None
             sample_indices = torch.tensor(
                 sample_indices, device=pruned_states.device, dtype=torch.int64
             )
