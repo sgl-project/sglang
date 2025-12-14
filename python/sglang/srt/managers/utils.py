@@ -183,10 +183,5 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
     spec_tokens = server_args.speculative_num_draft_tokens
-    page_size = server_args.page_size
 
-    if not server_args.disable_overlap_schedule:
-        return max(spec_steps * spec_topk, spec_tokens)
-
-    if page_size == 1:
-        return spec_steps * spec_topk
+    return max(spec_steps * spec_topk, spec_tokens)

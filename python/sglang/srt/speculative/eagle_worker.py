@@ -19,7 +19,6 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -381,11 +380,10 @@ class EAGLEWorker(TpModelWorker):
         # Layout of the out_cache_loc
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
-        alloc_len_per_decode = get_alloc_len_per_decode()
         if self.page_size == 1:
+            alloc_len_per_decode = self.speculative_num_steps * self.topk
             for req in batch.reqs:
                 req.kv_allocated_len += alloc_len_per_decode
-
             # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
