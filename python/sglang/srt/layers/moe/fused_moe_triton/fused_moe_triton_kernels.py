@@ -870,14 +870,16 @@ def silu_and_mul_triton_kernel_tma(
     if expert_id == -1:
         for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
             offset = start_offset + tl.arange(0, BLOCK_SIZE_N)
+            dim_mask = offset < half_hidden_size
             down_ptrs = (
                 down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
             )
-            tl.store(down_ptrs, 0)
+            tl.store(down_ptrs, 0, mask=dim_mask)
         return
 
     for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
         offset = start_offset + tl.arange(0, BLOCK_SIZE_N)
+        dim_mask = offset < half_hidden_size
 
         gate_ptrs = gateup_output + row_offsets[:, None] * hidden_size + offset[None, :]
         up_ptrs = (
@@ -886,8 +888,8 @@ def silu_and_mul_triton_kernel_tma(
             + (half_hidden_size + offset)[None, :]
         )
 
-        gate_data = tl.load(gate_ptrs)
-        up_data = tl.load(up_ptrs)
+        gate_data = tl.load(gate_ptrs, mask=dim_mask, other=0.0)
+        up_data = tl.load(up_ptrs, mask=dim_mask, other=0.0)
 
         gate_output = gate_data * tl.sigmoid(gate_data)
         gate_output = gate_output.to(InDtype)
@@ -898,7 +900,7 @@ def silu_and_mul_triton_kernel_tma(
         down_ptrs = (
             down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
         )
-        tl.store(down_ptrs, silu_mul_output)
+        tl.store(down_ptrs, silu_mul_output, mask=dim_mask)
 
 
 @triton.jit
