@@ -22,7 +22,7 @@ use crate::{
     },
     mcp::McpConfig,
     observability::metrics::RouterMetrics,
-    protocols::worker_spec::{JobStatus, WorkerConfigRequest},
+    protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
     workflow::{WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus},
 };
 
@@ -31,6 +31,10 @@ use crate::{
 pub enum Job {
     AddWorker {
         config: Box<WorkerConfigRequest>,
+    },
+    UpdateWorker {
+        url: String,
+        update: Box<WorkerUpdateRequest>,
     },
     RemoveWorker {
         url: String,
@@ -57,6 +61,7 @@ impl Job {
     pub fn job_type(&self) -> &str {
         match self {
             Job::AddWorker { .. } => "AddWorker",
+            Job::UpdateWorker { .. } => "UpdateWorker",
             Job::RemoveWorker { .. } => "RemoveWorker",
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
             Job::InitializeMcpServers { .. } => "InitializeMcpServers",
@@ -70,6 +75,7 @@ impl Job {
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config } => &config.url,
+            Job::UpdateWorker { url, .. } => url,
             Job::RemoveWorker { url } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
             Job::InitializeMcpServers { .. } => "startup",
@@ -341,6 +347,24 @@ impl JobQueue {
                     timeout_duration,
                 )
                 .await
+            }
+            Job::UpdateWorker { url, update } => {
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let instance_id =
+                    Self::start_worker_update_workflow(engine, url, update, context).await?;
+
+                debug!(
+                    "Started worker update workflow for {} (instance: {})",
+                    url, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(30);
+
+                Self::wait_for_workflow_completion(engine, instance_id, url, timeout_duration).await
             }
             Job::RemoveWorker { url } => {
                 let engine = context
@@ -682,6 +706,26 @@ impl JobQueue {
             .start_workflow(WorkflowId::new("worker_removal"), workflow_context)
             .await
             .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))
+    }
+
+    /// Start worker update workflow
+    async fn start_worker_update_workflow(
+        engine: &Arc<WorkflowEngine>,
+        url: &str,
+        update: &WorkerUpdateRequest,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        // Pass URL and dp_aware separately, workflow step handles the rest
+        workflow_context.set("worker_url", url.to_string());
+        workflow_context.set("dp_aware", context.router_config.dp_aware);
+        workflow_context.set("update_request", update.clone());
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("worker_update"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start worker update workflow: {:?}", e))
     }
 
     /// Start MCP server registration workflow
