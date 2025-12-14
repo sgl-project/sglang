@@ -360,6 +360,14 @@ def is_nvidia_cublas_cu12_version_ge_12_9():
     return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
 
 
+def is_cutedsl_version_ge_4_3_0():
+    try:
+        installed_version = version("nvidia-cutlass-dsl")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return pkg_version.parse(installed_version) >= pkg_version.parse("4.3.0")
+
+
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 

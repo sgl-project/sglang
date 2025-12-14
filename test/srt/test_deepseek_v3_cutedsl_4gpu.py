@@ -2,7 +2,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_cutedsl_version_ge_4_3_0, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST,
@@ -14,6 +14,11 @@ from sglang.test.test_utils import (
 )
 
 
+# TODO: Remove this skip once the driver on gb200 ci runner is updated
+@unittest.skipIf(
+    is_cutedsl_version_ge_4_3_0(),
+    "Driver on GB200 CI runner not supporting cutedsl 4.3.0",
+)
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -83,6 +88,10 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.92)
 
 
+@unittest.skipIf(
+    is_cutedsl_version_ge_4_3_0(),
+    "Driver on GB200 CI runner not supporting cutedsl 4.3.0",
+)
 class TestDummyWithSBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
