@@ -1,6 +1,9 @@
 name: Release PyPI Nightly Wheels
 
 on:
+  # Run daily at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
   # Triggered by nightly Docker workflow to use same commit
   repository_dispatch:
     types: [nightly-release]

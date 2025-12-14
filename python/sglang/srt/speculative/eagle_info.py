@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -754,13 +755,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
+            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
             if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-                )
+                if strict_check:
+                    raise ValueError(error_msg)
+                else:
+                    logger.warning(error_msg)
+
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]

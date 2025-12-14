@@ -156,6 +156,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
             CircuitState::HalfOpen => 2u8,
         };
         RouterMetrics::set_cb_state(self.url(), state_code);
+
+        // Update consecutive failures/successes gauges
+        RouterMetrics::set_cb_consecutive_failures(
+            self.url(),
+            self.circuit_breaker().failure_count(),
+        );
+        RouterMetrics::set_cb_consecutive_successes(
+            self.url(),
+            self.circuit_breaker().success_count(),
+        );
     }
 
     /// Check if this worker is DP-aware
@@ -639,11 +649,18 @@ impl Worker for BasicWorker {
     }
 
     fn decrement_load(&self) {
-        self.load_counter
+        if self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
-            .ok();
+            .is_err()
+        {
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                "Attempted to decrement load counter that is already at 0"
+            );
+        }
         self.update_running_requests_metrics();
     }
 
