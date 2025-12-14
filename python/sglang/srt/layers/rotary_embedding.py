@@ -1343,7 +1343,8 @@ def triton_mrope_fused(
     assert n_q_dim % head_size == 0
     assert n_k_dim % head_size == 0
     assert len(mrope_section) == 3
-    assert list(positions.shape) == [3, num_tokens]
+    # NOTE(dark): commented due to incompatibility with torch.compile
+    # assert list(positions.shape) == [3, num_tokens]
     assert (
         q.stride(1) == 1
         and k.stride(1) == 1
