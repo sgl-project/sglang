@@ -317,7 +317,7 @@ class SchedulerMetricsMixin:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_ssm_model:
                 self.stats.mamba_usage = mamba_usage
-            self.stats.decode_sum_seq_lens = batch.seq_lens.sum().item()
+            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
