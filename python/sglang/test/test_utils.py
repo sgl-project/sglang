@@ -30,6 +30,7 @@ from PIL import Image
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -128,7 +129,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
+DEFAULT_IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
@@ -162,7 +163,7 @@ def is_in_amd_ci():
 
 def is_blackwell_system():
     """Return whether it is running on a Blackwell (B200) system."""
-    return get_bool_env_var("IS_BLACKWELL")
+    return envs.IS_BLACKWELL.get()
 
 
 def _use_cached_default_models(model_repo: str):
