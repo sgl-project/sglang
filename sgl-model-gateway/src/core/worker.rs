@@ -1034,6 +1034,24 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
 }
 
+// TODO migrate code to V2 (and then remove this name suffix)
+pub struct WorkerLoadGuardV2 {
+    worker: Arc<dyn Worker>,
+}
+
+impl WorkerLoadGuardV2 {
+    pub fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self { worker }
+    }
+}
+
+impl Drop for WorkerLoadGuardV2 {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+    }
+}
+
 /// RAII guard for worker load management
 pub struct WorkerLoadGuard<'a> {
     workers: Vec<&'a dyn Worker>,
