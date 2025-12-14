@@ -295,9 +295,7 @@ class OpenAIServingChat(OpenAIServingBase):
             messages = [msg.model_dump() for msg in messages]
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(
-                messages, thinking_mode=thinking_mode, drop_thinking=False
-            )
+            real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
         else:
             for message in request.messages:

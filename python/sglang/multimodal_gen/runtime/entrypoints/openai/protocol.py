@@ -43,7 +43,7 @@ class VideoResponse(BaseModel):
     status: str = "queued"
     progress: int = 0
     created_at: int = Field(default_factory=lambda: int(time.time()))
-    size: str = "720x1280"
+    size: str = ""
     seconds: str = "4"
     quality: str = "standard"
     remixed_from_video_id: Optional[str] = None
@@ -57,7 +57,7 @@ class VideoGenerationsRequest(BaseModel):
     input_reference: Optional[str] = None
     model: Optional[str] = None
     seconds: Optional[int] = 4
-    size: Optional[str] = "720x1280"
+    size: Optional[str] = ""
     fps: Optional[int] = None
     num_frames: Optional[int] = None
     seed: Optional[int] = 1024
