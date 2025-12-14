@@ -8,7 +8,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use axum::response::{IntoResponse, Response};
 use futures::{
     future,
-    stream::{self, StreamExt},
+    stream::{FuturesUnordered, StreamExt},
 };
 use http::{Method, StatusCode};
 use serde_json::Value;
@@ -283,7 +283,7 @@ impl WorkerManager {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
 
-        let futures: Vec<_> = workers
+        let futures: FuturesUnordered<_> = workers
             .into_iter()
             .map(|worker| {
                 let client = client.clone();
@@ -320,7 +320,7 @@ impl WorkerManager {
             })
             .collect();
 
-        let responses: Vec<_> = stream::iter(futures)
+        let responses: Vec<_> = futures
             .buffer_unordered(MAX_CONCURRENT)
             .filter_map(|r| async { r })
             .collect()
