@@ -82,7 +82,7 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
   return detail::from_f32<T>(f32_val * cdf);
 }
 
-void silu_and_mul(at::Tensor& out, at::Tensor& input) {
+void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
@@ -97,52 +97,99 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
     sgl_hip::activation::act_and_mul_kernel<c_type, silu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    flashinfer::activation::act_and_mul_kernel<c_type, silu>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, silu>;
+
+    cudaLaunchKernelEx(
+        &config, kernel, static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 #endif
     return true;
   });
 }
 
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  dim3 grid(num_tokens);
-
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, 1024U));
 #if USE_ROCM
+    dim3 grid(num_tokens);
+    dim3 block(std::min(d / vec_size, 1024U));
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu_tanh>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh>;
+
+    cudaLaunchKernelEx(
+        &config, kernel, static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 #endif
+
     return true;
   });
 }
 
-void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  dim3 grid(num_tokens);
-
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const c10::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, 1024U));
 #if USE_ROCM
+    dim3 grid(num_tokens);
+    dim3 block(std::min(d / vec_size, 1024U));
     sgl_hip::activation::act_and_mul_kernel<c_type, gelu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #else
-    flashinfer::activation::act_and_mul_kernel<c_type, gelu>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu>;
+
+    cudaLaunchKernelEx(
+        &config, kernel, static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 #endif
 
     return true;
