@@ -184,4 +184,8 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = [QwenImagePipeline, QwenImageEditPipeline]
+from sglang.multimodal_gen.runtime.simple_pipelines.qwenimage_pipeline import (
+    QwenImageEditPlusPipeline,
+)
+
+EntryClass = [QwenImagePipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline]

@@ -328,3 +328,12 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         # remove noise over input image
         noise = noise[:, : latents.size(1)]
         return noise
+
+
+@dataclass
+class QwenImageEditPlusPipelineConfig(ImagePipelineConfig):
+    """Configuration for the QwenImageEditPlus pipeline."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pipeline_name = "QwenImageEditPlusPipeline"
