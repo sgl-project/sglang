@@ -370,10 +370,10 @@ class GroupCoordinator:
         torch.distributed.all_gather_into_tensor(
             output_tensor, input_, group=self.device_group
         )
-        
+
         if separate_tensors:
-            # Optimization: Since the data is physically stacked along dim 0, we can directly 
-            # chunk along dim 0 to recover the original tensors. This avoids unnecessary 
+            # Optimization: Since the data is physically stacked along dim 0, we can directly
+            # chunk along dim 0 to recover the original tensors. This avoids unnecessary
             # reshape and movedim operations required for the fused case.
             return list(torch.chunk(output_tensor, world_size, dim=0))
 
