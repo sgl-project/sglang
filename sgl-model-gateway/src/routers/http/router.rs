@@ -403,6 +403,8 @@ impl Router {
         is_stream: bool,
         load_guard: WorkerLoadGuardV2,
     ) -> Response {
+        let mut load_guard = Some(load_guard);
+
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
         let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
@@ -484,13 +486,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(ref w) = worker {
-                        w.decrement_load();
-                    }
-                }
-
                 return convert_reqwest_error(e);
             }
         };
@@ -514,13 +509,6 @@ impl Router {
                     error::internal_error("read_response_body_failed", error_msg)
                 }
             };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(ref w) = worker {
-                    w.decrement_load();
-                }
-            }
 
             response
         } else if load_incremented {
