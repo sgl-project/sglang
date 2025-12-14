@@ -227,10 +227,6 @@ class RotaryEmbedding(CustomOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for native implementation"
-
         if offsets is not None:
             positions = positions + offsets
         positions = positions.flatten()
@@ -264,10 +260,6 @@ class RotaryEmbedding(CustomOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-
         if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
             return self.forward_native(
                 positions, query, key, offsets, fused_set_kv_buffer_arg
@@ -298,10 +290,6 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
-
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
