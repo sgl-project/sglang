@@ -40,6 +40,9 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
         # CI failures channel
         channel_id = "C09HCG2HM1T"
 
+        # Get GitHub run ID for linking to the workflow run
+        run_id = os.environ.get("GITHUB_RUN_ID", "")
+
         # Load report data
         with open(report_file, "r") as f:
             report_data = json.load(f)
@@ -65,8 +68,16 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             workflow_jobs[workflow].append(job_name)
 
         # Create summary message
+        workflow_url = ""
+        if run_id:
+            workflow_url = (
+                f"https://github.com/sgl-project/sglang/actions/runs/{run_id}"
+            )
+
         if not workflow_jobs:
             summary = "✅ No critical failures detected in scheduled runs"
+            if workflow_url:
+                summary += f"\n<{workflow_url}|View CI Monitor Run>"
             color = "good"
         else:
             # Ping relevant people when there are failures
@@ -78,6 +89,8 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             for workflow, jobs in sorted(workflow_jobs.items()):
                 job_list = ", ".join(jobs)
                 summary_lines.append(f"• *{workflow}*: {job_list}")
+            if workflow_url:
+                summary_lines.append(f"\n<{workflow_url}|View Full CI Monitor Report>")
             summary = "\n".join(summary_lines)
             color = "danger"
 
@@ -85,8 +98,6 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
         response = client.chat_postMessage(
             channel=channel_id,
             text=summary,
-            username="SGLang CI Bot",
-            icon_emoji=":robot_face:",
             attachments=[
                 {
                     "color": color,
@@ -125,8 +136,6 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
                 channel=channel_id,
                 thread_ts=thread_ts,
                 text=details_text,
-                username="SGLang CI Bot",
-                icon_emoji=":robot_face:",
             )
 
         logger.info("CI failure report posted to Slack successfully")
