@@ -184,7 +184,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
-MAMBA_RADIX_CACHE_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
+mamba_scheduler_strategy_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 
 # Allow external code to add more choices
@@ -460,7 +460,7 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
     mamba_full_memory_ratio: float = 0.9
-    mamba_radix_cache_strategy: str = "auto"
+    mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
 
     # Hierarchical cache
@@ -729,10 +729,10 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
-        if self.mamba_radix_cache_strategy == "auto":
+        if self.mamba_scheduler_strategy == "auto":
             # TODO: when extra_buffer is more verified, we can set the default path based on
-            #       [branch, non-branch] x [overlap, non-overlap] x [spec dec, non-spec]
-            self.mamba_radix_cache_strategy = "no_buffer"
+            #       [overlap, non-overlap]
+            self.mamba_scheduler_strategy = "no_buffer"
 
         # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
@@ -1344,10 +1344,10 @@ class ServerArgs:
             if self.enable_mamba_extra_buffer():
                 assert (
                     is_cuda()
-                ), "MambaRadixCache extra_buffer is only supported on CUDA devices with FLA backend"
+                ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
                 assert (
                     self.disaggregation_mode == "null"
-                ), "MambaRadixCache extra_buffer is not compatible with disaggregation mode yet."
+                ), "Mamba extra_buffer is not compatible with disaggregation mode yet."
                 if self.speculative_num_draft_tokens is not None:
                     assert (
                         self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -1369,7 +1369,7 @@ class ServerArgs:
             elif not self.disable_radix_cache:
                 logger.warning(
                     "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
-                    "overlap schedule currently, try to use --mamba-radix-cache-strategy extra_buffer to enable overlap schedule"
+                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
                 )
                 self.disable_overlap_schedule = True
 
@@ -1381,11 +1381,11 @@ class ServerArgs:
         ]:
             assert (
                 not self.enable_mamba_extra_buffer()
-            ), f"MambaRadixCache extra_buffer is not supported for {model_arch} model"
+            ), f"mamba extra_buffer is not supported for {model_arch} model"
             if not self.disable_radix_cache:
                 logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
-                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
+                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
                 )
                 self.disable_overlap_schedule = True
 
@@ -3473,10 +3473,10 @@ class ServerArgs:
             help="The ratio of mamba state memory to full kv cache memory.",
         )
         parser.add_argument(
-            "--mamba-radix-cache-strategy",
+            "--mamba-scheduler-strategy",
             type=str,
-            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
-            default=ServerArgs.mamba_radix_cache_strategy,
+            choices=mamba_scheduler_strategy_CHOICES,
+            default=ServerArgs.mamba_scheduler_strategy,
             help="The strategy to use for mamba radix cache.",
         )
         parser.add_argument(
@@ -4271,7 +4271,7 @@ class ServerArgs:
         return model_config.attention_arch == AttentionArch.MLA
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return self.mamba_radix_cache_strategy == "extra_buffer"
+        return self.mamba_scheduler_strategy == "extra_buffer"
 
     def check_server_args(self):
         # Check parallel size constraints
