@@ -527,7 +527,7 @@ impl Router {
                     match chunk {
                         Ok(bytes) => {
                             // Check for stream end marker using memmem for efficiency
-                            if memmem::find(&bytes, b"data: [DONE]").is_some() {
+                            if load_guard.is_some() && memmem::find(&bytes, b"data: [DONE]").is_some() {
                                 load_guard = None;
                             }
                             if tx.send(Ok(bytes)).is_err() {
