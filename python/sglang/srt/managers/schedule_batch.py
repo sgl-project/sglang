@@ -242,6 +242,9 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
+        if self.pad_value is not None:
+            return
+
         from sglang.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
