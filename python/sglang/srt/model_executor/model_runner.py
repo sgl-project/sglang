@@ -323,7 +323,6 @@ class ModelRunner:
 
         # Model-specific adjustment
         self.model_specific_adjustment()
-        self.check_quantized_moe_compatibility()
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -355,6 +354,7 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
+        self.check_quantized_moe_compatibility()
 
         # Temporary cached values
         self.support_pp = (
@@ -1665,7 +1665,9 @@ class ModelRunner:
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
-            # Use a small KV cache pool size for local tests
+            logger.info(
+                f"Use a small KV cache pool size ({small_kv_size}) for local tests"
+            )
             self.max_total_num_tokens = small_kv_size
 
         if max_num_reqs is None:
