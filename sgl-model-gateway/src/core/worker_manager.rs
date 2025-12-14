@@ -279,6 +279,8 @@ impl WorkerManager {
         method: Method,
     ) -> Result<Vec<(String, String)>, Response> {
         let workers = worker_registry.get_all();
+        let worker_count = workers.len();
+
         if workers.is_empty() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
@@ -326,7 +328,7 @@ impl WorkerManager {
             .collect()
             .await;
 
-        if responses.is_empty() && !workers.is_empty() {
+        if responses.is_empty() && worker_count > 0 {
             return Err((StatusCode::BAD_GATEWAY, "All backend requests failed").into_response());
         }
 
