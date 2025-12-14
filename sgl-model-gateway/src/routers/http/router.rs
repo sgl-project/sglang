@@ -159,7 +159,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
@@ -210,7 +210,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
@@ -418,7 +418,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request

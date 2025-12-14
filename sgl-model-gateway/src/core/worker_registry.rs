@@ -224,6 +224,16 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    /// Get the number of workers in the registry
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Check if the registry is empty
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
     /// Get all workers
     pub fn get_all(&self) -> Vec<Arc<dyn Worker>> {
         self.workers

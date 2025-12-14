@@ -37,7 +37,7 @@ pub fn init_metrics() {
         "Total number of request errors by route and error type"
     );
     describe_counter!(
-        "sgl_router_upstream_http_responses_total",
+        "sgl_router_attempt_http_responses_total",
         "Total number of upstream engine HTTP responses by status code"
     );
     describe_counter!(
@@ -64,6 +64,23 @@ pub fn init_metrics() {
     describe_counter!(
         "sgl_router_cb_outcomes_total",
         "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
+    );
+    describe_gauge!(
+        "sgl_router_cb_consecutive_failures",
+        "Current consecutive failure count per worker circuit breaker"
+    );
+    describe_gauge!(
+        "sgl_router_cb_consecutive_successes",
+        "Current consecutive success count per worker circuit breaker"
+    );
+
+    describe_counter!(
+        "sgl_router_discovery_watcher_errors_total",
+        "Total number of Kubernetes watcher errors"
+    );
+    describe_counter!(
+        "sgl_router_discovery_watcher_restarts_total",
+        "Total number of Kubernetes watcher restarts"
     );
 
     describe_gauge!(
@@ -185,90 +202,6 @@ pub fn init_metrics() {
         "Number of running requests per worker"
     );
 
-    describe_histogram!(
-        "sgl_tokenizer_encode_duration_seconds",
-        "Time to encode text to tokens"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_decode_duration_seconds",
-        "Time to decode tokens to text"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_encode_batch_duration_seconds",
-        "Time to encode a batch of texts"
-    );
-    describe_counter!(
-        "sgl_tokenizer_encode_requests_total",
-        "Total number of encode requests by tokenizer type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_decode_requests_total",
-        "Total number of decode requests by tokenizer type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_encode_errors_total",
-        "Total number of encode errors by error type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_decode_errors_total",
-        "Total number of decode errors by error type"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_tokens_per_encode",
-        "Number of tokens produced per encode operation"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_chars_per_encode",
-        "Number of characters in input text per encode"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_tokens_per_decode",
-        "Number of tokens decoded per operation"
-    );
-    describe_gauge!(
-        "sgl_tokenizer_vocab_size",
-        "Vocabulary size of the loaded tokenizer"
-    );
-
-    describe_counter!(
-        "sgl_tokenizer_stop_sequences_detected_total",
-        "Total stop sequences detected by type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_partial_matches_total",
-        "Total partial stop sequence matches (jailed text)"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_stop_detection_duration_seconds",
-        "Time to check for stop sequences per token"
-    );
-
-    describe_counter!(
-        "sgl_tokenizer_stream_tokens_total",
-        "Total tokens processed in streaming decode"
-    );
-    describe_counter!(
-        "sgl_tokenizer_stream_incomplete_utf8_total",
-        "Total incomplete UTF-8 sequences detected"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_stream_step_duration_seconds",
-        "Time per streaming decode step"
-    );
-
-    describe_counter!(
-        "sgl_tokenizer_factory_loads_total",
-        "Total tokenizer loads by file type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_factory_errors_total",
-        "Total tokenizer loading errors by type"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_factory_load_duration_seconds",
-        "Time to load and initialize tokenizer"
-    );
-
     describe_counter!(
         "sgl_router_http_requests_total",
         "Total number of HTTP requests"
@@ -307,12 +240,10 @@ pub fn start_prometheus(config: PrometheusConfig) {
 
 pub struct RouterMetrics;
 
-pub struct TokenizerMetrics;
-
 impl RouterMetrics {
-    pub fn record_request(route: &str) {
+    pub fn record_request(route: &'static str) {
         counter!("sgl_router_requests_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
@@ -321,27 +252,27 @@ impl RouterMetrics {
         histogram!("sgl_router_request_duration_seconds").record(duration.as_secs_f64());
     }
 
-    pub fn record_request_error(route: &str, error_type: &str) {
+    pub fn record_request_error(route: &'static str, error_type: &'static str) {
         counter!("sgl_router_request_errors_total",
-            "route" => route.to_string(),
-            "error_type" => error_type.to_string()
+            "route" => route,
+            "error_type" => error_type
         )
         .increment(1);
     }
 
     // TODO unify metric names
-    pub fn record_attempt_http_response(route: &str, status_code: u16, error_code: &str) {
+    pub fn record_attempt_http_response(route: &'static str, status_code: u16, error_code: &str) {
         counter!("sgl_router_attempt_http_responses_total",
-            "route" => route.to_string(),
+            "route" => route,
             "status_code" => status_code.to_string(),
             "error_code" => error_code.to_string()
         )
         .increment(1);
     }
 
-    pub fn record_retry(route: &str) {
+    pub fn record_retry(route: &'static str) {
         counter!("sgl_router_retries_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
@@ -353,9 +284,9 @@ impl RouterMetrics {
         .record(duration.as_secs_f64());
     }
 
-    pub fn record_retries_exhausted(route: &str) {
+    pub fn record_retries_exhausted(route: &'static str) {
         counter!("sgl_router_retries_exhausted_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
@@ -367,6 +298,10 @@ impl RouterMetrics {
         .set(if healthy { 1.0 } else { 0.0 });
     }
 
+    pub fn set_active_workers(count: usize) {
+        gauge!("sgl_router_active_workers").set(count as f64);
+    }
+
     pub fn record_processed_request(worker_url: &str) {
         counter!("sgl_router_processed_requests_total",
             "worker" => worker_url.to_string()
@@ -374,9 +309,9 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn record_policy_decision(policy: &str, worker: &str) {
+    pub fn record_policy_decision(policy: &'static str, worker: &str) {
         counter!("sgl_router_policy_decisions_total",
-            "policy" => policy.to_string(),
+            "policy" => policy,
             "worker" => worker.to_string()
         )
         .increment(1);
@@ -406,16 +341,16 @@ impl RouterMetrics {
         gauge!("sgl_router_min_load").set(min_load as f64);
     }
 
-    pub fn record_pd_request(route: &str) {
+    pub fn record_pd_request(route: &'static str) {
         counter!("sgl_router_pd_requests_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
 
-    pub fn record_pd_request_duration(route: &str, duration: Duration) {
+    pub fn record_pd_request_duration(route: &'static str, duration: Duration) {
         histogram!("sgl_router_pd_request_duration_seconds",
-            "route" => route.to_string()
+            "route" => route
         )
         .record(duration.as_secs_f64());
     }
@@ -434,9 +369,9 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn record_pd_error(error_type: &str) {
+    pub fn record_pd_error(error_type: &'static str) {
         counter!("sgl_router_pd_errors_total",
-            "error_type" => error_type.to_string()
+            "error_type" => error_type
         )
         .increment(1);
     }
@@ -526,52 +461,79 @@ impl RouterMetrics {
         .set(state_code as f64);
     }
 
-    pub fn record_cb_state_transition(worker: &str, from: &str, to: &str) {
+    pub fn record_cb_state_transition(worker: &str, from: &'static str, to: &'static str) {
         counter!("sgl_router_cb_state_transitions_total",
             "worker" => worker.to_string(),
-            "from" => from.to_string(),
-            "to" => to.to_string()
+            "from" => from,
+            "to" => to
         )
         .increment(1);
     }
 
-    pub fn record_cb_outcome(worker: &str, outcome: &str) {
+    pub fn record_cb_outcome(worker: &str, outcome: &'static str) {
         counter!("sgl_router_cb_outcomes_total",
             "worker" => worker.to_string(),
-            "outcome" => outcome.to_string()
+            "outcome" => outcome
         )
         .increment(1);
+    }
+
+    pub fn set_cb_consecutive_failures(worker: &str, count: u32) {
+        gauge!("sgl_router_cb_consecutive_failures",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
+    }
+
+    pub fn set_cb_consecutive_successes(worker: &str, count: u32) {
+        gauge!("sgl_router_cb_consecutive_successes",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
+    }
+
+    pub fn record_discovery_watcher_error() {
+        counter!("sgl_router_discovery_watcher_errors_total").increment(1);
+    }
+
+    pub fn record_discovery_watcher_restart() {
+        counter!("sgl_router_discovery_watcher_restarts_total").increment(1);
     }
 
     // TODO delete the metrics (instead of setting them to zero)
     pub fn remove_worker_metrics(worker_url: &str) {
-        gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(0.0);
-        gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_cb_consecutive_failures","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_cb_consecutive_successes","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_running_requests","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_tree_size","worker" => worker_url.to_string()).set(0.0);
+
+        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
+        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
+        gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(-1.0);
+        gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(-1.0);
     }
 
     pub fn set_job_queue_depth(depth: usize) {
         gauge!("sgl_router_job_queue_depth").set(depth as f64);
     }
 
-    pub fn record_job_duration(job_type: &str, duration: Duration) {
+    pub fn record_job_duration(job_type: &'static str, duration: Duration) {
         histogram!("sgl_router_job_duration_seconds",
-            "job_type" => job_type.to_string()
+            "job_type" => job_type
         )
         .record(duration.as_secs_f64());
     }
 
-    pub fn record_job_success(job_type: &str) {
+    pub fn record_job_success(job_type: &'static str) {
         counter!("sgl_router_job_success_total",
-            "job_type" => job_type.to_string()
+            "job_type" => job_type
         )
         .increment(1);
     }
 
-    pub fn record_job_failure(job_type: &str) {
+    pub fn record_job_failure(job_type: &'static str) {
         counter!("sgl_router_job_failure_total",
-            "job_type" => job_type.to_string()
+            "job_type" => job_type
         )
         .increment(1);
     }
@@ -600,115 +562,6 @@ impl RouterMetrics {
             "error_code" => error_code.to_string()
         )
         .increment(1);
-    }
-}
-
-impl TokenizerMetrics {
-    pub fn record_encode_request(tokenizer_type: &str) {
-        counter!("sgl_tokenizer_encode_requests_total",
-            "tokenizer_type" => tokenizer_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_encode_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_encode_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_encode_error(error_type: &str) {
-        counter!("sgl_tokenizer_encode_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_tokens_per_encode(token_count: usize) {
-        histogram!("sgl_tokenizer_tokens_per_encode").record(token_count as f64);
-    }
-
-    pub fn record_chars_per_encode(char_count: usize) {
-        histogram!("sgl_tokenizer_chars_per_encode").record(char_count as f64);
-    }
-
-    pub fn record_decode_request(tokenizer_type: &str) {
-        counter!("sgl_tokenizer_decode_requests_total",
-            "tokenizer_type" => tokenizer_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_decode_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_decode_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_decode_error(error_type: &str) {
-        counter!("sgl_tokenizer_decode_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_tokens_per_decode(token_count: usize) {
-        histogram!("sgl_tokenizer_tokens_per_decode").record(token_count as f64);
-    }
-
-    pub fn record_encode_batch_duration(duration: Duration, batch_size: usize) {
-        histogram!("sgl_tokenizer_encode_batch_duration_seconds",
-            "batch_size" => batch_size.to_string()
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    pub fn record_stop_sequence_detected(stop_type: &str) {
-        counter!("sgl_tokenizer_stop_sequences_detected_total",
-            "type" => stop_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_partial_match() {
-        counter!("sgl_tokenizer_partial_matches_total").increment(1);
-    }
-
-    pub fn record_stop_detection_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_stop_detection_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_stream_token() {
-        counter!("sgl_tokenizer_stream_tokens_total").increment(1);
-    }
-
-    pub fn record_incomplete_utf8() {
-        counter!("sgl_tokenizer_stream_incomplete_utf8_total").increment(1);
-    }
-
-    pub fn record_stream_step_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_stream_step_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_factory_load(file_type: &str) {
-        counter!("sgl_tokenizer_factory_loads_total",
-            "file_type" => file_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_factory_error(error_type: &str) {
-        counter!("sgl_tokenizer_factory_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_factory_load_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_factory_load_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn set_vocab_size(tokenizer_type: &str, size: usize) {
-        gauge!("sgl_tokenizer_vocab_size",
-            "tokenizer_type" => tokenizer_type.to_string()
-        )
-        .set(size as f64);
     }
 }
 
@@ -953,37 +806,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenizer_metrics_static_methods() {
-        TokenizerMetrics::record_encode_request("huggingface");
-        TokenizerMetrics::record_encode_duration(Duration::from_millis(10));
-        TokenizerMetrics::record_encode_error("invalid_input");
-        TokenizerMetrics::record_tokens_per_encode(100);
-        TokenizerMetrics::record_chars_per_encode(500);
-
-        TokenizerMetrics::record_decode_request("huggingface");
-        TokenizerMetrics::record_decode_duration(Duration::from_millis(5));
-        TokenizerMetrics::record_decode_error("invalid_tokens");
-        TokenizerMetrics::record_tokens_per_decode(50);
-
-        TokenizerMetrics::record_encode_batch_duration(Duration::from_millis(100), 10);
-
-        TokenizerMetrics::record_stop_sequence_detected("token");
-        TokenizerMetrics::record_stop_sequence_detected("string");
-        TokenizerMetrics::record_partial_match();
-        TokenizerMetrics::record_stop_detection_duration(Duration::from_micros(100));
-
-        TokenizerMetrics::record_stream_token();
-        TokenizerMetrics::record_incomplete_utf8();
-        TokenizerMetrics::record_stream_step_duration(Duration::from_micros(50));
-
-        TokenizerMetrics::record_factory_load("json");
-        TokenizerMetrics::record_factory_error("unsupported_format");
-        TokenizerMetrics::record_factory_load_duration(Duration::from_millis(200));
-
-        TokenizerMetrics::set_vocab_size("huggingface", 50000);
-    }
-
-    #[test]
     fn test_port_already_in_use() {
         let port = 29123;
 
@@ -1056,7 +878,7 @@ mod tests {
     fn test_very_long_metric_labels() {
         let long_label = "a".repeat(1000);
 
-        RouterMetrics::record_request(&long_label);
+        RouterMetrics::record_request("/very_long_test_route");
         RouterMetrics::set_worker_health(&long_label, false);
     }
 
