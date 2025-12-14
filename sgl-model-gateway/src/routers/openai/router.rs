@@ -2,6 +2,7 @@ use std::{
     any::Any,
     collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
+    time::Instant,
 };
 
 use axum::{
@@ -35,13 +36,9 @@ use crate::{
     app_context::AppContext,
     core::{model_type::Endpoint, ModelCard, ProviderType, RuntimeType, Worker, WorkerRegistry},
     data_connector::{ConversationId, ListParams, ResponseId, SortOrder},
+    observability::metrics::{smg_labels, SmgMetrics},
     protocols::{
         chat::ChatCompletionRequest,
-        classify::ClassifyRequest,
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        generate::GenerateRequest,
-        rerank::RerankRequest,
         responses::{
             generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponsesGetParams, ResponsesRequest,
@@ -70,8 +67,78 @@ impl std::fmt::Debug for OpenAIRouter {
     }
 }
 
+/// Error response helpers for consistent API error formatting
+mod error_responses {
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Json,
+    };
+    use serde_json::json;
+
+    pub fn bad_request(message: impl Into<String>) -> Response {
+        (StatusCode::BAD_REQUEST, message.into()).into_response()
+    }
+
+    pub fn not_found(resource: &str, id: &str) -> Response {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": format!("No {} found with id '{}'", resource, id),
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "not_found"
+                }
+            })),
+        )
+            .into_response()
+    }
+
+    pub fn internal_error(message: impl Into<String>) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": message.into(),
+                    "type": "internal_error",
+                    "param": null,
+                    "code": "storage_error"
+                }
+            })),
+        )
+            .into_response()
+    }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Response {
+        (StatusCode::SERVICE_UNAVAILABLE, message.into()).into_response()
+    }
+
+    pub fn model_not_found(model: &str) -> Response {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": format!("No worker available for model '{}'", model),
+                    "type": "model_not_found",
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
 impl OpenAIRouter {
     const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
+
+    /// Get all external workers from the registry
+    fn external_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.worker_registry
+            .get_all()
+            .into_iter()
+            .filter(|w| w.metadata().runtime_type == RuntimeType::External)
+            .collect()
+    }
 
     fn shared_components(&self) -> Arc<SharedComponents> {
         Arc::clone(&self.shared_components)
@@ -209,53 +276,73 @@ impl OpenAIRouter {
         join_all(futures).await;
     }
 
+    /// Find workers that can handle the given model and select the least loaded one
+    fn find_best_worker_for_model(&self, model_id: &str) -> Option<Arc<dyn Worker>> {
+        self.worker_registry
+            .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
+            .into_iter()
+            .filter(|w| w.supports_model(model_id) && w.circuit_breaker().can_execute())
+            .min_by_key(|w| w.load())
+    }
+
     async fn select_worker_for_model(
         &self,
         model_id: &str,
         auth_header: Option<&HeaderValue>,
-    ) -> Result<Arc<dyn Worker>, Box<Response>> {
-        let find_candidates = || {
-            self.worker_registry
-                .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
-                .into_iter()
-                .filter(|w| w.supports_model(model_id) && w.circuit_breaker().can_execute())
-                .collect::<Vec<_>>()
-        };
-
-        let candidates = find_candidates();
-        if !candidates.is_empty() {
-            return Ok(candidates
-                .into_iter()
-                .min_by_key(|w| w.load())
-                .expect("candidates is not empty"));
+    ) -> Result<Arc<dyn Worker>, Response> {
+        // Try to find a worker immediately
+        if let Some(worker) = self.find_best_worker_for_model(model_id) {
+            return Ok(worker);
         }
 
+        // Refresh external models and try again
         tracing::debug!(
             "No worker found for model '{}', refreshing external worker models",
             model_id
         );
         self.refresh_external_models(auth_header).await;
 
-        let candidates = find_candidates();
-        if !candidates.is_empty() {
-            return Ok(candidates
-                .into_iter()
-                .min_by_key(|w| w.load())
-                .expect("candidates is not empty"));
-        }
+        self.find_best_worker_for_model(model_id)
+            .ok_or_else(|| error_responses::model_not_found(model_id))
+    }
 
-        Err(Box::new(
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": {
-                        "message": format!("No worker available for model '{}'", model_id),
-                        "type": "model_not_found",
-                    }
-                })),
-            )
-                .into_response(),
-        ))
+    /// Deserialize ResponseInputOutputItems from a JSON array value
+    fn deserialize_items_from_array(array: &Value) -> Vec<ResponseInputOutputItem> {
+        array
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        serde_json::from_value::<ResponseInputOutputItem>(item.clone())
+                            .map_err(|e| warn!("Failed to deserialize item: {}. Item: {}", e, item))
+                            .ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Append current request input to items list, creating a user message if needed
+    fn append_current_input(
+        items: &mut Vec<ResponseInputOutputItem>,
+        input: &ResponseInput,
+        id_suffix: &str,
+    ) {
+        match input {
+            ResponseInput::Text(text) => {
+                items.push(ResponseInputOutputItem::Message {
+                    id: format!("msg_u_{}", id_suffix),
+                    role: "user".to_string(),
+                    content: vec![ResponseContentPart::InputText { text: text.clone() }],
+                    status: Some("completed".to_string()),
+                });
+            }
+            ResponseInput::Items(current_items) => {
+                for item in current_items {
+                    items.push(crate::protocols::responses::normalize_input_item(item));
+                }
+            }
+        }
     }
 
     async fn handle_non_streaming_response(&self, mut ctx: RequestContext) -> Response {
@@ -388,65 +475,38 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        let external_workers: Vec<_> = self
-            .worker_registry
-            .get_all()
-            .into_iter()
-            .filter(|w| w.metadata().runtime_type == RuntimeType::External)
-            .collect();
-
+        let external_workers = self.external_workers();
         if external_workers.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No external workers registered",
-            )
-                .into_response();
+            return error_responses::service_unavailable("No external workers registered");
         }
 
-        let mut healthy_count = 0;
-        let mut unhealthy_workers = Vec::new();
+        let (healthy, unhealthy): (Vec<_>, Vec<_>) =
+            external_workers.iter().partition(|w| w.is_healthy());
 
-        for worker in &external_workers {
-            if worker.is_healthy() {
-                healthy_count += 1;
-            } else {
-                unhealthy_workers.push(format!("{} ({})", worker.model_id(), worker.url()));
-            }
-        }
-
-        if unhealthy_workers.is_empty() {
+        if unhealthy.is_empty() {
             (
                 StatusCode::OK,
-                format!("OK - {} workers healthy", healthy_count),
+                format!("OK - {} workers healthy", healthy.len()),
             )
                 .into_response()
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "{}/{} workers unhealthy: {}",
-                    unhealthy_workers.len(),
-                    external_workers.len(),
-                    unhealthy_workers.join(", ")
-                ),
-            )
-                .into_response()
+            let unhealthy_info: Vec<_> = unhealthy
+                .iter()
+                .map(|w| format!("{} ({})", w.model_id(), w.url()))
+                .collect();
+            error_responses::service_unavailable(format!(
+                "{}/{} workers unhealthy: {}",
+                unhealthy.len(),
+                external_workers.len(),
+                unhealthy_info.join(", ")
+            ))
         }
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         let stats = self.worker_registry.stats();
-        let external_workers: Vec<_> = self
-            .worker_registry
-            .get_all()
-            .into_iter()
-            .filter(|w| w.metadata().runtime_type == RuntimeType::External)
-            .collect();
-
-        let worker_urls: Vec<String> = external_workers
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect();
+        let external_workers = self.external_workers();
+        let worker_urls: Vec<_> = external_workers.iter().map(|w| w.url()).collect();
 
         let info = json!({
             "router_type": "openai",
@@ -460,19 +520,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
-        let external_workers: Vec<_> = self
-            .worker_registry
-            .get_all()
-            .into_iter()
-            .filter(|w| w.metadata().runtime_type == RuntimeType::External)
-            .collect();
-
+        let external_workers = self.external_workers();
         if external_workers.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No external workers registered",
-            )
-                .into_response();
+            return error_responses::service_unavailable("No external workers registered");
         }
 
         let auth_header = extract_auth_header(Some(req.headers()), &None);
@@ -522,33 +572,26 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         (StatusCode::OK, Json(response_json)).into_response()
     }
 
-    async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "get_model_info not implemented for OpenAI router",
-        )
-            .into_response()
-    }
-
-    async fn route_generate(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Generate endpoint not supported for OpenAI backend",
-        )
-            .into_response()
-    }
-
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+        let streaming = body.stream;
+
+        // Record request start
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_OPENAI,
+            smg_labels::BACKEND_EXTERNAL,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            smg_labels::ENDPOINT_CHAT,
+            streaming,
+        );
+
         let auth_header = extract_auth_header(headers, &None);
 
         let worker = match self
@@ -556,27 +599,45 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             .await
         {
             Ok(w) => w,
-            Err(response) => return *response,
+            Err(response) => {
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_OPENAI,
+                    smg_labels::BACKEND_EXTERNAL,
+                    smg_labels::CONNECTION_HTTP,
+                    model,
+                    smg_labels::ENDPOINT_CHAT,
+                    smg_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
         };
 
         let mut payload = match to_value(body) {
             Ok(v) => v,
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize request: {}", e),
-                )
-                    .into_response();
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_OPENAI,
+                    smg_labels::BACKEND_EXTERNAL,
+                    smg_labels::CONNECTION_HTTP,
+                    model,
+                    smg_labels::ENDPOINT_CHAT,
+                    smg_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Provider transform error: {}", e),
-            )
-                .into_response();
+            SmgMetrics::record_router_error(
+                smg_labels::ROUTER_OPENAI,
+                smg_labels::BACKEND_EXTERNAL,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                smg_labels::ENDPOINT_CHAT,
+                smg_labels::ERROR_VALIDATION,
+            );
+            return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
 
         let mut ctx = RequestContext::for_chat(
@@ -611,6 +672,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             Ok(r) => r,
             Err(e) => {
                 worker.circuit_breaker().record_failure();
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_OPENAI,
+                    smg_labels::BACKEND_EXTERNAL,
+                    smg_labels::CONNECTION_HTTP,
+                    model,
+                    smg_labels::ENDPOINT_CHAT,
+                    smg_labels::ERROR_BACKEND,
+                );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("Failed to contact upstream: {}", e),
@@ -627,6 +696,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             match resp.bytes().await {
                 Ok(body) => {
                     worker.circuit_breaker().record_success();
+                    SmgMetrics::record_router_duration(
+                        smg_labels::ROUTER_OPENAI,
+                        smg_labels::BACKEND_EXTERNAL,
+                        smg_labels::CONNECTION_HTTP,
+                        model,
+                        smg_labels::ENDPOINT_CHAT,
+                        start.elapsed(),
+                    );
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     if let Some(ct) = content_type {
@@ -636,6 +713,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
                 Err(e) => {
                     worker.circuit_breaker().record_failure();
+                    SmgMetrics::record_router_error(
+                        smg_labels::ROUTER_OPENAI,
+                        smg_labels::BACKEND_EXTERNAL,
+                        smg_labels::CONNECTION_HTTP,
+                        model,
+                        smg_labels::ENDPOINT_CHAT,
+                        smg_labels::ERROR_BACKEND,
+                    );
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to read response: {}", e),
@@ -644,6 +729,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
             }
         } else {
+            // For streaming, record duration at start since we can't track completion
+            SmgMetrics::record_router_duration(
+                smg_labels::ROUTER_OPENAI,
+                smg_labels::BACKEND_EXTERNAL,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                smg_labels::ENDPOINT_CHAT,
+                start.elapsed(),
+            );
             let stream = resp.bytes_stream();
             let (tx, rx) = mpsc::unbounded_channel();
             tokio::spawn(async move {
@@ -671,34 +765,44 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn route_completion(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &CompletionRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Completion endpoint not implemented",
-        )
-            .into_response()
-    }
-
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+        let streaming = body.stream.unwrap_or(false);
+
+        // Record request start
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_OPENAI,
+            smg_labels::BACKEND_EXTERNAL,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            smg_labels::ENDPOINT_RESPONSES,
+            streaming,
+        );
+
         let auth_header = extract_auth_header(headers, &None);
 
-        let model = model_id.unwrap_or(body.model.as_str());
         let worker = match self
             .select_worker_for_model(model, auth_header.as_ref())
             .await
         {
             Ok(w) => w,
-            Err(response) => return *response,
+            Err(response) => {
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_OPENAI,
+                    smg_labels::BACKEND_EXTERNAL,
+                    smg_labels::CONNECTION_HTTP,
+                    model,
+                    smg_labels::ENDPOINT_RESPONSES,
+                    smg_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
         };
 
         let mut request_body = body.clone();
@@ -709,8 +813,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         let original_previous_response_id = request_body.previous_response_id.clone();
 
+        // Load items from previous response chain if specified
         let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
-        if let Some(prev_id_str) = request_body.previous_response_id.clone() {
+        if let Some(prev_id_str) = request_body.previous_response_id.take() {
             let prev_id = ResponseId::from(prev_id_str.as_str());
             match self
                 .responses_components
@@ -719,43 +824,16 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .await
             {
                 Ok(chain) => {
-                    let mut items = Vec::new();
-                    for stored in chain.responses.iter() {
-                        if let Some(input_arr) = stored.input.as_array() {
-                            for item in input_arr {
-                                match serde_json::from_value::<ResponseInputOutputItem>(
-                                    item.clone(),
-                                ) {
-                                    Ok(input_item) => {
-                                        items.push(input_item);
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to deserialize stored input item: {}. Item: {}",
-                                            e, item
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(output_arr) = stored.output.as_array() {
-                            for item in output_arr {
-                                match serde_json::from_value::<ResponseInputOutputItem>(
-                                    item.clone(),
-                                ) {
-                                    Ok(output_item) => {
-                                        items.push(output_item);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to deserialize stored output item: {}. Item: {}", e, item);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let items: Vec<ResponseInputOutputItem> = chain
+                        .responses
+                        .iter()
+                        .flat_map(|stored| {
+                            Self::deserialize_items_from_array(&stored.input)
+                                .into_iter()
+                                .chain(Self::deserialize_items_from_array(&stored.output))
+                        })
+                        .collect();
                     conversation_items = Some(items);
-                    request_body.previous_response_id = None;
                 }
                 Err(e) => {
                     warn!(
@@ -775,11 +853,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .get_conversation(&conv_id)
                 .await
             {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "Conversation not found"})),
-                )
-                    .into_response();
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_OPENAI,
+                    smg_labels::BACKEND_EXTERNAL,
+                    smg_labels::CONNECTION_HTTP,
+                    model,
+                    smg_labels::ENDPOINT_RESPONSES,
+                    smg_labels::ERROR_VALIDATION,
+                );
+                return error_responses::not_found("conversation", &conv_id.0);
             }
 
             let params = ListParams {
@@ -864,26 +946,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         }
                     }
 
-                    match &request_body.input {
-                        ResponseInput::Text(text) => {
-                            items.push(ResponseInputOutputItem::Message {
-                                id: format!("msg_u_{}", conv_id.0),
-                                role: "user".to_string(),
-                                content: vec![ResponseContentPart::InputText {
-                                    text: text.clone(),
-                                }],
-                                status: Some("completed".to_string()),
-                            });
-                        }
-                        ResponseInput::Items(current_items) => {
-                            for item in current_items.iter() {
-                                let normalized =
-                                    crate::protocols::responses::normalize_input_item(item);
-                                items.push(normalized);
-                            }
-                        }
-                    }
-
+                    Self::append_current_input(&mut items, &request_body.input, &conv_id.0);
                     request_body.input = ResponseInput::Items(items);
                 }
                 Err(e) => {
@@ -892,29 +955,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         }
 
+        // Apply previous response chain items if loaded
         if let Some(mut items) = conversation_items {
-            match &request_body.input {
-                ResponseInput::Text(text) => {
-                    items.push(ResponseInputOutputItem::Message {
-                        id: format!(
-                            "msg_u_{}",
-                            original_previous_response_id
-                                .as_ref()
-                                .unwrap_or(&"new".to_string())
-                        ),
-                        role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText { text: text.clone() }],
-                        status: Some("completed".to_string()),
-                    });
-                }
-                ResponseInput::Items(current_items) => {
-                    for item in current_items.iter() {
-                        let normalized = crate::protocols::responses::normalize_input_item(item);
-                        items.push(normalized);
-                    }
-                }
-            }
-
+            let id_suffix = original_previous_response_id.as_deref().unwrap_or("new");
+            Self::append_current_input(&mut items, &request_body.input, id_suffix);
             request_body.input = ResponseInput::Items(items);
         }
 
@@ -926,21 +970,29 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut payload = match to_value(&request_body) {
             Ok(v) => v,
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize request: {}", e),
-                )
-                    .into_response();
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_OPENAI,
+                    smg_labels::BACKEND_EXTERNAL,
+                    smg_labels::CONNECTION_HTTP,
+                    model,
+                    smg_labels::ENDPOINT_RESPONSES,
+                    smg_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Provider transform error: {}", e),
-            )
-                .into_response();
+            SmgMetrics::record_router_error(
+                smg_labels::ROUTER_OPENAI,
+                smg_labels::BACKEND_EXTERNAL,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                smg_labels::ENDPOINT_RESPONSES,
+                smg_labels::ERROR_VALIDATION,
+            );
+            return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
 
         let mut ctx = RequestContext::for_responses(
@@ -961,11 +1013,25 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             previous_response_id: original_previous_response_id,
         });
 
-        if ctx.is_streaming() {
+        let response = if ctx.is_streaming() {
             handle_streaming_response(ctx).await
         } else {
             self.handle_non_streaming_response(ctx).await
+        };
+
+        // Record duration only for successful requests (errors tracked inside handlers)
+        if response.status().is_success() {
+            SmgMetrics::record_router_duration(
+                smg_labels::ROUTER_OPENAI,
+                smg_labels::BACKEND_EXTERNAL,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                smg_labels::ENDPOINT_RESPONSES,
+                start.elapsed(),
+            );
         }
+
+        response
     }
 
     async fn get_response(
@@ -988,25 +1054,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
                 (StatusCode::OK, Json(response_json)).into_response()
             }
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Response not found"})),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to get response: {}", e) })),
-            )
-                .into_response(),
+            Ok(None) => error_responses::not_found("response", response_id),
+            Err(e) => error_responses::internal_error(format!("Failed to get response: {}", e)),
         }
-    }
-
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Cancel response not implemented for OpenAI router",
-        )
-            .into_response()
     }
 
     async fn list_response_input_items(
@@ -1023,10 +1073,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             .await
         {
             Ok(Some(stored)) => {
-                let items = match &stored.input {
-                    Value::Array(arr) => arr.clone(),
-                    _ => vec![],
-                };
+                let items = stored.input.as_array().cloned().unwrap_or_default();
 
                 let items_with_ids: Vec<Value> = items
                     .into_iter()
@@ -1050,61 +1097,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
                 (StatusCode::OK, Json(response_body)).into_response()
             }
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": {
-                        "message": format!("No response found with id '{}'", response_id),
-                        "type": "invalid_request_error",
-                        "param": Value::Null,
-                        "code": "not_found"
-                    }
-                })),
-            )
-                .into_response(),
+            Ok(None) => error_responses::not_found("response", response_id),
             Err(e) => {
                 warn!("Failed to retrieve input items for {}: {}", response_id, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": {
-                            "message": format!("Failed to retrieve input items: {}", e),
-                            "type": "internal_error",
-                            "param": Value::Null,
-                            "code": "storage_error"
-                        }
-                    })),
-                )
-                    .into_response()
+                error_responses::internal_error(format!("Failed to retrieve input items: {}", e))
             }
         }
-    }
-
-    async fn route_embeddings(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &EmbeddingRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Embeddings not supported").into_response()
-    }
-
-    async fn route_classify(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ClassifyRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Classify not supported").into_response()
-    }
-
-    async fn route_rerank(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &RerankRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
     }
 
     fn router_type(&self) -> &'static str {

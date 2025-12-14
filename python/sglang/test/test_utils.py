@@ -30,6 +30,7 @@ from PIL import Image
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -56,6 +57,9 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
+
+# VL test models
+DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -125,7 +129,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
+DEFAULT_IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
@@ -159,7 +163,7 @@ def is_in_amd_ci():
 
 def is_blackwell_system():
     """Return whether it is running on a Blackwell (B200) system."""
-    return get_bool_env_var("IS_BLACKWELL")
+    return envs.IS_BLACKWELL.get()
 
 
 def _use_cached_default_models(model_repo: str):
@@ -1198,21 +1202,20 @@ def run_bench_one_batch(model, other_args):
 
     try:
         stdout, stderr = process.communicate()
-        output = stdout.decode()
-        error = stderr.decode()
+        output = stdout.decode(errors="backslashreplace")
+        error = stderr.decode(errors="backslashreplace")
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
         # Return prefill_latency, decode_throughput, decode_latency
-        prefill_line = output.split("\n")[-9]
-        decode_line = output.split("\n")[-3]
-        pattern = (
-            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
-        )
-        match = re.search(pattern, prefill_line)
+        pattern = r"Benchmark[\s\S]*Total"
+        match = re.search(pattern, output)
+        bench_output = match[0] if match else ""
+        pattern = r".*?latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        match = re.search(r"Prefill." + pattern, bench_output)
         if match:
             prefill_latency = float(match.group("latency"))
-        match = re.search(pattern, decode_line)
+        match = re.search(r"Decode." + pattern, bench_output)
         if match:
             decode_latency = float(match.group("latency"))
             decode_throughput = float(match.group("throughput"))
