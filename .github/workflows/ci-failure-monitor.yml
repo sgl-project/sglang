@@ -38,10 +38,58 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           cd scripts/ci_monitor
-          python ci_failures_analysis.py \
-            --token $GITHUB_TOKEN \
-            --limit 100 \
-            --output ci_failure_analysis_$(date +%Y%m%d_%H%M%S).json
+          # TEMPORARY: Using dummy test data for Slack bot testing
+          cat > ci_failure_analysis_$(date +%Y%m%d_%H%M%S).json <<'EOF'
+          {
+            "summary": {
+              "total_jobs": 25,
+              "jobs_with_streaks": 8,
+              "total_runners": 5,
+              "analysis_timestamp": "2025-12-14T10:30:00.000000"
+            },
+            "failing_jobs": [
+              {
+                "job_name": "test-backend-unit",
+                "workflow_name": "PR Test (Nvidia, scheduled)",
+                "consecutive_failures": 5,
+                "current_streak": 5,
+                "first_failed_at": "2025-12-10 14:30:22",
+                "first_failed_url": "https://github.com/sgl-project/sglang/actions/runs/12345678/job/11111111",
+                "last_failed_at": "2025-12-14 02:15:33",
+                "last_failed_url": "https://github.com/sgl-project/sglang/actions/runs/12345999/job/22222222",
+                "status": "Code-related issue - consistent failures across runners"
+              },
+              {
+                "job_name": "test-models-small",
+                "workflow_name": "PR Test (Nvidia, scheduled)",
+                "consecutive_failures": 3,
+                "current_streak": 3,
+                "first_failed_at": "2025-12-12 08:00:11",
+                "first_failed_url": "https://github.com/sgl-project/sglang/actions/runs/12345700/job/33333333",
+                "last_failed_at": "2025-12-14 02:15:44",
+                "last_failed_url": "https://github.com/sgl-project/sglang/actions/runs/12345999/job/44444444",
+                "status": "Under investigation"
+              },
+              {
+                "job_name": "test-amd-rocm",
+                "workflow_name": "Nightly Test (AMD, scheduled)",
+                "consecutive_failures": 7,
+                "current_streak": 7,
+                "first_failed_at": "2025-12-08 03:20:55",
+                "first_failed_url": "https://github.com/sgl-project/sglang/actions/runs/12344000/job/55555555",
+                "last_failed_at": "2025-12-14 03:15:22",
+                "last_failed_url": "https://github.com/sgl-project/sglang/actions/runs/12346000/job/66666666",
+                "status": "Runner infrastructure issue suspected"
+              }
+            ]
+          }
+          EOF
+
+          # Original command (commented out for testing):
+          # python ci_failures_analysis.py \
+          #   --token $GITHUB_TOKEN \
+          #   --limit 100 \
+          #   --output ci_failure_analysis_$(date +%Y%m%d_%H%M%S).json
 
       - name: Upload Analysis Results
         uses: actions/upload-artifact@v4
@@ -65,7 +113,7 @@ jobs:
           fi
 
           if [ -n "$SGLANG_DIFFUSION_SLACK_TOKEN" ]; then
-            python3 ../../python/sglang/multimodal_gen/test/slack_utils.py --report-file "$LATEST_REPORT"
+            python3 post_ci_failures_to_slack.py --report-file "$LATEST_REPORT"
           else
             echo "SGLANG_DIFFUSION_SLACK_TOKEN not configured, skipping notification"
           fi
