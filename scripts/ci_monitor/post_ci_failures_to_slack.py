@@ -147,7 +147,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             color = "good"
         else:
             # Ping relevant people when there are failures
-            mentions = "<@U09RR5TNC94>"
+            mentions = "<@U09RR5TNC94> <@U09ABMCKQPM>"
             summary_lines = [
                 f"{mentions} 🚨 *CI Critical Failures (Scheduled Runs)*",
                 "_Note: Recent runs are shown left to right in the detailed breakdown_\n",
