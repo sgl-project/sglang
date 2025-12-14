@@ -159,7 +159,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     get_int_env_var,
-    get_local_ip_auto,
     init_custom_process_group,
     is_cuda,
     is_float4_e2m1fn_x2,
