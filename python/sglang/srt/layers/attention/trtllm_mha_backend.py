@@ -39,6 +39,48 @@ DEFAULT_WORKSPACE_SIZE_MB = 512
 global_zero_init_workspace_buffer = None
 
 
+def _get_trtllm_mha_workspace_size(
+    default_mb: int = DEFAULT_WORKSPACE_SIZE_MB,
+) -> tuple[int, bool, Optional[int]]:
+    """
+    Get workspace size for TRTLLM MHA backend.
+
+    This function handles the case where FlashInferAttnBackend.__init__() may override
+    the user-set environment variable. It preserves the user's setting if they explicitly
+    set SGLANG_FLASHINFER_WORKSPACE_SIZE.
+
+    Args:
+        default_mb: Default workspace size in MB for TRTLLM MHA (default: 512 MB)
+
+    Returns:
+        tuple: (workspace_size_bytes, user_env_var_set, user_env_var_value_mb)
+            - workspace_size_bytes: The workspace size in bytes to use
+            - user_env_var_set: Whether user explicitly set the environment variable
+            - user_env_var_value_mb: User's environment variable value in MB (None if not set)
+    """
+    # Check if user explicitly set the environment variable before super().__init__()
+    # because FlashInferAttnBackend.__init__() may override it
+    user_env_var_set = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set()
+    user_env_var_value = (
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() if user_env_var_set else None
+    )
+
+    default_workspace_size_bytes = default_mb * 1024 * 1024
+
+    if user_env_var_set and user_env_var_value is not None:
+        # User explicitly set the environment variable, use their value
+        # Restore it in case it was overridden by super().__init__()
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(user_env_var_value)
+        workspace_size_bytes = user_env_var_value
+        user_env_var_value_mb = user_env_var_value / (1024 * 1024)
+    else:
+        # Environment variable not set, use TRTLLM MHA default
+        workspace_size_bytes = default_workspace_size_bytes
+        user_env_var_value_mb = None
+
+    return workspace_size_bytes, user_env_var_set, user_env_var_value_mb
+
+
 @dataclass
 class TRTLLMMHAMetadata:
     # Sequence lengths for the forward batch
@@ -66,6 +108,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
+        # Get workspace size before super().__init__() to preserve user's environment variable
+        workspace_size_bytes, user_env_var_set, user_env_var_value_mb = (
+            _get_trtllm_mha_workspace_size(DEFAULT_WORKSPACE_SIZE_MB)
+        )
+
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
@@ -84,22 +131,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.device = model_runner.device
 
         # Workspace allocation
-        # Use environment variable if set, otherwise use default 512 MB
-        # The default value for TRTLLM MHA is 512 MB, which is different from
-        # the general flashinfer workspace size default (384 MB)
-        # SGLANG_FLASHINFER_WORKSPACE_SIZE is in bytes
-        default_workspace_size_bytes = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        env_var_set = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set()
-        if env_var_set:
-            # Environment variable is set, use its value
-            self.workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
-        else:
-            # Environment variable not set, use TRTLLM MHA default (512 MB)
-            self.workspace_size = default_workspace_size_bytes
+        # Use the workspace size determined by _get_trtllm_mha_workspace_size()
+        # which handles preserving user's environment variable setting
+        self.workspace_size = workspace_size_bytes
+        user_env_var_str = (
+            f"{user_env_var_value_mb:.2f} MB"
+            if user_env_var_value_mb is not None
+            else "N/A"
+        )
         logger.info(
             f"TRTLLM MHA workspace size: {self.workspace_size / (1024*1024):.2f} MB "
-            f"(env var set: {env_var_set}, "
-            f"env var value: {envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() / (1024*1024):.2f} MB, "
+            f"(user env var set: {user_env_var_set}, "
+            f"user env var value: {user_env_var_str}, "
             f"TRTLLM MHA default: {DEFAULT_WORKSPACE_SIZE_MB} MB)"
         )
         # Allocate buffers
