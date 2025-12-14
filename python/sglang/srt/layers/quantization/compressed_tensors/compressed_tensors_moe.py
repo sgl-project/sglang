@@ -943,7 +943,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (  # noqa
             fused_marlin_moe,
         )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -967,7 +967,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             if expert_map is not None:
                 global_num_experts = self.moe_runner_config.num_experts
 
-        output = fused_marlin_moe(
+        output = torch.ops.sglang.fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
