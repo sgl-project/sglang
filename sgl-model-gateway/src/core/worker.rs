@@ -1168,7 +1168,7 @@ mod tests {
     use std::{thread, time::Duration};
 
     use super::*;
-    use crate::core::CircuitBreakerConfig;
+    use crate::core::{CircuitBreakerConfig, CircuitState};
 
     #[test]
     fn test_worker_type_display() {
