@@ -533,6 +533,8 @@ class QwenImageTransformer2DModel(CachableDiT):
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
+    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+
     def __init__(
         self,
         config: QwenImageDitConfig,
