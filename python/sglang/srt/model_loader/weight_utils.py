@@ -183,6 +183,8 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        if not isinstance(hf_quant_config, dict):
+            hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
