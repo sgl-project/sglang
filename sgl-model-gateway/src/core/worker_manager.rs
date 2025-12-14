@@ -282,14 +282,16 @@ impl WorkerManager {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
 
-        let tasks = workers.into_iter().map(|worker| {
+        // Create owned values for each task to avoid lifetime issues
+        let mut tasks = Vec::with_capacity(workers.len());
+        for worker in workers.iter() {
             let client = client.clone();
             let worker_url = worker.url().to_string();
             let url = format!("{}/{}", worker_url, endpoint);
             let api_key = worker.api_key().clone();
             let method = method.clone();
 
-            async move {
+            tasks.push(async move {
                 let request = client.request(method, &url).timeout(REQUEST_TIMEOUT);
 
                 let request = if let Some(key) = api_key {
@@ -315,8 +317,8 @@ impl WorkerManager {
                         None
                     }
                 }
-            }
-        });
+            });
+        }
 
         let responses: Vec<_> = stream::iter(tasks)
             .buffer_unordered(MAX_CONCURRENT)
