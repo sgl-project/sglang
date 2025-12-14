@@ -22,7 +22,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::RouterMetrics,
+        metrics::{smg_labels, RouterMetrics, SmgMetrics},
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
@@ -33,7 +33,11 @@ use crate::{
         generate::GenerateRequest,
         rerank::RerankRequest,
     },
-    routers::{error, header_utils, RouterTrait},
+    routers::{
+        error,
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 #[derive(Debug)]
@@ -275,10 +279,22 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
+        let model = context.model_id.unwrap_or("default");
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_HTTP,
+            smg_labels::BACKEND_PD,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            context.is_stream,
+        );
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
                 move |attempt: u32| {
@@ -345,7 +361,31 @@ impl PDRouter {
             },
             || RouterMetrics::record_retries_exhausted(route),
         )
-        .await
+        .await;
+
+        // Record Layer 2 metrics
+        let duration = start_time.elapsed();
+        if response.status().is_success() {
+            SmgMetrics::record_router_duration(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_PD,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
+        } else if !is_retryable_status(response.status()) {
+            SmgMetrics::record_router_error(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_PD,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
     }
 
     async fn handle_decode_error_response(

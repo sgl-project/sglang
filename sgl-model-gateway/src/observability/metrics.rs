@@ -210,6 +210,182 @@ pub fn init_metrics() {
         "sgl_router_http_responses_total",
         "Total number of HTTP responses by status code and error code"
     );
+
+    // ========================================================================
+    // SMG Metrics (new layered architecture)
+    // ========================================================================
+
+    // Layer 1: HTTP metrics
+    describe_counter!(
+        "smg_http_requests_total",
+        "Total HTTP requests by method, path, and status"
+    );
+    describe_histogram!(
+        "smg_http_request_duration_seconds",
+        "HTTP request duration by method and path"
+    );
+    describe_counter!(
+        "smg_http_responses_total",
+        "Total HTTP responses by status_code and error_code"
+    );
+    describe_gauge!(
+        "smg_http_connections_active",
+        "Currently active HTTP connections"
+    );
+    describe_counter!(
+        "smg_http_rate_limit_total",
+        "Rate limiting decisions by result (allowed/rejected)"
+    );
+
+    // Layer 2: Router metrics
+    describe_counter!(
+        "smg_router_requests_total",
+        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming"
+    );
+    describe_histogram!(
+        "smg_router_request_duration_seconds",
+        "Router request duration by router_type, backend_type, connection_mode, model, endpoint"
+    );
+    describe_counter!(
+        "smg_router_request_errors_total",
+        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type"
+    );
+    describe_histogram!(
+        "smg_router_stage_duration_seconds",
+        "Pipeline stage duration by router_type and stage (gRPC only)"
+    );
+    describe_counter!(
+        "smg_router_upstream_responses_total",
+        "Upstream backend HTTP responses by router_type, status_code, error_code"
+    );
+
+    // Layer 2: Router inference metrics (gRPC only)
+    describe_histogram!(
+        "smg_router_ttft_seconds",
+        "Time to first token by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+    describe_histogram!(
+        "smg_router_tpot_seconds",
+        "Time per output token by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+    describe_counter!(
+        "smg_router_tokens_total",
+        "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only)"
+    );
+    describe_histogram!(
+        "smg_router_generation_duration_seconds",
+        "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+
+    // Layer 3: Worker metrics
+    describe_gauge!(
+        "smg_worker_pool_size",
+        "Current worker pool size by worker_type, connection_mode, model"
+    );
+    describe_gauge!(
+        "smg_worker_connections_active",
+        "Active connections to workers by worker_type, connection_mode"
+    );
+    describe_gauge!(
+        "smg_worker_requests_active",
+        "Currently running requests per worker"
+    );
+    describe_counter!(
+        "smg_worker_health_checks_total",
+        "Health check results by worker_type and result"
+    );
+    describe_counter!(
+        "smg_worker_selection_total",
+        "Worker selection events by worker_type, connection_mode, model, policy"
+    );
+    describe_counter!(
+        "smg_worker_errors_total",
+        "Worker-level errors by worker_type, connection_mode, error_type"
+    );
+
+    // Layer 3: Worker resilience metrics (circuit breaker)
+    describe_gauge!(
+        "smg_worker_cb_state",
+        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
+    );
+    describe_counter!(
+        "smg_worker_cb_transitions_total",
+        "Circuit breaker state transitions by worker, from, to"
+    );
+    describe_counter!(
+        "smg_worker_cb_outcomes_total",
+        "Circuit breaker outcomes by worker and outcome (success/failure)"
+    );
+    describe_gauge!(
+        "smg_worker_cb_consecutive_failures",
+        "Current consecutive failure count per worker"
+    );
+    describe_gauge!(
+        "smg_worker_cb_consecutive_successes",
+        "Current consecutive success count per worker"
+    );
+
+    // Layer 3: Worker resilience metrics (retry)
+    describe_counter!(
+        "smg_worker_retries_total",
+        "Total retry attempts by worker_type and endpoint"
+    );
+    describe_counter!(
+        "smg_worker_retries_exhausted_total",
+        "Requests that exhausted all retries by worker_type and endpoint"
+    );
+    describe_histogram!(
+        "smg_worker_retry_backoff_seconds",
+        "Retry backoff duration by attempt number"
+    );
+
+    // Layer 4: Discovery metrics
+    describe_counter!(
+        "smg_discovery_registrations_total",
+        "Worker registration attempts by source and result"
+    );
+    describe_counter!(
+        "smg_discovery_deregistrations_total",
+        "Worker deregistration events by source and reason"
+    );
+    describe_histogram!(
+        "smg_discovery_sync_duration_seconds",
+        "Discovery sync duration by source"
+    );
+    describe_gauge!(
+        "smg_discovery_workers_discovered",
+        "Workers known via discovery by source"
+    );
+
+    // Layer 5: MCP metrics
+    describe_counter!(
+        "smg_mcp_tool_calls_total",
+        "Total MCP tool invocations by model, tool_name, result"
+    );
+    describe_histogram!(
+        "smg_mcp_tool_duration_seconds",
+        "MCP tool execution duration by model, tool_name"
+    );
+    describe_gauge!("smg_mcp_servers_active", "Active MCP server connections");
+    describe_counter!(
+        "smg_mcp_tool_iterations_total",
+        "Tool loop iterations in Responses API by model"
+    );
+
+    // Layer 6: Database metrics
+    describe_counter!(
+        "smg_db_operations_total",
+        "Total database operations by storage_type, operation, result"
+    );
+    describe_histogram!(
+        "smg_db_operation_duration_seconds",
+        "Database operation duration by storage_type, operation"
+    );
+    describe_gauge!(
+        "smg_db_connections_active",
+        "Active database connections by storage_type"
+    );
+    describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -560,6 +736,723 @@ impl RouterMetrics {
         counter!("sgl_router_http_responses_total",
             "status_code" => status_code.to_string(),
             "error_code" => error_code.to_string()
+        )
+        .increment(1);
+    }
+}
+
+// ============================================================================
+// SMG Metrics - New layered architecture
+// ============================================================================
+
+/// Label constants for consistent metric labeling
+pub mod smg_labels {
+    // Router types
+    pub const ROUTER_OPENAI: &str = "openai";
+    pub const ROUTER_HTTP: &str = "http";
+    pub const ROUTER_GRPC: &str = "grpc";
+
+    // Backend types
+    pub const BACKEND_REGULAR: &str = "regular";
+    pub const BACKEND_PD: &str = "pd";
+    pub const BACKEND_EXTERNAL: &str = "external";
+
+    // Connection modes
+    pub const CONNECTION_HTTP: &str = "http";
+    pub const CONNECTION_GRPC: &str = "grpc";
+
+    // Endpoints
+    pub const ENDPOINT_CHAT: &str = "chat";
+    pub const ENDPOINT_GENERATE: &str = "generate";
+    pub const ENDPOINT_RESPONSES: &str = "responses";
+    pub const ENDPOINT_COMPLETIONS: &str = "completions";
+    pub const ENDPOINT_RERANK: &str = "rerank";
+    pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
+
+    // Worker types
+    pub const WORKER_REGULAR: &str = "regular";
+    pub const WORKER_PREFILL: &str = "prefill";
+    pub const WORKER_DECODE: &str = "decode";
+    pub const WORKER_HTTP: &str = "http";
+    pub const WORKER_GRPC: &str = "grpc";
+
+    // Token types
+    pub const TOKEN_INPUT: &str = "input";
+    pub const TOKEN_OUTPUT: &str = "output";
+
+    // Storage types
+    pub const STORAGE_RESPONSE: &str = "response";
+    pub const STORAGE_CONVERSATION: &str = "conversation";
+    pub const STORAGE_CONVERSATION_ITEM: &str = "conversation_item";
+
+    // Database operations
+    pub const DB_OP_GET: &str = "get";
+    pub const DB_OP_PUT: &str = "put";
+    pub const DB_OP_DELETE: &str = "delete";
+    pub const DB_OP_LIST: &str = "list";
+
+    // Result types
+    pub const RESULT_SUCCESS: &str = "success";
+    pub const RESULT_ERROR: &str = "error";
+    pub const RESULT_TIMEOUT: &str = "timeout";
+    pub const RESULT_NOT_FOUND: &str = "not_found";
+
+    // Discovery sources
+    pub const DISCOVERY_STATIC: &str = "static";
+    pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
+    pub const DISCOVERY_CONSUL: &str = "consul";
+    pub const DISCOVERY_MANUAL: &str = "manual";
+
+    // Rate limit results
+    pub const RATE_LIMIT_ALLOWED: &str = "allowed";
+    pub const RATE_LIMIT_REJECTED: &str = "rejected";
+
+    // Circuit breaker states
+    pub const CB_CLOSED: &str = "closed";
+    pub const CB_OPEN: &str = "open";
+    pub const CB_HALF_OPEN: &str = "half_open";
+
+    // Circuit breaker outcomes
+    pub const CB_SUCCESS: &str = "success";
+    pub const CB_FAILURE: &str = "failure";
+
+    // Router error types
+    pub const ERROR_NO_WORKERS: &str = "no_workers";
+    pub const ERROR_TIMEOUT: &str = "timeout";
+    pub const ERROR_BACKEND: &str = "backend_error";
+    pub const ERROR_VALIDATION: &str = "validation_error";
+    pub const ERROR_INTERNAL: &str = "internal_error";
+
+    // Pipeline stages (gRPC router)
+    pub const STAGE_PREPARATION: &str = "preparation";
+    pub const STAGE_WORKER_SELECTION: &str = "worker_selection";
+    pub const STAGE_CLIENT_ACQUISITION: &str = "client_acquisition";
+    pub const STAGE_REQUEST_BUILDING: &str = "request_building";
+    pub const STAGE_DISPATCH_METADATA: &str = "dispatch_metadata";
+    pub const STAGE_REQUEST_EXECUTION: &str = "request_execution";
+    pub const STAGE_RESPONSE_PROCESSING: &str = "response_processing";
+}
+
+/// SMG Metrics helper struct for the new layered metrics architecture
+pub struct SmgMetrics;
+
+/// Parameters for recording streaming metrics.
+pub struct StreamingMetricsParams<'a> {
+    /// Router type label (e.g., "grpc", "http")
+    pub router_type: &'static str,
+    /// Backend type label (e.g., "regular", "pd")
+    pub backend_type: &'static str,
+    /// Model identifier (will be converted to owned String for metrics)
+    pub model_id: &'a str,
+    /// Endpoint label (e.g., "chat", "generate")
+    pub endpoint: &'static str,
+    /// Time to first token (None if no tokens were generated)
+    pub ttft: Option<Duration>,
+    /// Total generation time
+    pub generation_duration: Duration,
+    /// Input token count (None for endpoints that don't track this)
+    pub input_tokens: Option<u64>,
+    /// Output token count
+    pub output_tokens: u64,
+}
+
+impl SmgMetrics {
+    /// Record an HTTP request
+    pub fn record_http_request(method: &str, path: &str, status_class: &str) {
+        counter!(
+            "smg_http_requests_total",
+            "method" => method.to_string(),
+            "path" => path.to_string(),
+            "status" => status_class.to_string()
+        )
+        .increment(1);
+    }
+
+    /// Record HTTP request duration
+    pub fn record_http_duration(method: &str, path: &str, duration: Duration) {
+        histogram!(
+            "smg_http_request_duration_seconds",
+            "method" => method.to_string(),
+            "path" => path.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Set active HTTP connections count
+    pub fn set_http_connections_active(count: usize) {
+        gauge!("smg_http_connections_active").set(count as f64);
+    }
+
+    /// Record HTTP response
+    pub fn record_http_response(status_code: u16, error_code: &str) {
+        counter!(
+            "smg_http_responses_total",
+            "status_code" => status_code.to_string(),
+            "error_code" => error_code.to_string()
+        )
+        .increment(1);
+    }
+
+    /// Record rate limit decision
+    pub fn record_http_rate_limit(result: &'static str) {
+        counter!(
+            "smg_http_rate_limit_total",
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    // ========================================================================
+    // Layer 2: Router metrics
+    // ========================================================================
+
+    /// Record a routed request
+    pub fn record_router_request(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        streaming: bool,
+    ) {
+        counter!(
+            "smg_router_requests_total",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "connection_mode" => connection_mode,
+            "model" => model_id.to_string(),
+            "endpoint" => endpoint,
+            "streaming" => streaming.to_string()
+        )
+        .increment(1);
+    }
+
+    /// Record router request duration
+    pub fn record_router_duration(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        duration: Duration,
+    ) {
+        histogram!(
+            "smg_router_request_duration_seconds",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "connection_mode" => connection_mode,
+            "model" => model_id.to_string(),
+            "endpoint" => endpoint
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record a router error
+    pub fn record_router_error(
+        router_type: &'static str,
+        backend_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        error_type: &'static str,
+    ) {
+        counter!(
+            "smg_router_request_errors_total",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "connection_mode" => connection_mode,
+            "model" => model_id.to_string(),
+            "endpoint" => endpoint,
+            "error_type" => error_type
+        )
+        .increment(1);
+    }
+
+    /// Record pipeline stage duration (gRPC only)
+    pub fn record_router_stage_duration(
+        router_type: &'static str,
+        stage: &'static str,
+        duration: Duration,
+    ) {
+        histogram!(
+            "smg_router_stage_duration_seconds",
+            "router_type" => router_type,
+            "stage" => stage
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record upstream backend response
+    pub fn record_router_upstream_response(
+        router_type: &'static str,
+        status_code: u16,
+        error_code: &str,
+    ) {
+        counter!(
+            "smg_router_upstream_responses_total",
+            "router_type" => router_type,
+            "status_code" => status_code.to_string(),
+            "error_code" => error_code.to_string()
+        )
+        .increment(1);
+    }
+
+    // ========================================================================
+    // Layer 2: Router inference metrics (gRPC only)
+    // ========================================================================
+
+    /// Record time to first token
+    pub fn record_router_ttft(
+        router_type: &'static str,
+        backend_type: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        duration: Duration,
+    ) {
+        histogram!(
+            "smg_router_ttft_seconds",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model_id.to_string(),
+            "endpoint" => endpoint
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record time per output token
+    pub fn record_router_tpot(
+        router_type: &'static str,
+        backend_type: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        duration: Duration,
+    ) {
+        histogram!(
+            "smg_router_tpot_seconds",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model_id.to_string(),
+            "endpoint" => endpoint
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record tokens processed
+    pub fn record_router_tokens(
+        router_type: &'static str,
+        backend_type: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        token_type: &'static str,
+        count: u64,
+    ) {
+        counter!(
+            "smg_router_tokens_total",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model_id.to_string(),
+            "endpoint" => endpoint,
+            "token_type" => token_type
+        )
+        .increment(count);
+    }
+
+    /// Record total generation duration
+    pub fn record_router_generation_duration(
+        router_type: &'static str,
+        backend_type: &'static str,
+        model_id: &str,
+        endpoint: &'static str,
+        duration: Duration,
+    ) {
+        histogram!(
+            "smg_router_generation_duration_seconds",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model_id.to_string(),
+            "endpoint" => endpoint
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record all streaming metrics in a single batch call.
+    ///
+    /// This consolidates TTFT, TPOT, generation duration, and token metrics
+    /// into one function, handling TPOT calculation internally.
+    pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
+        let StreamingMetricsParams {
+            router_type,
+            backend_type,
+            model_id,
+            endpoint,
+            ttft,
+            generation_duration,
+            input_tokens,
+            output_tokens,
+        } = params;
+        // metrics-rs requires owned strings for dynamic labels (uses Cow<'static, str>).
+        // We allocate once and clone for each metric - unavoidable with this API.
+        let model = model_id.to_string();
+
+        // TTFT and TPOT (only if we have a first token time)
+        if let Some(ttft_duration) = ttft {
+            histogram!(
+                "smg_router_ttft_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model.clone(),
+                "endpoint" => endpoint
+            )
+            .record(ttft_duration.as_secs_f64());
+
+            // TPOT - only meaningful with >1 output token
+            if output_tokens > 1 {
+                let time_after_first = generation_duration.saturating_sub(ttft_duration);
+                let tpot = time_after_first / (output_tokens as u32 - 1);
+                histogram!(
+                    "smg_router_tpot_seconds",
+                    "router_type" => router_type,
+                    "backend_type" => backend_type,
+                    "model" => model.clone(),
+                    "endpoint" => endpoint
+                )
+                .record(tpot.as_secs_f64());
+            }
+        }
+
+        // Generation duration
+        histogram!(
+            "smg_router_generation_duration_seconds",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model.clone(),
+            "endpoint" => endpoint
+        )
+        .record(generation_duration.as_secs_f64());
+
+        // Input tokens (if available)
+        if let Some(input) = input_tokens {
+            counter!(
+                "smg_router_tokens_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model.clone(),
+                "endpoint" => endpoint,
+                "token_type" => smg_labels::TOKEN_INPUT
+            )
+            .increment(input);
+        }
+
+        // Output tokens
+        counter!(
+            "smg_router_tokens_total",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model,
+            "endpoint" => endpoint,
+            "token_type" => smg_labels::TOKEN_OUTPUT
+        )
+        .increment(output_tokens);
+    }
+
+    // ========================================================================
+    // Layer 3: Worker metrics
+    // ========================================================================
+
+    /// Set worker pool size
+    pub fn set_worker_pool_size(
+        worker_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        size: usize,
+    ) {
+        gauge!(
+            "smg_worker_pool_size",
+            "worker_type" => worker_type,
+            "connection_mode" => connection_mode,
+            "model" => model_id.to_string()
+        )
+        .set(size as f64);
+    }
+
+    /// Set active worker connections
+    pub fn set_worker_connections_active(
+        worker_type: &'static str,
+        connection_mode: &'static str,
+        count: usize,
+    ) {
+        gauge!(
+            "smg_worker_connections_active",
+            "worker_type" => worker_type,
+            "connection_mode" => connection_mode
+        )
+        .set(count as f64);
+    }
+
+    /// Record health check result
+    pub fn record_worker_health_check(worker_type: &'static str, result: &'static str) {
+        counter!(
+            "smg_worker_health_checks_total",
+            "worker_type" => worker_type,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record worker selection
+    pub fn record_worker_selection(
+        worker_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        policy: &'static str,
+    ) {
+        counter!(
+            "smg_worker_selection_total",
+            "worker_type" => worker_type,
+            "connection_mode" => connection_mode,
+            "model" => model_id.to_string(),
+            "policy" => policy
+        )
+        .increment(1);
+    }
+
+    /// Record worker error
+    pub fn record_worker_error(
+        worker_type: &'static str,
+        connection_mode: &'static str,
+        error_type: &'static str,
+    ) {
+        counter!(
+            "smg_worker_errors_total",
+            "worker_type" => worker_type,
+            "connection_mode" => connection_mode,
+            "error_type" => error_type
+        )
+        .increment(1);
+    }
+
+    /// Set running requests per worker
+    pub fn set_worker_requests_active(worker: &str, count: usize) {
+        gauge!(
+            "smg_worker_requests_active",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
+    }
+
+    // ========================================================================
+    // Layer 3: Worker resilience metrics (circuit breaker)
+    // ========================================================================
+
+    /// Set circuit breaker state (0=closed, 1=open, 2=half_open)
+    pub fn set_worker_cb_state(worker: &str, state_code: u8) {
+        gauge!(
+            "smg_worker_cb_state",
+            "worker" => worker.to_string()
+        )
+        .set(state_code as f64);
+    }
+
+    /// Record circuit breaker state transition
+    pub fn record_worker_cb_transition(worker: &str, from: &'static str, to: &'static str) {
+        counter!(
+            "smg_worker_cb_transitions_total",
+            "worker" => worker.to_string(),
+            "from" => from,
+            "to" => to
+        )
+        .increment(1);
+    }
+
+    /// Record circuit breaker outcome
+    pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
+        counter!(
+            "smg_worker_cb_outcomes_total",
+            "worker" => worker.to_string(),
+            "outcome" => outcome
+        )
+        .increment(1);
+    }
+
+    /// Set circuit breaker consecutive failures
+    pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
+        gauge!(
+            "smg_worker_cb_consecutive_failures",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
+    }
+
+    /// Set circuit breaker consecutive successes
+    pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
+        gauge!(
+            "smg_worker_cb_consecutive_successes",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
+    }
+
+    // ========================================================================
+    // Layer 3: Worker resilience metrics (retry)
+    // ========================================================================
+
+    /// Record retry attempt
+    pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
+        counter!(
+            "smg_worker_retries_total",
+            "worker_type" => worker_type,
+            "endpoint" => endpoint
+        )
+        .increment(1);
+    }
+
+    /// Record retries exhausted
+    pub fn record_worker_retries_exhausted(worker_type: &'static str, endpoint: &'static str) {
+        counter!(
+            "smg_worker_retries_exhausted_total",
+            "worker_type" => worker_type,
+            "endpoint" => endpoint
+        )
+        .increment(1);
+    }
+
+    /// Record retry backoff duration
+    pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
+        histogram!(
+            "smg_worker_retry_backoff_seconds",
+            "attempt" => attempt.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    // ========================================================================
+    // Layer 4: Discovery metrics
+    // ========================================================================
+
+    /// Record worker registration attempt
+    pub fn record_discovery_registration(source: &'static str, result: &'static str) {
+        counter!(
+            "smg_discovery_registrations_total",
+            "source" => source,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record worker deregistration
+    pub fn record_discovery_deregistration(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_deregistrations_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Record discovery sync duration
+    pub fn record_discovery_sync_duration(source: &'static str, duration: Duration) {
+        histogram!(
+            "smg_discovery_sync_duration_seconds",
+            "source" => source
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Set workers discovered count
+    pub fn set_discovery_workers_discovered(source: &'static str, count: usize) {
+        gauge!(
+            "smg_discovery_workers_discovered",
+            "source" => source
+        )
+        .set(count as f64);
+    }
+
+    // ========================================================================
+    // Layer 5: MCP metrics
+    // ========================================================================
+
+    /// Record MCP tool call
+    pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
+        counter!(
+            "smg_mcp_tool_calls_total",
+            "model" => model_id.to_string(),
+            "tool_name" => tool_name.to_string(),
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record MCP tool execution duration
+    pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
+        histogram!(
+            "smg_mcp_tool_duration_seconds",
+            "model" => model_id.to_string(),
+            "tool_name" => tool_name.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Set active MCP servers count
+    pub fn set_mcp_servers_active(count: usize) {
+        gauge!("smg_mcp_servers_active").set(count as f64);
+    }
+
+    /// Record MCP tool loop iteration
+    pub fn record_mcp_tool_iteration(model_id: &str) {
+        counter!(
+            "smg_mcp_tool_iterations_total",
+            "model" => model_id.to_string()
+        )
+        .increment(1);
+    }
+
+    // ========================================================================
+    // Layer 6: Database metrics
+    // ========================================================================
+
+    /// Record database operation
+    pub fn record_db_operation(
+        storage_type: &'static str,
+        operation: &'static str,
+        result: &'static str,
+    ) {
+        counter!(
+            "smg_db_operations_total",
+            "storage_type" => storage_type,
+            "operation" => operation,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record database operation duration
+    pub fn record_db_operation_duration(
+        storage_type: &'static str,
+        operation: &'static str,
+        duration: Duration,
+    ) {
+        histogram!(
+            "smg_db_operation_duration_seconds",
+            "storage_type" => storage_type,
+            "operation" => operation
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Set active database connections
+    pub fn set_db_connections_active(storage_type: &'static str, count: usize) {
+        gauge!(
+            "smg_db_connections_active",
+            "storage_type" => storage_type
+        )
+        .set(count as f64);
+    }
+
+    /// Record item stored
+    pub fn increment_db_items_stored(storage_type: &'static str) {
+        counter!(
+            "smg_db_items_stored",
+            "storage_type" => storage_type
         )
         .increment(1);
     }

@@ -584,7 +584,7 @@
                 "48": 247.48,
                 "49": 247.54
             },
-            "expected_e2e_ms": 16563.83,
+            "expected_e2e_ms": 18382.19,
             "expected_avg_denoise_ms": 260.76,
             "expected_median_denoise_ms": 247.84
         },
@@ -706,7 +706,7 @@
                 "TimestepPreparationStage": 2.9,
                 "LatentPreparationStage": 1.25,
                 "ImageVAEEncodingStage": 1655.89,
-                "DenoisingStage": 100544.98,
+                "DenoisingStage": 106972.82,
                 "DecodingStage": 1355.52,
                 "per_frame_generation": null
             },
@@ -753,7 +753,7 @@
                 "39": 1599.78
             },
             "expected_e2e_ms": 123182.9887,
-            "expected_avg_denoise_ms": 2513.52,
+            "expected_avg_denoise_ms": 2831.00,
             "expected_median_denoise_ms": 1600.09
         },
         "wan2_1_i2v_14b_480P_2gpu": {
