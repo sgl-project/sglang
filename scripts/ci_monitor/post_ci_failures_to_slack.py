@@ -49,14 +49,80 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
 
         client = WebClient(token=token)
 
-        # Build summary by workflow
-        failing_jobs = report_data.get("failing_jobs", [])
-        critical_failures = [
-            job
-            for job in failing_jobs
-            if job.get("consecutive_failures", 0) >= 2
-            and "scheduled" in job.get("workflow_name", "").lower()
-        ]
+        # Parse the real JSON structure
+        # The JSON has workflow sections like "pr_test_nvidia_scheduled_data", "nightly_scheduled_data"
+        # Each section contains jobs with their stats including "current_streak"
+
+        critical_failures = []
+
+        # Map workflow data keys to display names
+        workflow_name_map = {
+            # PR Tests - Scheduled (5 workflows)
+            "pr_test_nvidia_scheduled_data": "PR Test (Nvidia, scheduled)",
+            "pr_test_amd_scheduled_data": "PR Test (AMD, scheduled)",
+            "pr_test_xeon_scheduled_data": "PR Test (Xeon, scheduled)",
+            "pr_test_xpu_scheduled_data": "PR Test (XPU, scheduled)",
+            "pr_test_npu_scheduled_data": "PR Test (NPU, scheduled)",
+            # Nightly Tests - Scheduled (4 workflows)
+            "nightly_nvidia_scheduled_data": "Nightly Test (Nvidia, scheduled)",
+            "nightly_amd_scheduled_data": "Nightly Test (AMD, scheduled)",
+            "nightly_intel_scheduled_data": "Nightly Test (Intel, scheduled)",
+            "nightly_npu_scheduled_data": "Nightly Test (NPU, scheduled)",
+        }
+
+        # Iterate through each workflow section
+        for workflow_key, workflow_data in report_data.items():
+            # Skip non-workflow keys (summary, limits, etc.)
+            if not isinstance(workflow_data, dict) or not any(
+                isinstance(v, dict) and "current_streak" in v
+                for v in workflow_data.values()
+            ):
+                continue
+
+            # Get workflow display name
+            workflow_name = workflow_name_map.get(workflow_key, workflow_key)
+
+            # Only process scheduled workflows
+            if "scheduled" not in workflow_key.lower():
+                continue
+
+            # Check each job in this workflow
+            for job_name, job_data in workflow_data.items():
+                if not isinstance(job_data, dict):
+                    continue
+
+                current_streak = job_data.get("current_streak", 0)
+
+                # Filter for jobs with streak >= 2
+                if current_streak >= 2:
+                    first_failure = job_data.get("first_failure_in_streak", {})
+                    last_failure = job_data.get("last_failure_in_streak", {})
+
+                    critical_failures.append(
+                        {
+                            "workflow_name": workflow_name,
+                            "job_name": job_name,
+                            "consecutive_failures": current_streak,
+                            "first_failed_at": (
+                                first_failure.get("created_at", "unknown")
+                                if first_failure
+                                else "unknown"
+                            ),
+                            "first_failed_url": (
+                                first_failure.get("job_url", "")
+                                if first_failure
+                                else ""
+                            ),
+                            "last_failed_at": (
+                                last_failure.get("created_at", "unknown")
+                                if last_failure
+                                else "unknown"
+                            ),
+                            "last_failed_url": (
+                                last_failure.get("job_url", "") if last_failure else ""
+                            ),
+                        }
+                    )
 
         # Group by workflow
         workflow_jobs = {}
