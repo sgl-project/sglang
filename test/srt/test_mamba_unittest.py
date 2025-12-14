@@ -81,10 +81,12 @@ class TestMamba(unittest.TestCase):
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
+            enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )
 
@@ -159,10 +161,12 @@ class TestMamba(unittest.TestCase):
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
+            enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )
         # setup kv pool
