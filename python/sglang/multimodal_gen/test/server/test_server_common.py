@@ -491,6 +491,7 @@ Consider updating perf_baselines.json with the snippets below:
             case.id,
             generate_fn,
         )
+
         self._validate_and_record(case, perf_record)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
