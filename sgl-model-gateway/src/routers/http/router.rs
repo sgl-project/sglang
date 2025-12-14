@@ -511,7 +511,7 @@ impl Router {
             };
 
             response
-        } else if load_incremented {
+        } else {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -530,41 +530,6 @@ impl Router {
                             if load_guard.is_some() && memmem::find(&bytes, b"data: [DONE]").is_some() {
                                 load_guard = None;
                             }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
