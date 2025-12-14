@@ -765,6 +765,9 @@ pub mod smg_labels {
     pub const ENDPOINT_CHAT: &str = "chat";
     pub const ENDPOINT_GENERATE: &str = "generate";
     pub const ENDPOINT_RESPONSES: &str = "responses";
+    pub const ENDPOINT_COMPLETIONS: &str = "completions";
+    pub const ENDPOINT_RERANK: &str = "rerank";
+    pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
 
     // Worker types
     pub const WORKER_REGULAR: &str = "regular";
@@ -812,6 +815,22 @@ pub mod smg_labels {
     // Circuit breaker outcomes
     pub const CB_SUCCESS: &str = "success";
     pub const CB_FAILURE: &str = "failure";
+
+    // Router error types
+    pub const ERROR_NO_WORKERS: &str = "no_workers";
+    pub const ERROR_TIMEOUT: &str = "timeout";
+    pub const ERROR_BACKEND: &str = "backend_error";
+    pub const ERROR_VALIDATION: &str = "validation_error";
+    pub const ERROR_INTERNAL: &str = "internal_error";
+
+    // Pipeline stages (gRPC router)
+    pub const STAGE_PREPARATION: &str = "preparation";
+    pub const STAGE_WORKER_SELECTION: &str = "worker_selection";
+    pub const STAGE_CLIENT_ACQUISITION: &str = "client_acquisition";
+    pub const STAGE_REQUEST_BUILDING: &str = "request_building";
+    pub const STAGE_DISPATCH_METADATA: &str = "dispatch_metadata";
+    pub const STAGE_REQUEST_EXECUTION: &str = "request_execution";
+    pub const STAGE_RESPONSE_PROCESSING: &str = "response_processing";
 }
 
 /// SMG Metrics helper struct for the new layered metrics architecture
