@@ -26,11 +26,13 @@ class SetLoraReq:
     lora_nickname: str
     lora_path: Optional[str] = None
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+    strength: float = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
 class MergeLoraWeightsReq:
     target: str = "all"  # "all", "transformer", "transformer_2", "critic"
+    strength: float = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass

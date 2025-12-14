@@ -234,6 +234,7 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_nickname: str,
         lora_path: str | None,
         rank: int,
+        strength: float = 1.0,
     ) -> int:
         """
         Apply LoRA weights to the given lora_layers.
@@ -243,6 +244,7 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_nickname: The nickname of the LoRA adapter.
             lora_path: The path to the LoRA adapter.
             rank: The distributed rank (for logging).
+            strength: LoRA strength for merge, default 1.0.
 
         Returns:
             The number of layers that had LoRA weights applied.
@@ -259,6 +261,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     self.lora_adapters[lora_nickname][lora_A_name],
                     self.lora_adapters[lora_nickname][lora_B_name],
                     lora_path=lora_path,
+                    strength=strength,
                 )
                 adapted_count += 1
             else:
@@ -351,7 +354,11 @@ class LoRAPipeline(ComposedPipelineBase):
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
     def set_lora(
-        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+        self,
+        lora_nickname: str,
+        lora_path: str | None = None,
+        target: str = "all",
+        strength: float = 1.0,
     ):  # type: ignore
         """
         Load a LoRA adapter into the pipeline and apply it to the specified transformer(s).
@@ -364,6 +371,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model (fake_score_transformer)
+            strength: LoRA strength for merge, default 1.0.
         """
         if target not in self.VALID_TARGETS:
             raise ValueError(
@@ -424,7 +432,7 @@ class LoRAPipeline(ComposedPipelineBase):
         adapted_count = 0
         for module_name, lora_layers_dict in target_modules:
             count = self._apply_lora_to_layers(
-                lora_layers_dict, lora_nickname, lora_path, rank
+                lora_layers_dict, lora_nickname, lora_path, rank, strength
             )
             adapted_count += count
             self.cur_adapter_name[module_name] = lora_nickname
@@ -434,14 +442,15 @@ class LoRAPipeline(ComposedPipelineBase):
             self.is_lora_merged[module_name] = True
 
         logger.info(
-            "Rank %d: LoRA adapter %s applied to %d layers (target: %s)",
+            "Rank %d: LoRA adapter %s applied to %d layers (target: %s, strength: %s)",
             rank,
             lora_path,
             adapted_count,
             target,
+            strength,
         )
 
-    def merge_lora_weights(self, target: str = "all") -> None:
+    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
         Merge LoRA weights into the base model for the specified target.
 
@@ -450,6 +459,7 @@ class LoRAPipeline(ComposedPipelineBase):
         Args:
             target: Which transformer(s) to merge. One of "all", "transformer",
                     "transformer_2", "critic".
+            strength: LoRA strength for merge, default 1.0.
         """
         target_modules, error = self._get_target_lora_layers(target)
         if error:
@@ -469,12 +479,14 @@ class LoRAPipeline(ComposedPipelineBase):
                 if hasattr(layer, "disable_lora"):
                     layer.disable_lora = False
                 try:
-                    layer.merge_lora_weights()
+                    layer.merge_lora_weights(strength=strength)
                 except Exception as e:
                     logger.warning("Could not merge layer %s: %s", name, e)
                     continue
             self.is_lora_merged[module_name] = True
-            logger.info("LoRA weights merged for %s", module_name)
+            logger.info(
+                "LoRA weights merged for %s (strength: %s)", module_name, strength
+            )
 
     def unmerge_lora_weights(self, target: str = "all") -> None:
         """
