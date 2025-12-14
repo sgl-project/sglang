@@ -278,8 +278,9 @@ class NanoV3Detector(BaseReasoningFormatDetector):
     """
     Detector for NanoV3 model.
     Uses the same reasoning format as DeepSeek-R1: (<think>)*(.*)</think>
+
     """
-    
+
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
         super().__init__(
             "<think>",
