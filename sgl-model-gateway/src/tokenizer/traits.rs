@@ -1,17 +1,41 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 
 /// Type alias for token IDs
 pub type TokenIdType = u32;
 
+/// Threshold for adaptive async encoding.
+/// Below this, inline execution is faster than spawn_blocking overhead.
+/// ~4KB typically maps to ~1K tokens.
+pub const ENCODE_ASYNC_THRESHOLD: usize = 4096;
+
 /// Core encoding trait - separate from decoding for modularity
-pub trait Encoder: Send + Sync {
+#[async_trait]
+pub trait Encoder: Send + Sync + 'static {
     fn encode(&self, input: &str) -> Result<Encoding>;
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>>;
+
+    /// Async encode with adaptive offloading.
+    ///
+    /// - Small inputs (<4KB): inline execution, no overhead
+    /// - Large inputs (>=4KB): offloaded to blocking thread pool to avoid
+    ///   blocking the async runtime (large prompts can take 50-200ms+)
+    async fn encode_async(self: Arc<Self>, input: &str) -> Result<Encoding> {
+        if input.len() < ENCODE_ASYNC_THRESHOLD {
+            return self.encode(input);
+        }
+
+        let input = input.to_string();
+        tokio::task::spawn_blocking(move || self.encode(&input))
+            .await
+            .map_err(|e| anyhow!("Tokenization task panicked: {}", e))?
+    }
 }
 
 /// Core decoding trait - can be implemented independently

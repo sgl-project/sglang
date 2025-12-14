@@ -58,8 +58,14 @@ impl ChatPreparationStage {
             }
         };
 
-        // Step 3: Tokenize the processed text
-        let encoding = match ctx.components.tokenizer.encode(&processed_messages.text) {
+        // Step 3: Tokenize the processed text (async to avoid blocking runtime for large prompts)
+        let encoding = match ctx
+            .components
+            .tokenizer
+            .clone()
+            .encode_async(&processed_messages.text)
+            .await
+        {
             Ok(encoding) => encoding,
             Err(e) => {
                 error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");

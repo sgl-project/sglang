@@ -71,12 +71,21 @@ impl Tokenizer {
         DecodeStream::new(self.0.clone(), prompt_token_ids, skip_special_tokens)
     }
 
-    /// Direct encode method
+    /// Direct encode method (sync)
     pub fn encode(&self, input: &str) -> Result<Encoding> {
         self.0.encode(input)
     }
 
-    /// Direct batch encode method
+    /// Async encode with adaptive offloading.
+    ///
+    /// - Small inputs (<4KB): inline execution, no overhead
+    /// - Large inputs (>=4KB): offloaded to blocking thread pool to avoid
+    ///   blocking the async runtime (large prompts can take 50-200ms+)
+    pub async fn encode_async(&self, input: &str) -> Result<Encoding> {
+        self.0.clone().encode_async(input).await
+    }
+
+    /// Direct batch encode method (sync)
     pub fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
         self.0.encode_batch(inputs)
     }

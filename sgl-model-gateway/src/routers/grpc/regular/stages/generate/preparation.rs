@@ -45,7 +45,7 @@ impl GeneratePreparationStage {
         request: &GenerateRequest,
     ) -> Result<(), Response> {
         // Resolve input (text, prompt, or input_ids)
-        let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
+        let (original_text, token_ids) = match self.resolve_generate_input(ctx, request).await {
             Ok(res) => res,
             Err(msg) => {
                 error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
@@ -82,7 +82,7 @@ impl GeneratePreparationStage {
         Ok(())
     }
 
-    fn resolve_generate_input(
+    async fn resolve_generate_input(
         &self,
         ctx: &RequestContext,
         request: &GenerateRequest,
@@ -90,6 +90,7 @@ impl GeneratePreparationStage {
         if let Some(text) = &request.text {
             return self
                 .tokenize_single_text(&ctx.components.tokenizer, text)
+                .await
                 .map(|(original, ids)| (Some(original), ids));
         }
 
@@ -111,13 +112,17 @@ impl GeneratePreparationStage {
         Err("Either `text` or `input_ids` must be provided".to_string())
     }
 
-    fn tokenize_single_text(
+    /// Tokenize text using async encode to avoid blocking the async runtime.
+    /// For large prompts (>=4KB), this offloads to the blocking thread pool.
+    async fn tokenize_single_text(
         &self,
         tokenizer: &Arc<dyn Tokenizer>,
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
         let encoding = tokenizer
-            .encode(text)
+            .clone()
+            .encode_async(text)
+            .await
             .map_err(|e| format!("Tokenization failed: {}", e))?;
         Ok((text.to_string(), encoding.token_ids().to_vec()))
     }
