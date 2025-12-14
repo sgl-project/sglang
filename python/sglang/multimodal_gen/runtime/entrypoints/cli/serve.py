@@ -6,7 +6,7 @@ import argparse
 import os
 from typing import cast
 
-from sglang.apps.webui import run_sgl_diffusion_webui
+from sglang.multimodal_gen.apps.webui import run_sgl_diffusion_webui
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.server_args import ServerArgs

@@ -1,8 +1,6 @@
 import argparse
 import os
 
-import gradio as gr
-
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
@@ -21,6 +19,9 @@ def add_webui_args(parser: argparse.ArgumentParser):
 
 
 def run_sgl_diffusion_webui(server_args: ServerArgs):
+    # import gradio in function to avoid CI crash
+    import gradio as gr
+
     # init client
     sync_scheduler_client.initialize(server_args)
 
@@ -144,4 +145,4 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
     )
     print(delimiter)
 
-    demo.launch(server_port=server_args.webui_port)
+    demo.launch(server_port=server_args.webui_port, quiet=True)
