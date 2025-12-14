@@ -156,6 +156,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
             CircuitState::HalfOpen => 2u8,
         };
         RouterMetrics::set_cb_state(self.url(), state_code);
+
+        // Update consecutive failures/successes gauges
+        RouterMetrics::set_cb_consecutive_failures(
+            self.url(),
+            self.circuit_breaker().failure_count(),
+        );
+        RouterMetrics::set_cb_consecutive_successes(
+            self.url(),
+            self.circuit_breaker().success_count(),
+        );
     }
 
     /// Check if this worker is DP-aware
@@ -561,6 +571,10 @@ impl BasicWorker {
             Ok(self.url())
         }
     }
+
+    fn update_running_requests_metrics(&self) {
+        RouterMetrics::set_running_requests(self.url(), self.load());
+    }
 }
 
 #[async_trait]
@@ -631,6 +645,7 @@ impl Worker for BasicWorker {
 
     fn increment_load(&self) {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn decrement_load(&self) {
@@ -639,10 +654,12 @@ impl Worker for BasicWorker {
                 current.checked_sub(1)
             })
             .ok();
+        self.update_running_requests_metrics();
     }
 
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn processed_requests(&self) -> usize {
