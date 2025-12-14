@@ -180,6 +180,11 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args.speculative_algorithm is None:
         return 1
 
+    # Spec v1:
+    # 1) alloc topk * num_steps when draft decoding and then restore the allocation
+    # 2) alloc num_draft_tokens when verifying the drafts
+    # Sepc v2: allocate max(topk * num_steps, num_draft_tokens)
+
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
     spec_tokens = server_args.speculative_num_draft_tokens
