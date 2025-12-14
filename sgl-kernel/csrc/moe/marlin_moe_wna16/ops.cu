@@ -486,12 +486,12 @@ MarlinFuncPtr get_marlin_kernel(
   }
 
   // Only instantiate templates for Kimi K2 Thinking model
-  // Kimi K2 uses uint4b8 (4-bit) and uint8b128 (8-bit) without zero points
+  // Kimi K2 uses uint4b8 (4-bit) without zero points
   // Supported dtypes: float16 and bfloat16
 
   // COMMON_GET_IF(sglang::kU4)           // uint4 with zero point - not used by Kimi K2
   COMMON_GET_IF(sglang::kU4B8)    // uint4b8 - used by Kimi K2
-  COMMON_GET_IF(sglang::kU8B128)  // uint8b128 - used by Kimi K2
+  // COMMON_GET_IF(sglang::kU8B128)       // uint8b128 - not used by Kimi K2
 
   // NVFP4_GET_IF(sglang::kFE2M1f)        // float4_e2m1f (NVFP4) - not used
 

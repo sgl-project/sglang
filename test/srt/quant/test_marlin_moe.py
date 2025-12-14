@@ -97,16 +97,13 @@ def marlin_moe_generate_valid_test_cases():
     topk_list = [2, 3]
     dtype_list = [torch.half, torch.bfloat16]
     group_size_list = [64, 128]
-    # Only test configurations supported by optimized marlin_moe_wna16 kernel
-    # Currently only Kimi K2 Thinking model uses this kernel
-    # Supported: uint4b8 and uint8b128 without zero points, no act_order
-    act_order_list = [False]  # act_order templates removed for size optimization
+    act_order_list = [False]
     quant_type_list = [
-        # scalar_types.uint4,  # Removed: uint4 with zero point not used by Kimi K2
-        scalar_types.uint4b8,  # Supported: used by Kimi K2
-        scalar_types.uint8b128,  # Supported: used by Kimi K2
+        # scalar_types.uint4,        # uint4 with zero point - not used by Kimi K2
+        scalar_types.uint4b8,       # uint4b8 - used by Kimi K2
+        # scalar_types.uint8b128,    # uint8b128
     ]
-    is_k_full_list = [True]  # Only test is_k_full=True since act_order=False
+    is_k_full_list = [True]
 
     all_combinations = itertools.product(
         m_list,
@@ -125,15 +122,14 @@ def marlin_moe_generate_valid_test_cases():
         if group_size > 0 and k % group_size != 0:
             return False
 
-        # Since we removed act_order and uint4 templates, only test supported configs
         if act_order:
-            return False  # act_order templates removed
+            return False
 
-        if quant_type not in [scalar_types.uint4b8, scalar_types.uint8b128]:
-            return False  # Only test supported quant types
+        if quant_type not in [scalar_types.uint4b8]:
+            return False
 
         if not is_k_full:
-            return False  # Only test is_k_full=True
+            return False
 
         return True
 
@@ -180,13 +176,10 @@ class TestFusedMarlinMoe(CustomTestCase):
             ):
                 torch.manual_seed(0)
 
-                # uint4b8 and uint8b128 do not have zero points
                 has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
 
-                # Since we only test act_order=False and is_k_full=True, skip validation
-                # All test cases should be valid based on marlin_moe_generate_valid_test_cases()
                 if act_order or not is_k_full or has_zp:
-                    continue  # Should not happen with current test case generation
+                    continue
 
                 a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
                 w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
@@ -297,9 +290,6 @@ class TestFusedMarlinMoe(CustomTestCase):
                     expert_map=e_map,
                 )
 
-                # Determine num_bits from quant_type
-                num_bits = quant_type.size_bits()
-
                 marlin_output = fused_marlin_moe(
                     a,
                     qweight1,
@@ -317,7 +307,7 @@ class TestFusedMarlinMoe(CustomTestCase):
                     sort_indices2=sort_indices2,
                     w1_zeros=zeros1,
                     w2_zeros=zeros2,
-                    num_bits=num_bits,
+                    num_bits=4,
                     is_k_full=is_k_full,
                 )
 

@@ -3,6 +3,4 @@
 #pragma once
 
 #include "kernel_bf16_ku4b8.cuh"
-#include "kernel_bf16_ku8b128.cuh"
 #include "kernel_fp16_ku4b8.cuh"
-#include "kernel_fp16_ku8b128.cuh"

@@ -46,11 +46,11 @@ KERNEL_FILE_NAME = "kernel_marlin.cuh"
 # we don't add it to reduce wheel size.
 # Only keep the most commonly used types to reduce compilation time
 # Currently only Kimi K2 Thinking model uses this kernel
-# Kimi K2 uses: uint4b8 (4-bit) and uint8b128 (8-bit) without zero points
+# Kimi K2 uses: uint4b8 (4-bit) without zero points
 SCALAR_TYPES = [
     # "sglang::kU4",        # uint4 with zero point - not used by Kimi K2
-    "sglang::kU4B8",  # uint4b8
-    "sglang::kU8B128",  # uint8b128
+    "sglang::kU4B8",  # uint4b8 - used by Kimi K2
+    # "sglang::kU8B128",    # uint8b128 - not used by Kimi K2
 ]
 THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256)]
 
