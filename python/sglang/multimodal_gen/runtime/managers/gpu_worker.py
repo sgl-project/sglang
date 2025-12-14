@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
-from sglang.multimodal_gen.runtime.pipelines_core import Req, build_pipeline
+from sglang.multimodal_gen.runtime.pipelines_core import build_pipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
@@ -99,27 +99,28 @@ class GPUWorker:
         # TODO: dealing with first req for now
         req = batch[0]
         output_batch = None
-        try:
-            start_time = time.monotonic()
-            timings = RequestTimings(request_id=req.request_id)
-            req.timings = timings
+        # try:
+        start_time = time.monotonic()
+        timings = RequestTimings(request_id=req.request_id)
+        req.timings = timings
 
-            output_batch = self.pipeline.forward(req, self.server_args)
-            duration_ms = (time.monotonic() - start_time) * 1000
+        output_batch = self.pipeline.forward(req, self.server_args)
+        duration_ms = (time.monotonic() - start_time) * 1000
 
-            if output_batch.timings:
-                output_batch.timings.total_duration_ms = duration_ms
-                PerformanceLogger.log_request_summary(timings=output_batch.timings)
-        except Exception as e:
-            if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
+        if output_batch.timings:
+            output_batch.timings.total_duration_ms = duration_ms
+            # PerformanceLogger.log_request_summary(timings=output_batch.timings)
+        # except Exception as e:
+        #     if output_batch is None:
+        #         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+        #             OutputBatch,
+        #         )
 
-                output_batch = OutputBatch()
-            output_batch.error = f"Error executing request {req.request_id}: {e}"
-        finally:
-            return output_batch
+        #         output_batch = OutputBatch()
+        #     # raise e
+        #     output_batch.error = f"Error executing request {req.request_id}: {e}"
+        # finally:
+        return output_batch
 
     def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
         """

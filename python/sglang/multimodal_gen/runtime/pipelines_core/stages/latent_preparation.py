@@ -11,8 +11,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -105,6 +103,7 @@ class LatentPreparationStage(PipelineStage):
         # Update batch with prepared latents
         batch.latents = latents
         batch.raw_latent_shape = latents.shape
+
         return batch
 
     def adjust_video_length(self, batch: Req, server_args: ServerArgs) -> int:
@@ -120,6 +119,8 @@ class LatentPreparationStage(PipelineStage):
         """
 
         video_length = batch.num_frames
+        if batch.extra.get("clip_len") is not None:
+            video_length = batch.extra.get("clip_len")
         use_temporal_scaling_frames = (
             server_args.pipeline_config.vae_config.use_temporal_scaling_frames
         )
@@ -130,6 +131,8 @@ class LatentPreparationStage(PipelineStage):
             latent_num_frames = (video_length - 1) // temporal_scale_factor + 1
         else:  # stepvideo only
             latent_num_frames = video_length // 17 * 3
+        if batch.extra.get("clip_len") is not None:
+            return int(latent_num_frames) + 1
         return int(latent_num_frames)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

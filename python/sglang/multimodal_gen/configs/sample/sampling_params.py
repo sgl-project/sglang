@@ -301,12 +301,12 @@ class SamplingParams:
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
-        sampling_params = SamplingParams.from_pretrained(model_path)
+        sampling_params = SamplingParams.from_pretrained(model_path, **kwargs)
 
-        user_sampling_params = SamplingParams(*args, **kwargs)
+        # user_sampling_params = SamplingParams(*args, **kwargs)
         # TODO: refactor
-        sampling_params._merge_with_user_params(user_sampling_params)
-        sampling_params._adjust(server_args)
+        # sampling_params._merge_with_user_params(user_sampling_params)
+        # sampling_params._adjust(server_args)
 
         return sampling_params
 

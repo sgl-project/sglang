@@ -14,6 +14,7 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_Animate_14B_Config
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -26,8 +27,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -207,8 +206,12 @@ class ImageVAEEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
 
-        num_frames = batch.num_frames
+        num_frames_bak = batch.num_frames
 
+        if isinstance(server_args.pipeline_config, Wan2_2_Animate_14B_Config):
+            batch.num_frames = 1
+
+        num_frames = batch.num_frames
         self.vae = self.vae.to(get_local_torch_device())
 
         image = batch.condition_image
@@ -293,6 +296,9 @@ class ImageVAEEncodingStage(PipelineStage):
         batch.image_latent = server_args.pipeline_config.postprocess_image_latent(
             latent_condition, batch
         )
+
+        if isinstance(server_args.pipeline_config, Wan2_2_Animate_14B_Config):
+            batch.num_frames = num_frames_bak
 
         self.maybe_free_model_hooks()
 
