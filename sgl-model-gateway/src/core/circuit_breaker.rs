@@ -311,7 +311,7 @@ impl CircuitBreaker {
         }
     }
 
-    // TODO maybe publish whenever the value is changed
+    // TODO maybe publish whenever the variable is changed
     fn publish_gauge_metrics(&self) {
         RouterMetrics::set_cb_consecutive_failures(&self.metric_label, self.failure_count());
         RouterMetrics::set_cb_consecutive_successes(&self.metric_label, self.success_count());
