@@ -137,6 +137,7 @@ impl WorkerManager {
             message,
         })
     }
+
     pub async fn get_worker_load(
         url: &str,
         api_key: Option<&str>,
@@ -282,38 +283,42 @@ impl WorkerManager {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
 
-        let futures = workers.into_iter().map(|worker| {
-            let client = client.clone();
-            let worker_url = worker.url().to_string();
-            let url = format!("{}/{}", worker_url, endpoint);
-            let api_key = worker.api_key().clone();
-            let method = method.clone();
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                let client = client.clone();
+                let worker_url = worker.url().to_string();
+                let url = format!("{worker_url}/{endpoint}");
+                let api_key = worker.api_key().clone();
+                let method = method.clone();
 
-            async move {
-                let mut req = client.request(method, &url).timeout(REQUEST_TIMEOUT);
-                if let Some(key) = api_key {
-                    req = req.bearer_auth(key);
-                }
+                async move {
+                    let mut req = client.request(method, &url).timeout(REQUEST_TIMEOUT);
 
-                match req.send().await {
-                    Ok(res) if res.status().is_success() => match res.text().await {
-                        Ok(body) => Some((worker_url, body)),
-                        Err(e) => {
-                            warn!("Failed reading response from {}: {}", url, e);
+                    if let Some(key) = api_key {
+                        req = req.bearer_auth(key);
+                    }
+
+                    match req.send().await {
+                        Ok(res) if res.status().is_success() => match res.text().await {
+                            Ok(body) => Some((worker_url, body)),
+                            Err(e) => {
+                                warn!("Failed reading response from {url}: {e}");
+                                None
+                            }
+                        },
+                        Ok(res) => {
+                            warn!("Request to {url} failed: {}", res.status());
                             None
                         }
-                    },
-                    Ok(res) => {
-                        warn!("Request to {} failed: {}", url, res.status());
-                        None
-                    }
-                    Err(e) => {
-                        warn!("Request to {} failed: {}", url, e);
-                        None
+                        Err(e) => {
+                            warn!("Request to {url} failed: {e}");
+                            None
+                        }
                     }
                 }
-            }
-        });
+            })
+            .collect();
 
         let responses: Vec<_> = stream::iter(futures)
             .buffer_unordered(MAX_CONCURRENT)
@@ -321,7 +326,7 @@ impl WorkerManager {
             .collect()
             .await;
 
-        if responses.is_empty() {
+        if responses.is_empty() && !workers.is_empty() {
             return Err((StatusCode::BAD_GATEWAY, "All backend requests failed").into_response());
         }
 
