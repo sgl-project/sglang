@@ -806,6 +806,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         model.load_weights = load_weights_proxy
 
         model.load_weights(weights)
+        # Load quantized weights
+        model.load_weights(quantize_weights_iterator(iter(weights_list)))
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset
@@ -833,14 +835,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         recorded_loader[key][name] = attr.__func__  # Store unbound
                     else:
                         recorded_loader[key][name] = attr
-        model.recorded_loader = recorded_loader
-
         # Apply FP8 quantization (creates new Parameters, loses attributes)
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                all_params, name, scale_info
+            )
 
         model.flash_rl_initial_load_complete = True
         self._initial_load_complete = True
@@ -1037,9 +1039,15 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
+            from sglang.srt.layers.quantization.blockwise_fp8_utils import (
+                scaled_fp8_blockwise,
+            )
             from sglang.srt.layers.quantization.fp8_kernel import (
                 per_token_group_quant_fp8,
             )
+
+            # Default block size for blockwise quantization
+            default_block_size = [128, 128]
 
             for name, weight in weights_iter:
                 if any(
@@ -1049,8 +1057,40 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     logger.info(f"[QuantizedRL] Skip: {name} ({weight.dtype})")
                     yield (name, weight)
                 elif weight.dtype in [torch.bfloat16, torch.float32, torch.float16]:
-                    qweight, scale = per_token_group_quant_fp8(weight, weight.shape[-1])
-                    logger.info(f"[QuantizedRL] Quantize: {name} {weight.dtype}→FP8")
+                    # Try blockwise quantization first
+                    use_blockwise = False
+                    if len(weight.shape) == 2:
+                        # Check if shape is compatible with blockwise quantization
+                        if (
+                            weight.shape[0] % default_block_size[0] == 0
+                            and weight.shape[1] % default_block_size[1] == 0
+                        ):
+                            try:
+                                qweight, scale = scaled_fp8_blockwise(
+                                    weight, default_block_size
+                                )
+                                # scale shape is (blk_m, blk_n, 1), need to squeeze
+                                scale = scale.squeeze(-1)
+                                use_blockwise = True
+                                logger.info(
+                                    f"[QuantizedRL] Quantize (blockwise): {name} {weight.dtype}→FP8 "
+                                    f"(shape={weight.shape}, block_size={default_block_size})"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
+                                    "falling back to per_token_group_quant_fp8"
+                                )
+
+                    # Fallback to per_token_group_quant_fp8 if blockwise failed or not applicable
+                    if not use_blockwise:
+                        qweight, scale = per_token_group_quant_fp8(
+                            weight, weight.shape[-1]
+                        )
+                        logger.info(
+                            f"[QuantizedRL] Quantize (per_token_group): {name} {weight.dtype}→FP8"
+                        )
+
                     QuantizedRLModelLoader._store_quantized_scale(
                         quantized_scales, name, scale
                     )
