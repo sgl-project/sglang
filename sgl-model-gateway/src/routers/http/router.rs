@@ -510,6 +510,7 @@ impl Router {
                 }
             };
 
+            drop(load_guard);
             response
         } else {
             // Preserve headers for streaming response
