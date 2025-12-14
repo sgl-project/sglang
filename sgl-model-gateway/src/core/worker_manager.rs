@@ -6,7 +6,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::response::{IntoResponse, Response};
-use futures::future;
+use futures::{
+    future,
+    stream::{self, StreamExt},
+};
 use http::{Method, StatusCode};
 use serde_json::Value;
 use tokio::{
@@ -20,6 +23,9 @@ use crate::{
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT: usize = 32;
 
 /// Unified worker management
 pub struct WorkerManager;
@@ -66,7 +72,7 @@ impl WorkerManager {
             workers.len()
         );
 
-        let mut tasks = Vec::new();
+        let mut tasks = Vec::with_capacity(http_workers.len());
         for worker in &http_workers {
             let url = worker.url().to_string();
             let flush_url = format!("{}/flush_cache", url);
@@ -195,7 +201,7 @@ impl WorkerManager {
         let total_workers = workers.len();
 
         // Prepare tasks for parallel execution
-        let mut tasks = Vec::new();
+        let mut tasks = Vec::with_capacity(workers.len());
         for worker in &workers {
             let url = worker.url().to_string();
             let api_key = worker.api_key().clone();
@@ -276,61 +282,51 @@ impl WorkerManager {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
 
-        let mut tasks = Vec::new();
-
-        for worker in workers {
+        let tasks = workers.iter().map(|worker| {
+            let client = client.clone();
             let worker_url = worker.url().to_string();
             let url = format!("{}/{}", worker_url, endpoint);
-
-            // Clone variables to move into the async block
-            let client = client.clone();
-            let method = method.clone();
             let api_key = worker.api_key().clone();
+            let method = method.clone();
 
-            tasks.push(async move {
-                let mut request_builder = match method {
-                    Method::GET => client.get(&url),
-                    Method::POST => client.post(&url),
-                    _ => return None,
+            async move {
+                let request = client.request(method, &url).timeout(REQUEST_TIMEOUT);
+
+                let request = if let Some(key) = api_key {
+                    request.bearer_auth(key)
+                } else {
+                    request
                 };
 
-                if let Some(key) = api_key {
-                    request_builder =
-                        request_builder.header("Authorization", format!("Bearer {}", key));
-                }
-
-                match request_builder.send().await {
-                    Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        match res.text().await {
-                            Ok(body_text) => {
-                                if status.is_success() {
-                                    Some((worker_url, body_text))
-                                } else {
-                                    warn!("Request to {} failed with status: {}", url, status);
-                                    None
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed reading text from {}: {}", url, e);
-                                None
-                            }
+                match request.send().await {
+                    Ok(res) if res.status().is_success() => match res.text().await {
+                        Ok(body) => Some((worker_url, body)),
+                        Err(e) => {
+                            warn!("Failed reading response from {}: {}", url, e);
+                            None
                         }
+                    },
+                    Ok(res) => {
+                        warn!("Request to {} failed with status: {}", url, res.status());
+                        None
                     }
                     Err(e) => {
                         warn!("Failed sending request to {}: {}", url, e);
                         None
                     }
                 }
-            });
+            }
+        });
+
+        let responses: Vec<_> = stream::iter(tasks)
+            .buffer_unordered(MAX_CONCURRENT)
+            .filter_map(|r| async { r })
+            .collect()
+            .await;
+
+        if responses.is_empty() {
+            return Err((StatusCode::BAD_GATEWAY, "All backend requests failed").into_response());
         }
-
-        // Execute all tasks concurrently
-        let results = future::join_all(tasks).await;
-
-        // Filter out failures (None) and collect successes
-        let responses: Vec<(String, String)> = results.into_iter().flatten().collect();
 
         Ok(responses)
     }
