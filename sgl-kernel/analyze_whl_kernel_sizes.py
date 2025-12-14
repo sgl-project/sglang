@@ -151,16 +151,17 @@ def generate_report(all_kernels, output_file):
     lines.append(f"Average kernel size: {total_size / len(all_kernels) / 1024:.2f} KB")
     lines.append("")
 
-    # Grouped by kernel name prefix
+    # Grouped by kernel name prefix (Top 20 + Other)
     lines.append("=" * 140)
-    lines.append("Kernel Groups (by name prefix)")
+    lines.append("Kernel Groups (by name prefix) - Top 20")
     lines.append("=" * 140)
     lines.append(
         f"{'Rank':<6} {'Kernel Prefix':<80} {'Count':<8} {'Total (MB)':<12} {'%':<8}"
     )
     lines.append("-" * 140)
 
-    for i, (prefix, stats) in enumerate(sorted_groups, 1):
+    TOP_N = 20
+    for i, (prefix, stats) in enumerate(sorted_groups[:TOP_N], 1):
         percentage = (stats["size"] / total_size * 100) if total_size > 0 else 0
         size_mb = stats["size"] / 1024 / 1024
 
@@ -172,16 +173,28 @@ def generate_report(all_kernels, output_file):
             f"{i:<6} {display_prefix:<80} {stats['count']:<8} {size_mb:<12.2f} {percentage:<8.2f}"
         )
 
+    # Add "Other" category for remaining kernels
+    if len(sorted_groups) > TOP_N:
+        other_size = sum(stats["size"] for _, stats in sorted_groups[TOP_N:])
+        other_count = sum(stats["count"] for _, stats in sorted_groups[TOP_N:])
+        other_percentage = (other_size / total_size * 100) if total_size > 0 else 0
+        other_size_mb = other_size / 1024 / 1024
+
+        lines.append(
+            f"{'Other':<6} {'(remaining ' + str(len(sorted_groups) - TOP_N) + ' kernel groups)':<80} "
+            f"{other_count:<8} {other_size_mb:<12.2f} {other_percentage:<8.2f}"
+        )
+
     lines.append("")
     lines.append("=" * 140)
-    lines.append("Individual Kernels (sorted by size)")
+    lines.append("Individual Kernels (sorted by size) - Top 20")
     lines.append("=" * 140)
     lines.append(
         f"{'Rank':<6} {'File':<40} {'Kernel Name':<70} {'Size (KB)':<12} {'Size (MB)':<12} {'%':<8}"
     )
     lines.append("-" * 140)
 
-    for i, kernel in enumerate(sorted_kernels, 1):
+    for i, kernel in enumerate(sorted_kernels[:TOP_N], 1):
         percentage = (kernel["size"] / total_size * 100) if total_size > 0 else 0
         kernel_name = kernel["name"]
         if len(kernel_name) > 67:
@@ -194,6 +207,19 @@ def generate_report(all_kernels, output_file):
         lines.append(
             f"{i:<6} {file_name:<40} {kernel_name:<70} "
             f"{kernel['size_kb']:<12.2f} {kernel['size_mb']:<12.4f} {percentage:<8.2f}"
+        )
+
+    # Add "Other" category for remaining individual kernels
+    if len(sorted_kernels) > TOP_N:
+        other_size = sum(k["size"] for k in sorted_kernels[TOP_N:])
+        other_count = len(sorted_kernels) - TOP_N
+        other_percentage = (other_size / total_size * 100) if total_size > 0 else 0
+        other_size_kb = other_size / 1024
+        other_size_mb = other_size / 1024 / 1024
+
+        lines.append(
+            f"{'Other':<6} {'(remaining ' + str(other_count) + ' kernels)':<40} "
+            f"{'':<70} {other_size_kb:<12.2f} {other_size_mb:<12.4f} {other_percentage:<8.2f}"
         )
 
     report_text = "\n".join(lines)
