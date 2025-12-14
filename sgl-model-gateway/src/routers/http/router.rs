@@ -233,7 +233,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = WorkerLoadGuardV2::new(worker);
+        let load_guard = WorkerLoadGuardV2::new(worker.clone());
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
@@ -250,21 +250,13 @@ impl Router {
                 route,
                 worker.url(),
                 is_stream,
-                load_incremented,
+                load_guard,
             )
             .await;
 
         events::RequestReceivedEvent {}.emit();
 
         worker.record_outcome(response.status().is_success());
-
-        // For retryable failures, we need to decrement load since send_typed_request
-        // won't have done it (it only decrements on success or non-retryable failures)
-        if is_retryable_status(response.status()) && load_incremented {
-            if let Some(cleanup_worker) = worker_for_cleanup {
-                cleanup_worker.decrement_load();
-            }
-        }
 
         response
     }
@@ -409,7 +401,7 @@ impl Router {
         route: &'static str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        load_guard: WorkerLoadGuardV2,
     ) -> Response {
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
