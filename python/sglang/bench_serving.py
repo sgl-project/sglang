@@ -77,6 +77,7 @@ class RequestFuncInput:
     model: str
     lora_name: str
     image_data: Optional[List[str]]
+    audio_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
 
@@ -310,24 +311,36 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
+    content_items: List[Dict[str, Any]] = []
+
+    # image
     if request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
-        content_items = [
+        content_items.extend([
             {
                 "type": "image_url",
                 "image_url": {"url": img_url},
             }
             for img_url in request_func_input.image_data
-        ]
-        content_items.append({"type": "text", "text": request_func_input.prompt})
-        messages = [
+        ])
+
+    # audio
+    if request_func_input.audio_data:
+        content_items.extend([
             {
-                "role": "user",
-                "content": content_items,
-            },
-        ]
+                "type": "audio_url",
+                "audio_url": {"url": audio_url},
+            }
+            for audio_url in request_func_input.audio_data
+        ])
+
+    # text
+    if request_func_input.prompt:
+        content_items.append({"type": "text", "text": request_func_input.prompt})
+
+    if content_items:
+        messages = [{"role": "user", "content": content_items}]
     else:
-        messages = [{"role": "user", "content": request_func_input.prompt}]
+        messages = [{"role": "user", "content": ""}]
 
     async with _create_bench_client_session() as session:
         payload = {
@@ -745,7 +758,7 @@ def get_dataset(args, tokenizer, model_id=None):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
-    elif args.dataset_name.startswith("random"):
+    elif args.dataset_name.startswith("random") and args.dataset_name != "random-omni":
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -755,6 +768,19 @@ def get_dataset(args, tokenizer, model_id=None):
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
+        )
+    elif args.dataset_name == "random-omni":
+        processor = get_processor(model_id)
+        input_requests = sample_random_omni_requests(
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            num_prompts=args.num_prompts,
+            range_ratio=args.random_range_ratio,
+            audio_length=args.audio_length,
+            processor=processor,
+            tokenizer=tokenizer,
+            return_text=not tokenize_prompt,
+            skip_special_tokens=skip_special_tokens,
         )
     elif args.dataset_name == "image":
         processor = get_processor(model_id)
@@ -931,6 +957,7 @@ class DatasetRow:
     text_prompt_len: Optional[int] = None
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
 
     def __post_init__(self):
@@ -1293,6 +1320,150 @@ def sample_random_requests(
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
 
+# Function from https://github.com/sgl-project/sglang/pull
+def encode_wav_data_url(y: np.ndarray, sr: int) -> str:
+    import io
+
+    import soundfile as sf
+
+    try:
+        from scipy.signal import resample as _resample
+    except Exception:
+        _resample = None
+
+    # Convert lists to ndarray
+    if isinstance(y, list):
+        y = np.asarray(y)
+
+    # Convert to mono if multi-channel
+    if hasattr(y, "ndim") and y.ndim > 1:
+        y = np.mean(y, axis=1)
+
+    target_sr = int(getattr(args, "asr_target_sr", 16000))
+    if _resample is not None and sr > 0 and sr != target_sr:
+        num_samples = int(len(y) * float(target_sr) / float(sr))
+        if num_samples > 0:
+            y = np.asarray(_resample(y, num_samples))
+            sr = target_sr
+
+    buf = io.BytesIO()
+    sf.write(buf, y, sr, format="WAV")
+    b64 = pybase64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:audio/wav;base64,{b64}"
+
+def generate_dummy_audio(duration_s=10, sr=1600):
+    """
+    Generate a float32 audio array of `duration_s` seconds at sampling rate `sr`.
+    Returns:
+        y: np.ndarray, float32 audio
+        sr: sampling rate
+    """
+    num_samples = duration_s * sr
+    y = np.random.uniform(low=-1.0, high=1.0, size=num_samples).astype(np.float32)
+    return y, sr
+
+def build_no_speical_token_table(tokenizer, special_tokens=None):
+    """
+    build no special token to replace special token randomly generated
+    for Qwen3-Omni 
+    """
+    vocab = tokenizer.get_vocab().values()
+    special_set = set(special_tokens or [])
+
+    safe_tokens = []
+    for t in vocab:
+        if t in special_set:
+            continue
+        safe_tokens.append(t)
+
+    if not safe_tokens:
+        raise RuntimeError("No available non-special tokens")
+
+    return np.array(safe_tokens, dtype=np.int32)
+
+def sample_random_omni_requests(
+    input_len: int,
+    output_len: int,
+    num_prompts: int,
+    range_ratio: float,
+    audio_length: int,
+    processor: AutoProcessor,
+    tokenizer: PreTrainedTokenizerBase,
+    return_text: bool = True,
+    skip_special_tokens: bool = True, 
+) -> List[DatasetRow]:
+    """
+    Omni request temporary limitation:
+    ----------------------------------
+    Currently this benchmark only tests the (audio + text) modality.
+    Audio is generated as a dummy waveform and paired
+    with the provided random text prompt. 
+    `skip_speical_tokens` default true to avoid common mistakes made 
+    in Qwen3-Omni's preprocessing
+    """
+    input_lens = np.random.randint(
+        max(int(input_len * range_ratio), 1),
+        input_len + 1,
+        size=num_prompts,
+    )
+    output_lens = np.random.randint(
+        int(output_len * range_ratio),
+        output_len + 1,
+        size=num_prompts,
+    )
+
+    special_tokens = None
+    if (
+        skip_special_tokens
+        and hasattr(processor.tokenizer, "all_special_ids")
+        and processor.tokenizer.all_special_ids is not None
+    ):
+        special_tokens = set(processor.tokenizer.all_special_ids)
+    no_special_tokens = build_no_speical_token_table(
+        tokenizer,
+        special_tokens,
+    )
+    # Sample token ids from random integers. This can cause some NaN issues.
+    offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
+    input_requests = []
+    for i in range(num_prompts):
+        """
+        Skip Special tokens and maintain continuity for the output
+        """
+        input_content = []
+        for j in range(input_lens[i]):
+            tid = (offsets[i] + i + j) % tokenizer.vocab_size
+            if (
+                no_special_tokens is not None 
+                and special_tokens is not None 
+                and tid in special_tokens
+            ):
+                idx = (tid + j) % len(no_special_tokens)
+                tid = int(no_special_tokens[idx])
+            input_content.append(tid)
+
+        if return_text:
+            input_content = tokenizer.decode(input_content)
+        # generate audio
+        if audio_length and audio_length > 0:
+            y, sr = generate_dummy_audio(audio_length, 1600)
+            data_url = encode_wav_data_url(y, sr)
+            audio_list = [data_url] 
+        else:
+            audio_list = None
+        input_requests.append(
+            DatasetRow(
+                prompt=input_content,
+                prompt_len=int(input_lens[i]),
+                output_len=int(output_lens[i]),
+                audio_data=audio_list,
+            )
+        )
+
+    print(f"#Input text tokens: {np.sum(input_lens)}")
+    print(f"#Total input audio lengths: {audio_length*num_prompts if audio_length and audio_length > 0 else 0} seconds")
+    print(f"#Output tokens: {np.sum(output_lens)}")
+    return input_requests
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     """Parse image resolution into (width, height).
@@ -1840,6 +2011,7 @@ async def benchmark(
         output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
         image_data=test_request.image_data,
+        audio_data=test_request.audio_data,
         extra_request_body=extra_request_body,
     )
 
@@ -1926,6 +2098,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            audio_data=request.audio_data,
             extra_request_body=extra_request_body,
             timestamp=request.timestamp,
         )
@@ -2392,6 +2565,7 @@ if __name__ == "__main__":
             "sharegpt",
             "random",
             "random-ids",
+            "random-omni",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -2563,6 +2737,12 @@ if __name__ == "__main__":
         "--pd-separated",
         action="store_true",
         help="Benchmark PD disaggregation server",
+    )
+    parser.add_argument(
+        "--audio-length",
+        type=int,
+        default=10,
+        help="Audio length in second (default is 10s), only used with --dataset-name random-omni",
     )
 
     # Create a mutually exclusive group for profiling URLs
