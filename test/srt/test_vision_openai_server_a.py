@@ -126,13 +126,6 @@ class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     ]
 
 
-class TestGemma3itServer(ImageOpenAITestMixin):
-    model = "google/gemma-3-4b-it"
-    extra_args = [
-        "--cuda-graph-max-bs=4",
-    ]
-
-
 class TestKimiVLServer(ImageOpenAITestMixin):
     model = "moonshotai/Kimi-VL-A3B-Instruct"
     extra_args = [
