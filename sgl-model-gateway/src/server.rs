@@ -23,14 +23,13 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
-        worker_to_info,
-        workflow::{
+        steps::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
             create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
-            WorkflowEngine,
+            create_worker_registration_workflow, create_worker_removal_workflow,
+            create_worker_update_workflow,
         },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        worker_to_info, Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -47,11 +46,12 @@ use crate::{
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
-        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
+        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest},
     },
     routers::{conversations, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
+    workflow::{LoggingSubscriber, WorkflowEngine},
 };
 
 #[derive(Clone)]
@@ -589,6 +589,41 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<Strin
     }
 }
 
+async fn update_worker(
+    State(state): State<Arc<AppState>>,
+    Path(url): Path<String>,
+    Json(update): Json<WorkerUpdateRequest>,
+) -> Response {
+    let worker_id = url.clone();
+    let job = Job::UpdateWorker {
+        url,
+        update: Box::new(update),
+    };
+
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_id,
+                "message": "Worker update queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
+        }
+        Err(error) => {
+            let error_response = WorkerErrorResponse {
+                error,
+                code: "INTERNAL_SERVER_ERROR".to_string(),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
+        }
+    }
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -680,8 +715,10 @@ pub fn build_app(
     let worker_routes = Router::new()
         .route("/workers", post(create_worker))
         .route("/workers", get(list_workers_rest))
-        .route("/workers/{url}", get(get_worker))
-        .route("/workers/{url}", delete(delete_worker))
+        .route(
+            "/workers/{url}",
+            get(get_worker).put(update_worker).delete(delete_worker),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -771,12 +808,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .subscribe(Arc::new(LoggingSubscriber))
         .await;
 
-    engine.register_workflow(create_worker_registration_workflow(&config.router_config));
-    engine.register_workflow(create_external_worker_registration_workflow());
-    engine.register_workflow(create_worker_removal_workflow());
-    engine.register_workflow(create_mcp_registration_workflow());
-    engine.register_workflow(create_wasm_module_registration_workflow());
-    engine.register_workflow(create_wasm_module_removal_workflow());
+    engine
+        .register_workflow(create_worker_registration_workflow(&config.router_config))
+        .expect("worker_registration workflow should be valid");
+    engine
+        .register_workflow(create_external_worker_registration_workflow())
+        .expect("external_worker_registration workflow should be valid");
+    engine
+        .register_workflow(create_worker_removal_workflow())
+        .expect("worker_removal workflow should be valid");
+    engine
+        .register_workflow(create_worker_update_workflow())
+        .expect("worker_update workflow should be valid");
+    engine
+        .register_workflow(create_mcp_registration_workflow())
+        .expect("mcp_registration workflow should be valid");
+    engine
+        .register_workflow(create_wasm_module_registration_workflow())
+        .expect("wasm_module_registration workflow should be valid");
+    engine
+        .register_workflow(create_wasm_module_removal_workflow())
+        .expect("wasm_module_removal workflow should be valid");
     app_context
         .workflow_engine
         .set(engine)

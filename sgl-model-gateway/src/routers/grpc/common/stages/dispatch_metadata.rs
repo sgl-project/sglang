@@ -23,7 +23,7 @@ impl PipelineStage for DispatchMetadataStage {
                 function = "DispatchMetadataStage::execute",
                 "Proto request not built"
             );
-            error::internal_error("Proto request not built")
+            error::internal_error("proto_request_not_built", "Proto request not built")
         })?;
 
         let request_id = proto_request.request_id().to_string();

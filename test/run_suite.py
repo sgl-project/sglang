@@ -3,8 +3,10 @@ import glob
 import sys
 from typing import List
 
+import tabulate
+
 from sglang.test.ci.ci_register import CIRegistry, HWBackend, collect_tests
-from sglang.test.ci.ci_utils import TestFile, run_unittest_files
+from sglang.test.ci.ci_utils import run_unittest_files
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
@@ -53,7 +55,6 @@ def filter_tests(
         if t.backend == hw and t.suite == suite and t.nightly == nightly
     ]
 
-    ret = []
     valid_suites = (
         NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
     )
@@ -63,17 +64,13 @@ def filter_tests(
             f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
         )
 
-    for t in ci_tests:
-        if t.disabled is None:
-            ret.append(t)
-            print(f"Including test {t.filename}")
-        else:
-            print(f"Skipping disabled test {t.filename} due to: {t.disabled}")
+    enabled_tests = [t for t in ci_tests if t.disabled is None]
+    skipped_tests = [t for t in ci_tests if t.disabled is not None]
 
-    return ret
+    return enabled_tests, skipped_tests
 
 
-def auto_partition(files, rank, size):
+def auto_partition(files: List[CIRegistry], rank, size):
     """
     Partition files into size sublists with approximately equal sums of estimated times
     using a greedy algorithm (LPT heuristic), and return the partition for the specified rank.
@@ -82,7 +79,7 @@ def auto_partition(files, rank, size):
         return []
 
     # Sort files by estimated_time in descending order (LPT heuristic)
-    sorted_files = sorted(files, key=lambda f: f.estimated_time, reverse=True)
+    sorted_files = sorted(files, key=lambda f: f.est_time, reverse=True)
 
     partitions = [[] for _ in range(size)]
     partition_sums = [0.0] * size
@@ -91,11 +88,49 @@ def auto_partition(files, rank, size):
     for file in sorted_files:
         min_sum_idx = min(range(size), key=partition_sums.__getitem__)
         partitions[min_sum_idx].append(file)
-        partition_sums[min_sum_idx] += file.estimated_time
+        partition_sums[min_sum_idx] += file.est_time
 
     if rank < size:
         return partitions[rank]
     return []
+
+
+def pretty_print_tests(
+    args, ci_tests: List[CIRegistry], skipped_tests: List[CIRegistry]
+):
+    hw = HW_MAPPING[args.hw]
+    suite = args.suite
+    nightly = args.nightly
+    if args.auto_partition_size:
+        partition_info = (
+            f"{args.auto_partition_id + 1}/{args.auto_partition_size} "
+            f"(0-based id={args.auto_partition_id})"
+        )
+    else:
+        partition_info = "full"
+
+    headers = ["Hardware", "Suite", "Nightly", "Partition"]
+    rows = [[hw.name, suite, str(nightly), partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql")
+    print(msg + "\n")
+
+    if skipped_tests:
+        print(f"⚠️  Skipped {len(skipped_tests)} test(s):")
+        for t in skipped_tests:
+            reason = t.disabled or "disabled"
+            print(f"  - {t.filename} (reason: {reason})")
+
+        print()
+
+    if len(ci_tests) == 0:
+        print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
+        print("This is expected during incremental migration. Skipping.")
+        return
+
+    total_est_time = sum(t.est_time for t in ci_tests)
+    print(f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):")
+    for t in ci_tests:
+        print(f"  - {t.filename} (est_time={t.est_time})")
 
 
 def run_a_suite(args):
@@ -111,34 +146,21 @@ def run_a_suite(args):
         sanity_check = False  # Allow files without registration during migration
     else:
         files = glob.glob("registered/**/*.py", recursive=True)
-        sanity_check = (
-            True  # Strict: all registered files must have proper registration
-        )
+        # Strict: all registered files must have proper registration
+        sanity_check = True
 
-    ci_tests = filter_tests(
-        collect_tests(files, sanity_check=sanity_check), hw, suite, nightly
-    )
-    test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
-
-    if not test_files:
-        print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
-        print("This is expected during incremental migration. Skipping.")
-        return 0
+    all_tests = collect_tests(files, sanity_check=sanity_check)
+    ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:
-        test_files = auto_partition(test_files, auto_partition_id, auto_partition_size)
+        ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
 
-    print(
-        f"Running {len(test_files)} test(s) for hw={hw.name}, suite={suite}, nightly={nightly}"
-    )
+    pretty_print_tests(args, ci_tests, skipped_tests)
 
     return run_unittest_files(
-        test_files,
+        ci_tests,
         timeout_per_file=args.timeout_per_file,
         continue_on_error=args.continue_on_error,
-        enable_retry=args.enable_retry,
-        max_attempts=args.max_attempts,
-        retry_wait_seconds=args.retry_wait_seconds,
     )
 
 
@@ -180,24 +202,6 @@ def main():
         "--auto-partition-size",
         type=int,
         help="Use auto load balancing. The number of parts.",
-    )
-    parser.add_argument(
-        "--enable-retry",
-        action="store_true",
-        default=False,
-        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
-    )
-    parser.add_argument(
-        "--max-attempts",
-        type=int,
-        default=2,
-        help="Maximum number of attempts per file including initial run (default: 2)",
-    )
-    parser.add_argument(
-        "--retry-wait-seconds",
-        type=int,
-        default=60,
-        help="Seconds to wait between retries (default: 60)",
     )
     args = parser.parse_args()
 
