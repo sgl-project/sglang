@@ -33,7 +33,14 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.utils import get_int_env_var, get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -1300,7 +1307,7 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
         self.gemm_ar_attn_op = None
-        self.gemm_ar_mlp_op = None            
+        self.gemm_ar_mlp_op = None
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
@@ -1407,7 +1414,7 @@ class RowParallelLinear(LinearBase):
 
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
-                    
+
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1440,7 +1447,7 @@ class RowParallelLinear(LinearBase):
         #     n = output_parallel.shape[1]
         #     print(f"SGLang original gemm_ar_op: m={m}, n={n}, k={k}, forward execution time: {execution_time:.3f} ms")
         #     # print(f"input_parallel shape: {input_parallel.shape}, output_parallel shape: {output_parallel.shape}, output shape: {output.shape}, forward execution time: {execution_time:.3f} ms")
-    
+
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias

@@ -1,28 +1,27 @@
-import nvshmem.core
-import torch.distributed._symmetric_memory as symm_mem
-
-import os
-import argparse
 from typing import Optional, Tuple, Type, Union
 
-import numpy as np
-import torch
-import torch.distributed as dist
 import cuda.bindings.driver as cuda
-from cuda.core.experimental import Device
-from cuda.pathfinder import load_nvidia_dynamic_lib
-
-
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
+import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
-import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
+import nvshmem.core
+import torch
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+from cuda.pathfinder import load_nvidia_dynamic_lib
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Int32, Float16, BFloat16, Float32, Float8E5M2, Float8E4M3FN
+from cutlass.cute.typing import (
+    BFloat16,
+    Float8E4M3FN,
+    Float8E5M2,
+    Float16,
+    Float32,
+    Int32,
+)
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
@@ -43,6 +42,7 @@ except RuntimeError as exc:
         "  For CUDA 12: pip install nvidia-nvshmem-cu12\n"
         "  For CUDA 13: pip install nvidia-nvshmem-cu13\n"
     ) from None
+
 
 def _compute_stages(
     tiled_mma: cute.TiledMma,
@@ -1011,7 +1011,9 @@ class PersistentDenseGemmKernel:
                 # we want 128bit ld/st for better performance
                 atom_val = 128 // c_mc.element_type.width
                 atom_thr_n = self.mma_tiler[1] // atom_val
-                atom_thr_m = len(self.all_reduce_warp_id) * cute.arch.WARP_SIZE // atom_thr_n
+                atom_thr_m = (
+                    len(self.all_reduce_warp_id) * cute.arch.WARP_SIZE // atom_thr_n
+                )
                 thr_layout = cute.make_layout(
                     (atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1)
                 )
@@ -1061,9 +1063,11 @@ class PersistentDenseGemmKernel:
                         (None, None, None),
                     )
                     cC = cute.local_tile(
-                        idC, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                        idC,
+                        cute.slice_(self.mma_tiler, (None, None, 0)),
+                        (None, None, None),
                     )
-                    
+
                     tCgC_mc = thr_mma.partition_C(gC_mc)
                     tCpC = thr_mma.partition_C(cC)
                     tCgC_mc_slice = tCgC_mc[((None, None), 0, 0, *mma_tile_coord_mnl)]
@@ -1077,11 +1081,15 @@ class PersistentDenseGemmKernel:
                     tCgC_mc_slice_partitioned = cute.zipped_divide(
                         tCgC_mc_slice, (m_local_rank, self.mma_tiler[1])
                     )
-                    tCpC_slice_partitioned = cute.zipped_divide(tCpC_slice, (m_local_rank, self.mma_tiler[1]))
+                    tCpC_slice_partitioned = cute.zipped_divide(
+                        tCpC_slice, (m_local_rank, self.mma_tiler[1])
+                    )
                     tCgC_mc_local_rank = cute.slice_(
                         tCgC_mc_slice_partitioned, ((None, None), (rank_id, 0))
                     )
-                    tCpC_local_rank = cute.slice_(tCpC_slice_partitioned, ((None, None), (rank_id, 0)))
+                    tCpC_local_rank = cute.slice_(
+                        tCpC_slice_partitioned, ((None, None), (rank_id, 0))
+                    )
 
                     # partition at thread level
                     frgC_mc = thr_copy_fake.partition_S(tCgC_mc_local_rank)
@@ -1093,24 +1101,34 @@ class PersistentDenseGemmKernel:
                                 mc_ptr = frgC_mc[None, i, j].iterator
                                 x, y, z, w = 0, 0, 0, 0
                                 if cutlass.const_expr(self.c_dtype == Float16):
-                                    x, y, z, w = utils.distributed.multimem_ld_reduce_8xf16(
-                                        mc_ptr
+                                    x, y, z, w = (
+                                        utils.distributed.multimem_ld_reduce_8xf16(
+                                            mc_ptr
+                                        )
                                     )
                                 elif cutlass.const_expr(self.c_dtype == Float32):
-                                    x, y, z, w = utils.distributed.multimem_ld_reduce_4xf32(
-                                        mc_ptr
+                                    x, y, z, w = (
+                                        utils.distributed.multimem_ld_reduce_4xf32(
+                                            mc_ptr
+                                        )
                                     )
                                 elif cutlass.const_expr(self.c_dtype == BFloat16):
                                     x, y, z, w = (
-                                        utils.distributed.multimem_ld_reduce_8xbf16(mc_ptr)
+                                        utils.distributed.multimem_ld_reduce_8xbf16(
+                                            mc_ptr
+                                        )
                                     )
                                 elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
                                     x, y, z, w = (
-                                        utils.distributed.multimem_ld_reduce_16xe4m3(mc_ptr)
+                                        utils.distributed.multimem_ld_reduce_16xe4m3(
+                                            mc_ptr
+                                        )
                                     )
                                 elif cutlass.const_expr(self.c_dtype == Float8E5M2):
                                     x, y, z, w = (
-                                        utils.distributed.multimem_ld_reduce_16xe5m2(mc_ptr)
+                                        utils.distributed.multimem_ld_reduce_16xe5m2(
+                                            mc_ptr
+                                        )
                                     )
                                 utils.distributed.multimem_st_4xb32(mc_ptr, x, y, z, w)
                     # Advance to next tile
@@ -1695,7 +1713,14 @@ class PersistentDenseGemmKernel:
 
         # check if c_dtype is supported by multimem all-reduce
         if cutlass.const_expr(
-            c_dtype not in {cutlass.Float16, cutlass.Float32, cutlass.BFloat16, cutlass.Float8E4M3FN, cutlass.Float8E5M2}
+            c_dtype
+            not in {
+                cutlass.Float16,
+                cutlass.Float32,
+                cutlass.BFloat16,
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E5M2,
+            }
         ):
             return False
 
@@ -1855,16 +1880,16 @@ class PersistentDenseGemmKernel:
 
 class GemmARLayer:
     """A high-performance GEMM+AllReduce layer based on CUTLASS PersistentDenseGemmKernel.
-    
+
     This layer combines matrix multiplication with all-reduce communication in a single
     fused operation, optimized for distributed training on Blackwell GPUs.
     """
-    
+
     def __init__(
         self,
         tp_group,
         max_M: int,
-        N: int, 
+        N: int,
         K: int,
         input_dtype: torch.dtype,
         output_dtype: torch.dtype,
@@ -1875,13 +1900,13 @@ class GemmARLayer:
         cluster_shape_mn: Tuple[int, int] = (2, 1),
         use_2cta_instrs: bool = True,
         use_tma_store: bool = True,
-        all_reduce: str = "none"
+        all_reduce: str = "none",
     ):
         self.tp_group = tp_group
         self.max_M = max_M
         self.N = N
         self.K = K
-        
+
         self.input_torch_dtype = input_dtype
         self.output_torch_dtype = output_dtype
         self.input_dtype = self._torch_dtype_to_cutlass_dtype(input_dtype)
@@ -1899,10 +1924,12 @@ class GemmARLayer:
         self.all_reduce = all_reduce
 
         if all_reduce != "none" and local_world_size not in [2, 4, 8]:
-            raise ValueError(f"AllReduce only supports world_size of 2, 4, 8, got {local_world_size}")
-        
+            raise ValueError(
+                f"AllReduce only supports world_size of 2, 4, 8, got {local_world_size}"
+            )
+
         self._init_gemm_allreduce()
-    
+
     def _torch_dtype_to_cutlass_dtype(self, torch_dtype):
         """Convert PyTorch dtype to CUTLASS dtype"""
         dtype_map = {
@@ -1912,15 +1939,15 @@ class GemmARLayer:
             torch.int8: cutlass.Int8,
             torch.uint8: cutlass.Uint8,
         }
-        if hasattr(torch, 'float8_e4m3fn'):
+        if hasattr(torch, "float8_e4m3fn"):
             dtype_map[torch.float8_e4m3fn] = cutlass.Float8E4M3FN
-        if hasattr(torch, 'float8_e5m2'):
+        if hasattr(torch, "float8_e5m2"):
             dtype_map[torch.float8_e5m2] = cutlass.Float8E5M2
-        
+
         if torch_dtype not in dtype_map:
             raise ValueError(f"Unsupported PyTorch dtype: {torch_dtype}")
         return dtype_map[torch_dtype]
-    
+
     def _init_gemm_allreduce(self):
         """Initialize the CUTLASS GEMM+AllReduce kernel."""
 
@@ -1931,28 +1958,34 @@ class GemmARLayer:
             cluster_shape_mn=self.cluster_shape_mn,
             use_tma_store=self.use_tma_store,
             rank_id=dist.get_rank(self.tp_group),
-            world_size=self.local_world_size,            
+            world_size=self.local_world_size,
             all_reduce=self.all_reduce,
         )
-        
+
         # Get hardware info for max active clusters
         self.max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
             self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
         )
-        
+
         # Pre-compile kernel with template tensors
         self._precompile_kernel()
-     
+
     def _create_template_tensors(self):
         """Create template tensors for kernel compilation following distributed version exactly."""
         l = 1  # Batch dimension
-        
+
         a_major = "k"
         b_major = "k"
         c_major = "n"
-        a_torch_cpu = cutlass_torch.matrix(l, self.max_M, self.K, a_major == "m", self.input_dtype)
-        b_torch_cpu = cutlass_torch.matrix(l, self.N, self.K, b_major == "n", self.input_dtype)
-        c_torch_cpu = cutlass_torch.matrix(l, self.max_M, self.N, c_major == "m", self.output_dtype)
+        a_torch_cpu = cutlass_torch.matrix(
+            l, self.max_M, self.K, a_major == "m", self.input_dtype
+        )
+        b_torch_cpu = cutlass_torch.matrix(
+            l, self.N, self.K, b_major == "n", self.input_dtype
+        )
+        c_torch_cpu = cutlass_torch.matrix(
+            l, self.max_M, self.N, c_major == "m", self.output_dtype
+        )
         # print(f"a_torch_cpu: {a_torch_cpu.shape, a_torch_cpu.stride(), a_torch_cpu.dtype}, ")
         # print(f"b_torch_cpu: {b_torch_cpu.shape, b_torch_cpu.stride(), b_torch_cpu.dtype}, ")
         # print(f"c_torch_cpu: {c_torch_cpu.shape, c_torch_cpu.stride(), c_torch_cpu.dtype}, ")
@@ -1976,7 +2009,9 @@ class GemmARLayer:
             torch_tensor_gpu = self.torch_symm_tensor
             cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
             cute_tensor.element_type = self.output_dtype
-            cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=1) # if is_dynamic_layout 
+            cute_tensor = cute_tensor.mark_layout_dynamic(
+                leading_dim=1
+            )  # if is_dynamic_layout
             cute_tensor = cutlass_torch.convert_cute_tensor(
                 torch_tensor_gpu,
                 cute_tensor,
@@ -1987,12 +2022,12 @@ class GemmARLayer:
             c_tensor = cute_tensor
             c_torch_gpu = torch_tensor_gpu
         return a_tensor, b_tensor, c_tensor, c_torch_gpu
-    
+
     def _precompile_kernel(self):
         """Pre-compile the GEMM kernel with template tensors."""
         torch_stream = torch.cuda.current_stream()
         current_stream = cuda.CUstream(torch_stream.cuda_stream)
-        
+
         a_tensor, b_tensor, c_tensor, c_torch_gpu = self._create_template_tensors()
         # c_torch_gpu is used in compare of verity
         # self.c_tensor = c_tensor
@@ -2000,57 +2035,74 @@ class GemmARLayer:
 
         if not self.gemm_kernel.can_implement(a_tensor, b_tensor, c_tensor):
             raise RuntimeError(f"GEMM kernel cannot implement configuration")
-        
-        
+
         if self.all_reduce == "none":
             # print("[GEMM_ALLREDUCE] Starting compilation (all_reduce=none)...")
             # compile_start_time = time.time()
             self.compiled_gemm = cute.compile(
-                self.gemm_kernel, a_tensor, b_tensor, c_tensor, 
-                self.max_active_clusters, current_stream
+                self.gemm_kernel,
+                a_tensor,
+                b_tensor,
+                c_tensor,
+                self.max_active_clusters,
+                current_stream,
             )
             # compile_end_time = time.time()
             # compile_duration = compile_end_time - compile_start_time
             # print(f"[GEMM_ALLREDUCE] Compilation completed in {compile_duration:.4f} seconds")
         else:
-            self.barrier_flag_memref, self.barrier_flag_mc_memref = self._create_barrier_flags(self.max_M)
+            self.barrier_flag_memref, self.barrier_flag_mc_memref = (
+                self._create_barrier_flags(self.max_M)
+            )
             # print(f"[GEMM_ALLREDUCE] Starting compilation (all_reduce={self.all_reduce})...")
             # compile_start_time = time.time()
             self.compiled_gemm = cute.compile(
                 self.gemm_kernel,
-                a_tensor, b_tensor, c_tensor,
+                a_tensor,
+                b_tensor,
+                c_tensor,
                 self.c_tensor_mc,
                 self.barrier_flag_memref,
                 self.barrier_flag_mc_memref,
-                self.max_active_clusters, current_stream,
+                self.max_active_clusters,
+                current_stream,
             )
             # compile_end_time = time.time()
             # compile_duration = compile_end_time - compile_start_time
             # print(f"[GEMM_ALLREDUCE] Compilation completed in {compile_duration:.4f} seconds")
-    
+
     def _create_barrier_flags(self, m: int):
         """Create barrier flags for synchronization in all-reduce."""
         cta_tile_shape_mn = (
             self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1),
             self.mma_tiler_mn[1],
         )
-        problem_shape_ntile_mn = (m // cta_tile_shape_mn[0], self.N // cta_tile_shape_mn[1])
+        problem_shape_ntile_mn = (
+            m // cta_tile_shape_mn[0],
+            self.N // cta_tile_shape_mn[1],
+        )
         num_tiles = problem_shape_ntile_mn[0] * problem_shape_ntile_mn[1]
         num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-        # Try NVSHMEM first, fallback to torch symm_mem  
-        from cuda.core.experimental import Device, system
-        import nvshmem.core
-        from sglang.srt.distributed.device_communicators.nvshmem_communicator import get_nvshmem_comm
+        # Try NVSHMEM first, fallback to torch symm_mem
+
+        from sglang.srt.distributed.device_communicators.nvshmem_communicator import (
+            get_nvshmem_comm,
+        )
+
         nvshmem_comm = get_nvshmem_comm()
-        
+
         if nvshmem_comm:
             # Use NVSHMEM_SYMM_MEM
-            barrier_flag = nvshmem_comm.create_symmetric_tensor((num_tiles + num_sms,), dtype=torch.int32)
+            barrier_flag = nvshmem_comm.create_symmetric_tensor(
+                (num_tiles + num_sms,), dtype=torch.int32
+            )
             barrier_flag_mc = nvshmem_comm.create_multicast_pointer(barrier_flag)
         else:
             # Use TORCH_SYMM_MEM
-            barrier_flag = symm_mem.empty((num_tiles + num_sms,), device="cuda", dtype=torch.int32)
+            barrier_flag = symm_mem.empty(
+                (num_tiles + num_sms,), device="cuda", dtype=torch.int32
+            )
             barrier_flag.fill_(0)
             symm = symm_mem.rendezvous(barrier_flag, group=dist.group.WORLD.group_name)
             barrier_flag_mc = symm.multicast_ptr
@@ -2063,22 +2115,33 @@ class GemmARLayer:
             ),
         )
         barrier_flag_mc_memref = barrier_flag_mc_memref.mark_layout_dynamic()
-        
+
         return barrier_flag_memref, barrier_flag_mc_memref
-    
-    def forward(self, input_tensor: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+    def forward(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
-            input_tensor: Input tensor of shape [M, K] 
+            input_tensor: Input tensor of shape [M, K]
             weight: Weight tensor of shape [N, K]
         Returns:
             Output tensor of shape [M, N] with all-reduce applied
         """
-        assert input_tensor.shape[1] == self.K, f"Input K dim mismatch: {input_tensor.shape[1]} vs {self.K}"
-        assert weight.shape[0] == self.N, f"Weight N dim mismatch: {weight.shape[0]} vs {self.N}"
-        assert weight.shape[1] == self.K, f"Weight K dim mismatch: {weight.shape[1]} vs {self.K}"
+        assert (
+            input_tensor.shape[1] == self.K
+        ), f"Input K dim mismatch: {input_tensor.shape[1]} vs {self.K}"
+        assert (
+            weight.shape[0] == self.N
+        ), f"Weight N dim mismatch: {weight.shape[0]} vs {self.N}"
+        assert (
+            weight.shape[1] == self.K
+        ), f"Weight K dim mismatch: {weight.shape[1]} vs {self.K}"
         assert bias is None, f"Bias is not supported yet"
-        
+
         torch_stream = torch.cuda.current_stream()
         current_stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -2098,12 +2161,12 @@ class GemmARLayer:
         a_tensor = a_tensor.mark_layout_dynamic(leading_dim=1)
         b_tensor = from_dlpack(weight_3d, assumed_align=16)
         b_tensor.element_type = self.input_dtype
-        b_tensor = b_tensor.mark_layout_dynamic(leading_dim=1)            
+        b_tensor = b_tensor.mark_layout_dynamic(leading_dim=1)
 
         c_tensor = from_dlpack(self.c_torch_gpu[:actual_m, :], assumed_align=16)
         c_tensor.element_type = self.output_dtype
         c_tensor = c_tensor.mark_layout_dynamic(leading_dim=1)
-        
+
         # print(f"a_tensor: {a_tensor.shape, a_tensor._dtype}")
         # print(f"b_tensor: {b_tensor.shape, b_tensor._dtype}")
         # print(f"c_tensor: {c_tensor.shape, c_tensor._dtype}, actual_m: {actual_m}")
@@ -2112,14 +2175,15 @@ class GemmARLayer:
             self.compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         else:
             self.compiled_gemm(
-                a_tensor, b_tensor, c_tensor,
+                a_tensor,
+                b_tensor,
+                c_tensor,
                 self.c_tensor_mc,
                 self.barrier_flag_memref,
                 self.barrier_flag_mc_memref,
                 current_stream,
             )
-        
+
         result = self.c_torch_gpu.squeeze(-1)
         # print(f"result: {result.shape}")
         return result[:actual_m, :]
-    

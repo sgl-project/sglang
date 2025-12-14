@@ -245,7 +245,9 @@ class GroupCoordinator:
     )
 
     use_torch_symm_mem: bool  # a hint of whether to use SymmMemAllReduce
-    use_nvshmem_mem: bool  # a hint of whether to use NvshmemMem for symmetric memory operations
+    use_nvshmem_mem: (
+        bool  # a hint of whether to use NvshmemMem for symmetric memory operations
+    )
 
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
@@ -1349,6 +1351,7 @@ class GroupCoordinator:
             self.nvshmem_comm.cleanup()
             self.nvshmem_comm = None
 
+
 _WORLD: Optional[GroupCoordinator] = None
 
 
@@ -1371,7 +1374,7 @@ def init_world_group(
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
-        use_nvshmem_communicator=(os.environ.get('SGLANG_USE_NVSHMEM', '0') == '1'),
+        use_nvshmem_communicator=(os.environ.get("SGLANG_USE_NVSHMEM", "0") == "1"),
         group_name="world",
     )
 
