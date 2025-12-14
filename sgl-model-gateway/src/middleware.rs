@@ -27,6 +27,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::metrics::RouterMetrics,
+    routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -336,8 +337,10 @@ impl<B> OnResponse<B> for ResponseLogger {
         let status = response.status();
         let status_code = status.as_u16();
 
+        let error_code = extract_error_code_from_response(response);
+
         // TODO support `route` information
-        RouterMetrics::record_http_status_code(status_code);
+        RouterMetrics::record_http_status_code(status_code, error_code);
         RouterMetrics::record_request_duration(latency);
 
         // Record these in the span for structured logging/observability tools
@@ -378,62 +381,6 @@ pub fn create_logging_layer() -> TraceLayer<
         .make_span_with(RequestSpan)
         .on_request(RequestLogger)
         .on_response(ResponseLogger::default())
-}
-
-/// Structured logging data for requests
-#[derive(Debug, serde::Serialize)]
-pub struct RequestLogEntry {
-    pub timestamp: String,
-    pub request_id: String,
-    pub method: String,
-    pub uri: String,
-    pub status: u16,
-    pub latency_ms: u64,
-    pub user_agent: Option<String>,
-    pub remote_addr: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Log a request with structured data
-pub fn log_request(entry: RequestLogEntry) {
-    if entry.status >= 500 {
-        tracing::error!(
-            target: "sgl_model_gateway::http",
-            request_id = %entry.request_id,
-            method = %entry.method,
-            uri = %entry.uri,
-            status = entry.status,
-            latency_ms = entry.latency_ms,
-            user_agent = ?entry.user_agent,
-            remote_addr = ?entry.remote_addr,
-            error = ?entry.error,
-            "HTTP request failed"
-        );
-    } else if entry.status >= 400 {
-        tracing::warn!(
-            target: "sgl_model_gateway::http",
-            request_id = %entry.request_id,
-            method = %entry.method,
-            uri = %entry.uri,
-            status = entry.status,
-            latency_ms = entry.latency_ms,
-            user_agent = ?entry.user_agent,
-            remote_addr = ?entry.remote_addr,
-            "HTTP request client error"
-        );
-    } else {
-        tracing::info!(
-            target: "sgl_model_gateway::http",
-            request_id = %entry.request_id,
-            method = %entry.method,
-            uri = %entry.uri,
-            status = entry.status,
-            latency_ms = entry.latency_ms,
-            user_agent = ?entry.user_agent,
-            remote_addr = ?entry.remote_addr,
-            "HTTP request completed"
-        );
-    }
 }
 
 /// Request queue entry
