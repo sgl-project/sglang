@@ -148,10 +148,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
         else:
             # Ping relevant people when there are failures
             mentions = "<@U09RR5TNC94> <@U09ABMCKQPM>"
-            summary_lines = [
-                f"{mentions} 🚨 *CI Critical Failures (Scheduled Runs)*",
-                "_Note: Recent runs are shown left to right in the detailed breakdown_\n",
-            ]
+            summary_lines = [f"{mentions} 🚨 *CI Critical Failures (Scheduled Runs)*"]
             for workflow, jobs in sorted(workflow_jobs.items()):
                 job_list = ", ".join(jobs)
                 summary_lines.append(f"• *{workflow}*: {job_list}")
