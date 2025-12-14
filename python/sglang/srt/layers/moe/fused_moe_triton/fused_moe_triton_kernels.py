@@ -835,6 +835,79 @@ def silu_and_mul_triton_kernel(
 
 
 @triton.jit
+def silu_and_mul_triton_kernel_tma(
+    gateup_output,
+    down_input,
+    hidden_size,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_valid_tokens,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """
+    SiLU and multiply kernel for TMA.
+
+    Adapated from silu_and_mul_triton_kernel to process blocks of tokens
+    in sorted order using TMA for efficient memory access
+    """
+    InDtype = gateup_output.dtype.element_ty
+    OutDtype = down_input.dtype.element_ty
+
+    half_hidden_size = hidden_size // 2
+
+    pid_m = tl.program_id(0)
+    start_offs_m = pid_m * BLOCK_SIZE_M
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    if start_offs_m >= num_tokens_post_padded:
+        return
+
+    row_offsets = start_offs_m + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + row_offsets)
+    token_mask = offs_token < num_valid_tokens
+
+    expert_id = tl.load(expert_ids_ptr + pid_m)
+    if expert_id == -1:
+        for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
+            offset = start_offset + tl.arange(0, BLOCK_SIZE_N)
+            dim_mask = offset < half_hidden_size
+            combined_mask = token_mask[:, None] & dim_mask[None, :]
+            down_ptrs = (
+                down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
+            )
+            tl.store(down_ptrs, 0, mask=combined_mask)
+        return
+
+    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE_N)
+        dim_mask = offset < half_hidden_size
+        combined_mask = token_mask[:, None] & dim_mask[None, :]
+
+        gate_ptrs = gateup_output + row_offsets[:, None] * hidden_size + offset[None, :]
+        up_ptrs = (
+            gateup_output
+            + row_offsets[:, None] * hidden_size
+            + (half_hidden_size + offset)[None, :]
+        )
+
+        gate_data = tl.load(gate_ptrs, mask=combined_mask, other=0.0)
+        up_data = tl.load(up_ptrs, mask=combined_mask, other=0.0)
+
+        gate_output = gate_data * tl.sigmoid(gate_data)
+        gate_output = gate_output.to(InDtype)
+
+        silu_mul_output = gate_output * up_data
+        silu_mul_output = silu_mul_output.to(OutDtype)
+
+        down_ptrs = (
+            down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
+        )
+        tl.store(down_ptrs, silu_mul_output, mask=combined_mask)
+
+
+@triton.jit
 def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
