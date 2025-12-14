@@ -30,6 +30,7 @@ class LoadFormat(str, enum.Enum):
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
     PRIVATE = "private"
+    FASTSAFETENSORS = "fastsafetensors"
 
 
 @dataclass
