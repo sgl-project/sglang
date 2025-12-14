@@ -205,6 +205,8 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
+        self._verify_transformers_version()
+
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
 
@@ -358,10 +360,9 @@ class ModelConfig:
                 mscale_all_dim = self.hf_config.rope_scaling.get(
                     "mscale_all_dim", False
                 )
-                scaling_factor = self.hf_config.rope_scaling.get("factor")
-                if scaling_factor is not None:
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -524,12 +525,18 @@ class ModelConfig:
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             if not is_local:
-                import huggingface_hub
+                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+                if envs.SGLANG_USE_MODELSCOPE.get():
 
-                try:
+                    from modelscope import HubApi, model_file_download
+
+                    hf_api = HubApi()
+                else:
+                    import huggingface_hub
                     from huggingface_hub import HfApi, hf_hub_download
 
                     hf_api = HfApi()
+                try:
                     # Retry HF API call up to 3 times
                     file_exists = retry(
                         lambda: hf_api.file_exists(
@@ -541,11 +548,18 @@ class ModelConfig:
                     )
                     if file_exists:
                         # Download and parse the quantization config for remote models
-                        quant_config_file = hf_hub_download(
-                            repo_id=self.model_path,
-                            filename="hf_quant_config.json",
-                            revision=self.revision,
-                        )
+                        if envs.SGLANG_USE_MODELSCOPE.get():
+                            quant_config_file = model_file_download(
+                                model_id=self.model_path,
+                                file_path="hf_quant_config.json",
+                                revision=self.revision,
+                            )
+                        else:
+                            quant_config_file = hf_hub_download(
+                                repo_id=self.model_path,
+                                filename="hf_quant_config.json",
+                                revision=self.revision,
+                            )
                         with open(quant_config_file) as f:
                             quant_config_dict = json.load(f)
                         quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
@@ -770,6 +784,41 @@ class ModelConfig:
                     "sparse_attention_enabled"
                 ] = True
 
+    def _verify_transformers_version(self):
+        import transformers
+        from packaging import version
+
+        tf_version_str = getattr(transformers, "__version__", None)
+        if tf_version_str is None:
+            return
+
+        vision_config = getattr(self.hf_config, "vision_config", None)
+        is_glm_46vmoe = "glm-4.6v" in self.model_path.lower() or (
+            vision_config is not None
+            and getattr(vision_config, "model_type", None) == "glm4v_moe_vision"
+            # The vision config model type for GLM-4.5v is 'glm4v_moe',
+            # while for GLM-4.6v, it is 'glm4v_moe_vision'.
+        )
+        needs_tf_v5 = is_glm_46vmoe
+
+        tf_version = version.parse(tf_version_str)
+        required_version = version.parse("5.0.0")
+
+        if tf_version < required_version:
+            if needs_tf_v5:
+                raise ValueError(
+                    f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
+                    f"or model type {self.hf_config.model_type}. "
+                    "Please upgrade transformers to >= 5.0.0."
+                )
+        elif not needs_tf_v5:
+            logger.warning(
+                f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
+                "If you experience issues related to RoPE parameters, "
+                "they may be due to incompatibilities between Transformers >=5.0.0 and some models. "
+                "You can try downgrading to transformers==4.57.1 as a workaround."
+            )
+
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids is not None:
@@ -983,6 +1032,7 @@ multimodal_model_archs = [
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
+    "PaddleOCRVLForConditionalGeneration",
 ]
 
 if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
