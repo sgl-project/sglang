@@ -1132,7 +1132,7 @@ class ServerArgs:
                         self.speculative_moe_runner_backend = "deep_gemm"
                         self.speculative_moe_a2a_backend = "deepep"
                         logger.info(
-                            "Use deep_gemm and deepep as MoE runner and a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
+                            "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
                     else:
                         self.speculative_moe_runner_backend = "triton"
