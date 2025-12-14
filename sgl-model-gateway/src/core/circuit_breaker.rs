@@ -151,9 +151,7 @@ impl CircuitBreaker {
 
         let outcome_str = if success { "success" } else { "failure" };
         RouterMetrics::record_cb_outcome(&self.metric_label, outcome_str);
-        RouterMetrics::set_cb_state(&self.metric_label, self.state().to_int());
-        RouterMetrics::set_cb_consecutive_failures(&self.metric_label, self.failure_count());
-        RouterMetrics::set_cb_consecutive_successes(&self.metric_label, self.success_count());
+        self.publish_gauge_metrics();
     }
 
     /// Record a successful request
@@ -289,6 +287,7 @@ impl CircuitBreaker {
         self.transition_to(CircuitState::Closed);
         self.consecutive_failures.store(0, Ordering::Release);
         self.consecutive_successes.store(0, Ordering::Release);
+        self.publish_gauge_metrics();
     }
 
     /// Force the circuit to open (for manual intervention)
@@ -307,6 +306,12 @@ impl CircuitBreaker {
             time_since_last_failure: self.time_since_last_failure(),
             time_since_last_state_change: self.time_since_last_state_change(),
         }
+    }
+
+    fn publish_gauge_metrics(&self) {
+        RouterMetrics::set_cb_state(&self.metric_label, self.state().to_int());
+        RouterMetrics::set_cb_consecutive_failures(&self.metric_label, self.failure_count());
+        RouterMetrics::set_cb_consecutive_successes(&self.metric_label, self.success_count());
     }
 }
 
