@@ -555,16 +555,17 @@ def fused_experts_impl(
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_hip or (_is_cuda and down_moe_use_tma):
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            elif _is_cuda:
-                silu_and_mul_triton_kernel[(intermediate_cache2.shape[0],)](
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    N,
-                    curr_topk_ids,
-                    512,
-                )
+            elif _is_hip or _is_cuda:
+                if not filter_expert or down_moe_use_tma:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    silu_and_mul_triton_kernel[(intermediate_cache2.shape[0],)](
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        N,
+                        curr_topk_ids,
+                        512,
+                    )
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -572,16 +573,17 @@ def fused_experts_impl(
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_hip or (_is_cuda and down_moe_use_tma):
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            elif _is_cuda:
-                gelu_and_mul_triton_kernel[(intermediate_cache2.shape[0],)](
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    N,
-                    curr_topk_ids,
-                    512,
-                )
+            if _is_hip or _is_cuda:
+                if not filter_expert or down_moe_use_tma:
+                    gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    gelu_and_mul_triton_kernel[(intermediate_cache2.shape[0],)](
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        N,
+                        curr_topk_ids,
+                        512,
+                    )
             else:
                 vllm_ops.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
