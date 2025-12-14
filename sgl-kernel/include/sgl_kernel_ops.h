@@ -137,19 +137,24 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
 // Device LayerNorm and fused LayerNorm+ScaleShift (CUTLASS-based)
 torch::Tensor fused_layernorm_scale_shift(
-    torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, torch::Tensor scale, torch::Tensor shift);
-torch::Tensor fused_layernorm_scale_shift_no_affine(torch::Tensor x, torch::Tensor scale, torch::Tensor shift);
+    torch::Tensor x,
+    c10::optional<torch::Tensor> gamma_opt,
+    c10::optional<torch::Tensor> beta_opt,
+    torch::Tensor scale,
+    torch::Tensor shift,
+    double eps);
 
 // LayerNorm fused with residual + gate (gate shapes: [M,N], [B,1,N], or [B,F,1,N]) and then scale/shift ([M,N] or
 // [B,F,1,N])
 std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_layernorm_scale_shift(
-    torch::Tensor residual,
-    torch::Tensor x,
-    torch::Tensor gamma,
-    torch::Tensor beta,
-    torch::Tensor scale,
-    torch::Tensor shift,
-    const c10::optional<torch::Tensor>& gate_opt);
+    const torch::Tensor& residual,
+    const torch::Tensor& x,
+    const c10::optional<torch::Tensor>& gate_opt,
+    const c10::optional<torch::Tensor>& gamma_opt,
+    const c10::optional<torch::Tensor>& beta_opt,
+    const torch::Tensor& scale,
+    const torch::Tensor& shift,
+    double eps);
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,

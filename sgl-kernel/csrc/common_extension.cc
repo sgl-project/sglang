@@ -85,13 +85,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   // Device LayerNorm and fused LayerNorm+ScaleShift
-  m.def("fused_layernorm_scale_shift(Tensor x, Tensor gamma, Tensor beta, Tensor scale, Tensor shift) -> Tensor");
-  m.impl("fused_layernorm_scale_shift", torch::kCUDA, &fused_layernorm_scale_shift);
-  m.def("fused_layernorm_scale_shift_no_affine(Tensor x, Tensor scale, Tensor shift) -> Tensor");
-  m.impl("fused_layernorm_scale_shift_no_affine", torch::kCUDA, &fused_layernorm_scale_shift_no_affine);
   m.def(
-      "fused_scale_residual_layernorm_scale_shift(Tensor residual, Tensor x, Tensor gamma, Tensor beta, Tensor scale, "
-      "Tensor shift, Tensor? gate=None) -> (Tensor, Tensor)");
+      "fused_layernorm_scale_shift(Tensor x, Tensor? gamma_opt, Tensor? beta_opt, "
+      "Tensor scale, Tensor shift, float eps) -> (Tensor)");
+  m.impl("fused_layernorm_scale_shift", torch::kCUDA, &fused_layernorm_scale_shift);
+  m.def(
+      "fused_scale_residual_layernorm_scale_shift(Tensor residual, Tensor x, Tensor? gate_opt, "
+      "Tensor? gamma_opt, Tensor? beta_opt, Tensor scale, Tensor shift, float eps) -> (Tensor, Tensor)");
   m.impl("fused_scale_residual_layernorm_scale_shift", torch::kCUDA, &fused_scale_residual_layernorm_scale_shift);
 
   m.def(
