@@ -230,6 +230,7 @@ impl CircuitBreaker {
             let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
             RouterMetrics::record_cb_state_transition(&self.metric_label, from, to);
+            RouterMetrics::set_cb_state(&self.metric_label, new_state.to_int());
         }
     }
 
@@ -309,7 +310,6 @@ impl CircuitBreaker {
     }
 
     fn publish_gauge_metrics(&self) {
-        RouterMetrics::set_cb_state(&self.metric_label, self.state().to_int());
         RouterMetrics::set_cb_consecutive_failures(&self.metric_label, self.failure_count());
         RouterMetrics::set_cb_consecutive_successes(&self.metric_label, self.success_count());
     }
