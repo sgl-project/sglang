@@ -219,10 +219,6 @@ class GroupCoordinator:
 
         self.mq_broadcaster = None
 
-        # TODO(will): check if this is needed
-        # self.use_custom_op_call = current_platform.is_cuda_alike()
-        self.use_custom_op_call = False
-
     @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""
@@ -333,10 +329,14 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        else:
-            torch.distributed.all_reduce(
-                input_, op=op, group=self.device_group, async_op=async_op
-            )
+
+        if self.device_communicator is not None and self.use_device_communicator:
+            return self.device_communicator.all_reduce(input_, op=op)
+
+        # Fallback to PyTorch implementation
+        torch.distributed.all_reduce(
+            input_, op=op, group=self.device_group, async_op=async_op
+        )
         return input_
 
     def all_gather(
@@ -352,6 +352,20 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+
+        if self.device_communicator is not None and self.use_device_communicator:
+            output_tensor = self.device_communicator.all_gather(input_, dim=dim)
+            if separate_tensors:
+                tensor_list = [
+                    output_tensor.reshape(-1)
+                    .narrow(0, input_.numel() * i, input_.numel())
+                    .view_as(input_)
+                    for i in range(world_size)
+                ]
+                return tensor_list
+
+            return output_tensor
+
         # Allocate output tensor.
         input_size = list(input_.size())
         input_size[0] *= world_size
@@ -403,6 +417,10 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+
+        if self.device_communicator is not None and self.use_device_communicator:
+            return self.device_communicator.gather(input_, dst=dst, dim=dim)
+
         # Allocate output tensor.
         if self.rank_in_group == dst:
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]
@@ -427,6 +445,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+
         # Broadcast.
         torch.distributed.broadcast(
             input_,
