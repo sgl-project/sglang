@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     get_deepep_config,
+    get_is_in_spec,
     get_moe_runner_backend,
     is_tbo_enabled,
 )
@@ -387,7 +388,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
-            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            and (not envs.SGLANG_DEEPEP_BF16_DISPATCH.get() or get_is_in_spec())
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -609,7 +610,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get() or get_is_in_spec():
             use_fp8 = True
 
         buffer = self._get_buffer()

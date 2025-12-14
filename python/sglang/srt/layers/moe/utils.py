@@ -134,6 +134,7 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
+IS_IN_SPEC: Optional[bool] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -286,12 +287,22 @@ def speculative_moe_a2a_backend_context():
     This ensures that draft models in speculative decoding use the configured speculative A2A backend.
     """
     global MOE_A2A_BACKEND
+    global IS_IN_SPEC
     original_backend = MOE_A2A_BACKEND
+    IS_IN_SPEC = True
     try:
         MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
         yield
     finally:
         MOE_A2A_BACKEND = original_backend
+        IS_IN_SPEC = False
+
+
+def get_is_in_spec() -> bool:
+    global IS_IN_SPEC
+    if IS_IN_SPEC is None:
+        IS_IN_SPEC = False
+    return IS_IN_SPEC
 
 
 # The type of method in top-K routing, for use in torch custom op
