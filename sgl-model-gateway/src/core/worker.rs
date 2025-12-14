@@ -137,24 +137,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
         let after = self.circuit_breaker().state();
 
         if before != after {
-            let from = match before {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            let to = match after {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
+            let from = before.to_string();
+            let to = after.to_string();
             RouterMetrics::record_cb_state_transition(self.url(), from, to);
         }
 
-        let state_code = match self.circuit_breaker().state() {
-            CircuitState::Closed => 0u8,
-            CircuitState::Open => 1u8,
-            CircuitState::HalfOpen => 2u8,
-        };
+        let state_code = self.circuit_breaker().state().to_int();
         RouterMetrics::set_cb_state(self.url(), state_code);
 
         // Update consecutive failures/successes gauges
