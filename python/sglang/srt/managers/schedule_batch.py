@@ -1576,6 +1576,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_topk = server_args.speculative_eagle_topk or 1
         spec_tokens = server_args.speculative_num_draft_tokens
 
+        if page_size > 1:
+            spec_tokens = (spec_tokens + page_size - 1) // page_size * page_size
+
         if page_size > 1 and spec_topk > 1:
             # last partial page and ceil alignment
             len_per_topk = (len_per_topk + 2 * page_size - 1) // page_size * page_size
