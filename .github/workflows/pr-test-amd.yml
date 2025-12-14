@@ -495,7 +495,7 @@ jobs:
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
 
   pr-test-amd-finish:
     needs:
