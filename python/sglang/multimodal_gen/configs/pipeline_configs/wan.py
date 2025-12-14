@@ -201,6 +201,17 @@ class Wan2_2_I2V_A14B_Config(WanI2V480PConfig):
         self.dit_config.boundary_ratio = self.boundary_ratio
 
 
+class Wan2_2_Animate_14B_Config(WanI2V480PConfig):
+    flow_shift: float | None = 5.0
+    boundary_ratio: float | None = 0.900
+
+    def post_denoising_loop(self, latents, batch):
+        return latents[:, :, 1:]
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================

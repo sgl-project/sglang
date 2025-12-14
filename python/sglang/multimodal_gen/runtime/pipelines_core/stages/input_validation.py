@@ -11,6 +11,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_Animate_14B_Config
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -171,9 +172,9 @@ class InputValidationStage(PipelineStage):
             height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
             width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-            batch.condition_image = batch.condition_image.resize((width, height))
-            batch.height = height
-            batch.width = width
+            # batch.condition_image = batch.condition_image.resize((width, height))
+            batch.height = condition_image_height
+            batch.width = condition_image_width
 
     def forward(
         self,
@@ -265,6 +266,73 @@ class InputValidationStage(PipelineStage):
             batch.height = batch.width * default_height // default_width
         elif batch.width is None:
             batch.width = batch.height * default_width // default_height
+
+        if isinstance(server_args.pipeline_config, Wan2_2_Animate_14B_Config):
+            pose_video = batch.extra.get("pose_video")
+            face_video = batch.extra.get("face_video")
+            if pose_video is None:
+                raise ValueError("Pose video must be provided")
+            if face_video is None:
+                raise ValueError("Face video must be provided")
+
+            if not isinstance(pose_video, list) or not isinstance(face_video, list):
+                raise ValueError("Pose and face videos must be lists of PIL images")
+
+            if len(pose_video) == 0 or len(face_video) == 0:
+                raise ValueError("Pose and face videos must be non-empty")
+
+            refert_num = batch.extra.get("refert_num")
+            if refert_num is None:
+                refert_num = 1
+                batch.extra["refert_num"] = refert_num
+            else:
+                assert refert_num == 1 or refert_num == 5, "refert_num must be 1 or 5"
+
+            clip_len = batch.extra.get("clip_len")
+            if clip_len is None:
+                clip_len = 77
+                batch.extra["clip_len"] = clip_len
+            else:
+                assert clip_len % 4 == 1, "clip_len must be 4N+1"
+
+            def get_valid_len(real_len, clip_len, overlap):
+                real_clip_len = clip_len - overlap
+                last_clip_num = (real_len - overlap) % real_clip_len
+                if last_clip_num == 0:
+                    extra = 0
+                else:
+                    extra = real_clip_len - last_clip_num
+                target_len = real_len + extra
+                return target_len
+
+            real_frame_len = len(pose_video)
+            batch.extra["real_frame_len"] = real_frame_len
+            target_len = get_valid_len(real_frame_len, clip_len, overlap=refert_num)
+            batch.num_frames = target_len
+
+            def inputs_padding(array, target_len):
+                from copy import deepcopy
+
+                idx = 0
+                flip = False
+                target_array = []
+                while len(target_array) < target_len:
+                    target_array.append(deepcopy(array[idx]))
+                    if flip:
+                        idx -= 1
+                    else:
+                        idx += 1
+                    if idx == 0 or idx == len(array) - 1:
+                        flip = not flip
+                return target_array[:target_len]
+
+            pose_video = inputs_padding(pose_video, target_len)
+            face_video = inputs_padding(face_video, target_len)
+            batch.extra["pose_video"] = pose_video
+            batch.extra["face_video"] = face_video
+
+            batch.extra["num_segments"] = batch.num_frames // (clip_len - refert_num)
+            batch.extra["cur_segment"] = 0
 
         return batch
 

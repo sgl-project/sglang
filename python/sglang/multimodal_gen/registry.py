@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    Wan2_2_Animate_14B_Config,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
@@ -52,13 +53,14 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
+    Wan2_2_Animate_14B_SamplingParam,
     Wan2_2_I2V_A14B_SamplingParam,
     Wan2_2_T2V_A14B_SamplingParam,
     Wan2_2_TI2V_5B_SamplingParam,
     WanI2V_14B_480P_SamplingParam,
     WanI2V_14B_720P_SamplingParam,
-    WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
+    WanT2V_1_3B_SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -339,6 +341,13 @@ def _register_configs():
         pipeline_config_cls=WanI2V720PConfig,
         hf_model_paths=[
             "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_Animate_14B_SamplingParam,
+        pipeline_config_cls=Wan2_2_Animate_14B_Config,
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-Animate-14B-Diffusers",
         ],
     )
     register_configs(

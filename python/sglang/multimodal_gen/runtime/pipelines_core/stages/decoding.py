@@ -8,6 +8,7 @@ Decoding stage for diffusion pipelines.
 import weakref
 
 import torch
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_Animate_14B_Config
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
@@ -21,7 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args, ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -238,6 +239,29 @@ class DecodingStage(PipelineStage):
             trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
         else:
             trajectory_decoded = None
+
+        if isinstance(server_args.pipeline_config, Wan2_2_Animate_14B_Config):
+            if batch.extra.get("all_frames") is None:
+                batch.extra["all_frames"] = frames
+            else:
+                batch.extra["all_frames"] = torch.cat(
+                    (
+                        batch.extra.get("all_frames"),
+                        frames[:, :, batch.extra.get("refert_num") :],
+                    ),
+                    dim=2,
+                )
+            if batch.extra.get("cur_segment") != batch.extra.get("num_segments") - 1:
+                batch.extra["cur_segment"] = batch.extra.get("cur_segment") + 1
+                batch.timesteps = None
+                batch.latents = None
+                return batch
+            else:
+                frames = batch.extra.get("all_frames")
+                frames = frames[:, :, : batch.extra["real_frame_len"]]
+
+        # Convert to CPU float32 for compatibility
+        frames = frames.cpu().float()
 
         # Update batch with decoded image
         output_batch = OutputBatch(
