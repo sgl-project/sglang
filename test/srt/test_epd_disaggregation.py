@@ -4,7 +4,9 @@ import threading
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.test_disaggregation_utils import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEPDDisaggregationOneEncoder(TestDisaggregationBase):
+class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
 
     @classmethod
@@ -203,7 +205,7 @@ class TestEPDDisaggregationOneEncoder(TestDisaggregationBase):
         self.assertGreater(mmmu_accuracy, 0.40)
 
 
-class TestEPDDisaggregationMultiEncoders(TestDisaggregationBase):
+class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
     """
     Test EPD disaggregation with multiple encode servers for load balancing.
     Both encode servers run on GPU 0 (different ports) for testing load distribution.
