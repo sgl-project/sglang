@@ -304,7 +304,7 @@
                 "LatentPreparationStage": 12.4,
                 "TimestepPreparationStage": 2.71,
                 "DenoisingStage": 54705.41,
-                "DecodingStage": 311.13
+                "DecodingStage": 469.47
             },
             "denoise_step_ms": {
                 "0": 1067.03,
@@ -682,7 +682,7 @@
                 "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 44.28,
                 "LatentPreparationStage": 0.29,
-                "DenoisingStage": 9054.39,
+                "DenoisingStage": 9154.39,
                 "DecodingStage": 5995.09,
                 "per_frame_generation": null
             },
@@ -694,8 +694,8 @@
                 "4": 1489.93,
                 "5": 1487.02
             },
-            "expected_e2e_ms": 15672.15,
-            "expected_avg_denoise_ms": 1508.46,
+            "expected_e2e_ms": 16672.15,
+            "expected_avg_denoise_ms": 1608.46,
             "expected_median_denoise_ms": 1488.48
         },
         "wan2_2_i2v_a14b_2gpu": {

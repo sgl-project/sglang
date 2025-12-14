@@ -123,6 +123,7 @@ class SamplingParams:
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = None
+    guidance_scale_2: float = None
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -495,6 +496,13 @@ class SamplingParams:
             help="Classifier-free guidance scale",
         )
         parser.add_argument(
+            "--guidance-scale-2",
+            type=float,
+            default=SamplingParams.guidance_scale_2,
+            dest="guidance_scale_2",
+            help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
+        )
+        parser.add_argument(
             "--guidance-rescale",
             type=float,
             default=SamplingParams.guidance_rescale,
@@ -589,7 +597,7 @@ class SamplingParams:
         attrs = sampling_params_fields & args_attrs
         args.height_not_provided = False
         args.width_not_provided = False
-        return {attr: getattr(args, attr) for attr in attrs}
+        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
