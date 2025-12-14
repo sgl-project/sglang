@@ -4,6 +4,7 @@ import enum
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import ceil_align
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1576,15 +1577,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_topk = server_args.speculative_eagle_topk or 1
         spec_tokens = server_args.speculative_num_draft_tokens
 
-        if page_size > 1:
-            spec_tokens = (spec_tokens + page_size - 1) // page_size * page_size
-
         if page_size > 1 and spec_topk > 1:
             # last partial page and ceil alignment
-            len_per_topk = (len_per_topk + 2 * page_size - 1) // page_size * page_size
+            len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
         elif page_size > 1:
             # only page alignment
-            len_per_topk = (len_per_topk + page_size - 1) // page_size * page_size
+            len_per_topk = ceil_align(len_per_topk, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
 
         num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
 
