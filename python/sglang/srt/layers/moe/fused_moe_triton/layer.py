@@ -1091,7 +1091,6 @@ class FlashInferFusedMoE(FusedMoE):
 
         else:
 
-            # FP8 Matrix multiply.
             final_hidden_states = self.quant_method.apply_with_router_logits(
                 layer=self,
                 dispatch_output=StandardDispatchOutput(

@@ -592,3 +592,145 @@ def swizzle_blockscale(scale: torch.Tensor):
         if scale_ndim == 2
         else swizzled_scale.reshape(B, M_padded, K_padded)
     )
+
+
+def reorder_w1w3_to_w3w1(
+    weight: torch.Tensor, scale: torch.Tensor, dim: int = -2
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-order the concatenated `[w1, w3]` tensors to `[w3, w1]`"""
+    size = weight.size(dim)
+    assert size % 2 == 0, f"Expected even size in dim {dim}, got {size}"
+    half = size // 2
+
+    w1, w3 = weight.split(half, dim=dim)
+    s1, s3 = scale.split(half, dim=dim)
+
+    return (
+        torch.cat([w3, w1], dim=dim).contiguous(),
+        torch.cat([s3, s1], dim=dim).contiguous(),
+    )
+
+
+def prepare_static_weights_for_trtllm_fp4_moe(
+    # args_dequant,
+    # args,
+    gemm1_weights,
+    gemm2_weights,
+    gemm1_scales_linear_fp4_bytes,
+    gemm2_scales_linear_fp4_bytes,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+):
+    from flashinfer import nvfp4_block_scale_interleave
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    """Prepare quantized weights for kernel (done offline with weights)."""
+    _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
+    epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+
+    # Convert quantized weights to proper formats
+    gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
+        num_experts, 2 * intermediate_size, hidden_size // 2
+    )  # packed fp4
+    gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn
+    ).reshape(
+        num_experts, 2 * intermediate_size, hidden_size // 16
+    )  # fp8 scaling factors
+
+    gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
+        num_experts, hidden_size, intermediate_size // 2
+    )  # packed fp4
+    gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn
+    ).reshape(
+        num_experts, hidden_size, intermediate_size // 16
+    )  # fp8 scaling factors
+
+    gemm1_weights_fp4_shuffled = []
+    gemm1_scales_fp4_shuffled = []
+    gemm2_weights_fp4_shuffled = []
+    gemm2_scales_fp4_shuffled = []
+    for i in range(num_experts):
+        # Calculate the permute indices for the following:
+        # 1. Reorder rows of W1 and scales for fused gated activation
+        # 2. Shuffle weights and scaling factors for transposed mma output
+        # for both w3_w1 and w2 weights and scale factors
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            _cache_permute_indices,
+            gemm1_weights_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        gemm1_weights_fp4_shuffled.append(
+            gemm1_weights_fp4[i]
+            .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+            _cache_permute_indices,
+            gemm1_scales_linear_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        gemm1_scales_fp4_shuffled.append(
+            nvfp4_block_scale_interleave(
+                gemm1_scales_linear_fp4[i]
+                .view(torch.uint8)[
+                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
+                ]
+                .contiguous()
+            )
+        )
+
+        permute_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm2_weights_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        gemm2_weights_fp4_shuffled.append(
+            gemm2_weights_fp4[i]
+            .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm2_scales_linear_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        gemm2_scales_fp4_shuffled.append(
+            nvfp4_block_scale_interleave(
+                gemm2_scales_linear_fp4[i]
+                .view(torch.uint8)[
+                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
+                ]
+                .contiguous()
+            )
+        )
+
+    # Stack weights for all experts
+    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
+    gemm1_scales_fp4_shuffled = (
+        torch.stack(gemm1_scales_fp4_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
+    )
+
+    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
+    gemm2_scales_fp4_shuffled = (
+        torch.stack(gemm2_scales_fp4_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_experts, hidden_size, intermediate_size // 16)
+    )
+    return (
+        gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled,
+        gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled,
+    )
