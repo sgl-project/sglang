@@ -701,11 +701,11 @@
         "wan2_2_i2v_a14b_2gpu": {
             "stages_ms": {
                 "InputValidationStage": 18.45,
-                "TextEncodingStage": 2376.74,
+                "TextEncodingStage": 3337.77,
                 "ConditioningStage": 0.03,
                 "TimestepPreparationStage": 2.9,
                 "LatentPreparationStage": 1.25,
-                "ImageVAEEncodingStage": 1130.89,
+                "ImageVAEEncodingStage": 1655.89,
                 "DenoisingStage": 100544.98,
                 "DecodingStage": 1355.52,
                 "per_frame_generation": null
