@@ -15,6 +15,7 @@
 
 import asyncio
 import copy
+import ctypes
 import dataclasses
 import logging
 import os
@@ -32,6 +33,7 @@ from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import orjson
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -116,6 +118,29 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
+
+
+class TensorWrapper:
+    """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
+
+    def __init__(self, tensor):
+        # Ensure tensor is on CPU and contiguous
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+
+        # Keep tensor reference
+        self.tensor = tensor
+        self.shape = list(tensor.shape)
+        self.dtype = tensor.dtype
+
+    def __buffer__(self):
+        data_ptr = self.tensor.data_ptr()
+        total_bytes = self.tensor.numel() * self.tensor.element_size()
+        c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
+        c_obj._keep_alive_ref = self
+        return memoryview(c_obj)
 
 
 @dataclasses.dataclass
@@ -908,6 +933,88 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         )
 
+    @staticmethod
+    def extract_feature_tensors(tokenized_obj):
+        if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            return False, None, None
+
+        has_feature_tensors = False
+        feature_wrappers = []
+        feature_infos = []
+
+        if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+            mm_items = tokenized_obj.mm_inputs.get("mm_items", [])
+
+            for idx, item in enumerate(mm_items):
+                if (
+                    hasattr(item, "feature")
+                    and item.feature is not None
+                    and isinstance(item.feature, torch.Tensor)
+                ):
+                    has_feature_tensors = True
+
+                    # Create wrapper (handles CPU/contiguous conversion and keeps tensor alive)
+                    wrapper = TensorWrapper(item.feature)
+                    feature_wrappers.append(wrapper)
+
+                    # Store metadata (from wrapper for consistency)
+                    feature_info = {
+                        "idx": idx,
+                        "shape": wrapper.shape,
+                        "dtype": wrapper.dtype,
+                    }
+                    feature_infos.append(feature_info)
+
+                    # Clear original reference for pickling
+                    item.feature = None
+
+        return has_feature_tensors, feature_wrappers, feature_infos
+
+    def _send_multi_parts(self, sender, obj, copy=False):
+        has_feature_tensors = False
+        feature_wrappers = None
+        feature_infos = None
+        if not self.server_args.skip_tokenizer_init:
+            has_feature_tensors, feature_wrappers, feature_infos = (
+                TokenizerManager.extract_feature_tensors(obj)
+            )
+        if has_feature_tensors:
+            parts = [
+                b"FEAT",
+                pickle.dumps(obj),
+                pickle.dumps(feature_infos),
+            ]
+            # Add wrappers - they keep tensors alive and provide buffer interface
+            for wrapper in feature_wrappers:
+                parts.append(wrapper.__buffer__())
+            sender.send_multipart(parts, copy=copy)
+        else:
+            sender.send_multipart(
+                [
+                    b"NORM",
+                    pickle.dumps(obj),
+                ],
+                copy=False,
+            )
+
+    async def _send_multi_parts_async(self, sender, obj, copy=False):
+        has_feature_tensors = False
+        feature_wrappers = None
+        feature_infos = None
+
+        if not self.server_args.skip_tokenizer_init:
+            has_feature_tensors, feature_wrappers, feature_infos = (
+                TokenizerManager.extract_feature_tensors(obj)
+            )
+
+        if has_feature_tensors:
+            parts = [b"FEAT", pickle.dumps(obj), pickle.dumps(feature_infos)]
+            for wrapper in feature_wrappers:
+                parts.append(wrapper.__buffer__())
+            await sender.send_multipart(parts, copy=copy)
+        else:
+            await sender.send_multipart([b"NORM", pickle.dumps(obj)], copy=copy)
+
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -916,7 +1023,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        self._send_multi_parts(self.send_to_scheduler, tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
@@ -938,8 +1045,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
-
-        self.send_to_scheduler.send_pyobj(batch_req)
+        self._send_multi_parts(self.send_to_scheduler, batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
@@ -1164,7 +1270,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if not abort_all and rid not in self.rid_to_state:
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self.send_to_scheduler.send_pyobj(req)
+        self._send_multi_parts(self.send_to_scheduler, req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1175,7 +1281,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                await self._send_multi_parts_async(self.send_to_scheduler, obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1189,7 +1295,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            await self._send_multi_parts_async(self.send_to_scheduler, obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1228,7 +1334,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self.send_to_scheduler.send_pyobj(obj)
+        self._send_multi_parts(self.send_to_scheduler, obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
@@ -1268,7 +1374,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        self._send_multi_parts(self.send_to_scheduler, FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -2025,7 +2131,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await asyncio.sleep(self.server_args.load_watch_interval)
             loads = await self.get_load_communicator(GetLoadReqInput())
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            self.send_to_scheduler.send_pyobj(load_udpate_req)
+            self._send_multi_parts(self.send_to_scheduler, load_udpate_req)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):
