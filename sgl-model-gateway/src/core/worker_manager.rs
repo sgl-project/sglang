@@ -282,7 +282,7 @@ impl WorkerManager {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
 
-        let tasks = workers.iter().map(|worker| {
+        let tasks = workers.into_iter().map(|worker| {
             let client = client.clone();
             let worker_url = worker.url().to_string();
             let url = format!("{}/{}", worker_url, endpoint);
