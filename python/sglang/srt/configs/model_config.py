@@ -431,6 +431,9 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
+        self.sliding_window_size = getattr(
+            self.hf_text_config, "sliding_window_size", None
+        ) or getattr(self.hf_text_config, "sliding_window", None)
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads

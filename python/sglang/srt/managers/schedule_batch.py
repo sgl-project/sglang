@@ -1385,6 +1385,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            if pre_len > 0:
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+                )
+                if isinstance(self.tree_cache, SWAChunkCache):
+                    self.tree_cache.evict_swa(
+                        req,
+                        pre_len,
+                        self.model_config.attention_chunk_size,
+                        self.model_config.sliding_window_size,
+                    )
             # update req-level memory management fields
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
@@ -1785,6 +1796,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        # free memory
+        if isinstance(self.tree_cache, SWAChunkCache):
+            for req in self.reqs:
+                self.tree_cache.evict_swa(
+                    req,
+                    req.seqlen - 1,
+                    self.model_config.attention_chunk_size,
+                    self.model_config.sliding_window_size,
+                )
+
+        # Allocate memory
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            self.out_cache_loc = self.alloc_token_slots(bs)
+        else:
+            last_loc = self.req_to_token_pool.req_to_token[
+                self.req_pool_indices, self.seq_lens - 2
+            ]
+            self.out_cache_loc = self.alloc_paged_token_slots_decode(
+                self.seq_lens, self.seq_lens_cpu, last_loc
+            )
+        locs = self.seq_lens - 1
+        self.req_to_token_pool.write(
+            (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
+        )
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
