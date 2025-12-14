@@ -82,16 +82,22 @@ pub struct CircuitBreaker {
     last_failure_time: Arc<RwLock<Option<Instant>>>,
     last_state_change: Arc<RwLock<Instant>>,
     config: CircuitBreakerConfig,
+    metric_label: String,
 }
 
 impl CircuitBreaker {
     /// Create a new circuit breaker with default configuration
     pub fn new() -> Self {
-        Self::with_config(CircuitBreakerConfig::default())
+        Self::with_config_and_label(CircuitBreakerConfig::default(), String::new())
     }
 
     /// Create a new circuit breaker with custom configuration
     pub fn with_config(config: CircuitBreakerConfig) -> Self {
+        Self::with_config_and_label(config, String::new())
+    }
+
+    /// Create a new circuit breaker with custom configuration and metric label
+    pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         Self {
             state: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
@@ -101,7 +107,13 @@ impl CircuitBreaker {
             last_failure_time: Arc::new(RwLock::new(None)),
             last_state_change: Arc::new(RwLock::new(Instant::now())),
             config,
+            metric_label,
         }
+    }
+
+    /// Get the metric label
+    pub fn metric_label(&self) -> &str {
+        &self.metric_label
     }
 
     /// Check if a request can be executed
@@ -306,6 +318,7 @@ impl Clone for CircuitBreaker {
             last_failure_time: Arc::clone(&self.last_failure_time),
             last_state_change: Arc::clone(&self.last_state_change),
             config: self.config.clone(),
+            metric_label: self.metric_label.clone(),
         }
     }
 }
