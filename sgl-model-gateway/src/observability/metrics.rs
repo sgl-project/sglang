@@ -65,6 +65,23 @@ pub fn init_metrics() {
         "sgl_router_cb_outcomes_total",
         "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
     );
+    describe_gauge!(
+        "sgl_router_cb_consecutive_failures",
+        "Current consecutive failure count per worker circuit breaker"
+    );
+    describe_gauge!(
+        "sgl_router_cb_consecutive_successes",
+        "Current consecutive success count per worker circuit breaker"
+    );
+
+    describe_counter!(
+        "sgl_router_discovery_watcher_errors_total",
+        "Total number of Kubernetes watcher errors"
+    );
+    describe_counter!(
+        "sgl_router_discovery_watcher_restarts_total",
+        "Total number of Kubernetes watcher restarts"
+    );
 
     describe_gauge!(
         "sgl_router_active_workers",
@@ -461,9 +478,33 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    pub fn set_cb_consecutive_failures(worker: &str, count: u32) {
+        gauge!("sgl_router_cb_consecutive_failures",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
+    }
+
+    pub fn set_cb_consecutive_successes(worker: &str, count: u32) {
+        gauge!("sgl_router_cb_consecutive_successes",
+            "worker" => worker.to_string()
+        )
+        .set(count as f64);
+    }
+
+    pub fn record_discovery_watcher_error() {
+        counter!("sgl_router_discovery_watcher_errors_total").increment(1);
+    }
+
+    pub fn record_discovery_watcher_restart() {
+        counter!("sgl_router_discovery_watcher_restarts_total").increment(1);
+    }
+
     // TODO delete the metrics (instead of setting them to zero)
     pub fn remove_worker_metrics(worker_url: &str) {
         gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_cb_consecutive_failures","worker" => worker_url.to_string()).set(0.0);
+        gauge!("sgl_router_cb_consecutive_successes","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_running_requests","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_tree_size","worker" => worker_url.to_string()).set(0.0);

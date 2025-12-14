@@ -300,6 +300,7 @@ pub async fn start_service_discovery(
                 }
                 Err(err) => {
                     error!("Error in Kubernetes watcher: {}", err);
+                    RouterMetrics::record_discovery_watcher_error();
                     warn!(
                         "Retrying in {} seconds with exponential backoff",
                         retry_delay.as_secs()
@@ -314,6 +315,7 @@ pub async fn start_service_discovery(
                 "Kubernetes watcher exited, restarting in {} seconds",
                 config_arc.check_interval.as_secs()
             );
+            RouterMetrics::record_discovery_watcher_restart();
             time::sleep(config_arc.check_interval).await;
         }
     });
