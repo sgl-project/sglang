@@ -545,8 +545,21 @@ class Llama4ForConditionalGeneration(nn.Module):
         # For text-only models, return None or raise an error
         if not self.has_vision or self.vision_model is None:
             raise ValueError("Vision model not available for text-only checkpoint")
+
+        all_features = [item.feature for item in items]
+
+        # Check if the input is already precomputed embeddings
+        # If the last dimension matches the text hidden size, it's an embedding.
+        text_hidden_size = (
+            self.config.text_config.hidden_size
+            if hasattr(self.config, "text_config")
+            else self.config.hidden_size
+        )
+        if len(all_features) > 0 and all_features[0].shape[-1] == text_hidden_size:
+            return torch.cat(all_features, dim=0)
+
         pixel_values = (
-            torch.concat([item.feature for item in items])
+            torch.concat(all_features)
             .to(next(self.vision_model.parameters()).device)
             .type(next(self.vision_model.parameters()).dtype)
         )
