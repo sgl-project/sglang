@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.utils import allocate_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -92,7 +93,7 @@ class EagleDraftInputV2Mixin:
         num_needed_tokens = 0
         for r in batch.reqs:
             # Over-allocation happens here
-            x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
+            x = r.kv_committed_len + 2 * allocate_len_per_decode() - r.kv_allocated_len
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
