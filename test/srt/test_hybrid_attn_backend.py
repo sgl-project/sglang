@@ -22,8 +22,6 @@ GSM_DATASET_PATH = None
 # Default server arguments shared across all tests
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
-    "8",
     "--prefill-attention-backend",
     "fa3",
     "--decode-attention-backend",

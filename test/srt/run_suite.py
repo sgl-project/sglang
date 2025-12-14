@@ -117,7 +117,6 @@ suites = {
         TestFile("test_torchao.py", 103),
         TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 203),
-        TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_moe_channel_fp8_kernel.py", 16),
         TestFile("test_triton_sliding_window.py", 84),
         TestFile("test_utils_update_weights.py", 29),

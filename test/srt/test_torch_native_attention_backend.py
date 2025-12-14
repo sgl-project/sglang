@@ -34,7 +34,7 @@ class TestTorchNativeAttnBackend(CustomTestCase):
                 model=model,
                 eval_name="mmlu",
                 num_examples=64,
-                num_threads=32,
+                num_threads=128,
             )
 
             metrics = run_eval(args)

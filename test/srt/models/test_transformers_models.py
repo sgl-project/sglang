@@ -42,7 +42,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             model=self.model,
             eval_name="mmlu",
             num_examples=64,
-            num_threads=32,
+            num_threads=128,
         )
         from sglang.test.run_eval import run_eval
 
@@ -55,7 +55,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
-            parallel=128,
+            parallel=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )

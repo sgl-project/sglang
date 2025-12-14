@@ -22,7 +22,7 @@ class TestMLADeepseekV3(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if is_cuda():
-            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+            other_args.extend(["--enable-torch-compile"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -40,7 +40,7 @@ class TestMLADeepseekV3(CustomTestCase):
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
-            parallel=128,
+            parallel=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -58,8 +58,6 @@ class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
-        if is_cuda():
-            other_args.extend(["--cuda-graph-max-bs", "2"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -77,7 +75,7 @@ class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
-            parallel=128,
+            parallel=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -119,7 +117,7 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
-            parallel=128,
+            parallel=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
