@@ -2871,13 +2871,63 @@ def get_model_loader(
             "Same model path for both training and inference."
         )
 
-        # Set quantization to FP8 for native SGLang support
-        if model_config and not model_config.quantization:
-            logger.info(
-                "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
-                "Model will be loaded with FP8 infrastructure"
-            )
-            model_config.quantization = "fp8"
+        # Automatically set quantization to FP8 for flash_rl load format
+        if model_config:
+            
+            # Force set quantization to fp8 for flash_rl format
+            if not model_config.quantization or model_config.quantization != "fp8":
+                logger.info(
+                    "QuantizedRL: Current model quantization config is not fp8, "
+                    "Automatically setting quantization to fp8 for flash_rl load format. "
+                    
+                )
+                model_config.quantization = "fp8"
+            
+            # Set quantization_config following verl's logic for blockwise FP8 quantization
+            # Default FP8 blockwise quantization config following verl's logic
+            FP8_BLOCK_QUANT_KWARGS = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+            
+            # Check if quantization_config is already set (e.g., from json_model_override_args)
+            existing_quant_config = getattr(model_config.hf_config, "quantization_config", None)
+            
+
+            # TODO: Simplify the code below?
+            if existing_quant_config is None:
+                # Set default FP8 blockwise quantization config
+                fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+                logger.info(
+                    "QuantizedRL: Setting quantization_config with blockwise FP8 parameters. "
+                    f"Config: {fp8_block_quant_kwargs}"
+                )
+                model_config.hf_config.quantization_config = fp8_block_quant_kwargs
+            else:
+                # Merge with existing config, prioritizing existing values but filling in missing keys
+                if isinstance(existing_quant_config, dict):
+                    # Update existing config with default values for missing keys
+                    updated = False
+                    for key, default_value in FP8_BLOCK_QUANT_KWARGS.items():
+                        if key not in existing_quant_config:
+                            existing_quant_config[key] = default_value
+                            updated = True
+                            logger.info(
+                                f"QuantizedRL: Added missing quantization_config key '{key}' = {default_value}"
+                            )
+                    if updated:
+                        model_config.hf_config.quantization_config = existing_quant_config
+                    else:
+                        logger.info(
+                            "QuantizedRL: quantization_config already complete, no updates needed"
+                        )
+                else:
+                    logger.info(
+                        "QuantizedRL: quantization_config already exists and is not a dict, "
+                        "keeping existing configuration"
+                    )
 
         return QuantizedRLModelLoader(load_config)
 
