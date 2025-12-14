@@ -102,14 +102,32 @@ class SGLangFailuresAnalyzer:
         return all_runs
 
     def get_jobs_for_run(self, run_id: int) -> List[Dict]:
-        """Get all jobs for a specific workflow run."""
+        """Get all jobs for a specific workflow run, handling pagination."""
         try:
+            all_jobs = []
             url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            jobs = data.get("jobs", [])
-            return jobs
+            params = {"per_page": 100}  # Max per page
+
+            while url:
+                response = self.session.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                jobs = data.get("jobs", [])
+                all_jobs.extend(jobs)
+
+                # Check for next page in Link header
+                link_header = response.headers.get("Link", "")
+                next_url = None
+                if link_header:
+                    links = link_header.split(", ")
+                    for link in links:
+                        if 'rel="next"' in link:
+                            next_url = link.split(";")[0].strip("<>")
+                            break
+                url = next_url
+                params = {}  # Clear params for subsequent requests (URL has them)
+
+            return all_jobs
         except requests.exceptions.RequestException as e:
             print(f"Error fetching jobs for run {run_id}: {e}")
             return []
