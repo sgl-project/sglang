@@ -296,6 +296,17 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
         all_pixel_values = flatten_nested_list([item.feature for item in items])
+
+        # -------------------------------------------------------------
+        # FIX: Check if the input is already precomputed embeddings
+        # If the last dimension matches the text hidden size, it's an embedding.
+        if (
+            len(all_pixel_values) > 0
+            and all_pixel_values[0].shape[-1] == self.config.text_config.hidden_size
+        ):
+            return torch.cat(all_pixel_values, dim=0)
+        # -------------------------------------------------------------
+
         vision_outputs_list = []
 
         for pixel_values_batch in all_pixel_values:

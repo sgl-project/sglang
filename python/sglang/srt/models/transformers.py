@@ -173,6 +173,13 @@ class TransformersForCausalLM(nn.Module):
             if not hasattr(config, "head_dim")
             else config.head_dim
         )
+        # FIX: Handle models (like CLIP) that do not have num_key_value_heads.
+        # Fallback to num_attention_heads (Standard Multi-Head Attention).
+        if hasattr(config, "num_key_value_heads"):
+            num_kv_heads = config.num_key_value_heads
+        else:
+            num_kv_heads = config.num_attention_heads
+
         self.attention_instances = [
             RadixAttention(
                 num_heads=divide(config.num_attention_heads, tp_size),
@@ -180,7 +187,7 @@ class TransformersForCausalLM(nn.Module):
                 # NOTE: We use Llama scale as default, if it's set by
                 # Transformers, it's updated in sglang_flash_attention_forward
                 scaling=head_dim**-0.5,
-                num_kv_heads=divide(config.num_key_value_heads, tp_size),
+                num_kv_heads=divide(num_kv_heads, tp_size),
                 layer_id=i,
                 quant_config=self.quant_config,
                 prefix=f"{i}.attn",
@@ -236,17 +243,29 @@ class TransformersForCausalLM(nn.Module):
         _tensor_parallel(self.model)
 
     def replace_vocab_embed_class(self, module: nn.Module):
-        # Use native set input embeddings
-        new_module = VocabParallelEmbedding(
-            self.vocab_size,
-            self.config.hidden_size,
-            org_num_embeddings=self.config.vocab_size,
-            quant_config=None,
-        )
-        self.log_replacement(
-            "input embedding", self.model.get_input_embeddings(), new_module
-        )
-        self.model.set_input_embeddings(new_module)
+        # -------------------------------------------------------------
+        # FIX: Wrap the entire replacement logic in try-except.
+        # CLIPVisionModel might return valid embeddings via get_input_embeddings
+        # but raises NotImplementedError on set_input_embeddings.
+        if (
+            not hasattr(module, "get_input_embeddings")
+            or module.get_input_embeddings() is None
+        ):
+            return
+
+        try:
+            new_module = VocabParallelEmbedding(
+                self.vocab_size,
+                self.config.hidden_size,
+                org_num_embeddings=self.config.vocab_size,
+                quant_config=None,
+            )
+            self.log_replacement(
+                "input embedding", self.model.get_input_embeddings(), new_module
+            )
+            self.model.set_input_embeddings(new_module)
+        except (NotImplementedError, AttributeError):
+            return
 
     @torch.no_grad()
     def forward(
