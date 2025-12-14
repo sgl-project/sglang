@@ -129,31 +129,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Record the outcome of a request to this worker
     fn record_outcome(&self, success: bool) {
-        let outcome_str = if success { "success" } else { "failure" };
-        RouterMetrics::record_cb_outcome(self.url(), outcome_str);
-
-        let before = self.circuit_breaker().state();
         self.circuit_breaker().record_outcome(success);
-        let after = self.circuit_breaker().state();
-
-        if before != after {
-            let from = before.as_str();
-            let to = after.as_str();
-            RouterMetrics::record_cb_state_transition(self.url(), from, to);
-        }
-
-        let state_code = self.circuit_breaker().state().to_int();
-        RouterMetrics::set_cb_state(self.url(), state_code);
-
-        // Update consecutive failures/successes gauges
-        RouterMetrics::set_cb_consecutive_failures(
-            self.url(),
-            self.circuit_breaker().failure_count(),
-        );
-        RouterMetrics::set_cb_consecutive_successes(
-            self.url(),
-            self.circuit_breaker().success_count(),
-        );
     }
 
     /// Check if this worker is DP-aware

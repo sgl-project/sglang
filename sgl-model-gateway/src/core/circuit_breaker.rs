@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::observability::metrics::RouterMetrics;
 use tracing::info;
 
 /// Circuit breaker configuration
@@ -147,6 +148,28 @@ impl CircuitBreaker {
         } else {
             self.record_failure();
         }
+
+        let outcome_str = if success { "success" } else { "failure" };
+        RouterMetrics::record_cb_outcome(&self.metric_label, outcome_str);
+
+        if before != after {
+            let from = before.as_str();
+            let to = after.as_str();
+            RouterMetrics::record_cb_state_transition(&self.metric_label, from, to);
+        }
+
+        let state_code = self.circuit_breaker().state().to_int();
+        RouterMetrics::set_cb_state(&self.metric_label, state_code);
+
+        // Update consecutive failures/successes gauges
+        RouterMetrics::set_cb_consecutive_failures(
+            &self.metric_label,
+            self.circuit_breaker().failure_count(),
+        );
+        RouterMetrics::set_cb_consecutive_successes(
+            &self.metric_label,
+            self.circuit_breaker().success_count(),
+        );
     }
 
     /// Record a successful request
