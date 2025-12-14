@@ -105,21 +105,27 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
-            return self.forward_native(x, residual)
+            return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
                 or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
-                return self.forward_native(x, residual)
+                return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
                 self.weight.data,
                 self.variance_epsilon,
             )
         if residual is not None:
+            # TODO: Ideally we want to have (hidden_states + residual) + post_residual_addition
+            # but right now we can only have hidden_states + (residual + post_residual_addition).
+            # since it is not associative, we probably need to add another parameter to fused_add_rmsnorm
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
@@ -179,13 +185,22 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
         x = x.to(torch.float32)
         if residual is not None:
-            x = x + residual.to(torch.float32)
+            x = (
+                x
+                + residual.to(torch.float32)
+                + (
+                    post_residual_addition.to(torch.float32)
+                    if post_residual_addition is not None
+                    else 0.0
+                )
+            )
             if self.fp32_residual:
                 residual = x.clone()
             else:
