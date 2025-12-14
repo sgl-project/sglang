@@ -21,7 +21,7 @@ def add_webui_args(parser: argparse.ArgumentParser):
 
 
 def run_sgl_diffusion_webui(server_args: ServerArgs):
-    # init
+    # init client
     sync_scheduler_client.initialize(server_args)
 
     # server_args will be reused in gradio_generate function
@@ -80,33 +80,32 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
 
     with gr.Blocks() as demo:
         gr.Markdown("# 🚀 SGLang Diffusion Application")
+        launched_model = gr.Textbox(label="Model", value=server_args.model_path)
 
         with gr.Row():
-            with gr.Column():
-                launched_model = gr.Textbox(label="Model", value=server_args.model_path)
+            with gr.Column(scale=4):
                 prompt = gr.Textbox(label="Prompt", value="A curious raccoon")
                 negative_prompt = gr.Textbox(
                     label="Negative_prompt",
                     value="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
                 )
-
-            run_btn = gr.Button("Generate", variant="primary")
+            with gr.Column(scale=1):
+                seed = gr.Number(label="seed", precision=0, value=1234)
+                run_btn = gr.Button("Generate", variant="primary", size="lg")
 
         with gr.Row():
             with gr.Column():
-                seed = gr.Number(label="seed", precision=0, value=1234)
                 num_frames = gr.Slider(
-                    minimum=17, maximum=161, value=33, step=1, label="num_frames"
+                    minimum=1, maximum=161, value=81, step=1, label="num_frames"
                 )
                 frames_per_second = gr.Slider(
-                    minimum=4, maximum=60, value=16, step=1, label="num_frames"
+                    minimum=4, maximum=60, value=16, step=1, label="frames_per_second"
                 )
                 width = gr.Number(label="width", precision=0, value=720)
                 height = gr.Number(label="height", precision=0, value=480)
                 num_inference_steps = gr.Slider(
                     minimum=0, maximum=50, value=20, step=1, label="num_inference_steps"
                 )
-
                 guidance_scale = gr.Slider(
                     minimum=0.0, maximum=10, value=5, step=0.01, label="guidance_scale"
                 )

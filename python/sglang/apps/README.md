@@ -1,29 +1,36 @@
-# SGLang diffusion webui user guide
+# SGLang Diffusion WebUI User Guide
 
-The SGLang-diffusion webui provides a web interface for image and video generation, implemented using Gradio library.
+SGLang Diffusion WebUI provides an intuitive Gradio-based interface for image and video generation, supporting parameter tuning and real-time previews.
 
+## Launch WebUI Service
+SGLang Diffusion now includes an integrated WebUI. Simply add the `--webui` parameter when starting the service.
 
-## 1. Launch server within webui
-When launching http server within webui, the http server will be launched from another subprocess to release control of main process.
-Finally, the webui will occupy the terminal.
-
-### webui example script for t2i and t2v
-
+### Launch Text-to-Image Service
 ```bash
-## text to image
 SERVER_ARGS=(
   --model-path black-forest-labs/FLUX.1-dev
   --num-gpus 2
 )
-sglang serve "${SERVER_ARGS[@]}" --webui --webui-port 2333
-
-## text to video
+WEBUI_PORT=2333
+sglang serve "${SERVER_ARGS[@]}" --webui --webui-port ${WEBUI_PORT}
+```
+### Launch Text-to-Video Service
+```bash
 SERVER_ARGS=(
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
   --num-gpus 2
 )
-sglang serve "${SERVER_ARGS[@]}" --webui --webui-port 2333
+WEBUI_PORT=2333
+sglang serve "${SERVER_ARGS[@]}" --webui --webui-port ${WEBUI_PORT}
 ```
 
-## 2. With a pre-launched http server
-  *WIP*
+## Interface Instructions
+
+1. Task mode is automatically determined by the `num_frames` parameter:
+  - num_frames = 1: Text-to-Image mode
+  - num_frames > 1: Text-to-Video mode
+2. After generation, manually click:
+  - Image output: View generated images
+  - Video output: View generated videos
+
+Once launched, access the interface at http://localhost:${WEBUI_PORT} in your browser.

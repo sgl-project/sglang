@@ -295,7 +295,7 @@ class ServerArgs:
     host: str | None = None
     port: int | None = None
 
-    # webui and their endpoint
+    # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
     webui_port: int | None = 12312
 
