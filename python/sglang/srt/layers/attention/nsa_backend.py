@@ -509,14 +509,10 @@ class NativeSparseAttnBackend(AttentionBackend):
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
-        if (
-            is_cuda()
-            and self.nsa_kv_cache_store_fp8
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            )
+        if is_cuda() and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
         ):
             try:
                 import deep_gemm
@@ -716,14 +712,10 @@ class NativeSparseAttnBackend(AttentionBackend):
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if (
-            is_cuda()
-            and self.nsa_kv_cache_store_fp8
-            and (
-                forward_mode.is_decode_or_idle()
-                or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend()
-            )
+        if is_cuda() and (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
         ):
             try:
                 import deep_gemm
@@ -889,14 +881,10 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if (
-            is_cuda()
-            and self.nsa_kv_cache_store_fp8
-            and (
-                forward_mode.is_decode_or_idle()
-                or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend()
-            )
+        if is_cuda() and (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
         ):
             try:
                 import deep_gemm
