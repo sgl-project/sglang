@@ -16,10 +16,7 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
-from sglang.multimodal_gen.runtime.utils.common import (
-    get_bool_env_var,
-    is_cuda,
-)
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -30,7 +27,6 @@ _is_xpu = is_xpu()
 from sgl_kernel import (
     fused_add_rmsnorm,
     fused_layernorm_scale_shift,
-    fused_layernorm_scale_shift_no_affine,
     fused_scale_residual_layernorm_scale_shift,
     rmsnorm,
 )
@@ -292,6 +288,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.eps = eps
         if norm_type == "rms":
             self.norm = RMSNorm(
                 hidden_size, has_weight=elementwise_affine, eps=eps, dtype=dtype
@@ -339,14 +336,16 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             residual_2d = residual.contiguous().view(-1, C)
 
             # gamma/beta
+            gamma_opt = None
             if getattr(self.norm, "weight", None) is not None:
-                gamma = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
-            else:
-                gamma = torch.ones(C, device=x.device, dtype=x.dtype)
+                gamma_opt = self.norm.weight.contiguous().to(
+                    dtype=x.dtype, device=x.device
+                )
+            beta_opt = None
             if getattr(self.norm, "bias", None) is not None:
-                beta = self.norm.bias.contiguous().to(dtype=x.dtype, device=x.device)
-            else:
-                beta = torch.zeros(C, device=x.device, dtype=x.dtype)
+                beta_opt = self.norm.bias.contiguous().to(
+                    dtype=x.dtype, device=x.device
+                )
 
             def get_arg(t):
                 if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
@@ -376,7 +375,6 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             if isinstance(gate, int):
                 # used by cross-attention, should be 1
                 assert gate == 1
-                gate_opt = torch.ones(M, C, device=x.device, dtype=x.dtype)
             elif isinstance(gate, torch.Tensor):
                 if (gate.dim() == 2 and gate.shape[0] == 1) or (
                     gate.dim() == 3 and gate.shape[0] == 1 and gate.shape[1] == 1
@@ -400,7 +398,14 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
 
             # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
             y_2d, residual_output = fused_scale_residual_layernorm_scale_shift(
-                residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
+                residual_2d,
+                x_2d,
+                gate_opt,
+                gamma_opt,
+                beta_opt,
+                scale_arg,
+                shift_arg,
+                self.eps,
             )
             return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
@@ -449,6 +454,7 @@ class LayerNormScaleShift(nn.Module):
         super().__init__()
         self.compute_dtype = compute_dtype
         self.norm_type = norm_type
+        self.eps = eps
         if norm_type == "rms":
             self.norm = RMSNorm(hidden_size, has_weight=elementwise_affine, eps=eps)
         elif norm_type == "layer":
@@ -520,21 +526,25 @@ class LayerNormScaleShift(nn.Module):
                 scale_arg = self._get_arg(scale, x, B, L, C, M)
                 shift_arg = self._get_arg(shift, x, B, L, C, M)
 
-                y_2d = fused_layernorm_scale_shift_no_affine(x_2d, scale_arg, shift_arg)
+                y_2d = fused_layernorm_scale_shift(
+                    x_2d, None, None, scale_arg, shift_arg, self.eps
+                )
                 return y_2d.view(B, L, C)
 
             # Standard path: use affine LayerNorm + fused scale/shift kernel.
-            gamma = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
-            beta = (
-                self.norm.bias.contiguous().to(dtype=x.dtype, device=x.device)
-                if self.norm.bias is not None
-                else torch.zeros(C, device=x.device, dtype=x.dtype)
-            )
+            gamma_opt = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
+            beta_opt = None
+            if self.norm.bias is not None:
+                beta_opt = self.norm.bias.contiguous().to(
+                    dtype=x.dtype, device=x.device
+                )
 
             scale_arg = self._get_arg(scale, x, B, L, C, M)
             shift_arg = self._get_arg(shift, x, B, L, C, M)
 
-            y_2d = fused_layernorm_scale_shift(x_2d, gamma, beta, scale_arg, shift_arg)
+            y_2d = fused_layernorm_scale_shift(
+                x_2d, gamma_opt, beta_opt, scale_arg, shift_arg, self.eps
+            )
             return y_2d.view(B, L, C)
 
         else:
