@@ -227,13 +227,6 @@ impl Router {
             }
         };
 
-        // Optional load tracking for cache-aware policy
-        // Get the policy for this model to check if it's cache-aware
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
         let load_guard = WorkerLoadGuardV2::new(worker.clone());
 
         events::RequestSentEvent {
