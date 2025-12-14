@@ -647,8 +647,8 @@ impl Worker for BasicWorker {
             .is_err()
         {
             tracing::warn!(
-                "Attempted to decrement load counter that is already at 0 for worker: {}",
-                self.metadata.url
+                worker_url = %self.metadata.url,
+                "Attempted to decrement load counter that is already at 0"
             );
         }
         self.update_running_requests_metrics();
