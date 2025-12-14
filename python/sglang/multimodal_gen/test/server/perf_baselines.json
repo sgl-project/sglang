@@ -752,7 +752,8 @@
                 "38": 1600.27,
                 "39": 1599.78
             },
-            "expected_e2e_ms": 105443.7,
+            "expected_e2e_ms": 123182.9887,
+            ,
             "expected_avg_denoise_ms": 2513.52,
             "expected_median_denoise_ms": 1600.09
         },
@@ -900,7 +901,7 @@
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.99,
                 "LatentPreparationStage": 1.26,
-                "DenoisingStage": 144568.03,
+                "DenoisingStage": 156678.8406,
                 "DecodingStage": 2702.7,
                 "per_frame_generation": null
             },
