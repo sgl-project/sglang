@@ -927,6 +927,8 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        if self.attention_backend is None:
+            self._set_default_attention_backend()
 
         # parallelism
         self.check_server_dp_args()
@@ -938,6 +940,17 @@ class ServerArgs:
                 raise ValueError(
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
                 )
+
+    def _set_default_attention_backend(self) -> None:
+        """Configure ROCm defaults when users do not specify an attention backend."""
+        if current_platform.is_rocm():
+            default_backend = AttentionBackendEnum.AITER.name.lower()
+            self.attention_backend = default_backend
+            logger.info(
+                "Attention backend not specified. Using '%s' by default on ROCm "
+                "to match SGLang SRT defaults.",
+                default_backend,
+            )
 
 
 @dataclasses.dataclass

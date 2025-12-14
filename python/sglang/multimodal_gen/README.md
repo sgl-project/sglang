@@ -20,7 +20,7 @@ SGLang Diffusion has the following features:
 uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
-For more installation methods (e.g. pypi, uv, docker), check [install.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
+For more installation methods (e.g. pypi, uv, docker), check [install.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md). ROCm/AMD users should follow the [ROCm quickstart](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) that includes the additional kernel builds and attention backend settings we validated on MI300X.
 
 
 ## Inference
