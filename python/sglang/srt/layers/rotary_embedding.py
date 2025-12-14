@@ -806,6 +806,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
+        self.cos_cached_total = None
+        self.sin_cached_total = None
+        self.cos_cached = None
+        self.sin_cached = None
         self.device = device
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
@@ -854,7 +858,40 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         cos = freqs.cos() * self.mscale
         sin = freqs.sin() * self.mscale
         cache = torch.cat((cos, sin), dim=-1)
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached_total = torch.cos(emb) * self.mscale
+        self.sin_cached_total = torch.sin(emb) * self.mscale
         return cache
+
+    def get_cos_cached_total(self):
+        return self.cos_cached_total
+
+    def get_sin_cached_total(self):
+        return self.sin_cached_total
+
+    def get_cos_sin_cache(
+        self, positions, dtype, offsets: Optional[torch.Tensor] = None
+    ):
+        self.cos_cached = (
+            self.cos_cached_total[
+                torch.add(positions, offsets) if offsets is not None else positions
+            ]
+            .unsqueeze(-2)
+            .unsqueeze(-2)
+            .to(dtype)
+        )
+        self.sin_cached = (
+            self.sin_cached_total[
+                torch.add(positions, offsets) if offsets is not None else positions
+            ]
+            .unsqueeze(-2)
+            .unsqueeze(-2)
+            .to(dtype)
+        )
+        cos = self.cos_cached.to(positions.device)
+        sin = self.sin_cached.to(positions.device)
+        return cos, sin
 
     def forward_native(
         self,
@@ -906,14 +943,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         num_tokens, num_q_heads, _ = query.shape
         num_k_heads = key.shape[1]
 
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
-        cos_sin = self.cos_sin_cache[
-            torch.add(positions, offsets) if offsets is not None else positions
-        ]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        # Reshape to [batchsize, head_dim, seq, rotary_dim]
-        cos = cos.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
-        sin = sin.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
+        cos, sin = self.get_cos_sin_cache(positions, query.dtype, offsets)
 
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
