@@ -60,7 +60,7 @@ jobs:
           LATEST_REPORT=$(ls -t ci_failure_analysis_*.json | head -1)
 
           if [ ! -f "$LATEST_REPORT" ]; then
-            echo "No report found, skipping Slack notification"
+            echo "No report found, so skipping Slack notification"
             exit 0
           fi
 
