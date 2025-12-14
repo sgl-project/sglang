@@ -26,16 +26,6 @@ from sglang.srt.utils.common import is_npu, rank0_log
 logger = logging.getLogger(__name__)
 
 
-SPLIT_OPS = [
-    "sglang.unified_attention_with_output",
-    "sglang.gdn_with_output",
-]
-
-
-def add_split_ops(ops):
-    SPLIT_OPS.extend(ops)
-
-
 def make_compiler(config: CompilationConfig):
     if config.compiler == "eager":
         return EagerAdapter()
@@ -433,7 +423,7 @@ class SGLangBackend:
 
         self.split_gm, self.piecewise_graphs = split_graph(
             graph,
-            SPLIT_OPS,
+            self.compile_config.split_ops,
         )
         from torch._dynamo.utils import lazy_format_graph_code
 
