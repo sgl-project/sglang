@@ -400,6 +400,8 @@ class FluxTransformer2DModel(CachableDiT):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
+    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+
     def __init__(self, config: FluxConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
         self.config = config.arch_config

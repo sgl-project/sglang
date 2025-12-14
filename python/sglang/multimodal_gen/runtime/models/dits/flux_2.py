@@ -608,6 +608,8 @@ class Flux2Transformer2DModel(CachableDiT):
 
     """
 
+    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+
     def __init__(self, config: FluxConfig, hf_config: dict[str, Any]):
         super().__init__(config=config, hf_config=hf_config)
         patch_size: int = config.patch_size
