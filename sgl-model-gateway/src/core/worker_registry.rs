@@ -7,8 +7,10 @@ use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
-use crate::observability::metrics::RouterMetrics;
+use crate::{
+    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    observability::metrics::RouterMetrics,
+};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -222,6 +224,16 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    /// Get the number of workers in the registry
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Check if the registry is empty
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
     /// Get all workers
     pub fn get_all(&self) -> Vec<Arc<dyn Worker>> {
         self.workers
@@ -378,6 +390,25 @@ impl WorkerRegistry {
             prefill_workers: prefill_count,
             decode_workers: decode_count,
         }
+    }
+
+    /// Get counts of regular and PD workers efficiently (O(1))
+    /// This avoids the overhead of get_all() which allocates memory and iterates all workers
+    pub fn get_worker_distribution(&self) -> (usize, usize) {
+        // Use the existing type_workers index for O(1) lookup
+        let regular_count = self
+            .type_workers
+            .get(&WorkerType::Regular)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        // Get total workers count efficiently from DashMap
+        let total_workers = self.workers.len();
+
+        // PD workers are any workers that are not Regular
+        let pd_count = total_workers.saturating_sub(regular_count);
+
+        (regular_count, pd_count)
     }
 
     /// Start a health checker for all workers in the registry
