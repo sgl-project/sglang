@@ -206,7 +206,7 @@ def test_input_output_logprobs_match_helper(
 def test_input_output_logprobs_match_prefill_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
         print("Radix cache is disabled, skipping test")
         return
@@ -259,7 +259,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
 def test_input_output_logprobs_match_decode_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
         print("Radix cache is disabled, skipping test")
         return
