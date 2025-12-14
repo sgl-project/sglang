@@ -987,3 +987,153 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)
+
+    def apply_deepep_normal(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
+    ) -> torch.Tensor:
+        """Apply MoE computation for DeepEP normal mode.
+
+        Args:
+            layer: The MoE layer
+            dispatch_output: DeepEPNormalDispatchOutput containing dispatched tokens
+
+        Returns:
+            Output tensor after MoE computation
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert,
+        ) = dispatch_output
+
+        # Marlin uses fp16/bf16 activations, no need for FP8 scale
+        if hidden_states_scale is not None:
+            raise RuntimeError(
+                "Marlin MoE does not support FP8 activations in DeepEP dispatch. "
+                "Please set environment variable: SGLANG_DEEPEP_BF16_DISPATCH=1"
+            )
+
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        # DeepEP Normal mode always returns 2D tensor [total_tokens, hidden_size]
+        assert hidden_states.ndim == 2, (
+            f"DeepEP Normal mode should return 2D hidden_states, "
+            f"but got shape {hidden_states.shape}"
+        )
+
+        # Create a dummy router_logits tensor for compatibility
+        # In DeepEP mode, routing has already been done
+        router_logits = torch.zeros(
+            hidden_states.shape[0],
+            self.moe_runner_config.num_local_experts,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        output = fused_marlin_moe(
+            hidden_states,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            global_num_experts=self.moe_runner_config.num_experts,
+            expert_map=None,  # DeepEP handles expert mapping
+            g_idx1=layer.w13_weight_g_idx,
+            g_idx2=layer.w2_weight_g_idx,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
+            num_bits=self.num_bits,
+            is_k_full=self.is_k_full,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+        )
+        return output
+
+    def apply_deepep_ll(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output,
+    ) -> torch.Tensor:
+        """Apply MoE computation for DeepEP low latency mode.
+
+        Args:
+            layer: The MoE layer
+            dispatch_output: DeepEPLLDispatchOutput containing dispatched tokens
+
+        Returns:
+            Output tensor after MoE computation
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            batched_fused_marlin_moe,
+            get_scalar_type,
+        )
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+        ) = dispatch_output
+
+        # Marlin uses fp16/bf16 activations, no need for FP8 scale
+        if hidden_states_scale is not None:
+            raise RuntimeError(
+                "Marlin MoE does not support FP8 activations in DeepEP dispatch. "
+                "Please set environment variable: SGLANG_DEEPEP_BF16_DISPATCH=1"
+            )
+
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        # Extract expert_num_tokens from masked_m
+        # masked_m contains the number of valid tokens per expert
+        expert_num_tokens = masked_m.to(torch.int32)
+
+        # Call batched_fused_marlin_moe
+        scalar_type = get_scalar_type(self.num_bits, has_zp=False)
+        
+        output = batched_fused_marlin_moe(
+            hidden_states=hidden_states,
+            expert_num_tokens=expert_num_tokens,
+            w1=layer.w13_weight_packed,
+            w2=layer.w2_weight_packed,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            gating_output=None,  # Not used in batched mode
+            quant_type_id=scalar_type.id,
+            global_num_experts=self.moe_runner_config.num_experts,
+            expert_map=None,  # DeepEP handles expert mapping
+            g_idx1=layer.w13_weight_g_idx,
+            g_idx2=layer.w2_weight_g_idx,
+            sort_indices1=layer.w13_g_idx_sort_indices,
+            sort_indices2=layer.w2_g_idx_sort_indices,
+            w1_zeros=None,
+            w2_zeros=None,
+            workspace=None,
+            num_bits=self.num_bits,
+            is_k_full=self.is_k_full,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+        )
+
+        return output

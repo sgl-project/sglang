@@ -202,6 +202,8 @@ class DeepEPMoE(FusedMoE):
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
+            elif self._is_marlin_moe():
+                output = self.forward_marlin_moe(dispatch_output)
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
@@ -212,6 +214,8 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_flashinfer_cutedsl(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+            elif self._is_marlin_moe():
+                output = self.forward_marlin_moe(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -239,6 +243,38 @@ class DeepEPMoE(FusedMoE):
             topk_weights=topk_weights,
             overlap_args=overlap_args,
         )
+
+    def _is_marlin_moe(self) -> bool:
+        """Check if the current quantization method is Marlin MoE (CompressedTensors WNA16)."""
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+            CompressedTensorsWNA16MoEMethod,
+        )
+
+        if not isinstance(self.quant_config, CompressedTensorsConfig):
+            return False
+
+        return isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod)
+
+    def forward_marlin_moe(
+        self,
+        dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput],
+    ):
+        """Forward pass for Marlin MoE with DeepEP."""
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+            CompressedTensorsWNA16MoEMethod,
+        )
+
+        assert isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod)
+        assert self.moe_runner_config.activation == "silu"
+
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            return self.quant_method.apply_deepep_normal(self, dispatch_output)
+        else:
+            return self.quant_method.apply_deepep_ll(self, dispatch_output)
 
     def forward_aiter(
         self,
