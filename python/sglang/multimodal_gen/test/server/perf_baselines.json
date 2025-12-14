@@ -693,7 +693,7 @@
                 "4": 407.51,
                 "5": 404.2
             },
-            "expected_e2e_ms": 7487.87,
+            "expected_e2e_ms": 15911.85,
             "expected_avg_denoise_ms": 642.29,
             "expected_median_denoise_ms": 407.25
         },
@@ -825,7 +825,7 @@
         },
         "wan2_1_i2v_14b_720P_2gpu": {
             "stages_ms": {
-                "InputValidationStage": 153.67,
+                "InputValidationStage": 324.46,
                 "TextEncodingStage": 2838,
                 "ImageEncodingStage": 3123.99,
                 "ConditioningStage": 0.01,
@@ -943,7 +943,7 @@
                 "38": 753.64,
                 "39": 756.95
             },
-            "expected_e2e_ms": 116895.63,
+            "expected_e2e_ms": 146742.21,
             "expected_avg_denoise_ms": 2550.47,
             "expected_median_denoise_ms": 756.59
         },
@@ -1067,7 +1067,7 @@
                 "38": 758.26,
                 "39": 758.46
             },
-            "expected_e2e_ms": 101234.3062,
+            "expected_e2e_ms": 152496.3062,
             "expected_avg_denoise_ms": 2006.04,
             "expected_median_denoise_ms": 758.24
         },
@@ -1134,7 +1134,7 @@
                 "48": 142.66,
                 "49": 142.32
             },
-            "expected_e2e_ms": 11905.69,
+            "expected_e2e_ms": 18615.64,
             "expected_avg_denoise_ms": 174.94,
             "expected_median_denoise_ms": 142.57
         },
