@@ -667,7 +667,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.cache_seqlens_int32 += (
                     expanded_last_page_lens
                 )
-                # NOTE: also consider the partial page at the end of decode_length
+                # NOTE: also consider the partial page in previous cache
                 max_pages_expand = (
                     int(decode_length + 2 * self.page_size - 1) // self.page_size
                 )
