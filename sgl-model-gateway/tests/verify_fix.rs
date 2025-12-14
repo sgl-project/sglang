@@ -44,7 +44,6 @@ async fn run_blocking_scenario(tokenizer: Arc<HuggingFaceTokenizer>, text: Strin
     sleep(Duration::from_millis(10)).await;
 
     let start = Instant::now();
-    // !!! The Problem: Calling CPU intensive task on async thread !!!
     let _ = tokenizer.encode(&text).unwrap();
     println!("Blocking Task took: {:?}", start.elapsed());
 
@@ -65,7 +64,6 @@ async fn run_fixed_scenario(tokenizer: Arc<HuggingFaceTokenizer>, text: String) 
 
     let start = Instant::now();
 
-    // !!! The Fix: Wrapping CPU task in spawn_blocking !!!
     let _ = tokio::task::spawn_blocking(move || {
         tokenizer.encode(&text).unwrap()
     }).await.unwrap();
