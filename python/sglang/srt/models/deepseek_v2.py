@@ -232,8 +232,11 @@ logger = logging.getLogger(__name__)
 
 
 def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
-    print("nextn moe bf16 cast to fp8 quant config: ", quant_config)
-    return envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get() and quant_config is None
+    return (
+        envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
+        and quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+    )
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -2720,7 +2723,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
-        moe_quant_config: Optional[QuantizationConfig] = None,
+        moe_quant_config_override: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -2773,7 +2776,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
-                quant_config=moe_quant_config or quant_config,
+                quant_config=moe_quant_config_override or quant_config,
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
