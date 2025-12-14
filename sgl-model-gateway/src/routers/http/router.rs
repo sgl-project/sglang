@@ -512,10 +512,6 @@ impl Router {
 
             response
         } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            // Clone the worker Arc for the async block instead of looking it up again
-            let stream_worker = worker.clone();
-
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -527,16 +523,12 @@ impl Router {
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut decremented = false;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
                             // Check for stream end marker using memmem for efficiency
                             if memmem::find(&bytes, b"data: [DONE]").is_some() {
-                                if let Some(ref w) = stream_worker {
-                                    w.decrement_load();
-                                    decremented = true;
-                                }
+                                load_guard = None;
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
@@ -546,11 +538,6 @@ impl Router {
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
-                    }
-                }
-                if !decremented {
-                    if let Some(ref w) = stream_worker {
-                        w.decrement_load();
                     }
                 }
             });
