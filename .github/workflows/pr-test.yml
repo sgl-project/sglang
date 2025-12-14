@@ -627,8 +627,6 @@ jobs:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
     strategy:
       fail-fast: false
-      matrix:
-        part: [0, 1, 2]
 
     steps:
       - name: Checkout code
@@ -650,7 +648,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200-stage-b --auto-partition-id ${{ matrix.part }}  --auto-partition-size 3 --timeout-per-file 1800
+          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200-stage-b --timeout-per-file 1800
 
 
   unit-test-backend-2-gpu:
