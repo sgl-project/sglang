@@ -567,7 +567,13 @@ class MLATokenToKVPoolHost(HostKVCache):
         return buffer
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        io_block_num=2,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -577,6 +583,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     item_size=self.token_stride_size,
+                    block_quota=io_block_num,
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(

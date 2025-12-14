@@ -130,6 +130,7 @@ class SparseKVCacheManager:
             should_load_device_indices.flatten(),
             layer_id,
             "kernel",
+            io_block_num=bs,
         )
 
         return self.req_states.curr_device_indices[:bs, :-1]
