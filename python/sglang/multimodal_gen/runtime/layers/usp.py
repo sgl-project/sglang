@@ -229,13 +229,13 @@ def ring_attn(
     use_segment_id = parse(torch.__version__).release >= parse("2.6.0").release
 
     attn_kwargs = dict(
-        mesh=ring_pg,
         op=attn_callable_adapter,
         dropout_p=dropout_p,
         is_causal=is_causal,
         query=query,
         key=key,
         value=value,
+        group=ring_pg,  # https://github.com/pytorch/pytorch/blob/c907c778f42ba2fdaf25b733dd25baf9779c6a12/torch/distributed/tensor/experimental/_context_parallel/_attention.py#L309
     )
 
     if use_segment_id:

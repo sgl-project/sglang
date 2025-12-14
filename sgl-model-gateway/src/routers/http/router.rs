@@ -23,7 +23,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::RouterMetrics,
+        metrics::{smg_labels, RouterMetrics, SmgMetrics},
         otel_trace::inject_trace_context_http,
     },
     policies::PolicyRegistry,
@@ -37,7 +37,11 @@ use crate::{
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{error, header_utils, RouterTrait},
+    routers::{
+        error,
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 /// Regular router that uses injected load balancing policies
@@ -159,12 +163,24 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let model = model_id.unwrap_or("default");
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_HTTP,
+            smg_labels::BACKEND_REGULAR,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            is_stream,
+        );
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -199,8 +215,24 @@ impl Router {
             let duration = start.elapsed();
             RouterMetrics::record_request(route);
             RouterMetrics::record_generate_duration(duration);
+            SmgMetrics::record_router_duration(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_REGULAR,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
         } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
+            SmgMetrics::record_router_error(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_REGULAR,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
         }
 
         response
@@ -210,7 +242,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
@@ -234,7 +266,7 @@ impl Router {
         };
 
         let load_incremented = if policy.name() == "cache_aware" {
-            increment_load(&worker);
+            worker.increment_load();
             true
         } else {
             false
@@ -274,7 +306,7 @@ impl Router {
         // won't have done it (it only decrements on success or non-retryable failures)
         if is_retryable_status(response.status()) && load_incremented {
             if let Some(cleanup_worker) = worker_for_cleanup {
-                decrement_load(&cleanup_worker);
+                cleanup_worker.decrement_load();
             }
         }
 
@@ -418,7 +450,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
@@ -507,7 +539,7 @@ impl Router {
                 // Decrement load on error if it was incremented
                 if load_incremented {
                     if let Some(ref w) = worker {
-                        decrement_load(w);
+                        w.decrement_load();
                     }
                 }
 
@@ -530,13 +562,6 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(ref w) = worker {
-                            decrement_load(w);
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     error::internal_error("read_response_body_failed", error_msg)
                 }
@@ -545,7 +570,7 @@ impl Router {
             // Decrement load counter for non-streaming requests if it was incremented
             if load_incremented {
                 if let Some(ref w) = worker {
-                    decrement_load(w);
+                    w.decrement_load();
                 }
             }
 
@@ -573,7 +598,7 @@ impl Router {
                             // Check for stream end marker using memmem for efficiency
                             if memmem::find(&bytes, b"data: [DONE]").is_some() {
                                 if let Some(ref w) = stream_worker {
-                                    decrement_load(w);
+                                    w.decrement_load();
                                     decremented = true;
                                 }
                             }
@@ -589,7 +614,7 @@ impl Router {
                 }
                 if !decremented {
                     if let Some(ref w) = stream_worker {
-                        decrement_load(w);
+                        w.decrement_load();
                     }
                 }
             });
@@ -657,16 +682,6 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
-}
-
-fn increment_load(w: &Arc<dyn Worker>) {
-    w.increment_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
-}
-
-fn decrement_load(w: &Arc<dyn Worker>) {
-    w.decrement_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
