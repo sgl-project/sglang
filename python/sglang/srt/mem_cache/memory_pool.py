@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from typing import List
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -878,6 +880,10 @@ class MHATokenToKVPool(KVCache):
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+            move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+            return
+
         N = tgt_loc.numel()
         if N == 0:
             return
@@ -1975,6 +1981,22 @@ class DoubleSparseTokenToKVPool(KVCache):
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
         self.label_buffer[layer_id - self.start_layer][loc] = cache_label
+
+
+def move_kv_cache_native(
+    k_buffer: List[torch.Tensor],
+    v_buffer: List[torch.Tensor],
+    tgt_loc: torch.Tensor,
+    src_loc: torch.Tensor,
+):
+    if tgt_loc.numel() == 0:
+        return
+
+    tgt_loc_flat = tgt_loc.view(-1).long()
+    src_loc_flat = src_loc.view(-1).long()
+    for k_cache, v_cache in zip(k_buffer, v_buffer):
+        k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
+        v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
 @triton.jit

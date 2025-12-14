@@ -47,6 +47,10 @@ By default, trace files are saved in the ./logs/ directory. The exact output fil
 ```bash
 [mm-dd hh:mm:ss] Saving profiler traces to: /sgl-workspace/sglang/logs/mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz
 ```
+{request_id}-{num_steps}_steps-global-rank{rank}.trace.json.gz
+```
+
+Example: `mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz`
 
 ### View Traces
 
