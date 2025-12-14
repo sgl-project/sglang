@@ -268,7 +268,7 @@ class QwenImageCrossAttention(nn.Module):
             hidden_size=dim,
             head_size=head_dim,
             total_num_heads=num_heads,
-            bias=True,
+            bias=False,
         )
 
         if self.qk_norm:
