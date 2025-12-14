@@ -161,7 +161,14 @@ def is_xpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
+    if hasattr(torch, "npu"):
+        if torch.npu.is_available():
+            return True
+        else:
+            raise RuntimeError(
+                "torch_npu detected, but NPU device is not available or visible."
+            )
+    return False
 
 
 @lru_cache(maxsize=1)
@@ -1853,11 +1860,14 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        if device_id == None:
-            return "npu"
-        return "npu:{}".format(device_id)
-
+    if hasattr(torch, "npu"):
+        if torch.npu.is_available():
+            if device_id == None:
+                return "npu"
+            return "npu:{}".format(device_id)
+        raise RuntimeError(
+            "torch_npu detected, but NPU device is not available or visible."
+        )
     if is_habana_available():
         try:
             import habana_frameworks.torch.hpu  # noqa: F401
