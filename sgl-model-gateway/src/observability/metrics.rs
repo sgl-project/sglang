@@ -502,12 +502,15 @@ impl RouterMetrics {
 
     // TODO delete the metrics (instead of setting them to zero)
     pub fn remove_worker_metrics(worker_url: &str) {
-        gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_cb_consecutive_failures","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_cb_consecutive_successes","worker" => worker_url.to_string()).set(0.0);
-        gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_running_requests","worker" => worker_url.to_string()).set(0.0);
         gauge!("sgl_router_tree_size","worker" => worker_url.to_string()).set(0.0);
+
+        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
+        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
+        gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(-1.0);
+        gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(-1.0);
     }
 
     pub fn set_job_queue_depth(depth: usize) {
