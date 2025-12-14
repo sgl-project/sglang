@@ -1,7 +1,5 @@
 //! Generate preparation stage: Resolve input, tokenize, create stop decoder
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
@@ -16,7 +14,6 @@ use crate::{
             utils,
         },
     },
-    tokenizer::traits::Tokenizer,
 };
 
 /// Generate preparation stage
@@ -44,7 +41,7 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
-        // Resolve input (text, prompt, or input_ids)
+        // Await the async resolution (which contains the spawn_blocking)
         let (original_text, token_ids) = match self.resolve_generate_input(ctx, request).await {
             Ok(res) => res,
             Err(msg) => {
@@ -89,7 +86,6 @@ impl GeneratePreparationStage {
     ) -> Result<(Option<String>, Vec<u32>), String> {
         if let Some(text) = &request.text {
             // Offload CPU-intensive tokenization to blocking thread
-            // This prevents the tokenizer from blocking the async runtime loop
             let tokenizer = ctx.components.tokenizer.clone();
             let text_owned = text.clone();
 
