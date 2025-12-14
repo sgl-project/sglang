@@ -70,7 +70,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             color = "good"
         else:
             # Ping relevant people when there are failures
-            mentions = "<@Douglas Yang>"
+            mentions = "<@U09RR5TNC94>"
             summary_lines = [
                 f"{mentions} 🚨 *CI Critical Failures (Scheduled Runs)*",
                 "_Note: Recent runs are shown left to right in the detailed breakdown_\n",
@@ -85,6 +85,8 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
         response = client.chat_postMessage(
             channel=channel_id,
             text=summary,
+            username="SGLang CI Bot",
+            icon_emoji=":robot_face:",
             attachments=[
                 {
                     "color": color,
@@ -120,7 +122,11 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             details_text = "\n".join(details_lines)
 
             client.chat_postMessage(
-                channel=channel_id, thread_ts=thread_ts, text=details_text
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=details_text,
+                username="SGLang CI Bot",
+                icon_emoji=":robot_face:",
             )
 
         logger.info("CI failure report posted to Slack successfully")
