@@ -550,6 +550,7 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
 
         self._create_buffers()
+        self._create_data_ptrs()
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
@@ -632,6 +633,7 @@ class MHATokenToKVPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+    def _create_data_ptrs(self):
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -1193,18 +1195,7 @@ class SWAKVPool(KVCache):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        self.swa_kv_pool = token_to_kv_pool_class(
-            size=size_swa,
-            dtype=dtype,
-            layer_num=self.swa_layer_nums,
-            **kwargs,
-        )
-        self.full_kv_pool = token_to_kv_pool_class(
-            size=size,
-            dtype=dtype,
-            layer_num=self.full_layer_nums,
-            **kwargs,
-        )
+        self._create_buffers(token_to_kv_pool_class, **kwargs)
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -1217,6 +1208,20 @@ class SWAKVPool(KVCache):
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
             f"SWAKVPool mem usage: {self.mem_usage} GB, swa size: {self.size_swa}, full size: {self.size}"
+        )
+
+    def _create_buffers(self, token_to_kv_pool_class, **kwargs):
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=self.size_swa,
+            dtype=self.dtype,
+            layer_num=self.swa_layer_nums,
+            **kwargs,
+        )
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=self.size,
+            dtype=self.dtype,
+            layer_num=self.full_layer_nums,
+            **kwargs,
         )
 
     def get_kv_size_bytes(self):
