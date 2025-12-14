@@ -221,7 +221,7 @@ class InputValidationStage(PipelineStage):
 
         # if height or width is not specified at this point, set default to 720p
         default_height = 720
-        default_width = 1080
+        default_width = 1280
         if batch.height is None and batch.width is None:
             batch.height = default_height
             batch.width = default_width
