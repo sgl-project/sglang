@@ -464,13 +464,14 @@ def _get_chunked_prefill_embedding(
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
 
         if isinstance(embedding_per_req, EVSEmbeddingResult):
+            item = embedding_items_per_req[0]
             input_ids, items_offset = (
                 embedding_per_req.redistribute_pruned_frames_placeholders(
                     input_ids,
                     items_offset,
+                    item=item,
                     extend_prefix_len=extend_prefix_len,
                     extend_seq_len=extend_seq_len,
-                    filler_token_id=embedding_items_per_req[0].pad_value,
                 )
             )
 

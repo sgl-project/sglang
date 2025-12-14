@@ -59,20 +59,24 @@ class EVSEmbeddingResult(EmbeddingResult):
     """
 
     num_tokens_per_frame: list[int]
-    pre_chunked_input_ids: list[int]
 
     def redistribute_pruned_frames_placeholders(
         self,
         input_ids: torch.Tensor,
         offsets: list[tuple[int, int]],
         *,
+        item: VideoEVSDataItem,
         extend_prefix_len: int,
         extend_seq_len: int,
-        filler_token_id: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
         assert len(input_ids) == extend_seq_len
+        assert isinstance(
+            item, VideoEVSDataItem
+        ), f"Expected VideoEVSDataItem, got {type(item)}"
+        pre_chunked_input_ids = item.pre_chunked_input_ids
+        filler_token_id = item.pad_value
         input_ids_list = replace_offsets_with_tokens_per_frame(
-            pre_chunked_input_ids=self.pre_chunked_input_ids,
+            pre_chunked_input_ids=pre_chunked_input_ids,
             num_tokens_per_frame=self.num_tokens_per_frame,
             frame_offsets_inclusive=offsets,
             filler_token_id=filler_token_id,
@@ -84,6 +88,9 @@ class EVSEmbeddingResult(EmbeddingResult):
             input_ids, filler_token_id
         )
         input_ids = input_ids[extend_prefix_len : extend_prefix_len + extend_seq_len]
+        assert (
+            len(input_ids) == extend_seq_len
+        ), f"Input ids length changed after redistribution, got {len(input_ids)} != {extend_seq_len}"
         return input_ids, offsets
 
 
@@ -191,5 +198,4 @@ class EVS(torch.nn.Module, ABC):
         return EVSEmbeddingResult(
             embedding=final_embeddings_tensor,
             num_tokens_per_frame=num_tokens_per_frame,
-            pre_chunked_input_ids=item.pre_chunked_input_ids,
         )
