@@ -92,6 +92,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get_set_value_or(
             default_workspace_size_bytes
         )
+        logger.info(
+            f"TRTLLM MHA workspace size: {self.workspace_size / (1024*1024):.2f} MB "
+            f"(env var set: {envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set()}, "
+            f"default: {DEFAULT_WORKSPACE_SIZE_MB} MB)"
+        )
         # Allocate buffers
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
