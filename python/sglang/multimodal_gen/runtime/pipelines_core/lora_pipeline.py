@@ -161,6 +161,13 @@ class LoRAPipeline(ComposedPipelineBase):
         Returns:
             The number of layers converted.
         """
+        name_list = []
+        for name, layer in module.named_modules():
+            name_list.append(name)
+        
+        logger.info("===================name_list: %s", name_list)
+        logger.info("===================whitelist: %s", whitelist)
+
         converted_count = 0
         for name, layer in module.named_modules():
             if not isinstance(layer, torch.nn.Linear):
@@ -539,3 +546,4 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
             self.is_lora_merged[module_name] = False
             logger.info("LoRA weights unmerged for %s", module_name)
+ 
