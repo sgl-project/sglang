@@ -9,7 +9,7 @@ use sgl_model_gateway::{
     },
     core::ConnectionMode,
     observability::{
-        metrics::PrometheusConfig,
+        metrics::{PrometheusConfig, PyroscopeConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
     server::{self, ServerConfig},
@@ -360,6 +360,24 @@ struct CliArgs {
 
     #[arg(long, default_value = "localhost:4317")]
     otlp_traces_endpoint: String,
+
+    #[arg(long, default_value_t = false)]
+    enable_pyroscope: bool,
+
+    #[arg(long)]
+    pyroscope_url: Option<String>,
+
+    #[arg(long)]
+    pyroscope_app_name: Option<String>,
+
+    #[arg(long)]
+    pyroscope_sample_rate: Option<u32>,
+
+    #[arg(long)]
+    pyroscope_user: Option<String>,
+
+    #[arg(long)]
+    pyroscope_password: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -691,6 +709,25 @@ impl CliArgs {
             },
         });
 
+        let pyroscope_config = if self.enable_pyroscope {
+            let url = self.pyroscope_url.clone().unwrap();
+            let app_name = self.pyroscope_app_name.clone().unwrap();
+            let backend_str = self.backend.to_string();
+            Some(PyroscopeConfig {
+                url,
+                app_name,
+                sample_rate: self.pyroscope_sample_rate,
+                user: self.pyroscope_user.clone(),
+                password: self.pyroscope_password.clone(),
+                tags: vec![
+                    ("app".to_string(), "sgl-model-gateway".to_string()),
+                    ("backend".to_string(), backend_str),
+                ],
+            })
+        } else {
+            None
+        };
+
         ServerConfig {
             host: self.host.clone(),
             port: self.port,
@@ -700,6 +737,7 @@ impl CliArgs {
             log_level: Some(self.log_level.clone()),
             service_discovery_config,
             prometheus_config,
+            pyroscope_config,
             request_timeout_secs: self.request_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
                 None

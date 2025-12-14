@@ -1,10 +1,13 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use pyroscope::{PyroscopeAgent, pyroscope::PyroscopeAgentRunning};
+use pyroscope_pprofrs::{pprof_backend, PprofConfig};
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -236,6 +239,66 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+}
+
+#[derive(Debug, Clone)]
+pub struct PyroscopeConfig {
+    pub url: String,
+    pub app_name: String,
+    pub sample_rate: Option<u32>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub tags: Vec<(String, String)>,
+}
+
+impl Default for PyroscopeConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://localhost:4040".to_string(),
+            app_name: "sgl-model-gateway".to_string(),
+            sample_rate: None,
+            user: None,
+            password: None,
+            tags: vec![],
+        }
+    }
+}
+
+static PYROSCOPE_AGENT: std::sync::OnceLock<Arc<PyroscopeAgent<PyroscopeAgentRunning>>> =
+    std::sync::OnceLock::new();
+
+// TODO handle stopping
+pub fn start_pyroscope(config: PyroscopeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let sample_rate = config.sample_rate.unwrap_or(100);
+    let pprof_config = PprofConfig::new().sample_rate(sample_rate);
+    let pprof_backend = pprof_backend(pprof_config);
+
+    let mut agent_builder =
+        PyroscopeAgent::builder(config.url.clone(), config.app_name.clone()).backend(pprof_backend);
+
+    if let (Some(user), Some(password)) = (config.user.clone(), config.password.clone()) {
+        agent_builder = agent_builder.basic_auth(user, password);
+    }
+
+    if !config.tags.is_empty() {
+        agent_builder = agent_builder.tags(
+            config.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        );
+    }
+
+    let agent = agent_builder.build()?;
+    let agent_running = agent.start()?;
+
+    PYROSCOPE_AGENT
+        .set(Arc::new(agent_running))
+        .map_err(|_| "Pyroscope agent already initialized")?;
+
+    tracing::info!(
+        "Pyroscope profiling enabled: {} -> {}",
+        config.app_name,
+        config.url
+    );
+    Ok(())
 }
 
 pub struct RouterMetrics;
