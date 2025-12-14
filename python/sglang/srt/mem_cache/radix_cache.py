@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.session_cache import SessionCache
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -426,6 +427,15 @@ class RadixCache(BasePrefixCache):
         page_aligned_len = len(key) // self.page_size * self.page_size
         return key[:page_aligned_len]
 
+    def write_backup_session(
+        self,
+        device_indices: torch.Tensor,
+        node: TreeNode,
+        session_id: Optional[str],
+        new_kv_cache: Optional[SessionCache],
+    ):
+        return SessionCache()
+
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
@@ -447,7 +457,7 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
+        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
@@ -460,6 +470,13 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+
+            # append to session cache
+            new_indices, new_last_node, _, _, _ = self.match_prefix(radix_key)
+            req.new_kv_cache = self.write_backup_session(
+                new_indices, new_last_node, req.session_id, req.new_kv_cache
+            )
+
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
