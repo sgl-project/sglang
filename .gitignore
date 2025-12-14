@@ -252,3 +252,4 @@ outputs/
 
 # Eval Cache
 .longbench_cache/
+logs/

@@ -149,6 +149,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc);
 
+// RoPE with position ids + cos/sin cache (used by SRT)
 void rotary_embedding(
     torch::Tensor& positions,
     torch::Tensor& query,
@@ -156,6 +157,15 @@ void rotary_embedding(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,
     bool is_neox);
+
+// RoPE with explicit cos/sin tensors (used by diffusion / Qwen image)
+void rotary_embedding_cos_sin(
+    at::Tensor& cos,
+    at::Tensor& sin,
+    at::Tensor& query,
+    const std::optional<at::Tensor>& key,
+    int64_t head_size,
+    bool interleaved);
 
 void downcast_fp8(
     at::Tensor& k,
@@ -402,6 +412,17 @@ void fused_qk_norm_rope(
     double low,
     double high,
     double attention_factor);
+
+/*
+ * From csrc/multimodal/rotary_embedding
+ */
+void rotary_embedding(
+    at::Tensor& cos,
+    at::Tensor& sin,
+    at::Tensor& query,
+    const std::optional<at::Tensor>& key,
+    int64_t head_size,
+    bool is_neox);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
