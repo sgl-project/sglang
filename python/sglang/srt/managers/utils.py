@@ -188,5 +188,11 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
     spec_tokens = server_args.speculative_num_draft_tokens
+    page_size = server_args.page_size
 
-    return max(spec_steps * spec_topk, spec_tokens)
+    if page_size == 1 or spec_topk == 1:
+        return max(spec_steps * spec_topk, spec_tokens)
+    else:
+        raise NotImplementedError(
+            "get_alloc_len_per_decode not implemented for page_size > 1 and spec_topk > 1"
+        )
