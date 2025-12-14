@@ -19,7 +19,7 @@ use tracing::{debug, error};
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType, WorkerLoadGuardV2,
     },
     observability::{
         events::{self, Event},
@@ -233,7 +233,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = WorkerLoadGuard::new(worker);
+        let load_guard = WorkerLoadGuardV2::new(worker);
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
@@ -693,7 +693,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
-use crate::core::WorkerLoadGuard;
 use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
