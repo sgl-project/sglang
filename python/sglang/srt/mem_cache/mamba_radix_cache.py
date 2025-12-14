@@ -384,7 +384,7 @@ class MambaRadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        value, last_node = self._match_prefix_helper(key)
+        value, last_node, mamba_branching_seqlen = self._match_prefix_helper(key)
 
         # copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
@@ -415,15 +415,28 @@ class MambaRadixCache(BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
-    def insert(self, key: RadixKey, value=None, mamba_value=None) -> Tuple[int, bool]:
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        mamba_value=None,
+        branchoff_mamba_value=None,
+    ) -> Tuple[int, bool]:
         if self.disable:
             return 0
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        return self._insert_helper(self.root_node, key, value, mamba_value)
+        return self._insert_helper(
+            self.root_node,
+            key,
+            value,
+            mamba_value,
+            branchoff_mamba_value=branchoff_mamba_value,
+        )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
@@ -494,6 +507,10 @@ class MambaRadixCache(BasePrefixCache):
         ).unsqueeze(-1)
         # radix tree mamba value is forked from req space
         mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        branch_checkpoint = (
+            req.mamba_branching_seqlen is not None
+            and page_aligned_len == req.mamba_branching_seqlen
+        )
 
         # if alloc mamba cache failed, do evict and alloc again
         if mamba_value_forked is None:
@@ -506,6 +523,7 @@ class MambaRadixCache(BasePrefixCache):
             RadixKey(page_aligned_token_ids, req.extra_key),
             page_aligned_kv_indices,
             mamba_value_forked,
+            branchoff_mamba_value=mamba_value_forked if branch_checkpoint else None,
         )
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
@@ -740,7 +758,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode]:
+    ) -> Tuple[List[torch.Tensor], TreeNode, Optional[int]]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
@@ -753,6 +771,8 @@ class MambaRadixCache(BasePrefixCache):
         value = []
         best_value_len = 0
         best_last_node = node
+        mamba_branching_seqlen: Optional[int] = None
+        matched_len = 0
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
@@ -762,17 +782,30 @@ class MambaRadixCache(BasePrefixCache):
 
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
+                if len(key) > prefix_len:
+                    mamba_branching_seqlen = matched_len + prefix_len
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
                 node = new_node
+                matched_len += prefix_len
                 break
             else:
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
+                matched_len += prefix_len
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
+
+        if (
+            mamba_branching_seqlen is None
+            and matched_len > 0
+            and node.mamba_value is None
+            and len(node.children) > 0
+        ):
+            # Reuse of a purely-input prefix would require a checkpoint here.
+            mamba_branching_seqlen = matched_len
         # handle best_value_len and best_last_node, for the case that last node is fully matched
         if node.mamba_value is not None:
             best_value_len = len(value)
@@ -793,9 +826,15 @@ class MambaRadixCache(BasePrefixCache):
             )
             node_update = node_update.parent
 
-        return value[:best_value_len], best_last_node
+        return value[:best_value_len], best_last_node, mamba_branching_seqlen
 
-    def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
+    def _split_node(
+        self,
+        key: RadixKey,
+        child: TreeNode,
+        split_len: int,
+        branchoff_mamba_value: Optional[torch.Tensor] = None,
+    ) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
@@ -821,6 +860,10 @@ class MambaRadixCache(BasePrefixCache):
         # parent first so that parent is after child in the lru list
         self.full_lru_list.insert_mru(new_node)
         self.full_lru_list.insert_mru(child)
+        if branchoff_mamba_value is not None:
+            new_node.mamba_value = branchoff_mamba_value
+            self.mamba_lru_list.insert_mru(new_node)
+            self.mamba_evictable_size_ += len(branchoff_mamba_value)
         if child.mamba_value is not None:
             self.mamba_lru_list.insert_mru(child)
         return new_node
@@ -831,6 +874,7 @@ class MambaRadixCache(BasePrefixCache):
         key: RadixKey,
         value,
         mamba_value,
+        branchoff_mamba_value=None,
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
@@ -841,7 +885,17 @@ class MambaRadixCache(BasePrefixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
-            return 0, True
+            mamba_value_exist = node.mamba_value is not None
+            if not mamba_value_exist:
+                node.mamba_value = mamba_value
+                # Existing node is already in full_lru_list; add to mamba LRU.
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(mamba_value)
+                node.last_access_time = get_last_access_time()
+            else:
+                self.mamba_lru_list.reset_node_mru(node)
+                node.last_access_time = get_last_access_time()
+            return 0, mamba_value_exist
 
         child_key = self.get_child_key_fn(key)
 
@@ -858,7 +912,10 @@ class MambaRadixCache(BasePrefixCache):
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
-                new_node = self._split_node(node.key, node, prefix_len)
+                new_node = self._split_node(
+                    node.key, node, prefix_len, branchoff_mamba_value
+                )
+                branchoff_mamba_value = None
                 node = new_node
 
             if len(key):

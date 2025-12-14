@@ -452,7 +452,15 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def add_chunked_req(self, req: Req):
-        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        _rem_tokens = int(self.rem_total_tokens)
+        if self.rem_chunk_tokens is not None:
+            _rem_tokens = min(self.rem_chunk_tokens, _rem_tokens)
+
+        if self.is_ssm_radix_cache and req.mamba_branching_seqlen is not None:
+            prefix_len = len(req.prefix_indices)
+            if prefix_len < req.mamba_branching_seqlen:
+                _rem_tokens = min(_rem_tokens, req.mamba_branching_seqlen - prefix_len)
+
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -613,7 +621,22 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            trunc_len = None
+            if self.is_ssm_radix_cache and truncation_align_size is None:
+                branching_seqlen = req.mamba_branching_seqlen
+                prefix_len = len(req.prefix_indices)
+                if (
+                    branching_seqlen is not None
+                    and prefix_len < branching_seqlen
+                    and branching_seqlen < len(req.fill_ids)
+                ):
+                    trunc_len = branching_seqlen - prefix_len
+                    if trunc_len <= 0:
+                        trunc_len = None
+
+            if trunc_len is None and (
+                self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens
+            ):
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 if self.is_hybrid_swa:
@@ -631,7 +654,13 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                if trunc_len is None:
+                    trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                elif self.rem_chunk_tokens is not None:
+                    trunc_len = min(
+                        trunc_len,
+                        self.rem_chunk_tokens // self.page_size * self.page_size,
+                    )
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
