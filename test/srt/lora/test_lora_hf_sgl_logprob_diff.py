@@ -543,6 +543,42 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             max_new_tokens=32,
         )
 
+    def test_moe_lora_logprob_comparison_basic(self):
+        """
+        Test comparing HF and SGLang MoE LoRA logprobs with basic prompts.
+        """
+        if is_in_ci():
+            self.skipTest("Skipping in CI environment - requires large MoE models")
+
+        model_path = "Qwen/Qwen1.5-MoE-A2.7B"
+        lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
+        prompts = DEFAULT_TEST_PROMPTS[:2]  # Use first 2 default prompts for basic test
+
+        self._run_comparison_test(
+            model_path=model_path,
+            lora_paths=lora_paths,
+            prompts=prompts,
+            max_new_tokens=32,
+        )
+
+    def test_moe_lora_logprob_comparison_full(self):
+        """
+        Full test comparing HF and SGLang MoE LoRA logprobs with all default prompts.
+        """
+        if is_in_ci():
+            self.skipTest("Skipping in CI environment - requires large MoE models")
+
+        model_path = "Qwen/Qwen1.5-MoE-A2.7B"
+        lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
+        prompts = DEFAULT_TEST_PROMPTS
+
+        self._run_comparison_test(
+            model_path=model_path,
+            lora_paths=lora_paths,
+            prompts=prompts,
+            max_new_tokens=32,
+        )
+
 
 if __name__ == "__main__":
     try:

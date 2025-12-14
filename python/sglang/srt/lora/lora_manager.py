@@ -43,6 +43,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.lora.layers import FusedMoEWithLoRA
 
 logger = logging.getLogger(__name__)
 
@@ -281,15 +283,59 @@ class LoRAManager:
             use_cuda_graph=use_cuda_graph,
         )
 
+        # Populate per-token LoRA indices from segment information
+        batch_info = self.lora_backend.batch_info
+        num_tokens = forward_batch.input_ids.shape[0]  # Tokens in current forward pass
+
+        # Create tensor and fill with adapter indices from segments
+        token_lora_indices_reordered = torch.empty(num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device)
+        seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
+        for seg_idx in range(batch_info.num_segments):
+            start_token = seg_indptr[seg_idx]
+            end_token = seg_indptr[seg_idx + 1]
+            lora_adapter = batch_info.weight_indices[seg_idx]
+            token_lora_indices_reordered[start_token:end_token] = lora_adapter
+
+        if batch_info.permutation is None:
+            # No reordering (e.g., triton backend): segments are in original order
+            token_lora_indices = token_lora_indices_reordered
+        else:
+            # Tokens are reordered (chunked backend): need to convert back to original order
+            inverse_permutation = torch.empty_like(batch_info.permutation)
+            inverse_permutation[batch_info.permutation] = torch.arange(num_tokens, dtype=batch_info.permutation.dtype, device=batch_info.permutation.device)
+            token_lora_indices = token_lora_indices_reordered[inverse_permutation]
+
+        forward_batch.token_lora_indices = token_lora_indices
+
+        # Store forward_batch reference in backend for MoE layer access
+        self.lora_backend.forward_batch = forward_batch
+
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
+                # Hack for FusedMoE layer
+                if isinstance(module, FusedMoEWithLoRA) and all(x in self.target_modules for x in ['gate_up_proj', 'down_proj']):
+                    module.set_lora_info(
+                        self.memory_pool.get_tensor(
+                            target_module='gate_up_proj_moe',
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_A,
+                        ),
+                        self.memory_pool.get_tensor(
+                            target_module='down_proj_moe',
+                            layer_id=layer_id,
+                            lora_type=LoRAType.LORA_B,
+                        ),
+                    )
+                    continue
+                
                 target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
+
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
                         target_module=target_module,
@@ -460,6 +506,7 @@ class LoRAManager:
         )
 
     def set_lora_module(self, module_name, module):
+        """Wrap any module (standard or MoE) with LoRA support."""
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
@@ -484,6 +531,7 @@ class LoRAManager:
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
 
+            # Check if module should be wrapped with LoRA
             # Handle embed_tokens
             if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
                 if isinstance(module, VocabParallelEmbedding) and not isinstance(
@@ -505,6 +553,13 @@ class LoRAManager:
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
+                self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                    module_name, module
+                )
+                continue
+        
+            # Temporarily workaround for FusedMoE layer
+            if isinstance(module, FusedMoE) and all(x in self.target_modules for x in ['gate_up_proj', 'down_proj']):
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )

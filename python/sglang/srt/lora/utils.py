@@ -78,9 +78,9 @@ def get_hidden_dim(
                 head_dim * config.num_attention_heads,
                 config.hidden_size,
             )
-        elif module_name == "gate_up_proj":
+        elif module_name == "gate_up_proj" or module_name == "gate_up_proj_moe":
             return config.hidden_size, config.intermediate_size * 2
-        elif module_name == "down_proj":
+        elif module_name == "down_proj" or module_name == "down_proj_moe":
             return config.intermediate_size, config.hidden_size
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
@@ -130,6 +130,7 @@ def get_stacked_multiply(module_name: str) -> int:
     stacked_rank = {
         "qkv_proj": 3,
         "gate_up_proj": 2,
+        "gate_up_proj_moe": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
