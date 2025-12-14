@@ -23,7 +23,6 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
@@ -1219,12 +1218,12 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         gemm1_scales_shuffled = torch.stack(gemm1_scales_shuffled).view(torch.bfloat16)
         gemm2_scales_shuffled = torch.stack(gemm2_scales_shuffled).view(torch.bfloat16)
 
-        return {
-            "gemm1_weights": gemm1_weights_mxint4_shuffled,
-            "gemm1_scales": gemm1_scales_shuffled,
-            "gemm2_weights": gemm2_weights_mxint4_shuffled,
-            "gemm2_scales": gemm2_scales_shuffled,
-        }
+        return (
+            gemm1_weights_mxint4_shuffled,
+            gemm1_scales_shuffled,
+            gemm2_weights_mxint4_shuffled,
+            gemm2_scales_shuffled,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
@@ -1235,16 +1234,15 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         #     getattr(layer, name).copy_(new_t)
         #     del new_t
 
-        num_experts = layer.w13_weight.shape[0]
-        device = layer.w13_weight.device
+        num_experts = layer.w13_weight_packed.shape[0]
         (
             gemm1_weights_mxint4_shuffled,
             gemm1_scales_shuffled,
             gemm2_weights_mxint4_shuffled,
             gemm2_scales_shuffled,
         ) = self.prepare_static_weights_for_kernel(
-            layer.w13_weight,
-            layer.w2_weight,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
             layer.w13_weight_scale,
             layer.w2_weight_scale,
             num_experts=num_experts,
@@ -1273,8 +1271,6 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        assert TopKOutputChecker.format_is_bypassed(topk_output)
-
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
 
@@ -1286,7 +1282,7 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
             router_logits = router_logits.to(torch.float32)
 
         output = trtllm_mxint4_block_scale_moe(
-            router_logits=router_logits,  # float
+            routing_logits=router_logits,  # float
             hidden_states=x,
             gemm1_weights=layer.w13_weight_packed,
             gemm1_weights_scale=layer.w13_weight_scale,
@@ -1296,7 +1292,7 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
             gemm2_weights=layer.w2_weight_packed,
             gemm2_weights_scale=layer.w2_weight_scale,
             num_experts=self.moe_runner_config.num_experts,
-            topk=topk_config.top_k,
+            top_k=topk_config.top_k,
             n_group=topk_config.num_expert_group,
             topk_group=topk_config.topk_group,
             intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
