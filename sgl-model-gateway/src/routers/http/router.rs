@@ -227,7 +227,18 @@ impl Router {
             }
         };
 
-        let load_guard = WorkerLoadGuardV2::new(worker.clone());
+        // Optional load tracking for cache-aware policy
+        // Get the policy for this model to check if it's cache-aware
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let load_guard = if policy.name() == "cache_aware" {
+            Some(WorkerLoadGuardV2::new(worker.clone()))
+        } else {
+            None
+        };
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
@@ -395,10 +406,8 @@ impl Router {
         route: &'static str,
         worker_url: &str,
         is_stream: bool,
-        load_guard: WorkerLoadGuardV2,
+        mut load_guard: Option<WorkerLoadGuardV2>,
     ) -> Response {
-        let mut load_guard = Some(load_guard);
-
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
         let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
