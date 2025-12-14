@@ -91,11 +91,6 @@ impl CircuitBreaker {
         Self::with_config_and_label(CircuitBreakerConfig::default(), String::new())
     }
 
-    /// Create a new circuit breaker with custom configuration
-    pub fn with_config(config: CircuitBreakerConfig) -> Self {
-        Self::with_config_and_label(config, String::new())
-    }
-
     /// Create a new circuit breaker with custom configuration and metric label
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         Self {
@@ -362,7 +357,7 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         assert_eq!(cb.state(), CircuitState::Closed);
         cb.record_failure();
@@ -383,7 +378,7 @@ mod tests {
             timeout_duration: Duration::from_millis(100),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -402,7 +397,7 @@ mod tests {
             timeout_duration: Duration::from_millis(50),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -425,7 +420,7 @@ mod tests {
             timeout_duration: Duration::from_millis(50),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -445,7 +440,7 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         cb.record_failure();
@@ -466,7 +461,7 @@ mod tests {
             failure_threshold: 1,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -493,7 +488,7 @@ mod tests {
             failure_threshold: 2,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_success();
         cb.record_failure();
