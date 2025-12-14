@@ -16,7 +16,7 @@ use super::{
     CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
 };
 use crate::{
-    core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
+    core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
     observability::metrics::RouterMetrics,
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
