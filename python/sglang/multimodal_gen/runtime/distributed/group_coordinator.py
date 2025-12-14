@@ -356,14 +356,7 @@ class GroupCoordinator:
         if self.device_communicator is not None and self.use_device_communicator:
             output_tensor = self.device_communicator.all_gather(input_, dim=dim)
             if separate_tensors:
-                tensor_list = [
-                    output_tensor.reshape(-1)
-                    .narrow(0, input_.numel() * i, input_.numel())
-                    .view_as(input_)
-                    for i in range(world_size)
-                ]
-                return tensor_list
-
+                return list(torch.chunk(output_tensor, world_size, dim=dim))
             return output_tensor
 
         # Allocate output tensor.
@@ -373,9 +366,17 @@ class GroupCoordinator:
             input_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
+        # The output_tensor layout here is always [Rank0, Rank1, ...] stacked along dim 0.
         torch.distributed.all_gather_into_tensor(
             output_tensor, input_, group=self.device_group
         )
+        
+        if separate_tensors:
+            # Optimization: Since the data is physically stacked along dim 0, we can directly 
+            # chunk along dim 0 to recover the original tensors. This avoids unnecessary 
+            # reshape and movedim operations required for the fused case.
+            return list(torch.chunk(output_tensor, world_size, dim=0))
+
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -386,20 +387,11 @@ class GroupCoordinator:
             )
             output_tensor = output_tensor.movedim(0, dim)
 
-        if separate_tensors:
-            tensor_list = [
-                output_tensor.reshape(-1)
-                .narrow(0, input_.numel() * i, input_.numel())
-                .view_as(input_)
-                for i in range(world_size)
-            ]
-            return tensor_list
-        else:
-            input_size = list(input_.size())
-            input_size[dim] = input_size[dim] * world_size
-            # Reshape
-            output_tensor = output_tensor.reshape(input_size)
-            return output_tensor
+        input_size = list(input_.size())
+        input_size[dim] = input_size[dim] * world_size
+        # Reshape
+        output_tensor = output_tensor.reshape(input_size)
+        return output_tensor
 
     def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor:
         """
