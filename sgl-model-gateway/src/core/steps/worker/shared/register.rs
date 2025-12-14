@@ -8,6 +8,7 @@ use tracing::debug;
 use crate::{
     app_context::AppContext,
     core::Worker,
+    observability::metrics::RouterMetrics,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowResult},
 };
 
@@ -35,6 +36,9 @@ impl StepExecutor for RegisterWorkersStep {
             );
             worker_ids.push(worker_id);
         }
+
+        // Update active workers metric
+        RouterMetrics::set_active_workers(app_context.worker_registry.len());
 
         context.set("worker_ids", worker_ids);
         Ok(StepResult::Success)

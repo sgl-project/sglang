@@ -971,7 +971,7 @@ impl PDRouter {
         &self,
         client: &Client,
         url: &str,
-        route: &str,
+        route: &'static str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
