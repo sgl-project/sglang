@@ -35,13 +35,13 @@ async fn latency_monitor() -> Vec<Duration> {
     spikes
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_reproduce_cpu_blocking() {
     // A. Setup Tokenizer (Simulate heavy load)
     // We reuse the logic from your existing benchmarks to get a valid tokenizer
     // !!! IMPORTANT: Replace this path with a valid tokenizer.json on your system !!!
     // Example: "models/Meta-Llama-3-8B-Instruct/tokenizer.json"
-    let tokenizer_path = "tokenizer.json";
+    let tokenizer_path = "tests/tokenizer.json";
 
     // Fallback check to avoid crashing if file doesn't exist during dry run
     if !std::path::Path::new(tokenizer_path).exists() {
