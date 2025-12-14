@@ -58,7 +58,7 @@ pub enum Job {
 
 impl Job {
     /// Get job type as string for logging
-    pub fn job_type(&self) -> &str {
+    pub fn job_type(&self) -> &'static str {
         match self {
             Job::AddWorker { .. } => "AddWorker",
             Job::UpdateWorker { .. } => "UpdateWorker",
@@ -237,13 +237,13 @@ impl JobQueue {
         }
 
         // Extract values before moving job
-        let job_type = job.job_type().to_string();
+        let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
 
         // Record pending status
         self.status_map.insert(
             worker_url.clone(),
-            JobStatus::pending(&job_type, &worker_url),
+            JobStatus::pending(job_type, &worker_url),
         );
 
         match self.tx.send(job).await {
@@ -286,14 +286,14 @@ impl JobQueue {
         status_map: Arc<DashMap<String, JobStatus>>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        let job_type = job.job_type().to_string();
+        let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
 
         // Update to processing
         status_map.insert(
             worker_url.clone(),
-            JobStatus::processing(&job_type, &worker_url),
+            JobStatus::processing(job_type, &worker_url),
         );
 
         debug!("Processing job: type={}, worker={}", job_type, worker_url);
@@ -303,13 +303,13 @@ impl JobQueue {
             Some(ctx) => {
                 let result = Self::execute_job(&job, &ctx).await;
                 let duration = start.elapsed();
-                Self::record_job_completion(&job_type, &worker_url, duration, &result, &status_map);
+                Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
                 status_map.insert(
                     worker_url.clone(),
-                    JobStatus::failed(&job_type, &worker_url, error_msg),
+                    JobStatus::failed(job_type, &worker_url, error_msg),
                 );
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
@@ -808,7 +808,7 @@ impl JobQueue {
 
     /// Record job completion metrics and update status
     fn record_job_completion(
-        job_type: &str,
+        job_type: &'static str,
         worker_url: &str,
         duration: Duration,
         result: &Result<String, String>,

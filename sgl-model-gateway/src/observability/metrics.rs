@@ -241,9 +241,9 @@ pub fn start_prometheus(config: PrometheusConfig) {
 pub struct RouterMetrics;
 
 impl RouterMetrics {
-    pub fn record_request(route: &str) {
+    pub fn record_request(route: &'static str) {
         counter!("sgl_router_requests_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
@@ -252,27 +252,27 @@ impl RouterMetrics {
         histogram!("sgl_router_request_duration_seconds").record(duration.as_secs_f64());
     }
 
-    pub fn record_request_error(route: &str, error_type: &str) {
+    pub fn record_request_error(route: &'static str, error_type: &'static str) {
         counter!("sgl_router_request_errors_total",
-            "route" => route.to_string(),
-            "error_type" => error_type.to_string()
+            "route" => route,
+            "error_type" => error_type
         )
         .increment(1);
     }
 
     // TODO unify metric names
-    pub fn record_attempt_http_response(route: &str, status_code: u16, error_code: &str) {
+    pub fn record_attempt_http_response(route: &'static str, status_code: u16, error_code: &str) {
         counter!("sgl_router_attempt_http_responses_total",
-            "route" => route.to_string(),
+            "route" => route,
             "status_code" => status_code.to_string(),
             "error_code" => error_code.to_string()
         )
         .increment(1);
     }
 
-    pub fn record_retry(route: &str) {
+    pub fn record_retry(route: &'static str) {
         counter!("sgl_router_retries_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
@@ -284,9 +284,9 @@ impl RouterMetrics {
         .record(duration.as_secs_f64());
     }
 
-    pub fn record_retries_exhausted(route: &str) {
+    pub fn record_retries_exhausted(route: &'static str) {
         counter!("sgl_router_retries_exhausted_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
@@ -309,9 +309,9 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn record_policy_decision(policy: &str, worker: &str) {
+    pub fn record_policy_decision(policy: &'static str, worker: &str) {
         counter!("sgl_router_policy_decisions_total",
-            "policy" => policy.to_string(),
+            "policy" => policy,
             "worker" => worker.to_string()
         )
         .increment(1);
@@ -341,16 +341,16 @@ impl RouterMetrics {
         gauge!("sgl_router_min_load").set(min_load as f64);
     }
 
-    pub fn record_pd_request(route: &str) {
+    pub fn record_pd_request(route: &'static str) {
         counter!("sgl_router_pd_requests_total",
-            "route" => route.to_string()
+            "route" => route
         )
         .increment(1);
     }
 
-    pub fn record_pd_request_duration(route: &str, duration: Duration) {
+    pub fn record_pd_request_duration(route: &'static str, duration: Duration) {
         histogram!("sgl_router_pd_request_duration_seconds",
-            "route" => route.to_string()
+            "route" => route
         )
         .record(duration.as_secs_f64());
     }
@@ -369,9 +369,9 @@ impl RouterMetrics {
         .increment(1);
     }
 
-    pub fn record_pd_error(error_type: &str) {
+    pub fn record_pd_error(error_type: &'static str) {
         counter!("sgl_router_pd_errors_total",
-            "error_type" => error_type.to_string()
+            "error_type" => error_type
         )
         .increment(1);
     }
@@ -461,19 +461,19 @@ impl RouterMetrics {
         .set(state_code as f64);
     }
 
-    pub fn record_cb_state_transition(worker: &str, from: &str, to: &str) {
+    pub fn record_cb_state_transition(worker: &str, from: &'static str, to: &'static str) {
         counter!("sgl_router_cb_state_transitions_total",
             "worker" => worker.to_string(),
-            "from" => from.to_string(),
-            "to" => to.to_string()
+            "from" => from,
+            "to" => to
         )
         .increment(1);
     }
 
-    pub fn record_cb_outcome(worker: &str, outcome: &str) {
+    pub fn record_cb_outcome(worker: &str, outcome: &'static str) {
         counter!("sgl_router_cb_outcomes_total",
             "worker" => worker.to_string(),
-            "outcome" => outcome.to_string()
+            "outcome" => outcome
         )
         .increment(1);
     }
@@ -514,23 +514,23 @@ impl RouterMetrics {
         gauge!("sgl_router_job_queue_depth").set(depth as f64);
     }
 
-    pub fn record_job_duration(job_type: &str, duration: Duration) {
+    pub fn record_job_duration(job_type: &'static str, duration: Duration) {
         histogram!("sgl_router_job_duration_seconds",
-            "job_type" => job_type.to_string()
+            "job_type" => job_type
         )
         .record(duration.as_secs_f64());
     }
 
-    pub fn record_job_success(job_type: &str) {
+    pub fn record_job_success(job_type: &'static str) {
         counter!("sgl_router_job_success_total",
-            "job_type" => job_type.to_string()
+            "job_type" => job_type
         )
         .increment(1);
     }
 
-    pub fn record_job_failure(job_type: &str) {
+    pub fn record_job_failure(job_type: &'static str) {
         counter!("sgl_router_job_failure_total",
-            "job_type" => job_type.to_string()
+            "job_type" => job_type
         )
         .increment(1);
     }
@@ -875,7 +875,7 @@ mod tests {
     fn test_very_long_metric_labels() {
         let long_label = "a".repeat(1000);
 
-        RouterMetrics::record_request(&long_label);
+        RouterMetrics::record_request("/very_long_test_route");
         RouterMetrics::set_worker_health(&long_label, false);
     }
 
