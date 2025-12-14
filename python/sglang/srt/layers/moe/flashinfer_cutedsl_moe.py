@@ -82,7 +82,9 @@ def flashinfer_cutedsl_moe_masked(
     n = w2.shape[-1] * 2  # intermediate dimension
 
     if hidden_states[1] is not None:
-
+        assert (
+            hidden_states[1].stride(-1) == 1
+        ), "The last dimension of hidden_states[1] must be contiguous. Please check whether SGLANG_DEEPEP_BF16_DISPATCH or SGLANG_MOE_NVFP4_DISPATCH is set to 1."
         a_q = hidden_states[0].view(torch.uint8)
         a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
         m, k_by_2, num_experts = a_q.shape
