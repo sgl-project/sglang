@@ -43,12 +43,12 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    qkv = attn.to_qkv(hidden_states)
+    qkv, _ = attn.to_qkv(hidden_states)
     query, key, value = qkv.chunk(3, dim=-1)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        added_qkv = attn.to_added_qkv(encoder_hidden_states)
+        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
         encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
