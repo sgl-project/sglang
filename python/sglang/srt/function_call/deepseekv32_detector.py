@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import List
+from typing import List, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -71,15 +71,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
+
         self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
         self.invoke_end_token = "</｜DSML｜invoke>"
-        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        self.invoke_end_token_prefixes = [
+            "<",
+            "</",
+            "</｜DSML｜",
+            "</｜DSML｜inv",
+            "</｜DSML｜invoke",
+        ]
+
+        self.xml_parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
         self._last_arguments = ""
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
-        return self.bot_token in text
+        return self.bot_token in text or "<｜DSML｜invoke" in text
 
     def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
         """
@@ -105,7 +114,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         # Fall back to XML parameter tag parsing (original format)
         parameters = {}
-        param_matches = re.findall(self.parameter_regex, invoke_content, re.DOTALL)
+        param_matches = re.findall(self.xml_parameter_regex, invoke_content, re.DOTALL)
         for param_name, param_type, param_value in param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
@@ -117,6 +126,33 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 except (json.JSONDecodeError, ValueError):
                     parameters[param_name] = param_value.strip()
         return parameters
+
+    def _parse_parameters_partially(self, invoke_content: str) -> Tuple[str, str]:
+        # 1. check json format
+        if invoke_content.strip().startswith("{"):
+            return invoke_content, "json"
+
+        # 2. check xml format
+        xml_param_matches = re.findall(
+            self.xml_parameter_regex, invoke_content, re.DOTALL
+        )
+
+        json_parts = []
+        for param_name, param_type, param_value in xml_param_matches:
+            # Convert value based on type
+            if param_type == "true":  # string type
+                json_parts.append(f'"{param_name}": "{param_value.strip()}"')
+            else:
+                # Try to parse as JSON for other types
+                try:
+                    json_parts.append(
+                        f'"{param_name}": {json.dumps(json.loads(param_value.strip()), ensure_ascii=False)}'
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    json_parts.append(
+                        f'"{param_name}": {json.dumps(param_value.strip(), ensure_ascii=False)}'
+                    )
+        return "{" + ", ".join(json_parts), "xml"
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -175,13 +211,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call or any DSML-related content
-        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
-        # If we see these markers anywhere, we should keep buffering
-        has_tool_call = (
-            self.bot_token in current_text or "<｜DSML｜invoke" in current_text
-        )
-
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
         dsml_markers = ["｜DSML｜", "<｜", "</｜"]
@@ -193,7 +222,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
         )
 
-        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
+        if (
+            not self.has_tool_call(current_text)
+            and not potentially_dsml
+            and not ends_with_prefix
+        ):
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in new_text:
@@ -203,9 +236,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        all_calls: list[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
         try:
-            # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
@@ -213,14 +245,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     string=current_text,
                     flags=re.DOTALL,
                 )
-
                 if not invoke_match:
                     break
 
                 func_name = invoke_match.group(1).strip()
                 invoke_content = invoke_match.group(2)
+
+                if any(
+                    invoke_content.endswith(end)
+                    for end in self.invoke_end_token_prefixes
+                ):
+                    break
+
                 # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
                 is_tool_end = bool(invoke_match.group(3))
+
+                func_args_raw, format = self._parse_parameters_partially(invoke_content)
+                if is_tool_end and format == "xml":
+                    func_args_raw += "}"
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -228,81 +270,67 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
 
-                # Don't pre-allocate arrays until we actually complete a tool call
-                # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
 
-                # Parse current parameters from XML/JSON
-                current_params = self._parse_parameters_from_xml(invoke_content)
-                current_args_json = json.dumps(current_params, ensure_ascii=False)
-
-                # Check if tool call is complete (has closing tag)
-                if is_tool_end:
-                    # Only emit the tool call when it's complete (saw </｜DSML｜invoke>)
-                    # This ensures each function returns at most once
-                    calls_for_this_invoke: list[ToolCallItem] = []
-
-                    # Note: invoke_content can be empty for functions with no parameters
-                    # This is valid and should NOT be skipped
-
-                    # Send tool name
-                    calls_for_this_invoke.append(
+                if not self.current_tool_name_sent:
+                    # send tool name first
+                    calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
                             name=func_name,
                             parameters="",
                         )
                     )
-
-                    # Send parameters as complete JSON
-                    # Always send parameters, even if empty, to maintain consistency
-                    calls_for_this_invoke.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=None,
-                            parameters=current_args_json,
-                        )
-                    )
-
-                    # Ensure arrays are large enough for current tool
-                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                        self.prev_tool_call_arr.append({})
-                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                        self.streamed_args_for_tool.append("")
-
-                    # Update the stored arguments
+                    self.current_tool_name_sent = True
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": func_name,
-                        "arguments": current_params,
+                        "arguments": {},
                     }
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        current_args_json
-                    )
-
-                    # Remove the completed tool call from buffer
-                    self._buffer = current_text[invoke_match.end() :]
-                    current_text = self._buffer  # Update for next iteration
-
-                    # Add calls for this invoke to all_calls
-                    all_calls.extend(calls_for_this_invoke)
-
-                    # Move to next tool call
-                    self.current_tool_id += 1
-                    self._last_arguments = ""
-                    self.current_tool_name_sent = False
-
-                    # Don't pre-allocate arrays for the next tool
-                    # Only allocate when we actually complete a tool call
-                    # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
-
-                    # Continue loop to check for more invoke blocks
-                    continue
                 else:
-                    # Tool call not complete yet, don't return anything
-                    # Wait for more chunks until we see </｜DSML｜invoke>
+                    argument_diff = (
+                        func_args_raw[len(self._last_arguments) :]
+                        if func_args_raw.startswith(self._last_arguments)
+                        else func_args_raw
+                    )
+                    if argument_diff:
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters=argument_diff,
+                            )
+                        )
+                        self._last_arguments += argument_diff
+                        self.streamed_args_for_tool[
+                            self.current_tool_id
+                        ] += argument_diff
+
+                    if is_tool_end:
+                        # Update the stored arguments
+                        try:
+                            parsed_args = json.loads(func_args_raw)
+                            self.prev_tool_call_arr[self.current_tool_id][
+                                "arguments"
+                            ] = parsed_args
+                        except json.JSONDecodeError:
+                            pass
+
+                        # Remove the completed tool call from buffer, keep any remaining content
+                        self._buffer = current_text[invoke_match.end(3) :]
+                        current_text = self._buffer
+
+                        # update state
+                        self.update_state()
+
+                if not is_tool_end:
+                    # if current tool is not end, it means the following content is definitely not a tool call, so break the loop
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text="", calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
@@ -312,5 +340,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return lambda name: StructureInfo(
             begin=f'<｜DSML｜invoke name="{name}">',
             end="</｜DSML｜invoke>",
-            trigger=f'<｜DSML｜invoke name="{name}">',
+            trigger=f"<｜DSML｜",
         )
+
+    def update_state(self):
+        self.current_tool_id += 1
+        self._last_arguments = ""
+        self.current_tool_name_sent = False
