@@ -274,6 +274,19 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self.think_start_token + text)
 
 
+class NanoV3Detector(DeepSeekR1Detector):
+    """
+    Detector for NanoV3 model.
+    Similar to DeepSeek-R1 but with potential variations in reasoning format.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -297,6 +310,7 @@ class ReasoningParser:
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "step3": DeepSeekR1Detector,
+        "nano_v3": NanoV3Detector,
     }
 
     def __init__(
