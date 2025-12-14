@@ -62,6 +62,7 @@ suites = {
         TestFile("test_deterministic.py", 228),
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
+        TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
         TestFile("test_fa3.py", 420),
         TestFile("test_flashmla.py", 230),
