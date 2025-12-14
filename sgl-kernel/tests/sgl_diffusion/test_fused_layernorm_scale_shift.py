@@ -1,6 +1,109 @@
 import pytest
-import sgl_kernel
 import torch
+from sgl_kernel import (
+    fused_layernorm_scale_shift,
+    fused_scale_residual_layernorm_scale_shift,
+)
+
+
+# Reference fused output: compute LN in fp32, then apply scale/shift in fp32, cast back
+@torch.no_grad()
+def fused_layernorm_scale_shift_ref(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+    dtype: torch.dtype,
+):
+    x32 = x.float()
+    s32 = scale.float()
+    sh32 = shift.float()
+    mean = x32.mean(dim=1, keepdim=True)
+    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
+    inv_std = (var + eps).sqrt().reciprocal()
+    y_ln32 = (x32 - mean) * inv_std
+    if weight is not None:
+        w32 = weight.float()
+        y_ln32 = y_ln32 * w32
+        if bias is not None:
+            b32 = bias.float()
+            y_ln32 = y_ln32 + b32
+    if s32.ndim == 4:
+        M = x32.shape[0]
+        B, F, _, _ = s32.shape
+        S = M // (B * F)
+        y_gt_fused = torch.empty_like(y_ln32)
+        for m in range(M):
+            b = (m // (F * S)) % B
+            s_in_b = m - b * F * S
+            f = s_in_b // S
+            y_gt_fused[m] = y_ln32[m] * (1.0 + s32[b, f, 0]) + sh32[b, f, 0]
+    else:
+        y_gt_fused = y_ln32 * (1.0 + s32) + sh32
+    return y_gt_fused.to(dtype)
+
+
+@torch.no_grad()
+def fused_scale_residual_layernorm_scale_shift_ref(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor | int,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+    dtype: torch.dtype,
+):
+    r32 = residual.float()
+    x32 = x.float()
+    g32 = gate.float() if gate is not None else 1
+    s32 = scale.float()
+    sh32 = shift.float()
+    M, N = x.shape
+    if gate is not None and gate.ndim == 3:
+        B, _, N = gate.shape
+        S = M // B
+        x32 = x32.view(B, S, N)
+        r32 = r32.view(B, S, N)
+    if gate is not None and gate.ndim == 4:
+        out32 = torch.empty_like(x32)
+        B, F, _, _ = gate.shape
+        S = M // (B * F)
+        for m in range(M):
+            b = (m // (F * S)) % B
+            s_in_b = m - b * F * S
+            f = s_in_b // S
+            out32[m] = r32[m] + x32[m] * g32[b, f, 0]
+    else:
+        out32 = r32 + g32 * x32
+    out32 = out32.view(M, N)
+    mean = out32.mean(dim=1, keepdim=True)
+    var = (out32 - mean).pow(2).mean(dim=1, keepdim=True)
+    inv_std = (var + eps).sqrt().reciprocal()
+    y_ln32 = (out32 - mean) * inv_std
+    if weight is not None:
+        w32 = weight.float()
+        y_ln32 = y_ln32 * w32
+        if bias is not None:
+            b32 = bias.float()
+            y_ln32 = y_ln32 + b32
+    if scale.ndim == 4:
+        M = x32.shape[0]
+        B, F, _, _ = s32.shape
+        S = M // (B * F)
+        y_ref = torch.empty_like(y_ln32)
+        for m in range(M):
+            b = (m // (F * S)) % B
+            s_in_b = m - b * F * S
+            f = s_in_b // S
+            y_ref[m] = y_ln32[m] * (1.0 + s32[b, f, 0]) + sh32[b, f, 0]
+    else:
+        y_ref = y_ln32 * (1.0 + s32) + sh32
+    residual_ref = out32
+    return y_ref.to(dtype), residual_ref.to(dtype)
 
 
 @torch.no_grad()
@@ -17,21 +120,10 @@ def run_case_fused_accuracy(
     scale = torch.randn(M, N, device=device, dtype=dtype)
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
-    y_dev_fused = sgl_kernel.fused_layernorm_scale_shift(x, weight, bias, scale, shift)
-
-    # Reference fused output: compute LN in fp32, then apply scale/shift in fp32, cast back
-    x32 = x.float()
-    w32 = weight.float()
-    b32 = bias.float()
-    s32 = scale.float()
-    sh32 = shift.float()
-    mean = x32.mean(dim=1, keepdim=True)
-    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (x32 - mean) * inv_std
-    y_ln32 = y_ln32 * w32 + b32
-    y_gt_fused = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
-
+    y_dev_fused = fused_layernorm_scale_shift(x, weight, bias, scale, shift, eps)
+    y_gt_fused = fused_layernorm_scale_shift_ref(
+        x, weight, bias, scale, shift, eps, dtype
+    )
     return y_dev_fused, y_gt_fused
 
 
@@ -48,18 +140,10 @@ def run_case_fused_no_affine_accuracy(
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
     # CUDA fused LayerNorm without affine weights (gamma=1, beta=0) + scale/shift
-    y_dev_fused = sgl_kernel.fused_layernorm_scale_shift_no_affine(x, scale, shift)
-
-    # Reference fused output: compute LN (gamma=1, beta=0) in fp32, then apply scale/shift in fp32, cast back
-    x32 = x.float()
-    s32 = scale.float()
-    sh32 = shift.float()
-    mean = x32.mean(dim=1, keepdim=True)
-    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (x32 - mean) * inv_std  # no affine weights
-    y_gt_fused = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
-
+    y_dev_fused = fused_layernorm_scale_shift(x, None, None, scale, shift, eps)
+    y_gt_fused = fused_layernorm_scale_shift_ref(
+        x, None, None, scale, shift, eps, dtype
+    )
     return y_dev_fused, y_gt_fused
 
 
@@ -81,31 +165,10 @@ def run_case_fused_4d_scale_accuracy(
     shift4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
 
     # CUDA 4D scale/shift fused
-    y_dev_fused = sgl_kernel.fused_layernorm_scale_shift(
-        x, weight, bias, scale4d, shift4d
+    y_dev_fused = fused_layernorm_scale_shift(x, weight, bias, scale4d, shift4d, eps)
+    y_ref = fused_layernorm_scale_shift_ref(
+        x, weight, bias, scale4d, shift4d, eps, dtype
     )
-
-    # Reference in fp32
-    x32 = x.float()
-    w32 = weight.float()
-    b32 = bias.float()
-    sc4 = scale4d.float()
-    sh4 = shift4d.float()
-    mean = x32.mean(dim=1, keepdim=True)
-    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (x32 - mean) * inv_std
-    y_ln32 = y_ln32 * w32 + b32
-
-    # Map rows m -> (b,f) with frame_seqlen = S
-    y_ref = torch.empty_like(y_ln32)
-    for m in range(M):
-        b = (m // (F * S)) % B
-        s_in_b = m - b * F * S
-        f = s_in_b // S
-        y_ref[m] = y_ln32[m] * (1.0 + sc4[b, f, 0]) + sh4[b, f, 0]
-    y_ref = y_ref.to(dtype)
-
     return y_dev_fused, y_ref
 
 
@@ -127,22 +190,12 @@ def run_case_residual_gate_int(
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
     # gate == 1 (no gate tensor)
-    y_dev, residual_out_dev = (
-        torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-            residual, x, weight, bias, scale, shift, None
-        )
+    y_dev, residual_out_dev = fused_scale_residual_layernorm_scale_shift(
+        residual, x, None, weight, bias, scale, shift, eps
     )
-
-    # Reference
-    out32 = residual.float() + x.float()  # gate==1
-    mean = out32.mean(dim=1, keepdim=True)
-    var = (out32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (out32 - mean) * inv_std
-    y_ln32 = y_ln32 * weight.float() + bias.float()
-    y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
-    residual_ref = out32.to(dtype)
-
+    y_ref, residual_ref = fused_scale_residual_layernorm_scale_shift_ref(
+        residual, x, None, weight, bias, scale, shift, eps, dtype
+    )
     return y_dev, residual_out_dev, y_ref, residual_ref
 
 
@@ -164,25 +217,12 @@ def run_case_residual_gate_3d(
     scale = torch.randn(M, N, device=device, dtype=dtype)
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
-    y_dev, residual_out_dev = (
-        torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-            residual, x, weight, bias, scale, shift, gate
-        )
+    y_dev, residual_out_dev = fused_scale_residual_layernorm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, eps
     )
-
-    # Reference: reshape to [B,S,N] for broadcasting gate[b,1,N]
-    x32 = x.float().view(B, S, N)
-    r32 = residual.float().view(B, S, N)
-    g32 = gate.float().view(B, 1, N)
-    out32 = (r32 + x32 * g32).view(M, N)
-    mean = out32.mean(dim=1, keepdim=True)
-    var = (out32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (out32 - mean) * inv_std
-    y_ln32 = y_ln32 * weight.float() + bias.float()
-    y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
-    residual_ref = out32.to(dtype)
-
+    y_ref, residual_ref = fused_scale_residual_layernorm_scale_shift_ref(
+        residual, x, gate, weight, bias, scale, shift, eps, dtype
+    )
     return y_dev, residual_out_dev, y_ref, residual_ref
 
 
@@ -205,38 +245,12 @@ def run_case_residual_gate_4d(
     scale4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
     shift4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
 
-    y_dev, residual_out_dev = (
-        torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-            residual, x, weight, bias, scale4d, shift4d, gate4d
-        )
+    y_dev, residual_out_dev = fused_scale_residual_layernorm_scale_shift(
+        residual, x, gate4d, weight, bias, scale4d, shift4d, eps
     )
-
-    # Reference: map rows m -> (b,f)
-    x32 = x.float()
-    r32 = residual.float()
-    g4 = gate4d.float()
-    out32 = torch.empty_like(x32)
-    for m in range(M):
-        b = (m // (F * S)) % B
-        s_in_b = m - b * F * S
-        f = s_in_b // S
-        out32[m] = r32[m] + x32[m] * g4[b, f, 0]
-    mean = out32.mean(dim=1, keepdim=True)
-    var = (out32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (out32 - mean) * inv_std
-    y_ln32 = y_ln32 * weight.float() + bias.float()
-    sc4 = scale4d.float()
-    sh4 = shift4d.float()
-    y_ref = torch.empty_like(y_ln32)
-    for m in range(M):
-        b = (m // (F * S)) % B
-        s_in_b = m - b * F * S
-        f = s_in_b // S
-        y_ref[m] = y_ln32[m] * (1.0 + sc4[b, f, 0]) + sh4[b, f, 0]
-    y_ref = y_ref.to(dtype)
-    residual_ref = out32.to(dtype)
-
+    y_ref, residual_ref = fused_scale_residual_layernorm_scale_shift_ref(
+        residual, x, gate4d, weight, bias, scale4d, shift4d, eps, dtype
+    )
     return y_dev, residual_out_dev, y_ref, residual_ref
 
 
@@ -260,25 +274,12 @@ def run_case_residual_gate_fully_expanded(
     shift = torch.randn(M, N, device=device, dtype=dtype)
     gate = torch.randn(M, N, device=device, dtype=dtype)
 
-    y_dev, residual_out_dev = (
-        torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-            residual, x, weight, bias, scale, shift, gate
-        )
+    y_dev, residual_out_dev = fused_scale_residual_layernorm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, eps
     )
-
-    # Reference
-    x32 = x.float()
-    r32 = residual.float()
-    g32 = gate.float()
-    out32 = r32 + x32 * g32
-    mean = out32.mean(dim=1, keepdim=True)
-    var = (out32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (out32 - mean) * inv_std
-    y_ln32 = y_ln32 * weight.float() + bias.float()
-    y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
-    residual_ref = out32.to(dtype)
-
+    y_ref, residual_ref = fused_scale_residual_layernorm_scale_shift_ref(
+        residual, x, gate, weight, bias, scale, shift, eps, dtype
+    )
     return y_dev, residual_out_dev, y_ref, residual_ref
 
 
@@ -304,26 +305,41 @@ def run_case_residual_gate_3d_scalar(
     scale = torch.zeros(1, device=device, dtype=dtype)
     shift = torch.zeros(1, device=device, dtype=dtype)
 
-    y_dev, residual_out_dev = (
-        torch.ops.sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-            residual, x, weight, bias, scale, shift, gate
-        )
+    y_dev, residual_out_dev = fused_scale_residual_layernorm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, eps
     )
+    y_ref, residual_ref = fused_scale_residual_layernorm_scale_shift_ref(
+        residual, x, gate, weight, bias, scale, shift, eps, dtype
+    )
+    return y_dev, residual_out_dev, y_ref, residual_ref
 
-    # Reference
-    x32 = x.float().view(B, S, N)
-    r32 = residual.float().view(B, S, N)
-    g32 = gate.float().view(B, 1, N)
-    out32 = (r32 + x32 * g32).view(M, N)
-    mean = out32.mean(dim=1, keepdim=True)
-    var = (out32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (out32 - mean) * inv_std
-    y_ln32 = y_ln32 * weight.float() + bias.float()
-    # Scalar broadcast
-    y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
-    residual_ref = out32.to(dtype)
 
+@torch.no_grad()
+def run_case_residual_gate_3d_scalar_no_affine(
+    dtype=torch.float32,
+    B: int = 1,
+    S: int = 32760,
+    N: int = 1536,
+    eps: float = 1e-5,
+):
+    device = "cuda"
+    M = B * S
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    residual = torch.randn(M, N, device=device, dtype=dtype)
+
+    # 3D Gate [B, 1, N]
+    gate = torch.randn(B, 1, N, device=device, dtype=dtype)
+
+    # Scalar Scale/Shift
+    scale = torch.zeros(1, device=device, dtype=dtype)
+    shift = torch.zeros(1, device=device, dtype=dtype)
+
+    y_dev, residual_out_dev = fused_scale_residual_layernorm_scale_shift(
+        residual, x, gate, None, None, scale, shift, eps
+    )
+    y_ref, residual_ref = fused_scale_residual_layernorm_scale_shift_ref(
+        residual, x, gate, None, None, scale, shift, eps, dtype
+    )
     return y_dev, residual_out_dev, y_ref, residual_ref
 
 
@@ -360,9 +376,7 @@ def run_case_broadcast(
 
     # Test pure fused_layernorm_scale_shift (only valid if gate is None)
     if gate is None:
-        y_dev_fused = sgl_kernel.fused_layernorm_scale_shift(
-            x, weight, bias, scale, shift
-        )
+        y_dev_fused = fused_layernorm_scale_shift(x, weight, bias, scale, shift, eps)
 
         # Reference
         x32 = x.float()
@@ -387,9 +401,7 @@ def run_case_broadcast(
         )
 
         # Test no-affine variant
-        y_dev_no_affine = sgl_kernel.fused_layernorm_scale_shift_no_affine(
-            x, scale, shift
-        )
+        y_dev_no_affine = fused_layernorm_scale_shift(x, None, None, scale, shift, eps)
         y_ln32_no_affine = (x32 - mean) * inv_std
         y_gt_no_affine = (y_ln32_no_affine * (1.0 + s32) + sh32).to(dtype)
         torch.testing.assert_close(
@@ -397,8 +409,8 @@ def run_case_broadcast(
         )
 
     # Test residual + gate + fused
-    y_dev_res, res_out_dev = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-        residual, x, weight, bias, scale, shift, gate
+    y_dev_res, res_out_dev = fused_scale_residual_layernorm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, eps
     )
 
     # Reference
@@ -570,6 +582,23 @@ def test_residual_gate_3d_scalar(dtype, B, S, N):
     torch.backends.cudnn.allow_tf32 = True
     y_dev, residual_out_dev, y_ref, residual_ref = run_case_residual_gate_3d_scalar(
         dtype=dtype, B=B, S=S, N=N, eps=1e-5
+    )
+    torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(
+        residual_out_dev, residual_ref, atol=_tol(dtype), rtol=_tol(dtype)
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("B,S,N", [(1, 32760, 1536)])
+def test_residual_gate_3d_scalar_no_affine(dtype, B, S, N):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.cuda.manual_seed(0)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    y_dev, residual_out_dev, y_ref, residual_ref = (
+        run_case_residual_gate_3d_scalar_no_affine(dtype=dtype, B=B, S=S, N=N, eps=1e-5)
     )
     torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
     torch.testing.assert_close(
