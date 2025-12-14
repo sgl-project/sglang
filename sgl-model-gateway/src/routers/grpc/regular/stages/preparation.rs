@@ -8,10 +8,12 @@ use axum::response::Response;
 use tracing::error;
 
 use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{RequestContext, RequestType},
+use crate::routers::{
     error as grpc_error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{RequestContext, RequestType},
+    },
 };
 
 /// Preparation stage (delegates to endpoint-specific implementations)
@@ -47,6 +49,7 @@ impl PipelineStage for PreparationStage {
                     "RequestType::Responses reached regular preparation stage"
                 );
                 Err(grpc_error::internal_error(
+                    "responses_in_wrong_pipeline",
                     "RequestType::Responses reached regular preparation stage",
                 ))
             }

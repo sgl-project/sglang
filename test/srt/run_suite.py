@@ -167,8 +167,10 @@ suites = {
         TestFile("test_disaggregation_pp.py", 140),
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
+    "per-commit-4-gpu-b200-stage-b": [
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),  # Stage B test
+    ],
     "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         TestFile("test_flash_attention_4.py", 90),
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
@@ -361,6 +363,7 @@ suite_xpu = {
 suite_ascend = {
     "per-commit-1-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),

@@ -472,7 +472,7 @@ class Req:
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
-        reasoning: bool = False,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -518,8 +518,8 @@ class Req:
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
-        # For reasoning
-        self.reasoning = reasoning
+        # Require reasoning for the request (hybrid reasoning model only)
+        self.require_reasoning = require_reasoning
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -677,6 +677,7 @@ class Req:
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
+        self.retraction_mb_id = None
 
         # For metrics
         self.metrics_collector = metrics_collector
@@ -1608,6 +1609,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def retract_decode(
         self,
         server_args: ServerArgs,
+        buf_multiplier: int = 1,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1629,7 +1631,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         first_iter = True
         while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
+            not self.check_decode_mem(
+                selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+            )
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -1792,6 +1796,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
+        # FIXME(lsyin): deprecate this API after spec v1 is deprecated
+        v1_spec_info_filtered: Optional[bool] = False,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
@@ -1848,11 +1854,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        # NOTE: spec_info filtered before batch filtering only happens in:
+        # - Spec v1's verify phase
+        # - Only for decode batch (running_batch)
+        has_been_filtered = v1_spec_info_filtered and not self.is_v2_eagle
+
         if self.spec_info:
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
-            else:
-                has_been_filtered = True
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
