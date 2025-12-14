@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
@@ -120,6 +120,42 @@ def gemma_rmsnorm(
         enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
+
+
+def scale_residual_norm_scale_shift(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor | None,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+    norm_type: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Fused kernel: scale_residual_norm_scale_shift.
+
+    1. residual_out = residual + gate * x
+    2. normalized = norm(residual_out)
+    3. modulated = (1 + scale) * normalized + shift.
+
+    Returns
+    -------
+    output: Tuple[torch.Tensor, torch.Tensor]
+        Modulated tensor, shape (batch_size, seq_len, hidden_dim);
+        Residual Output tensor, shape (batch_size, seq_len, hidden_dim).
+    """
+    return torch.ops.sgl_kernel.scale_residual_norm_scale_shift(
+        residual,
+        x,
+        gate,
+        weight,
+        bias,
+        scale,
+        shift,
+        eps,
+        norm_type == "rms",
+    )
 
 
 def gemma_fused_add_rmsnorm(
