@@ -116,6 +116,7 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            load_aware_fallback_threshold: 5,
         };
         self
     }
