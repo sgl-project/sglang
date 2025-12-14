@@ -3,7 +3,10 @@ import os
 
 import gradio as gr
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import post_process_sample
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -26,6 +29,8 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
         prompt,
         negative_prompt,
         seed,
+        num_frames,
+        frames_per_second,
         width,
         height,
         num_inference_steps,
@@ -35,12 +40,14 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
         """
         NOTE: The input and output of function which is called by gradio button must be gradio components
         So we use global variable sampling_params_kwargs to avoid pass this param, because gradio does not support this.
-        return PIL.Image.Image | np.ndarray
+        return [ np.ndarray, None ] | [None, np.ndarray]
         """
         sampling_params_kwargs = dict(
             prompt=prompt,
             negative_prompt=negative_prompt,
             seed=seed,
+            num_frames=num_frames,
+            fps=frames_per_second,
             width=width,
             height=height,
             guidance_scale=guidance_scale,
@@ -65,13 +72,18 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
             batch.save_output,
             save_file_path,
         )
-        return frames[0]
+        if batch.data_type == DataType.VIDEO:
+            # gradio video need video path to show video
+            return None, save_file_path
+        else:
+            return frames[0], None
 
     with gr.Blocks() as demo:
         gr.Markdown("# 🚀 SGLang Diffusion Application")
 
         with gr.Row():
             with gr.Column():
+                launched_model = gr.Textbox(label="Model", value=server_args.model_path)
                 prompt = gr.Textbox(label="Prompt", value="A curious raccoon")
                 negative_prompt = gr.Textbox(
                     label="Negative_prompt",
@@ -83,8 +95,14 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
         with gr.Row():
             with gr.Column():
                 seed = gr.Number(label="seed", precision=0, value=1234)
-                width = gr.Number(label="width", precision=0, value=1280)
-                height = gr.Number(label="height", precision=0, value=720)
+                num_frames = gr.Slider(
+                    minimum=17, maximum=161, value=33, step=1, label="num_frames"
+                )
+                frames_per_second = gr.Slider(
+                    minimum=4, maximum=60, value=16, step=1, label="num_frames"
+                )
+                width = gr.Number(label="width", precision=0, value=720)
+                height = gr.Number(label="height", precision=0, value=480)
                 num_inference_steps = gr.Slider(
                     minimum=0, maximum=50, value=20, step=1, label="num_inference_steps"
                 )
@@ -94,9 +112,13 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
                 )
                 enable_teacache = gr.Checkbox(label="enable_teacache", value=False)
 
-            image_out = gr.Image(
-                label="Generated Image",
-            )
+            with gr.Tabs() as tabs:
+                with gr.TabItem("Image output", id=1):
+                    image_out = gr.Image(
+                        label="Generated Image",
+                    )
+                with gr.TabItem("Video output", id=2):
+                    video_out = gr.Video(label="Generated Video")
 
         run_btn.click(
             fn=gradio_generate,
@@ -104,13 +126,15 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
                 prompt,
                 negative_prompt,
                 seed,
+                num_frames,
+                frames_per_second,
                 width,
                 height,
                 num_inference_steps,
                 guidance_scale,
                 enable_teacache,
             ],
-            outputs=[image_out],
+            outputs=[image_out, video_out],
         )
 
     demo.launch(server_port=server_args.webui_port)
