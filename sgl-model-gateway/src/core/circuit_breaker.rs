@@ -53,6 +53,24 @@ impl std::fmt::Display for CircuitState {
     }
 }
 
+impl CircuitState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+
+    pub fn to_int(&self) -> u8 {
+        match self {
+            CircuitState::Closed => 0u8,
+            CircuitState::Open => 1u8,
+            CircuitState::HalfOpen => 2u8,
+        }
+    }
+}
+
 /// Circuit breaker implementation
 #[derive(Debug)]
 pub struct CircuitBreaker {
@@ -196,16 +214,8 @@ impl CircuitBreaker {
                 }
             }
 
-            let from = match old_state {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            let to = match new_state {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
+            let from = old_state.as_str();
+            let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
         }
     }
