@@ -667,23 +667,17 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.cache_seqlens_int32 += (
                     expanded_last_page_lens
                 )
-                decode_length = self.speculative_step_id + 1
-                expand_page_table = cache_loc[:, :decode_length].clone()
-                strided_indices_expand = torch.arange(
-                    0,
-                    decode_length,
-                    self.page_size,
-                    device=self.device,
+                # NOTE: also consider the partial page at the end of decode_length
+                max_pages_expand = (
+                    int(decode_length + 2 * self.page_size - 1) // self.page_size
                 )
-                last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(-1).expand(
-                    -1, expand_page_table.shape[1]
+                page_base = (cache_loc[:, 0] // self.page_size).to(torch.int32)
+                page_offsets = torch.arange(
+                    max_pages_expand, device=page_base.device, dtype=torch.int32
                 )
-                expand_page_table -= last_page_lens_broadcast
-                expand_page_table = (
-                    expand_page_table[:, strided_indices_expand] // self.page_size
-                )
+                expand_page_table = page_base[:, None] + page_offsets[None, :]
                 self.forward_metadata_spec_decode_expand.page_table = (
-                    expand_page_table.to(torch.int32)
+                    expand_page_table.contiguous()
                 )
 
         self.forward_metadata = metadata
