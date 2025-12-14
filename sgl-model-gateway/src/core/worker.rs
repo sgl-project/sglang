@@ -649,11 +649,18 @@ impl Worker for BasicWorker {
     }
 
     fn decrement_load(&self) {
-        self.load_counter
+        if self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
-            .ok();
+            .is_err()
+        {
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                "Attempted to decrement load counter that is already at 0"
+            );
+        }
         self.update_running_requests_metrics();
     }
 
