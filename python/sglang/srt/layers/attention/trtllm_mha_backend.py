@@ -41,44 +41,30 @@ global_zero_init_workspace_buffer = None
 
 def _get_trtllm_mha_workspace_size(
     default_mb: int = DEFAULT_WORKSPACE_SIZE_MB,
-) -> tuple[int, bool, Optional[int]]:
+) -> tuple[int, bool, Optional[float]]:
     """
     Get workspace size for TRTLLM MHA backend.
 
-    This function handles the case where FlashInferAttnBackend.__init__() may override
-    the user-set environment variable. It preserves the user's setting if they explicitly
-    set SGLANG_FLASHINFER_WORKSPACE_SIZE.
+    Preserves user's SGLANG_FLASHINFER_WORKSPACE_SIZE setting even if it gets
+    overridden by FlashInferAttnBackend.__init__().
 
     Args:
         default_mb: Default workspace size in MB for TRTLLM MHA (default: 512 MB)
 
     Returns:
-        tuple: (workspace_size_bytes, user_env_var_set, user_env_var_value_mb)
-            - workspace_size_bytes: The workspace size in bytes to use
-            - user_env_var_set: Whether user explicitly set the environment variable
-            - user_env_var_value_mb: User's environment variable value in MB (None if not set)
+        tuple: (workspace_size_bytes, is_user_set, user_value_mb)
     """
-    # Check if user explicitly set the environment variable before super().__init__()
-    # because FlashInferAttnBackend.__init__() may override it
-    user_env_var_set = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.is_set()
-    user_env_var_value = (
-        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() if user_env_var_set else None
-    )
+    env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
+    is_user_set = env_var.is_set()
+    user_value_bytes = env_var.get() if is_user_set else None
+    default_bytes = default_mb * 1024 * 1024
 
-    default_workspace_size_bytes = default_mb * 1024 * 1024
+    if is_user_set and user_value_bytes is not None:
+        # Preserve user's setting (may be overridden by super().__init__())
+        env_var.set(user_value_bytes)
+        return user_value_bytes, True, user_value_bytes / (1024 * 1024)
 
-    if user_env_var_set and user_env_var_value is not None:
-        # User explicitly set the environment variable, use their value
-        # Restore it in case it was overridden by super().__init__()
-        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(user_env_var_value)
-        workspace_size_bytes = user_env_var_value
-        user_env_var_value_mb = user_env_var_value / (1024 * 1024)
-    else:
-        # Environment variable not set, use TRTLLM MHA default
-        workspace_size_bytes = default_workspace_size_bytes
-        user_env_var_value_mb = None
-
-    return workspace_size_bytes, user_env_var_set, user_env_var_value_mb
+    return default_bytes, False, None
 
 
 @dataclass
