@@ -380,7 +380,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 ]
 
 TWO_GPU_CASES_A = [
-    # TODO: Timeout with Torch2.9. Add back when it can pass CI
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
