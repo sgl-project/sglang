@@ -137,12 +137,21 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
             outputs=[image_out, video_out],
         )
 
-    delimiter = "=" * 80
-    print(delimiter)
-    print(
-        f"SGLang Diffusion WebUI available at"
-        f"\033[36mhttp://0.0.0.0:{server_args.webui_port}\033[0m"
-    )
-    print(delimiter)
+        _, local_url, _ = demo.launch(
+            server_port=server_args.webui_port,
+            quiet=True,
+            prevent_thread_lock=True,
+        )
 
-    demo.launch(server_port=server_args.webui_port, quiet=True)
+        # print banner
+        delimiter = "=" * 80
+        url = local_url or f"http://localhost:{server_args.webui_port}"
+        print(
+            f"""
+{delimiter}
+\033[1mSGLang Diffusion WebUI available at:\033[0m \033[1;4;92m{url}\033[0m
+{delimiter}
+"""
+        )
+
+        demo.block_thread()
