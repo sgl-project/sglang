@@ -370,6 +370,125 @@ class FlashAttentionBackend(AttentionBackend):
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
 
+    def _assert_kvcache_indices_safe(
+        self,
+        page_table: Optional[torch.Tensor],
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        context: str,
+    ):
+        # Guard against invalid block indices before launching the kernel.
+        if page_table is None or page_table.numel() == 0:
+            return
+        total_pages = min(key_cache.shape[0], value_cache.shape[0])
+        max_idx = torch.amax(page_table).item()
+        min_idx = torch.amin(page_table).item()
+        if min_idx < 0 or max_idx >= total_pages:
+            raise RuntimeError(
+                f"[{context}] page_table indices out of bounds: "
+                f"min={min_idx}, max={max_idx}, total_pages={total_pages}"
+            )
+
+    def _flash_attn_with_kvcache_safe(self, context: str, **kwargs):
+        self._assert_kvcache_indices_safe(
+            kwargs.get("page_table"), kwargs["k_cache"], kwargs["v_cache"], context
+        )
+        self.check_fa_inputs(context, **kwargs)
+        return flash_attn_with_kvcache(**kwargs)
+
+    def check_fa_inputs(
+        self,
+        context,
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k_new,
+        max_seqlen_q,
+        **kwargs,
+    ):
+        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+
+        def req(cond, msg):
+            if not cond:
+                raise RuntimeError(f"[{context}] {msg}")
+
+        # device/dtype
+        req(q.is_cuda, f"q not cuda: {q.device}")
+        dev = q.device
+        for name, t in [
+            ("k_cache", k_cache),
+            ("v_cache", v_cache),
+            ("page_table", page_table),
+            ("cache_seqlens", cache_seqlens),
+            ("cu_seqlens_q", cu_seqlens_q),
+            ("cu_seqlens_k_new", cu_seqlens_k_new),
+        ]:
+            req(t.is_cuda, f"{name} not cuda")
+            req(t.device == dev, f"{name} device mismatch: {t.device} vs {dev}")
+            req(t.is_contiguous(), f"{name} not contiguous: stride={t.stride()}")
+
+        req(cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32")
+        req(cu_seqlens_k_new.dtype == torch.int32, "cu_seqlens_k_new must be int32")
+        req(
+            cache_seqlens.dtype in (torch.int32, torch.int64),
+            "cache_seqlens must be int32/int64",
+        )
+        req(
+            page_table.dtype in (torch.int32, torch.int64),
+            "page_table must be int32/int64",
+        )
+
+        B = cache_seqlens.numel()
+        req(
+            cu_seqlens_q.numel() == B + 1,
+            f"cu_seqlens_q numel {cu_seqlens_q.numel()} != B+1 {B+1}",
+        )
+        req(cu_seqlens_k_new.numel() == B + 1, f"cu_seqlens_k_new numel mismatch")
+        req(page_table.shape[0] == B, f"page_table batch {page_table.shape[0]} != {B}")
+
+        # monotonic check (copy small int arrays to cpu)
+        cq = cu_seqlens_q.detach().cpu()
+        ck = cu_seqlens_k_new.detach().cpu()
+        cs = cache_seqlens.detach().cpu()
+        print(f"[check fa inputs] {context}: {B=}, {cq=}, {ck=}, {cs=}")
+
+        req(int(cq[0]) == 0, "cu_seqlens_q[0] != 0")
+        req(int(ck[0]) == 0, "cu_seqlens_k_new[0] != 0")
+        req((cq[1:] - cq[:-1] >= 0).all(), "cu_seqlens_q not non-decreasing")
+        req((ck[1:] - ck[:-1] >= 0).all(), "cu_seqlens_k_new not non-decreasing")
+
+        # max_seqlen_q sanity: should be >= max(q_len)
+        q_lens = (cq[1:] - cq[:-1]).to(torch.int64)
+        req(
+            int(q_lens.max()) <= int(max_seqlen_q),
+            f"max_seqlen_q {max_seqlen_q} < max(q_len) {int(q_lens.max())}",
+        )
+
+        # page table value-range check for the actually-needed pages
+        pt = page_table.detach().cpu()
+        for i in range(B):
+            L = int(cs[i])
+            req(L >= 0, f"cache_seqlens[{i}] < 0")
+            need_pages = (L + self.page_size - 1) // self.page_size if L > 0 else 0
+            print(f"[check fa inputs] {i=}, {L=}")
+            req(
+                need_pages <= pt.shape[1],
+                f"need_pages {need_pages} > page_table width {pt.shape[1]}",
+            )
+            if need_pages > 0:
+                ids = pt[i, :need_pages].to(torch.int64)
+                req(
+                    (ids >= 0).all(),
+                    f"page_table[{i},:need] has negative ids: {ids.min().item()}",
+                )
+                req(
+                    (ids < max_num_pages).all(),
+                    f"page_table[{i},:need] id OOR: max {ids.max().item()} >= {max_num_pages}",
+                )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -1166,7 +1285,8 @@ class FlashAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        self._flash_attn_with_kvcache_safe(
+                            context="decode_self_attn_cascade_expand",
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
