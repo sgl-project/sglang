@@ -293,7 +293,9 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
+
             if messages[0]["role"] != "system":
+                # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
