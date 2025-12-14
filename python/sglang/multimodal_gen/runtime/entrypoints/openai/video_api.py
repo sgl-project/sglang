@@ -166,7 +166,7 @@ async def create_video(
             input_reference=input_path,
             model=model,
             seconds=seconds if seconds is not None else 4,
-            size=size or "720x1280",
+            size=size,
             fps=fps_val,
             num_frames=num_frames_val,
         )
