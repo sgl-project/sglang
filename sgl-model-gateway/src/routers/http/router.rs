@@ -19,7 +19,8 @@ use tracing::{debug, error};
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType, WorkerLoadGuardV2,
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuardV2,
+        WorkerRegistry, WorkerType,
     },
     observability::{
         events::{self, Event},
@@ -527,7 +528,9 @@ impl Router {
                     match chunk {
                         Ok(bytes) => {
                             // Check for stream end marker using memmem for efficiency
-                            if load_guard.is_some() && memmem::find(&bytes, b"data: [DONE]").is_some() {
+                            if load_guard.is_some()
+                                && memmem::find(&bytes, b"data: [DONE]").is_some()
+                            {
                                 load_guard = None;
                             }
                             if tx.send(Ok(bytes)).is_err() {
@@ -625,6 +628,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
+
 use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
