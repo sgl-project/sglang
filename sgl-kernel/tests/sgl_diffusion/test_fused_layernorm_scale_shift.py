@@ -1,3 +1,5 @@
+from typing import Optional
+
 import pytest
 import torch
 from sgl_kernel import (
@@ -10,8 +12,8 @@ from sgl_kernel import (
 @torch.no_grad()
 def fused_layernorm_scale_shift_ref(
     x: torch.Tensor,
-    weight: torch.Tensor | None,
-    bias: torch.Tensor | None,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
     scale: torch.Tensor,
     shift: torch.Tensor,
     eps: float,
@@ -50,8 +52,8 @@ def fused_scale_residual_layernorm_scale_shift_ref(
     residual: torch.Tensor,
     x: torch.Tensor,
     gate: torch.Tensor | int,
-    weight: torch.Tensor | None,
-    bias: torch.Tensor | None,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
     scale: torch.Tensor,
     shift: torch.Tensor,
     eps: float,
