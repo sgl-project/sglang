@@ -1282,9 +1282,9 @@ class ServerArgs:
                 self.disable_overlap_schedule = True
                 if is_sm100_supported():
                     if self.attention_backend is None:
-                        self.attention_backend = "triton"
+                        self.attention_backend = "flashinfer"
                         logger.info(
-                            f"Use triton as attention backend on sm100 for {model_arch}"
+                            "Use flashinfer as attention backend on sm100 for NemotronHForCausalLM"
                         )
                     if self.attention_backend == "trtllm_mha":
                         logger.warning(
@@ -1293,6 +1293,10 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
+            assert self.attention_backend != "triton", (
+                "NemotronHForCausalLM does not support triton attention backend,"
+                "as the first layer might not be an attention layer"
+            )
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
