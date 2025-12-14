@@ -263,7 +263,14 @@ def make_local_attention_virtual_batches(
         np.arange(actual_batch_size, dtype=np.int32),
         local_blocks * pages_per_local_batch,
     )
-    block_table_local = block_table[batch_indices, block_indices].view(
+
+    # NOTE: https://github.com/pytorch/pytorch/pull/160256 causes performance
+    # regression when using numpy arrays (batch and block indices) to index into
+    # torch tensor (block_table). As a workaround, convert numpy arrays to torch
+    # tensor first, which recovers perf.
+    batch_indices_torch = torch.from_numpy(batch_indices)
+    block_indices_torch = torch.from_numpy(block_indices)
+    block_table_local = block_table[batch_indices_torch, block_indices_torch].view(
         virtual_batches, -1
     )
 
@@ -328,8 +335,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
-        self.is_hybrid = model_runner.is_hybrid
-        if self.is_hybrid:
+        self.is_hybrid_swa = model_runner.is_hybrid_swa
+        if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
             )
@@ -720,10 +727,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa = (
+        is_hybrid_swa = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_swa else (-1, -1)
+        window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -759,7 +766,7 @@ class FlashAttentionBackend(AttentionBackend):
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
-            and not is_swa
+            and not is_hybrid_swa
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
@@ -776,7 +783,7 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
-        elif is_swa and metadata.swa_spec_metadata is not None:
+        elif is_hybrid_swa and metadata.swa_spec_metadata is not None:
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
             cu_seqlens_q = swa_spec_metadata.cu_seqlens_q
@@ -2079,7 +2086,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             page_table = self.full_to_swa_index_mapping[metadata.page_table].to(
                 torch.int32
             )
@@ -2203,7 +2210,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             sliced_page_table = self.full_to_swa_index_mapping[
                 metadata.page_table[:bs, :max_seq_len]
             ].to(torch.int32)

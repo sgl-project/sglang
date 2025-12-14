@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -38,9 +39,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
-
-_is_npu = is_npu()
+from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -69,6 +68,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
 
+    # Shape info for padding
+    num_tokens_per_batch: int = -1
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
 
@@ -77,22 +79,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
-        if not _is_npu:
-            device = "cuda"
-        else:
-            device = "npu"
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device=device),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
-            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
+            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
             retrive_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_cum_len=None,
             topk=topk,
@@ -186,6 +184,25 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kv_indices,
             req_to_token.size(1),
         )
+        mask_numel = (
+            paged_kernel_lens_sum * self.draft_token_num
+            + (self.draft_token_num**2) * batch_size
+        )
+        if self.custom_mask.numel() < mask_numel:
+            # FIXME(attn): temporary fix for custom mask padding with cuda graph
+            self.custom_mask = torch.cat(
+                [
+                    self.custom_mask,
+                    torch.full(
+                        (mask_numel - self.custom_mask.numel(),),
+                        True,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ],
+                dim=0,
+            )
+
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(
@@ -282,7 +299,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(
@@ -738,13 +755,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
+            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
             if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-                )
+                if strict_check:
+                    raise ValueError(error_msg)
+                else:
+                    logger.warning(error_msg)
+
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]

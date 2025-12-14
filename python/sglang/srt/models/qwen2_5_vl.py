@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
+import re
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -57,7 +58,10 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -66,10 +70,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import permute_inv
+from sglang.srt.models.utils import RotaryPosMixin, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +168,9 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        output_ws=None,
     ) -> torch.Tensor:
+        ws = output_ws
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
         x2d = x.reshape(-1, H)
@@ -175,6 +182,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            output_ws=ws,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -243,7 +251,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen2_5_VisionTransformer(nn.Module):
+class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
     def __init__(
         self,
@@ -252,6 +260,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        max_context_len: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -303,6 +312,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
         )
+
+        # Resource prepared for vit cuda graph
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.max_context_len = max_context_len
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
 
     def get_window_index(self, grid_thw):
         cu_window_seqlens: list = [0]
@@ -359,30 +375,10 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         pos_ids = []
-        for i in range(grid_thw.size(0)):
-            t, h, w = grid_thw[i].tolist()
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+        for t, h, w in grid_thw:
+            base = self.rot_pos_ids(h, w, self.spatial_merge_size)
+            pos_ids.append(base if t == 1 else base.repeat(t, 1))
 
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-            hpos_ids = hpos_ids.flatten()
-
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-            wpos_ids = wpos_ids.flatten()
-
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = grid_thw[:, 1:].max()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
@@ -394,6 +390,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+            return self.forward_with_cuda_graph(x, grid_thw)
+
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -462,6 +461,72 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         return x
 
+    def forward_with_cuda_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        # compute position embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=x.device,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+
+        window_index = window_index.to(device=x.device)
+        reverse_indices = permute_inv(window_index)
+        rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
+
+        # patch token num
+        seq_len, _ = x.size()
+
+        # [G, M, hidden]
+        x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        x = x[window_index, :, :]  # [G, M, hidden]
+        x = x.reshape(seq_len, -1)  # [seq_len, hidden]
+
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        # After building position_embeddings, make sure both cos and sin are on
+        # the same device/dtype as the attention input
+        position_embeddings = (
+            position_embeddings[0].to(x.device, x.dtype),
+            position_embeddings[1].to(x.device, x.dtype),
+        )
+
+        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        cu_seqlens = torch.cat(
+            [
+                torch.tensor([0], device=x.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(device=x.device, dtype=torch.int32),
+            ]
+        )
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+
+        return self.cuda_graph_runner.run(
+            x=x,
+            position_embeddings=position_embeddings,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=cu_window_seqlens,
+            output_indices=reverse_indices,
+        )
+
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
@@ -501,6 +566,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
+            max_context_len=self.config.max_position_embeddings,
         )
 
         self.model = Qwen2Model(
@@ -550,6 +616,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         else:
             image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
+
+    _lora_pattern = re.compile(
+        r"^model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
@@ -624,21 +697,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        input_embeds = forward_batch.input_embeds
-        # It may seem strange to assign input_embeds again even after passing it as an argument.
-        # This is for compatibility considerations.
-        # In the 'extend' scenario, this forward function is called from two places:
-        # 1. model_runner calls forward directly,
-        # 2. piece_wise_cuda_graph_runner calls forward and replay.
-
-        # Currently,
-        # In 'extend', input_embeds is passed in.
-        # In 'decode', input_ids is passed in.
-
-        hidden_states = self.model(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            language_model=self.model,
+            multimodal_model=self,
             positions=positions,
             pp_proxy_tensors=pp_proxy_tensors,
         )
@@ -715,7 +778,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                     else:
-                        continue
+                        raise ValueError(f"Weight {name} not found in params_dict")
                 except KeyError:
                     print(params_dict.keys())
                     raise

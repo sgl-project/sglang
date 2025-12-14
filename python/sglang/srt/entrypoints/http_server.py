@@ -25,16 +25,22 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
-
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Union,
+)
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 import numpy as np
 import orjson
@@ -72,6 +78,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -118,21 +125,23 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
-from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
+# Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
@@ -153,8 +162,15 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 
+def get_global_state() -> _GlobalState:
+    return _global_state
+
+
 async def init_multi_tokenizer() -> ServerArgs:
-    """Read args information from shm and init tokenizer manager for current process"""
+    """
+    Initialization function for multi-process tokenizer mode.
+    It read args information from shm and inits tokenizer manager for current process.
+    """
 
     # Read configuration from shared memory
     main_pid = get_main_process_id()
@@ -205,16 +221,12 @@ async def init_multi_tokenizer() -> ServerArgs:
 async def lifespan(fast_api_app: FastAPI):
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
-        warmup_thread_args = fast_api_app.warmup_thread_args
+        warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
         thread_label = "Tokenizer"
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        warmup_thread_args = (
-            server_args,
-            None,
-            None,
-        )
+        warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
     # Add prometheus middleware
@@ -297,7 +309,7 @@ async def lifespan(fast_api_app: FastAPI):
     # Execute the general warmup
     warmup_thread = threading.Thread(
         target=_wait_and_warmup,
-        args=warmup_thread_args,
+        kwargs=warmup_thread_kwargs,
     )
     warmup_thread.start()
 
@@ -433,8 +445,9 @@ async def health_generate(request: Request) -> Response:
     rid = f"HEALTH_CHECK_{time.time()}"
 
     if _global_state.tokenizer_manager.is_image_gen:
-        # Keep this branch for some internal use cases.
-        raise NotImplementedError("Image generation is not supported yet.")
+        gri = _global_state.tokenizer_manager.get_image_gen_health_check_request(
+            rid, sampling_params
+        )
     elif _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
@@ -497,14 +510,17 @@ async def get_model_info():
 @app.get("/model_info")
 async def model_info():
     """Get the model information."""
+    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
-        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
-        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "model_type": getattr(model_config.hf_config, "model_type", None),
+        "architectures": getattr(model_config.hf_config, "architectures", None),
     }
     return result
 
@@ -693,6 +709,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
         profile_prefix=obj.profile_prefix,
+        profile_stages=obj.profile_stages,
     )
     return Response(
         content="Start profiling.\n",
@@ -1361,103 +1378,6 @@ def _create_error_response(e):
     )
 
 
-def launch_server(
-    server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
-    launch_callback: Optional[Callable[[], None]] = None,
-):
-    """
-    Launch SRT (SGLang Runtime) Server.
-
-    The SRT server consists of an HTTP server and an SRT engine.
-
-    - HTTP server: A FastAPI server that routes requests to the engine.
-    - The engine consists of three components:
-        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
-
-    Note:
-    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
-    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
-    """
-    tokenizer_manager, template_manager, scheduler_info, port_args = (
-        _launch_subprocesses(server_args=server_args)
-    )
-
-    set_global_state(
-        _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=template_manager,
-            scheduler_info=scheduler_info,
-        )
-    )
-
-    # Pass additional arguments to the lifespan function.
-    # They will be used for additional initialization setups.
-    if server_args.tokenizer_worker_num == 1:
-        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
-        app.is_single_tokenizer_mode = True
-        app.server_args = server_args
-        app.warmup_thread_args = (
-            server_args,
-            pipe_finish_writer,
-            launch_callback,
-        )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        if server_args.api_key:
-            add_api_key_middleware(app, server_args.api_key)
-    else:
-        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
-        # for other worker processes to read.
-        app.is_single_tokenizer_mode = False
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_info
-        )
-
-    try:
-        # Update logging configs
-        set_uvicorn_logging_configs()
-
-        # Listen for HTTP requests
-        if server_args.tokenizer_worker_num == 1:
-            uvicorn.run(
-                app,
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-            )
-        else:
-            from uvicorn.config import LOGGING_CONFIG
-
-            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
-                "handlers": ["default"],
-                "level": "INFO",
-                "propagate": False,
-            }
-            monkey_patch_uvicorn_multiprocessing()
-
-            uvicorn.run(
-                "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
-                workers=server_args.tokenizer_worker_num,
-            )
-    finally:
-        if server_args.tokenizer_worker_num > 1:
-            multi_tokenizer_args_shm.unlink()
-            _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
-
-
 # Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
@@ -1493,9 +1413,8 @@ def _execute_server_warmup(
 
     model_info = res.json()
 
+    # Construct a warmup request
     is_vlm = bool(model_info.get("has_image_understanding", False))
-
-    # Send a warmup request
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
@@ -1546,7 +1465,7 @@ def _execute_server_warmup(
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
-    # Debug dumping
+    # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
         json_data.pop("text", None)
         json_data["input_ids"] = np.load(
@@ -1554,8 +1473,9 @@ def _execute_server_warmup(
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
+    # Send a warmup request
+    warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
-        warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
         if server_args.disaggregation_mode == "null":
             res = requests.post(
                 url + request_name,
@@ -1619,13 +1539,16 @@ def _execute_server_warmup(
 
 def _wait_and_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
     launch_callback: Optional[Callable[[], None]] = None,
+    execute_warmup_func: Callable = _execute_server_warmup,
 ):
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
+
+    # Send a warmup request
     if not server_args.skip_server_warmup:
-        if not _execute_server_warmup(
+        if not execute_warmup_func(
             server_args,
             pipe_finish_writer,
         ):
@@ -1633,6 +1556,7 @@ def _wait_and_warmup(
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
 
     if pipe_finish_writer is not None:
@@ -1667,3 +1591,106 @@ def _wait_weights_ready():
         f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
         f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
     )
+
+
+def launch_server(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
+    launch_subprocesses_func: Callable = _launch_subprocesses,
+    execute_warmup_func: Callable = _execute_server_warmup,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """
+    Launch SRT (SGLang Runtime) Server.
+
+    The SRT server consists of an HTTP server and an SRT engine.
+
+    - HTTP server: A FastAPI server that routes requests to the engine.
+    - The engine consists of three components:
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
+    """
+    tokenizer_manager, template_manager, scheduler_info, port_args = (
+        launch_subprocesses_func(server_args=server_args)
+    )
+
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_info,
+        )
+    )
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
+
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    if server_args.tokenizer_worker_num == 1:
+        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+        app.is_single_tokenizer_mode = True
+        app.server_args = server_args
+        app.warmup_thread_kwargs = dict(
+            server_args=server_args,
+            pipe_finish_writer=pipe_finish_writer,
+            launch_callback=launch_callback,
+            execute_warmup_func=execute_warmup_func,
+        )
+
+        # Add api key authorization
+        # This is only supported in single tokenizer mode.
+        if server_args.api_key:
+            add_api_key_middleware(app, server_args.api_key)
+    else:
+        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+        # for other worker processes to read.
+        app.is_single_tokenizer_mode = False
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args, server_args, scheduler_info
+        )
+
+    try:
+        # Update logging configs
+        set_uvicorn_logging_configs()
+
+        # Listen for HTTP requests
+        if server_args.tokenizer_worker_num == 1:
+            uvicorn.run(
+                app,
+                host=server_args.host,
+                port=server_args.port,
+                root_path=server_args.fastapi_root_path,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+            )
+        else:
+            from uvicorn.config import LOGGING_CONFIG
+
+            LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            }
+            monkey_patch_uvicorn_multiprocessing()
+
+            uvicorn.run(
+                "sglang.srt.entrypoints.http_server:app",
+                host=server_args.host,
+                port=server_args.port,
+                root_path=server_args.fastapi_root_path,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+                workers=server_args.tokenizer_worker_num,
+            )
+    finally:
+        if server_args.tokenizer_worker_num > 1:
+            multi_tokenizer_args_shm.unlink()
+            _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()

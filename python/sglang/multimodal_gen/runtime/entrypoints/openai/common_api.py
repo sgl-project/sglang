@@ -37,26 +37,61 @@ async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
 async def set_lora(
     lora_nickname: str = Body(..., embed=True),
     lora_path: Optional[str] = Body(None, embed=True),
+    target: str = Body("all", embed=True),
 ):
-    req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
+    """
+    Set a LoRA adapter for the specified transformer(s).
+
+    Args:
+        lora_nickname: The nickname of the adapter.
+        lora_path: Path to the LoRA adapter (local path or HF repo id).
+        target: Which transformer(s) to apply the LoRA to. One of:
+            - "all": Apply to all transformers (default)
+            - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
+            - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
+            - "critic": Apply only to the critic model
+    """
+    req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path, target=target)
     return await _handle_lora_request(
         req,
-        f"Successfully set LoRA adapter: {lora_nickname}",
+        f"Successfully set LoRA adapter: {lora_nickname} (target: {target})",
         "Failed to set LoRA adapter",
     )
 
 
 @router.post("/merge_lora_weights")
-async def merge_lora_weights():
-    req = MergeLoraWeightsReq()
+async def merge_lora_weights(
+    target: str = Body("all", embed=True),
+):
+    """
+    Merge LoRA weights into the base model.
+
+    Args:
+        target: Which transformer(s) to merge. One of "all", "transformer",
+                "transformer_2", "critic".
+    """
+    req = MergeLoraWeightsReq(target=target)
     return await _handle_lora_request(
-        req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
+        req,
+        f"Successfully merged LoRA weights (target: {target})",
+        "Failed to merge LoRA weights",
     )
 
 
 @router.post("/unmerge_lora_weights")
-async def unmerge_lora_weights():
-    req = UnmergeLoraWeightsReq()
+async def unmerge_lora_weights(
+    target: str = Body("all", embed=True),
+):
+    """
+    Unmerge LoRA weights from the base model.
+
+    Args:
+        target: Which transformer(s) to unmerge. One of "all", "transformer",
+                "transformer_2", "critic".
+    """
+    req = UnmergeLoraWeightsReq(target=target)
     return await _handle_lora_request(
-        req, "Successfully unmerged LoRA weights", "Failed to unmerge LoRA weights"
+        req,
+        f"Successfully unmerged LoRA weights (target: {target})",
+        "Failed to unmerge LoRA weights",
     )

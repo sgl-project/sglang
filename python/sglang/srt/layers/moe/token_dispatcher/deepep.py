@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -13,6 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcherConfig,
     CombineInput,
     CombineInputFormat,
+    DispatcherBaseHooks,
     DispatchOutput,
     DispatchOutputFormat,
 )
@@ -25,7 +27,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_int_env_var,
+    is_blackwell,
     is_hip,
     is_npu,
     load_json_config,
@@ -34,7 +36,7 @@ from sglang.srt.utils import (
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
     from deep_ep import Buffer, Config
@@ -56,6 +58,13 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+class DeepEPPDispatchHooks(DispatcherBaseHooks):
+
+    def __call__(self, dispatcher: BaseDispatcher):
+        for hook_fun in self.hook_dict.values():
+            hook_fun(dispatcher)
 
 
 class DeepEPNormalDispatchOutput(NamedTuple):
@@ -308,8 +317,8 @@ class _DeepEPDispatcherImplBase:
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
@@ -378,7 +387,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
-            and not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH")
+            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -600,7 +609,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
+        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
 
         buffer = self._get_buffer()
@@ -660,11 +669,30 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         overlap_args = self.overlap_args
+        meta_overlap_args = self.meta_overlap_args
 
         ctx = nullcontext()
         if overlap_args is not None:
             overlap_args.stream.wait_event(overlap_args.wait_event)
             ctx = torch.cuda.stream(overlap_args.stream)
+
+            if is_blackwell():
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    src_signals=overlap_args.signal,
+                    src_signal_expect_value=overlap_args.threshold,
+                )
+            else:
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    packed_recv_count=self.packed_recv_count,
+                    comp_signal=overlap_args.signal,
+                    block_m=meta_overlap_args["block_m"],
+                    threshold=meta_overlap_args["threshold"],
+                    num_sms=overlap_args.num_sms,
+                )
+        else:
+            overlap_args_dict = {}
 
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
@@ -674,15 +702,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **(
-                    dict(
-                        overlap=overlap_args.overlap,
-                        src_signals=overlap_args.signal,
-                        src_signal_expect_value=overlap_args.threshold,
-                    )
-                    if overlap_args is not None
-                    else {}
-                ),
+                **overlap_args_dict,
             )
 
         self.packed_recv_count = self.handle = None
@@ -749,6 +769,7 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
         self._stage = _Stage.INITIAL
+        self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
     def dispatch(
         self,
@@ -756,6 +777,8 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ) -> DispatchOutput:
         self.dispatch_a(hidden_states, topk_output)
+        if self._deepep_dispatch_hooks is not None:
+            self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
         return ret
 
@@ -844,3 +867,6 @@ class DeepEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.clear_overlap_args()
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.clear_overlap_args()
+
+    def register_deepep_dispatch_hook(self, hook):
+        return self._deepep_dispatch_hooks.register_hook(hook)

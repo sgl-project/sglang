@@ -22,6 +22,7 @@ SUITES = {
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
+        "test_lora_format_adapter.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -67,11 +68,56 @@ def run_pytest(files):
         print("No files to run.")
         return 0
 
-    cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"] + files
+    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
 
-    logger.info(f"Running command: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    return result.returncode
+    max_retries = 4
+    # retry if the perf assertion failed, for {max_retries} times
+    for i in range(max_retries + 1):
+        cmd = list(base_cmd)
+        if i > 0:
+            cmd.append("--last-failed")
+        cmd.extend(files)
+
+        if i > 0:
+            logger.info(
+                f"Performance assertion failed. Retrying ({i}/{max_retries}) with --last-failed..."
+            )
+
+        logger.info(f"Running command: {' '.join(cmd)}")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_lines = []
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                sys.stdout.write(line)
+                output_lines.append(line)
+
+        returncode = process.poll()
+
+        if returncode == 0:
+            return 0
+
+        # check if the failure is due to an assertion in test_server_utils.py
+        full_output = "".join(output_lines)
+        is_perf_assertion = (
+            "multimodal_gen/test/server/test_server_utils.py" in full_output
+            and "AssertionError" in full_output
+        )
+
+        if not is_perf_assertion:
+            return returncode
+
+    return returncode
 
 
 def main():

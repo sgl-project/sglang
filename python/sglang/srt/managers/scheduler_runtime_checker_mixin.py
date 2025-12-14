@@ -3,8 +3,11 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING
+
+import psutil
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -196,15 +199,15 @@ class SchedulerRuntimeCheckerMixin:
             )
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
                 "count_req_pool_leak_warnings",
                 msg,
             )
 
     def check_memory(self: Scheduler):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+        elif self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache):
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
@@ -213,7 +216,7 @@ class SchedulerRuntimeCheckerMixin:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
                 "count_memory_leak_warnings",
                 msg,
             )
@@ -226,7 +229,7 @@ class SchedulerRuntimeCheckerMixin:
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 (
                     full_num_used,
                     swa_num_used,
@@ -239,7 +242,7 @@ class SchedulerRuntimeCheckerMixin:
                 ) = self._get_swa_token_info()
                 num_used = max(full_num_used, swa_num_used)
                 token_usage = max(full_token_usage, swa_token_usage)
-            elif self.is_hybrid_gdn:
+            elif self.is_ssm_model:
                 (
                     num_used,
                     _,
@@ -277,8 +280,8 @@ class SchedulerRuntimeCheckerMixin:
         self._publish_kv_events()
 
     def check_tree_cache(self: Scheduler):
-        if (self.is_hybrid and isinstance(self.tree_cache, SWARadixCache)) or (
-            self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache)
+        if (self.is_hybrid_swa and isinstance(self.tree_cache, SWARadixCache)) or (
+            self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache)
         ):
             self.tree_cache.sanity_check()
 
@@ -302,41 +305,63 @@ class SchedulerRuntimeCheckerMixin:
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
 
-    def watchdog_thread(self: Scheduler):
-        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
-        self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.perf_counter()
+
+class SchedulerWatchdog:
+    """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
+
+    def __init__(
+        self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
+    ):
+        self.scheduler = scheduler
+        self.soft = soft
+
+        self.watchdog_timeout = watchdog_timeout
+        t = threading.Thread(target=self._watchdog_thread, daemon=True)
+        t.start()
+        self.parent_process = psutil.Process().parent()
+
+    def _watchdog_thread(self):
+        while True:
+            self._watchdog_once()
+
+    def _watchdog_once(self):
+        watchdog_last_forward_ct = 0
+        watchdog_last_time = time.perf_counter()
 
         while True:
             current = time.perf_counter()
-            if self.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.forward_ct:
-                    if current > self.watchdog_last_time + self.watchdog_timeout:
+            if self.scheduler.cur_batch is not None:
+                if watchdog_last_forward_ct == self.scheduler.forward_ct:
+                    if current > watchdog_last_time + self.watchdog_timeout:
                         break
                 else:
-                    self.watchdog_last_forward_ct = self.forward_ct
-                    self.watchdog_last_time = current
+                    watchdog_last_forward_ct = self.scheduler.forward_ct
+                    watchdog_last_time = current
             time.sleep(self.watchdog_timeout // 2)
 
         if not disable_request_logging():
+            # TODO extract this duplicated logic w/ another place
             # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid:
-                _, info_msg = self._check_hybrid_memory()
-            elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
-                _, info_msg = self._check_mamba_memory()
+            if self.scheduler.is_hybrid_swa:
+                _, info_msg = self.scheduler._check_hybrid_memory()
+            elif self.scheduler.is_ssm_model and isinstance(
+                self.scheduler.tree_cache, MambaRadixCache
+            ):
+                _, info_msg = self.scheduler._check_mamba_memory()
             else:
-                _, info_msg = self._check_radix_cache_memory()
+                _, info_msg = self.scheduler._check_radix_cache_memory()
             logger.error(
-                f"{self.cur_batch.batch_size()=}\n"
-                f"{self.cur_batch.reqs=}\n"
+                f"{self.scheduler.cur_batch.batch_size()=}\n"
+                f"{self.scheduler.cur_batch.reqs=}\n"
                 f"{info_msg}"
             )
 
         pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+        logger.error(f"Watchdog timeout ({self.watchdog_timeout=}, {self.soft=})")
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
 
-        # Wait for some time so that the parent process can print the error.
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
+        if not self.soft:
+            # Wait for some time so that the parent process can print the error.
+            time.sleep(5)
+            self.parent_process.send_signal(signal.SIGQUIT)

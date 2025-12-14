@@ -74,6 +74,16 @@ class EnvField:
     def value(self):
         return self.get()
 
+    def __bool__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
+    def __len__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
 
 class EnvTuple(EnvField):
     def parse(self, value: str) -> tuple[str, ...]:
@@ -135,14 +145,17 @@ class Envs:
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    IS_BLACKWELL = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
+    SGLANG_PROFILE_V2 = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -160,6 +173,7 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    SGLANG_CI_SMALL_KV_SIZE = EnvInt(-1)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -180,6 +194,8 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -202,6 +218,7 @@ class Envs:
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+    ASCEND_NPU_PHY_ID = EnvInt(-1)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
@@ -219,12 +236,17 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
 
+    # NPU
+    SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
+    SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
+    SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -259,6 +281,11 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+
+    # DeepEP
+    SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
+    SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -295,10 +322,14 @@ class Envs:
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
+    # Spec Config
+    SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+    SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -327,6 +358,9 @@ class Envs:
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
+    # Numa
+    SGLANG_NUMA_BIND_V2 = EnvBool(True)
+
     # fmt: on
 
 
@@ -341,10 +375,22 @@ def _print_deprecated_env(new_name: str, old_name: str):
         os.environ[new_name] = os.environ[old_name]
 
 
+def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
+    """Warn when a deprecated environment variable is used.
+
+    This is for env vars that are deprecated in favor of CLI flags.
+    """
+    if env_name in os.environ:
+        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+
+
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
         "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
+    )
+    _print_deprecated_env(
+        "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
     )
 
     for key, value in os.environ.items():
@@ -357,6 +403,19 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
+
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
 
 
 def example_with_exit_stack():
@@ -381,6 +440,30 @@ def example_with_subprocess():
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output = process.stdout.read().decode("utf-8").strip()
     assert output == "None"
+
+
+def example_with_implicit_bool_avoidance():
+    @contextmanager
+    def assert_throws(message_matcher: str):
+        try:
+            yield
+        except Exception as e:
+            assert message_matcher in str(e), f"{e=}"
+            print(f"assert_throws find expected error: {e}")
+            return
+        raise AssertionError(f"assert_throws do not see exceptions")
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if (1 != 1) or envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT or (1 == 1):
+            pass
 
 
 def examples():
@@ -412,6 +495,7 @@ def examples():
 
     example_with_exit_stack()
     example_with_subprocess()
+    example_with_implicit_bool_avoidance()
 
 
 if __name__ == "__main__":

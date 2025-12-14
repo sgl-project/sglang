@@ -44,7 +44,7 @@ You can install SGLang using one of the methods below.
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel
@@ -100,7 +100,7 @@ The steps below show how to build and use an image.
        --port 30000
    ```
 
-4. To verify the utility, you can run a benchmark in another terminal or refer to [other docs](https://docs.sglang.ai/basic_usage/openai_api_completions.html) to send requests to the engine.
+4. To verify the utility, you can run a benchmark in another terminal or refer to [other docs](https://docs.sglang.io/basic_usage/openai_api_completions.html) to send requests to the engine.
 
    ```bash
    drun sglang_image \

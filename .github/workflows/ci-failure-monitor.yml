@@ -2,19 +2,8 @@ name: CI Failure Monitor
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # Every 30 minutes
+    - cron: '0 * * * *' # Every hour
   workflow_dispatch:
-    inputs:
-      limit:
-        description: 'Number of workflow runs to analyze (across all workflows)'
-        required: false
-        default: '800'
-        type: string
-      threshold:
-        description: 'Alert threshold for consecutive failures'
-        required: false
-        default: '4'
-        type: string
 
 concurrency:
   group: ci-failure-monitor-${{ github.ref }}
@@ -51,8 +40,8 @@ jobs:
           cd scripts/ci_monitor
           python ci_failures_analysis.py \
             --token $GITHUB_TOKEN \
-            --limit ${{ inputs.limit || '800' }} \
-            --threshold ${{ inputs.threshold || '4' }} \
+            --limit 100 \
+            --threshold 4 \
             --output ci_failure_analysis_$(date +%Y%m%d_%H%M%S).json
 
       - name: Upload Analysis Results
