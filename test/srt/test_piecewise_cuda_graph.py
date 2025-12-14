@@ -4,7 +4,7 @@ import torch
 
 from sglang import Engine
 from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.utils import get_device_sm, kill_process_tree
+from sglang.srt.utils import get_device_count, get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -411,6 +411,166 @@ class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
         self.assertGreaterEqual(metrics["score"], 0.70)
+
+
+@unittest.skipIf(
+    get_device_count() < 2,
+    f"Test requires at least 2 GPUs, but only {get_device_count()} GPU(s) available",
+)
+class TestPiecewiseCudaGraphWithPP(CustomTestCase):
+    """Test piecewise CUDA graph with Pipeline Parallelism (PP) support"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-piecewise-cuda-graph",
+                "--pp-size",
+                "2",
+                "--tp-size",
+                "1",
+                "--chunked-prefill-size",
+                "256",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k_accuracy(self):
+        """Test GSM8K accuracy with PP and piecewise CUDA graph"""
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"GSM8K Accuracy with PP+Piecewise CUDA Graph: {metrics['accuracy']:.3f}")
+
+        # Verify accuracy is reasonable (should be similar to non-PP case)
+        self.assertGreater(metrics["accuracy"], 0.74)
+
+    def test_verify_pp_configuration(self):
+        """Verify that PP is actually enabled by checking server info"""
+        import requests
+
+        # Check server info to verify PP configuration
+        response = requests.get(f"{self.base_url}/get_server_info")
+        self.assertEqual(response.status_code, 200)
+        server_info = response.json()
+
+        # Verify PP is enabled
+        self.assertIn("pp_size", server_info)
+        self.assertEqual(
+            server_info["pp_size"],
+            2,
+            f"Expected pp_size=2, but got {server_info.get('pp_size')}. "
+            "Pipeline parallelism may not be enabled correctly.",
+        )
+
+        # Verify piecewise CUDA graph is enabled
+        self.assertIn("enable_piecewise_cuda_graph", server_info)
+        self.assertTrue(
+            server_info["enable_piecewise_cuda_graph"],
+            "Piecewise CUDA graph should be enabled",
+        )
+
+        print(
+            f"✓ Verified PP configuration: pp_size={server_info['pp_size']}, "
+            f"tp_size={server_info.get('tp_size', 'N/A')}, "
+            f"piecewise_cuda_graph={server_info.get('enable_piecewise_cuda_graph', False)}"
+        )
+
+
+@unittest.skipIf(
+    get_device_count() < 2,
+    f"Test requires at least 2 GPUs, but only {get_device_count()} GPU(s) available",
+)
+class TestPiecewiseCudaGraphPPConsistency(CustomTestCase):
+    """Test consistency between PP with and without piecewise CUDA graph"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url_pp_only = "http://127.0.0.1:23337"
+        cls.base_url_pp_pcg = "http://127.0.0.1:23338"
+
+    def run_gsm8k_test(self, base_url, enable_piecewise_cuda_graph=False):
+        """Helper method to run GSM8K test with given configuration"""
+        other_args = [
+            "--pp-size",
+            "2",
+            "--tp-size",
+            "1",
+            "--chunked-prefill-size",
+            "256",
+        ]
+        if enable_piecewise_cuda_graph:
+            other_args.append("--enable-piecewise-cuda-graph")
+
+        process = popen_launch_server(
+            self.__class__.model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+        try:
+            args = SimpleNamespace(
+                num_shots=5,
+                data_path=None,
+                num_questions=100,  # Use fewer questions for consistency test
+                max_new_tokens=256,
+                parallel=64,
+                host="http://127.0.0.1",
+                port=int(base_url.split(":")[-1]),
+            )
+            metrics = run_eval_few_shot_gsm8k(args)
+            import time
+
+            time.sleep(2)  # Wait for cleanup
+            return metrics
+        finally:
+            kill_process_tree(process.pid)
+
+    def test_pp_consistency_with_piecewise_cuda_graph(self):
+        """Test that PP with piecewise CUDA graph produces similar results to PP without it"""
+        pp_only_metrics = self.run_gsm8k_test(
+            self.base_url_pp_only, enable_piecewise_cuda_graph=False
+        )
+        pp_pcg_metrics = self.run_gsm8k_test(
+            self.base_url_pp_pcg, enable_piecewise_cuda_graph=True
+        )
+
+        print(
+            f"[PP Consistency Test] PP only: {pp_only_metrics} | PP+Piecewise CUDA Graph: {pp_pcg_metrics}"
+        )
+
+        # Both should have reasonable accuracy
+        self.assertGreaterEqual(pp_only_metrics["accuracy"], 0.70)
+        self.assertGreaterEqual(pp_pcg_metrics["accuracy"], 0.70)
+
+        # Accuracy difference should be small (within 3%)
+        accuracy_diff = abs(pp_only_metrics["accuracy"] - pp_pcg_metrics["accuracy"])
+        self.assertLess(
+            accuracy_diff,
+            0.03,
+            msg=(
+                f"Accuracy difference too large: {accuracy_diff:.3f}. "
+                f"PP only: {pp_only_metrics['accuracy']:.3f}, "
+                f"PP+PCG: {pp_pcg_metrics['accuracy']:.3f}"
+            ),
+        )
 
 
 if __name__ == "__main__":
