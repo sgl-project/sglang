@@ -1911,10 +1911,8 @@ def move_kv_cache_native(
     tgt_loc_flat = tgt_loc.view(-1).long()
     src_loc_flat = src_loc.view(-1).long()
     for k_cache, v_cache in zip(k_buffer, v_buffer):
-        k_src = k_cache.index_select(0, src_loc_flat)
-        v_src = v_cache.index_select(0, src_loc_flat)
-        k_cache[tgt_loc_flat] = k_src
-        v_cache[tgt_loc_flat] = v_src
+        k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
+        v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
 @triton.jit
