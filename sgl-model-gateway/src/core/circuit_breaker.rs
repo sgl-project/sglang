@@ -54,7 +54,7 @@ impl std::fmt::Display for CircuitState {
 }
 
 impl CircuitState {
-    pub fn to_string(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             CircuitState::Closed => "closed",
             CircuitState::Open => "open",
@@ -214,8 +214,8 @@ impl CircuitBreaker {
                 }
             }
 
-            let from = old_state.to_string();
-            let to = new_state.to_string();
+            let from = old_state.as_str();
+            let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
         }
     }

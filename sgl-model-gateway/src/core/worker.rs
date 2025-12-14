@@ -137,8 +137,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
         let after = self.circuit_breaker().state();
 
         if before != after {
-            let from = before.to_string();
-            let to = after.to_string();
+            let from = before.as_str();
+            let to = after.as_str();
             RouterMetrics::record_cb_state_transition(self.url(), from, to);
         }
 
