@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt import environ as envs
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
