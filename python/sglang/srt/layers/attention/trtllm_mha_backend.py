@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt import environ as envs
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -30,9 +31,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = (
-    512  # Memory workspace size in MB, todo(Yingyi): read from config
-)
+# Default workspace size in MB for TRTLLM MHA
+# Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
+DEFAULT_WORKSPACE_SIZE_MB = 512
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 global_zero_init_workspace_buffer = None
@@ -83,7 +84,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.device = model_runner.device
 
         # Workspace allocation
-        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        # Use environment variable if set, otherwise use default 512 MB
+        # The default value for TRTLLM MHA is 512 MB, which is different from
+        # the general flashinfer workspace size default (384 MB)
+        # SGLANG_FLASHINFER_WORKSPACE_SIZE is in bytes
+        default_workspace_size_bytes = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        self.workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get_set_value_or(
+            default_workspace_size_bytes
+        )
         # Allocate buffers
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
