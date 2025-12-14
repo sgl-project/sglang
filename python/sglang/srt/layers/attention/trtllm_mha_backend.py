@@ -120,17 +120,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Use the workspace size determined by _get_trtllm_mha_workspace_size()
         # which handles preserving user's environment variable setting
         self.workspace_size = workspace_size_bytes
-        user_env_var_str = (
-            f"{user_env_var_value_mb:.2f} MB"
-            if user_env_var_value_mb is not None
-            else "N/A"
-        )
-        logger.info(
-            f"TRTLLM MHA workspace size: {self.workspace_size / (1024*1024):.2f} MB "
-            f"(user env var set: {user_env_var_set}, "
-            f"user env var value: {user_env_var_str}, "
-            f"TRTLLM MHA default: {DEFAULT_WORKSPACE_SIZE_MB} MB)"
-        )
         # Allocate buffers
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
