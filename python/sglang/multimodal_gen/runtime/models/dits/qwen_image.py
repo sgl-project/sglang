@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -25,7 +24,6 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -580,48 +578,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         self.proj_out = nn.Linear(
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with mapping for q/k/v -> qkv fusion."""
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
-            (".to_added_qkv", ".add_q_proj", "q"),
-            (".to_added_qkv", ".add_k_proj", "k"),
-            (".to_added_qkv", ".add_v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            # Handle q/k/v -> qkv mapping
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                name = name.replace(weight_name, param_name)
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                # Use default weight loader for all other parameters
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-
-        return loaded_params
 
     def forward(
         self,
