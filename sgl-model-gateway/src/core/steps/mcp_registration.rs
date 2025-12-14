@@ -1,13 +1,3 @@
-//! MCP server registration workflow steps
-//!
-//! Each step is atomic and performs a single operation in the MCP server registration process.
-//! Updated for flat manager architecture - single McpManager manages all clients directly.
-//!
-//! Workflow order:
-//! 1. ConnectMcpServer - Establish connection to MCP server using McpManager::connect_server()
-//! 2. DiscoverMcpInventory - Discover and cache inventory using McpManager::load_server_inventory()
-//! 3. RegisterMcpServer - Register McpClient in McpManager's client map
-
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -16,8 +6,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
-    core::workflow::*,
     mcp::{config::McpServerConfig, manager::McpManager},
+    workflow::*,
 };
 
 /// MCP server connection configuration
@@ -263,7 +253,8 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["connect_mcp_server"]),
         )
         .add_step(
             StepDefinition::new(
@@ -272,7 +263,8 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 Arc::new(RegisterMcpServerStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep),
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["discover_mcp_inventory"]),
         )
         .add_step(
             StepDefinition::new(
@@ -281,6 +273,7 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition {
                 Arc::new(ValidateRegistrationStep),
             )
             .with_timeout(Duration::from_secs(1))
-            .with_failure_action(FailureAction::FailWorkflow),
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&["register_mcp_server"]),
         )
 }

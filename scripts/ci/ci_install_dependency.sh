@@ -5,6 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
+FLASHINFER_VERSION=0.5.3
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -153,6 +154,8 @@ $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFI
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
 $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 $PIP_CMD uninstall xformers || true
+
+$PIP_CMD install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/${CU_VERSION}
 
 # Show current packages
 $PIP_CMD list

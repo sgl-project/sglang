@@ -95,12 +95,15 @@ diffusion = [
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
   "runai_model_streamer",
-  "cache-dit==1.1.6"
+  "cache-dit==1.1.8"
 ]
 
-[tool.uv.extra-build-dependencies]
-st-attn = ["torch", "setuptools"]
-vsa = ["torch", "setuptools"]
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
+]
 
 test = [
   "accelerate",
@@ -109,18 +112,18 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
+  "parameterized",
   "peft",
   "pytest",
   "sentence_transformers",
   "tabulate",
 ]
+
 dev = ["sglang[test]"]
-tracing = [
-  "opentelemetry-api",
-  "opentelemetry-exporter-otlp",
-  "opentelemetry-exporter-otlp-proto-grpc",
-  "opentelemetry-sdk",
-]
+
+[tool.uv.extra-build-dependencies]
+st-attn = ["torch", "setuptools"]
+vsa = ["torch", "setuptools"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
