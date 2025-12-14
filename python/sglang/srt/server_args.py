@@ -2539,7 +2539,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "sjf", "priority"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -4319,7 +4319,8 @@ class ServerArgs:
             assert self.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+                "sjf",
+            ], f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof', or 'sjf'. '{self.schedule_policy}' is not supported."
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:
