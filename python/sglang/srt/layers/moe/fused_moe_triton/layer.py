@@ -222,6 +222,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
+            routing_method_type=routing_method_type,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
