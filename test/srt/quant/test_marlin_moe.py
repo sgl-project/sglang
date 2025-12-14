@@ -100,7 +100,7 @@ def marlin_moe_generate_valid_test_cases():
     act_order_list = [False]
     quant_type_list = [
         # scalar_types.uint4,        # uint4 with zero point - not used by Kimi K2
-        scalar_types.uint4b8,       # uint4b8 - used by Kimi K2
+        scalar_types.uint4b8,  # uint4b8 - used by Kimi K2
         # scalar_types.uint8b128,    # uint8b128
     ]
     is_k_full_list = [True]
