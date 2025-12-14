@@ -23,8 +23,8 @@ import glob
 import json
 import re
 import shutil
-from pathlib import Path
 from collections import OrderedDict
+from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -57,7 +57,9 @@ def split_kv(kv_weight: torch.Tensor, kv_bias: torch.Tensor | None = None):
     return (k, v), (k_bias, v_bias)
 
 
-def convert_transformer_weights(source_weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def convert_transformer_weights(
+    source_weights: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
     """
     Convert LongCat transformer weights to native SGLang Diffusion format.
 
@@ -165,7 +167,9 @@ def convert_transformer_weights(source_weights: dict[str, torch.Tensor]) -> dict
 
         # === Final Layer (must come BEFORE general transformer block patterns) ===
         elif key.startswith("final_layer.adaLN_modulation.1."):
-            new_key = key.replace("final_layer.adaLN_modulation.1.", "final_layer.adaln_linear.")
+            new_key = key.replace(
+                "final_layer.adaLN_modulation.1.", "final_layer.adaln_linear."
+            )
             converted[new_key] = value
 
         # === Transformer Block AdaLN ===
@@ -257,7 +261,9 @@ def validate_conversion(original: dict, converted: dict) -> bool:
     return True
 
 
-def copy_component(source_dir: Path, output_dir: Path, component: str, mapping: dict = None) -> bool:
+def copy_component(
+    source_dir: Path, output_dir: Path, component: str, mapping: dict = None
+) -> bool:
     """Copy a component directory, optionally with name mapping."""
     source_name = mapping.get(component, component) if mapping else component
     source_path = source_dir / source_name
@@ -284,7 +290,7 @@ def create_model_index():
         "text_encoder": ["transformers", "UMT5EncoderModel"],
         "vae": ["diffusers", "AutoencoderKLWan"],
         "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
-        "transformer": ["diffusers", "LongCatTransformer3DModel"]  # Native model
+        "transformer": ["diffusers", "LongCatTransformer3DModel"],  # Native model
     }
 
 
@@ -295,23 +301,23 @@ def update_transformer_config(transformer_dir: Path):
         print("  ⚠️  Transformer config not found, skipping")
         return
 
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config = json.load(f)
 
-    if '_class_name' in config:
-        old_class = config['_class_name']
-        config['_class_name'] = 'LongCatTransformer3DModel'
+    if "_class_name" in config:
+        old_class = config["_class_name"]
+        config["_class_name"] = "LongCatTransformer3DModel"
         print(f"  Updated _class_name: {old_class} → LongCatTransformer3DModel")
     else:
-        config['_class_name'] = 'LongCatTransformer3DModel'
+        config["_class_name"] = "LongCatTransformer3DModel"
         print(f"  Added _class_name: LongCatTransformer3DModel")
 
     # Fix num_heads -> num_attention_heads for Diffusion compatibility
-    if 'num_heads' in config and 'num_attention_heads' not in config:
-        config['num_attention_heads'] = config.pop('num_heads')
+    if "num_heads" in config and "num_attention_heads" not in config:
+        config["num_attention_heads"] = config.pop("num_heads")
         print(f"  Updated num_heads → num_attention_heads")
 
-    with open(config_path, 'w') as f:
+    with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
     print("  ✓ Transformer config updated")
@@ -321,10 +327,11 @@ def update_transformer_config(transformer_dir: Path):
 # LoRA Conversion Functions
 # ============================================================================
 
+
 def parse_lora_key(key: str) -> tuple[str, str]:
     """Parse LongCat LoRA key into module path and weight type."""
     if key.startswith("lora___lorahyphen___"):
-        key = key[len("lora___lorahyphen___"):]
+        key = key[len("lora___lorahyphen___") :]
 
     key = key.replace("___lorahyphen___", ".")
 
@@ -350,9 +357,11 @@ def map_lora_module(module_path: str) -> list[tuple[str, str]]:
     match = re.match(r"blocks\.(\d+)\.attn\.qkv", module_path)
     if match:
         b = match.group(1)
-        return [(f"blocks.{b}.self_attn.to_q", "q"),
-                (f"blocks.{b}.self_attn.to_k", "k"),
-                (f"blocks.{b}.self_attn.to_v", "v")]
+        return [
+            (f"blocks.{b}.self_attn.to_q", "q"),
+            (f"blocks.{b}.self_attn.to_k", "k"),
+            (f"blocks.{b}.self_attn.to_v", "v"),
+        ]
 
     # Self-attention output
     match = re.match(r"blocks\.(\d+)\.attn\.proj", module_path)
@@ -368,8 +377,10 @@ def map_lora_module(module_path: str) -> list[tuple[str, str]]:
     match = re.match(r"blocks\.(\d+)\.cross_attn\.kv_linear", module_path)
     if match:
         b = match.group(1)
-        return [(f"blocks.{b}.cross_attn.to_k", "k"),
-                (f"blocks.{b}.cross_attn.to_v", "v")]
+        return [
+            (f"blocks.{b}.cross_attn.to_k", "k"),
+            (f"blocks.{b}.cross_attn.to_v", "v"),
+        ]
 
     # FFN
     match = re.match(r"blocks\.(\d+)\.ffn\.(w[123])", module_path)
@@ -390,7 +401,9 @@ def map_lora_module(module_path: str) -> list[tuple[str, str]]:
     raise ValueError(f"Unknown LoRA module: {module_path}")
 
 
-def convert_lora_weights(source_weights: dict[str, torch.Tensor], lora_name: str) -> dict[str, torch.Tensor]:
+def convert_lora_weights(
+    source_weights: dict[str, torch.Tensor], lora_name: str
+) -> dict[str, torch.Tensor]:
     """Convert LongCat LoRA to Diffusion format."""
     print(f"  Converting {lora_name}...")
     print(f"    Source keys: {len(source_weights)}")
@@ -419,7 +432,11 @@ def convert_lora_weights(source_weights: dict[str, torch.Tensor], lora_name: str
         alpha_scale = 1.0
         if "alpha_scale" in weight_keys:
             alpha_scale_tensor = source_weights[weight_keys["alpha_scale"]]
-            alpha_scale = alpha_scale_tensor.item() if alpha_scale_tensor.numel() == 1 else float(alpha_scale_tensor.mean())
+            alpha_scale = (
+                alpha_scale_tensor.item()
+                if alpha_scale_tensor.numel() == 1
+                else float(alpha_scale_tensor.mean())
+            )
 
         # Handle lora_down (lora_A)
         if "lora_down.weight" in weight_keys:
@@ -430,22 +447,30 @@ def convert_lora_weights(source_weights: dict[str, torch.Tensor], lora_name: str
                 # Compute alpha from alpha_scale and rank
                 rank = lora_down.shape[0]
                 alpha = alpha_scale * rank
-                converted[f"{targets[0][0]}.lora_alpha"] = torch.tensor(alpha, dtype=torch.float32)
+                converted[f"{targets[0][0]}.lora_alpha"] = torch.tensor(
+                    alpha, dtype=torch.float32
+                )
             else:
                 # Split for fused projections
                 n = len(targets)
                 rank = lora_down.shape[0] // n
                 for i, (path, _) in enumerate(targets):
-                    converted[f"{path}.lora_A"] = lora_down[i*rank:(i+1)*rank, :]
+                    converted[f"{path}.lora_A"] = lora_down[
+                        i * rank : (i + 1) * rank, :
+                    ]
                     # Compute alpha from alpha_scale and rank for each split
                     alpha = alpha_scale * rank
-                    converted[f"{path}.lora_alpha"] = torch.tensor(alpha, dtype=torch.float32)
+                    converted[f"{path}.lora_alpha"] = torch.tensor(
+                        alpha, dtype=torch.float32
+                    )
 
         # Handle lora_up (lora_B) - may have multiple blocks
         lora_up_blocks = []
         i = 0
         while f"lora_up.blocks.{i}.weight" in weight_keys:
-            lora_up_blocks.append(source_weights[weight_keys[f"lora_up.blocks.{i}.weight"]])
+            lora_up_blocks.append(
+                source_weights[weight_keys[f"lora_up.blocks.{i}.weight"]]
+            )
             i += 1
 
         if lora_up_blocks:
@@ -458,11 +483,15 @@ def convert_lora_weights(source_weights: dict[str, torch.Tensor], lora_name: str
                 # Single layer with multi-block: create block-diagonal matrix
                 total_out = out_per_block * n_blocks
                 total_rank = rank_per_block * n_blocks
-                lora_B_blockdiag = torch.zeros(total_out, total_rank, dtype=lora_up_blocks[0].dtype)
+                lora_B_blockdiag = torch.zeros(
+                    total_out, total_rank, dtype=lora_up_blocks[0].dtype
+                )
 
                 for i in range(n_blocks):
-                    lora_B_blockdiag[i*out_per_block:(i+1)*out_per_block,
-                                     i*rank_per_block:(i+1)*rank_per_block] = lora_up_blocks[i]
+                    lora_B_blockdiag[
+                        i * out_per_block : (i + 1) * out_per_block,
+                        i * rank_per_block : (i + 1) * rank_per_block,
+                    ] = lora_up_blocks[i]
 
                 converted[f"{targets[0][0]}.lora_B"] = lora_B_blockdiag
                 # Note: rank for alpha calculation should be total_rank (will be computed from lora_A.shape[0])
@@ -481,7 +510,9 @@ def convert_lora_weights(source_weights: dict[str, torch.Tensor], lora_name: str
                 n = len(targets)
                 out_dim = lora_up.shape[0] // n
                 for i, (path, _) in enumerate(targets):
-                    converted[f"{path}.lora_B"] = lora_up[i*out_dim:(i+1)*out_dim, :]
+                    converted[f"{path}.lora_B"] = lora_up[
+                        i * out_dim : (i + 1) * out_dim, :
+                    ]
         else:
             continue
 
@@ -536,7 +567,9 @@ def convert_loras(source_dir: Path, output_dir: Path) -> bool:
             save_file(converted, str(output_file))
 
             size_mb = output_file.stat().st_size / (1024**2)
-            print(f"    ✓ {lora_file.name} → lora/{lora_subdir_name}/ ({size_mb:.1f} MB)")
+            print(
+                f"    ✓ {lora_file.name} → lora/{lora_subdir_name}/ ({size_mb:.1f} MB)"
+            )
 
         except Exception as e:
             print(f"    ❌ Failed to convert {lora_file.name}: {e}")
@@ -659,7 +692,7 @@ def main():
     # Step 5: Create model_index.json
     print("[Step 5/5] Creating model_index.json...")
     model_index_path = output_dir / "model_index.json"
-    with open(model_index_path, 'w') as f:
+    with open(model_index_path, "w") as f:
         json.dump(create_model_index(), f, indent=2)
     print(f"  ✓ Created {model_index_path}")
     print()

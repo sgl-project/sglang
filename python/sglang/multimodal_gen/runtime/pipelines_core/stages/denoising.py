@@ -20,8 +20,11 @@ from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.longcatvideo import (
+    LongCatT2V480PConfig,
+    LongCatT2V704PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
-from sglang.multimodal_gen.configs.pipeline_configs.longcatvideo import LongCatT2V480PConfig, LongCatT2V704PConfig
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -354,11 +357,9 @@ class DenoisingStage(PipelineStage):
             st_star: Optimized scale [B, 1]
         """
         # Calculate dot product
-        dot_product = torch.sum(positive_flat * negative_flat,
-                                dim=1,
-                                keepdim=True)
+        dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
         # Squared norm of uncondition
-        squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+        squared_norm = torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
         # st_star = v_cond^T * v_uncond / ||v_uncond||^2
         st_star = dot_product / squared_norm
         return st_star
@@ -1031,8 +1032,12 @@ class DenoisingStage(PipelineStage):
                         # Check if we should use LongCat-specific processing
                         should_preprocess_for_longcat = (
                             server_args.pipeline_config.task_type == ModelTaskType.T2V
-                            and (type(server_args.pipeline_config) is LongCatT2V480PConfig
-                                 or type(server_args.pipeline_config) is LongCatT2V704PConfig)
+                            and (
+                                type(server_args.pipeline_config)
+                                is LongCatT2V480PConfig
+                                or type(server_args.pipeline_config)
+                                is LongCatT2V704PConfig
+                            )
                         )
 
                         # LongCat: Negate noise prediction for flow matching scheduler
@@ -1356,8 +1361,10 @@ class DenoisingStage(PipelineStage):
             # Check if we should use LongCat-specific processing
             should_preprocess_for_longcat = (
                 server_args.pipeline_config.task_type == ModelTaskType.T2V
-                and (type(server_args.pipeline_config) is LongCatT2V480PConfig
-                     or type(server_args.pipeline_config) is LongCatT2V704PConfig)
+                and (
+                    type(server_args.pipeline_config) is LongCatT2V480PConfig
+                    or type(server_args.pipeline_config) is LongCatT2V704PConfig
+                )
             )
 
             # Apply LongCat CFG-zero optimization if needed
@@ -1374,9 +1381,9 @@ class DenoisingStage(PipelineStage):
                 st_star = st_star.view(B, *([1] * (len(original_shape) - 1)))
 
                 # Apply optimized CFG formula
-                noise_pred = (
-                    noise_pred_uncond * st_star + current_guidance_scale *
-                    (noise_pred_cond - noise_pred_uncond * st_star))
+                noise_pred = noise_pred_uncond * st_star + current_guidance_scale * (
+                    noise_pred_cond - noise_pred_uncond * st_star
+                )
             else:
                 # Standard CFG
                 noise_pred = noise_pred_uncond + current_guidance_scale * (

@@ -16,8 +16,7 @@ def broadcast(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     """
     num_tensors = len(tensors)
     shape_lens = set(len(t.shape) for t in tensors)
-    assert len(
-        shape_lens) == 1, "tensors must all have the same number of dimensions"
+    assert len(shape_lens) == 1, "tensors must all have the same number of dimensions"
 
     shape_len = list(shape_lens)[0]
     dim = (dim + shape_len) if dim < 0 else dim
@@ -26,16 +25,15 @@ def broadcast(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     expandable_dims = [(i, val) for i, val in enumerate(dims) if i != dim]
 
     assert all(
-        len(set(t[1])) <= 2 for t in
-        expandable_dims), "invalid dimensions for broadcastable concatenation"
+        len(set(t[1])) <= 2 for t in expandable_dims
+    ), "invalid dimensions for broadcastable concatenation"
 
     max_dims = [(t[0], max(t[1])) for t in expandable_dims]
     expanded_dims = [(t[0], (t[1],) * num_tensors) for t in max_dims]
     expanded_dims.insert(dim, (dim, dims[dim]))
     expandable_shapes = list(zip(*[t[1] for t in expanded_dims], strict=False))
     tensors = [
-        t[0].expand(*t[1])
-        for t in zip(tensors, expandable_shapes, strict=False)
+        t[0].expand(*t[1]) for t in zip(tensors, expandable_shapes, strict=False)
     ]
 
     return torch.cat(tensors, dim=dim)
@@ -87,8 +85,7 @@ class RotaryPositionalEmbedding3D(nn.Module):
         if grid_size not in self.freqs_dict:
             self.freqs_dict[grid_size] = self.precompute_freqs_3d(grid_size)
 
-    def precompute_freqs_3d(self, grid_size: tuple[int, int,
-    int]) -> torch.Tensor:
+    def precompute_freqs_3d(self, grid_size: tuple[int, int, int]) -> torch.Tensor:
         """
         Precompute 3D rotary frequencies.
 
@@ -107,12 +104,15 @@ class RotaryPositionalEmbedding3D(nn.Module):
         dim_w = 2 * (self.head_dim // 6)
 
         # Compute frequency bands for each dimension
-        freqs_t = 1.0 / (self.base ** (
-            torch.arange(0, dim_t, 2)[:(dim_t // 2)].float() / dim_t))
-        freqs_h = 1.0 / (self.base ** (
-            torch.arange(0, dim_h, 2)[:(dim_h // 2)].float() / dim_h))
-        freqs_w = 1.0 / (self.base ** (
-            torch.arange(0, dim_w, 2)[:(dim_w // 2)].float() / dim_w))
+        freqs_t = 1.0 / (
+            self.base ** (torch.arange(0, dim_t, 2)[: (dim_t // 2)].float() / dim_t)
+        )
+        freqs_h = 1.0 / (
+            self.base ** (torch.arange(0, dim_h, 2)[: (dim_h // 2)].float() / dim_h)
+        )
+        freqs_w = 1.0 / (
+            self.base ** (torch.arange(0, dim_w, 2)[: (dim_w // 2)].float() / dim_w)
+        )
 
         # Create position grids
         grid_t = torch.arange(num_frames, dtype=torch.float32)

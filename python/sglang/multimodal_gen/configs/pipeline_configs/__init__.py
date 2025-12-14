@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcatvideo import (
+    LongCatT2V480PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stepvideo import StepVideoT2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
@@ -20,7 +23,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V480PConfig,
     WanT2V720PConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.longcatvideo import LongCatT2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 
 __all__ = [
@@ -37,5 +39,5 @@ __all__ = [
     "StepVideoT2VConfig",
     "SelfForcingWanT2V480PConfig",
     "LongCatT2V480PConfig",
-    "ZImagePipelineConfig"
+    "ZImagePipelineConfig",
 ]

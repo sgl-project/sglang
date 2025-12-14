@@ -6,31 +6,35 @@ This is a Phase 2 reimplementation that replaces the third_party wrapper
 with native FastVideo layers for better performance and integration.
 """
 
-from typing import Any
 import math
+from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.dits.longcatvideo import LongCatVideoConfig
+from sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attention import (
+    flash_attn_bsa_3d,
+)
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    LocalAttention,
+    UlyssesAttention,
+)
+from sglang.multimodal_gen.runtime.layers.layernorm import FP32LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, FP32LayerNorm
-from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
 )
-from sglang.multimodal_gen.runtime.layers.attention.layer import UlyssesAttention, LocalAttention
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
-from sglang.multimodal_gen.third_party.longcatvideo.block_sparse_attention.bsa_interface import flash_attn_bsa_3d
 
 # ============================================================================
 # Embeddings
 # ============================================================================
+
 
 class TimestepEmbedder(nn.Module):
     """
@@ -62,21 +66,29 @@ class TimestepEmbedder(nn.Module):
         )
 
     @staticmethod
-    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    def timestep_embedding(
+        t: torch.Tensor, dim: int, max_period: int = 10000
+    ) -> torch.Tensor:
         """
         Create sinusoidal timestep embeddings.
         """
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
+            / half
         )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding
 
-    def forward(self, t: torch.Tensor, latent_shape: tuple | None = None) -> torch.Tensor:
+    def forward(
+        self, t: torch.Tensor, latent_shape: tuple | None = None
+    ) -> torch.Tensor:
         """
         Args:
             t: [B] or [B, T] timesteps
@@ -89,7 +101,11 @@ class TimestepEmbedder(nn.Module):
 
         # Cast to model dtype before MLP
         # Handle LoRA wrapper if present
-        linear_layer = self.linear_1.base_layer if hasattr(self.linear_1, 'base_layer') else self.linear_1
+        linear_layer = (
+            self.linear_1.base_layer
+            if hasattr(self.linear_1, "base_layer")
+            else self.linear_1
+        )
         target_dtype = linear_layer.weight.dtype
         if t_freq.dtype != target_dtype:
             t_freq = t_freq.to(target_dtype)
@@ -106,6 +122,7 @@ class TimestepEmbedder(nn.Module):
             t_emb = t_emb.reshape(B, T, -1)
 
         return t_emb
+
 
 class CaptionEmbedder(nn.Module):
     """
@@ -178,6 +195,7 @@ class CaptionEmbedder(nn.Module):
 # Attention Modules (Placeholders for now)
 # ============================================================================
 
+
 class LongCatSelfAttention(nn.Module):
     """
     Self-attention with 3D RoPE support and optional BSA.
@@ -223,8 +241,8 @@ class LongCatSelfAttention(nn.Module):
         )
 
         # BSA configuration
-        self.enable_bsa = getattr(config, 'enable_bsa', False)
-        self.bsa_params = getattr(config, 'bsa_params', None)
+        self.enable_bsa = getattr(config, "enable_bsa", False)
+        self.bsa_params = getattr(config, "bsa_params", None)
 
         # FastVideo attention backend (used when BSA is disabled)
         self.attn = UlyssesAttention(
@@ -234,10 +252,7 @@ class LongCatSelfAttention(nn.Module):
         )
 
     def forward(
-        self,
-        x: torch.Tensor,  # [B, N, C]
-        latent_shape: tuple,  # (T, H, W)
-        **kwargs
+        self, x: torch.Tensor, latent_shape: tuple, **kwargs  # [B, N, C]  # (T, H, W)
     ) -> torch.Tensor:
         """
         Forward pass with 3D RoPE and optional BSA.
@@ -282,20 +297,24 @@ class LongCatSelfAttention(nn.Module):
 
             # Handle SP split: BSA operates on per-rank spatial dimensions
             # Replicate LongCat's cp_split_hw logic exactly
-            from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_sp_world_size,
+            )
+
             sp_size = get_sp_world_size()
             if sp_size > 1:
                 # Calculate optimal 2D split (same as LongCat's get_optimal_split)
                 factors = []
-                for i in range(1, int(sp_size ** 0.5) + 1):
+                for i in range(1, int(sp_size**0.5) + 1):
                     if sp_size % i == 0:
                         factors.append([i, sp_size // i])
                 cp_split_hw = min(factors, key=lambda x: abs(x[0] - x[1]))
 
                 # Split H and W dimensions by their respective factors
                 T_bsa, H_bsa, W_bsa = latent_shape
-                assert H_bsa % cp_split_hw[0] == 0 and W_bsa % cp_split_hw[1] == 0, \
-                    f"H {H_bsa} must be divisible by {cp_split_hw[0]}, W {W_bsa} must be divisible by {cp_split_hw[1]}"
+                assert (
+                    H_bsa % cp_split_hw[0] == 0 and W_bsa % cp_split_hw[1] == 0
+                ), f"H {H_bsa} must be divisible by {cp_split_hw[0]}, W {W_bsa} must be divisible by {cp_split_hw[1]}"
                 H_bsa = H_bsa // cp_split_hw[0]
                 W_bsa = W_bsa // cp_split_hw[1]
                 latent_shape_bsa = (T_bsa, H_bsa, W_bsa)
@@ -304,10 +323,12 @@ class LongCatSelfAttention(nn.Module):
 
             # Call BSA with per-rank latent shape
             out = flash_attn_bsa_3d(
-                q_bsa, k_bsa, v_bsa,
+                q_bsa,
+                k_bsa,
+                v_bsa,
                 latent_shape_q=latent_shape_bsa,
                 latent_shape_k=latent_shape_bsa,
-                **self.bsa_params
+                **self.bsa_params,
             )  # [B, num_heads, N, head_dim]
 
             # Transpose back: [B, N, num_heads, head_dim]
@@ -366,7 +387,7 @@ class LongCatCrossAttention(nn.Module):
         self,
         x: torch.Tensor,  # [B, N_img, C]
         context: torch.Tensor,  # [B, N_text, C]
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass for cross-attention (standard implementation).
@@ -408,6 +429,7 @@ class LongCatCrossAttention(nn.Module):
 # Feed-Forward Network
 # ============================================================================
 
+
 class LongCatSwiGLUFFN(nn.Module):
     """
     SwiGLU feed-forward network using FastVideo's ReplicatedLinear.
@@ -424,9 +446,15 @@ class LongCatSwiGLUFFN(nn.Module):
         super().__init__()
 
         # Three projections for SwiGLU (no bias as per original)
-        self.w1 = ReplicatedLinear(dim, hidden_dim, bias=False, params_dtype=dtype)  # gate
-        self.w3 = ReplicatedLinear(dim, hidden_dim, bias=False, params_dtype=dtype)  # up
-        self.w2 = ReplicatedLinear(hidden_dim, dim, bias=False, params_dtype=dtype)  # down
+        self.w1 = ReplicatedLinear(
+            dim, hidden_dim, bias=False, params_dtype=dtype
+        )  # gate
+        self.w3 = ReplicatedLinear(
+            dim, hidden_dim, bias=False, params_dtype=dtype
+        )  # up
+        self.w2 = ReplicatedLinear(
+            hidden_dim, dim, bias=False, params_dtype=dtype
+        )  # down
 
         self.act = nn.SiLU()
 
@@ -445,15 +473,19 @@ class LongCatSwiGLUFFN(nn.Module):
 # Modulation Utilities
 # ============================================================================
 
-def modulate_fp32(norm: nn.Module, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+
+def modulate_fp32(
+    norm: nn.Module, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
     """
     Apply modulation in FP32 for numerical stability (matching original LongCat).
 
     shift and scale should already be FP32 from torch.amp.autocast context.
     """
     # Ensure modulation params are FP32 (should be from autocast)
-    assert shift.dtype == torch.float32 and scale.dtype == torch.float32, \
-        f"shift and scale must be FP32, got {shift.dtype} and {scale.dtype}"
+    assert (
+        shift.dtype == torch.float32 and scale.dtype == torch.float32
+    ), f"shift and scale must be FP32, got {shift.dtype} and {scale.dtype}"
 
     orig_dtype = x.dtype
 
@@ -467,6 +499,7 @@ def modulate_fp32(norm: nn.Module, x: torch.Tensor, shift: torch.Tensor, scale: 
 # ============================================================================
 # Transformer Block
 # ============================================================================
+
 
 class LongCatTransformerBlock(nn.Module):
     """
@@ -540,7 +573,7 @@ class LongCatTransformerBlock(nn.Module):
         context: torch.Tensor,  # [B, N_text, C]
         t: torch.Tensor,  # [B, T, C_t]
         latent_shape: tuple,  # (T, H, W)
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass with AdaLN modulation.
@@ -551,23 +584,33 @@ class LongCatTransformerBlock(nn.Module):
 
         # === AdaLN Modulation (CRITICAL: FP32 for stability like original) ===
         # Use autocast to compute modulation params in FP32
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
             t_mod = self.adaln_act(t)
             mod_params, _ = self.adaln_linear_1(t_mod)
             # Ensure FP32 output (needed when LoRA is applied)
             if mod_params.dtype != torch.float32:
                 mod_params = mod_params.float()
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-                mod_params.unsqueeze(2).chunk(6, dim=-1)  # [B, T, 1, C]
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = mod_params.unsqueeze(2).chunk(
+                6, dim=-1
+            )  # [B, T, 1, C]
 
         # === Self-Attention ===
-        x_norm = modulate_fp32(self.norm_attn, x.view(B, T, -1, C), shift_msa, scale_msa)
+        x_norm = modulate_fp32(
+            self.norm_attn, x.view(B, T, -1, C), shift_msa, scale_msa
+        )
         x_norm = x_norm.view(B, N, C)
 
         attn_out = self.self_attn(x_norm, latent_shape=latent_shape)
 
         # Residual with gating (CRITICAL: FP32 like original, then cast back)
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
             x = x + (gate_msa * attn_out.view(B, T, -1, C)).view(B, N, C)
         x = x.to(x_orig_dtype)
 
@@ -577,13 +620,15 @@ class LongCatTransformerBlock(nn.Module):
         x = x + cross_out
 
         # === FFN ===
-        x_norm_ffn = modulate_fp32(self.norm_ffn, x.view(B, T, -1, C), shift_mlp, scale_mlp)
+        x_norm_ffn = modulate_fp32(
+            self.norm_ffn, x.view(B, T, -1, C), shift_mlp, scale_mlp
+        )
         x_norm_ffn = x_norm_ffn.view(B, N, C)
 
         ffn_out = self.ffn(x_norm_ffn)
 
         # Residual with gating (CRITICAL: FP32 like original, then cast back)
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
             x = x + (gate_mlp * ffn_out.view(B, T, -1, C)).view(B, N, C)
         x = x.to(x_orig_dtype)
 
@@ -593,6 +638,7 @@ class LongCatTransformerBlock(nn.Module):
 # ============================================================================
 # Final Layer
 # ============================================================================
+
 
 class FinalLayer(nn.Module):
     """
@@ -643,7 +689,7 @@ class FinalLayer(nn.Module):
         T, _, _ = latent_shape
 
         # AdaLN modulation (FP32 for stability like original)
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
             t_mod = self.adaln_act(t)
             mod_params, _ = self.adaln_linear(t_mod)
             # Ensure FP32 output (needed when LoRA is applied)
@@ -664,6 +710,7 @@ class FinalLayer(nn.Module):
 # ============================================================================
 # Main Model
 # ============================================================================
+
 
 class LongCatTransformer3DModel(CachableDiT):
     """
@@ -720,20 +767,22 @@ class LongCatTransformer3DModel(CachableDiT):
         self.caption_embedder = CaptionEmbedder(
             caption_channels=config.caption_channels,
             hidden_size=self.hidden_size,
-            text_tokens_zero_pad=getattr(config, 'text_tokens_zero_pad', True),
+            text_tokens_zero_pad=getattr(config, "text_tokens_zero_pad", True),
         )
 
         # Transformer blocks (48 blocks)
-        self.blocks = nn.ModuleList([
-            LongCatTransformerBlock(
-                hidden_size=self.hidden_size,
-                num_heads=self.num_attention_heads,
-                mlp_ratio=self.mlp_ratio,
-                adaln_tembed_dim=config.adaln_tembed_dim,
-                config=config,
-            )
-            for _ in range(self.depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                LongCatTransformerBlock(
+                    hidden_size=self.hidden_size,
+                    num_heads=self.num_attention_heads,
+                    mlp_ratio=self.mlp_ratio,
+                    adaln_tembed_dim=config.adaln_tembed_dim,
+                    config=config,
+                )
+                for _ in range(self.depth)
+            ]
+        )
 
         # Output projection
         self.final_layer = FinalLayer(
@@ -761,7 +810,7 @@ class LongCatTransformer3DModel(CachableDiT):
         encoder_attention_mask: torch.Tensor | None = None,  # [B, N_text]
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
         guidance: float | None = None,  # Unused, for API compatibility
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass with FastVideo parameter ordering.
@@ -782,7 +831,7 @@ class LongCatTransformer3DModel(CachableDiT):
         # 1. Patch embedding
         x = self.patch_embed(hidden_states)  # [B, N, C]
 
-         # 2. Timestep embedding
+        # 2. Timestep embedding
         # Expand timestep from [B] to [B, T] if needed
         if timestep.ndim == 1:
             timestep = timestep.unsqueeze(1).expand(-1, N_t)  # [B, T]
@@ -793,16 +842,12 @@ class LongCatTransformer3DModel(CachableDiT):
 
         # 3. Caption embedding (standard format, no compaction)
         context = self.caption_embedder(
-            encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask
+            encoder_hidden_states, encoder_attention_mask=encoder_attention_mask
         )  # [B, N_text, C]
 
         # 4. Transformer blocks
         for i, block in enumerate(self.blocks):
-            x = block(
-                x, context, t,
-                latent_shape=(N_t, N_h, N_w)
-            )
+            x = block(x, context, t, latent_shape=(N_t, N_h, N_w))
 
         # 5. Output projection
         output = self.final_layer(x, t, latent_shape=(N_t, N_h, N_w))
@@ -835,5 +880,6 @@ class LongCatTransformer3DModel(CachableDiT):
             C_out=self.out_channels,
         )
         return x
+
 
 EntryClass = LongCatTransformer3DModel

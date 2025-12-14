@@ -5,4 +5,9 @@ from sglang.multimodal_gen.configs.models.dits.longcatvideo import LongCatVideoC
 from sglang.multimodal_gen.configs.models.dits.stepvideo import StepVideoConfig
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
-__all__ = ["HunyuanVideoConfig", "LongCatVideoConfig", "WanVideoConfig", "StepVideoConfig"]
+__all__ = [
+    "HunyuanVideoConfig",
+    "LongCatVideoConfig",
+    "WanVideoConfig",
+    "StepVideoConfig",
+]

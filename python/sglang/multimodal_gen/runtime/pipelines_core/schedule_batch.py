@@ -76,8 +76,6 @@ class Req:
     num_cond_frames: int = 0
     stage1_video: list[PIL.Image.Image] | None = None  # Loaded frames from refine_from
 
-
-
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None

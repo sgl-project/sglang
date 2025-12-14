@@ -7,7 +7,9 @@ def p2p_communicate(
     """Point-to-point communications of KV and dKV in Attention with context parallelism"""
     send_recv_ops = []
 
-    if batch_p2p_comm: # int(os.getenv("NVTE_BATCH_MHA_P2P_COMM", "0")) or (cp_size == 2) 为啥呢
+    if (
+        batch_p2p_comm
+    ):  # int(os.getenv("NVTE_BATCH_MHA_P2P_COMM", "0")) or (cp_size == 2) 为啥呢
         if rank % 2 == 0:
             send_op = torch.distributed.P2POp(
                 torch.distributed.isend, send_tensor, send_dst, cp_group

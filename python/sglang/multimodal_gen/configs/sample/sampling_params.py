@@ -127,8 +127,6 @@ class SamplingParams:
     spatial_refine_only: bool = False  # If True, only spatial (no temporal doubling)
     num_cond_frames: int = 0  # Number of conditioning frames
 
-
-
     # TeaCache parameters
     enable_teacache: bool = False
 
