@@ -460,10 +460,6 @@ class FluxTransformer2DModel(CachableDiT):
             bias=True,
         )
 
-    def fuse_qkv_projections(self):
-        # QKV projections are already fused in __init__, this method is kept for compatibility
-        pass
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with mapping for q/k/v -> qkv fusion."""
         stacked_params_mapping = [
