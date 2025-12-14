@@ -212,6 +212,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        draft_hidden_size: Optional[int] = None,  # For STANDALONE mode
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -222,12 +223,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         This API updates values inside logits_output based on the accepted
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
+
+        Args:
+            draft_hidden_size: Hidden size of the draft model. Required for STANDALONE
+                mode where draft and target models have different hidden sizes.
         """
+        # Use draft_hidden_size if provided (STANDALONE mode), otherwise use target's
+        hidden_size = draft_hidden_size or batch.model_config.hidden_size
         if batch.forward_mode.is_idle():
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
-                    hidden_size=batch.model_config.hidden_size,
+                    hidden_size=hidden_size,
                     dtype=batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -513,8 +520,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(accept_length + 1)
             batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
+            # For STANDALONE mode, create placeholder with draft model's hidden_size
+            # since the draft model produces its own hidden_states (not using target's)
+            if draft_hidden_size is not None:
+                draft_hidden_states = torch.zeros(
+                    (accept_index.shape[0], draft_hidden_size),
+                    dtype=batch.model_config.dtype,
+                    device=batch.device,
+                )
+            else:
+                draft_hidden_states = batch.spec_info.hidden_states[accept_index]
+
             draft_input = EagleDraftInput(
-                hidden_states=batch.spec_info.hidden_states[accept_index],
+                hidden_states=draft_hidden_states,
                 verified_id=verified_id,
                 accept_length=accept_length,
                 accept_length_cpu=accept_length_list,
@@ -574,10 +592,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(self.draft_token_num),
                     )
 
-                draft_input = EagleDraftInput(
-                    hidden_states=batch.spec_info.hidden_states[
+                # For STANDALONE mode, create placeholder with draft model's hidden_size
+                # since the draft model produces its own hidden_states (not using target's)
+                if draft_hidden_size is not None:
+                    draft_hidden_states = torch.zeros(
+                        (unfinished_accept_index.shape[0], draft_hidden_size),
+                        dtype=batch.model_config.dtype,
+                        device=batch.device,
+                    )
+                else:
+                    draft_hidden_states = batch.spec_info.hidden_states[
                         unfinished_accept_index
-                    ],
+                    ]
+
+                draft_input = EagleDraftInput(
+                    hidden_states=draft_hidden_states,
                     verified_id=predict[unfinished_accept_index],
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
@@ -590,7 +619,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             else:
                 draft_input = EagleDraftInput.create_idle_input(
                     device=batch.device,
-                    hidden_size=batch.model_config.hidden_size,
+                    hidden_size=hidden_size,  # Uses draft_hidden_size for STANDALONE mode
                     dtype=batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,

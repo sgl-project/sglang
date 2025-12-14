@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import bisect
+import logging
 from typing import TYPE_CHECKING, Callable
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Flag to log hidden_states size mismatch warning only once
+_hidden_states_mismatch_warned = False
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -100,8 +106,21 @@ class EAGLEDraftCudaGraphRunner:
             self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+
+            # For EAGLE models, use target_hidden_size from hf_config since EAGLE head uses target's hidden states
+            # For STANDALONE mode, use draft model's hidden_size since draft model produces its own hidden states
+            if hasattr(
+                self.model_runner.model_config.hf_config,
+                "target_hidden_size",
+            ):
+                draft_hidden_size = (
+                    self.model_runner.model_config.hf_config.target_hidden_size
+                )
+            else:
+                draft_hidden_size = self.model_runner.model_config.hidden_size
+
             self.hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.hidden_size),
+                (self.max_bs, draft_hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
@@ -346,7 +365,21 @@ class EAGLEDraftCudaGraphRunner:
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        # Only copy hidden_states if dimensions match (may differ in STANDALONE mode
+        # where target and draft models have different hidden sizes)
+        if (
+            forward_batch.spec_info.hidden_states.shape[1]
+            == self.hidden_states.shape[1]
+        ):
+            self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        else:
+            global _hidden_states_mismatch_warned
+            if not _hidden_states_mismatch_warned:
+                logger.warning(
+                    f"Skipping hidden_states copy due to size mismatch: "
+                    f"expected {self.hidden_states.shape[1]}, got {forward_batch.spec_info.hidden_states.shape[1]}"
+                )
+                _hidden_states_mismatch_warned = True
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded

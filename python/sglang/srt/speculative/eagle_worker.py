@@ -501,9 +501,15 @@ class EAGLEWorker(TpModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
+        # For EAGLE models, use target_hidden_size since EAGLE head uses target's hidden states
+        # For STANDALONE mode, use draft model's hidden_size since draft model produces its own hidden states
+        if hasattr(self.model_config.hf_config, "target_hidden_size"):
+            hidden_size = self.model_config.hf_config.target_hidden_size
+        else:
+            hidden_size = self.model_config.hidden_size
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.hidden_size,
+            hidden_size=hidden_size,
             dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -670,7 +676,7 @@ class EAGLEWorker(TpModelWorker):
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
-        spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
+        spec_info.num_tokens_per_batch = spec_info.draft_token_num
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -723,13 +729,27 @@ class EAGLEWorker(TpModelWorker):
         if self.enable_nan_detection:
             detect_nan(logits_output)
 
-        spec_info.hidden_states = logits_output.hidden_states
+        # For STANDALONE mode, create placeholder with draft model's hidden_size
+        # since the draft model produces its own hidden_states (not using target's)
+        if self.speculative_algorithm.is_standalone():
+            spec_info.hidden_states = torch.zeros(
+                (logits_output.hidden_states.shape[0], self.model_config.hidden_size),
+                dtype=logits_output.hidden_states.dtype,
+                device=logits_output.hidden_states.device,
+            )
+        else:
+            spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            draft_hidden_size=(
+                self.model_config.hidden_size
+                if self.speculative_algorithm.is_standalone()
+                else None
+            ),
         )
 
         # Post process based on verified outputs.
@@ -887,6 +907,14 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # For STANDALONE mode, create placeholder with draft model's hidden_size
+        # since the draft model produces its own hidden_states (not using target's)
+        if self.speculative_algorithm.is_standalone():
+            hidden_states = torch.zeros(
+                (hidden_states.shape[0], self.model_config.hidden_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
@@ -924,10 +952,16 @@ class EAGLEWorker(TpModelWorker):
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
+            # For EAGLE models, use target_hidden_size since EAGLE head uses target's hidden states
+            # For STANDALONE mode, use draft model's hidden_size since draft model produces its own hidden states
+            if hasattr(self.model_config.hf_config, "target_hidden_size"):
+                base_hidden_size = self.model_config.hf_config.target_hidden_size
+            else:
+                base_hidden_size = self.model_config.hidden_size
             hidden_size = (
-                self.model_config.hidden_size * 3
+                base_hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
-                else self.model_config.hidden_size
+                else base_hidden_size
             )
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,

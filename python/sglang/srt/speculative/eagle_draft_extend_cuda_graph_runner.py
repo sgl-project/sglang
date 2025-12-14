@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import bisect
+import logging
 from typing import TYPE_CHECKING, Callable
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Flag to log hidden_states size mismatch warning only once
+_hidden_states_mismatch_warned = False
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -98,25 +104,26 @@ class EAGLEDraftExtendCudaGraphRunner:
                 (3, self.max_num_token), dtype=torch.int64
             )
 
+            # For EAGLE models, use target_hidden_size from hf_config since EAGLE head uses target's hidden states
+            # For STANDALONE mode, use draft model's hidden_size since draft model produces its own hidden states
+            if hasattr(
+                self.model_runner.model_config.hf_config,
+                "target_hidden_size",
+            ):
+                draft_hidden_size = (
+                    self.model_runner.model_config.hf_config.target_hidden_size
+                )
+            else:
+                draft_hidden_size = self.model_runner.model_config.hidden_size
+
             if self.eagle_worker.speculative_algorithm.is_eagle3():
                 self.hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        (
-                            self.model_runner.model_config.hf_config.target_hidden_size
-                            * 3
-                            if hasattr(
-                                self.model_runner.model_config.hf_config,
-                                "target_hidden_size",
-                            )
-                            else self.model_runner.model_config.hidden_size * 3
-                        ),
-                    ),
+                    (self.max_num_token, draft_hidden_size * 3),
                     dtype=self.model_runner.dtype,
                 )
             else:
                 self.hidden_states = torch.zeros(
-                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    (self.max_num_token, draft_hidden_size),
                     dtype=self.model_runner.dtype,
                 )
             self.seq_len_fill_value = (
@@ -399,6 +406,14 @@ class EAGLEDraftExtendCudaGraphRunner:
             == self.hidden_states.shape[1]
         ):
             self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
+        else:
+            global _hidden_states_mismatch_warned
+            if not _hidden_states_mismatch_warned:
+                logger.warning(
+                    f"Skipping hidden_states copy due to size mismatch: "
+                    f"expected {self.hidden_states.shape[1]}, got {forward_batch.spec_info.hidden_states.shape[1]}"
+                )
+                _hidden_states_mismatch_warned = True
         if forward_batch.spec_info.accept_length is not None:
             self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
