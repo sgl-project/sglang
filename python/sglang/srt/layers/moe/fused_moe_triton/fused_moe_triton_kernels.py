@@ -839,10 +839,8 @@ def silu_and_mul_triton_kernel_tma(
     gateup_output,
     down_input,
     hidden_size,
-    sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
-    num_valid_tokens,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -866,20 +864,22 @@ def silu_and_mul_triton_kernel_tma(
 
     row_offsets = start_offs_m + tl.arange(0, BLOCK_SIZE_M)
 
-    expert_id = tl.load(expert_ids_ptr + pid_m)
+    expert_id = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if expert_id == -1:
         for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
-            offset = start_offset + tl.arange(0, BLOCK_SIZE_N)
-            dim_mask = offset < half_hidden_size
+            offset = (
+                start_offset + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+            ) % half_hidden_size
             down_ptrs = (
                 down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
             )
-            tl.store(down_ptrs, 0, mask=dim_mask)
+            tl.store(down_ptrs, 0)
         return
 
     for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
-        offset = start_offset + tl.arange(0, BLOCK_SIZE_N)
-        dim_mask = offset < half_hidden_size
+        offset = (
+            start_offset + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        ) % half_hidden_size
 
         gate_ptrs = gateup_output + row_offsets[:, None] * hidden_size + offset[None, :]
         up_ptrs = (
@@ -888,8 +888,8 @@ def silu_and_mul_triton_kernel_tma(
             + (half_hidden_size + offset)[None, :]
         )
 
-        gate_data = tl.load(gate_ptrs, mask=dim_mask, other=0.0)
-        up_data = tl.load(up_ptrs, mask=dim_mask, other=0.0)
+        gate_data = tl.load(gate_ptrs).to(tl.float32)
+        up_data = tl.load(up_ptrs)
 
         gate_output = gate_data * tl.sigmoid(gate_data)
         gate_output = gate_output.to(InDtype)
@@ -900,7 +900,7 @@ def silu_and_mul_triton_kernel_tma(
         down_ptrs = (
             down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
         )
-        tl.store(down_ptrs, silu_mul_output, mask=dim_mask)
+        tl.store(down_ptrs, silu_mul_output)
 
 
 @triton.jit

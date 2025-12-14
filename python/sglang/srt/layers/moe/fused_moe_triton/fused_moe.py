@@ -573,10 +573,8 @@ def fused_experts_impl(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
                         N,
-                        sorted_token_ids,
                         expert_ids,
                         num_tokens_post_padded,
-                        curr_topk_ids.numel(),
                         BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
                         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
                     )
