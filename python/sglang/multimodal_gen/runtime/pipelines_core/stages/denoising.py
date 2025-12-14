@@ -20,6 +20,10 @@ from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.longcatvideo import (
+    LongCatT2V480PConfig,
+    LongCatT2V704PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
@@ -338,6 +342,27 @@ class DenoisingStage(PipelineStage):
             return self._build_guidance(bsz, dtype, device, guidance_val)
         else:
             return None
+
+    def optimized_scale(self, positive_flat, negative_flat) -> torch.Tensor:
+        """
+        Calculate optimized scale from CFG-zero paper for LongCat.
+
+        st_star = (v_cond^T * v_uncond) / ||v_uncond||^2
+
+        Args:
+            positive_flat: Conditional prediction, flattened [B, -1]
+            negative_flat: Unconditional prediction, flattened [B, -1]
+
+        Returns:
+            st_star: Optimized scale [B, 1]
+        """
+        # Calculate dot product
+        dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+        # Squared norm of uncondition
+        squared_norm = torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
+        # st_star = v_cond^T * v_uncond / ||v_uncond||^2
+        st_star = dot_product / squared_norm
+        return st_star
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -874,6 +899,7 @@ class DenoisingStage(PipelineStage):
             and batch.condition_image is not None
             and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
         )
+
         if should_preprocess_for_wan_ti2v:
             # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
             # This ensures the first frame is always the condition image after each step.
@@ -1002,6 +1028,21 @@ class DenoisingStage(PipelineStage):
                             guidance=guidance,
                             latents=latents,
                         )
+
+                        # Check if we should use LongCat-specific processing
+                        should_preprocess_for_longcat = (
+                            server_args.pipeline_config.task_type == ModelTaskType.T2V
+                            and (
+                                type(server_args.pipeline_config)
+                                is LongCatT2V480PConfig
+                                or type(server_args.pipeline_config)
+                                is LongCatT2V704PConfig
+                            )
+                        )
+
+                        # LongCat: Negate noise prediction for flow matching scheduler
+                        if should_preprocess_for_longcat:
+                            noise_pred = -noise_pred
 
                         # Compute the previous noisy sample
                         latents = self.scheduler.step(
@@ -1316,9 +1357,38 @@ class DenoisingStage(PipelineStage):
         else:
             # Serial CFG: both cond and uncond are available locally
             assert noise_pred_cond is not None and noise_pred_uncond is not None
-            noise_pred = noise_pred_uncond + current_guidance_scale * (
-                noise_pred_cond - noise_pred_uncond
+
+            # Check if we should use LongCat-specific processing
+            should_preprocess_for_longcat = (
+                server_args.pipeline_config.task_type == ModelTaskType.T2V
+                and (
+                    type(server_args.pipeline_config) is LongCatT2V480PConfig
+                    or type(server_args.pipeline_config) is LongCatT2V704PConfig
+                )
             )
+
+            # Apply LongCat CFG-zero optimization if needed
+            if should_preprocess_for_longcat:
+                B = noise_pred_cond.shape[0]
+                positive = noise_pred_cond.reshape(B, -1)
+                negative = noise_pred_uncond.reshape(B, -1)
+
+                # Calculate optimized scale (CFG-zero)
+                st_star = self.optimized_scale(positive, negative)
+
+                # Reshape for broadcasting to match noise pred dimensions
+                original_shape = noise_pred_cond.shape
+                st_star = st_star.view(B, *([1] * (len(original_shape) - 1)))
+
+                # Apply optimized CFG formula
+                noise_pred = noise_pred_uncond * st_star + current_guidance_scale * (
+                    noise_pred_cond - noise_pred_uncond * st_star
+                )
+            else:
+                # Standard CFG
+                noise_pred = noise_pred_uncond + current_guidance_scale * (
+                    noise_pred_cond - noise_pred_uncond
+                )
 
             if batch.guidance_rescale > 0.0:
                 noise_pred = self.rescale_noise_cfg(

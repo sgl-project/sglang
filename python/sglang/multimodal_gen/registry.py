@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcatvideo import (
+    LongCatT2V480PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
@@ -43,6 +46,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.longcatvideo import LongCatVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
@@ -360,6 +364,14 @@ def _register_configs():
         hf_model_paths=[
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         ],
+    )
+    register_configs(
+        sampling_param_cls=LongCatVideoSamplingParams,
+        pipeline_config_cls=LongCatT2V480PConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Video",
+        ],
+        model_detectors=[lambda id: "longcat" in id.lower()],
     )
 
     register_configs(
