@@ -63,7 +63,9 @@ class FutureMap:
             )
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        if self.buf_initialized or not self.spec_algo.is_eagle():
+        if self.buf_initialized or (
+            not self.spec_algo.is_eagle() and not self.spec_algo.is_standalone()
+        ):
             return
 
         self.buf_initialized = True
@@ -111,7 +113,7 @@ class FutureMap:
         return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
-        if self.spec_algo.is_eagle():
+        if self.spec_algo.is_eagle() or self.spec_algo.is_standalone():
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             if draft_input is None:
@@ -136,7 +138,7 @@ class FutureMap:
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
-        if self.spec_algo.is_eagle():
+        if self.spec_algo.is_eagle() or self.spec_algo.is_standalone():
             draft_input: EagleDraftInput = batch_result.next_draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)
         else:

@@ -1849,8 +1849,8 @@ class ServerArgs:
 
             if (
                 self.speculative_algorithm == "EAGLE"
-                and envs.SGLANG_ENABLE_SPEC_V2.get()
-            ):
+                or self.speculative_algorithm == "STANDALONE"
+            ) and envs.SGLANG_ENABLE_SPEC_V2.get():
                 self.disable_overlap_schedule = False
                 logger.warning(
                     "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
