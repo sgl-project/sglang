@@ -22,6 +22,7 @@ on:
           - 'nightly-test-general-4-gpu-h100'
           - 'nightly-test-general-8-gpu-h200'
           - 'nightly-test-general-8-gpu-h20'
+          - 'nightly-test-general-8-gpu-b200'
           - 'nightly-test-text-accuracy-2-gpu-runner'
           - 'nightly-test-text-perf-2-gpu-runner'
           - 'nightly-test-vlm-accuracy-2-gpu-runner'
@@ -214,6 +215,28 @@ jobs:
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h20 --nightly --continue-on-error
+
+  # General tests - 8 GPU B200
+  nightly-test-general-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
+    runs-on: 8-gpu-b200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          GPU_CONFIG: "8-gpu-b200"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
@@ -573,6 +596,7 @@ jobs:
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20
+      - nightly-test-general-8-gpu-b200
       - nightly-test-text-accuracy-2-gpu-runner
       - nightly-test-text-perf-2-gpu-runner
       - nightly-test-vlm-accuracy-2-gpu-runner
