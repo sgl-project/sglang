@@ -10,9 +10,9 @@ use super::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
-    routers::grpc::{
-        context::{RequestContext, WorkerSelection},
+    routers::{
         error,
+        grpc::context::{RequestContext, WorkerSelection},
     },
 };
 
@@ -52,7 +52,10 @@ impl PipelineStage for WorkerSelectionStage {
                 function = "WorkerSelectionStage::execute",
                 "Preparation stage not completed"
             );
-            error::internal_error("Preparation stage not completed")
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
         })?;
 
         // For Harmony, use selection_text produced during Harmony encoding
@@ -74,10 +77,10 @@ impl PipelineStage for WorkerSelectionStage {
                             model_id = ?ctx.input.model_id,
                             "No available workers for model"
                         );
-                        return Err(error::service_unavailable(format!(
-                            "No available workers for model: {:?}",
-                            ctx.input.model_id
-                        )));
+                        return Err(error::service_unavailable(
+                            "no_available_workers",
+                            format!("No available workers for model: {:?}", ctx.input.model_id),
+                        ));
                     }
                 }
             }
@@ -91,10 +94,13 @@ impl PipelineStage for WorkerSelectionStage {
                             model_id = ?ctx.input.model_id,
                             "No available PD worker pairs for model"
                         );
-                        return Err(error::service_unavailable(format!(
-                            "No available PD worker pairs for model: {:?}",
-                            ctx.input.model_id
-                        )));
+                        return Err(error::service_unavailable(
+                            "no_available_pd_worker_pairs",
+                            format!(
+                                "No available PD worker pairs for model: {:?}",
+                                ctx.input.model_id
+                            ),
+                        ));
                     }
                 }
             }

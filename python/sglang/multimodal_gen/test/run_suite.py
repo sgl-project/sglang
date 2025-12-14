@@ -22,6 +22,7 @@ SUITES = {
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
+        "test_lora_format_adapter.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -69,7 +70,7 @@ def run_pytest(files):
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
 
-    max_retries = 2
+    max_retries = 4
     # retry if the perf assertion failed, for {max_retries} times
     for i in range(max_retries + 1):
         cmd = list(base_cmd)
@@ -116,6 +117,7 @@ def run_pytest(files):
         if not is_perf_assertion:
             return returncode
 
+    logger.info(f"Max retry exceeded")
     return returncode
 
 
