@@ -96,7 +96,6 @@ impl MockWorker {
             )
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
-            .route("/metrics", get(metrics_handler))
             .with_state(config);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1269,26 +1268,4 @@ impl Default for MockWorkerConfig {
             fail_rate: 0.0,
         }
     }
-}
-async fn metrics_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
-    let config = config.read().await;
-
-    // Simulate the delay
-    if config.response_delay_ms > 0 {
-        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
-    }
-
-    // Return fake prometheus metrics
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    format!(
-        "# HELP sglang_num_running_reqs The number of running requests\n\
-         # TYPE sglang_num_running_reqs gauge\n\
-         sglang_num_running_reqs{{worker_port=\"{}\"}} 42\n\
-         sglang_up_timestamp {}\n",
-        config.port, timestamp
-    )
-    .into_response()
 }
