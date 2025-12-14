@@ -232,6 +232,7 @@ impl CircuitBreaker {
             info!("Circuit breaker state transition: {} -> {}", from, to);
             RouterMetrics::record_cb_state_transition(&self.metric_label, from, to);
             RouterMetrics::set_cb_state(&self.metric_label, new_state.to_int());
+            self.publish_gauge_metrics();
         }
     }
 
