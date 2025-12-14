@@ -1348,6 +1348,7 @@ class ServerArgs:
             and not self.enable_dp_attention
             and self.nnodes == 1
             and not is_h20_device
+            and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
             logger.info(
