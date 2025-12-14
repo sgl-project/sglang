@@ -753,7 +753,6 @@
                 "39": 1599.78
             },
             "expected_e2e_ms": 123182.9887,
-            ,
             "expected_avg_denoise_ms": 2513.52,
             "expected_median_denoise_ms": 1600.09
         },
