@@ -935,6 +935,7 @@ def extend_mrope_positions_for_retracted_request(
     # Concatenate to the original mrope_positions
     return torch.cat([mrope_positions, output_positions], dim=1)
 
+
 def clear_mm_features_for_decode(
     tokenized_obj,
     disaggregation_mode: str,
@@ -946,24 +947,24 @@ def clear_mm_features_for_decode(
     # Early return if not in decode mode or clearing is disabled
     if disaggregation_mode != "decode" or not enable_clearing:
         return
-    
+
     # Check if multimodal inputs exist
     if not hasattr(tokenized_obj, "mm_inputs") or not tokenized_obj.mm_inputs:
         return
-    
+
     # Get mm_items
     mm_items = tokenized_obj.mm_inputs.get("mm_items", [])
     if not mm_items:
         return
-    
+
     # Get request ID for hash
     rid = getattr(tokenized_obj, "rid", None)
     if rid is None:
         return
-    
+
     # Convert rid to hash value
     hash_value = int(rid, 16)
-    
+
     # Clear features and set hash
     for item in mm_items:
         if hasattr(item, "feature"):
