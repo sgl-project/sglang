@@ -79,7 +79,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
-        return self.bot_token in text
+        return self.bot_token in text or self.bot_token.replace("｜DSML｜", "") in text
 
     def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
         """
@@ -105,7 +105,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         # Fall back to XML parameter tag parsing (original format)
         parameters = {}
-        param_matches = re.findall(self.parameter_regex, invoke_content, re.DOTALL)
+        param_matches = re.findall(
+            self.parameter_regex, invoke_content, re.DOTALL
+        ) + re.findall(
+            self.parameter_regex.replace("｜DSML｜", ""), invoke_content, re.DOTALL
+        )
         for param_name, param_type, param_value in param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
@@ -126,16 +130,31 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
+        if (
+            self.bot_token not in text
+            and self.bot_token.replace("｜DSML｜", "") not in text
+        ):
+            return StreamingParseResult(normal_text=text, calls=[])
         idx = text.find(self.bot_token)
+        if idx == -1:
+            idx = text.find(self.bot_token.replace("｜DSML｜", ""))
         normal_text = text[:idx].strip() if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
 
         calls = []
         try:
             # Extract content between function_calls tags
+            function_calls_pattern = (
+                r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>"
+            )
+            function_calls_pattern_fallback = function_calls_pattern.replace(
+                "｜DSML｜", ""
+            )
             function_calls_match = re.search(
-                r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>",
+                function_calls_pattern,
+                text,
+                re.DOTALL,
+            ) or re.search(
+                function_calls_pattern_fallback,
                 text,
                 re.DOTALL,
             )
@@ -148,9 +167,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
             invoke_pattern = (
                 r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
             )
+            invoke_pattern_fallback = invoke_pattern.replace("｜DSML｜", "")
             invoke_matches = re.findall(
                 invoke_pattern, function_calls_content, re.DOTALL
-            )
+            ) + re.findall(invoke_pattern_fallback, function_calls_content, re.DOTALL)
 
             for func_name, invoke_content in invoke_matches:
                 # Parse parameters from XML format
@@ -179,12 +199,25 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
         # If we see these markers anywhere, we should keep buffering
         has_tool_call = (
-            self.bot_token in current_text or "<｜DSML｜invoke" in current_text
+            self.bot_token in current_text
+            or self.bot_token.replace("｜DSML｜", "") in current_text
+            or "<｜DSML｜invoke" in current_text
+            or "<invoke" in current_text
         )
 
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
+        dsml_markers = [
+            "｜DSML｜",
+            "<｜",
+            "</｜",
+            "<inv",
+            "<par",
+            "<fun",
+            "</fun",
+            "</inv",
+            "</par",
+        ]
         potentially_dsml = any(marker in current_text for marker in dsml_markers)
 
         # Also check if text ends with start of a tag (to handle "<" arriving separately)
@@ -195,7 +228,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         if not has_tool_call and not potentially_dsml and not ends_with_prefix:
             self._buffer = ""
-            for e_token in [self.eot_token, self.invoke_end_token]:
+            for e_token in [
+                self.eot_token,
+                self.eot_token.replace("｜DSML｜", ""),
+                self.invoke_end_token,
+                self.invoke_end_token.replace("｜DSML｜", ""),
+            ]:
                 if e_token in new_text:
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)
@@ -208,8 +246,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
+                pattern = (
+                    r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)'
+                )
+                pattern_fallback = pattern.replace("｜DSML｜", "")
                 invoke_match = re.search(
-                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                    pattern=pattern,
+                    string=current_text,
+                    flags=re.DOTALL,
+                ) or re.search(
+                    pattern=pattern_fallback,
                     string=current_text,
                     flags=re.DOTALL,
                 )
