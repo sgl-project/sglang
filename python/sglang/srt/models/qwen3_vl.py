@@ -41,6 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    patch_conv3d,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -131,9 +132,12 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
-        )
+        # hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
+        #     -1, self.embed_dim
+        # )
+        hidden_states = patch_conv3d(
+            self.proj, hidden_states.to(dtype=target_dtype)
+        ).view(-1, self.embed_dim)
         return hidden_states
 
 

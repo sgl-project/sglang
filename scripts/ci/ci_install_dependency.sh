@@ -151,8 +151,7 @@ fi
 # DeepEP depends on nvshmem 3.4.5
 $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
 
-# Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-$PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+
 $PIP_CMD uninstall xformers || true
 
 $PIP_CMD install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/${CU_VERSION}
