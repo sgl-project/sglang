@@ -244,8 +244,8 @@ def create_grammar_backend(
         except TokenizerNotSupportedError as e:
             logger.warning(
                 f"Grammar backend disabled because tokenizer is not supported by XGrammar: {e}. "
-                f"Falling back to grammar_backend='none'. "
-                f"Structured outputs (JSON schema, regex, EBNF) will not be available."
+                "Falling back to grammar_backend='none'. "
+                "Structured outputs (JSON schema, regex, EBNF) will not be available."
             )
             server_args.grammar_backend = "none"
             return None
