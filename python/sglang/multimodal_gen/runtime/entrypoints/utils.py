@@ -35,7 +35,9 @@ def prepare_request(
     req = Req(**filtered_params, VSA_sparsity=server_args.VSA_sparsity)
     req.adjust_size(server_args)
 
-    if req.width <= 0 or req.height <= 0:
+    if (req.width is not None and req.width <= 0) or (
+        req.height is not None and req.height <= 0
+    ):
         raise ValueError(
             f"Height, width must be positive integers, got "
             f"height={req.height}, width={req.width}"

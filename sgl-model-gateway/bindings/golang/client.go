@@ -32,8 +32,9 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/sglang/sglang-go-grpc-sdk/internal/ffi"
+	grpcclient "github.com/sglang/sglang-go-grpc-sdk/internal/grpc"
 )
 
 // Client is the main client for interacting with SGLang gRPC API.
@@ -44,7 +45,7 @@ import (
 type Client struct {
 	endpoint      string
 	tokenizerPath string
-	clientHandle  *ffi.SglangClientHandle
+	grpcClient    *grpcclient.GrpcClient // gRPC-based client
 	mu            sync.RWMutex
 }
 
@@ -58,6 +59,41 @@ type ClientConfig struct {
 	// tokenizer configuration files (e.g., tokenizer.json, vocab.json).
 	// Required field.
 	TokenizerPath string
+
+	// ChannelBufferSizes configures buffer sizes for internal channels.
+	// If nil, default values will be used (optimized for high concurrency).
+	ChannelBufferSizes *ChannelBufferSizes
+
+	// Timeouts configures timeout values for various operations.
+	// If nil, default values will be used.
+	Timeouts *Timeouts
+}
+
+// ChannelBufferSizes configures buffer sizes for internal channels.
+// These affect concurrency and memory usage. Larger buffers allow more
+// concurrent operations but use more memory.
+type ChannelBufferSizes = grpcclient.ChannelBufferSizes
+
+// Timeouts configures timeout values for various operations.
+type Timeouts = grpcclient.Timeouts
+
+// defaultChannelBufferSizes returns default channel buffer sizes optimized for high concurrency (10k+).
+// These values are designed to handle thousands of concurrent requests without blocking.
+func defaultChannelBufferSizes() ChannelBufferSizes {
+	return ChannelBufferSizes{
+		ResultJSONChan: 10000, // Increased for high concurrency: each request may produce 200-500 chunks
+		ErrChan:        100,   // Errors are rare, 100 is sufficient
+		RecvChan:       2000,  // Increased for high concurrency: more gRPC responses to buffer
+	}
+}
+
+// defaultTimeouts returns default timeout values.
+func defaultTimeouts() Timeouts {
+	return Timeouts{
+		KeepaliveTime:    300 * time.Second, // Increased to reduce ping frequency and avoid "too many pings" errors
+		KeepaliveTimeout: 20 * time.Second,
+		CloseTimeout:     5 * time.Second,
+	}
 }
 
 // NewClient creates a new SGLang client with the given configuration.
@@ -77,15 +113,41 @@ func NewClient(config ClientConfig) (*Client, error) {
 		return nil, errors.New("tokenizer path is required")
 	}
 
-	clientHandle, err := ffi.NewClient(config.Endpoint, config.TokenizerPath)
+	bufferSizes := defaultChannelBufferSizes()
+	if config.ChannelBufferSizes != nil {
+		if config.ChannelBufferSizes.ResultJSONChan > 0 {
+			bufferSizes.ResultJSONChan = config.ChannelBufferSizes.ResultJSONChan
+		}
+		if config.ChannelBufferSizes.ErrChan > 0 {
+			bufferSizes.ErrChan = config.ChannelBufferSizes.ErrChan
+		}
+		if config.ChannelBufferSizes.RecvChan > 0 {
+			bufferSizes.RecvChan = config.ChannelBufferSizes.RecvChan
+		}
+	}
+
+	timeouts := defaultTimeouts()
+	if config.Timeouts != nil {
+		if config.Timeouts.KeepaliveTime > 0 {
+			timeouts.KeepaliveTime = config.Timeouts.KeepaliveTime
+		}
+		if config.Timeouts.KeepaliveTimeout > 0 {
+			timeouts.KeepaliveTimeout = config.Timeouts.KeepaliveTimeout
+		}
+		if config.Timeouts.CloseTimeout > 0 {
+			timeouts.CloseTimeout = config.Timeouts.CloseTimeout
+		}
+	}
+
+	grpcClient, err := grpcclient.NewGrpcClient(config.Endpoint, config.TokenizerPath, bufferSizes, timeouts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create client: %w", err)
+		return nil, fmt.Errorf("failed to create gRPC client: %w", err)
 	}
 
 	return &Client{
 		endpoint:      config.Endpoint,
 		tokenizerPath: config.TokenizerPath,
-		clientHandle:  clientHandle,
+		grpcClient:    grpcClient,
 	}, nil
 }
 
@@ -97,9 +159,11 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.clientHandle != nil {
-		c.clientHandle.Free()
-		c.clientHandle = nil
+	if c.grpcClient != nil {
+		if err := c.grpcClient.Close(); err != nil {
+			return err
+		}
+		c.grpcClient = nil
 	}
 	return nil
 }
@@ -229,7 +293,7 @@ type MessageDelta struct {
 //
 // Context Support:
 // The ctx parameter is fully supported for cancellation and timeouts:
-// - If ctx is cancelled, the request will be interrupted on the next stream.Recv() call
+// - If ctx is cancelled, the request will be interrupted on the next stream.RecvJSON() call
 // - If ctx times out, the request will return context.DeadlineExceeded
 //
 // Example with timeout:
@@ -244,7 +308,6 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 	// For non-streaming, we'll collect all chunks and return the final response
 	req.Stream = true // We still use streaming internally, but collect all chunks
 
-	// Prepare request: if Tools is empty, set to nil for proper JSON serialization
 	if len(req.Tools) == 0 {
 		req.Tools = nil
 	}
@@ -265,12 +328,17 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 	var systemFingerprint string
 
 	for {
-		chunk, err := stream.Recv()
+		chunkJSON, err := stream.RecvJSON()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
+		}
+
+		var chunk ChatCompletionStreamResponse
+		if err := json.Unmarshal([]byte(chunkJSON), &chunk); err != nil {
+			return nil, fmt.Errorf("failed to parse chunk: %w", err)
 		}
 
 		if chunk.ID != "" {
@@ -293,21 +361,16 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 			if len(choice.Delta.ToolCalls) > 0 {
 				fullToolCalls = append(fullToolCalls, choice.Delta.ToolCalls...)
 			}
-			// Always update finish_reason if present (even if empty string, but should not be empty)
-			// The last chunk (Complete message) should have finish_reason set
 			if choice.FinishReason != "" {
 				finishReason = choice.FinishReason
 			}
 		}
 
-		// Extract usage from chunk if available (usually in the last chunk)
-		// Always update usage if present, as the last chunk should have the final usage
 		if chunk.Usage != nil {
 			usage = *chunk.Usage
 		}
 	}
 
-	// Build final response
 	message := Message{
 		Role:    "assistant",
 		Content: fullContent.String(),
@@ -316,8 +379,6 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 		message.ToolCalls = fullToolCalls
 	}
 
-	// Ensure finish_reason is set (defensive check)
-	// If finish_reason is still empty, default to "stop"
 	if finishReason == "" {
 		finishReason = "stop"
 	}
@@ -341,94 +402,22 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 
 // ChatCompletionStream represents a streaming chat completion
 type ChatCompletionStream struct {
-	stream *ffi.SglangStreamHandle
-	mu     sync.Mutex
-	done   bool               // Track if stream has been marked as done
-	ctx    context.Context    // Context for cancellation support
-	cancel context.CancelFunc // Cancel function to stop monitoring goroutine
-	closed chan struct{}      // Signal when stream is closed
+	grpcStream *grpcclient.GrpcChatCompletionStream
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-// Recv receives the next chunk from the stream.
-//
-// Supports context cancellation: if the context passed to CreateChatCompletionStream
-// is cancelled, Recv will return context.Canceled error on the next call.
-func (s *ChatCompletionStream) Recv() (*ChatCompletionStreamResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check if context was cancelled
-	select {
-	case <-s.ctx.Done():
-		return nil, s.ctx.Err() // Returns context.Canceled or context.DeadlineExceeded
-	default:
-	}
-
-	if s.stream == nil {
-		return nil, io.EOF
-	}
-
-	// If stream was already marked as done, immediately return EOF
-	// This prevents calling ReadNext() again after isDone=1
-	if s.done {
-		return nil, io.EOF
-	}
-
-	// Loop to handle empty responses (Ok(None) from Rust)
-	// Keep reading until we get actual data or stream ends
-	for {
-		responseJSON, isDone, err := s.stream.ReadNext()
-		if err != nil {
-			return nil, err
-		}
-
-		// Mark stream as done if ReadNext indicates completion
-		if isDone {
-			s.done = true
-		}
-
-		// If we have a response, parse and return it
-		if responseJSON != "" {
-			var response ChatCompletionStreamResponse
-			if err := json.Unmarshal([]byte(responseJSON), &response); err != nil {
-				return nil, fmt.Errorf("failed to parse response: %w", err)
-			}
-			return &response, nil
-		}
-
-		// If stream is done but no response, return EOF
-		if isDone {
-			return nil, io.EOF
-		}
-
-		// Empty response and stream not done - loop to read next chunk
-		// This handles Ok(None) cases where Rust returns no data but stream continues
-	}
+func (s *ChatCompletionStream) RecvJSON() (string, error) {
+	return s.grpcStream.RecvJSON()
 }
 
 // Close closes the stream and cancels any pending operations.
 func (s *ChatCompletionStream) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Cancel the context to signal the monitoring goroutine to stop
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	// Signal that stream is closed
-	select {
-	case <-s.closed:
-		// Already closed
-	default:
-		close(s.closed)
-	}
-
-	// Free the stream to mark it as completed
-	// This prevents AbortOnDropStream from sending abort when dropped
-	if s.stream != nil {
-		s.stream.Free()
-		s.stream = nil
+	if s.grpcStream != nil {
+		return s.grpcStream.Close()
 	}
 	return nil
 }
@@ -437,8 +426,8 @@ func (s *ChatCompletionStream) Close() error {
 //
 // Context Support:
 // The ctx parameter is now fully supported for cancellation and timeouts:
-// - If ctx is cancelled, stream.Recv() will return context.Canceled on the next call
-// - If ctx times out (WithTimeout), stream.Recv() will return context.DeadlineExceeded
+// - If ctx is cancelled, stream.RecvJSON() will return context.Canceled on the next call
+// - If ctx times out (WithTimeout), stream.RecvJSON() will return context.DeadlineExceeded
 // - Calling stream.Close() also cancels the context
 //
 // Example with timeout:
@@ -457,54 +446,38 @@ func (s *ChatCompletionStream) Close() error {
 //	    cancel()  // Cancel after 5 seconds
 //	}()
 func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatCompletionRequest) (*ChatCompletionStream, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if c.clientHandle == nil {
-		return nil, errors.New("client is closed")
-	}
-
-	// Marshal request to JSON, then ensure tools field is always present.
-	// Due to omitempty tag, empty Tools slice will be omitted from JSON.
-	// We need to ensure tools field is always present as [] when empty (not omitted),
-	// matching the behavior of complete_sdk example.
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Unmarshal into map and ensure tools field is present
 	var reqMap map[string]interface{}
 	if err := json.Unmarshal(reqJSON, &reqMap); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal request to map: %w", err)
 	}
 
-	// Add empty tools array if not present
 	if _, exists := reqMap["tools"]; !exists {
 		reqMap["tools"] = []interface{}{}
 	}
 
-	// Marshal back to JSON
 	reqJSON, err = json.Marshal(reqMap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request map to JSON: %w", err)
 	}
 
-	// Create stream
-	streamHandle, err := c.clientHandle.ChatCompletionStream(string(reqJSON))
+	if c.grpcClient == nil {
+		return nil, errors.New("gRPC client is closed")
+	}
+
+	grpcStream, err := c.grpcClient.CreateChatCompletionStream(ctx, string(reqJSON))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stream: %w", err)
+		return nil, fmt.Errorf("failed to create gRPC stream: %w", err)
 	}
 
-	// Create a child context from the provided context for cancellation support
 	streamCtx, cancel := context.WithCancel(ctx)
-
-	stream := &ChatCompletionStream{
-		stream: streamHandle,
-		ctx:    streamCtx,
-		cancel: cancel,
-		closed: make(chan struct{}),
-	}
-
-	return stream, nil
+	return &ChatCompletionStream{
+		grpcStream: grpcStream,
+		ctx:        streamCtx,
+		cancel:     cancel,
+	}, nil
 }

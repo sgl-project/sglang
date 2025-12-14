@@ -325,8 +325,31 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            from sglang.srt.managers.mm_utils import (
+                init_feature_buffer,
+                is_feature_buffer_initialized,
+                reset_buffer_offset,
+                try_add_to_buffer,
+            )
+
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if not is_feature_buffer_initialized():
+                init_feature_buffer(device)
+            reset_buffer_offset()
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = try_add_to_buffer(item.feature)
+
         for item in ret.mm_items:
             item.set_pad_value()
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    item.feature = item.feature.to("cpu", non_blocking=True)
 
         optional_args = [
             "mrope_positions",
@@ -449,6 +472,7 @@ class Req:
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -493,6 +517,9 @@ class Req:
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+
+        # Require reasoning for the request (hybrid reasoning model only)
+        self.require_reasoning = require_reasoning
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -650,6 +677,7 @@ class Req:
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
+        self.retraction_mb_id = None
 
         # For metrics
         self.metrics_collector = metrics_collector
@@ -683,7 +711,6 @@ class Req:
         self.dimensions = dimensions
 
         # For diffusion LLM
-        self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -759,22 +786,19 @@ class Req:
     def is_dllm(self):
         return self.dllm_config is not None
 
+    def _init_fill_ids_for_dllm(self):
+        if not self.fill_ids:
+            self.fill_ids = (
+                self.origin_input_ids
+                + [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
+        else:
+            self.dllm_block_offset += self.dllm_config.block_size
+            self.fill_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
-            if not self.fill_ids:
-                self.dllm_ids = (
-                    self.origin_input_ids
-                    + [
-                        self.dllm_config.mask_id,
-                    ]
-                    * self.dllm_config.block_size
-                )
-            else:
-                self.dllm_block_offset += self.dllm_config.block_size
-                self.dllm_ids += [
-                    self.dllm_config.mask_id
-                ] * self.dllm_config.block_size
-            self.fill_ids = self.dllm_ids
+            self._init_fill_ids_for_dllm()
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
@@ -1297,6 +1321,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
+        if self.is_dllm():
+            # For DLLM, we use a separate forward mode
+            self.forward_mode = ForwardMode.DLLM_EXTEND
+
         # Init tensors
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -1581,6 +1609,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def retract_decode(
         self,
         server_args: ServerArgs,
+        buf_multiplier: int = 1,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1602,7 +1631,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         first_iter = True
         while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
+            not self.check_decode_mem(
+                selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+            )
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -1765,6 +1796,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
+        # FIXME(lsyin): deprecate this API after spec v1 is deprecated
+        v1_spec_info_filtered: Optional[bool] = False,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
@@ -1821,11 +1854,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        # NOTE: spec_info filtered before batch filtering only happens in:
+        # - Spec v1's verify phase
+        # - Only for decode batch (running_batch)
+        has_been_filtered = v1_spec_info_filtered and not self.is_v2_eagle
+
         if self.spec_info:
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
-            else:
-                has_been_filtered = True
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,

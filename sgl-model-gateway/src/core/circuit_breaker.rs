@@ -88,9 +88,7 @@ impl CircuitBreaker {
 
     /// Check if a request can be executed
     pub fn can_execute(&self) -> bool {
-        self.check_and_update_state();
-
-        let state = *self.state.read().unwrap();
+        let state = self.state();
         match state {
             CircuitState::Closed => true,
             CircuitState::Open => false,
@@ -100,8 +98,21 @@ impl CircuitBreaker {
 
     /// Get the current state
     pub fn state(&self) -> CircuitState {
-        self.check_and_update_state();
-        *self.state.read().unwrap()
+        self.check_and_update_state_returning()
+    }
+
+    /// Check and update state, returning the current state to avoid double lock
+    fn check_and_update_state_returning(&self) -> CircuitState {
+        let current_state = *self.state.read().unwrap();
+
+        if current_state == CircuitState::Open {
+            let last_change = *self.last_state_change.read().unwrap();
+            if last_change.elapsed() >= self.config.timeout_duration {
+                self.transition_to(CircuitState::HalfOpen);
+                return CircuitState::HalfOpen;
+            }
+        }
+        current_state
     }
 
     /// Record the outcome of a request
@@ -157,18 +168,6 @@ impl CircuitBreaker {
                 self.transition_to(CircuitState::Open);
             }
             CircuitState::Open => {}
-        }
-    }
-
-    /// Check and update state based on timeout
-    fn check_and_update_state(&self) {
-        let current_state = *self.state.read().unwrap();
-
-        if current_state == CircuitState::Open {
-            let last_change = *self.last_state_change.read().unwrap();
-            if last_change.elapsed() >= self.config.timeout_duration {
-                self.transition_to(CircuitState::HalfOpen);
-            }
         }
     }
 

@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 use wasmtime::{
     component::{Component, Linker, ResourceTable},
-    Config, Engine, Store, UpdateDeadline,
+    Config, Engine, Store, StoreLimitsBuilder, UpdateDeadline,
 };
 use wasmtime_wasi::WasiCtx;
 
@@ -342,13 +342,33 @@ impl WasmThreadPool {
         let mut linker = Linker::<WasiState>::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         let mut builder = WasiCtx::builder();
+
+        // Create memory limits from config.
+        // Use the config helper to get total bytes, then safely convert to usize.
+        let memory_limit_bytes =
+            usize::try_from(config.get_total_memory_bytes()).map_err(|_| {
+                WasmError::from(WasmRuntimeError::CallFailed(
+                    "Configured WASM memory limit exceeds addressable space on this platform."
+                        .to_string(),
+                ))
+            })?;
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(memory_limit_bytes)
+            .trap_on_grow_failure(true) // Trap instead of returning -1 for easier debugging
+            .build();
+
         let mut store = Store::new(
             engine,
             WasiState {
                 ctx: builder.build(),
                 table: ResourceTable::new(),
+                limits,
             },
         );
+
+        // Apply resource limits to the store.
+        // This enforces max_memory_pages by preventing memory.grow beyond the limit.
+        store.limiter(|state| &mut state.limits);
 
         // Set epoch deadline for timeout enforcement.
         // The deadline is the number of epoch ticks before execution is interrupted.

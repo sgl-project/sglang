@@ -71,6 +71,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from unittest import SkipTest
 from urllib.parse import urlparse
 
 import numpy as np
@@ -227,9 +228,7 @@ def is_blackwell():
 def is_blackwell_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
-    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
-        torch.version.cuda >= "12.8"
-    )
+    return is_sm100_supported(device) or is_sm120_supported(device)
 
 
 @lru_cache(maxsize=1)
@@ -243,7 +242,7 @@ def is_sm120_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
@@ -252,7 +251,7 @@ def is_sm100_supported(device=None) -> bool:
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
-    if not is_cuda_alike():
+    if not is_cuda():
         return False
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
@@ -314,7 +313,6 @@ try:
     )
 except:
     is_intel_amx_backend_available = False
-
 
 try:
     # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -1147,18 +1145,6 @@ def add_api_key_middleware(app, api_key: str):
         return await call_next(request)
 
 
-def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-        if not os.path.exists(model_path):
-            from modelscope import snapshot_download
-
-            model_path = snapshot_download(model_path)
-            tokenizer_path = snapshot_download(
-                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
-            )
-    return model_path, tokenizer_path
-
-
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1264,41 +1250,61 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    async_send: bool = False,
 ):
-    """Send data from src to dst in group using DeviceToDevice communication."""
-    device = torch.get_device_module().current_device()
+    """Send data from src to dst in group."""
+    from sglang.srt.distributed.parallel_state import P2PWork
+
+    if async_send:
+        send_func = dist.isend
+    else:
+        send_func = dist.send
     if rank == src:
+        p2p_works = []
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.send(tensor_size, dst=dst, group=group)
+            tensor_size = torch.tensor(
+                [0],
+                dtype=torch.long,
+            )
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(
-                device=device
-            )  # Move to GPU
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.send(tensor_size, dst=dst, group=group)
-            dist.send(tensor_data, dst=dst, group=group)
-        return data
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+            work = send_func(tensor_data, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_data))
+        return p2p_works
 
     elif rank == dst:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.recv(tensor_size, src=src, group=group)
+        tensor_size = torch.tensor(
+            [0],
+            dtype=torch.long,
+        )
+        work = dist.irecv(tensor_size, src=src, group=group)
+        work.wait()
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.recv(tensor_data, src=src, group=group)
+        tensor_data = torch.empty(
+            size,
+            dtype=torch.uint8,
+        )
+        work = dist.irecv(tensor_data, src=src, group=group)
+        work.wait()
 
-        serialized_data = bytes(
-            tensor_data.cpu().numpy()
-        )  # Move back to host for deserialization
+        serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
 
@@ -1503,6 +1509,31 @@ def add_prometheus_middleware(app):
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
+
+
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter
+
+    http_response_status_counter = Counter(
+        name="sglang:http_responses_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        response = await call_next(request)
+
+        route = request.scope.get("route")
+        endpoint = route.path if route else "Unknown"
+
+        http_response_status_counter.labels(
+            endpoint=endpoint,
+            status_code=str(response.status_code),
+            method=request.method,
+        ).inc()
+
+        return response
 
 
 def bind_port(port):
@@ -1999,7 +2030,7 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA")
+        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
@@ -2518,6 +2549,9 @@ def retry(
     for try_index in itertools.count():
         try:
             return fn()
+        except SkipTest:
+            # Do NOT retry skipped tests - used in CI and unittest
+            raise
         except Exception as e:
             traceback.print_exc()
 
@@ -2707,15 +2741,18 @@ def is_fa3_default_architecture(hf_config):
     if not isinstance(architectures, list) or not architectures:
         return False
     default_archs = {
-        "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
         "Glm4MoeForCausalLM",
+        "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
@@ -3322,6 +3359,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

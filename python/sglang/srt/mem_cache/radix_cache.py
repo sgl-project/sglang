@@ -730,10 +730,10 @@ class RadixCache(BasePrefixCache):
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):

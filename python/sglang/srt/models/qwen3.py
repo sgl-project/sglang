@@ -276,6 +276,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=False,
             is_previous_layer_sparse=False,
+            is_next_layer_sparse=False,
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,

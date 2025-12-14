@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
@@ -18,6 +17,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 use tokio::task::spawn_blocking;
+use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
 use tracing_subscriber::{
@@ -25,25 +25,44 @@ use tracing_subscriber::{
     Layer,
 };
 
-use super::events::get_module_path as http_router_get_module_path;
+use super::events::get_module_path as events_module_path;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-// global tracer
+// Global tracer and provider
 static TRACER: OnceLock<SdkTracer> = OnceLock::new();
 static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
 
-pub struct CustomOtelFilter {
-    allowed_targets: HashSet<String>,
+/// Targets allowed for OTEL export. Using a static slice avoids allocations.
+/// Note: "sgl_model_gateway::otel-trace" is a custom target used for manual spans,
+/// not the actual module path.
+static ALLOWED_TARGETS: OnceLock<[&'static str; 3]> = OnceLock::new();
+
+fn get_allowed_targets() -> &'static [&'static str; 3] {
+    ALLOWED_TARGETS.get_or_init(|| {
+        [
+            "sgl_model_gateway::otel-trace", // Custom target for manual spans
+            "sgl_model_gateway::observability::otel_trace",
+            events_module_path(),
+        ]
+    })
 }
+
+/// Filter that only allows specific module targets to be exported to OTEL.
+/// This reduces noise and cost by only exporting relevant spans.
+#[derive(Clone)]
+pub struct CustomOtelFilter;
 
 impl CustomOtelFilter {
     pub fn new() -> Self {
-        let mut allowed_targets = HashSet::new();
-        allowed_targets.insert("sgl_model_gateway::otel-trace".to_string());
-        allowed_targets.insert(http_router_get_module_path().to_string());
+        Self
+    }
 
-        Self { allowed_targets }
+    #[inline]
+    fn is_allowed(target: &str) -> bool {
+        get_allowed_targets()
+            .iter()
+            .any(|allowed| target.starts_with(allowed))
     }
 }
 
@@ -52,11 +71,11 @@ where
     S: Subscriber,
 {
     fn enabled(&self, meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
-        self.allowed_targets.contains(meta.target())
+        Self::is_allowed(meta.target())
     }
 
     fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> tracing::subscriber::Interest {
-        if self.allowed_targets.contains(meta.target()) {
+        if Self::is_allowed(meta.target()) {
             tracing::subscriber::Interest::always()
         } else {
             tracing::subscriber::Interest::never()
@@ -70,7 +89,11 @@ impl Default for CustomOtelFilter {
     }
 }
 
-/// init OpenTelemetry connection
+/// Initialize OpenTelemetry tracing with OTLP exporter.
+///
+/// # Arguments
+/// * `enable` - Whether to enable OTEL tracing
+/// * `otlp_endpoint` - OTLP collector endpoint (defaults to "localhost:4317")
 pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()> {
     if !enable {
         ENABLED.store(false, Ordering::Relaxed);
@@ -84,117 +107,105 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         endpoint.to_string()
     };
 
-    let result = std::panic::catch_unwind(|| -> Result<()> {
-        global::set_text_map_propagator(TraceContextPropagator::new());
+    global::set_text_map_propagator(TraceContextPropagator::new());
 
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .with_protocol(opentelemetry_otlp::Protocol::Grpc)
-            .build()?;
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&endpoint)
+        .with_protocol(opentelemetry_otlp::Protocol::Grpc)
+        .build()
+        .map_err(|e| {
+            eprintln!("[tracing] Failed to create OTLP exporter: {}", e);
+            anyhow::anyhow!("Failed to create OTLP exporter: {}", e)
+        })?;
 
-        let batch_config = BatchConfigBuilder::default()
-            .with_scheduled_delay(Duration::from_millis(500))
-            .with_max_export_batch_size(64)
-            .build();
+    let batch_config = BatchConfigBuilder::default()
+        .with_scheduled_delay(Duration::from_millis(500))
+        .with_max_export_batch_size(64)
+        .build();
 
-        let span_processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
-            .with_batch_config(batch_config)
-            .build();
+    let span_processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
+        .with_batch_config(batch_config)
+        .build();
 
-        let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
-            "service.name",
-            "sgl-router",
-        )]));
+    let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
+        "service.name",
+        "sgl-router",
+    )]));
 
-        let provider = TracerProvider::builder()
-            .with_span_processor(span_processor)
-            .with_resource(resource)
-            .build();
-        PROVIDER
-            .set(provider.clone())
-            .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
+    let provider = TracerProvider::builder()
+        .with_span_processor(span_processor)
+        .with_resource(resource)
+        .build();
 
-        let tracer = provider.tracer("sgl-router");
+    PROVIDER
+        .set(provider.clone())
+        .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
 
-        TRACER
-            .set(tracer)
-            .map_err(|_| anyhow::anyhow!("Tracer already initialized"))?;
+    let tracer = provider.tracer("sgl-router");
 
-        let _ = global::set_tracer_provider(provider);
+    TRACER
+        .set(tracer)
+        .map_err(|_| anyhow::anyhow!("Tracer already initialized"))?;
 
-        ENABLED.store(true, Ordering::Relaxed);
+    let _ = global::set_tracer_provider(provider);
 
-        Ok(())
-    });
+    ENABLED.store(true, Ordering::Relaxed);
 
-    match result {
-        Ok(Ok(())) => {
-            eprintln!(
-                "[tracing] OpenTelemetry initialized successfully, enabled: {}",
-                ENABLED.load(Ordering::Relaxed)
-            );
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            eprintln!("[tracing] Failed to initialize OTLP tracer: {}", e);
-            ENABLED.store(false, Ordering::Relaxed);
-            Err(e)
-        }
-        Err(_) => {
-            eprintln!("[tracing] Panic during OpenTelemetry initialization");
-            ENABLED.store(false, Ordering::Relaxed);
-            Err(anyhow::anyhow!("Panic during initialization"))
-        }
-    }
+    eprintln!("[tracing] OpenTelemetry initialized successfully");
+    Ok(())
 }
 
-pub fn get_otel_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>, &'static str>
+/// Get the OpenTelemetry tracing layer to add to the subscriber.
+///
+/// Must be called after `otel_tracing_init` with `enable=true`.
+pub fn get_otel_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>>
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
 {
     if !is_otel_enabled() {
-        return Err("OpenTelemetry is not enabled");
+        anyhow::bail!("OpenTelemetry is not enabled");
     }
 
     let tracer = TRACER
         .get()
-        .ok_or("Tracer not initialized. Call otel_tracing_init first.")?
+        .ok_or_else(|| anyhow::anyhow!("Tracer not initialized. Call otel_tracing_init first."))?
         .clone();
-
-    let custom_filter = CustomOtelFilter::new();
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
-        .with_filter(custom_filter);
+        .with_filter(CustomOtelFilter::new());
 
     Ok(Box::new(layer))
 }
 
+/// Returns whether OpenTelemetry tracing is enabled.
+#[inline]
 pub fn is_otel_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Flush all pending spans to the OTLP collector.
+///
+/// This is useful before shutdown or when you need to ensure spans are exported.
 pub async fn flush_spans_async() -> Result<()> {
     if !is_otel_enabled() {
         return Ok(());
     }
 
-    if let Some(provider) = PROVIDER.get() {
-        let provider = provider.clone();
+    let provider = PROVIDER
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Provider not initialized"))?
+        .clone();
 
-        spawn_blocking(move || provider.force_flush())
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to join blocking task for flushing spans: {}", e)
-            })?;
+    spawn_blocking(move || provider.force_flush())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to flush spans: {}", e))?;
 
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Provider not initialized"))
-    }
+    Ok(())
 }
 
+/// Shutdown OpenTelemetry tracing and flush remaining spans.
 pub fn shutdown_otel() {
     if ENABLED.load(Ordering::Relaxed) {
         global::shutdown_tracer_provider();
@@ -203,16 +214,20 @@ pub fn shutdown_otel() {
     }
 }
 
-pub fn inject_trace_context_http(headers: &mut HeaderMap) -> Result<()> {
+/// Inject W3C trace context headers into an HTTP request.
+///
+/// This propagates the current span context to downstream services.
+/// Does nothing if OTEL is not enabled.
+pub fn inject_trace_context_http(headers: &mut HeaderMap) {
     if !is_otel_enabled() {
-        return Err(anyhow::anyhow!("OTEL not enabled"));
+        return;
     }
 
     let context = tracing::Span::current().context();
 
     struct HeaderInjector<'a>(&'a mut HeaderMap);
 
-    impl<'a> opentelemetry::propagation::Injector for HeaderInjector<'a> {
+    impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
         fn set(&mut self, key: &str, value: String) {
             if let Ok(header_name) = HeaderName::from_bytes(key.as_bytes()) {
                 if let Ok(header_value) = HeaderValue::from_str(&value) {
@@ -225,5 +240,33 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) -> Result<()> {
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut HeaderInjector(headers));
     });
-    Ok(())
+}
+
+/// Inject W3C trace context into gRPC metadata.
+///
+/// This propagates the current span context to downstream gRPC services.
+/// Does nothing if OTEL is not enabled.
+pub fn inject_trace_context_grpc(metadata: &mut MetadataMap) {
+    if !is_otel_enabled() {
+        return;
+    }
+
+    let context = tracing::Span::current().context();
+
+    struct MetadataInjector<'a>(&'a mut MetadataMap);
+
+    impl opentelemetry::propagation::Injector for MetadataInjector<'_> {
+        fn set(&mut self, key: &str, value: String) {
+            // gRPC metadata keys must be lowercase ASCII
+            if let Ok(metadata_key) = MetadataKey::from_bytes(key.to_lowercase().as_bytes()) {
+                if let Ok(metadata_value) = MetadataValue::try_from(&value) {
+                    self.0.insert(metadata_key, metadata_value);
+                }
+            }
+        }
+    }
+
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut MetadataInjector(metadata));
+    });
 }

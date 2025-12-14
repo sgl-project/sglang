@@ -459,7 +459,7 @@ impl HarmonyStreamingProcessor {
             )
             .created(dispatch.created)
             .add_choice_role(index, "assistant")
-            .maybe_system_fingerprint(dispatch.weight_version.clone())
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
             .build();
 
             let chunk_json = serde_json::to_string(&role_chunk)
@@ -499,7 +499,7 @@ impl HarmonyStreamingProcessor {
                     finish_reason: None,
                     matched_stop: None,
                 })
-                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
 
         let chunk_json = serde_json::to_string(&chunk)
@@ -525,7 +525,7 @@ impl HarmonyStreamingProcessor {
             ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
                 .created(dispatch.created)
                 .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
-                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
 
         let chunk_json = serde_json::to_string(&chunk)
@@ -555,7 +555,7 @@ impl HarmonyStreamingProcessor {
                     total_tokens: prompt_tokens + completion_tokens,
                     completion_tokens_details: None,
                 })
-                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
 
         let chunk_json = serde_json::to_string(&usage_chunk)

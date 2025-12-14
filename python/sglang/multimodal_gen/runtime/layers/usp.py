@@ -51,10 +51,10 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     Perform Ulysses-style input all-to-all over the head dimension.
 
     Default layout expects heads at dim=1 and sequence at dim=2:
-        [b, h, s_local, d] -> [b, h // world_size, s_global, d]
+        [b, h, s_local, d] -> [b, h_local, s_global, d]
 
     If heads are at dim=2 (input is [b, s_local, h, d]), set head_dim=2, and the
-    function returns [b, s_global, h // world_size, d], preserving the original
+    function returns [b, s_global, h+local, d], preserving the original
     head/sequence dim ordering.
 
     Args:
@@ -83,11 +83,11 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         h % world_size == 0
     ), f"h ({h}) must be divisible by world_size ({world_size})"
 
-    # [b, h, s, d] -> [h, b, s, d]
+    # [b, h, s_local, d] -> [h, b, s_local, d]
     x_c = x_c.permute(1, 0, 2, 3).contiguous()
     # all-to-all along h
     x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h // world, s * world, d]
+    # -> [b, h_local, s, d]
     x_c = (
         x_c.reshape(world_size, h // world_size, b, -1, d)
         .permute(2, 1, 0, 3, 4)
@@ -109,7 +109,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
 
     Default layout expects heads at dim=1 and sequence at dim=2:
-        [b, h // world_size, s_global, d] -> [b, h, s_local, d]
+        [b, h_local, s, d] -> [b, h, s_local, d]
 
     If heads are at dim=2 (input is [b, s_global, h // world_size, d]), set head_dim=2,
     and the function returns [b, s_local, h, d], preserving the original head/sequence
@@ -141,10 +141,10 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         s % world_size == 0
     ), f"s ({s}) must be divisible by world_size ({world_size})"
 
-    # [b, h, s, d] -> [s, b, h, d]
+    # [b, h_local, s, d] -> [s, b, h_local, d]
     x_c = x_c.permute(2, 0, 1, 3).contiguous()
     x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h * world, s // world, d]
+    # -> [b, h, s_local, d]
     x_c = (
         x_c.reshape(world_size, s // world_size, b, -1, d)
         .permute(2, 0, 3, 1, 4)
