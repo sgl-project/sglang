@@ -234,11 +234,8 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = if policy.name() == "cache_aware" {
-            Some(WorkerLoadGuardV2::new(worker.clone()))
-        } else {
-            None
-        };
+        let load_guard =
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuardV2::new(worker.clone()));
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
