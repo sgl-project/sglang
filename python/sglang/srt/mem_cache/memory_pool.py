@@ -796,10 +796,26 @@ class MHATokenToKVPool(KVCache):
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
+    def _move_kv_cache_native(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+
+        if tgt_loc_flat.numel() == 0:
+            return
+
+        for k_cache, v_cache in zip(self.k_buffer, self.v_buffer):
+            k_src = k_cache.index_select(0, src_loc_flat)
+            v_src = v_cache.index_select(0, src_loc_flat)
+            k_cache[tgt_loc_flat] = k_src
+            v_cache[tgt_loc_flat] = v_src
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         N = tgt_loc.numel()
         if N == 0:
             return
+
+        self._move_kv_cache_native(tgt_loc, src_loc)
+        return
 
         assert (
             self._kv_copy_config is not None

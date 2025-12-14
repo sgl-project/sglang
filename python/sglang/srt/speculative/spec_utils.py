@@ -453,7 +453,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=False, disable=_is_npu)
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
