@@ -173,6 +173,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -297,6 +298,7 @@ class ReasoningParser:
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "step3": DeepSeekR1Detector,
+        "interns1": Qwen3Detector,
     }
 
     def __init__(
