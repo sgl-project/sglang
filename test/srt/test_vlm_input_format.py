@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from io import BytesIO
 from typing import Optional
@@ -256,41 +257,44 @@ class TestKimiVLImageUnderstandsImage(
 
 
 # not for CI: too large
-# class TestLlama4ImageUnderstandsImage(
-#     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
-# ):
-#     model_path = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-#     chat_template = "llama_4_vision"
+class TestLlama4ImageUnderstandsImage(
+    VLMInputTestBase, unittest.IsolatedAsyncioTestCase
+):
+    # Allow overriding via env for local/offline runs.
+    model_path = os.environ.get(
+        "LLAMA4_MODEL_PATH", "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    )
+    chat_template = "llama-4"
 
-#     def setUp(self):
-#         self.engine = Engine(
-#             model_path=self.model_path,
-#             trust_remote_code=True,
-#             chat_template=self.chat_template,
-#             enable_multimodal=True,
-#             mem_fraction_static=0.8,
-#             tp_size=4,
-#             attention_backend="fa3",
-#             context_length=65536,
-#         )
+    def setUp(self):
+        self.engine = Engine(
+            model_path=self.model_path,
+            trust_remote_code=True,
+            chat_template=self.chat_template,
+            enable_multimodal=True,
+            mem_fraction_static=0.8,
+            tp_size=4,
+            attention_backend="fa3",
+            context_length=65536,
+        )
 
-#     @classmethod
-#     def _init_visual(cls):
-#         model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True, torch_dtype="auto")
-#         cls.vision_tower = model.vision_model.eval().to(cls.device)
-#         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+    @classmethod
+    def _init_visual(cls):
+        model = AutoModel.from_pretrained(
+            cls.model_path, trust_remote_code=True, torch_dtype="auto"
+        )
+        cls.vision_tower = model.vision_model.eval().to(cls.device)
+        cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
 
-#         cls.visual = lambda tokenizer_output: cls.mm_projector(
-#             cls.vision_tower(
-#                 pixel_values=tokenizer_output["pixel_values"],
-#             ).last_hidden_state.flatten(0, -2)
-#         )
+        cls.visual = lambda tokenizer_output: cls.mm_projector(
+            cls.vision_tower(
+                pixel_values=tokenizer_output["pixel_values"],
+            ).last_hidden_state.flatten(0, -2)
+        )
 
-#     def _pixel_values_image_data(self, processor_output):
-#         return dict(
-#             modality="IMAGE",
-#             pixel_values=processor_output["pixel_values"],
-#         )
+    def _processor_output_image_data(self, processor_output):
+        # Llama-4 vision expects processor_output format with pixel_values
+        return dict(processor_output, format="processor_output")
 
 
 # class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
