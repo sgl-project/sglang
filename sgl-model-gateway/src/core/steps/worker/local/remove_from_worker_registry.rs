@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
+    observability::metrics::RouterMetrics,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -47,6 +48,9 @@ impl StepExecutor for RemoveFromWorkerRegistryStep {
         } else {
             debug!("Removed {} worker(s) from registry", removed_count);
         }
+
+        // Update active workers metric
+        RouterMetrics::set_active_workers(app_context.worker_registry.len());
 
         Ok(StepResult::Success)
     }

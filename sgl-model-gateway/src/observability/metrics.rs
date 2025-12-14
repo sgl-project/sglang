@@ -37,7 +37,7 @@ pub fn init_metrics() {
         "Total number of request errors by route and error type"
     );
     describe_counter!(
-        "sgl_router_upstream_http_responses_total",
+        "sgl_router_attempt_http_responses_total",
         "Total number of upstream engine HTTP responses by status code"
     );
     describe_counter!(
@@ -279,6 +279,10 @@ impl RouterMetrics {
             "worker" => worker_url.to_string()
         )
         .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_active_workers(count: usize) {
+        gauge!("sgl_router_active_workers").set(count as f64);
     }
 
     pub fn record_processed_request(worker_url: &str) {
