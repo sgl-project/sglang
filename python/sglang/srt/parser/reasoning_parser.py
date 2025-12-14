@@ -173,7 +173,6 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
-
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.

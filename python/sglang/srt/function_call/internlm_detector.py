@@ -5,9 +5,6 @@ import logging
 import re
 from typing import List
 
-from partial_json_parser.core.exceptions import MalformedJSON
-from partial_json_parser.core.options import Allow
-
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -17,7 +14,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +171,7 @@ class InternlmDetector(BaseFormatDetector):
             if self.current_tool_id > 0:
                 self._buffer = ""
                 return StreamingParseResult(normal_text="")
-            
+
             # Check if buffer could be partial start of bot_token
             if not self._ends_with_partial_token(current_text, self.bot_token):
                 # Not a partial match, return as normal text
