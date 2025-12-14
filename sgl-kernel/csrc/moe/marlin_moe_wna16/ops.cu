@@ -485,21 +485,25 @@ MarlinFuncPtr get_marlin_kernel(
   if (false) {
   }
 
-  COMMON_GET_IF(sglang::kU4)
-  COMMON_GET_IF(sglang::kU4B8)
-  COMMON_GET_IF(sglang::kU8B128)
+  // Only instantiate templates for Kimi K2 Thinking model
+  // Kimi K2 uses uint4b8 (4-bit) and uint8b128 (8-bit) without zero points
+  // Supported dtypes: float16 and bfloat16
 
-  NVFP4_GET_IF(sglang::kFE2M1f)
+  // COMMON_GET_IF(sglang::kU4)           // uint4 with zero point - not used by Kimi K2
+  COMMON_GET_IF(sglang::kU4B8)    // uint4b8 - used by Kimi K2
+  COMMON_GET_IF(sglang::kU8B128)  // uint8b128 - used by Kimi K2
 
-  BIGGROUP_GET_IF(sglang::kFE4M3fn)
+  // NVFP4_GET_IF(sglang::kFE2M1f)        // float4_e2m1f (NVFP4) - not used
 
-  ACT_GET_IF(sglang::kU4B8)
-  ACT_GET_IF(sglang::kU8B128)
-  if (std::is_same<scalar_t, nv_bfloat16>::value) {
-    if (false) {
-    }
-    MXFP4_GET_IF(sglang::kFE2M1f)
-  }
+  // BIGGROUP_GET_IF(sglang::kFE4M3fn)    // float8_e4m3fn - not used
+
+  // ACT_GET_IF(sglang::kU4B8)            // act_order version - not used
+  // ACT_GET_IF(sglang::kU8B128)          // act_order version - not used
+  // if (std::is_same<scalar_t, nv_bfloat16>::value) {
+  //   if (false) {
+  //   }
+  //   MXFP4_GET_IF(sglang::kFE2M1f)      // MXFP4 (bfloat16 only) - not used
+  // }
 
   return kernel;
 }
