@@ -158,18 +158,9 @@ impl CircuitBreaker {
             RouterMetrics::record_cb_state_transition(&self.metric_label, from, to);
         }
 
-        let state_code = self.circuit_breaker().state().to_int();
-        RouterMetrics::set_cb_state(&self.metric_label, state_code);
-
-        // Update consecutive failures/successes gauges
-        RouterMetrics::set_cb_consecutive_failures(
-            &self.metric_label,
-            self.circuit_breaker().failure_count(),
-        );
-        RouterMetrics::set_cb_consecutive_successes(
-            &self.metric_label,
-            self.circuit_breaker().success_count(),
-        );
+        RouterMetrics::set_cb_state(&self.metric_label, self.state().to_int());
+        RouterMetrics::set_cb_consecutive_failures(&self.metric_label, self.failure_count());
+        RouterMetrics::set_cb_consecutive_successes(&self.metric_label, self.success_count());
     }
 
     /// Record a successful request
