@@ -55,6 +55,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.utils import (
+    convert_response_tools_to_chat_tools,
+    parse_tool_calls_from_content,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -375,6 +379,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
 
+        # Convert ResponseTool to Tool format for ChatCompletionRequest
+        tools = convert_response_tools_to_chat_tools(request.tools)
+
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
@@ -382,6 +389,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=tools,
+                tool_choice=request.tool_choice,
             )
 
             # Follow SGLang's _process_messages pattern
@@ -551,9 +560,30 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
-        if content:
+
+        # Parse tool calls if tools are provided
+        remaining_text = content
+        if (
+            request.tool_choice != "none"
+            and request.tools
+            and self.tool_call_parser
+            and content
+        ):
+            # Convert ResponseTool to Tool format for parsing
+            tools = convert_response_tools_to_chat_tools(request.tools)
+            if tools:
+                remaining_text, tool_calls = parse_tool_calls_from_content(
+                    content=content,
+                    tools=tools,
+                    tool_call_parser=self.tool_call_parser,
+                    generate_tool_call_id=self._process_tool_call_id,
+                )
+                output_items.extend(tool_calls)
+
+        # Only add message if there's remaining text after tool call parsing
+        if remaining_text:
             output_text = ResponseOutputText(
-                text=content,
+                text=remaining_text,
                 annotations=[],  # TODO
                 type="output_text",
                 logprobs=None,  # TODO
