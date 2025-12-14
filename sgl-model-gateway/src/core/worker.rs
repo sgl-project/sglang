@@ -561,6 +561,10 @@ impl BasicWorker {
             Ok(self.url())
         }
     }
+
+    fn update_running_requests_metrics(&self) {
+        RouterMetrics::set_running_requests(self.url(), self.load());
+    }
 }
 
 #[async_trait]
@@ -631,6 +635,7 @@ impl Worker for BasicWorker {
 
     fn increment_load(&self) {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn decrement_load(&self) {
@@ -639,10 +644,12 @@ impl Worker for BasicWorker {
                 current.checked_sub(1)
             })
             .ok();
+        self.update_running_requests_metrics();
     }
 
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn processed_requests(&self) -> usize {

@@ -432,7 +432,8 @@ class FluxPosEmbed(nn.Module):
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos = ids.float()
-        # freqs_cos, freqs_sin = self.rope.forward(positions=pos)
+        # TODO: potential error: flux use n_axes = ids.shape[-1]
+        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
         freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 

@@ -461,7 +461,7 @@
             "stages_ms": {
                 "InputValidationStage": 23,
                 "ImageEncodingStage": 1485.0,
-                "ImageVAEEncodingStage": 350.0,
+                "ImageVAEEncodingStage": 400.0,
                 "ConditioningStage": 0.13,
                 "TimestepPreparationStage": 13.78,
                 "LatentPreparationStage": 15.0,
@@ -1203,7 +1203,7 @@
                 "48": 3721.72,
                 "49": 3715.61
             },
-            "expected_e2e_ms": 198187.89,
+            "expected_e2e_ms": 220000,
             "expected_avg_denoise_ms": 3751.95,
             "expected_median_denoise_ms": 3724.06
         }

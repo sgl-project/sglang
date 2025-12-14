@@ -30,6 +30,8 @@ suites = {
     ],
     "nightly-8-gpu-b200": [
         TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
+        TestFile("test_deepseek_v32_gpqa.py", 3600),
+        TestFile("test_mistral_large3_basic.py", 600),
     ],
     "nightly-4-gpu": [
         TestFile("test_encoder_dp.py", 500),
