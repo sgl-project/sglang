@@ -233,19 +233,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_incremented = if policy.name() == "cache_aware" {
-            worker.increment_load();
-            true
-        } else {
-            false
-        };
-
-        // Keep a clone for potential cleanup on retry
-        let worker_for_cleanup = if load_incremented {
-            Some(worker.clone())
-        } else {
-            None
-        };
+        let load_guard = WorkerLoadGuard::new(worker);
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
@@ -705,7 +693,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
-
+use crate::core::WorkerLoadGuard;
 use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
