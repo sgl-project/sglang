@@ -319,11 +319,13 @@ class TestEAGLEServerPageSize(TestEAGLEServerBasic):
 
 class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
     # default topk=8 and tokens=64
+    spec_topk = 2
+    spec_steps = 2
+    spec_tokens = 5
     extra_args = [
-        "--chunked-prefill-size=128",
-        "--max-running-requests=8",
-        "--page-size=4",
-        "--attention-backend=flashinfer",
+        "--page-size=64",
+        "--attention-backend=fa3",
+        "--cuda-graph-max-bs=5",
     ]
 
 

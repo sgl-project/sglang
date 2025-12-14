@@ -407,8 +407,14 @@ jobs:
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default
 
+      - name: Fail
+        if: always()
+        run: |
+          echo "Stage A Test 1 completed."
+          exit 1
+
   stage-b-test-small-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -425,7 +431,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1]
+        partition: [1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -445,13 +451,27 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
+          export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1
+          export CUDA_COREDUMP_SHOW_PROGRESS=1
+          export CUDA_COREDUMP_GENERATION_FLAGS="skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory"
+          export CUDA_COREDUMP_FILE="$PWD/cuda_coredump_%h.%p.%t"
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2
+
+      - name: Upload CUDA core dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-coredump-partition-${{ matrix.partition }}
+          path: |
+            cuda_coredump_*
+            test/cuda_coredump_*
+          if-no-files-found: ignore
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
+      false &&
       (
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
@@ -493,7 +513,7 @@ jobs:
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
+      false &&
       (
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
@@ -570,7 +590,7 @@ jobs:
   unit-test-backend-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1]
     if: |
-      always() &&
+      false &&
       (
         (inputs.target_stage == 'unit-test-backend-1-gpu') ||
         (

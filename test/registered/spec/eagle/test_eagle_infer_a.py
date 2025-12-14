@@ -59,6 +59,7 @@ class TestEAGLEEngine(CustomTestCase):
         ref_engine.shutdown()
 
     def test_correctness(self):
+        print(f"[???] {self.__class__.__name__}: test_correctness")
         configs = [
             # Basic config
             self.BASE_CONFIG,
