@@ -35,11 +35,10 @@ class QwenImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
-            # QKV fusion mappings - only weight, no bias for to_qkv
-            r"(.*)\.to_q\.weight$": (r"\1.to_qkv.weight", 0, 3),
-            r"(.*)\.to_k\.weight$": (r"\1.to_qkv.weight", 1, 3),
-            r"(.*)\.to_v\.weight$": (r"\1.to_qkv.weight", 2, 3),
-            # to_added_qkv has both weight and bias
+            # QKV fusion mappings
+            r"(.*)\.to_q\.(weight|bias)$": (r"\1.to_qkv.\2", 0, 3),
+            r"(.*)\.to_k\.(weight|bias)$": (r"\1.to_qkv.\2", 1, 3),
+            r"(.*)\.to_v\.(weight|bias)$": (r"\1.to_qkv.\2", 2, 3),
             r"(.*)\.add_q_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 0, 3),
             r"(.*)\.add_k_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 1, 3),
             r"(.*)\.add_v_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 2, 3),
