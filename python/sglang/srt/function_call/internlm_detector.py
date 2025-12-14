@@ -1,3 +1,5 @@
+# modified from https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/tool_parser/internlm2_parser.py
+
 import json
 import logging
 import re
@@ -43,9 +45,8 @@ class InternlmDetector(BaseFormatDetector):
     - Tool Call Start: `<|action_start|> <|plugin|>`
     - Tool Call End: `<|action_end|>`
     - Arguments: JSON object with `name` and `parameters`/`arguments`
-    - Only supports single tool call at a time (no parallel tool calls)
+    - Supports multiple sequential tool calls in both streaming and non-streaming modes
 
-    Reference: https://github.com/InternLM/lmdeploy/blob/main/lmdeploy/serve/openai/tool_parsers/internlm.py
     """
 
     def __init__(self):
@@ -131,7 +132,7 @@ class InternlmDetector(BaseFormatDetector):
 
                     # Create tool call item and add to list
                     tool_call = ToolCallItem(
-                        tool_index=idx,
+                        tool_index=tool_indices[name],
                         name=name,
                         parameters=json.dumps(parameters, ensure_ascii=False),
                     )
@@ -161,18 +162,26 @@ class InternlmDetector(BaseFormatDetector):
         """
         Streaming incremental parsing for InternLM format.
 
-        Handles the special case where InternLM only generates one tool call at a time.
+        Supports a single tool call in streaming mode.
         """
-
         self._buffer += new_text
         current_text = self._buffer
 
-        # If no tool call marker, return as normal text
-        if self.bot_token not in current_text:
-            # Only clear buffer if we're sure no tool call is starting
-            if not self._ends_with_partial_token(self._buffer, self.bot_token):
-                normal_text = self._buffer
+        # Check if we don't have a tool call start marker
+        start = current_text.find(self.bot_token)
+        if start == -1:
+            # No tool call marker found
+            # If we've already processed tool calls, don't return text again
+            if self.current_tool_id > 0:
                 self._buffer = ""
+                return StreamingParseResult(normal_text="")
+            
+            # Check if buffer could be partial start of bot_token
+            if not self._ends_with_partial_token(current_text, self.bot_token):
+                # Not a partial match, return as normal text
+                normal_text = current_text
+                self._buffer = ""
+                # Clean up any stray end tokens
                 if self.eot_token in normal_text:
                     normal_text = normal_text.replace(self.eot_token, "")
                 return StreamingParseResult(normal_text=normal_text)
@@ -180,167 +189,50 @@ class InternlmDetector(BaseFormatDetector):
                 # Might be partial start token, keep buffering
                 return StreamingParseResult()
 
-        # If the tool call has already been sent, return empty delta
-        # to make sure the finish_reason will be sent correctly
-        if self.current_tool_id > 0:
-            return StreamingParseResult(content="")
+        # Check if we have a complete tool call (with end marker)
+        end = current_text.find(self.eot_token)
+        if end != -1:
+            # We have a complete tool call
+            # Initialize state if this is the first tool call
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
 
-        # Check if we have the full plugin marker
-        if self.bot_token not in current_text:
-            return StreamingParseResult()
+            # Ensure we have enough entries in our tracking arrays
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
 
-        # Split into text and action
-        parts = current_text.split(self.bot_token)
-        text_part = parts[0]
+            # Use detect_and_parse on the complete tool call
+            complete_section = current_text[: end + len(self.eot_token)]
+            result = self.detect_and_parse(complete_section, tools=tools)
 
-        # If we have text before the action, send it
-        if text_part and len(text_part) > self.position:
-            sent_text = text_part[self.position :]
-            self.position = len(text_part)
-            return StreamingParseResult(normal_text=sent_text)
+            if result.calls:
+                # Update the tool call index
+                result.calls[0].tool_index = self.current_tool_id
+                # Store the parsed tool call for reference
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": result.calls[0].name,
+                    "arguments": json.loads(result.calls[0].parameters),
+                }
+                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
+                    0
+                ].parameters
+                # Increment tool ID for next tool call
+                self.current_tool_id += 1
 
-        # Now parse the action part
-        if len(parts) < 2:
-            return StreamingParseResult()
+            # Remove the completed tool call from buffer
+            self._buffer = current_text[end + len(self.eot_token) :]
+            return result
 
-        action = parts[1].strip()
-        action = action.split(self.eot_token)[0]
-
-        # Build tool indices if not already built
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
-        # Bit mask flags for partial JSON parsing
-        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
-
-        try:
-            # Try to parse as JSON
-            try:
-                tool_call_obj = _partial_json_loads(action, flags)[0]
-            except MalformedJSON:
-                logger.debug("Not enough tokens to parse into JSON yet")
-                return StreamingParseResult()
-
-            if not tool_call_obj:
-                return StreamingParseResult()
-
-            # Case 1: Send tool name if not sent yet
-            if not self.current_tool_name_sent:
-                function_name = tool_call_obj.get("name")
-
-                if function_name:
-                    # Validate tool name
-                    if function_name not in self._tool_indices:
-                        logger.warning(
-                            f"[InternLM Tool Call Stream] Model attempted to call undefined function: {function_name}, "
-                            f"available_tools={list(self._tool_indices.keys())}"
-                        )
-                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                            return StreamingParseResult()
-
-                    # Initialize tool tracking
-                    if self.current_tool_id == -1:
-                        self.current_tool_id = 0
-                        self.streamed_args_for_tool.append("")
-
-                    # Send tool name with empty parameters
-                    self.current_tool_name_sent = True
-                    return StreamingParseResult(
-                        calls=[
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=function_name,
-                                parameters="",
-                            )
-                        ]
-                    )
-                else:
-                    logger.debug("[InternLM Tool Call Stream] No function name yet")
-                    return StreamingParseResult()
-
-            # Case 2: Stream arguments
-            else:
-                cur_arguments = self.get_arguments(tool_call_obj)
-
-                # No arguments generated yet
-                if not cur_arguments:
-                    if not self.prev_tool_call_arr:
-                        return StreamingParseResult()
-                    prev_arguments = (
-                        self.get_arguments(self.prev_tool_call_arr[0])
-                        if self.prev_tool_call_arr
-                        else None
-                    )
-                    if not prev_arguments:
-                        return StreamingParseResult()
-
-                # First time getting parameters
-                if cur_arguments and (
-                    not self.prev_tool_call_arr
-                    or not self.get_arguments(self.prev_tool_call_arr[0])
-                ):
-                    cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)
-
-                    # Send all arguments accumulated so far
-                    arguments_delta = cur_arguments_json
-                    self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
-
-                    # Update prev_tool_call_arr
-                    tool_call_obj["arguments"] = cur_arguments
-                    self.prev_tool_call_arr = [tool_call_obj]
-
-                    return StreamingParseResult(
-                        calls=[
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                parameters=arguments_delta,
-                            )
-                        ]
-                    )
-
-                # Both prev and cur parameters exist, send the increase
-                elif cur_arguments:
-                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
-                    prev_arguments = self.get_arguments(self.prev_tool_call_arr[0])
-                    prev_args_json = (
-                        json.dumps(prev_arguments, ensure_ascii=False)
-                        if prev_arguments
-                        else ""
-                    )
-
-                    # Calculate the common prefix and send the diff
-                    sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    prefix = _find_common_prefix(prev_args_json, cur_args_json)
-                    argument_diff = prefix[sent:]
-
-                    if argument_diff:
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
-
-                        # Update prev_tool_call_arr
-                        tool_call_obj["arguments"] = cur_arguments
-                        self.prev_tool_call_arr = [tool_call_obj]
-
-                        return StreamingParseResult(
-                            calls=[
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    parameters=argument_diff,
-                                )
-                            ]
-                        )
-
-                return StreamingParseResult()
-
-        except Exception as e:
-            logger.error(
-                f"[InternLM Tool Call Stream] Error in streaming: {e}", exc_info=True
-            )
-            logger.debug(
-                "[InternLM Tool Call Stream] Skipping chunk as a result of tool streaming extraction error"
-            )
-            return StreamingParseResult()
+        # We have bot_token but no eot_token yet - handle partial tool call streaming
+        # Extract normal text before the tool call
+        normal_text = current_text[:start]
+        # Keep the tool call part in buffer
+        self._buffer = current_text[start:]
+        return StreamingParseResult(normal_text=normal_text)
 
     def structure_info(self) -> _GetInfoFunc:
         """
