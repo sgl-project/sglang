@@ -29,6 +29,10 @@ class ImageGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     user: Optional[str] = None
+    negative_prompt: Optional[str] = None
+    guidance_scale: Optional[float] = None
+    num_inference_steps: Optional[int] = None
+    enable_teacache: Optional[bool] = False
 
 
 # Video API protocol models
@@ -58,6 +62,10 @@ class VideoGenerationsRequest(BaseModel):
     num_frames: Optional[int] = None
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
+    negative_prompt: Optional[str] = None
+    guidance_scale: Optional[float] = None
+    num_inference_steps: Optional[int] = None
+    enable_teacache: Optional[bool] = False
 
 
 class VideoListResponse(BaseModel):

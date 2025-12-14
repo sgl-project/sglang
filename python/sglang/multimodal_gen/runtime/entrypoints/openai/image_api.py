@@ -55,6 +55,10 @@ def _build_sampling_params_from_request(
     image_path: Optional[str] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    guidance_scale: Optional[float] = None,
+    num_inference_steps: Optional[int] = None,
+    enable_teacache: Optional[bool] = None,
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -77,6 +81,10 @@ def _build_sampling_params_from_request(
         output_file_name=f"{request_id}.{ext}",
         seed=seed,
         generator_device=generator_device,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
+        **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
     )
     return sampling_params
 
@@ -114,6 +122,10 @@ async def generations(
         background=request.background,
         seed=request.seed,
         generator_device=request.generator_device,
+        negative_prompt=request.negative_prompt,
+        guidance_scale=request.guidance_scale,
+        num_inference_steps=request.num_inference_steps,
+        enable_teacache=request.enable_teacache,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
@@ -165,6 +177,10 @@ async def edits(
     seed: Optional[int] = Form(1024),
     generator_device: Optional[str] = Form("cuda"),
     user: Optional[str] = Form(None),
+    negative_prompt: Optional[str] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    enable_teacache: Optional[bool] = Form(False),
 ):
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
@@ -189,6 +205,10 @@ async def edits(
         image_path=input_path,
         seed=seed,
         generator_device=generator_device,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
     )
     batch = _build_req_from_sampling(sampling)
 
