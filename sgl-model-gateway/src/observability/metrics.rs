@@ -185,90 +185,6 @@ pub fn init_metrics() {
         "Number of running requests per worker"
     );
 
-    describe_histogram!(
-        "sgl_tokenizer_encode_duration_seconds",
-        "Time to encode text to tokens"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_decode_duration_seconds",
-        "Time to decode tokens to text"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_encode_batch_duration_seconds",
-        "Time to encode a batch of texts"
-    );
-    describe_counter!(
-        "sgl_tokenizer_encode_requests_total",
-        "Total number of encode requests by tokenizer type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_decode_requests_total",
-        "Total number of decode requests by tokenizer type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_encode_errors_total",
-        "Total number of encode errors by error type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_decode_errors_total",
-        "Total number of decode errors by error type"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_tokens_per_encode",
-        "Number of tokens produced per encode operation"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_chars_per_encode",
-        "Number of characters in input text per encode"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_tokens_per_decode",
-        "Number of tokens decoded per operation"
-    );
-    describe_gauge!(
-        "sgl_tokenizer_vocab_size",
-        "Vocabulary size of the loaded tokenizer"
-    );
-
-    describe_counter!(
-        "sgl_tokenizer_stop_sequences_detected_total",
-        "Total stop sequences detected by type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_partial_matches_total",
-        "Total partial stop sequence matches (jailed text)"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_stop_detection_duration_seconds",
-        "Time to check for stop sequences per token"
-    );
-
-    describe_counter!(
-        "sgl_tokenizer_stream_tokens_total",
-        "Total tokens processed in streaming decode"
-    );
-    describe_counter!(
-        "sgl_tokenizer_stream_incomplete_utf8_total",
-        "Total incomplete UTF-8 sequences detected"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_stream_step_duration_seconds",
-        "Time per streaming decode step"
-    );
-
-    describe_counter!(
-        "sgl_tokenizer_factory_loads_total",
-        "Total tokenizer loads by file type"
-    );
-    describe_counter!(
-        "sgl_tokenizer_factory_errors_total",
-        "Total tokenizer loading errors by type"
-    );
-    describe_histogram!(
-        "sgl_tokenizer_factory_load_duration_seconds",
-        "Time to load and initialize tokenizer"
-    );
-
     describe_counter!(
         "sgl_router_http_requests_total",
         "Total number of HTTP requests"
@@ -306,8 +222,6 @@ pub fn start_prometheus(config: PrometheusConfig) {
 }
 
 pub struct RouterMetrics;
-
-pub struct TokenizerMetrics;
 
 impl RouterMetrics {
     pub fn record_request(route: &str) {
@@ -603,115 +517,6 @@ impl RouterMetrics {
     }
 }
 
-impl TokenizerMetrics {
-    pub fn record_encode_request(tokenizer_type: &str) {
-        counter!("sgl_tokenizer_encode_requests_total",
-            "tokenizer_type" => tokenizer_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_encode_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_encode_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_encode_error(error_type: &str) {
-        counter!("sgl_tokenizer_encode_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_tokens_per_encode(token_count: usize) {
-        histogram!("sgl_tokenizer_tokens_per_encode").record(token_count as f64);
-    }
-
-    pub fn record_chars_per_encode(char_count: usize) {
-        histogram!("sgl_tokenizer_chars_per_encode").record(char_count as f64);
-    }
-
-    pub fn record_decode_request(tokenizer_type: &str) {
-        counter!("sgl_tokenizer_decode_requests_total",
-            "tokenizer_type" => tokenizer_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_decode_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_decode_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_decode_error(error_type: &str) {
-        counter!("sgl_tokenizer_decode_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_tokens_per_decode(token_count: usize) {
-        histogram!("sgl_tokenizer_tokens_per_decode").record(token_count as f64);
-    }
-
-    pub fn record_encode_batch_duration(duration: Duration, batch_size: usize) {
-        histogram!("sgl_tokenizer_encode_batch_duration_seconds",
-            "batch_size" => batch_size.to_string()
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    pub fn record_stop_sequence_detected(stop_type: &str) {
-        counter!("sgl_tokenizer_stop_sequences_detected_total",
-            "type" => stop_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_partial_match() {
-        counter!("sgl_tokenizer_partial_matches_total").increment(1);
-    }
-
-    pub fn record_stop_detection_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_stop_detection_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_stream_token() {
-        counter!("sgl_tokenizer_stream_tokens_total").increment(1);
-    }
-
-    pub fn record_incomplete_utf8() {
-        counter!("sgl_tokenizer_stream_incomplete_utf8_total").increment(1);
-    }
-
-    pub fn record_stream_step_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_stream_step_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_factory_load(file_type: &str) {
-        counter!("sgl_tokenizer_factory_loads_total",
-            "file_type" => file_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_factory_error(error_type: &str) {
-        counter!("sgl_tokenizer_factory_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_factory_load_duration(duration: Duration) {
-        histogram!("sgl_tokenizer_factory_load_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn set_vocab_size(tokenizer_type: &str, size: usize) {
-        gauge!("sgl_tokenizer_vocab_size",
-            "tokenizer_type" => tokenizer_type.to_string()
-        )
-        .set(size as f64);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
@@ -950,37 +755,6 @@ mod tests {
         RouterMetrics::record_discovery_update(3, 1);
         RouterMetrics::record_generate_duration(Duration::from_secs(2));
         RouterMetrics::set_running_requests("http://worker1", 15);
-    }
-
-    #[test]
-    fn test_tokenizer_metrics_static_methods() {
-        TokenizerMetrics::record_encode_request("huggingface");
-        TokenizerMetrics::record_encode_duration(Duration::from_millis(10));
-        TokenizerMetrics::record_encode_error("invalid_input");
-        TokenizerMetrics::record_tokens_per_encode(100);
-        TokenizerMetrics::record_chars_per_encode(500);
-
-        TokenizerMetrics::record_decode_request("huggingface");
-        TokenizerMetrics::record_decode_duration(Duration::from_millis(5));
-        TokenizerMetrics::record_decode_error("invalid_tokens");
-        TokenizerMetrics::record_tokens_per_decode(50);
-
-        TokenizerMetrics::record_encode_batch_duration(Duration::from_millis(100), 10);
-
-        TokenizerMetrics::record_stop_sequence_detected("token");
-        TokenizerMetrics::record_stop_sequence_detected("string");
-        TokenizerMetrics::record_partial_match();
-        TokenizerMetrics::record_stop_detection_duration(Duration::from_micros(100));
-
-        TokenizerMetrics::record_stream_token();
-        TokenizerMetrics::record_incomplete_utf8();
-        TokenizerMetrics::record_stream_step_duration(Duration::from_micros(50));
-
-        TokenizerMetrics::record_factory_load("json");
-        TokenizerMetrics::record_factory_error("unsupported_format");
-        TokenizerMetrics::record_factory_load_duration(Duration::from_millis(200));
-
-        TokenizerMetrics::set_vocab_size("huggingface", 50000);
     }
 
     #[test]
