@@ -464,6 +464,7 @@ jobs:
         with:
           name: cuda-coredump-partition-${{ matrix.partition }}
           path: |
+            cuda_coredump_*
             test/cuda_coredump_*
           if-no-files-found: ignore
 
