@@ -2125,7 +2125,7 @@ class ModelRunner:
             cluster_shape_mn=(2, 1),  # Better cluster shape for TP
             use_2cta_instrs=True,     # Enable for better performance
             use_tma_store=True,
-            all_reduce="two_shot",    
+            all_reduce="LDMCxSTMC",    
         )
 
         self.gemm_ar_mlp_op = GemmARLayer(
@@ -2142,7 +2142,7 @@ class ModelRunner:
             cluster_shape_mn=(2, 2),
             use_2cta_instrs=True,
             use_tma_store=True,
-            all_reduce="two_shot",    
+            all_reduce="LDMCxSTMC",    
         )
         
         for each in self.model.model.layers:
