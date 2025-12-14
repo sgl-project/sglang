@@ -734,6 +734,7 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
+        .layer(middleware::HttpMetricsLayer::new())
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
