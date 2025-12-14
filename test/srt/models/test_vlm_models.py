@@ -1,6 +1,7 @@
 import argparse
 import random
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -29,7 +30,10 @@ class TestVLMModels(MMMUVLMMixin, CustomTestCase):
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
+            # Use a unique temporary directory for each test run to avoid
+            # lmms_eval finding cached results and skipping re-evaluation
+            log_dir = tempfile.mkdtemp(prefix="sglang_vlm_test_")
+            self._run_vlm_mmmu_test(model, log_dir)
 
 
 if __name__ == "__main__":
