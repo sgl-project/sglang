@@ -1829,26 +1829,33 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+            running_batch_loras = {req.lora_id for req in self.running_batch.reqs}
+            next_batch_loras = running_batch_loras.copy()
+
+            # If a currently running LoRA adapter is preventing new requests from being scheduled,
+            # it needs to be drained so no further requests with that adapter can be scheduled.
+            draining_loras = set()
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # Non-LoRA requests (lora_id=None) share a single reserved slot and should always
+            # be scheduled.
+            if self.enable_lora and req.lora_id is not None:
+                if req.lora_id in draining_loras:
+                    continue
 
-            if self.enable_lora:
-                new_lora_set = (
-                    lora_set
-                    | set([req.lora_id for req in adder.can_run_list])
-                    | set([req.lora_id])
-                )
-                if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
-                        continue
+                # If this is a LoRA request that would exceed the LoRA slot limit, skip it.
+                # We'll schedule it in future iterations.
+                if not self.tp_worker.can_run_lora_batch(
+                    next_batch_loras | {req.lora_id}
+                ):
+                    draining_loras.update(
+                        lora_id
+                        for lora_id in running_batch_loras
+                        if lora_id is not None
+                    )
+
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -1877,6 +1884,9 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if self.enable_lora:
+                next_batch_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
