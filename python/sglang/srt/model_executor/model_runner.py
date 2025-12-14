@@ -434,16 +434,6 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
-        if (
-            self.server_args.remote_instance_weight_loader_support_transfer_engine
-            and self.remote_instance_transfer_engine_weight_info is None
-        ):
-            self.remote_instance_transfer_engine_weight_info = (
-                register_memory_region_v2(
-                    self.model, self.remote_instance_transfer_engine
-                )
-            )
-
         if self.device == "cuda" and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
             logger.info(f"Initialize Gemm-AllReduce Overlap Operator...")
             self.init_overlap_gemm_allreduce_operator()
