@@ -3,9 +3,10 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from sglang.srt.utils.common import kill_process_tree
+from sglang.test.ci.ci_register import CIRegistry
 
 
 @dataclass
@@ -39,7 +40,9 @@ def run_with_timeout(
 
 
 def run_unittest_files(
-    files: List[TestFile], timeout_per_file: float, continue_on_error: bool = False
+    files: Union[List[TestFile], List[CIRegistry]],
+    timeout_per_file: float,
+    continue_on_error: bool = False,
 ):
     """
     Run a list of test files.
@@ -56,7 +59,12 @@ def run_unittest_files(
     failed_tests = []
 
     for i, file in enumerate(files):
-        filename, estimated_time = file.name, file.estimated_time
+        if isinstance(file, CIRegistry):
+            filename, estimated_time = file.filename, file.est_time
+        else:
+            # FIXME: remove this branch after migrating all tests to use CIRegistry
+            filename, estimated_time = file.name, file.estimated_time
+
         process = None
 
         def run_one_file(filename):

@@ -1,7 +1,7 @@
 //! Workflow step implementations
 //!
 //! This module contains concrete step implementations for various workflows:
-//! - Worker management (registration, removal, future: updates)
+//! - Worker management (registration, removal, updates)
 //! - MCP server registration
 //! - WASM module registration and removal
 //! - Future: Tokenizer fetching, LoRA updates, etc.
@@ -22,6 +22,7 @@ pub use worker::{
     create_external_worker_workflow,
     create_local_worker_workflow,
     create_worker_removal_workflow,
+    create_worker_update_workflow,
     // Utility functions
     group_models_into_cards,
     infer_model_type_from_id,
@@ -36,6 +37,8 @@ pub use worker::{
     DiscoverMetadataStep,
     DiscoverModelsStep,
     DpInfo,
+    // Update steps
+    FindWorkerToUpdateStep,
     // Removal steps
     FindWorkersToRemoveStep,
     ModelInfo,
@@ -43,8 +46,10 @@ pub use worker::{
     RegisterWorkersStep,
     RemoveFromPolicyRegistryStep,
     RemoveFromWorkerRegistryStep,
+    UpdatePoliciesForWorkerStep,
     UpdatePoliciesStep,
     UpdateRemainingPoliciesStep,
+    UpdateWorkerPropertiesStep,
     WorkerList,
     WorkerRemovalRequest,
 };

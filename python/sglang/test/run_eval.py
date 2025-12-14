@@ -125,6 +125,9 @@ def run_eval(args):
 
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+        metrics = result.metrics | {"score": result.score}
+        print(f"Total latency: {latency:.3f} s")
+        print(f"Score: {metrics['score']:.3f}")
     else:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -147,26 +150,22 @@ def run_eval(args):
         print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
         print(f"Scores: {scores_repeat}")
         print("=" * 20)
+        metrics = result.metrics | {"scores": scores_repeat}
+        metrics = metrics | {"mean_score": mean_score}
 
         executor.shutdown()
 
     # Dump reports
-    metrics = result.metrics | {"score": result.score}
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
     report_filename = f"/tmp/{file_stem}.html"
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
-    metrics = result.metrics | {"score": result.score}
     print(metrics)
     result_filename = f"/tmp/{file_stem}.json"
     with open(result_filename, "w") as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
-
-    # Print results
-    print(f"Total latency: {latency:.3f} s")
-    print(f"Score: {metrics['score']:.3f}")
 
     if getattr(args, "return_latency", False):
         return metrics, latency
