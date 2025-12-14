@@ -171,7 +171,7 @@ def get_logprob_from_pp_outputs(
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
 
 
-def allocate_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args is None:
         from sglang.srt.server_args import get_global_server_args
 
@@ -183,6 +183,10 @@ def allocate_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
     spec_tokens = server_args.speculative_num_draft_tokens
+    page_size = server_args.page_size
 
     if not server_args.disable_overlap_schedule:
         return max(spec_steps * spec_topk, spec_tokens)
+
+    if page_size == 1:
+        return spec_steps * spec_topk
