@@ -806,8 +806,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         model.load_weights = load_weights_proxy
 
         model.load_weights(weights)
-        # Load quantized weights
-        model.load_weights(quantize_weights_iterator(iter(weights_list)))
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset
@@ -835,14 +833,161 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         recorded_loader[key][name] = attr.__func__  # Store unbound
                     else:
                         recorded_loader[key][name] = attr
+        model.recorded_loader = recorded_loader
+
         # Apply FP8 quantization (creates new Parameters, loses attributes)
-        for _, module in model.named_modules():
+        # Use blockwise quantization first, fallback to per-channel if needed
+        from sglang.srt.layers.quantization.blockwise_fp8_utils import (
+            scaled_fp8_blockwise,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            per_token_group_quant_fp8,
+        )
+        from sglang.srt.layers.parameter import BlockQuantScaleParameter
+        from torch.nn.parameter import Parameter
+
+        # Default block size for blockwise quantization
+        default_block_size = [128, 128]
+
+        for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-                all_params, name, scale_info
-            )
+                    # Check if this module should be skipped
+                    if any(
+                        skip in name
+                        for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+                    ):
+                        logger.info(
+                            f"[QuantizedRL] Skip quantization for module: {name}"
+                        )
+                        # Still call process_weights_after_loading for non-quantized layers
+                        quant_method.process_weights_after_loading(module)
+                        continue
+
+                    # Check if module has weight parameter
+                    if not hasattr(module, "weight") or module.weight is None:
+                        quant_method.process_weights_after_loading(module)
+                        continue
+
+                    weight = module.weight
+                    # Only quantize if weight is in BF16/FP16/FP32
+                    if weight.dtype not in [
+                        torch.bfloat16,
+                        torch.float32,
+                        torch.float16,
+                    ]:
+                        quant_method.process_weights_after_loading(module)
+                        continue
+
+                    # Try blockwise quantization first
+                    use_blockwise = False
+                    if len(weight.shape) == 2:
+                        # Check if shape is compatible with blockwise quantization
+                        if (
+                            weight.shape[0] % default_block_size[0] == 0
+                            and weight.shape[1] % default_block_size[1] == 0
+                        ):
+                            try:
+                                qweight, scale = scaled_fp8_blockwise(
+                                    weight.data, default_block_size
+                                )
+                                # scale shape is (blk_m, blk_n, 1), need to squeeze
+                                scale = scale.squeeze(-1)
+
+                                # Clean up old weight_scale if exists (for per-channel quantization)
+                                if hasattr(module, "weight_scale"):
+                                    delattr(module, "weight_scale")
+
+                                # Check if module has weight_scale_inv (for blockwise)
+                                if hasattr(module, "weight_scale_inv"):
+                                    # Update weight_scale_inv for blockwise quantization
+                                    if isinstance(
+                                        module.weight_scale_inv, BlockQuantScaleParameter
+                                    ):
+                                        # Check if scale shape matches
+                                        if module.weight_scale_inv.data.shape == scale.shape:
+                                            module.weight_scale_inv.data.copy_(scale)
+                                        else:
+                                            logger.warning(
+                                                f"[QuantizedRL] Scale shape mismatch for {name}: "
+                                                f"expected {module.weight_scale_inv.data.shape}, "
+                                                f"got {scale.shape}. Recreating scale parameter."
+                                            )
+                                            # Recreate with correct shape
+                                            scale_param = BlockQuantScaleParameter(
+                                                data=scale,
+                                                input_dim=1,
+                                                output_dim=0,
+                                            )
+                                            module.register_parameter(
+                                                "weight_scale_inv", scale_param
+                                            )
+                                    else:
+                                        # Replace non-BlockQuantScaleParameter with BlockQuantScaleParameter
+                                        scale_param = BlockQuantScaleParameter(
+                                            data=scale,
+                                            input_dim=1,
+                                            output_dim=0,
+                                        )
+                                        module.register_parameter(
+                                            "weight_scale_inv", scale_param
+                                        )
+                                else:
+                                    # Create weight_scale_inv if it doesn't exist
+                                    scale_param = BlockQuantScaleParameter(
+                                        data=scale,
+                                        input_dim=1,
+                                        output_dim=0,
+                                    )
+                                    module.register_parameter(
+                                        "weight_scale_inv", scale_param
+                                    )
+
+                                # Update weight
+                                module.weight = Parameter(
+                                    qweight.t(), requires_grad=False
+                                )
+                                use_blockwise = True
+                                logger.info(
+                                    f"[QuantizedRL] Quantize (blockwise): {name} "
+                                    f"{weight.dtype}→FP8 "
+                                    f"(shape={weight.shape}, block_size={default_block_size})"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
+                                    "falling back to per_token_group_quant_fp8"
+                                )
+
+                    # Fallback to per-channel quantization if blockwise failed or not applicable
+                    if not use_blockwise:
+                        qweight, weight_scale = per_token_group_quant_fp8(
+                            weight.data, weight.shape[-1]
+                        )
+                        weight_scale = weight_scale.t().contiguous()
+
+                        # Clean up weight_scale_inv if exists (for blockwise)
+                        if hasattr(module, "weight_scale_inv"):
+                            delattr(module, "weight_scale_inv")
+
+                        # Update weight and scale
+                        module.weight = Parameter(qweight.t(), requires_grad=False)
+                        if hasattr(module, "weight_scale"):
+                            module.weight_scale = Parameter(
+                                weight_scale, requires_grad=False
+                            )
+                        else:
+                            module.register_parameter(
+                                "weight_scale", Parameter(weight_scale, requires_grad=False)
+                            )
+                        if hasattr(module, "input_scale"):
+                            module.input_scale = None
+
+                        logger.info(
+                            f"[QuantizedRL] Quantize (per_token_group): {name} "
+                            f"{weight.dtype}→FP8"
+                        )
 
         model.flash_rl_initial_load_complete = True
         self._initial_load_complete = True
