@@ -136,4 +136,12 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
             outputs=[image_out, video_out],
         )
 
+    delimiter = "=" * 80
+    print(delimiter)
+    print(
+        f"SGLang Diffusion WebUI available at"
+        f"\033[36mhttp://0.0.0.0:{server_args.webui_port}\033[0m"
+    )
+    print(delimiter)
+
     demo.launch(server_port=server_args.webui_port)
