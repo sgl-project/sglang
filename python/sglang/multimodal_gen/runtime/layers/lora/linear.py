@@ -51,13 +51,22 @@ class BaseLayerWithLoRA(nn.Module):
         self.cpu_weight = base_layer.weight.to("cpu")
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
-        self.disable_lora: bool = False
+        # Default to True to prevent using uninitialized weights; set to False when weights are loaded
+        self.disable_lora: bool = True
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_path: str | None = None
 
         self.lora_A = None
         self.lora_B = None
+
+    @property
+    def weight(self):
+        return self.base_layer.weight
+
+    @property
+    def bias(self):
+        return getattr(self.base_layer, "bias", None)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -79,7 +88,7 @@ class BaseLayerWithLoRA(nn.Module):
             return out + delta, output_bias
         else:
             out, output_bias = self.base_layer(x)
-            return out.to(x), output_bias
+            return out, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A

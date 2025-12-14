@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
@@ -35,6 +36,59 @@ _is_npu = is_npu()
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
+
+
+_GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
+_BUFFER_OFFSET = 0
+
+
+def init_feature_buffer(device):
+    global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
+    if (
+        device == "cpu"
+        or envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
+        or _GPU_FEATURE_BUFFER is not None
+    ):
+        return
+    try:
+        size_mb = envs.SGLANG_MM_BUFFER_SIZE_MB.get()
+        num_elements = int(size_mb * 1024 * 1024 / 4)
+        _GPU_FEATURE_BUFFER = torch.empty(
+            num_elements, dtype=torch.float32, device=device
+        )
+        logger.info(f"Preallocated {size_mb}MB GPU buffer")
+    except RuntimeError as e:
+        _GPU_FEATURE_BUFFER = None
+
+
+def reset_buffer_offset():
+    global _BUFFER_OFFSET
+    _BUFFER_OFFSET = 0
+
+
+def is_feature_buffer_initialized():
+    global _GPU_FEATURE_BUFFER
+    if _GPU_FEATURE_BUFFER is None:
+        return False
+    return True
+
+
+def try_add_to_buffer(tensor: torch.Tensor) -> Optional[torch.Tensor]:
+    global _BUFFER_OFFSET
+
+    if _GPU_FEATURE_BUFFER is None:
+        return tensor
+
+    tensor_size = tensor.numel()
+
+    if _BUFFER_OFFSET + tensor_size <= _GPU_FEATURE_BUFFER.numel():
+        buffer_view = _GPU_FEATURE_BUFFER[_BUFFER_OFFSET : _BUFFER_OFFSET + tensor_size]
+        buffer_view.copy_(tensor.flatten(), non_blocking=True)
+        result = buffer_view.view(tensor.shape)
+        _BUFFER_OFFSET += tensor_size
+        return result
+    else:
+        return tensor
 
 
 class TransportProxyTensor(torch.Tensor):
@@ -341,13 +395,49 @@ def get_embedding_chunk(
 
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
 ) -> Optional[torch.Tensor]:
     """
     If all items have precomputed_embeddings, return their concatenation.
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
-    precomputed_embeddings = [item.precomputed_embeddings for item in items]
+    precomputed_embeddings = []
+    for idx, item in enumerate(items):
+        if item.precomputed_embeddings is None:
+            precomputed_embeddings.append(None)
+            continue
+        seq_start_idx = prefix_length[idx]
+        seq_end_idx = seq_start_idx + extend_length[idx] - 1
+        prefix_embedding_length = []
+        extend_embedding_length = []
+        for mm_start_idx, mm_end_idx in items_offset_list[idx]:
+            if mm_start_idx > seq_end_idx:
+                break
+            if seq_start_idx > mm_start_idx:
+                prefix_embedding_length.append(
+                    min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1)
+                )
+            if mm_end_idx >= seq_start_idx:
+                extend_embedding_length.append(
+                    min(
+                        mm_end_idx - seq_start_idx + 1,
+                        seq_end_idx - mm_start_idx + 1,
+                        mm_end_idx - mm_start_idx + 1,
+                        seq_end_idx - seq_start_idx + 1,
+                    )
+                )
+        prefix_embedding_length = int(np.sum(prefix_embedding_length))
+        extend_embedding_length = int(np.sum(extend_embedding_length))
+        precomputed_embeddings.append(
+            item.precomputed_embeddings[
+                prefix_embedding_length : prefix_embedding_length
+                + extend_embedding_length
+            ]
+        )
+
     if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
             raise NotImplementedError(
@@ -473,7 +563,9 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
     """
     # 1. Get embedding
-    embedding = _get_precomputed_embedding(embedding_items)
+    embedding = _get_precomputed_embedding(
+        embedding_items, prefix_length, extend_length, items_offset_list
+    )
     if embedding is None:
         embedding = _get_chunked_prefill_embedding(
             data_embedding_func,
