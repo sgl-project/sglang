@@ -156,6 +156,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
             CircuitState::HalfOpen => 2u8,
         };
         RouterMetrics::set_cb_state(self.url(), state_code);
+
+        // Update consecutive failures/successes gauges
+        RouterMetrics::set_cb_consecutive_failures(
+            self.url(),
+            self.circuit_breaker().failure_count(),
+        );
+        RouterMetrics::set_cb_consecutive_successes(
+            self.url(),
+            self.circuit_breaker().success_count(),
+        );
     }
 
     /// Check if this worker is DP-aware
