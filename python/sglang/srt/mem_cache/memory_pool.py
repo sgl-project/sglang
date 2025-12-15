@@ -829,6 +829,57 @@ class MHATokenToKVPool(KVCache):
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
+    """Unified FP4 KV cache pool supporting both MXFP4 and NVFP4 formats.
+
+    MXFP4: E8M0 scale factors, no global scale
+    NVFP4: FP8 E4M3FN scale factors, optional global FP32 scale
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+        fp4_format: str = "mxfp4",  # "mxfp4" or "nvfp4"
+    ):
+        self.fp4_format = fp4_format
+        if fp4_format not in ("mxfp4", "nvfp4"):
+            raise ValueError(f"fp4_format must be 'mxfp4' or 'nvfp4', got {fp4_format}")
+
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            head_num,
+            head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+            enable_alt_stream,
+            enable_kv_cache_copy,
+        )
+
+        # Initialize global scales for NVFP4 (per layer, per K/V)
+        if self.fp4_format == "nvfp4":
+            self.k_global_scale = [
+                torch.tensor([1.0], dtype=torch.float32, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+            self.v_global_scale = [
+                torch.tensor([1.0], dtype=torch.float32, device=self.device)
+                for _ in range(self.layer_num)
+            ]
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -844,6 +895,10 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 k = self.head_dim
 
                 scale_block_size = 16
+                # Match TRTLLM-style KV-cache block scales:
+                # one FP8 scale per 16 FP4 values (compact, no padding-to-128).
+                scale_dim = (n * k) // scale_block_size
+
                 self.store_dtype = torch.uint8
                 self.k_buffer = [
                     torch.zeros(
@@ -864,7 +919,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
                 self.k_scale_buffer = [
                     torch.zeros(
-                        (m, (n * k) // scale_block_size),
+                        (m, scale_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -872,7 +927,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 ]
                 self.v_scale_buffer = [
                     torch.zeros(
-                        (m, (n * k) // scale_block_size),
+                        (m, scale_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -884,6 +939,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
+        if self.fp4_format == "nvfp4":
+            del self.k_global_scale
+            del self.v_global_scale
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
@@ -893,11 +951,22 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
-
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
-                cache_k_nope_fp4, cache_k_nope_fp4_sf
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                KVMXFP4QuantizeUtil,
+                KVNVFP4QuantizeUtil,
             )
+
+            if self.fp4_format == "mxfp4":
+                quantize_util = KVMXFP4QuantizeUtil
+                cache_k_nope_fp4_dequant = quantize_util.batched_dequantize(
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf
+                )
+            else:  # nvfp4
+                quantize_util = KVNVFP4QuantizeUtil
+                k_global_scale = self.k_global_scale[layer_id - self.start_layer]
+                cache_k_nope_fp4_dequant = quantize_util.batched_dequantize(
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf, k_global_scale
+                )
             return cache_k_nope_fp4_dequant
         return self.k_buffer[layer_id - self.start_layer]
 
@@ -909,11 +978,22 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
             cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
-
-            cache_v_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
-                cache_v_nope_fp4, cache_v_nope_fp4_sf
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                KVMXFP4QuantizeUtil,
+                KVNVFP4QuantizeUtil,
             )
+
+            if self.fp4_format == "mxfp4":
+                quantize_util = KVMXFP4QuantizeUtil
+                cache_v_nope_fp4_dequant = quantize_util.batched_dequantize(
+                    cache_v_nope_fp4, cache_v_nope_fp4_sf
+                )
+            else:  # nvfp4
+                quantize_util = KVNVFP4QuantizeUtil
+                v_global_scale = self.v_global_scale[layer_id - self.start_layer]
+                cache_v_nope_fp4_dequant = quantize_util.batched_dequantize(
+                    cache_v_nope_fp4, cache_v_nope_fp4_sf, v_global_scale
+                )
             return cache_v_nope_fp4_dequant
         return self.v_buffer[layer_id - self.start_layer]
 
@@ -925,6 +1005,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        k_global_scale: Optional[torch.Tensor] = None,
+        v_global_scale: Optional[torch.Tensor] = None,
         layer_id_override: Optional[int] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -933,16 +1015,49 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                KVMXFP4QuantizeUtil,
+                KVNVFP4QuantizeUtil,
+            )
 
-            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+            if self.fp4_format == "mxfp4":
+                quantize_util = KVMXFP4QuantizeUtil
+                cache_k, cache_k_fp4_sf = quantize_util.batched_quantize(cache_k)
+                cache_v, cache_v_fp4_sf = quantize_util.batched_quantize(cache_v)
+            else:  # nvfp4
+                quantize_util = KVNVFP4QuantizeUtil
+                # Use provided global scale or retrieve from stored per-layer scale
+                if k_global_scale is not None:
+                    k_gs = k_global_scale
+                    # Store it for this layer
+                    if k_gs.dim() == 0:
+                        k_gs = k_gs.unsqueeze(0)
+                    self.k_global_scale[layer_id - self.start_layer] = k_gs.to(
+                        torch.float32
+                    )
+                else:
+                    k_gs = self.k_global_scale[layer_id - self.start_layer]
+
+                if v_global_scale is not None:
+                    v_gs = v_global_scale
+                    # Store it for this layer
+                    if v_gs.dim() == 0:
+                        v_gs = v_gs.unsqueeze(0)
+                    self.v_global_scale[layer_id - self.start_layer] = v_gs.to(
+                        torch.float32
+                    )
+                else:
+                    v_gs = self.v_global_scale[layer_id - self.start_layer]
+
+                cache_k, cache_k_fp4_sf = quantize_util.batched_quantize(cache_k, k_gs)
+                cache_v, cache_v_fp4_sf = quantize_util.batched_quantize(cache_v, v_gs)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -1522,6 +1637,48 @@ class MLATokenToKVPool(KVCache):
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        use_nsa: bool = False,
+        override_kv_cache_dim: Optional[int] = None,
+        fp4_format: str = "mxfp4",  # "mxfp4" or "nvfp4"
+    ):
+        self.fp4_format = fp4_format
+        if fp4_format not in ("mxfp4", "nvfp4"):
+            raise ValueError(f"fp4_format must be 'mxfp4' or 'nvfp4', got {fp4_format}")
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            use_nsa=use_nsa,
+            override_kv_cache_dim=override_kv_cache_dim,
+        )
+
+        # Optional global scale for NVFP4 (per layer). Defaults to 1.0.
+        if self.fp4_format == "nvfp4":
+            self.k_global_scale = [
+                torch.tensor([1.0], dtype=torch.float32, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1558,6 +1715,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.kv_scale_buffer
+        if getattr(self, "fp4_format", "mxfp4") == "nvfp4":
+            del self.k_global_scale
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1569,11 +1728,20 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
             cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
-
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
-                cache_k_nope_fp4, cache_k_nope_fp4_sf
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                KVMXFP4QuantizeUtil,
+                KVNVFP4QuantizeUtil,
             )
+
+            if self.fp4_format == "mxfp4":
+                cache_k_nope_fp4_dequant = KVMXFP4QuantizeUtil.batched_dequantize(
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf
+                )
+            else:
+                k_global_scale = self.k_global_scale[layer_id - self.start_layer]
+                cache_k_nope_fp4_dequant = KVNVFP4QuantizeUtil.batched_dequantize(
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf, k_global_scale
+                )
             return cache_k_nope_fp4_dequant
 
         return self.kv_buffer[layer_id - self.start_layer]
@@ -1588,9 +1756,20 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
         if cache_k.dtype != self.dtype:
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                KVMXFP4QuantizeUtil,
+                KVNVFP4QuantizeUtil,
+            )
 
-            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
+            if self.fp4_format == "mxfp4":
+                cache_k_fp4, cache_k_fp4_sf = KVMXFP4QuantizeUtil.batched_quantize(
+                    cache_k
+                )
+            else:
+                k_global_scale = self.k_global_scale[layer_id - self.start_layer]
+                cache_k_fp4, cache_k_fp4_sf = KVNVFP4QuantizeUtil.batched_quantize(
+                    cache_k, k_global_scale
+                )
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
@@ -1621,15 +1800,29 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         else:
             if cache_k_nope.dtype != self.dtype:
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
-                    KVFP4QuantizeUtil,
+                    KVMXFP4QuantizeUtil,
+                    KVNVFP4QuantizeUtil,
                 )
 
-                cache_k_nope_fp4, cache_k_nope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
-                )
-                cache_k_rope_fp4, cache_k_rope_fp4_sf = (
-                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
-                )
+                if self.fp4_format == "mxfp4":
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf = (
+                        KVMXFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                    )
+                    cache_k_rope_fp4, cache_k_rope_fp4_sf = (
+                        KVMXFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                    )
+                else:
+                    k_global_scale = self.k_global_scale[layer_id - self.start_layer]
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf = (
+                        KVNVFP4QuantizeUtil.batched_quantize(
+                            cache_k_nope, k_global_scale
+                        )
+                    )
+                    cache_k_rope_fp4, cache_k_rope_fp4_sf = (
+                        KVNVFP4QuantizeUtil.batched_quantize(
+                            cache_k_rope, k_global_scale
+                        )
+                    )
 
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)

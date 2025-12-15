@@ -1607,7 +1607,7 @@ class ServerArgs:
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
-        if self.kv_cache_dtype != "fp4_e2m1":
+        if self.kv_cache_dtype not in ("fp4_e2m1", "mxfp4_e2m1", "nvfp4_e2m1"):
             return
 
         use_mla_backend = self.use_mla_backend()
@@ -1683,6 +1683,15 @@ class ServerArgs:
                         )
         else:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+
+        # NVFP4 KV cache format requires flashinfer + SM100 kernels for quant/dequant.
+        if self.kv_cache_dtype == "nvfp4_e2m1":
+            if not (is_flashinfer_available() and is_sm100_supported()):
+                raise ValueError(
+                    "NVFP4 KV cache (nvfp4_e2m1) requires "
+                    "flashinfer and SM100 support. Please install flashinfer and run on "
+                    "Blackwell (SM100), or use --kv-cache-dtype mxfp4_e2m1."
+                )
 
     def _handle_page_size(self):
         if self.page_size is None:
@@ -2527,8 +2536,21 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                # FP4 KV cache (E2M1). fp4_e2m1 is kept as an alias for mxfp4_e2m1.
+                "fp4_e2m1",
+                "mxfp4_e2m1",
+                "nvfp4_e2m1",
+            ],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. '
+            '"fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. '
+            '"mxfp4_e2m1" and "nvfp4_e2m1" store KV as FP4 (E2M1 packed) but differ in scale format. '
+            '"fp4_e2m1" is an alias for "mxfp4_e2m1".',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

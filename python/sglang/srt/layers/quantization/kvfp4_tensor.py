@@ -12,7 +12,16 @@
 # limitations under the License.
 # ==============================================================================
 
+
 import torch
+
+from sglang.srt.utils.common import is_flashinfer_available, is_sm100_supported
+
+if is_flashinfer_available() and is_sm100_supported():
+    from flashinfer import e2m1_and_ufp8sf_scale_to_float, fp4_quantize
+else:
+    e2m1_and_ufp8sf_scale_to_float = None
+    fp4_quantize = None
 
 E2M1_MAX = 6.0
 # Put constants directly on CUDA if available
@@ -25,20 +34,25 @@ E2M1_BOUNDS = torch.tensor(
 )
 
 
-class KVFP4QuantizeUtil:
-    """Utility class for MXFP4 quantization and dequantization operations."""
+class KVMXFP4QuantizeUtil:
+    """Utility class for MXFP4 quantization and dequantization operations.
+
+    MXFP4 uses:
+    - E8M0 scale factors (exponent-only, stored as uint8)
+    - Block size: 16 elements
+    """
 
     @staticmethod
     @torch.compile
     def batched_quantize(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Quantize tensor to KVFP4 format
+        Quantize tensor to MXFP4 format
         Args:
             tensor: Input tensor of shape [B, M, N]
 
         Returns:
             quant_tensor: Quantized tensor of shape [B, M, N/2]
-            scale_factors: Scale factors of shape [B, M*N/16]
+            scale_factors: E8M0 scale factors of shape [B, M*N/16] (uint8)
         """
         b, m, n = tensor.shape
 
@@ -77,10 +91,10 @@ class KVFP4QuantizeUtil:
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """
-        Dequantize KVFP4 tensor
+        Dequantize MXFP4 tensor
         Args:
             quant_tensor: Quantized tensor of shape [B, M, N/2]
-            scale_factors: Scale factors of shape [B, M*N/16]
+            scale_factors: E8M0 scale factors of shape [B, M*N/16] (uint8)
             dtype: Target dtype for output
 
         Returns:
@@ -105,8 +119,136 @@ class KVFP4QuantizeUtil:
         # Reshape for block-wise scaling
         reshaped = float_vals.view(b, m * n // 16, 16)
 
-        # Apply scale factors
         scale_exp = scale_factors.float() - 127
         scaled = reshaped * torch.exp2(scale_exp.unsqueeze(-1))
 
         return scaled.view(b, m, n).to(dtype)
+
+
+class KVNVFP4QuantizeUtil:
+    """Utility class for NVFP4 quantization and dequantization operations.
+
+    NVFP4 uses:
+    - FP8 E4M3FN scale factors (full FP8 format, stored as uint8)
+    - Block size: 16 elements
+    - Global FP32 scale (optional, loaded from checkpoint, per layer)
+    """
+
+    @staticmethod
+    def batched_quantize(
+        tensor: torch.Tensor,
+        global_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize tensor to NVFP4 format.
+
+        Mirrors TRTLLM KV-cache behavior: block scales are stored compactly as
+        (num_heads * head_dim / 16) bytes per token (per K or V), i.e. no padding-to-128
+        and no swizzled layout.
+        Args:
+            tensor: Input tensor of shape [B, M, N]
+            global_scale: Optional global FP32 scale factor (scalar tensor).
+                         If None, defaults to 1.0 (no scaling).
+
+        Returns:
+            quant_tensor: Quantized tensor of shape [B, M, N/2]
+            scale_factors: FP8 E4M3FN scale factors (uint8)
+        """
+        if fp4_quantize is None:
+            raise RuntimeError("fp4_quantize requires flashinfer and SM100 support")
+
+        b, m, n = tensor.shape
+
+        # Ensure tensor is contiguous (required by flashinfer)
+        tensor = tensor.contiguous()
+
+        # Always pass a global scale (default to 1.0 if not provided)
+        if global_scale is None:
+            global_scale = torch.tensor(
+                [1.0], dtype=torch.float32, device=tensor.device
+            )
+        elif not isinstance(global_scale, torch.Tensor):
+            global_scale = torch.tensor(
+                [global_scale], dtype=torch.float32, device=tensor.device
+            )
+        elif global_scale.dim() == 0:
+            global_scale = global_scale.unsqueeze(0)
+
+        # Use flashinfer fp4_quantize on a flattened (B*M, N) matrix with
+        # is_sf_swizzled_layout=False to get compact per-16 block scales.
+        flat = tensor.reshape(b * m, n)
+        q_flat, sf_flat = fp4_quantize(
+            flat,
+            global_scale,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,  # UE4M3 scales (NVFP4)
+            is_sf_swizzled_layout=False,
+            is_sf_8x4_layout=False,
+        )
+
+        quant_tensor = q_flat.view(b, m, n // 2)
+        scale_factors = sf_flat.view(b, (m * n) // 16)
+        return quant_tensor, scale_factors
+
+    @staticmethod
+    def batched_dequantize(
+        quant_tensor: torch.Tensor,
+        scale_factors: torch.Tensor,
+        global_scale: torch.Tensor | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """
+        Dequantize NVFP4 tensor using flashinfer's e2m1_and_ufp8sf_scale_to_float.
+        Args:
+            quant_tensor: Quantized tensor of shape [B, M, N/2]
+            scale_factors: FP8 E4M3FN scale factors (uint8) in swizzled layout
+            global_scale: Optional global FP32 scale factor (scalar tensor).
+                         If None, defaults to 1.0 (no scaling).
+            dtype: Target dtype for output
+
+        Returns:
+            Dequantized tensor of shape [B, M, N]
+        """
+        if e2m1_and_ufp8sf_scale_to_float is None:
+            raise RuntimeError(
+                "e2m1_and_ufp8sf_scale_to_float requires flashinfer and SM100 support"
+            )
+
+        b, m, n_half = quant_tensor.shape
+
+        # Ensure tensors are contiguous (required by flashinfer)
+        quant_tensor = quant_tensor.contiguous()
+        scale_factors = scale_factors.contiguous()
+
+        # Always pass a global scale (default to 1.0 if not provided)
+        if global_scale is None:
+            global_scale = torch.tensor(
+                [1.0], dtype=torch.float32, device=quant_tensor.device
+            )
+        elif not isinstance(global_scale, torch.Tensor):
+            global_scale = torch.tensor(
+                [global_scale], dtype=torch.float32, device=quant_tensor.device
+            )
+        elif global_scale.dim() == 0:
+            global_scale = global_scale.unsqueeze(0)
+
+        # Process each batch element (e2m1_and_ufp8sf_scale_to_float works on [M, K/2])
+        dequantized_batches = []
+        for i in range(b):
+            dequantized = e2m1_and_ufp8sf_scale_to_float(
+                quant_tensor[i],  # [M, N/2]
+                scale_factors[i].flatten(),  # compact (M*N/16)
+                global_scale,
+                sf_vec_size=16,
+                ufp8_type=1,  # 1 for E4M3 (NVFP4)
+                is_sf_swizzled_layout=False,
+            )
+            dequantized_batches.append(dequantized)
+
+        # Stack batches and convert to target dtype
+        result = torch.stack(dequantized_batches, dim=0)  # [B, M, N]
+        return result.to(dtype)
+
+
+# Backward compatibility alias. TODO: remove this in the future.
+KVFP4QuantizeUtil = KVMXFP4QuantizeUtil

@@ -1647,7 +1647,11 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
-        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+        elif self.server_args.kv_cache_dtype in (
+            "fp4_e2m1",
+            "mxfp4_e2m1",
+            "nvfp4_e2m1",
+        ):
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
@@ -1876,6 +1880,11 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    fp4_format=(
+                        "nvfp4"
+                        if self.server_args.kv_cache_dtype == "nvfp4_e2m1"
+                        else "mxfp4"
+                    ),
                 )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(
@@ -1963,6 +1972,11 @@ class ModelRunner:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                        ),
+                        fp4_format=(
+                            "nvfp4"
+                            if self.server_args.kv_cache_dtype == "nvfp4_e2m1"
+                            else "mxfp4"
                         ),
                     )
                 else:
