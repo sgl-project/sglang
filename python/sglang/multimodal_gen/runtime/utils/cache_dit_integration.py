@@ -28,22 +28,26 @@ from cache_dit import (
 from cache_dit.caching.block_adapters import BlockAdapterRegister
 from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
+_original_similarity = None
+
 
 def _patch_cache_dit_similarity():
     from cache_dit.caching.cache_contexts import cache_manager
 
-    original_similarity = cache_manager.CachedContextManager.similarity
+    global _original_similarity
+    if _original_similarity is None:
+        _original_similarity = cache_manager.CachedContextManager.similarity
 
     def patched_similarity(self, t1, t2, threshold, parallelized, prefix=""):
         if not parallelized:
-            return original_similarity(self, t1, t2, threshold, parallelized, prefix)
+            return _original_similarity(self, t1, t2, threshold, parallelized, prefix)
 
         sp_group = getattr(self, "_sglang_sp_group", None)
         tp_group = getattr(self, "_sglang_tp_group", None)
         target_group = sp_group or tp_group
 
         if target_group is None:
-            return original_similarity(self, t1, t2, threshold, parallelized, prefix)
+            return _original_similarity(self, t1, t2, threshold, parallelized, prefix)
 
         condition_thresh = self.get_important_condition_threshold()
         if condition_thresh > 0.0:
