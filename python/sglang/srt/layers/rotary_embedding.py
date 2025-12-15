@@ -219,6 +219,11 @@ class RotaryEmbedding(CustomOp):
             sin.view(-1, 1, 1, last_dim).contiguous(),
         )
 
+    def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_sin = self.cos_sin_cache[:seqlen]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return cos, sin
+
     def forward_native(
         self,
         positions: torch.Tensor,
