@@ -9,6 +9,7 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    observability::metrics::{smg_labels, SmgMetrics},
     policies::PolicyRegistry,
     routers::{
         error,
@@ -146,7 +147,17 @@ impl WorkerSelectionStage {
 
         // Select worker using the policy
         let idx = policy.select_worker(&available, text)?;
-        Some(available[idx].clone())
+        let selected = available[idx].clone();
+
+        // Record worker selection metric
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_REGULAR,
+            smg_labels::CONNECTION_GRPC,
+            model_id.unwrap_or("default"),
+            policy.name(),
+        );
+
+        Some(selected)
     }
 
     fn select_pd_pair(
@@ -194,6 +205,23 @@ impl WorkerSelectionStage {
 
         let prefill_idx = policy.select_worker(&available_prefill, text)?;
         let decode_idx = policy.select_worker(&available_decode, text)?;
+
+        let model = model_id.unwrap_or("default");
+        let policy_name = policy.name();
+
+        // Record worker selection metrics for both prefill and decode
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_PREFILL,
+            smg_labels::CONNECTION_GRPC,
+            model,
+            policy_name,
+        );
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_DECODE,
+            smg_labels::CONNECTION_GRPC,
+            model,
+            policy_name,
+        );
 
         Some((
             available_prefill[prefill_idx].clone(),
