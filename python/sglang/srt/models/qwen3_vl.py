@@ -19,7 +19,6 @@ import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -355,69 +354,82 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
 
-        # TODO: use torch instand of np
         for t, h, w in grid_thw:
-            h_idxs = np.linspace(0, num_grid_per_side - 1, h)
-            w_idxs = np.linspace(0, num_grid_per_side - 1, w)
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, device=self.device)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, device=self.device)
 
-            h_idxs_floor = h_idxs.astype(int)
-            w_idxs_floor = w_idxs.astype(int)
-            h_idxs_ceil = (h_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
+            h_idxs_floor = h_idxs.to(torch.int32)
+            w_idxs_floor = w_idxs.to(torch.int32)
+            h_idxs_ceil = (h_idxs_floor + 1).clip(max=num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs_floor + 1).clip(max=num_grid_per_side - 1)
 
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
 
-            idx_list[0].extend(
-                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_floor[None])
+            idx_list[0].append(
+                ((h_idxs_floor * num_grid_per_side).unsqueeze(-1) + w_idxs_floor.unsqueeze(0))
                 .flatten()
-                .tolist()
-                * t
+                .repeat(t)
             )
-            idx_list[1].extend(
-                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_ceil[None])
+            idx_list[1].append(
+                ((h_idxs_floor * num_grid_per_side).unsqueeze(-1) + w_idxs_ceil.unsqueeze(0))
                 .flatten()
-                .tolist()
-                * t
+                .repeat(t)
             )
-            idx_list[2].extend(
-                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_floor[None])
+            idx_list[2].append(
+                ((h_idxs_ceil * num_grid_per_side).unsqueeze(-1) + w_idxs_floor.unsqueeze(0))
                 .flatten()
-                .tolist()
-                * t
+                .repeat(t)
             )
-            idx_list[3].extend(
-                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_ceil[None])
+            idx_list[3].append(
+                ((h_idxs_ceil * num_grid_per_side).unsqueeze(-1) + w_idxs_ceil.unsqueeze(0))
                 .flatten()
-                .tolist()
-                * t
+                .repeat(t)
             )
 
-            weight_list[0].extend(
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten().tolist() * t
+            weight_list[0].append(
+                ((1 - dh).unsqueeze(-1) * (1 - dw).unsqueeze(0))
+                .flatten()
+                .repeat(t)
             )
-            weight_list[1].extend(((1 - dh)[None].T * dw[None]).flatten().tolist() * t)
-            weight_list[2].extend((dh[None].T * (1 - dw)[None]).flatten().tolist() * t)
-            weight_list[3].extend((dh[None].T * dw[None]).flatten().tolist() * t)
+            weight_list[1].append(
+                ((1 - dh).unsqueeze(-1) * dw.unsqueeze(0))
+                .flatten()
+                .repeat(t)
+            )
+            weight_list[2].append(
+                (dh.unsqueeze(-1) * (1 - dw).unsqueeze(0))
+                .flatten()
+                .repeat(t)
+            )
+            weight_list[3].append(
+                (dh.unsqueeze(-1) * dw.unsqueeze(0))
+                .flatten()
+                .repeat(t)
+            )
 
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
+        if len(grid_thw) > 1:
+            idx_list = [torch.concat(items, dim=0) for items in idx_list]
+            weight_list = [torch.concat(items, dim=0) for items in weight_list]
+        else:
+            idx_list = [items[0] for items in idx_list]
+            weight_list = [items[0] for items in weight_list]
 
         p0 = (
-            self.pos_embed(torch.tensor(idx_list[0], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[0], dtype=dtype, device=device)[:, None]
+            self.pos_embed(idx_list[0].to(torch.long))
+            * weight_list[0].to(self.dtype).unsqueeze(-1)
         )
         p1 = (
-            self.pos_embed(torch.tensor(idx_list[1], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[1], dtype=dtype, device=device)[:, None]
+            self.pos_embed(idx_list[1].to(torch.long))
+            * weight_list[1].to(self.dtype).unsqueeze(-1)
         )
         p2 = (
-            self.pos_embed(torch.tensor(idx_list[2], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[2], dtype=dtype, device=device)[:, None]
+            self.pos_embed(idx_list[2].to(torch.long))
+            * weight_list[2].to(self.dtype).unsqueeze(-1)
         )
         p3 = (
-            self.pos_embed(torch.tensor(idx_list[3], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[3], dtype=dtype, device=device)[:, None]
+            self.pos_embed(idx_list[3].to(torch.long))
+            * weight_list[3].to(self.dtype).unsqueeze(-1)
         )
 
         patch_pos_embeds = p0 + p1 + p2 + p3
