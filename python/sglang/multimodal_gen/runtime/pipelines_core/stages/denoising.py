@@ -1114,10 +1114,8 @@ class DenoisingStage(PipelineStage):
             A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
-        if local_rank == 0:
-            return tqdm(iterable=iterable, total=total)
-        else:
-            return tqdm(iterable=iterable, total=total, disable=True)
+        disable = local_rank != 0
+        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def rescale_noise_cfg(
         self, noise_cfg, noise_pred_text, guidance_rescale=0.0
