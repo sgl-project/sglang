@@ -970,6 +970,11 @@ def silu_and_mul_triton(
 
 
 @triton.jit
+def tanh(x):
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+@triton.jit
 def gelu_and_mul_triton_kernel(
     gateup_output,
     down_input,
@@ -1011,7 +1016,7 @@ def gelu_and_mul_triton_kernel(
                 * gate_output
                 * (
                     1
-                    + tl.tanh(
+                    + tanh(
                         kAlpha
                         * (
                             gate_output
@@ -1090,7 +1095,7 @@ def gelu_and_mul_triton_kernel_sorted(
             * gate_data
             * (
                 1
-                + tl.tanh(
+                + tanh(
                     kAlpha * (gate_data + 0.044715 * gate_data * gate_data * gate_data)
                 )
             )
