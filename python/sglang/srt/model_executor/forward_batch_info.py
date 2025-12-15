@@ -541,11 +541,6 @@ class ForwardBatch:
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
-        self.num_token_non_padded_cpu = compute_local_num_token_non_padded(
-            global_num_token_non_padded=self.num_token_non_padded_cpu,
-            num_tokens_per_dp=num_tokens_per_dp,
-        )
-
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
         Merge all multimodal inputs in the batch into a single MultiModalInputs object.
@@ -669,7 +664,7 @@ class ForwardBatch:
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # batch_size * [3 * seq_len]
-        batch_size = self.seq_lens.shape[0]
+        batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
@@ -678,13 +673,13 @@ class ForwardBatch:
                 if mm_input is None:
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
-                        self.seq_lens[batch_idx] - 1,
+                        self.seq_lens_cpu[batch_idx] - 1,
                         dtype=torch.int64,
                         device=model_runner.device,
                     )
                 else:
                     mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens[batch_idx], model_runner.device
+                        mm_input, self.seq_lens_cpu[batch_idx], model_runner.device
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
