@@ -102,7 +102,6 @@ class ModelConfig:
         quantize_and_serve: bool = False,
         moe_router_dtype: str = "auto",
         is_mtp: bool = False,
-        draft_model_idx: int = 0,
     ) -> None:
         # Parse args
         self.model_path = model_path
