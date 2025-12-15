@@ -15,7 +15,6 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from einops import rearrange
 from tqdm.auto import tqdm
 
@@ -211,16 +210,11 @@ class DenoisingStage(PipelineStage):
         sp_group = None
         tp_group = None
         if parallelized:
-
             sp_group_candidate = get_sp_group()
             tp_group_candidate = get_tp_group()
 
-            sp_world_size = (
-                dist.get_world_size(sp_group_candidate) if sp_group_candidate else 1
-            )
-            tp_world_size = (
-                dist.get_world_size(tp_group_candidate) if tp_group_candidate else 1
-            )
+            sp_world_size = sp_group_candidate.world_size if sp_group_candidate else 1
+            tp_world_size = tp_group_candidate.world_size if tp_group_candidate else 1
 
             has_sp = sp_world_size > 1
             has_tp = tp_world_size > 1
@@ -231,8 +225,8 @@ class DenoisingStage(PipelineStage):
                     "Please use either sequence parallelism or tensor parallelism, not both."
                 )
 
-            sp_group = sp_group_candidate if has_sp else None
-            tp_group = tp_group_candidate if has_tp else None
+            sp_group = sp_group_candidate.device_group if has_sp else None
+            tp_group = tp_group_candidate.device_group if has_tp else None
 
             logger.info(
                 "cache-dit enabled in distributed environment (world_size=%d, "
