@@ -202,6 +202,11 @@ class ModelSlimConfig(QuantizationConfig):
                 quant_config=self.quant_description,
                 prefix=layer_name
             )
+        elif quant_type == "W8A8":
+            return ModelSlimW8A8Int8(
+                quant_config=self.quant_description,
+                prefix=layer_name
+            )
         elif quant_type == "W4A4_DYNAMIC":
             return ModelSlimW4A4Int4(
                 quant_config=self.quant_description,
