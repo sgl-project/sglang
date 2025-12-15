@@ -21,6 +21,7 @@ import sys
 import time
 from collections import deque
 from concurrent import futures
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -999,6 +1000,20 @@ class Scheduler(
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+        # Confidential compute mode: use worker thread for D2H copies
+        self.enable_confidential_compute_optimize = getattr(
+            self.server_args, "enable_confidential_compute_optimize", False
+        )
+        if self.enable_confidential_compute_optimize and self.device != "cpu":
+            self.host_copy_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="host_copy"
+            )
+            logger.info(
+                "Confidential compute mode enabled: GPU->CPU copies will use worker thread"
+            )
+        else:
+            self.host_copy_executor = None
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
@@ -2099,7 +2114,14 @@ class Scheduler(
                     ).Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        # Use confidential compute mode if enabled
+                        if self.host_copy_executor is not None:
+                            batch_result.copy_to_cpu_confidential(
+                                self.host_copy_executor,
+                                return_logprob=batch.return_logprob,
+                            )
+                        else:
+                            batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
 
@@ -2188,7 +2210,14 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+            # Use confidential compute mode if enabled
+            if self.host_copy_executor is not None:
+                batch_result.copy_to_cpu_confidential(
+                    self.host_copy_executor,
+                    return_logprob=self.cur_batch.return_logprob,
+                )
+            else:
+                batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
     def process_batch_result(
         self,
@@ -2207,7 +2236,10 @@ class Scheduler(
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                if result.copy_done is not None:
+                # Handle synchronization for overlap scheduling
+                if hasattr(result, "use_confidential_compute") and result.use_confidential_compute:
+                    result.resolve_confidential_futures()
+                elif result.copy_done is not None:
                     result.copy_done.synchronize()
 
         self.maybe_send_health_check_signal()
