@@ -137,6 +137,8 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
+ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
@@ -268,6 +270,12 @@ class ServerArgs:
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
+
+    # Encode prefill disaggregation
+    encoder_only: bool = False
+    language_only: bool = False
+    encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
+    encoder_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Quantization and data type
     dtype: str = "auto"
@@ -607,6 +615,7 @@ class ServerArgs:
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
+    enable_prefix_mm_cache: bool = False
     enable_clear_mm_features_for_decode: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
@@ -677,7 +686,10 @@ class ServerArgs:
         self._handle_load_format()
 
         # Handle PD disaggregation.
-        self._handle_disaggregation()
+        self._handle_pd_disaggregation()
+
+        # Handle Encoder disaggregation.
+        self._handle_encoder_disaggregation()
 
         # Validate tokenizer settings.
         self._handle_tokenizer_batching()
@@ -1275,6 +1287,29 @@ class ServerArgs:
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
+                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
+                if is_sm100_supported():
+                    if self.attention_backend is None:
+                        self.attention_backend = "flashinfer"
+                        logger.info(
+                            "Use flashinfer as attention backend on sm100 for NemotronHForCausalLM"
+                        )
+                    if self.attention_backend == "trtllm_mha":
+                        logger.warning(
+                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                            "Try to use --attention-backend triton if radix cache is necessary."
+                        )
+                        self.disable_radix_cache = True
+                        self.disable_overlap_schedule = False
+            assert self.attention_backend != "triton", (
+                "NemotronHForCausalLM does not support triton attention backend,"
+                "as the first layer might not be an attention layer"
+            )
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -1339,7 +1374,6 @@ class ServerArgs:
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
         elif model_arch in [
-            "NemotronHForCausalLM",
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
@@ -1350,6 +1384,19 @@ class ServerArgs:
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
                 )
                 self.disable_overlap_schedule = True
+                if is_sm100_supported():
+                    if self.attention_backend is None:
+                        self.attention_backend = "triton"
+                        logger.info(
+                            f"Use triton as attention backend on sm100 for {model_arch}"
+                        )
+                    if self.attention_backend == "trtllm_mha":
+                        logger.warning(
+                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                            "Try to use --attention-backend triton if radix cache is necessary."
+                        )
+                        self.disable_radix_cache = True
+                        self.disable_overlap_schedule = False
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1992,7 +2039,30 @@ class ServerArgs:
             ):
                 self.load_format = "auto"
 
-    def _handle_disaggregation(self):
+    def _handle_encoder_disaggregation(self):
+        if self.enable_prefix_mm_cache and not self.encoder_only:
+            raise ValueError(
+                "--enable-prefix-mm-cache requires --encoder-only to be enabled"
+            )
+        if self.encoder_only and self.language_only:
+            raise ValueError("Cannot set --encoder-only and --language-only together")
+        if self.encoder_only and not self.disaggregation_mode == "null":
+            raise ValueError(
+                "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
+            )
+        if (
+            self.language_only
+            and self.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.pp_size > 1
+        ):
+            raise ValueError("zmq_to_scheduler not support pp_size > 1")
+
+        if self.language_only and len(self.encoder_urls) == 0:
+            raise ValueError(
+                "requires at least one encoder urls to be set via --encoder-urls"
+            )
+
+    def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
             assert (
                 self.disaggregation_decode_tp is None
@@ -2395,6 +2465,32 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
+
+        # Encode prefill disaggregation
+        parser.add_argument(
+            "--encoder-only",
+            action="store_true",
+            help="For MLLM with an encoder, launch an encoder-only server",
+        )
+        parser.add_argument(
+            "--language-only",
+            action="store_true",
+            help="For VLM, load weights for the language model only.",
+        )
+        parser.add_argument(
+            "--encoder-transfer-backend",
+            type=str,
+            default=ServerArgs.encoder_transfer_backend,
+            choices=ENCODER_TRANSFER_BACKEND_CHOICES,
+            help="The backend for encoder disaggregation transfer. Default is zmq_to_scheduler.",
+        )
+        parser.add_argument(
+            "--encoder-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="List of encoder server urls.",
         )
 
         # Quantization and data type
@@ -4167,6 +4263,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+        parser.add_argument(
+            "--enable-prefix-mm-cache",
+            action="store_true",
+            default=ServerArgs.enable_prefix_mm_cache,
+            help="Enable prefix multimodal cache. Currently only supports mm-only.",
         )
 
         # For registering hooks
