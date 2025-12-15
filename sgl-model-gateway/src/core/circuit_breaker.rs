@@ -95,8 +95,10 @@ impl CircuitBreaker {
 
     /// Create a new circuit breaker with custom configuration and metric label
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
+        let init_state = CircuitState::Closed;
+        RouterMetrics::set_cb_state(&metric_label, init_state.to_int());
         Self {
-            state: Arc::new(RwLock::new(CircuitState::Closed)),
+            state: Arc::new(RwLock::new(init_state)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
             consecutive_successes: Arc::new(AtomicU32::new(0)),
             total_failures: Arc::new(AtomicU64::new(0)),
