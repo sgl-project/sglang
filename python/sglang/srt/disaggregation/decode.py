@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -431,6 +432,8 @@ class DecodePreallocQueue:
         failed_reqs = []
         preallocated_reqs = []
         indices_to_remove = set()
+        bootstrap_table = None
+        data_parallel_rank = None
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
@@ -454,6 +457,30 @@ class DecodePreallocQueue:
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
+            if envs.SGLANG_SYNC_PREFILL_DP_RANK.get():
+                if hasattr(decode_req.kv_receiver, "_get_prefill_dp_rank_from_server"):
+                    if bootstrap_table is None:
+                        bootstrap_table = (
+                            decode_req.kv_receiver._get_prefill_dp_rank_from_server(
+                                decode_req.req.bootstrap_room
+                            )
+                        )
+
+                # Do not check warmup requests with FAKE_BOOTSTRAP_HOST
+                if decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
+                    if (
+                        bootstrap_table
+                        and str(decode_req.req.bootstrap_room) in bootstrap_table
+                    ):
+                        data_parallel_rank = bootstrap_table[
+                            str(decode_req.req.bootstrap_room)
+                        ]["dp_rank"]
+                    else:
+                        logger.debug(
+                            f"bootstrap info for {decode_req.req.bootstrap_room} {decode_req.req.bootstrap_host} not found"
+                        )
+                        continue
+
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -549,7 +576,10 @@ class DecodePreallocQueue:
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.init(
-                page_indices, decode_req.metadata_buffer_index, state_indices
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                data_parallel_rank,
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)

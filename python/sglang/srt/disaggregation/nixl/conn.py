@@ -780,6 +780,7 @@ class NixlKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
