@@ -130,26 +130,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Record the outcome of a request to this worker
     fn record_outcome(&self, success: bool) {
         self.circuit_breaker().record_outcome(success);
-        let after = self.circuit_breaker().state();
-
-        if before != after {
-            let from = before.as_str();
-            let to = after.as_str();
-            RouterMetrics::record_cb_state_transition(self.url(), from, to);
-        }
-
-        let state_code = self.circuit_breaker().state().to_int();
-        RouterMetrics::set_cb_state(self.url(), state_code);
-
-        // Update consecutive failures/successes gauges
-        RouterMetrics::set_cb_consecutive_failures(
-            self.url(),
-            self.circuit_breaker().failure_count(),
-        );
-        RouterMetrics::set_cb_consecutive_successes(
-            self.url(),
-            self.circuit_breaker().success_count(),
-        );
     }
 
     /// Check if this worker is DP-aware
@@ -1052,6 +1032,24 @@ pub fn urls_to_workers(urls: Vec<String>, api_key: Option<String>) -> Vec<Box<dy
 /// Convert worker trait objects back to URLs
 pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
+}
+
+// TODO migrate code to V2 (and then remove this name suffix)
+pub struct WorkerLoadGuardV2 {
+    worker: Arc<dyn Worker>,
+}
+
+impl WorkerLoadGuardV2 {
+    pub fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self { worker }
+    }
+}
+
+impl Drop for WorkerLoadGuardV2 {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+    }
 }
 
 /// RAII guard for worker load management
