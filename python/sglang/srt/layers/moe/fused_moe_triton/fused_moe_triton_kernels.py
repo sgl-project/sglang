@@ -835,7 +835,7 @@ def silu_and_mul_triton_kernel(
 
 
 @triton.jit
-def silu_and_mul_triton_kernel_tma(
+def silu_and_mul_triton_kernel_sorted(
     gateup_output,
     down_input,
     hidden_size,
@@ -845,10 +845,10 @@ def silu_and_mul_triton_kernel_tma(
     BLOCK_SIZE_N: tl.constexpr,
 ):
     """
-    SiLU and multiply kernel for TMA.
+    SiLU and multiply kernel for sorted.
 
     Adapated from silu_and_mul_triton_kernel to process blocks of tokens
-    in sorted order using TMA for efficient memory access
+    in sorted order for efficient memory access
     """
     InDtype = gateup_output.dtype.element_ty
     OutDtype = down_input.dtype.element_ty
@@ -903,25 +903,28 @@ def silu_and_mul_triton_kernel_tma(
         tl.store(down_ptrs, silu_mul_output)
 
 
-def silu_and_mul_triton(
+def _activation_and_mul_triton_wrapper(
     gateup_output: torch.Tensor,
     down_input: torch.Tensor,
     hidden_size: int,
     config: Dict[str, Any],
+    regular_kernel,
+    sorted_kernel,
     topk_ids: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     num_tokens_post_padded: Optional[torch.Tensor] = None,
     sorted_token_ids: Optional[torch.Tensor] = None,
 ) -> None:
-    use_tma = (
+    """Generic wrapper for activation and multiply kernels."""
+    use_sorted = (
         expert_ids is not None
         and num_tokens_post_padded is not None
         and sorted_token_ids is not None
     )
 
-    if use_tma:
+    if use_sorted:
         grid = (triton.cdiv(sorted_token_ids.shape[0], config["BLOCK_SIZE_M"]),)
-        silu_and_mul_triton_kernel_tma[grid](
+        sorted_kernel[grid](
             gateup_output,
             down_input,
             hidden_size,
@@ -932,13 +935,38 @@ def silu_and_mul_triton(
         )
     else:
         grid = (down_input.shape[0],)
-        silu_and_mul_triton_kernel[grid](
+        regular_kernel[grid](
             gateup_output,
             down_input,
             hidden_size,
             topk_ids,
             BLOCK_SIZE=config["BLOCK_SIZE_N"],
         )
+
+
+def silu_and_mul_triton(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    hidden_size: int,
+    config: Dict[str, Any],
+    topk_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+) -> None:
+    """SiLU and multiply wrapper."""
+    _activation_and_mul_triton_wrapper(
+        gateup_output,
+        down_input,
+        hidden_size,
+        config,
+        silu_and_mul_triton_kernel,
+        silu_and_mul_triton_kernel_sorted,
+        topk_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        sorted_token_ids,
+    )
 
 
 @triton.jit
@@ -997,6 +1025,110 @@ def gelu_and_mul_triton_kernel(
             gelu_mul_output = gate_output * up_output
             gelu_mul_output = gelu_mul_output.to(OutDtype)
             tl.store(down_input_ptr + offset, gelu_mul_output, mask=mask)
+
+
+@triton.jit
+def gelu_and_mul_triton_kernel_sorted(
+    gateup_output,
+    down_input,
+    hidden_size,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """
+    GELU and multiply kernel for sorted.
+
+    Adapated from gelu_and_mul_triton_kernel to process blocks of tokens
+    in sorted order for efficient memory access
+    """
+    InDtype = gateup_output.dtype.element_ty
+    OutDtype = down_input.dtype.element_ty
+
+    half_hidden_size = hidden_size // 2
+
+    pid_m = tl.program_id(0)
+    start_offs_m = pid_m * BLOCK_SIZE_M
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    if start_offs_m >= num_tokens_post_padded:
+        return
+
+    row_offsets = start_offs_m + tl.arange(0, BLOCK_SIZE_M)
+
+    expert_id = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if expert_id == -1:
+        for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
+            offset = (
+                start_offset + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+            ) % half_hidden_size
+            down_ptrs = (
+                down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
+            )
+            tl.store(down_ptrs, 0)
+        return
+
+    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
+        offset = (
+            start_offset + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        ) % half_hidden_size
+
+        gate_ptrs = gateup_output + row_offsets[:, None] * hidden_size + offset[None, :]
+        up_ptrs = (
+            gateup_output
+            + row_offsets[:, None] * hidden_size
+            + (half_hidden_size + offset)[None, :]
+        )
+
+        gate_data = tl.load(gate_ptrs).to(tl.float32)
+        up_data = tl.load(up_ptrs)
+
+        kAlpha = 0.7978845608028654
+        gate_output = (
+            0.5
+            * gate_data
+            * (
+                1
+                + tl.tanh(
+                    kAlpha * (gate_data + 0.044715 * gate_data * gate_data * gate_data)
+                )
+            )
+        )
+        gate_output = gate_output.to(InDtype)
+
+        gelu_mul_output = gate_output * up_data
+        gelu_mul_output = gelu_mul_output.to(OutDtype)
+
+        down_ptrs = (
+            down_input + row_offsets[:, None] * half_hidden_size + offset[None, :]
+        )
+        tl.store(down_ptrs, gelu_mul_output)
+
+
+def gelu_and_mul_triton(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    hidden_size: int,
+    config: Dict[str, Any],
+    topk_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+) -> None:
+    """GELU and multiply wrapper."""
+    _activation_and_mul_triton_wrapper(
+        gateup_output,
+        down_input,
+        hidden_size,
+        config,
+        gelu_and_mul_triton_kernel,
+        gelu_and_mul_triton_kernel_sorted,
+        topk_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        sorted_token_ids,
+    )
 
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py

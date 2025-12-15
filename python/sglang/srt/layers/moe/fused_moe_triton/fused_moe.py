@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +25,7 @@ from sglang.srt.utils import (
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
-    gelu_and_mul_triton_kernel,
+    gelu_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     silu_and_mul_triton,
@@ -368,6 +368,24 @@ def _down_moe_use_tma():
     return support_tensor_descriptor()
 
 
+def _prepare_activation_kernel_args(
+    down_moe_use_tma: bool,
+    curr_topk_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+) -> Dict[str, Optional[torch.Tensor]]:
+    """Prepare arguments for activation kernels based on sorted mode."""
+    return {
+        "topk_ids": curr_topk_ids if not down_moe_use_tma else None,
+        "expert_ids": expert_ids if down_moe_use_tma else None,
+        "num_tokens_post_padded": (
+            num_tokens_post_padded if down_moe_use_tma else None
+        ),
+        "sorted_token_ids": sorted_token_ids if down_moe_use_tma else None,
+    }
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -559,17 +577,19 @@ def fused_experts_impl(
                 if not filter_expert:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:
+                    kwargs = _prepare_activation_kernel_args(
+                        down_moe_use_tma,
+                        curr_topk_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        sorted_token_ids,
+                    )
                     silu_and_mul_triton(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
                         N,
                         config,
-                        topk_ids=curr_topk_ids if not down_moe_use_tma else None,
-                        expert_ids=expert_ids if down_moe_use_tma else None,
-                        num_tokens_post_padded=(
-                            num_tokens_post_padded if down_moe_use_tma else None
-                        ),
-                        sorted_token_ids=sorted_token_ids if down_moe_use_tma else None,
+                        **kwargs,
                     )
             else:
                 vllm_ops.silu_and_mul(
@@ -581,12 +601,19 @@ def fused_experts_impl(
             if _is_hip or (_is_cuda and down_moe_use_tma):
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             elif _is_cuda:
-                gelu_and_mul_triton_kernel[(intermediate_cache2.shape[0],)](
+                kwargs = _prepare_activation_kernel_args(
+                    down_moe_use_tma,
+                    curr_topk_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    sorted_token_ids,
+                )
+                gelu_and_mul_triton(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     N,
-                    curr_topk_ids,
-                    BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+                    config,
+                    **kwargs,
                 )
             else:
                 vllm_ops.gelu_and_mul(
