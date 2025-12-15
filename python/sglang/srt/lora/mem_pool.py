@@ -492,7 +492,8 @@ class LoRAMemoryPool:
 
                 expert_match = re.search(r"experts\.(\d+)\.", name)
 
-                if expert_match and self.is_moe_module(target_module):
+                if expert_match:
+                    target_module = target_module + "_moe"
                     # MoE weight - multiple tensors per module (one per expert)
                     if temp_A_buffer[target_module] is None:
                         temp_A_buffer[target_module] = {}
