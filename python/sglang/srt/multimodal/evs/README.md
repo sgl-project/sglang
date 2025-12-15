@@ -5,13 +5,42 @@ Implementation of [Efficient Video Sampling: Pruning Temporally Redundant Tokens
 ## Overview
 
 > NOTE: The current implementation in sglang is cannot work with VLMs that use positional embeddings [Such as Qwen2.5VL]. Further work is warranted.
-> NOTE: Actual retained accuracy post-EVS may depend on how dynamic the input videos are, how high the pruning rate is, whether or not the model was trained with EVS on or not, etc. To learn more, read the paper above. It is incumbent on the user to evaluate as per their use case and benchmarks.
 
 Video frames often contain redundant information, as consecutive frames may be nearly identical. EVS exploits this in the latent space [=embedding space] by computing similarity between adjacent frame token embeddings and pruning tokens that are highly similar to the previous frames. This reduces the token count while preserving informative content.
 
 Key properties:
 - The first frame is always fully retained (provides complete initial context)
 - Configurable via `video_pruning_rate` in model config.json (0 = disabled, 0.7 = ~70% reduction; ~30% retained.)
+
+
+## Performance Characteristics VS. Accuracy - Example
+
+> NOTE: Actual retained accuracy post-EVS may depend on how dynamic the input videos are, how high the pruning rate is, whether or not the model was trained with EVS on or not, etc.
+> To learn more, read the paper above. It is incumbent on the user to evaluate as per their use case and benchmarks.
+
+A cursory example of a performance boost due to EVS:
+
+```bash
+export SGLANG_VLM_CACHE_SIZE_MB=0
+sglang serve --model-path nvidia/Nemotron-Nano-12B-v2-VL-BF16 --trust-remote-code --mem-fraction-static 0.8 --max-mamba-cache-size 128 --chunked-prefill-size 8192
+```
+Example Request:
+```json
+{ "model": "nvidia/Nemotron-Nano-12B-v2-VL-BF16", "stream": true, "temperature": 0.0, "max_completion_tokens": 3, "messages": [{ "role": "user", "content": [{ "type": "video_url", "video_url": { "url": "file:///tmp/01.mp4" } }]}]}
+```
+
+- `1XH100 95GiB`
+- `BS=1`
+- All 30 videos of `https://huggingface.co/datasets/lmms-lab/Video-MME/blob/main/videos_chunked_01.zip`
+- Default [for this model] pruning rate of `--json-model-override-args '{"video_pruning_rate": 0.7}'` [i.e., 30% of tokens are preserved] VS. `--json-model-override-args '{"video_pruning_rate": 0.0}'` [EVS off]
+
+| Scenario\ Metric                	| Online TTFT (Seconds) stderr: ±0.38 	| VideoMME Accuracy       	|
+|---------------------------------	|-------------------------------------	|-------------------------	|
+| EVS Off [q=0.0]                 	| 11.96 [100%]                          | Between 0.665 and 0.668 	|
+| EVS Off [q=0.4]                 	| 09.97 [ 83%]                          |                         	|
+| EVS On  [q=0.7] (default value) 	| 08.79 [ 73%]                          |                         	|
+| EVS Off [q=0.9]                 	| 08.39 [ 70%]                         	| 0.644                   	|
+
 
 ## Architecture
 
