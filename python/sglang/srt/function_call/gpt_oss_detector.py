@@ -355,9 +355,11 @@ class GptOssDetector(BaseFormatDetector):
                 )
                 if items_enum:
                     arguments[arg_name] = [
-                        self._match_enum_value(v, items_enum)
-                        if isinstance(v, str)
-                        else v
+                        (
+                            self._match_enum_value(v, items_enum)
+                            if isinstance(v, str)
+                            else v
+                        )
                         for v in arg_value
                     ]
 
