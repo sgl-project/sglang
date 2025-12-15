@@ -37,7 +37,7 @@ __Note__: The permissions to trigger CI tests are defined separately according t
    - **Ideal case:** For each modified file, one Codeowner has approved the PR. The PR has also passed the required CI tests. Then, anyone with write permission can merge the PR.
    - **Exception:** In cases where it is difficult to meet all requirements (due to flaky CI or slow responses), a Merge Oncall can bypass branch protection to merge the PR.
 
-If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.ai/): #dev, #pull-request, and #ci-cd-build-release.
+If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.io/): #dev, #pull-request, and #ci-cd-build-release.
 
 ## The List of Merge Oncalls and Reviewers
 The format is @github-username (Slack username).

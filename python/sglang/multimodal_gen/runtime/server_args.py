@@ -295,6 +295,10 @@ class ServerArgs:
     host: str | None = None
     port: int | None = None
 
+    # TODO: webui and their endpoint, check if webui_port is available.
+    webui: bool = False
+    webui_port: int | None = 12312
+
     scheduler_port: int = 5555
 
     # Stage verification
@@ -543,7 +547,6 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
-
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -613,6 +616,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--webui",
+            action=StoreBoolean,
+            default=ServerArgs.webui,
+            help="Whether to use webui for better display",
+        )
+
+        parser.add_argument(
+            "--webui-port",
+            type=int,
+            default=ServerArgs.webui_port,
+            help="Whether to use webui for better display",
         )
 
         # Stage verification
