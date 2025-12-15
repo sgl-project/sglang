@@ -1925,12 +1925,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             output_throughput = None
             if (
                 state.first_token_time_perf > 0.0
-                and state.finished_time_perf > 0.0
+                and state.finished_time_perf > state.first_token_time_perf
                 and completion_tokens > 0
             ):
                 decode_time = state.finished_time_perf - state.first_token_time_perf
-                if decode_time > 0:
-                    output_throughput = completion_tokens / decode_time
+                output_throughput = completion_tokens / decode_time
+
 
             self.metrics_collector.observe_one_finished_request(
                 labels,
