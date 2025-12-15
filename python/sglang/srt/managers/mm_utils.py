@@ -911,7 +911,25 @@ def hash_feature(f):
     if isinstance(f, list):
         if isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
-        # Convert tuple to bytes for hashing
+        return data_hash(tuple(flatten_nested_list(f)))
+    elif isinstance(f, np.ndarray):
+        arr = np.ascontiguousarray(f)
+        arr_bytes = arr.tobytes()
+        return data_hash(arr_bytes)
+    elif isinstance(f, torch.Tensor):
+        return tensor_hash([f])
+    elif isinstance(f, CudaIpcTensorTransportProxy):
+        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+        return tensor_hash([reconstruct_t])
+    return data_hash(f)
+
+
+
+"""
+def hash_feature(f):
+    if isinstance(f, list):
+        if isinstance(f[0], torch.Tensor):
+            return tensor_hash(f)
         flattened_tuple = tuple(flatten_nested_list(f))
         return data_hash(pickle.dumps(flattened_tuple))
     elif isinstance(f, np.ndarray):
@@ -942,3 +960,4 @@ def hash_feature(f):
             reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
             return tensor_hash([reconstruct_t])
     return data_hash(f)
+"""
