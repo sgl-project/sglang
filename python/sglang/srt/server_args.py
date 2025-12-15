@@ -442,6 +442,7 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
 
     # For Multi-Layer MTP
+    # FIXME: rename -> enable_multi_layer_mtp
     enable_mtp: bool = False
 
     # Expert parallelism
