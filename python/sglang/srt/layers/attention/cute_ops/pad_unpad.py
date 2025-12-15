@@ -17,14 +17,26 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
-from cutlass.cute.runtime import from_dlpack
+from cutlass import const_expr
+from cutlass.cute.runtime import make_fake_compact_tensor
 
 
 @dataclass
 class _PadKernelConfig:
     block_head: int = 32
     block_dim: int = 32
+
+
+def _torch_dtype_to_cutlass_dtype(dtype: torch.dtype):
+    if dtype == torch.float16:
+        return cutlass.Float16
+    if dtype == torch.bfloat16:
+        return cutlass.BFloat16
+    if dtype == torch.float32:
+        return cutlass.Float32
+    if dtype == torch.int32:
+        return cutlass.Int32
+    raise TypeError(f"Unsupported dtype for CuTe fake tensor: {dtype}")
 
 
 class CutePadDraftExtendQueryKernel:
@@ -34,8 +46,7 @@ class CutePadDraftExtendQueryKernel:
 
     def __init__(self, block_head: int = 32, block_dim: int = 32):
         self.cfg = _PadKernelConfig(block_head=block_head, block_dim=block_dim)
-        self._compiled_kernel = None
-        self._compile_key = None
+        self._compiled = {}
 
     def __call__(
         self,
@@ -44,75 +55,73 @@ class CutePadDraftExtendQueryKernel:
         seq_lens_q: torch.Tensor,  # [batch_size], int32
         cumsum: torch.Tensor,  # [batch_size + 1], int32
     ) -> None:
-        assert q.is_cuda and padded_q.is_cuda
-        batch_size, max_seq_len, num_heads, head_dim = padded_q.shape
+        assert q.is_cuda and padded_q.is_cuda and seq_lens_q.is_cuda and cumsum.is_cuda
+        assert seq_lens_q.dtype == torch.int32 and cumsum.dtype == torch.int32
 
-        # Compile kernel on first use or if shape changed
-        compile_key = (num_heads, head_dim, self.cfg.block_head, self.cfg.block_dim)
-        if self._compiled_kernel is None or self._compile_key != compile_key:
-            # Create fake tensors for compilation using concrete values
-            # Use a small batch size for compilation - kernel will work with any batch size at runtime
-            compile_batch_size = 1
-            compile_total_seq = max_seq_len
-            mQ_fake = cute.runtime.make_fake_tensor(
-                q.dtype, (compile_total_seq, num_heads, head_dim)
+        # Compile once per (dtype, max_seq_len, heads, dim, tile)
+        max_seq_len = padded_q.shape[1]
+        num_heads = padded_q.shape[2]
+        head_dim = padded_q.shape[3]
+        compile_key = (
+            q.dtype,
+            max_seq_len,
+            num_heads,
+            head_dim,
+            self.cfg.block_head,
+            self.cfg.block_dim,
+        )
+        compiled = self._compiled.get(compile_key)
+        if compiled is None:
+            batch_sym = cute.sym_int32()
+            total_seq_sym = cute.sym_int32()
+
+            q_dt = _torch_dtype_to_cutlass_dtype(q.dtype)
+            i32 = cutlass.Int32
+
+            # Row-major compact tensors: last dim contiguous
+            mQ_fake = make_fake_compact_tensor(
+                q_dt, (total_seq_sym, num_heads, head_dim), stride_order=(2, 1, 0)
             )
-            mPadded_fake = cute.runtime.make_fake_tensor(
-                padded_q.dtype, (compile_batch_size, max_seq_len, num_heads, head_dim)
+            mPadded_fake = make_fake_compact_tensor(
+                q_dt,
+                (batch_sym, max_seq_len, num_heads, head_dim),
+                stride_order=(3, 2, 1, 0),
             )
-            mSeqLens_fake = cute.runtime.make_fake_tensor(
-                seq_lens_q.dtype, (compile_batch_size,)
+            mSeqLens_fake = make_fake_compact_tensor(
+                i32, (batch_sym,), stride_order=(0,)
             )
-            mCumsum_fake = cute.runtime.make_fake_tensor(
-                cumsum.dtype, (compile_batch_size + 1,)
+            mCumsum_fake = make_fake_compact_tensor(
+                i32, (batch_sym + 1,), stride_order=(0,)
             )
 
-            # Compile the kernel with compile-time batch size
-            self._compiled_kernel = cute.compile(
-                self.kernel,
+            compiled = cute.compile(
+                self.op,
                 mQ_fake,
                 mPadded_fake,
                 mSeqLens_fake,
                 mCumsum_fake,
-                Int32(compile_batch_size),
-                Int32(max_seq_len),
-                Int32(num_heads),
-                Int32(head_dim),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-            self._compile_key = compile_key
+            self._compiled[compile_key] = compiled
 
-        # Convert torch tensors to CuTe tensors
-        mQ = from_dlpack(q)
-        mPadded = from_dlpack(padded_q)
-        mSeqLens = from_dlpack(seq_lens_q)
-        mCumsum = from_dlpack(cumsum)
-
-        # Call compiled kernel
-        self._compiled_kernel(
-            mQ,
-            mPadded,
-            mSeqLens,
-            mCumsum,
-            Int32(batch_size),
-            Int32(max_seq_len),
-            Int32(num_heads),
-            Int32(head_dim),
-        )
+        # compiled callable accepts torch tensors directly
+        compiled(q, padded_q, seq_lens_q, cumsum)
 
     @cute.jit
-    def kernel(
+    def op(
         self,
-        mQ: cute.Tensor,  # [total_seq, num_heads, head_dim]
-        mPadded: cute.Tensor,  # [batch, max_seq, num_heads, head_dim]
+        mQ: cute.Tensor,  # [total_seq, heads, dim]
+        mPadded: cute.Tensor,  # [batch, max_seq, heads, dim]
         mSeqLens: cute.Tensor,  # [batch]
         mCumsum: cute.Tensor,  # [batch + 1]
-        batch_size: Int32,
-        max_seq_len: Int32,
-        num_heads: Int32,
-        head_dim: Int32,
+        stream,
     ):
+        batch_size = mPadded.shape[0]
+        max_seq_len = mPadded.shape[1]
+        num_heads = mPadded.shape[2]
+        head_dim = mPadded.shape[3]
+
         grid = (
             batch_size * max_seq_len,
             cute.ceil_div(num_heads, self.cfg.block_head),
@@ -120,28 +129,20 @@ class CutePadDraftExtendQueryKernel:
         )
         block = (self.cfg.block_head, self.cfg.block_dim, 1)
 
-        self.kernel_impl(
+        self.kernel(
             mQ,
             mPadded,
             mSeqLens,
             mCumsum,
-            batch_size,
-            max_seq_len,
-            num_heads,
-            head_dim,
-        ).launch(grid=grid, block=block, stream=cutlass.get_default_stream())
+        ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
-    def kernel_impl(
+    def kernel(
         self,
-        mQ: cute.Tensor,  # [total_seq, num_heads, head_dim]
-        mPadded: cute.Tensor,  # [batch, max_seq, num_heads, head_dim]
+        mQ: cute.Tensor,  # [total_seq, heads, dim]
+        mPadded: cute.Tensor,  # [batch, max_seq, heads, dim]
         mSeqLens: cute.Tensor,  # [batch]
         mCumsum: cute.Tensor,  # [batch + 1]
-        batch_size: Int32,
-        max_seq_len: Int32,
-        num_heads: Int32,
-        head_dim: Int32,
     ):
         tidx, tidy, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -149,10 +150,12 @@ class CutePadDraftExtendQueryKernel:
         block_head = const_expr(self.cfg.block_head)
         block_dim = const_expr(self.cfg.block_dim)
 
+        max_seq_len = mPadded.shape[1]
+        num_heads = mPadded.shape[2]
+        head_dim = mPadded.shape[3]
+
         batch_id = bidx // max_seq_len
         seq_pos = bidx - batch_id * max_seq_len
-        if batch_id >= batch_size:
-            return
 
         seq_len = mSeqLens[batch_id]
         if seq_pos >= seq_len:
@@ -180,8 +183,7 @@ class CuteUnpadDraftExtendOutputKernel:
 
     def __init__(self, block_head: int = 32, block_dim: int = 32):
         self.cfg = _UnpadKernelConfig(block_head=block_head, block_dim=block_dim)
-        self._compiled_kernel = None
-        self._compile_key = None
+        self._compiled = {}
 
     def __call__(
         self,
@@ -190,81 +192,77 @@ class CuteUnpadDraftExtendOutputKernel:
         accept_lengths: torch.Tensor,  # [batch_size], int32
         cumsum: torch.Tensor,  # [batch_size + 1], int32
     ) -> None:
-        assert raw_out.is_cuda and output.is_cuda
-        batch_size, token_per_batch, tp_q_head_num, v_head_dim = raw_out.shape
+        assert (
+            raw_out.is_cuda
+            and output.is_cuda
+            and accept_lengths.is_cuda
+            and cumsum.is_cuda
+        )
+        assert accept_lengths.dtype == torch.int32 and cumsum.dtype == torch.int32
 
-        # Compile kernel on first use or if shape changed
+        token_per_batch = raw_out.shape[1]
+        tp_q_head_num = raw_out.shape[2]
+        v_head_dim = raw_out.shape[3]
         compile_key = (
+            raw_out.dtype,
+            token_per_batch,
             tp_q_head_num,
             v_head_dim,
             self.cfg.block_head,
             self.cfg.block_dim,
         )
-        if self._compiled_kernel is None or self._compile_key != compile_key:
-            # Create fake tensors for compilation using concrete values
-            # Use a small batch size for compilation - kernel will work with any batch size at runtime
-            compile_batch_size = 1
-            compile_total_tokens = token_per_batch
-            mRaw_fake = cute.runtime.make_fake_tensor(
-                raw_out.dtype,
-                (compile_batch_size, token_per_batch, tp_q_head_num, v_head_dim),
+        compiled = self._compiled.get(compile_key)
+        if compiled is None:
+            batch_sym = cute.sym_int32()
+            total_tokens_sym = cute.sym_int32()
+
+            out_dt = _torch_dtype_to_cutlass_dtype(raw_out.dtype)
+            i32 = cutlass.Int32
+
+            mRaw_fake = make_fake_compact_tensor(
+                out_dt,
+                (batch_sym, token_per_batch, tp_q_head_num, v_head_dim),
+                stride_order=(3, 2, 1, 0),
             )
-            mOut_fake = cute.runtime.make_fake_tensor(
-                output.dtype, (compile_total_tokens, tp_q_head_num, v_head_dim)
+            mOut_fake = make_fake_compact_tensor(
+                out_dt,
+                (total_tokens_sym, tp_q_head_num, v_head_dim),
+                stride_order=(2, 1, 0),
             )
-            mAccept_fake = cute.runtime.make_fake_tensor(
-                accept_lengths.dtype, (compile_batch_size,)
+            mAccept_fake = make_fake_compact_tensor(
+                i32, (batch_sym,), stride_order=(0,)
             )
-            mCumsum_fake = cute.runtime.make_fake_tensor(
-                cumsum.dtype, (compile_batch_size + 1,)
+            mCumsum_fake = make_fake_compact_tensor(
+                i32, (batch_sym + 1,), stride_order=(0,)
             )
 
-            # Compile the kernel with compile-time batch size
-            self._compiled_kernel = cute.compile(
-                self.kernel,
+            compiled = cute.compile(
+                self.op,
                 mRaw_fake,
                 mOut_fake,
                 mAccept_fake,
                 mCumsum_fake,
-                Int32(compile_batch_size),
-                Int32(token_per_batch),
-                Int32(tp_q_head_num),
-                Int32(v_head_dim),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-            self._compile_key = compile_key
+            self._compiled[compile_key] = compiled
 
-        # Convert torch tensors to CuTe tensors
-        mRaw = from_dlpack(raw_out)
-        mOut = from_dlpack(output)
-        mAccept = from_dlpack(accept_lengths)
-        mCumsum = from_dlpack(cumsum)
-
-        # Call compiled kernel
-        self._compiled_kernel(
-            mRaw,
-            mOut,
-            mAccept,
-            mCumsum,
-            Int32(batch_size),
-            Int32(token_per_batch),
-            Int32(tp_q_head_num),
-            Int32(v_head_dim),
-        )
+        compiled(raw_out, output, accept_lengths, cumsum)
 
     @cute.jit
-    def kernel(
+    def op(
         self,
         mRaw: cute.Tensor,  # [batch, token_per_batch, heads, dim]
         mOut: cute.Tensor,  # [total_tokens, heads, dim]
         mAccept: cute.Tensor,  # [batch]
         mCumsum: cute.Tensor,  # [batch + 1]
-        batch_size: Int32,
-        token_per_batch: Int32,
-        tp_q_head_num: Int32,
-        v_head_dim: Int32,
+        stream,
     ):
+        batch_size = mRaw.shape[0]
+        token_per_batch = mRaw.shape[1]
+        tp_q_head_num = mRaw.shape[2]
+        v_head_dim = mRaw.shape[3]
+
         grid = (
             batch_size * token_per_batch,
             cute.ceil_div(tp_q_head_num, self.cfg.block_head),
@@ -272,28 +270,17 @@ class CuteUnpadDraftExtendOutputKernel:
         )
         block = (self.cfg.block_head, self.cfg.block_dim, 1)
 
-        self.kernel_impl(
-            mRaw,
-            mOut,
-            mAccept,
-            mCumsum,
-            batch_size,
-            token_per_batch,
-            tp_q_head_num,
-            v_head_dim,
-        ).launch(grid=grid, block=block, stream=cutlass.get_default_stream())
+        self.kernel(mRaw, mOut, mAccept, mCumsum).launch(
+            grid=grid, block=block, stream=stream
+        )
 
     @cute.kernel
-    def kernel_impl(
+    def kernel(
         self,
         mRaw: cute.Tensor,  # [batch, token_per_batch, heads, dim]
         mOut: cute.Tensor,  # [total_tokens, heads, dim]
         mAccept: cute.Tensor,  # [batch]
         mCumsum: cute.Tensor,  # [batch + 1]
-        batch_size: Int32,
-        token_per_batch: Int32,
-        tp_q_head_num: Int32,
-        v_head_dim: Int32,
     ):
         tidx, tidy, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -301,10 +288,12 @@ class CuteUnpadDraftExtendOutputKernel:
         block_head = const_expr(self.cfg.block_head)
         block_dim = const_expr(self.cfg.block_dim)
 
+        token_per_batch = mRaw.shape[1]
+        tp_q_head_num = mRaw.shape[2]
+        v_head_dim = mRaw.shape[3]
+
         batch_id = bidx // token_per_batch
         seq_pos = bidx - batch_id * token_per_batch
-        if batch_id >= batch_size:
-            return
 
         accept_len = mAccept[batch_id]
         if seq_pos >= accept_len:
