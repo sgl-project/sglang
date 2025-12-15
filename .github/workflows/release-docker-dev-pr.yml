@@ -53,6 +53,14 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Debug - List docker directory
+        run: |
+          echo "Contents of docker directory:"
+          ls -la docker/
+          echo ""
+          echo "Looking for Dockerfile.test:"
+          ls -la docker/Dockerfile.test || echo "Dockerfile.test NOT FOUND"
+
       - name: Get git metadata
         id: git_meta
         run: |
