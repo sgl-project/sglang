@@ -7,10 +7,7 @@ use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::{
-    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
-    observability::metrics::RouterMetrics,
-};
+use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -142,7 +139,6 @@ impl WorkerRegistry {
             }
 
             worker.set_healthy(false);
-            RouterMetrics::remove_worker_metrics(worker.url());
 
             Some(worker)
         } else {
@@ -222,6 +218,16 @@ impl WorkerRegistry {
             .get(connection_mode)
             .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// Get the number of workers in the registry
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Check if the registry is empty
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
     }
 
     /// Get all workers
@@ -417,10 +423,6 @@ impl WorkerRegistry {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-            // Counter for periodic load reset (every 10 health check cycles)
-            let mut check_count = 0u64;
-            const LOAD_RESET_INTERVAL: u64 = 10;
-
             loop {
                 interval.tick().await;
 
@@ -448,15 +450,6 @@ impl WorkerRegistry {
                     })
                     .collect();
                 futures::future::join_all(health_futures).await;
-
-                // Reset loads periodically
-                check_count += 1;
-                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
-                    }
-                }
             }
         });
 
