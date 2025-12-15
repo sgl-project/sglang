@@ -78,7 +78,7 @@ jobs:
           docker buildx build \
             --platform ${{ matrix.platform }} \
             --push \
-            -f Dockerfile.test \
+            -f docker/Dockerfile.test \
             --build-arg CUDA_VERSION=${{ matrix.version }} \
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
@@ -88,7 +88,7 @@ jobs:
             --build-arg GIT_BRANCH=${{ steps.git_meta.outputs.branch }} \
             --build-arg PR_NUMBER=${{ inputs.pr_number }} \
             -t dougyster/sglang:${tag} \
-            docker/
+            .
 
   create-manifests:
     runs-on: ubuntu-latest
