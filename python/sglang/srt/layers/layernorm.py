@@ -430,10 +430,12 @@ class GemmaRMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
-            x = x + residual
-            residual = x
-
-        x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+            gamma = (1.0 + self.weight).to(x.dtype)
+            x, _, residual = torch_npu.npu_add_rms_norm(
+                x, residual, gamma, self.variance_epsilon
+            )
+        else:
+            x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x if residual is None else (x, residual)
 
     def forward_xpu(

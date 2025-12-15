@@ -94,8 +94,25 @@ class ModelSlimConfig(QuantizationConfig):
         else:
             weight_quant = target_scheme.get("weights")
             input_quant = target_scheme.get("input_activations")
-            self.is_moe_w4_dynamic = self.is_dynamic_token_w4(weight_quant, input_quant)
+            is_dynamic_token, is_w8, is_w4 = self.is_dynamic_token(
+                weight_quant, input_quant
+            )
+            self.is_moe_w4_dynamic = is_dynamic_token and is_w4
             self.is_moe_input_quant = input_quant
+
+        if target == "Linear":
+            if target_scheme is not None:
+                self.is_dynamic = is_dynamic_token
+        else:
+            target_scheme = self.target_scheme_map.get("Linear", None)
+            if target_scheme is not None:
+                input_quant = target_scheme.get("input_activations")
+                if (
+                    input_quant is not None
+                    and input_quant.dynamic
+                    and input_quant.strategy == QuantizationStrategy.TOKEN.value
+                ):
+                    self.is_dynamic = True
 
         for name in self.quant_description.keys():
             if "norm.bias" in name:
@@ -140,35 +157,33 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignore,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                return UnquantizedLinearMethod()
             key = "model"
             if "vision_model" in prefix:
                 key = "vision_model"
             elif "visual" in prefix:
                 key = "visual"
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
+            if should_ignore_layer(
+                prefix,
+                ignore=self.ignore,
+                fused_mapping=packed_modules_mapping_subset,
+            ):
+                return UnquantizedLinearMethod()
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
-            self.is_dynamic = (
+            is_dynamic = self.is_dynamic or (
                 self.quant_description.get(prefix_in_quant_config + ".weight", "")
                 == "W8A8_DYNAMIC"
-                or self.quant_description.get("quant_method", "")
-                == "modelslim"  # TODO: This path is for compress-tensor config，needs refactor @zhengdqin
             )
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             return (
                 NPUW8A8Int8DynamicLinearMethod(self)
-                if self.is_dynamic
+                if is_dynamic
                 else NPUW8A8Int8LinearMethod(self)
             )
         elif isinstance(layer, FusedMoE):
@@ -221,8 +236,9 @@ class ModelSlimConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def is_dynamic_token_w4(self, weight_quant, input_quant) -> bool:
+    def is_dynamic_token(self, weight_quant, input_quant) -> bool:
         is_w4 = weight_quant.num_bits == 4
+        is_w8 = weight_quant.num_bits == 8
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
             or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
@@ -240,4 +256,4 @@ class ModelSlimConfig(QuantizationConfig):
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w4 and weight_quant.symmetric and is_token and is_dynamic
+        return weight_quant.symmetric and is_token and is_dynamic, is_w8, is_w4
