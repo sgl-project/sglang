@@ -1,37 +1,33 @@
-name: Release PyPI Nightly Wheels
+name: Release PyPI PR Wheels
 
 on:
-  # Run daily at 2 AM UTC
-  schedule:
-    - cron: '0 2 * * *'
-  # Triggered by nightly Docker workflow to use same commit
-  repository_dispatch:
-    types: [nightly-release]
-  # Manual trigger for testing
   workflow_dispatch:
     inputs:
-      commit_sha:
-        description: 'Specific commit SHA to build (leave empty for latest)'
-        required: false
+      pr_number:
+        description: 'PR number to build wheel for'
+        required: true
+        type: string
+      pr_branch:
+        description: 'PR branch name to build from (e.g., my-feature-branch or refs/pull/123/head)'
+        required: true
         type: string
 
 concurrency:
-  group: release-pypi-nightly-${{ github.ref }}
+  group: build-pr-wheel-${{ github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
-  build-nightly-wheel:
+  build-pr-wheel:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     outputs:
-      nightly_version: ${{ steps.gen_version.outputs.nightly_version }}
+      wheel_version: ${{ steps.gen_version.outputs.wheel_version }}
       commit_hash: ${{ steps.gen_version.outputs.commit_hash }}
       build_date: ${{ steps.gen_version.outputs.build_date }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # Use commit from: 1) Docker workflow, 2) manual input, 3) latest main
-          ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
+          ref: ${{ inputs.pr_branch }}
           fetch-depth: 0  # Need full history for version generation
 
       - name: Set up Python
@@ -39,7 +35,7 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Generate nightly version
+      - name: Generate PR wheel version
         id: gen_version
         run: |
           # Get base version from version.py
@@ -49,33 +45,34 @@ jobs:
           COMMIT_HASH=$(git rev-parse --short HEAD)
           COMMIT_COUNT=$(git rev-list --count HEAD)
 
-          # Get current date in YYYY-MM-DD format for release tag
+          # Get current date in YYYY-MM-DD format
           BUILD_DATE=$(date -u +%Y-%m-%d)
-          # Get compact date format for wheel filename (YYYYMMDD)
-          BUILD_DATE_COMPACT=$(date -u +%Y%m%d)
 
-          # Generate nightly version following PEP 440
-          # Format: {base_version}.dev{commit_count}+{date}.g{commit_hash}
-          NIGHTLY_VERSION="${BASE_VERSION}.dev${COMMIT_COUNT}+${BUILD_DATE_COMPACT}.g${COMMIT_HASH}"
+          # Always use pr-{number} format for suffix
+          SUFFIX="pr-${{ inputs.pr_number }}"
+
+          # Generate PR wheel version following PEP 440
+          # Format: {base_version}.dev{commit_count}+pr-{number}.g{commit_hash}
+          WHEEL_VERSION="${BASE_VERSION}.dev${COMMIT_COUNT}+${SUFFIX}.g${COMMIT_HASH}"
 
           echo "Base version: ${BASE_VERSION}"
-          echo "Nightly version: ${NIGHTLY_VERSION}"
+          echo "PR wheel version: ${WHEEL_VERSION}"
           echo "Commit: ${COMMIT_HASH}"
           echo "Build date: ${BUILD_DATE}"
 
-          echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "wheel_version=${WHEEL_VERSION}" >> $GITHUB_OUTPUT
           echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
           echo "base_version=${BASE_VERSION}" >> $GITHUB_OUTPUT
           echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
 
-      - name: Update pyproject.toml with nightly version
+      - name: Update pyproject.toml with PR wheel version
         run: |
           cd python
           BASE_VERSION=$(cat sglang/version.py | cut -d'"' -f2)
-          NIGHTLY_VERSION="${{ steps.gen_version.outputs.nightly_version }}"
+          WHEEL_VERSION="${{ steps.gen_version.outputs.wheel_version }}"
 
           # Update version (temporary, not committed)
-          sed -i "s/version = \"${BASE_VERSION}\"/version = \"${NIGHTLY_VERSION}\"/" pyproject.toml
+          sed -i "s/version = \"${BASE_VERSION}\"/version = \"${WHEEL_VERSION}\"/" pyproject.toml
 
           # Verify update
           echo "Updated version in pyproject.toml:"
@@ -99,12 +96,12 @@ jobs:
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-wheel
+          name: pr-wheel-${{ inputs.pr_number }}
           path: python/dist/*.whl
-          retention-days: 7
+          retention-days: 30
 
-  release-nightly:
-    needs: build-nightly-wheel
+  release-pr-wheel:
+    needs: build-pr-wheel
     runs-on: ubuntu-latest
     environment: 'prod'
     steps:
@@ -113,7 +110,7 @@ jobs:
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
-          name: nightly-wheel
+          name: pr-wheel-${{ inputs.pr_number }}
           path: dist/
 
       - name: List downloaded wheels
@@ -121,18 +118,29 @@ jobs:
           echo "Downloaded wheel:"
           ls -lh dist/
 
-      - name: Create GitHub Release for nightly wheel
+      - name: Create GitHub Release for PR wheel
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly-${{ needs.build-nightly-wheel.outputs.build_date }}-${{ needs.build-nightly-wheel.outputs.commit_hash }}
-          name: Nightly Build ${{ needs.build-nightly-wheel.outputs.build_date }} (${{ needs.build-nightly-wheel.outputs.commit_hash }})
+          tag_name: pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}
+          name: "PR #${{ inputs.pr_number }} Build (${{ needs.build-pr-wheel.outputs.commit_hash }})"
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           prerelease: true
           body: |
-            Nightly build from commit ${{ github.sha }}
-            Build date: ${{ needs.build-nightly-wheel.outputs.build_date }}
-            Version: ${{ needs.build-nightly-wheel.outputs.nightly_version }}
+            PR wheel build from PR #${{ inputs.pr_number }}
+            Commit: ${{ github.sha }}
+            Build date: ${{ needs.build-pr-wheel.outputs.build_date }}
+            Version: ${{ needs.build-pr-wheel.outputs.wheel_version }}
+
+            **Installation via index:**
+            ```bash
+            pip install sglang=={version} --index-url https://sgl-project.github.io/whl/pr/
+            ```
+
+            **Direct installation:**
+            ```bash
+            pip install https://github.com/sgl-project/whl/releases/download/pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}/sglang-${{ needs.build-pr-wheel.outputs.wheel_version }}-py3-none-any.whl
+            ```
           files: |
             dist/*.whl
 
@@ -152,14 +160,15 @@ jobs:
 
       - name: Update wheel index
         run: |
-          python3 scripts/update_nightly_whl_index.py \
-            --commit-hash ${{ needs.build-nightly-wheel.outputs.commit_hash }} \
-            --nightly-version ${{ needs.build-nightly-wheel.outputs.nightly_version }} \
-            --build-date ${{ needs.build-nightly-wheel.outputs.build_date }}
+          python3 scripts/update_pr_whl_index.py \
+            --pr-number ${{ inputs.pr_number }} \
+            --commit-hash ${{ needs.build-pr-wheel.outputs.commit_hash }} \
+            --wheel-version ${{ needs.build-pr-wheel.outputs.wheel_version }} \
+            --build-date ${{ needs.build-pr-wheel.outputs.build_date }}
 
       - name: Push wheel index
         run: |
           cd sgl-whl
           git add -A
-          git diff --staged --quiet || git commit -m "Update nightly wheel index for commit ${{ needs.build-nightly-wheel.outputs.commit_hash }}"
+          git diff --staged --quiet || git commit -m "Update PR wheel index for PR #${{ inputs.pr_number }} (commit ${{ needs.build-pr-wheel.outputs.commit_hash }})"
           git push

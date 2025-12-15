@@ -345,10 +345,25 @@ impl PDRouter {
                             )
                             .await;
 
-                        let _status = response.status();
-                        let not_error = _status.is_success() || _status.is_client_error();
+                        let status = response.status();
+                        let not_error = status.is_success() || status.is_client_error();
                         prefill.record_outcome(not_error);
                         decode.record_outcome(not_error);
+
+                        // Record worker errors for server errors (5xx)
+                        if status.is_server_error() {
+                            let error_type = error_type_from_status(status);
+                            SmgMetrics::record_worker_error(
+                                smg_labels::WORKER_PREFILL,
+                                smg_labels::CONNECTION_HTTP,
+                                error_type,
+                            );
+                            SmgMetrics::record_worker_error(
+                                smg_labels::WORKER_DECODE,
+                                smg_labels::CONNECTION_HTTP,
+                                error_type,
+                            );
+                        }
 
                         response
                     }
@@ -358,8 +373,16 @@ impl PDRouter {
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
                 RouterMetrics::record_retry_backoff_duration(delay, attempt);
+                // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
+                SmgMetrics::record_worker_retry(smg_labels::WORKER_PREFILL, endpoint);
+                SmgMetrics::record_worker_retry(smg_labels::WORKER_DECODE, endpoint);
+                SmgMetrics::record_worker_retry_backoff(attempt, delay);
             },
-            || RouterMetrics::record_retries_exhausted(route),
+            || {
+                RouterMetrics::record_retries_exhausted(route);
+                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_PREFILL, endpoint);
+                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_DECODE, endpoint);
+            },
         )
         .await;
 
@@ -728,6 +751,21 @@ impl PDRouter {
             request_text,
             "decode",
         )?;
+
+        // Record worker selection metrics (Layer 3)
+        let model = model_id.unwrap_or("default");
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_PREFILL,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            prefill_policy.name(),
+        );
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_DECODE,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            decode_policy.name(),
+        );
 
         Ok((prefill, decode))
     }
