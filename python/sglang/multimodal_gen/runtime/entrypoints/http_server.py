@@ -6,8 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, prepare_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 @asynccontextmanager
@@ -63,18 +62,3 @@ def create_app(server_args: ServerArgs):
 
     app.state.server_args = server_args
     return app
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    server_args = prepare_server_args([])
-    configure_logger(server_args)
-    app = create_app(server_args)
-    uvicorn.run(
-        app,
-        host=server_args.host,
-        port=server_args.port,
-        log_config=None,
-        reload=False,  # Set to True during development for auto-reloading
-    )

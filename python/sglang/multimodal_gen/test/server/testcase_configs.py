@@ -119,6 +119,8 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    ulysses_degree: int | None = None
+    ring_degree: int | None = None
     # LoRA
     lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
@@ -227,7 +229,6 @@ TI2I_sampling_params = DiffusionSamplingParams(
 T2V_PROMPT = "A curious raccoon"
 
 TI2V_sampling_params = DiffusionSamplingParams(
-    output_size="832x1104",
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
 )
@@ -317,7 +318,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="848x480",
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -334,7 +334,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
-            output_size="480x320",
             num_frames=8,
         ),
     ),
@@ -370,7 +369,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
         ),
     ),
     # === Text and Image to Video (TI2V) ===
@@ -399,7 +397,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 ]
 
 TWO_GPU_CASES_A = [
-    # TODO: Timeout with Torch2.9. Add back when it can pass CI
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
@@ -423,7 +420,6 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
         ),
     ),
     # LoRA test case for transformer_2 support
@@ -440,7 +436,6 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
-            output_size="720x480",
         ),
     ),
     DiffusionTestCase(
@@ -455,7 +450,7 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            output_size="720x480",
+            output_size="832x480",
         ),
     ),
 ]
@@ -507,6 +502,9 @@ TWO_GPU_CASES_B = [
             warmup_text=1,
             warmup_edit=0,
             num_gpus=2,
+            # test ring attn
+            ulysses_degree=1,
+            ring_degree=2,
         ),
         T2I_sampling_params,
     ),

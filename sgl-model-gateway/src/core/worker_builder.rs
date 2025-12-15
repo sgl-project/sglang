@@ -185,7 +185,10 @@ impl BasicWorkerBuilder {
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            circuit_breaker: CircuitBreaker::with_config_and_label(
+                self.circuit_breaker_config,
+                self.url.clone(),
+            ),
             grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
         }
