@@ -191,7 +191,7 @@ jobs:
           fi
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: |
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \

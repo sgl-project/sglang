@@ -594,6 +594,10 @@ def get_generate_fn(
     sampling_params: DiffusionSamplingParams,
 ) -> Callable[[str, Client], str]:
     """Return appropriate generation function for the case."""
+    # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
+    output_size = os.environ.get(
+        "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
+    )
 
     def _create_and_download_video(
         client,
@@ -697,7 +701,7 @@ def get_generate_fn(
             model=model_path,
             prompt=sampling_params.prompt,
             n=1,
-            size=sampling_params.output_size,
+            size=output_size,
             response_format="b64_json",
         )
         result = response.parse()
@@ -735,7 +739,7 @@ def get_generate_fn(
                 image=fh,
                 prompt=sampling_params.prompt,
                 n=1,
-                size=sampling_params.output_size,
+                size=output_size,
                 response_format="b64_json",
             )
         rid = response.headers.get("x-request-id", "")
@@ -768,7 +772,7 @@ def get_generate_fn(
             case_id,
             model=model_path,
             prompt=sampling_params.prompt,
-            size=sampling_params.output_size,
+            size=output_size,
             seconds=video_seconds,
         )
 
@@ -790,7 +794,7 @@ def get_generate_fn(
                 case_id,
                 model=model_path,
                 prompt=sampling_params.prompt,
-                size=sampling_params.output_size,
+                size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
             )
@@ -813,7 +817,7 @@ def get_generate_fn(
                 case_id,
                 model=model_path,
                 prompt=sampling_params.prompt,
-                size=sampling_params.output_size,
+                size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
             )
