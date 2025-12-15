@@ -1754,7 +1754,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
 
-            kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
+            kv_a_quanted, _, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
                 self.kv_a_layernorm.variance_epsilon,
@@ -1764,7 +1764,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 group_size=128,
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
-                output_unquantized_inp1=True,  # return unqaunt kv_a
+                output_unquantized_inp1=False,
             )
             kv = self.kv_b_proj(
                 kv_a_quanted,
@@ -1796,7 +1796,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q.dtype,
                     forward_batch,
                 )
-        kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
