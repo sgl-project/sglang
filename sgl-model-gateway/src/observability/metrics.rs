@@ -756,6 +756,7 @@ pub mod smg_labels {
     pub const BACKEND_REGULAR: &str = "regular";
     pub const BACKEND_PD: &str = "pd";
     pub const BACKEND_EXTERNAL: &str = "external";
+    pub const BACKEND_HARMONY: &str = "harmony";
 
     // Connection modes
     pub const CONNECTION_HTTP: &str = "http";
