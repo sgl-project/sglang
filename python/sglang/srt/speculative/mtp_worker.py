@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
-    get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -48,6 +47,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
 from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
     MTPDraftExtendCudaGraphRunner,
 )
@@ -987,20 +987,3 @@ class MTPWorker(TpModelWorker):
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
-
-
-@torch.compile(dynamic=True, disable=_is_npu)
-def get_last_loc_large_page_size_top_k_1(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens,
-    speculative_num_steps: int,
-):
-    prefix_lens = seq_lens
-    seq_lens = prefix_lens + speculative_num_steps
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
-    )
-    return prefix_lens, seq_lens, last_loc
