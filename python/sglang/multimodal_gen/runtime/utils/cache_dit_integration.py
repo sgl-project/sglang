@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -28,63 +29,80 @@ from cache_dit.caching.block_adapters import BlockAdapterRegister
 from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 
-def build_parallelism_config(
-    sp_group: Optional[torch.distributed.ProcessGroup] = None,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Optional[ParallelismConfig]:
-    """Build ParallelismConfig from process groups.
+def _patch_cache_dit_similarity():
+    from cache_dit.caching.cache_contexts import cache_manager
 
-    Args:
-        sp_group: Sequence parallel process group (for Ulysses/Ring).
-        tp_group: Tensor parallel process group.
+    original_similarity = cache_manager.CachedContextManager.similarity
 
-    Returns:
-        ParallelismConfig if any group is provided, None otherwise.
-    """
+    def patched_similarity(self, t1, t2, threshold, parallelized, prefix=""):
+        if not parallelized:
+            return original_similarity(self, t1, t2, threshold, parallelized, prefix)
+
+        sp_group = getattr(self.transformer, "_sglang_sp_group", None)
+        tp_group = getattr(self.transformer, "_sglang_tp_group", None)
+        target_group = sp_group or tp_group
+
+        if target_group is None:
+            return original_similarity(self, t1, t2, threshold, parallelized, prefix)
+
+        condition_thresh = self.get_important_condition_threshold()
+        if condition_thresh > 0.0:
+            raw_diff = (t1 - t2).abs()
+            token_m_df = raw_diff.mean(dim=-1)
+            token_m_t1 = t1.abs().mean(dim=-1)
+            token_diff = token_m_df / token_m_t1
+            condition = token_diff > condition_thresh
+            if condition.sum() > 0:
+                condition = condition.unsqueeze(-1).expand_as(raw_diff)
+                mean_diff = raw_diff[condition].mean()
+                mean_t1 = t1[condition].abs().mean()
+            else:
+                mean_diff = (t1 - t2).abs().mean()
+                mean_t1 = t1.abs().mean()
+        else:
+            mean_diff = (t1 - t2).abs().mean()
+            mean_t1 = t1.abs().mean()
+
+        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
+        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+
+        diff = (mean_diff / mean_t1).item()
+        self.add_residual_diff(diff)
+        return diff < threshold
+
+    cache_manager.CachedContextManager.similarity = patched_similarity
+
+
+def _build_parallelism_config(sp_group, tp_group):
     if sp_group is None and tp_group is None:
         return None
 
     ulysses_size = None
     ring_size = None
-    tp_size = None
-
     if sp_group is not None:
-        import torch.distributed as dist
+        ulysses_size = getattr(sp_group, "ulysses_world_size", None)
+        ring_size = getattr(sp_group, "ring_world_size", None)
 
-        sp_world_size = dist.get_world_size(sp_group)
-        ulysses_size = sp_world_size
-        logger.info(
-            "Detected SP group with world_size=%d, using ulysses_size=%d",
-            sp_world_size,
-            ulysses_size,
-        )
-
+    tp_size = None
     if tp_group is not None:
-        import torch.distributed as dist
+        tp_size = dist.get_world_size(tp_group.device_group)
 
-        tp_world_size = dist.get_world_size(tp_group)
-        tp_size = tp_world_size
-        logger.info(
-            "Detected TP group with world_size=%d, using tp_size=%d",
-            tp_world_size,
-            tp_size,
-        )
-
-    parallelism_config = ParallelismConfig(
-        backend=(
-            ParallelismBackend.NATIVE_DIFFUSER
-            if ulysses_size or ring_size
-            else ParallelismBackend.NATIVE_PYTORCH
-        ),
+    return ParallelismConfig(
+        backend=ParallelismBackend.NATIVE_PYTORCH,
         ulysses_size=ulysses_size,
         ring_size=ring_size,
         tp_size=tp_size,
     )
-    logger.info(
-        "Created parallelism config: %s", parallelism_config.strify(details=True)
-    )
 
-    return parallelism_config
+
+def _mark_transformer_parallelized(transformer, config, sp_group, tp_group):
+    if config is None:
+        return
+
+    transformer._is_parallelized = True
+    transformer._parallelism_config = config
+    transformer._sglang_sp_group = sp_group
+    transformer._sglang_tp_group = tp_group
 
 
 def get_scm_mask(
@@ -258,13 +276,17 @@ def enable_cache_on_transformer(
             config.steps_computation_policy,
         )
 
-    parallelism_config = build_parallelism_config(sp_group, tp_group)
+    parallelism_config = _build_parallelism_config(sp_group, tp_group)
+    if parallelism_config is not None:
+        _patch_cache_dit_similarity()
+
+    _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
     cache_dit.enable_cache(
         transformer,
         cache_config=cache_config,
         calibrator_config=calibrator_config,
-        parallelism_config=parallelism_config,
+        parallelism_config=None,
     )
 
     return transformer
@@ -391,7 +413,14 @@ def enable_cache_on_dual_transformer(
             primary_config.steps_computation_policy,
         )
 
-    parallelism_config = build_parallelism_config(sp_group, tp_group)
+    parallelism_config = _build_parallelism_config(sp_group, tp_group)
+    if parallelism_config is not None:
+        _patch_cache_dit_similarity()
+
+    _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
+    _mark_transformer_parallelized(
+        transformer_2, parallelism_config, sp_group, tp_group
+    )
 
     # Get blocks attribute - Wan transformers use 'blocks' attribute
     transformer_blocks = getattr(transformer, "blocks", None)
@@ -418,7 +447,7 @@ def enable_cache_on_dual_transformer(
                 params_modifiers=[primary_modifier, secondary_modifier],
                 has_separate_cfg=True,
             ),
-            parallelism_config=parallelism_config,
+            parallelism_config=None,
         )
     else:
         raise ValueError(
