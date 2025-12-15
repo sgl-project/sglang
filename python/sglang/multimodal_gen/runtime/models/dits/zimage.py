@@ -74,17 +74,13 @@ class TimestepEmbedder(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = ReplicatedLinear(dim, hidden_dim, bias=False)
+        self.w13 = ReplicatedLinear(dim, 2 * hidden_dim, bias=False)
         self.w2 = ReplicatedLinear(hidden_dim, dim, bias=False)
-        self.w3 = ReplicatedLinear(dim, hidden_dim, bias=False)
-
-    def _forward_silu_gating(self, x1, x3):
-        return F.silu(x1) * x3
 
     def forward(self, x):
-        x1, _ = self.w1(x)
-        x3, _ = self.w3(x)
-        out, _ = self.w2(self._forward_silu_gating(x1, x3))
+        x13, _ = self.w13(x)
+        x1, x3 = torch.chunk(x13, 2, dim=-1)
+        out, _ = self.w2(F.silu(x1) * x3)
         return out
 
 
@@ -344,6 +340,8 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
+
+    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
 
     def __init__(
         self,

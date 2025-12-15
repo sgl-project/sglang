@@ -26,6 +26,13 @@ class ZImageArchConfig(DiTArchConfig):
     axes_dims: Tuple[int, int, int] = (32, 48, 48)
     axes_lens: Tuple[int, int, int] = (1024, 512, 512)
 
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"(.*)\.w1\.(weight|bias)$": (r"\1.w13.\2", 0, 2),
+            r"(.*)\.w3\.(weight|bias)$": (r"\1.w13.\2", 1, 2),
+        }
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.out_channels = self.out_channels or self.in_channels
