@@ -1,9 +1,10 @@
 name: Release Docker Images (NPU)
 on:
   push:
-    tags-ignore:
-      - "gateway-*" # Exclude gateway/router tags
-      - "router-*" # Exclude router tags
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
   pull_request:
     branches:
       - main
@@ -17,7 +18,7 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        cann_version: ["8.3.rc1"]
+        cann_version: ["8.3.rc2"]
         device_type: ["910b", "a3"]
     steps:
       - name: Checkout repository
@@ -38,7 +39,6 @@ jobs:
             lmsysorg/sglang
           tags: |
             type=ref,event=pr
-            type=ref,event=tag,suffix=-cann${{ matrix.cann_version }}-${{ matrix.device_type }}
           flavor: |
             latest=false
 
@@ -70,6 +70,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=20251128
+            SGLANG_KERNEL_NPU_TAG=20251206
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}

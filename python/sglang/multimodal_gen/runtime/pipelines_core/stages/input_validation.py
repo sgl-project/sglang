@@ -219,6 +219,17 @@ class InputValidationStage(PipelineStage):
                 batch, server_args, condition_image_width, condition_image_height
             )
 
+        # if height or width is not specified at this point, set default to 720p
+        default_height = 720
+        default_width = 1280
+        if batch.height is None and batch.width is None:
+            batch.height = default_height
+            batch.width = default_width
+        elif batch.height is None:
+            batch.height = batch.width * default_height // default_width
+        elif batch.width is None:
+            batch.width = batch.height * default_width // default_height
+
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -251,6 +262,7 @@ class InputValidationStage(PipelineStage):
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
         # Validate height and width
+
         if batch.height % 8 != 0 or batch.width % 8 != 0:
             raise ValueError(
                 f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
