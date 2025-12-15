@@ -419,6 +419,53 @@ class SGLDiffusionServerAPI:
 
         return image
 
+    def set_lora(
+        self,
+        lora_nickname: str,
+        lora_path: Optional[str] = None,
+        target: str = "all",
+    ) -> Dict[str, Any]:
+        """
+        Set a LoRA adapter for the specified transformer(s).
+
+        Args:
+            lora_nickname: The nickname of the adapter (required).
+            lora_path: Path to the LoRA adapter (local path or HF repo id). 
+                      Required for the first load; optional if re-activating a cached nickname.
+            target: Which transformer(s) to apply the LoRA to. One of:
+                - "all": Apply to all transformers (default)
+                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
+                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
+                - "critic": Apply only to the critic model
+
+        Returns:
+            Dictionary containing the API response with status and message
+        """
+        if not lora_nickname:
+            raise ValueError("lora_nickname cannot be empty")
+
+        # Prepare request payload
+        payload: Dict[str, Any] = {
+            "lora_nickname": lora_nickname,
+            "target": target,
+        }
+
+        # Add optional lora_path if provided
+        if lora_path:
+            payload["lora_path"] = lora_path
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/set_lora",
+                json=payload,
+                headers=self.headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
+
 
 if __name__ == "__main__":
     api = SGLDiffusionServerAPI(
