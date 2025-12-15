@@ -1015,7 +1015,7 @@ class TokenizerMetricsCollector:
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
         # Per-request output throughput (tokens/second)
-        if output_throughput is not None and output_throughput > 0:
+        if output_throughput is not None:
             self.histogram_request_output_throughput.labels(**labels).observe(
                 output_throughput
             )
