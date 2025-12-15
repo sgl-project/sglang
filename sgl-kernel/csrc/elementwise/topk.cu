@@ -401,8 +401,17 @@ auto get_params(
 template <auto* f, size_t max_dynamic_smem>
 void setup_kernel_smem_once() {
   [[maybe_unused]]
-  static const auto result =
-      [] { return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem); }();
+  static const auto result = [] {
+#ifdef USE_ROCM
+    // ROCm (hipify): hipFuncSetAttribute expects `const void*` and HIP does not implicitly
+    // convert function pointers to void*, so cast explicitly.
+    return ::cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#else
+    // CUDA: keep original behavior (no cast).
+    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#endif
+  }();
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
 }
 
