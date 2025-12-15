@@ -290,6 +290,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.dcp_size = server_args.dcp_size
+        self.dcp_rank = self.tp_rank % self.dcp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size

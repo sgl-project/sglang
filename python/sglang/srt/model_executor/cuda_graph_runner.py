@@ -256,6 +256,7 @@ class CudaGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
+        self.dcp_size = model_runner.server_args.dcp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
@@ -342,6 +343,7 @@ class CudaGraphRunner:
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,
+            dcp_size=self.dcp_size,
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             seq_len_fill_value=self.seq_len_fill_value,
@@ -578,6 +580,11 @@ class CudaGraphRunner:
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
+        if self.dcp_size > 1:
+            dcp_kv_mask = buffers.dcp_kv_mask[:num_tokens]
+        else:
+            dcp_kv_mask = None
+
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -675,6 +682,7 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            dcp_kv_mask=dcp_kv_mask,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

@@ -870,6 +870,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
+                if self.dcp_size > 1:
+                    assert forward_batch.dcp_kv_mask is not None
+                    k = k[forward_batch.dcp_kv_mask]
+                    v = v[forward_batch.dcp_kv_mask]
+                    cache_loc = cache_loc[forward_batch.dcp_kv_mask]
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
@@ -897,6 +902,11 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                if self.dcp_size > 1:
+                    assert forward_batch.dcp_kv_mask is not None
+                    k = k[forward_batch.dcp_kv_mask]
+                    v = v[forward_batch.dcp_kv_mask]
+                    cache_loc = cache_loc[forward_batch.dcp_kv_mask]
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
