@@ -127,6 +127,12 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
+    # Refine inputs (LongCat 480p->720p upscaling)
+    refine_from: str | None = None  # Path to stage1 video (480p output from distill)
+    t_thresh: float = 0.5  # Threshold for timestep scheduling in refinement
+    spatial_refine_only: bool = False  # If True, only spatial (no temporal doubling)
+    num_cond_frames: int = 0  # Number of conditioning frames
+
     # TeaCache parameters
     enable_teacache: bool = False
 
@@ -573,6 +579,31 @@ class SamplingParams:
                 "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
+        )
+
+        parser.add_argument(
+            "--refine-from",
+            type=str,
+            default=SamplingParams.refine_from,
+            help="Path to stage1 video for refinement (LongCat 480p->720p)",
+        )
+        parser.add_argument(
+            "--t-thresh",
+            type=float,
+            default=SamplingParams.t_thresh,
+            help="Threshold for timestep scheduling in refinement (default: 0.5)",
+        )
+        parser.add_argument(
+            "--spatial-refine-only",
+            action="store_true",
+            default=SamplingParams.spatial_refine_only,
+            help="Only perform spatial super-resolution (no temporal doubling)",
+        )
+        parser.add_argument(
+            "--num-cond-frames",
+            type=int,
+            default=SamplingParams.num_cond_frames,
+            help="Number of conditioning frames for refinement",
         )
         return parser
 
