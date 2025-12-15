@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from python.sglang.srt.utils.common import fast_topk
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
@@ -30,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import fast_topk, is_cuda, is_hip, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
