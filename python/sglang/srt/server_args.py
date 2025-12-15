@@ -3115,6 +3115,7 @@ class ServerArgs:
             help="The load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
+                "decode_round_robin",
                 "shortest_queue",
                 "minimum_tokens",
             ],

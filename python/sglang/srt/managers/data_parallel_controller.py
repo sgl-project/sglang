@@ -68,6 +68,7 @@ class LoadBalanceMethod(Enum):
     """Load balance method."""
 
     ROUND_ROBIN = auto()
+    DECODE_ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
     MINIMUM_TOKENS = auto()
 
@@ -147,6 +148,7 @@ class DataParallelController:
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            LoadBalanceMethod.DECODE_ROUND_ROBIN: self.decode_round_robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
             LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
         }
@@ -482,6 +484,18 @@ class DataParallelController:
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+
+    def decode_round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        if self.server_args.disaggregation_mode == "decode":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+            return
+        self.round_robin_scheduler(req)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
