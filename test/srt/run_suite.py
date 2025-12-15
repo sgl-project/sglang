@@ -13,11 +13,6 @@ suites = {
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 7),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 13),
-        TestFile("lora/test_lora.py", 82),
-        TestFile("lora/test_lora_eviction.py", 224),
-        TestFile("lora/test_lora_update.py", 451),
-        TestFile("lora/test_lora_backend.py", 200),
-        TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
         TestFile("models/test_embedding_models.py", 73),
@@ -133,7 +128,6 @@ suites = {
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
-        TestFile("lora/test_lora_tp.py", 116),
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
@@ -228,12 +222,10 @@ suite_amd = {
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
-        TestFile("lora/test_lora.py", 665),
+        # LoRA tests moved to test/registered/lora/ - AMD entries need to be re-added there
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("lora/test_lora_eviction.py", 240),
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
@@ -308,7 +300,7 @@ suite_amd = {
         TestFile("test_mla.py", 242),
     ],
     "per-commit-2-gpu-amd": [
-        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
+        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107. Moved to test/registered/lora/
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),

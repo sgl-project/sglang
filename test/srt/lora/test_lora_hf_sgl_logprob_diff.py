@@ -28,16 +28,11 @@ Usage:
 """
 
 import multiprocessing as mp
-import os
-import sys
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-
-# Add sglang to path if needed
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../python"))
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
