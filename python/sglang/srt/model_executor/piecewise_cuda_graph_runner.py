@@ -569,7 +569,7 @@ class PiecewiseCudaGraphRunner:
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=False,
             extend_seq_lens=forward_batch.extend_seq_lens,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            extend_prefix_lens=forward_batch.extend_prefix_lens.long(),
             extend_start_loc=forward_batch.extend_start_loc,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
