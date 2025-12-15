@@ -660,9 +660,15 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def increment_realtime_tokens(self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0):
-        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(prefill_compute_tokens)
-        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(prefill_cache_tokens)
+    def increment_realtime_tokens(
+        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+    ):
+        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(
+            prefill_compute_tokens
+        )
+        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(
+            prefill_cache_tokens
+        )
         self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
 
     def log_stats(self, stats: SchedulerStats) -> None:

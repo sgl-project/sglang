@@ -356,7 +356,9 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.stats.increment_realtime_tokens(decode_tokens=last_num_generated_tokens)
+            self.stats.increment_realtime_tokens(
+                decode_tokens=last_num_generated_tokens
+            )
 
             # Others
             self.calculate_utilization()
