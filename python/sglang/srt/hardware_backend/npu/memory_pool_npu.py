@@ -150,6 +150,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 cache_v.view(-1, 1, self.head_num, self.head_dim),
             )
         else:
+            loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(
                 key=cache_k,
                 value=cache_v,
