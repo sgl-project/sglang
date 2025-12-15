@@ -6,8 +6,8 @@ import subprocess
 import time
 from typing import List, Optional, Tuple
 
-from sglang.bench_one_batch_server import BenchmarkResult, generate_markdown_report
 from sglang.srt.utils import kill_process_tree
+from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
@@ -123,9 +123,9 @@ class NightlyBenchmarkRunner:
             "--show-report",
             "--profile",
             "--profile-by-stage",
-            "--profile-filename-prefix",
+            "--profile-output-dir",
             profile_path_prefix,
-            f"--output-path={json_output_file}",
+            f"--pydantic-result-filename={json_output_file}",
             "--no-append-to-github-summary",
         ]
 
@@ -295,6 +295,7 @@ class NightlyBenchmarkRunner:
         """Write the final report to GitHub summary if in CI."""
         if is_in_ci():
             write_github_step_summary(self.full_report)
+        print(self.full_report)
 
     def get_full_report(self) -> str:
         """Get the accumulated full report.

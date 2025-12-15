@@ -3,10 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
 """The arguments of sglang-diffusion Inference."""
+
 import argparse
 import dataclasses
 import inspect
 import json
+import os
 import random
 import sys
 import tempfile
@@ -156,9 +158,6 @@ class ExecutionMode(str, Enum):
     """
 
     INFERENCE = "inference"
-    PREPROCESS = "preprocess"
-    FINETUNING = "finetuning"
-    DISTILLATION = "distillation"
 
     @classmethod
     def from_string(cls, value: str) -> "ExecutionMode":
@@ -255,6 +254,9 @@ class ServerArgs:
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+
+    # VAE parameters
+    vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -293,6 +295,10 @@ class ServerArgs:
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
     port: int | None = None
+
+    # TODO: webui and their endpoint, check if webui_port is available.
+    webui: bool = False
+    webui_port: int | None = 12312
 
     scheduler_port: int = 5555
 
@@ -376,6 +382,12 @@ class ServerArgs:
             "--model-dir",
             type=str,
             help="Directory containing StepVideo model",
+        )
+        parser.add_argument(
+            "--vae-path",
+            type=str,
+            default=ServerArgs.vae_path,
+            help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
         )
 
         # attention
@@ -536,7 +548,6 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
-
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -607,6 +618,19 @@ class ServerArgs:
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
         )
+        parser.add_argument(
+            "--webui",
+            action=StoreBoolean,
+            default=ServerArgs.webui,
+            help="Whether to use webui for better display",
+        )
+
+        parser.add_argument(
+            "--webui-port",
+            type=int,
+            default=ServerArgs.webui_port,
+            help="Whether to use webui for better display",
+        )
 
         # Stage verification
         parser.add_argument(
@@ -620,6 +644,19 @@ class ServerArgs:
             type=str,
             default=ServerArgs.override_transformer_cls_name,
             help="Override transformer cls name",
+        )
+        # LoRA
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=ServerArgs.lora_path,
+            help="The path to the LoRA adapter weights (can be local file path or HF hub id) to launch with",
+        )
+        parser.add_argument(
+            "--lora-nickname",
+            type=str,
+            default=ServerArgs.lora_nickname,
+            help="The nickname for the LoRA adapter to launch with",
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
@@ -815,17 +852,15 @@ class ServerArgs:
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
             logger.info(
-                f"Ulysses degree not set, " f"using default value {self.ulysses_degree}"
+                f"Ulysses degree not set, using default value {self.ulysses_degree}"
             )
 
         if self.ring_degree is None:
             self.ring_degree = 1
-            logger.info(
-                f"Ring degree not set, " f"using default value {self.ring_degree}"
-            )
+            logger.info(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
-            if self.attention_backend != None and self.attention_backend != "fa":
+            if self.attention_backend is not None and self.attention_backend != "fa":
                 raise ValueError(
                     "Ring Attention is only supported for flash attention backend for now"
                 )
@@ -920,6 +955,15 @@ class ServerArgs:
             if self.num_gpus == 1:
                 raise ValueError(
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
+                )
+
+        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            has_sp = self.sp_degree > 1
+            has_tp = self.tp_size > 1
+            if has_sp and has_tp:
+                raise ValueError(
+                    "cache-dit does not support hybrid parallelism (SP + TP). "
+                    "Please use either sequence parallelism or tensor parallelism, not both."
                 )
 
 

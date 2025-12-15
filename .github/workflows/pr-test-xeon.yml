@@ -3,33 +3,60 @@ name: PR Test (Xeon)
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xeon.yml"
-      - "docker/xeon.Dockerfile"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xeon.yml"
-      - "docker/xeon.Dockerfile"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
 
 concurrency:
   group: pr-test-xeon-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
+              - "scripts/ci/**"
+              - "test/**"
+              - "sgl-kernel/**"
+              - ".github/workflows/pr-test-xeon.yml"
+              - "docker/xeon.Dockerfile"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
   build-test:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: xeon-gnr
     env:
       HF_HOME: /home/sdp/.cache/huggingface
@@ -65,13 +92,13 @@ jobs:
         timeout-minutes: 5
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
-            bash -c "python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
+            bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
 
       - name: Run unit tests
         timeout-minutes: 36
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
-            bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu --timeout-per-file 1500"
+            bash -c "source /opt/.venv/bin/activate && cd ./test/srt && python3 run_suite.py --suite per-commit-cpu --timeout-per-file 1500"
 
       - name: Change permission
         timeout-minutes: 2

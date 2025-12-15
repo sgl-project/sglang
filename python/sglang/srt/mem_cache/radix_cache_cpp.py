@@ -45,8 +45,8 @@ class RadixCacheCpp(BasePrefixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.device = self.token_to_kv_pool_allocator.device
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.device = self.token_to_kv_pool_allocator.device
         self.req_to_token_pool = params.req_to_token_pool
         self.page_size = params.page_size
         self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
