@@ -1856,8 +1856,7 @@ class Scheduler(
         chunked_req_added = False
         if self.chunked_req is not None:
             if (
-                not self.disaggregation_prefill_enable_interleave 
-                or not has_small_req_in_waiting_queue 
+                not has_small_req_in_waiting_queue 
                 or (self.disaggregation_prefill_enable_interleave and not self.is_last_chunk_req_scheduled)
             ):
                 self.chunked_req.init_next_round_input()
