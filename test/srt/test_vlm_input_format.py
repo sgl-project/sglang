@@ -1,5 +1,4 @@
 import json
-import os
 import unittest
 from io import BytesIO
 from typing import Optional
@@ -261,9 +260,7 @@ class TestLlama4ImageUnderstandsImage(
     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
 ):
     # Allow overriding via env for local/offline runs.
-    model_path = os.environ.get(
-        "LLAMA4_MODEL_PATH", "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-    )
+    model_path = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     chat_template = "llama-4"
 
     def setUp(self):
