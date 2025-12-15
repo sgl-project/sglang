@@ -22,7 +22,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::RouterMetrics,
+        metrics::{smg_labels, RouterMetrics, SmgMetrics},
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
@@ -33,7 +33,11 @@ use crate::{
         generate::GenerateRequest,
         rerank::RerankRequest,
     },
-    routers::{header_utils, RouterTrait},
+    routers::{
+        error,
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 #[derive(Debug)]
@@ -68,11 +72,7 @@ impl PDRouter {
         if let Some(worker_url) = first_worker_url {
             self.proxy_to_worker(worker_url, endpoint, headers).await
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No prefill servers available".to_string(),
-            )
-                .into_response()
+            error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
     }
 
@@ -104,26 +104,50 @@ impl PDRouter {
                     }
                     Err(e) => {
                         error!("Failed to read response body: {}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
+                        error::internal_error(
+                            "read_response_body_failed",
                             format!("Failed to read response body: {}", e),
                         )
-                            .into_response()
                     }
                 }
             }
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                (status, format!("{} server returned status: ", res.status())).into_response()
+                // Use the status code to determine which error function to use
+                match status {
+                    StatusCode::BAD_REQUEST => error::bad_request(
+                        "server_bad_request",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::NOT_FOUND => error::not_found(
+                        "server_not_found",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
+                        "server_internal_error",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
+                        "server_unavailable",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    StatusCode::BAD_GATEWAY => error::bad_gateway(
+                        "server_bad_gateway",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                    _ => error::internal_error(
+                        "server_error",
+                        format!("Server returned status: {}", res.status()),
+                    ),
+                }
             }
             Err(e) => {
                 error!("Failed to proxy request server: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                error::internal_error(
+                    "proxy_request_failed",
                     format!("Failed to proxy request: {}", e),
                 )
-                    .into_response()
             }
         }
     }
@@ -142,20 +166,15 @@ impl PDRouter {
     fn handle_server_selection_error(error: String) -> Response {
         error!("Failed to select PD pair error={}", error);
         RouterMetrics::record_pd_error("server_selection");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
+        error::service_unavailable(
+            "server_selection_failed",
             format!("No available servers: {}", error),
         )
-            .into_response()
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to serialize request",
-        )
-            .into_response()
+        error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
@@ -260,10 +279,22 @@ impl PDRouter {
         let start_time = Instant::now();
 
         let route = context.route;
+        let model = context.model_id.unwrap_or("default");
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_HTTP,
+            smg_labels::BACKEND_PD,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            context.is_stream,
+        );
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
-        RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
                 move |attempt: u32| {
@@ -314,10 +345,25 @@ impl PDRouter {
                             )
                             .await;
 
-                        let _status = response.status();
-                        let not_error = _status.is_success() || _status.is_client_error();
+                        let status = response.status();
+                        let not_error = status.is_success() || status.is_client_error();
                         prefill.record_outcome(not_error);
                         decode.record_outcome(not_error);
+
+                        // Record worker errors for server errors (5xx)
+                        if status.is_server_error() {
+                            let error_type = error_type_from_status(status);
+                            SmgMetrics::record_worker_error(
+                                smg_labels::WORKER_PREFILL,
+                                smg_labels::CONNECTION_HTTP,
+                                error_type,
+                            );
+                            SmgMetrics::record_worker_error(
+                                smg_labels::WORKER_DECODE,
+                                smg_labels::CONNECTION_HTTP,
+                                error_type,
+                            );
+                        }
 
                         response
                     }
@@ -327,10 +373,42 @@ impl PDRouter {
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
                 RouterMetrics::record_retry_backoff_duration(delay, attempt);
+                // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
+                SmgMetrics::record_worker_retry(smg_labels::WORKER_PREFILL, endpoint);
+                SmgMetrics::record_worker_retry(smg_labels::WORKER_DECODE, endpoint);
+                SmgMetrics::record_worker_retry_backoff(attempt, delay);
             },
-            || RouterMetrics::record_retries_exhausted(route),
+            || {
+                RouterMetrics::record_retries_exhausted(route);
+                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_PREFILL, endpoint);
+                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_DECODE, endpoint);
+            },
         )
-        .await
+        .await;
+
+        // Record Layer 2 metrics
+        let duration = start_time.elapsed();
+        if response.status().is_success() {
+            SmgMetrics::record_router_duration(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_PD,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
+        } else if !is_retryable_status(response.status()) {
+            SmgMetrics::record_router_error(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_PD,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
     }
 
     async fn handle_decode_error_response(
@@ -378,8 +456,71 @@ impl PDRouter {
         } else {
             // Handle non-streaming error response
             match res.bytes().await {
-                Ok(error_body) => (status, error_body).into_response(),
-                Err(e) => (status, format!("Decode server error: {}", e)).into_response(),
+                Ok(error_body) => {
+                    // Try to parse error message from body, fallback to status-based error
+                    let error_message = if let Ok(error_json) =
+                        serde_json::from_slice::<Value>(&error_body)
+                    {
+                        if let Some(msg) = error_json
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                        {
+                            msg.to_string()
+                        } else if let Some(msg) = error_json.get("message").and_then(|m| m.as_str())
+                        {
+                            msg.to_string()
+                        } else {
+                            String::from_utf8_lossy(&error_body).to_string()
+                        }
+                    } else {
+                        String::from_utf8_lossy(&error_body).to_string()
+                    };
+
+                    let status_code = StatusCode::from_u16(status.as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    match status_code {
+                        StatusCode::BAD_REQUEST => {
+                            error::bad_request("decode_bad_request", error_message)
+                        }
+                        StatusCode::NOT_FOUND => {
+                            error::not_found("decode_not_found", error_message)
+                        }
+                        StatusCode::INTERNAL_SERVER_ERROR => {
+                            error::internal_error("decode_internal_error", error_message)
+                        }
+                        StatusCode::SERVICE_UNAVAILABLE => {
+                            error::service_unavailable("decode_unavailable", error_message)
+                        }
+                        StatusCode::BAD_GATEWAY => {
+                            error::bad_gateway("decode_bad_gateway", error_message)
+                        }
+                        _ => error::internal_error("decode_error", error_message),
+                    }
+                }
+                Err(e) => {
+                    let error_message = format!("Decode server error: {}", e);
+                    let status_code = StatusCode::from_u16(status.as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    match status_code {
+                        StatusCode::BAD_REQUEST => {
+                            error::bad_request("decode_read_failed", error_message)
+                        }
+                        StatusCode::NOT_FOUND => {
+                            error::not_found("decode_read_failed", error_message)
+                        }
+                        StatusCode::INTERNAL_SERVER_ERROR => {
+                            error::internal_error("decode_read_failed", error_message)
+                        }
+                        StatusCode::SERVICE_UNAVAILABLE => {
+                            error::service_unavailable("decode_read_failed", error_message)
+                        }
+                        StatusCode::BAD_GATEWAY => {
+                            error::bad_gateway("decode_read_failed", error_message)
+                        }
+                        _ => error::internal_error("decode_read_failed", error_message),
+                    }
+                }
             }
         }
     }
@@ -535,8 +676,10 @@ impl PDRouter {
                             }
                             Err(e) => {
                                 error!("Failed to read decode response: {}", e);
-                                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
-                                    .into_response()
+                                error::internal_error(
+                                    "read_response_failed",
+                                    "Failed to read response",
+                                )
                             }
                         }
                     }
@@ -549,11 +692,7 @@ impl PDRouter {
                     "Decode request failed"
                 );
                 RouterMetrics::record_pd_decode_error(decode.url());
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Decode server error: {}", e),
-                )
-                    .into_response()
+                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
             }
         }
     }
@@ -612,6 +751,21 @@ impl PDRouter {
             request_text,
             "decode",
         )?;
+
+        // Record worker selection metrics (Layer 3)
+        let model = model_id.unwrap_or("default");
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_PREFILL,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            prefill_policy.name(),
+        );
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_DECODE,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            decode_policy.name(),
+        );
 
         Ok((prefill, decode))
     }
@@ -759,8 +913,7 @@ impl PDRouter {
             Ok(decode_body) => decode_body,
             Err(e) => {
                 error!("Failed to read decode response: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
-                    .into_response();
+                return error::internal_error("read_response_failed", "Failed to read response");
             }
         };
 
@@ -812,14 +965,13 @@ impl PDRouter {
                 );
 
                 // Return error immediately - don't wait for decode to timeout
-                return Err((
-                    StatusCode::BAD_GATEWAY,
+                return Err(error::bad_gateway(
+                    "prefill_server_error",
                     format!(
                         "Prefill server error: {}. This will cause decode timeout.",
                         e
                     ),
-                )
-                    .into_response());
+                ));
             }
         };
 
@@ -841,11 +993,34 @@ impl PDRouter {
                 prefill_url, prefill_status, error_msg
             );
 
-            return Err((
-                prefill_status,
-                format!("Prefill server error ({}): {}", prefill_status, error_msg),
-            )
-                .into_response());
+            // Map prefill_status to appropriate error function
+            let error_response = match prefill_status {
+                StatusCode::BAD_REQUEST => error::bad_request(
+                    "prefill_bad_request",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::NOT_FOUND => error::not_found(
+                    "prefill_not_found",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
+                    "prefill_internal_error",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
+                    "prefill_unavailable",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                StatusCode::BAD_GATEWAY => error::bad_gateway(
+                    "prefill_bad_gateway",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                _ => error::internal_error(
+                    "prefill_error",
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+            };
+            return Err(error_response);
         }
 
         // Read prefill body if needed for logprob merging
@@ -874,7 +1049,7 @@ impl PDRouter {
         &self,
         client: &Client,
         url: &str,
-        route: &str,
+        route: &'static str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
@@ -990,11 +1165,10 @@ impl RouterTrait for PDRouter {
         let (prefill, decode) = match self.select_pd_pair(None, None).await {
             Ok(pair) => pair,
             Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                return error::service_unavailable(
+                    "no_healthy_worker_pair",
                     format!("No healthy worker pair available: {}", e),
-                )
-                    .into_response();
+                );
             }
         };
 
@@ -1055,11 +1229,10 @@ impl RouterTrait for PDRouter {
             )
                 .into_response()
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
+            error::service_unavailable(
+                "health_generate_failed",
                 format!("Health generate failed: {:?}", errors),
             )
-                .into_response()
         }
     }
 

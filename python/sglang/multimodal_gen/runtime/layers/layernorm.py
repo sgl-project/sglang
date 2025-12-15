@@ -15,20 +15,10 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
-from sglang.multimodal_gen.runtime.utils.common import (
-    get_bool_env_var,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-)
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var, is_cuda, is_npu
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_npu = is_npu()
-_is_cpu = is_cpu()
-_is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm

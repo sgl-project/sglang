@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -146,6 +147,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             bs,
         )
 
+        if get_global_server_args().enable_mamba_extra_buffer():
+            batch.mamba_track_indices = torch.tensor(
+                [
+                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+                device=batch.device,
+            )
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -183,6 +194,25 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kv_indices,
             req_to_token.size(1),
         )
+        mask_numel = (
+            paged_kernel_lens_sum * self.draft_token_num
+            + (self.draft_token_num**2) * batch_size
+        )
+        if self.custom_mask.numel() < mask_numel:
+            # FIXME(attn): temporary fix for custom mask padding with cuda graph
+            self.custom_mask = torch.cat(
+                [
+                    self.custom_mask,
+                    torch.full(
+                        (mask_numel - self.custom_mask.numel(),),
+                        True,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ],
+                dim=0,
+            )
+
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(
@@ -735,13 +765,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
+            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
             if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-                )
+                if strict_check:
+                    raise ValueError(error_msg)
+                else:
+                    logger.warning(error_msg)
+
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
