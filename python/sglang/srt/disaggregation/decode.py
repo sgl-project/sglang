@@ -497,9 +497,6 @@ class DecodePreallocQueue:
             ):
                 break
             if required_tokens_for_request > allocatable_tokens:
-                logger.warning(
-                    f"Not enough space for req: {decode_req.req.rid} {decode_req.req.bootstrap_room=}, required_tokens_for_request: {required_tokens_for_request} > allocatable_tokens: {allocatable_tokens}"
-                )
                 break
 
             allocatable_tokens -= required_tokens_for_request
