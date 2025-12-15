@@ -19,7 +19,7 @@
 # limitations under the License.
 """SGLang BailingMoE model."""
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -768,7 +768,7 @@ class BailingMoEModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-                    
+
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
