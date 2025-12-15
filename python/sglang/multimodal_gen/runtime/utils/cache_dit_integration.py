@@ -35,8 +35,10 @@ def _patch_cache_dit_similarity():
     from cache_dit.caching.cache_contexts import cache_manager
 
     global _original_similarity
-    if _original_similarity is None:
-        _original_similarity = cache_manager.CachedContextManager.similarity
+    if _original_similarity is not None:
+        return
+
+    _original_similarity = cache_manager.CachedContextManager.similarity
 
     def patched_similarity(self, t1, t2, *, threshold, parallelized=False, prefix="Fn"):
         if not parallelized:
