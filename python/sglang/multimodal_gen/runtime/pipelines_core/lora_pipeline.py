@@ -170,9 +170,6 @@ class LoRAPipeline(ComposedPipelineBase):
 
         converted_count = 0
         for name, layer in module.named_modules():
-            if not isinstance(layer, torch.nn.Linear):
-                continue
-
             if whitelist is not None:
                 if name not in whitelist:
                     continue
