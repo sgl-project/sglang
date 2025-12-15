@@ -2,16 +2,16 @@
 Standalone benchmark comparing CuTe vs Triton implementations of pad/unpad kernels.
 
 Usage:
-    python bench_cute_vs_triton_pad_unpad.py [--max-seq-len 1024] [--num-heads 16] [--head-dim 128] [--dtype bfloat16] [--repeats 10]
+    python benchmark/bench_cute_vs_triton_pad_unpad.py --max-seq-len 1024 --num-heads 16 --head-dim 128
 """
 
 from __future__ import annotations
 
 import argparse
-import time
 
 import torch
 import triton
+from triton.testing import do_bench
 
 from sglang.srt.layers.attention.cute_ops import (
     CutePadDraftExtendQueryKernel,
@@ -23,27 +23,11 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 
 
-def _cuda_sync():
-    """Synchronize CUDA operations."""
+def _bench_ms(fn, warmup: int, iters: int) -> float:
+    # First call triggers compilation (Triton/CuTe). Exclude it from timing.
+    fn()
     torch.cuda.synchronize()
-
-
-def _time(fn, repeats: int = 10, warmup: int = 3) -> float:
-    """Time a function execution, averaging over repeats."""
-    # Warmup
-    for _ in range(warmup):
-        fn()
-    _cuda_sync()
-
-    # Actual timing
-    times = []
-    for _ in range(repeats):
-        _cuda_sync()
-        t0 = time.time()
-        fn()
-        _cuda_sync()
-        times.append(time.time() - t0)
-    return sum(times) / len(times)
+    return float(do_bench(fn, warmup=warmup, rep=iters))
 
 
 def _make_pad_inputs(
@@ -52,12 +36,19 @@ def _make_pad_inputs(
     num_heads: int,
     head_dim: int,
     dtype: torch.dtype,
+    fill_ratio: float,
     device: str = "cuda",
 ):
     """Create inputs for pad kernel benchmark."""
-    seq_lens = torch.randint(
-        1, max_seq_len + 1, (batch_size,), device=device, dtype=torch.int32
-    )
+    if fill_ratio >= 1.0:
+        seq_lens = torch.full(
+            (batch_size,), max_seq_len, device=device, dtype=torch.int32
+        )
+    else:
+        fixed_len = max(1, int(max_seq_len * fill_ratio))
+        seq_lens = torch.full(
+            (batch_size,), fixed_len, device=device, dtype=torch.int32
+        )
     cumsum = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
     cumsum[1:] = torch.cumsum(seq_lens, dim=0)
     q = torch.randn(int(cumsum[-1]), num_heads, head_dim, device=device, dtype=dtype)
@@ -73,12 +64,19 @@ def _make_unpad_inputs(
     num_heads: int,
     head_dim: int,
     dtype: torch.dtype,
+    fill_ratio: float,
     device: str = "cuda",
 ):
     """Create inputs for unpad kernel benchmark."""
-    accept_lengths = torch.randint(
-        1, token_per_batch + 1, (batch_size,), device=device, dtype=torch.int32
-    )
+    if fill_ratio >= 1.0:
+        accept_lengths = torch.full(
+            (batch_size,), token_per_batch, device=device, dtype=torch.int32
+        )
+    else:
+        fixed_len = max(1, int(token_per_batch * fill_ratio))
+        accept_lengths = torch.full(
+            (batch_size,), fixed_len, device=device, dtype=torch.int32
+        )
     cumsum = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
     cumsum[1:] = torch.cumsum(accept_lengths, dim=0)
     raw_out = torch.randn(
@@ -96,11 +94,13 @@ def benchmark_pad_triton(
     num_heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    repeats: int,
+    fill_ratio: float,
+    warmup: int,
+    iters: int,
 ):
     """Benchmark Triton pad kernel."""
     q, padded_q, seq_lens, cumsum = _make_pad_inputs(
-        batch_size, max_seq_len, num_heads, head_dim, dtype
+        batch_size, max_seq_len, num_heads, head_dim, dtype, fill_ratio
     )
     BLOCK_SIZE = 64
     num_head_blocks = triton.cdiv(num_heads, BLOCK_SIZE)
@@ -120,27 +120,37 @@ def benchmark_pad_triton(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-    return _time(run, repeats)
+    ms = _bench_ms(run, warmup=warmup, iters=iters)
+    active_tokens = int(cumsum[-1].item())
+    elems = active_tokens * num_heads * head_dim
+    gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+    return ms, gb
 
 
 def benchmark_pad_cute(
+    pad_kernel: CutePadDraftExtendQueryKernel,
     batch_size: int,
     max_seq_len: int,
     num_heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    repeats: int,
+    fill_ratio: float,
+    warmup: int,
+    iters: int,
 ):
     """Benchmark CuTe pad kernel."""
-    pad_kernel = CutePadDraftExtendQueryKernel()
     q, padded_q, seq_lens, cumsum = _make_pad_inputs(
-        batch_size, max_seq_len, num_heads, head_dim, dtype
+        batch_size, max_seq_len, num_heads, head_dim, dtype, fill_ratio
     )
 
     def run():
         pad_kernel(q=q, padded_q=padded_q, seq_lens_q=seq_lens, cumsum=cumsum)
 
-    return _time(run, repeats)
+    ms = _bench_ms(run, warmup=warmup, iters=iters)
+    active_tokens = int(cumsum[-1].item())
+    elems = active_tokens * num_heads * head_dim
+    gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+    return ms, gb
 
 
 def benchmark_unpad_triton(
@@ -149,11 +159,13 @@ def benchmark_unpad_triton(
     num_heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    repeats: int,
+    fill_ratio: float,
+    warmup: int,
+    iters: int,
 ):
     """Benchmark Triton unpad kernel."""
     raw_out, output, accept_lengths, cumsum = _make_unpad_inputs(
-        batch_size, token_per_batch, num_heads, head_dim, dtype
+        batch_size, token_per_batch, num_heads, head_dim, dtype, fill_ratio
     )
     BLOCK_SIZE = 64
     num_head_blocks = triton.cdiv(num_heads, BLOCK_SIZE)
@@ -173,21 +185,27 @@ def benchmark_unpad_triton(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-    return _time(run, repeats)
+    ms = _bench_ms(run, warmup=warmup, iters=iters)
+    active_tokens = int(cumsum[-1].item())
+    elems = active_tokens * num_heads * head_dim
+    gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+    return ms, gb
 
 
 def benchmark_unpad_cute(
+    unpad_kernel: CuteUnpadDraftExtendOutputKernel,
     batch_size: int,
     token_per_batch: int,
     num_heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    repeats: int,
+    fill_ratio: float,
+    warmup: int,
+    iters: int,
 ):
     """Benchmark CuTe unpad kernel."""
-    unpad_kernel = CuteUnpadDraftExtendOutputKernel()
     raw_out, output, accept_lengths, cumsum = _make_unpad_inputs(
-        batch_size, token_per_batch, num_heads, head_dim, dtype
+        batch_size, token_per_batch, num_heads, head_dim, dtype, fill_ratio
     )
 
     def run():
@@ -198,7 +216,11 @@ def benchmark_unpad_cute(
             cumsum=cumsum,
         )
 
-    return _time(run, repeats)
+    ms = _bench_ms(run, warmup=warmup, iters=iters)
+    active_tokens = int(cumsum[-1].item())
+    elems = active_tokens * num_heads * head_dim
+    gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+    return ms, gb
 
 
 def main():
@@ -214,7 +236,14 @@ def main():
         default="bfloat16",
         choices=["float16", "bfloat16", "float32"],
     )
-    parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=25)
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--fill-ratio",
+        type=float,
+        default=1.0,
+        help="0<r<=1.0. r=1 uses full-length (no early-exit).",
+    )
     parser.add_argument(
         "--batch-sizes",
         type=str,
@@ -236,7 +265,7 @@ def main():
     print(
         f"Config: max_seq_len={args.max_seq_len}, "
         f"heads={args.num_heads}, head_dim={args.head_dim}, "
-        f"dtype={args.dtype}, repeats={args.repeats}"
+        f"dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}, fill_ratio={args.fill_ratio}"
     )
 
     # Generate batch sizes
@@ -252,71 +281,91 @@ def main():
     )
     print()
 
+    # Reuse CuTe kernel objects so we don't recompile every batch size.
+    pad_kernel = CutePadDraftExtendQueryKernel()
+    unpad_kernel = CuteUnpadDraftExtendOutputKernel()
+
     # Benchmark pad kernel
     print("=" * 60)
     print("PAD KERNEL BENCHMARK")
     print("=" * 60)
     print(
-        f"{'batch_size':>12} | {'Triton (ms)':>12} | {'CuTe (ms)':>12} | {'Speedup':>10}"
+        f"{'batch_size':>12} | {'Triton (ms)':>12} | {'CuTe (ms)':>12} | {'Speedup':>10} | {'T GB/s':>8} | {'C GB/s':>8}"
     )
     print("-" * 60)
-    for batch_size in batch_sizes:
-        try:
-            t_triton = benchmark_pad_triton(
-                batch_size,
-                args.max_seq_len,
-                args.num_heads,
-                args.head_dim,
-                dtype,
-                args.repeats,
-            )
-            t_cute = benchmark_pad_cute(
-                batch_size,
-                args.max_seq_len,
-                args.num_heads,
-                args.head_dim,
-                dtype,
-                args.repeats,
-            )
-            speedup = t_triton / t_cute if t_cute > 0 else 0.0
-            print(
-                f"{batch_size:12d} | {t_triton*1e3:12.3f} | {t_cute*1e3:12.3f} | {speedup:10.2f}x"
-            )
-        except Exception as e:
-            print(f"{batch_size:12d} | ERROR: {e}")
+    with torch.inference_mode():
+        for batch_size in batch_sizes:
+            try:
+                t_ms, t_gb = benchmark_pad_triton(
+                    batch_size,
+                    args.max_seq_len,
+                    args.num_heads,
+                    args.head_dim,
+                    dtype,
+                    args.fill_ratio,
+                    args.warmup,
+                    args.iters,
+                )
+                c_ms, c_gb = benchmark_pad_cute(
+                    pad_kernel,
+                    batch_size,
+                    args.max_seq_len,
+                    args.num_heads,
+                    args.head_dim,
+                    dtype,
+                    args.fill_ratio,
+                    args.warmup,
+                    args.iters,
+                )
+                speedup = t_ms / c_ms if c_ms > 0 else 0.0
+                t_bw = t_gb / (t_ms / 1e3) if t_ms > 0 else 0.0
+                c_bw = c_gb / (c_ms / 1e3) if c_ms > 0 else 0.0
+                print(
+                    f"{batch_size:12d} | {t_ms:12.3f} | {c_ms:12.3f} | {speedup:10.2f}x | {t_bw:8.1f} | {c_bw:8.1f}"
+                )
+            except Exception as e:
+                print(f"{batch_size:12d} | ERROR: {e}")
 
     print()
     print("=" * 60)
     print("UNPAD KERNEL BENCHMARK")
     print("=" * 60)
     print(
-        f"{'batch_size':>12} | {'Triton (ms)':>12} | {'CuTe (ms)':>12} | {'Speedup':>10}"
+        f"{'batch_size':>12} | {'Triton (ms)':>12} | {'CuTe (ms)':>12} | {'Speedup':>10} | {'T GB/s':>8} | {'C GB/s':>8}"
     )
     print("-" * 60)
-    for batch_size in batch_sizes:
-        try:
-            t_triton = benchmark_unpad_triton(
-                batch_size,
-                args.max_seq_len,
-                args.num_heads,
-                args.head_dim,
-                dtype,
-                args.repeats,
-            )
-            t_cute = benchmark_unpad_cute(
-                batch_size,
-                args.max_seq_len,
-                args.num_heads,
-                args.head_dim,
-                dtype,
-                args.repeats,
-            )
-            speedup = t_triton / t_cute if t_cute > 0 else 0.0
-            print(
-                f"{batch_size:12d} | {t_triton*1e3:12.3f} | {t_cute*1e3:12.3f} | {speedup:10.2f}x"
-            )
-        except Exception as e:
-            print(f"{batch_size:12d} | ERROR: {e}")
+    with torch.inference_mode():
+        for batch_size in batch_sizes:
+            try:
+                t_ms, t_gb = benchmark_unpad_triton(
+                    batch_size,
+                    args.max_seq_len,
+                    args.num_heads,
+                    args.head_dim,
+                    dtype,
+                    args.fill_ratio,
+                    args.warmup,
+                    args.iters,
+                )
+                c_ms, c_gb = benchmark_unpad_cute(
+                    unpad_kernel,
+                    batch_size,
+                    args.max_seq_len,
+                    args.num_heads,
+                    args.head_dim,
+                    dtype,
+                    args.fill_ratio,
+                    args.warmup,
+                    args.iters,
+                )
+                speedup = t_ms / c_ms if c_ms > 0 else 0.0
+                t_bw = t_gb / (t_ms / 1e3) if t_ms > 0 else 0.0
+                c_bw = c_gb / (c_ms / 1e3) if c_ms > 0 else 0.0
+                print(
+                    f"{batch_size:12d} | {t_ms:12.3f} | {c_ms:12.3f} | {speedup:10.2f}x | {t_bw:8.1f} | {c_bw:8.1f}"
+                )
+            except Exception as e:
+                print(f"{batch_size:12d} | ERROR: {e}")
 
 
 if __name__ == "__main__":
