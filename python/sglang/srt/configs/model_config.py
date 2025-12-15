@@ -261,6 +261,7 @@ class ModelConfig:
             override_config_file=server_args.decrypted_config_file,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
+            is_draft_model=is_draft_model,
             **kwargs,
         )
 
