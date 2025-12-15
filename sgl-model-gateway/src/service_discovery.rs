@@ -18,7 +18,10 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
+use crate::{
+    app_context::AppContext, core::Job, observability::metrics::RouterMetrics,
+    protocols::worker_spec::WorkerConfigRequest,
+};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -297,6 +300,7 @@ pub async fn start_service_discovery(
                 }
                 Err(err) => {
                     error!("Error in Kubernetes watcher: {}", err);
+                    RouterMetrics::record_discovery_watcher_error();
                     warn!(
                         "Retrying in {} seconds with exponential backoff",
                         retry_delay.as_secs()
@@ -311,6 +315,7 @@ pub async fn start_service_discovery(
                 "Kubernetes watcher exited, restarting in {} seconds",
                 config_arc.check_interval.as_secs()
             );
+            RouterMetrics::record_discovery_watcher_restart();
             time::sleep(config_arc.check_interval).await;
         }
     });
@@ -393,7 +398,7 @@ async fn handle_pod_event(
                 health_failure_threshold: app_context.router_config.health_check.failure_threshold,
                 max_connection_attempts: app_context.router_config.health_check.success_threshold
                     * 20,
-                dp_aware: false,
+                dp_aware: app_context.router_config.dp_aware,
             };
 
             let job = Job::AddWorker {
@@ -404,6 +409,7 @@ async fn handle_pod_event(
                 match job_queue.submit(job).await {
                     Ok(_) => {
                         debug!("Worker addition job submitted for: {}", worker_url);
+                        RouterMetrics::record_discovery_update(1, 0);
                     }
                     Err(e) => {
                         error!(
@@ -462,6 +468,7 @@ async fn handle_pod_deletion(
                 );
             } else {
                 debug!("Submitted worker removal job for {}", worker_url);
+                RouterMetrics::record_discovery_update(0, 1);
             }
         } else {
             error!(

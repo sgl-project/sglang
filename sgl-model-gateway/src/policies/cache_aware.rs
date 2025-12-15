@@ -59,7 +59,14 @@
     during the next eviction cycle.
 */
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use rand::Rng;
@@ -77,7 +84,10 @@ use crate::{core::Worker, observability::metrics::RouterMetrics};
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    /// Handle to the background eviction thread
     eviction_handle: Option<thread::JoinHandle<()>>,
+    /// Flag to signal the eviction thread to stop
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl CacheAwarePolicy {
@@ -87,25 +97,54 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Start background eviction thread if configured
         let eviction_handle = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
+            let shutdown_clone = Arc::clone(&shutdown_flag);
             let max_tree_size = config.max_tree_size;
             let interval = config.eviction_interval_secs;
 
-            Some(thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(interval));
+            Some(thread::spawn(move || {
+                // Use smaller sleep intervals to check shutdown flag more frequently
+                let check_interval_ms = 100; // Check every 100ms
+                let total_sleep_ms = interval * 1000;
 
-                // Evict for all model trees
-                for tree_ref in trees_clone.iter() {
-                    let model_id = tree_ref.key();
-                    let tree = tree_ref.value();
-                    tree.evict_tenant_by_size(max_tree_size);
-                    debug!(
-                        "Cache eviction completed for model {}, max_size: {}",
-                        model_id, max_tree_size
-                    );
+                loop {
+                    // Sleep in small increments, checking shutdown flag periodically
+                    let mut slept_ms = 0u64;
+                    while slept_ms < total_sleep_ms {
+                        if shutdown_clone.load(Ordering::Relaxed) {
+                            debug!("Eviction thread received shutdown signal");
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(check_interval_ms));
+                        slept_ms += check_interval_ms;
+                    }
+
+                    // Check shutdown before starting eviction
+                    if shutdown_clone.load(Ordering::Relaxed) {
+                        debug!("Eviction thread received shutdown signal");
+                        return;
+                    }
+
+                    // Evict for all model trees
+                    for tree_ref in trees_clone.iter() {
+                        let model_id = tree_ref.key();
+                        let tree = tree_ref.value();
+                        tree.evict_tenant_by_size(max_tree_size);
+
+                        // Update tree size metrics per worker (tenant)
+                        for entry in tree.tenant_char_count.iter() {
+                            RouterMetrics::set_tree_size(entry.key(), *entry.value());
+                        }
+
+                        debug!(
+                            "Cache eviction completed for model {}, max_size: {}",
+                            model_id, max_tree_size
+                        );
+                    }
                 }
             }))
         } else {
@@ -116,6 +155,7 @@ impl CacheAwarePolicy {
             config,
             trees,
             eviction_handle,
+            shutdown_flag,
         }
     }
 
@@ -210,6 +250,63 @@ impl CacheAwarePolicy {
             );
         }
     }
+
+    fn select_worker_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: &Option<&str>,
+        healthy_indices: &[usize],
+        model_id: &str,
+        // TODO may skip passing this arg (and compute inside function) if this is not bottleneck
+        max_load: usize,
+        min_load: usize,
+    ) -> Option<usize> {
+        // Log load balancing trigger
+        // TODO may use `&str`
+        let worker_loads: Vec<(String, usize)> = workers
+            .iter()
+            .map(|w| (w.url().to_string(), w.load()))
+            .collect();
+
+        // TODO may change text
+        debug!(
+            "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+            max_load, min_load, worker_loads
+        );
+
+        RouterMetrics::record_load_balancing_event();
+        RouterMetrics::set_load_range(max_load, min_load);
+
+        // Use shortest queue when imbalanced
+        let min_load_idx = healthy_indices
+            .iter()
+            .min_by_key(|&&idx| workers[idx].load())
+            .copied()?;
+
+        // Even in imbalanced mode, update the tree to maintain cache state
+        if let Some(text) = request_text {
+            // Get the tree reference without locking the entire HashMap
+            // DashMap only locks the specific shard containing this key
+            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+
+            if let Some(tree) = tree {
+                // Now we can work with the tree without holding the HashMap lock
+                tree.insert(text, workers[min_load_idx].url());
+            } else {
+                debug!(
+                    "Warning: No tree found for model '{}', skipping cache update",
+                    model_id
+                );
+            }
+        }
+
+        // Increment processed counter
+        workers[min_load_idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[min_load_idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
+
+        Some(min_load_idx)
+    }
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
@@ -233,59 +330,26 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             first_model
         };
 
-        // Get current load statistics
-        let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
-        let max_load = *loads.iter().max().unwrap_or(&0);
-        let min_load = *loads.iter().min().unwrap_or(&0);
+        // Get current load statistics - compute min/max in single pass without allocation
+        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
+            let load = w.load();
+            (min.min(load), max.max(load))
+        });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            // Log load balancing trigger
-            let worker_loads: Vec<(String, usize)> = workers
-                .iter()
-                .map(|w| (w.url().to_string(), w.load()))
-                .collect();
-
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
+            return self.select_worker_min_load(
+                workers,
+                &request_text,
+                &healthy_indices,
+                model_id,
+                max_load,
+                min_load,
             );
-
-            RouterMetrics::record_load_balancing_event();
-            RouterMetrics::set_load_range(max_load, min_load);
-
-            // Use shortest queue when imbalanced
-            let min_load_idx = healthy_indices
-                .iter()
-                .min_by_key(|&&idx| workers[idx].load())
-                .copied()?;
-
-            // Even in imbalanced mode, update the tree to maintain cache state
-            if let Some(text) = request_text {
-                // Get the tree reference without locking the entire HashMap
-                // DashMap only locks the specific shard containing this key
-                let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-                if let Some(tree) = tree {
-                    // Now we can work with the tree without holding the HashMap lock
-                    tree.insert(text, workers[min_load_idx].url());
-                } else {
-                    debug!(
-                        "Warning: No tree found for model '{}', skipping cache update",
-                        model_id
-                    );
-                }
-            }
-
-            // Increment processed counter
-            workers[min_load_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[min_load_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
-
-            return Some(min_load_idx);
         }
 
         // Use cache-aware routing when balanced
@@ -309,7 +373,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_worker.to_string()
             } else {
                 RouterMetrics::record_cache_miss();
-                tree.get_smallest_tenant()
+                let min_load_idx = *healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())?;
+                workers[min_load_idx].url().to_string()
             };
 
             // Find the index of the selected worker
@@ -322,6 +389,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
                     RouterMetrics::record_processed_request(&selected_url);
+                    RouterMetrics::record_policy_decision(self.name(), &selected_url);
 
                     return Some(selected_idx);
                 }
@@ -344,37 +412,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let random_idx = rng.random_range(0..healthy_indices.len());
             Some(healthy_indices[random_idx])
         }
-    }
-
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        // DEPRECATED: This method is no longer used when separate policies are configured.
-        // The PD router now uses separate policies for prefill and decode selection.
-        // This implementation remains for backward compatibility when a single policy is used.
-
-        // In PD mode with single policy:
-        // - Prefill: Use cache-aware routing for better cache utilization
-        // - Decode: Use least-load routing for better load distribution
-
-        // Select prefill worker using cache-aware logic
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-
-        // Select decode worker using least-load logic
-        let healthy_decode = get_healthy_worker_indices(decode_workers);
-        if healthy_decode.is_empty() {
-            return None;
-        }
-
-        let decode_idx = healthy_decode
-            .iter()
-            .min_by_key(|&&idx| decode_workers[idx].load())
-            .copied()?;
-
-        Some((prefill_idx, decode_idx))
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
@@ -410,12 +447,16 @@ impl Default for CacheAwarePolicy {
 
 impl Drop for CacheAwarePolicy {
     fn drop(&mut self) {
-        // Note: We can't properly stop the eviction thread since it's in an infinite loop
-        // In a production system, we'd use a channel or atomic flag to signal shutdown
+        // Signal the eviction thread to stop
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+
+        // Wait for the thread to finish (with timeout)
         if let Some(handle) = self.eviction_handle.take() {
-            // The thread will continue running until the program exits
-            // This is acceptable for now since the router typically runs for the lifetime of the program
-            drop(handle);
+            // The thread checks the shutdown flag every 100ms, so it should exit quickly
+            match handle.join() {
+                Ok(()) => debug!("Eviction thread shut down cleanly"),
+                Err(_) => debug!("Eviction thread panicked during shutdown"),
+            }
         }
     }
 }

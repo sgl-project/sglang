@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
 # from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -52,45 +55,21 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
-    query, _ = attn.to_q(hidden_states)
-    key, _ = attn.to_k(hidden_states)
-    value, _ = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
-def _get_fused_projections(
+def _get_qkv_projections(
     attn: "FluxAttention", hidden_states, encoder_hidden_states=None
 ):
     qkv, _ = attn.to_qkv(hidden_states)
     query, key, value = qkv.chunk(3, dim=-1)
 
     encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
         added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
         encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
 
-def _get_qkv_projections(
-    attn: "FluxAttention", hidden_states, encoder_hidden_states=None
-):
-    if attn.fused_projections:
-        return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
-    return _get_projections(attn, hidden_states, encoder_hidden_states)
-
-
 class FluxAttention(torch.nn.Module, AttentionModuleMixin):
-    _supports_qkv_fusion = True
-
     def __init__(
         self,
         query_dim: int,
@@ -121,11 +100,15 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.added_proj_bias = added_proj_bias
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
-
         self.norm_k = RMSNorm(dim_head, eps=eps)
-        self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
+
+        # Use QKVParallelLinear for fused QKV projections
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=query_dim,
+            head_size=dim_head,
+            total_num_heads=num_heads,
+            bias=bias,
+        )
 
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
@@ -138,14 +121,12 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            # Use QKVParallelLinear for added (encoder) QKV projections
+            self.to_added_qkv = QKVParallelLinear(
+                hidden_size=added_kv_proj_dim,
+                head_size=dim_head,
+                total_num_heads=num_heads,
+                bias=added_proj_bias,
             )
             self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
 
@@ -161,61 +142,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 AttentionBackendEnum.SAGE_ATTN,
             },
         )
-
-        self.fused_projections = False
-
-    @torch.no_grad()
-    def fuse_projections(self):
-        if self.fused_projections:
-            return
-
-        device = self.to_q.weight.data.device
-        dtype = self.to_q.weight.data.dtype
-
-        concatenated_weights = torch.cat(
-            [self.to_q.weight.data, self.to_k.weight.data, self.to_v.weight.data]
-        )
-        in_features = concatenated_weights.shape[1]
-        out_features = concatenated_weights.shape[0]
-
-        self.to_qkv = ReplicatedLinear(in_features, out_features, bias=self.use_bias)
-        self.to_qkv.weight.data = concatenated_weights.to(device=device, dtype=dtype)
-        if self.use_bias:
-            concatenated_bias = torch.cat(
-                [self.to_q.bias.data, self.to_k.bias.data, self.to_v.bias.data]
-            )
-            self.to_qkv.bias.data = concatenated_bias.to(device=device, dtype=dtype)
-
-        if self.added_kv_proj_dim is not None:
-            concatenated_weights = torch.cat(
-                [
-                    self.add_q_proj.weight.data,
-                    self.add_k_proj.weight.data,
-                    self.add_v_proj.weight.data,
-                ]
-            )
-            in_features = concatenated_weights.shape[1]
-            out_features = concatenated_weights.shape[0]
-
-            self.to_added_qkv = ReplicatedLinear(
-                in_features, out_features, bias=self.added_proj_bias
-            )
-            self.to_added_qkv.weight.data = concatenated_weights.to(
-                device=device, dtype=dtype
-            )
-            if self.added_proj_bias:
-                concatenated_bias = torch.cat(
-                    [
-                        self.add_q_proj.bias.data,
-                        self.add_k_proj.bias.data,
-                        self.add_v_proj.bias.data,
-                    ]
-                )
-                self.to_added_qkv.bias.data = concatenated_bias.to(
-                    device=device, dtype=dtype
-                )
-
-        self.fused_projections = True
 
     def forward(
         self,
@@ -459,7 +385,8 @@ class FluxPosEmbed(nn.Module):
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos = ids.float()
-        # freqs_cos, freqs_sin = self.rope.forward(positions=pos)
+        # TODO: potential error: flux use n_axes = ids.shape[-1]
+        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
         freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
@@ -470,6 +397,8 @@ class FluxTransformer2DModel(CachableDiT):
 
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
+
+    param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
     def __init__(self, config: FluxConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
@@ -528,19 +457,6 @@ class FluxTransformer2DModel(CachableDiT):
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
         )
-
-    def fuse_qkv_projections(self):
-        for block in self.transformer_blocks:
-            if hasattr(block.attn, "fuse_projections") and getattr(
-                block.attn, "_supports_qkv_fusion", True
-            ):
-                block.attn.fuse_projections()
-
-        for block in self.single_transformer_blocks:
-            if hasattr(block.attn, "fuse_projections") and getattr(
-                block.attn, "_supports_qkv_fusion", True
-            ):
-                block.attn.fuse_projections()
 
     def forward(
         self,

@@ -210,7 +210,7 @@ pub struct WorkerTypeStats {
 }
 
 /// Worker update request
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerUpdateRequest {
     /// Update priority
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,6 +223,26 @@ pub struct WorkerUpdateRequest {
     /// Update labels
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<HashMap<String, String>>,
+
+    /// Update API key (for key rotation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// Update health check timeout in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check_timeout_secs: Option<u64>,
+
+    /// Update health check interval in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check_interval_secs: Option<u64>,
+
+    /// Update health success threshold
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_success_threshold: Option<u32>,
+
+    /// Update health failure threshold
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_failure_threshold: Option<u32>,
 }
 
 /// Generic API response

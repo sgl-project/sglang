@@ -14,6 +14,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
+    observability::metrics::{smg_labels, SmgMetrics, StreamingMetricsParams},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
         common::{
@@ -43,6 +44,16 @@ pub struct StreamingProcessor {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
+    backend_type: &'static str,
+}
+
+/// Context for generate endpoint streaming - groups config params to reduce function arguments
+struct GenerateStreamContext {
+    request_id: String,
+    weight_version: String,
+    return_logprob: bool,
+    backend_type: &'static str,
+    model: String,
 }
 
 impl StreamingProcessor {
@@ -52,6 +63,7 @@ impl StreamingProcessor {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        backend_type: &'static str,
     ) -> Self {
         Self {
             tokenizer,
@@ -59,6 +71,7 @@ impl StreamingProcessor {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            backend_type,
         }
     }
 
@@ -164,6 +177,10 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        // Metrics timing
+        let start_time = Instant::now();
+        let mut first_token_time: Option<Instant> = None;
+
         // Extract request parameters
         let separate_reasoning = original_request.separate_reasoning;
         let tool_choice = &original_request.tool_choice;
@@ -204,7 +221,7 @@ impl StreamingProcessor {
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_ref(),
+                self.configured_reasoning_parser.as_deref(),
                 model,
             );
 
@@ -222,7 +239,7 @@ impl StreamingProcessor {
         let tool_parser_available = tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_ref(),
+                self.configured_tool_parser.as_deref(),
                 model,
             );
 
@@ -246,6 +263,11 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
+                    // Track TTFT immediately on first chunk received from backend
+                    if first_token_time.is_none() {
+                        first_token_time = Some(Instant::now());
+                    }
+
                     let index = chunk.index();
 
                     // For vLLM, accumulate completion tokens (vLLM sends deltas)
@@ -300,7 +322,7 @@ impl StreamingProcessor {
                         let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                             .created(created)
                             .add_choice_role(index, "assistant")
-                            .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                            .maybe_system_fingerprint(system_fingerprint)
                             .build();
                         Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
                         tx.send(Ok(Bytes::from(sse_buffer.clone())))
@@ -419,9 +441,7 @@ impl StreamingProcessor {
                                     ChatCompletionStreamResponse::builder(request_id, model)
                                         .created(created)
                                         .add_choice_content(index, "assistant", text)
-                                        .maybe_system_fingerprint(
-                                            system_fingerprint.map(|s| s.to_string()),
-                                        )
+                                        .maybe_system_fingerprint(system_fingerprint)
                                         .build();
 
                                 let sse_chunk =
@@ -489,7 +509,7 @@ impl StreamingProcessor {
                     let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_call_delta(*index, tool_call_delta)
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .maybe_system_fingerprint(system_fingerprint)
                         .build();
 
                     let sse_chunk = serde_json::to_string(&tool_chunk)
@@ -514,7 +534,7 @@ impl StreamingProcessor {
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(*index, final_finish_reason, matched_stop_value)
-                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                .maybe_system_fingerprint(system_fingerprint)
                 .build();
 
             let sse_chunk = serde_json::to_string(&finish_chunk)
@@ -537,7 +557,7 @@ impl StreamingProcessor {
                         total_tokens: total_prompt + total_completion,
                         completion_tokens_details: None,
                     })
-                    .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                    .maybe_system_fingerprint(system_fingerprint)
                     .build();
 
                 let sse_chunk = serde_json::to_string(&usage_chunk)
@@ -549,6 +569,20 @@ impl StreamingProcessor {
 
         // Mark stream as completed successfully to prevent abort on drop
         grpc_stream.mark_completed();
+
+        // Record streaming metrics
+        let total_prompt: u32 = prompt_tokens.values().sum();
+        let total_completion: u32 = completion_tokens.values().sum();
+        SmgMetrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: smg_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: model,
+            endpoint: smg_labels::ENDPOINT_CHAT,
+            ttft: first_token_time.map(|t| t.duration_since(start_time)),
+            generation_duration: start_time.elapsed(),
+            input_tokens: Some(total_prompt as u64),
+            output_tokens: total_completion as u64,
+        });
 
         Ok(())
     }
@@ -605,30 +639,28 @@ impl StreamingProcessor {
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
     ) -> Response {
-        let return_logprob = generate_request.return_logprob.unwrap_or(false);
-
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+
+        // Build context once, clone for spawned task
+        let ctx = GenerateStreamContext {
+            request_id: dispatch.request_id.clone(),
+            weight_version: dispatch
+                .weight_version
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            return_logprob: generate_request.return_logprob.unwrap_or(false),
+            backend_type: self.backend_type,
+            model: dispatch.model.clone(),
+        };
 
         // Spawn background task based on execution mode
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 let tokenizer = self.tokenizer.clone();
-                let request_id = dispatch.request_id.clone();
-                let weight_version = dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
                 tokio::spawn(async move {
-                    let result = Self::process_generate_streaming(
-                        tokenizer,
-                        stream,
-                        request_id,
-                        weight_version,
-                        return_logprob,
-                        &tx,
-                    )
-                    .await;
+                    let result =
+                        Self::process_generate_streaming(tokenizer, stream, ctx, &tx).await;
 
                     if let Err(e) = result {
                         let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", e);
@@ -639,22 +671,10 @@ impl StreamingProcessor {
                 });
             }
             context::ExecutionResult::Dual { prefill, decode } => {
-                // For PD mode, need to handle prefill stream for input_logprobs
                 let tokenizer = self.tokenizer.clone();
-                let request_id = dispatch.request_id.clone();
-                let weight_version = dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
                 tokio::spawn(async move {
                     let result = Self::process_generate_streaming_dual(
-                        tokenizer,
-                        prefill,
-                        *decode,
-                        request_id,
-                        weight_version,
-                        return_logprob,
-                        &tx,
+                        tokenizer, prefill, *decode, ctx, &tx,
                     )
                     .await;
 
@@ -677,12 +697,11 @@ impl StreamingProcessor {
     async fn process_generate_streaming(
         tokenizer: Arc<dyn Tokenizer>,
         mut stream: ProtoStream,
-        request_id: String,
-        weight_version: String,
-        _include_logprobs: bool,
+        ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
+        let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
@@ -693,6 +712,11 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
+                    // Track TTFT immediately on first chunk received from backend
+                    if first_token_time.is_none() {
+                        first_token_time = Some(Instant::now());
+                    }
+
                     let index = chunk.index();
 
                     // Both backends send delta token_ids, so accumulate for both
@@ -710,7 +734,7 @@ impl StreamingProcessor {
                     accumulated_text.push_str(&chunk_text);
 
                     // Generate unique ID per index
-                    let index_id = format!("{}-{}", request_id, index);
+                    let index_id = format!("{}-{}", ctx.request_id, index);
 
                     // Build streaming response chunk (SGLang format)
                     let chunk_response = serde_json::json!({
@@ -720,7 +744,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": null,
                             "prompt_tokens": chunk.prompt_tokens(),
-                            "weight_version": &weight_version,
+                            "weight_version": &ctx.weight_version,
                             "completion_tokens": current_completion_tokens,
                             "cached_tokens": chunk.cached_tokens()
                         },
@@ -739,7 +763,7 @@ impl StreamingProcessor {
                     let accumulated_text =
                         accumulated_texts.get(&index).cloned().unwrap_or_default();
                     let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
-                    let index_id = format!("{}-{}", request_id, index);
+                    let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
 
                     // Send final chunk with finish_reason
@@ -750,7 +774,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": complete.finish_reason(),
                             "prompt_tokens": complete.prompt_tokens(),
-                            "weight_version": &weight_version,
+                            "weight_version": &ctx.weight_version,
                             "completion_tokens": completion_tokens,
                             "cached_tokens": complete.cached_tokens(),
                             "e2e_latency": e2e_latency
@@ -777,6 +801,10 @@ impl StreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         stream.mark_completed();
 
+        // Record streaming metrics
+        let total_completion: u32 = completion_tokens_map.values().sum();
+        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+
         Ok(())
     }
 
@@ -785,13 +813,11 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
-        request_id: String,
-        weight_version: String,
-        return_logprob: bool,
+        ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         // Collect input_logprobs from prefill stream if requested
-        let input_token_logprobs = if return_logprob {
+        let input_token_logprobs = if ctx.return_logprob {
             let mut input_logprobs = None;
             while let Some(response) = prefill_stream.next().await {
                 let gen_response = response.map_err(|e| format!("Prefill stream error: {}", e))?;
@@ -819,9 +845,7 @@ impl StreamingProcessor {
         let result = Self::process_generate_streaming_with_input_logprobs(
             tokenizer,
             decode_stream,
-            request_id,
-            weight_version,
-            return_logprob,
+            ctx,
             input_token_logprobs,
             tx,
         )
@@ -840,13 +864,12 @@ impl StreamingProcessor {
     async fn process_generate_streaming_with_input_logprobs(
         tokenizer: Arc<dyn Tokenizer>,
         mut stream: ProtoStream,
-        request_id: String,
-        weight_version: String,
-        _include_logprobs: bool,
+        ctx: GenerateStreamContext,
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
+        let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
@@ -859,6 +882,11 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
+                    // Track TTFT immediately on first chunk received from backend
+                    if first_token_time.is_none() {
+                        first_token_time = Some(Instant::now());
+                    }
+
                     let index = chunk.index();
 
                     // Both backends send delta token_ids, so accumulate for both
@@ -882,7 +910,7 @@ impl StreamingProcessor {
                     }
 
                     // Generate unique ID per index
-                    let index_id = format!("{}-{}", request_id, index);
+                    let index_id = format!("{}-{}", ctx.request_id, index);
 
                     // Build streaming response chunk with cumulative logprobs
                     let current_output_logprobs = accumulated_output_logprobs
@@ -896,7 +924,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": null,
                             "prompt_tokens": chunk.prompt_tokens(),
-                            "weight_version": &weight_version,
+                            "weight_version": &ctx.weight_version,
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": current_output_logprobs,
                             "completion_tokens": current_completion_tokens,
@@ -923,7 +951,7 @@ impl StreamingProcessor {
                     let final_output_logprobs = accumulated_output_logprobs
                         .get(&index)
                         .and_then(|o| o.as_ref());
-                    let index_id = format!("{}-{}", request_id, index);
+                    let index_id = format!("{}-{}", ctx.request_id, index);
                     let e2e_latency = start_time.elapsed().as_secs_f64();
 
                     // Parse finish_reason
@@ -940,7 +968,7 @@ impl StreamingProcessor {
                             "id": index_id,
                             "finish_reason": finish_reason,
                             "prompt_tokens": complete.prompt_tokens(),
-                            "weight_version": &weight_version,
+                            "weight_version": &ctx.weight_version,
                             "input_token_logprobs": input_token_logprobs.as_ref(),
                             "output_token_logprobs": final_output_logprobs,
                             "completion_tokens": completion_tokens,
@@ -969,12 +997,35 @@ impl StreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         stream.mark_completed();
 
+        // Record streaming metrics
+        let total_completion: u32 = completion_tokens_map.values().sum();
+        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+
         Ok(())
     }
 
     // ========================================================================
     // Helper Methods
     // ========================================================================
+
+    /// Record streaming metrics for generate endpoint
+    fn record_generate_metrics(
+        start_time: Instant,
+        first_token_time: Option<Instant>,
+        total_completion: u32,
+        ctx: &GenerateStreamContext,
+    ) {
+        SmgMetrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: smg_labels::ROUTER_GRPC,
+            backend_type: ctx.backend_type,
+            model_id: &ctx.model,
+            endpoint: smg_labels::ENDPOINT_GENERATE,
+            ttft: first_token_time.map(|t| t.duration_since(start_time)),
+            generation_duration: start_time.elapsed(),
+            input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
+            output_tokens: total_completion as u64,
+        });
+    }
 
     /// Process a chunk of tokens through the stop decoder
     fn process_chunk_tokens(
@@ -1023,7 +1074,7 @@ impl StreamingProcessor {
         reasoning_parsers.entry(index).or_insert_with(|| {
             let parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_ref(),
+                self.configured_reasoning_parser.as_deref(),
                 model,
             )
             .expect("Parser should be available - checked upfront");
@@ -1048,7 +1099,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_reasoning(index, reasoning_text)
-                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         )
                     } else {
@@ -1098,7 +1149,7 @@ impl StreamingProcessor {
                     ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_name(index, tool_call_id, function.name.clone())
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .maybe_system_fingerprint(system_fingerprint)
                         .build(),
                 );
             }
@@ -1109,7 +1160,7 @@ impl StreamingProcessor {
                     ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_tool_args(index, delta.to_string())
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                        .maybe_system_fingerprint(system_fingerprint)
                         .build(),
                 );
             }
@@ -1139,16 +1190,12 @@ impl StreamingProcessor {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
             let parser = if use_json_parser {
-                utils::create_tool_parser(
-                    &self.tool_parser_factory,
-                    Some(&"json".to_string()),
-                    model,
-                )
-                .expect("JSON parser should be available")
+                utils::create_tool_parser(&self.tool_parser_factory, Some("json"), model)
+                    .expect("JSON parser should be available")
             } else {
                 utils::create_tool_parser(
                     &self.tool_parser_factory,
-                    self.configured_tool_parser.as_ref(),
+                    self.configured_tool_parser.as_deref(),
                     model,
                 )
                 .expect("Parser should be available - checked upfront")
@@ -1167,7 +1214,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_content(index, "assistant", normal_text)
-                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         );
                     }
@@ -1209,7 +1256,7 @@ impl StreamingProcessor {
                             ChatCompletionStreamResponse::builder(request_id, model)
                                 .created(created)
                                 .add_choice_tool_call_delta(index, tool_call_delta)
-                                .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                                .maybe_system_fingerprint(system_fingerprint)
                                 .build(),
                         );
                     }

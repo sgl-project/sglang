@@ -47,6 +47,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
+    get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -91,6 +92,9 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    # Used in diffusion LLM inference
+    DLLM_EXTEND = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -102,6 +106,7 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.DLLM_EXTEND
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
@@ -153,6 +158,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
+            or self == ForwardMode.DLLM_EXTEND
         )
 
     def is_cpu_graph(self):
@@ -170,6 +176,9 @@ class ForwardMode(IntEnum):
 
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
+
+    def is_dllm_extend(self):
+        return self == ForwardMode.DLLM_EXTEND
 
 
 @total_ordering
@@ -192,6 +201,26 @@ class CaptureHiddenMode(IntEnum):
 
     def __lt__(self, other):
         return self.value < other.value
+
+
+def compute_local_num_token_non_padded(
+    global_num_token_non_padded: torch.Tensor | int,
+    num_tokens_per_dp: int,
+) -> torch.Tensor:
+    """Compute local non-padded token count for this attention-TP rank.
+
+    Converts a global count (across all TP ranks) to a local count for this rank.
+    The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
+    """
+    attn_tp_rank = get_attention_tp_rank()
+    attn_tp_size = get_attention_tp_size()
+    tokens_per_rank = num_tokens_per_dp // attn_tp_size
+
+    return torch.clamp(
+        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        0,
+        tokens_per_rank,
+    )
 
 
 @dataclass
@@ -220,6 +249,12 @@ class ForwardBatch:
     # The indices of output tokens in the token_to_kv_pool_swa
     # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
     out_cache_loc_swa: Optional[torch.Tensor] = None
+    # The indices to track mamba state with
+    mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    # The mask to track mamba state if needed
+    mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    # The seqlens to track mamba state if masked, prefill only.
+    mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -347,6 +382,7 @@ class ForwardBatch:
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
     # For matryoshka embeddings
@@ -368,6 +404,9 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_mask=batch.mamba_track_mask,
+            mamba_track_seqlens=batch.mamba_track_seqlens,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -442,8 +481,9 @@ class ForwardBatch:
             block_size = batch.dllm_config.block_size
             ret.positions = torch.tensor(
                 [
-                    [i for i in range(block_offset, block_offset + block_size)]
+                    i
                     for block_offset in batch.dllm_block_offsets
+                    for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=torch.int32,
             ).to(device, non_blocking=True)
@@ -493,6 +533,22 @@ class ForwardBatch:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
+        """Make num_token_non_padded local to this attention-TP rank."""
+        from sglang.srt.utils.common import require_mlp_tp_gather
+
+        dp_rank = get_attention_dp_rank()
+
+        if require_mlp_tp_gather(server_args):
+            num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+        else:
+            num_tokens_per_dp = self.global_num_tokens_gpu[0]
+
+        self.num_token_non_padded = compute_local_num_token_non_padded(
+            global_num_token_non_padded=self.num_token_non_padded,
+            num_tokens_per_dp=num_tokens_per_dp,
+        )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
@@ -617,7 +673,7 @@ class ForwardBatch:
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # batch_size * [3 * seq_len]
-        batch_size = self.seq_lens.shape[0]
+        batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
@@ -626,13 +682,13 @@ class ForwardBatch:
                 if mm_input is None:
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
-                        self.seq_lens[batch_idx] - 1,
+                        self.seq_lens_cpu[batch_idx] - 1,
                         dtype=torch.int64,
                         device=model_runner.device,
                     )
                 else:
                     mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens[batch_idx], model_runner.device
+                        mm_input, self.seq_lens_cpu[batch_idx], model_runner.device
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
@@ -801,6 +857,14 @@ class ForwardBatch:
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
         )
+        # TODO: The following is added to make sure sub-batch input_ids are padded
+        # to the multiple of attn_tp_size. It can likely be removed after this
+        # function is refactored and merged into the Scheduler.
+        if self.tbo_children:
+            for child in self.tbo_children:
+                child._pad_inputs_to_size(
+                    model_runner, child.tbo_padded_len, child.batch_size
+                )
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
@@ -826,6 +890,16 @@ class ForwardBatch:
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
+        if self.mamba_track_indices is not None:
+            self.mamba_track_indices = self._pad_tensor_to_size(
+                self.mamba_track_indices, bs
+            )
+        if self.mamba_track_mask is not None:
+            self.mamba_track_mask = self._pad_tensor_to_size(self.mamba_track_mask, bs)
+        if self.mamba_track_seqlens is not None:
+            self.mamba_track_seqlens = self._pad_tensor_to_size(
+                self.mamba_track_seqlens, bs
+            )
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)

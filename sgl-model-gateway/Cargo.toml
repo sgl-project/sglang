@@ -1,6 +1,6 @@
 [package]
 name = "sgl-model-gateway"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 
 [features]
@@ -32,6 +32,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
+axum-server = { version = "0.7.3", default_features = false, features = ["tls-rustls"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -41,6 +42,7 @@ serde_json = { version = "1.0", default-features = false, features = [
 ] }
 serde_bytes = "0.11"
 bytes = "1.8.0"
+http-body = "1.0"
 rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json", "rustls-tls"], default-features = false }
 futures-util = "0.3"
@@ -70,6 +72,7 @@ parking_lot = "0.12.4"
 rayon = "1.10"
 thiserror = "2.0.12"
 regex = "1.10"
+memchr = "2.7"  # SIMD-optimized byte pattern searching
 url = "2.5.4"
 validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -79,6 +82,8 @@ tiktoken-rs = { version = "0.7.0" }
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2.2"
 openssl = "0.10.73"
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 rmcp = { version = "0.8.3", features = ["client", "server",
@@ -145,6 +150,10 @@ harness = false
 path = "benches/request_processing.rs"
 
 [[bench]]
+name = "router_registry_bench"
+harness = false
+
+[[bench]]
 name = "tokenizer_benchmark"
 harness = false
 path = "benches/tokenizer_benchmark.rs"
@@ -153,6 +162,11 @@ path = "benches/tokenizer_benchmark.rs"
 name = "tool_parser_benchmark"
 harness = false
 path = "benches/tool_parser_benchmark.rs"
+
+[[bench]]
+name = "tree_benchmark"
+harness = false
+path = "benches/tree_benchmark.rs"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

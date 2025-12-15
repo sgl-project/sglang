@@ -215,6 +215,9 @@ struct CliArgs {
     prometheus_host: String,
 
     #[arg(long, num_args = 0..)]
+    prometheus_duration_buckets: Vec<f64>,
+
+    #[arg(long, num_args = 0..)]
     request_id_headers: Vec<String>,
 
     #[arg(long, default_value_t = 1800)]
@@ -357,6 +360,12 @@ struct CliArgs {
 
     #[arg(long, default_value = "localhost:4317")]
     otlp_traces_endpoint: String,
+
+    #[arg(long)]
+    tls_cert_path: Option<String>,
+
+    #[arg(long)]
+    tls_key_path: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -656,7 +665,8 @@ impl CliArgs {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
-            .igw(self.enable_igw);
+            .igw(self.enable_igw)
+            .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()
     }
@@ -681,6 +691,11 @@ impl CliArgs {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
+            duration_buckets: if self.prometheus_duration_buckets.is_empty() {
+                None
+            } else {
+                Some(self.prometheus_duration_buckets.clone())
+            },
         });
 
         ServerConfig {

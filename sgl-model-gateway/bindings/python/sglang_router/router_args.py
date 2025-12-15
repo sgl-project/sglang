@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Dict, List, Optional
 
+from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +54,7 @@ class RouterArgs:
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
+    prometheus_duration_buckets: Optional[List[float]] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
@@ -115,6 +118,9 @@ class RouterArgs:
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
     ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
+    # Server TLS configuration
+    server_cert_path: Optional[str] = None
+    server_key_path: Optional[str] = None
     # Trace
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -341,6 +347,12 @@ class RouterArgs:
             help="Host address to bind the Prometheus metrics server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
         )
         parser.add_argument(
+            f"--{prefix}prometheus-duration-buckets",
+            type=float,
+            nargs="+",
+            help="Buckets for Prometheus duration metrics",
+        )
+        parser.add_argument(
             f"--{prefix}request-id-headers",
             type=str,
             nargs="*",
@@ -520,11 +532,13 @@ class RouterArgs:
             default=None,
             help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
         )
+        tool_call_parser_choices = get_available_tool_call_parsers()
         parser.add_argument(
             f"--{prefix}tool-call-parser",
             type=str,
             default=None,
-            help="Specify the parser for handling tool-call interactions",
+            choices=tool_call_parser_choices,
+            help=f"Specify the parser for tool-call interactions (e.g., json, qwen)",
         )
         # MCP server configuration
         parser.add_argument(
@@ -633,6 +647,19 @@ class RouterArgs:
             default=[],
             help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
         )
+        # Server TLS configuration
+        parser.add_argument(
+            f"--{prefix}tls-cert-path",
+            type=str,
+            default=None,
+            help="Path to server TLS certificate (PEM format)",
+        )
+        parser.add_argument(
+            f"--{prefix}tls-key-path",
+            type=str,
+            default=None,
+            help="Path to server TLS private key (PEM format)",
+        )
         parser.add_argument(
             f"--{prefix}enable-trace",
             action="store_true",
@@ -667,6 +694,18 @@ class RouterArgs:
             elif attr.name in cli_args_dict:
                 args_dict[attr.name] = cli_args_dict[attr.name]
 
+            # Special handling for CLI args with dashes vs dataclass fields with underscores
+            # e.g. --tls-cert-path maps to tls_cert_path in args namespace, but we might want server_cert_path in dataclass
+            # Wait, dataclass fields are server_cert_path/server_key_path
+            # CLI args are tls_cert_path/tls_key_path
+            # We need to manually map them if names don't match
+
+        # Map tls args to server cert/key path
+        if f"{prefix}tls_cert_path" in cli_args_dict:
+            args_dict["server_cert_path"] = cli_args_dict[f"{prefix}tls_cert_path"]
+        if f"{prefix}tls_key_path" in cli_args_dict:
+            args_dict["server_key_path"] = cli_args_dict[f"{prefix}tls_key_path"]
+
         # parse special arguments and remove "--prefill" and "--decode" from cli_args_dict
         args_dict["prefill_urls"] = cls._parse_prefill_urls(
             cli_args_dict.get(f"{prefix}prefill", None)
@@ -692,10 +731,6 @@ class RouterArgs:
     def _validate_router_args(self):
         # Validate configuration based on mode
         if self.pd_disaggregation:
-            # Allow empty URLs even without service discovery to support dynamic worker addition
-            # URLs will be validated separately if provided
-            pass
-
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:
                 logger.warning(
