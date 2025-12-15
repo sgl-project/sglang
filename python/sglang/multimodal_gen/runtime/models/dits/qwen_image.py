@@ -16,7 +16,10 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
@@ -26,6 +29,20 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _get_qkv_projections(
+    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
+):
+    img_qkv, _ = attn.to_qkv(hidden_states)
+    img_query, img_key, img_value = img_qkv.chunk(3, dim=-1)
+
+    txt_query = txt_key = txt_value = None
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+        txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        txt_query, txt_key, txt_value = txt_qkv.chunk(3, dim=-1)
+
+    return img_query, img_key, img_value, txt_query, txt_key, txt_value
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -218,7 +235,6 @@ class QwenEmbedRope(nn.Module):
 
 
 class QwenImageCrossAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,  # query_dim
@@ -243,27 +259,31 @@ class QwenImageCrossAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
+        self.added_kv_proj_dim = added_kv_proj_dim
 
-        # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
+        # Use QKVParallelLinear for fused QKV projections
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=head_dim,
+            total_num_heads=num_heads,
+            bias=True,
+        )
+
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
+
         if added_kv_proj_dim is not None:
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
+            # Use QKVParallelLinear for added (encoder) QKV projections
+            self.to_added_qkv = QKVParallelLinear(
+                hidden_size=added_kv_proj_dim,
+                head_size=head_dim,
+                total_num_heads=num_heads,
+                bias=True,
             )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            if context_pre_only is not None:
-                self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
-                )
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
@@ -291,6 +311,7 @@ class QwenImageCrossAttention(nn.Module):
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
             },
         )
 
@@ -303,15 +324,9 @@ class QwenImageCrossAttention(nn.Module):
     ):
         seq_len_txt = encoder_hidden_states.shape[1]
 
-        # Compute QKV for image stream (sample projections)
-        img_query, _ = self.to_q(hidden_states)
-        img_key, _ = self.to_k(hidden_states)
-        img_value, _ = self.to_v(hidden_states)
-
-        # Compute QKV for text stream (context projections)
-        txt_query, _ = self.add_q_proj(encoder_hidden_states)
-        txt_key, _ = self.add_k_proj(encoder_hidden_states)
-        txt_value, _ = self.add_v_proj(encoder_hidden_states)
+        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
+            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        )
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -515,6 +530,8 @@ class QwenImageTransformer2DModel(CachableDiT):
     _no_split_modules = ["QwenImageTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
+
+    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
 
     def __init__(
         self,

@@ -115,9 +115,15 @@ class SamplingParams:
     width_not_provided: bool = False
     fps: int = 24
 
+    # Resolution validation
+    supported_resolutions: list[tuple[int, int]] | None = (
+        None  # None means all resolutions allowed
+    )
+
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = None
+    guidance_scale_2: float = None
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -223,12 +229,33 @@ class SamplingParams:
                 f"num_frames={self.num_frames}"
             )
 
+        # Validate resolution against pipeline-specific supported resolutions
+        if self.height is None and self.width is None:
+            if self.supported_resolutions is not None:
+                self.width, self.height = self.supported_resolutions[0]
+                logger.info(
+                    f"Resolution unspecified, using default: {self.supported_resolutions[0]}"
+                )
+
+        if self.height is not None and self.width is not None:
+            if self.supported_resolutions is not None:
+                if (self.width, self.height) not in self.supported_resolutions:
+                    supported_str = ", ".join(
+                        [f"{w}x{h}" for w, h in self.supported_resolutions]
+                    )
+                    error_msg = (
+                        f"Unsupported resolution: {self.width}x{self.height}. "
+                        f"Supported resolutions: {supported_str}"
+                    )
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             logger.debug(f"Setting num_frames to 1 because this is an image-gen model")
             self.num_frames = 1
             self.data_type = DataType.IMAGE
-        else:
+        elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
@@ -469,6 +496,13 @@ class SamplingParams:
             help="Classifier-free guidance scale",
         )
         parser.add_argument(
+            "--guidance-scale-2",
+            type=float,
+            default=SamplingParams.guidance_scale_2,
+            dest="guidance_scale_2",
+            help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
+        )
+        parser.add_argument(
             "--guidance-rescale",
             type=float,
             default=SamplingParams.guidance_rescale,
@@ -536,8 +570,8 @@ class SamplingParams:
             default=SamplingParams.adjust_frames,
             help=(
                 "Enable/disable adjusting num_frames to evenly split latent frames across GPUs "
-                "and satisfy model temporal constraints. Default: true. "
-                "Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
+                "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
+                "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
         return parser
@@ -558,10 +592,12 @@ class SamplingParams:
             args.width = 1280
             args.height = 720
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
+        args_attrs = set(vars(args).keys())
+        attrs = sampling_params_fields & args_attrs
         args.height_not_provided = False
         args.width_not_provided = False
-        return {attr: getattr(args, attr) for attr in attrs}
+        return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)

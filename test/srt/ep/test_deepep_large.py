@@ -35,6 +35,8 @@ class TestDeepseek(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "deepep",
+                "--moe-runner-backend",
+                "deep_gemm",
                 "--enable-two-batch-overlap",
                 "--ep-num-redundant-experts",
                 "32",
@@ -72,7 +74,6 @@ class TestDeepseek(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.92)
 
 
-@unittest.skip("Skipping this test until it's fixed.")
 class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -94,6 +95,8 @@ class TestDeepseekMTP(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "deepep",
+                "--moe-runner-backend",
+                "deep_gemm",
                 "--enable-two-batch-overlap",
                 "--ep-num-redundant-experts",
                 "32",
