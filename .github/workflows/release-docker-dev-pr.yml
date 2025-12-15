@@ -44,17 +44,6 @@ jobs:
         with:
           ref: ${{ inputs.pr_branch }}
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          docker-images: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -64,23 +53,33 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push Dev Image
+      - name: Get git metadata
+        id: git_meta
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "commit=${COMMIT}" >> $GITHUB_OUTPUT
+          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "Git commit: ${COMMIT}"
+          echo "Git branch: ${BRANCH}"
+
+      - name: Build and Push Test Image
         run: |
           tag=dev-${{ matrix.arch_tag }}-pr-${{ inputs.pr_number }}
 
           docker buildx build \
             --platform ${{ matrix.platform }} \
             --push \
-            -f docker/Dockerfile \
-            --target framework \
+            -f docker/Dockerfile.test \
             --build-arg CUDA_VERSION=${{ matrix.version }} \
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
-            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
             --build-arg USE_LATEST_SGLANG=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg GIT_COMMIT=${{ steps.git_meta.outputs.commit }} \
+            --build-arg GIT_BRANCH=${{ steps.git_meta.outputs.branch }} \
+            --build-arg PR_NUMBER=${{ inputs.pr_number }} \
             -t dougyster/sglang:${tag} \
-            --no-cache \
             .
 
   create-manifests:

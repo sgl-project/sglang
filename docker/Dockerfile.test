@@ -1,0 +1,36 @@
+# Lightweight test Dockerfile for validating PR docker workflow
+# This builds in seconds instead of 30+ minutes
+
+FROM python:3.10-slim
+
+# Accept build args (same as real Dockerfile)
+ARG CUDA_VERSION=12.9.1
+ARG BUILD_TYPE=all
+ARG GRACE_BLACKWELL=0
+ARG USE_LATEST_SGLANG=1
+ARG INSTALL_FLASHINFER_JIT_CACHE=1
+
+# Capture git info at build time
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG PR_NUMBER=unknown
+
+# Write build metadata to a file that can be inspected
+RUN echo "=== SGLang PR Docker Build Test ===" > /build-info.txt && \
+    echo "PR Number: ${PR_NUMBER}" >> /build-info.txt && \
+    echo "Git Branch: ${GIT_BRANCH}" >> /build-info.txt && \
+    echo "Git Commit: ${GIT_COMMIT}" >> /build-info.txt && \
+    echo "Build Time: $(date -u)" >> /build-info.txt && \
+    echo "CUDA Version: ${CUDA_VERSION}" >> /build-info.txt && \
+    echo "Build Type: ${BUILD_TYPE}" >> /build-info.txt && \
+    echo "Grace Blackwell: ${GRACE_BLACKWELL}" >> /build-info.txt && \
+    echo "Use Latest SGLang: ${USE_LATEST_SGLANG}" >> /build-info.txt && \
+    echo "Platform: $(uname -m)" >> /build-info.txt && \
+    cat /build-info.txt
+
+# Create a simple script to display build info
+RUN echo '#!/bin/bash' > /usr/local/bin/show-build-info && \
+    echo 'cat /build-info.txt' >> /usr/local/bin/show-build-info && \
+    chmod +x /usr/local/bin/show-build-info
+
+CMD ["show-build-info"]
