@@ -903,9 +903,42 @@ def silu_and_mul_triton_kernel_tma(
         tl.store(down_ptrs, silu_mul_output)
 
 
-@triton.jit
-def tanh(x):
-    return 2 * tl.sigmoid(2 * x) - 1
+def silu_and_mul_triton(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    hidden_size: int,
+    config: Dict[str, Any],
+    topk_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+) -> None:
+    use_tma = (
+        expert_ids is not None
+        and num_tokens_post_padded is not None
+        and sorted_token_ids is not None
+    )
+
+    if use_tma:
+        grid = (triton.cdiv(sorted_token_ids.shape[0], config["BLOCK_SIZE_M"]),)
+        silu_and_mul_triton_kernel_tma[grid](
+            gateup_output,
+            down_input,
+            hidden_size,
+            expert_ids,
+            num_tokens_post_padded,
+            BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+        )
+    else:
+        grid = (down_input.shape[0],)
+        silu_and_mul_triton_kernel[grid](
+            gateup_output,
+            down_input,
+            hidden_size,
+            topk_ids,
+            BLOCK_SIZE=config["BLOCK_SIZE_N"],
+        )
 
 
 @triton.jit
@@ -950,7 +983,7 @@ def gelu_and_mul_triton_kernel(
                 * gate_output
                 * (
                     1
-                    + tanh(
+                    + tl.tanh(
                         kAlpha
                         * (
                             gate_output

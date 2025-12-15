@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
-import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -29,8 +28,7 @@ from .fused_moe_triton_kernels import (
     gelu_and_mul_triton_kernel,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
-    silu_and_mul_triton_kernel,
-    silu_and_mul_triton_kernel_tma,
+    silu_and_mul_triton,
     support_tensor_descriptor,
 )
 from .moe_align_block_size import moe_align_block_size
@@ -443,12 +441,11 @@ def fused_experts_impl(
     )
 
     config, (down_config, max_block_m) = get_config_func(M)
-    # down_moe_use_tma = (
-    #     _down_moe_use_tma()
-    #     and down_config is not None
-    #     and down_config.pop("USE_TMA", False)
-    # )
-    down_moe_use_tma = True
+    down_moe_use_tma = (
+        _down_moe_use_tma()
+        and down_config is not None
+        and down_config.pop("USE_TMA", False)
+    )
     topk = topk_ids.shape[1]
     max_padded_tokens = (
         min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
@@ -494,12 +491,11 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             config, (down_config, _) = get_config_func(tokens_in_chunk)
-            # down_moe_use_tma = (
-            #     _down_moe_use_tma()
-            #     and down_config is not None
-            #     and down_config.pop("USE_TMA", False)
-            # )
-            down_moe_use_tma = True
+            down_moe_use_tma = (
+                _down_moe_use_tma()
+                and down_config is not None
+                and down_config.pop("USE_TMA", False)
+            )
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         padded_tokens = (
@@ -562,29 +558,18 @@ def fused_experts_impl(
             elif _is_hip or _is_cuda:
                 if not filter_expert:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-                elif down_moe_use_tma:
-                    silu_and_mul_triton_kernel_tma[
-                        (
-                            triton.cdiv(
-                                sorted_token_ids.shape[0], config["BLOCK_SIZE_M"]
-                            ),
-                        )
-                    ](
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        N,
-                        expert_ids,
-                        num_tokens_post_padded,
-                        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
-                        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
-                    )
                 else:
-                    silu_and_mul_triton_kernel[(intermediate_cache2.shape[0],)](
+                    silu_and_mul_triton(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
                         N,
-                        curr_topk_ids,
-                        512,
+                        config,
+                        topk_ids=curr_topk_ids if not down_moe_use_tma else None,
+                        expert_ids=expert_ids if down_moe_use_tma else None,
+                        num_tokens_post_padded=(
+                            num_tokens_post_padded if down_moe_use_tma else None
+                        ),
+                        sorted_token_ids=sorted_token_ids if down_moe_use_tma else None,
                     )
             else:
                 vllm_ops.silu_and_mul(
@@ -601,7 +586,7 @@ def fused_experts_impl(
                     intermediate_cache2,
                     N,
                     curr_topk_ids,
-                    512,
+                    BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
                 )
             else:
                 vllm_ops.gelu_and_mul(
