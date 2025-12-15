@@ -161,12 +161,14 @@ class LoRAPipeline(ComposedPipelineBase):
         Returns:
             The number of layers converted.
         """
-        name_list = []
-        for name, layer in module.named_modules():
-            name_list.append(name)
-        
-        logger.info("===================name_list: %s", name_list)
-        logger.info("===================whitelist: %s", whitelist)
+        if whitelist is not None:
+            name_set = {name for name, _ in module.named_modules()}
+            missing_in_name_list = whitelist - name_set
+            if missing_in_name_list:
+                logger.info(
+                    "===============The following whitelist items are not in name_list: %s",
+                    missing_in_name_list,
+                )
 
         converted_count = 0
         for name, layer in module.named_modules():
