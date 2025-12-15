@@ -33,8 +33,8 @@ pub struct GrpcEPDRouter {
     shared_components: Arc<SharedComponents>,
 }
 
-// TODO: Currently, the implement of grpc epd router has much similarity with rest epd router.
-// we might consider to refactor them to reduce code duplication later.
+// TODO: The implementation of grpc epd router may share similarities with PD mode,
+// which currently falls back to the PD router. Consider refactoring if code duplication is found.
 impl GrpcEPDRouter {
     /// Create a new gRPC EPD router
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {

@@ -7,7 +7,11 @@ use axum::response::Response;
 
 use crate::routers::{
     error,
-    grpc::{context::ExecutionResult, proto_wrapper::ProtoGenerateComplete, utils},
+    grpc::{
+        context::ExecutionResult,
+        proto_wrapper::{ProtoGenerateComplete, ProtoStream},
+        utils,
+    },
 };
 
 /// Collect and merge responses from execution result
@@ -34,49 +38,17 @@ pub async fn collect_responses(
         ExecutionResult::Dual {
             mut prefill,
             decode,
-        } => {
-            // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_responses =
-                utils::collect_stream_responses(&mut prefill, "Prefill").await?;
-
-            // Collect decode for actual output (don't mark completed yet)
-            let mut decode_stream = *decode;
-            let mut decode_responses =
-                utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
-            // Mark both streams as completed now that both succeeded
-            prefill.mark_completed();
-            decode_stream.mark_completed();
-
-            // Merge prefill input_logprobs if requested
-            if merge_logprobs {
-                merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
-            }
-
-            decode_responses
-        }
+        } => collect_prefill_decode(&mut prefill, decode, merge_logprobs).await?,
         ExecutionResult::Triple {
             mut encode,
             mut prefill,
             decode,
         } => {
-            let encode_responses = utils::collect_stream_responses(&mut encode, "Encode").await?;
-            let prefill_responses =
-                utils::collect_stream_responses(&mut prefill, "Prefill").await?;
-
-            let mut decode_stream = *decode;
-            let mut decode_responses =
-                utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
+            // Encode produces embeddings, not logprobs - just collect and complete
+            utils::collect_stream_responses(&mut encode, "Encode").await?;
             encode.mark_completed();
-            prefill.mark_completed();
-            decode_stream.mark_completed();
 
-            if merge_logprobs && !merge_input_logprobs(&encode_responses, &mut decode_responses) {
-                merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
-            }
-
-            decode_responses
+            collect_prefill_decode(&mut *prefill, decode, merge_logprobs).await?
         }
     };
 
@@ -88,6 +60,30 @@ pub async fn collect_responses(
     }
 
     Ok(all_responses)
+}
+
+/// Collect prefill and decode streams, merge input_logprobs if requested
+///
+/// Common logic for Dual (PD) and Triple (EPD) modes.
+async fn collect_prefill_decode(
+    prefill: &mut ProtoStream,
+    decode: Box<ProtoStream>,
+    merge_logprobs: bool,
+) -> Result<Vec<ProtoGenerateComplete>, Response> {
+    let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
+
+    let mut decode_stream = *decode;
+    let mut decode_responses =
+        utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+    prefill.mark_completed();
+    decode_stream.mark_completed();
+
+    if merge_logprobs {
+        merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
+    }
+
+    Ok(decode_responses)
 }
 
 /// Merge prefill input_logprobs into decode responses
