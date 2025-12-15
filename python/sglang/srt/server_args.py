@@ -428,7 +428,8 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
-    # For MTP
+
+    # For Multi-Layer MTP
     enable_mtp: bool = False
 
     # Expert parallelism

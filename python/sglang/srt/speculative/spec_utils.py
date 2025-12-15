@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -20,6 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -47,6 +48,14 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+
+
+def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
+    if server_args is None:
+        server_args = get_global_server_args()
+
+    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    return not server_args.enable_mtp
 
 
 @triton.jit
