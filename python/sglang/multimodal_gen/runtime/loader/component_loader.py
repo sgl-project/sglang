@@ -692,10 +692,6 @@ class TransformerLoader(ComponentLoader):
 
         model = model.eval()
 
-        if hasattr(model, "fuse_qkv_projections"):
-            logger.info("Fusing QKV projections for better performance")
-            model.fuse_qkv_projections()
-
         return model
 
 

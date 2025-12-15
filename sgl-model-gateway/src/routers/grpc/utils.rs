@@ -3,6 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
+use http::StatusCode;
 use serde_json::{json, Map, Value};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -15,6 +16,7 @@ use super::{
 use crate::{
     core::Worker,
     grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
+    observability::metrics::smg_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{
@@ -954,6 +956,33 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
             Ok(json_value) => GenerateFinishReason::Other(json_value),
             Err(_) => GenerateFinishReason::Other(Value::String(reason_str.to_string())),
         },
+    }
+}
+
+// ============================================================================
+// Metrics helper functions (shared by HTTP routers and gRPC pipeline)
+// ============================================================================
+
+/// Map route path to endpoint label for metrics
+pub fn route_to_endpoint(route: &str) -> &'static str {
+    match route {
+        "/v1/chat/completions" => smg_labels::ENDPOINT_CHAT,
+        "/generate" => smg_labels::ENDPOINT_GENERATE,
+        "/v1/completions" => smg_labels::ENDPOINT_COMPLETIONS,
+        "/v1/rerank" => smg_labels::ENDPOINT_RERANK,
+        "/v1/responses" => smg_labels::ENDPOINT_RESPONSES,
+        _ => "other",
+    }
+}
+
+/// Map HTTP status code to error type label for metrics
+pub fn error_type_from_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => smg_labels::ERROR_VALIDATION,
+        404 => smg_labels::ERROR_NO_WORKERS,
+        408 | 504 => smg_labels::ERROR_TIMEOUT,
+        500..=599 => smg_labels::ERROR_BACKEND,
+        _ => smg_labels::ERROR_INTERNAL,
     }
 }
 
