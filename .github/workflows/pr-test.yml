@@ -156,6 +156,7 @@ jobs:
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
@@ -197,6 +198,7 @@ jobs:
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-unit-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]

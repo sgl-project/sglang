@@ -124,14 +124,27 @@ SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' p
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
-    ls -alh sgl-kernel/dist
+    # Artifacts are downloaded into sgl-kernel/dist/ by the CI workflow.
+    # Create the directory to avoid confusing "No such file" failures when
+    # artifacts are missing, then fail with a clear error message.
+    mkdir -p sgl-kernel/dist
+    ls -alh sgl-kernel/dist || true
     # Determine wheel architecture
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
         WHEEL_ARCH="aarch64"
     else
         WHEEL_ARCH="x86_64"
     fi
-    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    WHEEL_PATH="sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl"
+    if [ ! -f "${WHEEL_PATH}" ]; then
+        echo "ERROR: CUSTOM_BUILD_SGL_KERNEL=true but expected wheel not found:"
+        echo "  ${WHEEL_PATH}"
+        echo ""
+        echo "Contents of sgl-kernel/dist/:"
+        ls -alh sgl-kernel/dist || true
+        exit 1
+    fi
+    $PIP_CMD install "${WHEEL_PATH}" --force-reinstall $PIP_INSTALL_SUFFIX
 else
     $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
 fi
