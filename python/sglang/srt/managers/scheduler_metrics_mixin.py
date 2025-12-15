@@ -112,7 +112,7 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_ssm_model:
+        elif self.is_hybrid_ssm:
             (
                 full_num_used,
                 _,
@@ -166,7 +166,7 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_ssm_model:
+            if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
@@ -238,7 +238,7 @@ class SchedulerMetricsMixin:
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_ssm_model:
+        elif self.is_hybrid_ssm:
             (
                 full_num_used,
                 mamba_used,
@@ -315,8 +315,9 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_ssm_model:
+            if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
+            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
@@ -401,7 +402,7 @@ class SchedulerMetricsMixin:
         if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
             num_tokens = max(full_num_used, swa_num_used)
-        elif self.is_ssm_model:
+        elif self.is_hybrid_ssm:
             num_tokens = self._get_mamba_token_info()[0]
         else:
             num_tokens = self._get_token_info()[0]
