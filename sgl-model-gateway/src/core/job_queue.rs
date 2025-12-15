@@ -21,7 +21,7 @@ use crate::{
         WorkerRemovalRequest,
     },
     mcp::McpConfig,
-    observability::metrics::RouterMetrics,
+    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
     workflow::{WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus},
 };
@@ -532,11 +532,22 @@ impl JobQueue {
 
                             if let Some(queue) = context.worker_job_queue.get() {
                                 queue.submit(job).await.map_err(|e| {
+                                    // Layer 4: Record failed registration
+                                    SmgMetrics::record_discovery_registration(
+                                        smg_labels::DISCOVERY_STATIC,
+                                        smg_labels::REGISTRATION_FAILED,
+                                    );
                                     format!(
                                         "Failed to submit AddWorker job for external endpoint {}: {}",
                                         url_for_error, e
                                     )
                                 })?;
+
+                                // Layer 4: Record successful registration job submission
+                                SmgMetrics::record_discovery_registration(
+                                    smg_labels::DISCOVERY_STATIC,
+                                    smg_labels::REGISTRATION_SUCCESS,
+                                );
                                 submitted_count += 1;
                             } else {
                                 return Err("JobQueue not available".to_string());
@@ -547,6 +558,12 @@ impl JobQueue {
                             info!("OpenAI mode: no worker URLs provided");
                             return Ok("OpenAI mode: no worker URLs to initialize".to_string());
                         }
+
+                        // Update workers discovered gauge for static config
+                        SmgMetrics::set_discovery_workers_discovered(
+                            smg_labels::DISCOVERY_STATIC,
+                            submitted_count,
+                        );
 
                         return Ok(format!(
                             "Submitted {} AddWorker jobs for external endpoints",
@@ -591,16 +608,33 @@ impl JobQueue {
 
                     if let Some(queue) = context.worker_job_queue.get() {
                         queue.submit(job).await.map_err(|e| {
+                            // Layer 4: Record failed registration from static config
+                            SmgMetrics::record_discovery_registration(
+                                smg_labels::DISCOVERY_STATIC,
+                                smg_labels::REGISTRATION_FAILED,
+                            );
                             format!(
                                 "Failed to submit AddWorker job for {} worker {}: {}",
                                 worker_type, url_for_error, e
                             )
                         })?;
+
+                        // Layer 4: Record successful registration job submission
+                        SmgMetrics::record_discovery_registration(
+                            smg_labels::DISCOVERY_STATIC,
+                            smg_labels::REGISTRATION_SUCCESS,
+                        );
                         worker_count += 1;
                     } else {
                         return Err("JobQueue not available".to_string());
                     }
                 }
+
+                // Update workers discovered gauge for static config
+                SmgMetrics::set_discovery_workers_discovered(
+                    smg_labels::DISCOVERY_STATIC,
+                    worker_count,
+                );
 
                 Ok(format!("Submitted {} AddWorker jobs", worker_count))
             }
