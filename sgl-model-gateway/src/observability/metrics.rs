@@ -308,6 +308,7 @@ pub mod metrics_labels {
     // Backend types
     pub const BACKEND_REGULAR: &str = "regular";
     pub const BACKEND_PD: &str = "pd";
+    pub const BACKEND_EPD: &str = "epd";
     pub const BACKEND_EXTERNAL: &str = "external";
     pub const BACKEND_HARMONY: &str = "harmony";
 

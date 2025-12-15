@@ -797,7 +797,7 @@ impl StreamingProcessor {
                         },
                         request_id,
                         weight_version,
-                        return_logprob,
+                        true,
                         &tx,
                     )
                     .await;
@@ -1009,9 +1009,13 @@ impl StreamingProcessor {
             tokenizer,
             streams.prefill,
             streams.decode,
-            request_id,
-            weight_version,
-            include_logprobs,
+            GenerateStreamContext {
+                request_id,
+                weight_version,
+                return_logprob: include_logprobs,
+                backend_type: smg_labels::BACKEND_EPD,
+                model: "".to_string(), // Model not needed for metrics here
+            },
             tx,
         )
         .await;

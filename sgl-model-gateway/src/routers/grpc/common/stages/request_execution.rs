@@ -1,17 +1,26 @@
 //! Request execution stage: Execute gRPC requests (single or dual dispatch)
 
+use std::sync::atomic::{AtomicI32, Ordering};
+
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{error, info_span, Instrument};
+use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::PipelineStage;
-use crate::routers::{
-    error,
-    grpc::{
-        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
-        proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+use crate::{
+    core::WorkerType,
+    grpc_client::sglang_proto as sglang,
+    routers::{
+        error,
+        grpc::{
+            context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
+            proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+        },
     },
 };
+
+/// Global counter for generating unique bootstrap room IDs
+static BOOTSTRAP_ROOM_COUNTER: AtomicI32 = AtomicI32::new(0);
 
 type StreamResult = Result<ProtoStream, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -104,7 +113,18 @@ impl PipelineStage for RequestExecutionStage {
                         .await
                 }
                 ExecutionMode::TripleDispatch => {
-                    self.execute_triple_dispatch(proto_request, clients).await
+                    let workers = ctx.state.workers.as_ref().ok_or_else(|| {
+                        error!(
+                            function = "RequestExecutionStage::execute",
+                            "Worker selection not available for triple dispatch"
+                        );
+                        error::internal_error(
+                            "worker_selection_not_available",
+                            "Worker selection not available",
+                        )
+                    })?;
+                    self.execute_triple_dispatch(proto_request, clients, workers)
+                        .await
                 }
             }
         }
@@ -225,10 +245,22 @@ impl RequestExecutionStage {
         })
     }
 
+    /// Execute triple dispatch for EPD (Encode-Prefill-Decode) mode
+    ///
+    /// For multimodal requests, the flow is:
+    /// 1. Router splits the request: image data → Encoder, text → Prefill
+    /// 2. All three workers start in parallel
+    /// 3. Encoder computes embeddings and pushes to Prefill via bootstrap
+    /// 4. Prefill merges embeddings with text and computes KV cache
+    /// 5. Decode receives KV cache from Prefill and generates output
+    ///
+    /// For non-multimodal requests, Encoder receives an empty request but the flow
+    /// still goes through all three workers for consistency.
     async fn execute_triple_dispatch(
         &self,
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
+        workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
         let (encode_client, prefill_client, decode_client) =
             clients.triple_mut().ok_or_else(|| {
@@ -237,14 +269,83 @@ impl RequestExecutionStage {
                     "Expected triple clients but selection differed"
                 );
                 error::internal_error(
+                    "expected_encode/prefill/decode_clients_but_selection_differed",
                     "Expected encode/prefill/decode clients but selection differed",
                 )
             })?;
 
-        let encode_request = proto_request.clone_inner();
-        let prefill_request = proto_request.clone_inner();
-        let decode_request = proto_request;
+        let (encode_worker, prefill_worker, _decode_worker) =
+            workers.triple().ok_or_else(|| {
+                error!(
+                    function = "execute_triple_dispatch",
+                    "Expected triple workers but selection differed"
+                );
+                error::internal_error(
+                    "expected_encode/prefill/decode_workers_but_selection_differed",
+                    "Expected encode/prefill/decode workers but selection differed",
+                )
+            })?;
 
+        // Get bootstrap info from workers
+        let encode_bootstrap_host = encode_worker.bootstrap_host();
+        let encode_bootstrap_port = match encode_worker.worker_type() {
+            WorkerType::Encode { bootstrap_port } => bootstrap_port.unwrap_or(0) as i32,
+            _ => {
+                warn!(
+                    "Encode worker has unexpected type: {:?}",
+                    encode_worker.worker_type()
+                );
+                0
+            }
+        };
+
+        let prefill_bootstrap_host = prefill_worker.bootstrap_host();
+        let prefill_bootstrap_port = prefill_worker.bootstrap_port().unwrap_or(0) as i32;
+
+        // Generate unique room ID for this request's bootstrap coordination
+        let bootstrap_room = BOOTSTRAP_ROOM_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // Check if request has multimodal content
+        let is_multimodal = Self::has_multimodal(&proto_request);
+
+        debug!(
+            encode_bootstrap_host = %encode_bootstrap_host,
+            encode_bootstrap_port = %encode_bootstrap_port,
+            prefill_bootstrap_host = %prefill_bootstrap_host,
+            prefill_bootstrap_port = %prefill_bootstrap_port,
+            bootstrap_room = %bootstrap_room,
+            is_multimodal = %is_multimodal,
+            "EPD dispatch: Setting up bootstrap metadata"
+        );
+
+        // Create specialized requests for each worker
+        //
+        // EPD Flow:
+        // - Encoder: receives multimodal data, outputs embeddings to prefill
+        // - Prefill: receives text tokens + encode bootstrap (to get embeddings),
+        //            outputs KV cache to decode
+        // - Decode:  receives prefill bootstrap (to get KV cache), generates output
+        let encode_request = Self::build_encode_request(&proto_request, bootstrap_room);
+        let prefill_request = Self::build_prefill_request_epd(
+            &proto_request,
+            prefill_bootstrap_host,
+            prefill_bootstrap_port,
+            bootstrap_room,
+            encode_bootstrap_host,
+            encode_bootstrap_port,
+            bootstrap_room,
+        );
+        let decode_request = Self::build_decode_request_epd(
+            &proto_request,
+            prefill_bootstrap_host,
+            prefill_bootstrap_port,
+            bootstrap_room,
+        );
+
+        // Launch all three workers in parallel
+        // The workers coordinate via their bootstrap connections:
+        // - Encoder pushes embeddings to Prefill
+        // - Prefill pushes KV cache to Decode
         let encode_future = encode_client.generate(encode_request);
         let prefill_future = prefill_client.generate(prefill_request);
         let decode_future = decode_client.generate(decode_request);
@@ -263,10 +364,10 @@ impl RequestExecutionStage {
                     error = %e,
                     "Encode worker failed to start"
                 );
-                return Err(error::internal_error(format!(
-                    "Encode worker failed to start: {}",
-                    e
-                )));
+                return Err(error::internal_error(
+                    "encode_worker_failed_to_start",
+                    format!("Encode worker failed to start: {}", e),
+                ));
             }
         };
 
@@ -278,10 +379,10 @@ impl RequestExecutionStage {
                     error = %e,
                     "Prefill worker failed to start"
                 );
-                return Err(error::internal_error(format!(
-                    "Prefill worker failed to start: {}",
-                    e
-                )));
+                return Err(error::internal_error(
+                    "prefill_worker_failed_to_start",
+                    format!("Prefill worker failed to start: {}", e),
+                ));
             }
         };
 
@@ -293,10 +394,10 @@ impl RequestExecutionStage {
                     error = %e,
                     "Decode worker failed to start"
                 );
-                return Err(error::internal_error(format!(
-                    "Decode worker failed to start: {}",
-                    e
-                )));
+                return Err(error::internal_error(
+                    "decode_worker_failed_to_start",
+                    format!("Decode worker failed to start: {}", e),
+                ));
             }
         };
 
@@ -305,5 +406,129 @@ impl RequestExecutionStage {
             prefill: Box::new(prefill_stream),
             decode: Box::new(decode_stream),
         })
+    }
+
+    // ===== EPD Request Building Helpers =====
+
+    /// Check if a request contains multimodal content (images, videos, audio)
+    fn has_multimodal(proto_request: &ProtoGenerateRequest) -> bool {
+        match proto_request {
+            ProtoGenerateRequest::Sglang(req) => {
+                if let Some(ref mm) = req.mm_inputs {
+                    !mm.image_urls.is_empty()
+                        || !mm.video_urls.is_empty()
+                        || !mm.audio_urls.is_empty()
+                        || !mm.image_data.is_empty()
+                        || !mm.video_data.is_empty()
+                        || !mm.audio_data.is_empty()
+                } else {
+                    false
+                }
+            }
+            ProtoGenerateRequest::Vllm(_) => false,
+        }
+    }
+
+    /// Build request for Encoder worker
+    ///
+    /// Encoder receives multimodal inputs and produces embeddings.
+    fn build_encode_request(
+        proto_request: &ProtoGenerateRequest,
+        encode_bootstrap_room: i32,
+    ) -> ProtoGenerateRequest {
+        match proto_request {
+            ProtoGenerateRequest::Sglang(req) => {
+                let mut encoder_req = (**req).clone();
+                // Keep multimodal inputs for encoder
+                // Clear tokenized input - encoder only processes multimodal
+                encoder_req.tokenized = Some(sglang::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: Vec::new(),
+                });
+                // Set room ID so encoder knows this is its assigned room
+                if encoder_req.disaggregated_params.is_none() {
+                    encoder_req.disaggregated_params = Some(sglang::DisaggregatedParams::default());
+                }
+                if let Some(ref mut params) = encoder_req.disaggregated_params {
+                    params.encode_bootstrap_room = Some(encode_bootstrap_room);
+                }
+                ProtoGenerateRequest::Sglang(Box::new(encoder_req))
+            }
+            ProtoGenerateRequest::Vllm(_) => {
+                panic!("EPD mode not supported for vLLM")
+            }
+        }
+    }
+
+    /// Build request for Prefill worker in EPD mode
+    ///
+    /// Prefill receives text tokens and waits for embeddings from Encoder.
+    fn build_prefill_request_epd(
+        proto_request: &ProtoGenerateRequest,
+        prefill_bootstrap_host: &str,
+        prefill_bootstrap_port: i32,
+        prefill_bootstrap_room: i32,
+        encode_bootstrap_host: &str,
+        encode_bootstrap_port: i32,
+        encode_bootstrap_room: i32,
+    ) -> ProtoGenerateRequest {
+        match proto_request {
+            ProtoGenerateRequest::Sglang(req) => {
+                let mut prefill_req = (**req).clone();
+                // Clear multimodal inputs - encoder processes those
+                prefill_req.mm_inputs = None;
+                // Set disaggregated params
+                prefill_req.disaggregated_params = Some(sglang::DisaggregatedParams {
+                    // Prefill's bootstrap info (for decode to connect)
+                    bootstrap_host: prefill_bootstrap_host.to_string(),
+                    bootstrap_port: prefill_bootstrap_port,
+                    bootstrap_room: prefill_bootstrap_room,
+                    // Encode bootstrap info (for prefill to receive embeddings)
+                    encode_bootstrap_host: Some(encode_bootstrap_host.to_string()),
+                    encode_bootstrap_port: Some(encode_bootstrap_port),
+                    encode_bootstrap_room: Some(encode_bootstrap_room),
+                });
+                ProtoGenerateRequest::Sglang(Box::new(prefill_req))
+            }
+            ProtoGenerateRequest::Vllm(_) => {
+                panic!("EPD mode not supported for vLLM")
+            }
+        }
+    }
+
+    /// Build request for Decode worker in EPD mode
+    ///
+    /// Decode receives KV cache from Prefill.
+    fn build_decode_request_epd(
+        proto_request: &ProtoGenerateRequest,
+        prefill_bootstrap_host: &str,
+        prefill_bootstrap_port: i32,
+        prefill_bootstrap_room: i32,
+    ) -> ProtoGenerateRequest {
+        match proto_request {
+            ProtoGenerateRequest::Sglang(req) => {
+                let mut decode_req = (**req).clone();
+                // Clear multimodal inputs - not needed for decode
+                decode_req.mm_inputs = None;
+                // Clear tokenized input - decode receives context from prefill
+                decode_req.tokenized = Some(sglang::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: Vec::new(),
+                });
+                // Set prefill bootstrap info for decode to receive KV cache
+                decode_req.disaggregated_params = Some(sglang::DisaggregatedParams {
+                    bootstrap_host: prefill_bootstrap_host.to_string(),
+                    bootstrap_port: prefill_bootstrap_port,
+                    bootstrap_room: prefill_bootstrap_room,
+                    encode_bootstrap_host: None,
+                    encode_bootstrap_port: None,
+                    encode_bootstrap_room: None,
+                });
+                ProtoGenerateRequest::Sglang(Box::new(decode_req))
+            }
+            ProtoGenerateRequest::Vllm(_) => {
+                panic!("EPD mode not supported for vLLM")
+            }
+        }
     }
 }

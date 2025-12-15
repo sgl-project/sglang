@@ -220,6 +220,7 @@ impl RequestPipeline {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            smg_labels::BACKEND_EPD,
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
@@ -238,6 +239,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: smg_labels::BACKEND_EPD,
         }
     }
 

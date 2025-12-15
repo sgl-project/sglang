@@ -73,6 +73,7 @@ impl PipelineStage for ClientAcquisitionStage {
                         "vLLM backend does not support encode/prefill/decode disaggregated mode"
                     );
                     return Err(error::bad_request(
+                        "vllm_epd_mode_not_supported",
                         "vLLM backend does not support encode/prefill/decode disaggregated mode. \
                          Please use runtime_type: sglang for EPD mode, or use a regular worker configuration."
                     ));
