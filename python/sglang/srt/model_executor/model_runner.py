@@ -2003,6 +2003,7 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid_swa:
+                kwargs = {}
                 if self.is_hybrid_swa_compress:
                     kwargs = {
                         "swa_head_num": max(
@@ -2014,8 +2015,6 @@ class ModelRunner:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
-                else:
-                    kwargs = {}
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
