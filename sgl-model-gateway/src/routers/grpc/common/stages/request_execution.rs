@@ -1,16 +1,14 @@
 //! Request execution stage: Execute gRPC requests (single or dual dispatch)
 
-use std::sync::atomic::{AtomicI32, Ordering};
-
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{debug, error, info_span, warn, Instrument};
+use tracing::{debug, error, info_span, Instrument};
 
 use super::PipelineStage;
 use crate::{
-    core::WorkerType,
     grpc_client::sglang_proto as sglang,
     routers::{
+        context::{ClientSelection, ExecutionResult, RequestContext},
         error,
         grpc::{
             context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
@@ -18,9 +16,6 @@ use crate::{
         },
     },
 };
-
-/// Global counter for generating unique bootstrap room IDs
-static BOOTSTRAP_ROOM_COUNTER: AtomicI32 = AtomicI32::new(0);
 
 type StreamResult = Result<ProtoStream, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -113,6 +108,7 @@ impl PipelineStage for RequestExecutionStage {
                         .await
                 }
                 ExecutionMode::TripleDispatch => {
+<<<<<<< HEAD
                     let workers = ctx.state.workers.as_ref().ok_or_else(|| {
                         error!(
                             function = "RequestExecutionStage::execute",
@@ -125,6 +121,9 @@ impl PipelineStage for RequestExecutionStage {
                     })?;
                     self.execute_triple_dispatch(proto_request, clients, workers)
                         .await
+=======
+                    self.execute_triple_dispatch(proto_request, clients).await
+>>>>>>> f6244831d ([model gateway] Fix EPD metadata injection to use RequestBuildingStage metadata)
                 }
             }
         }
@@ -254,13 +253,12 @@ impl RequestExecutionStage {
     /// 4. Prefill merges embeddings with text and computes KV cache
     /// 5. Decode receives KV cache from Prefill and generates output
     ///
-    /// For non-multimodal requests, Encoder receives an empty request but the flow
-    /// still goes through all three workers for consistency.
+    /// Bootstrap metadata is injected by RequestBuildingStage via helpers::inject_bootstrap_metadata().
+    /// This function extracts that metadata and creates split requests for each worker.
     async fn execute_triple_dispatch(
         &self,
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
-        workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
         let (encode_client, prefill_client, decode_client) =
             clients.triple_mut().ok_or_else(|| {
@@ -274,6 +272,7 @@ impl RequestExecutionStage {
                 )
             })?;
 
+<<<<<<< HEAD
         let (encode_worker, prefill_worker, _decode_worker) =
             workers.triple().ok_or_else(|| {
                 error!(
@@ -304,43 +303,41 @@ impl RequestExecutionStage {
 
         // Generate unique room ID for this request's bootstrap coordination
         let bootstrap_room = BOOTSTRAP_ROOM_COUNTER.fetch_add(1, Ordering::Relaxed);
+=======
+        // Extract bootstrap metadata that was injected by RequestBuildingStage
+        let disagg_params = Self::extract_disaggregated_params(&proto_request).ok_or_else(|| {
+            error!(
+                function = "execute_triple_dispatch",
+                "DisaggregatedParams not found in request - RequestBuildingStage may not have injected metadata"
+            );
+            error::internal_error("EPD bootstrap metadata not found in request")
+        })?;
+>>>>>>> f6244831d ([model gateway] Fix EPD metadata injection to use RequestBuildingStage metadata)
 
         // Check if request has multimodal content
         let is_multimodal = Self::has_multimodal(&proto_request);
 
         debug!(
-            encode_bootstrap_host = %encode_bootstrap_host,
-            encode_bootstrap_port = %encode_bootstrap_port,
-            prefill_bootstrap_host = %prefill_bootstrap_host,
-            prefill_bootstrap_port = %prefill_bootstrap_port,
-            bootstrap_room = %bootstrap_room,
+            prefill_bootstrap_host = %disagg_params.bootstrap_host,
+            prefill_bootstrap_port = %disagg_params.bootstrap_port,
+            prefill_bootstrap_room = %disagg_params.bootstrap_room,
+            encode_bootstrap_host = ?disagg_params.encode_bootstrap_host,
+            encode_bootstrap_port = ?disagg_params.encode_bootstrap_port,
+            encode_bootstrap_room = ?disagg_params.encode_bootstrap_room,
             is_multimodal = %is_multimodal,
-            "EPD dispatch: Setting up bootstrap metadata"
+            "EPD dispatch: Using injected bootstrap metadata"
         );
 
-        // Create specialized requests for each worker
+        // Create specialized requests for each worker using the injected metadata
         //
         // EPD Flow:
         // - Encoder: receives multimodal data, outputs embeddings to prefill
         // - Prefill: receives text tokens + encode bootstrap (to get embeddings),
         //            outputs KV cache to decode
         // - Decode:  receives prefill bootstrap (to get KV cache), generates output
-        let encode_request = Self::build_encode_request(&proto_request, bootstrap_room);
-        let prefill_request = Self::build_prefill_request_epd(
-            &proto_request,
-            prefill_bootstrap_host,
-            prefill_bootstrap_port,
-            bootstrap_room,
-            encode_bootstrap_host,
-            encode_bootstrap_port,
-            bootstrap_room,
-        );
-        let decode_request = Self::build_decode_request_epd(
-            &proto_request,
-            prefill_bootstrap_host,
-            prefill_bootstrap_port,
-            bootstrap_room,
-        );
+        let encode_request = Self::build_encode_request(&proto_request, &disagg_params);
+        let prefill_request = Self::build_prefill_request_epd(&proto_request, &disagg_params);
+        let decode_request = Self::build_decode_request_epd(&proto_request, &disagg_params);
 
         // Launch all three workers in parallel
         // The workers coordinate via their bootstrap connections:
@@ -408,7 +405,17 @@ impl RequestExecutionStage {
         })
     }
 
-    // ===== EPD Request Building Helpers =====
+    // ===== EPD Helper Functions =====
+
+    /// Extract DisaggregatedParams from a proto request
+    fn extract_disaggregated_params(
+        proto_request: &ProtoGenerateRequest,
+    ) -> Option<sglang::DisaggregatedParams> {
+        match proto_request {
+            ProtoGenerateRequest::Sglang(req) => req.disaggregated_params.clone(),
+            ProtoGenerateRequest::Vllm(_) => None,
+        }
+    }
 
     /// Check if a request contains multimodal content (images, videos, audio)
     fn has_multimodal(proto_request: &ProtoGenerateRequest) -> bool {
@@ -432,9 +439,10 @@ impl RequestExecutionStage {
     /// Build request for Encoder worker
     ///
     /// Encoder receives multimodal inputs and produces embeddings.
+    /// Uses the encode_bootstrap_room from injected metadata.
     fn build_encode_request(
         proto_request: &ProtoGenerateRequest,
-        encode_bootstrap_room: i32,
+        disagg_params: &sglang::DisaggregatedParams,
     ) -> ProtoGenerateRequest {
         match proto_request {
             ProtoGenerateRequest::Sglang(req) => {
@@ -445,13 +453,17 @@ impl RequestExecutionStage {
                     original_text: String::new(),
                     input_ids: Vec::new(),
                 });
-                // Set room ID so encoder knows this is its assigned room
-                if encoder_req.disaggregated_params.is_none() {
-                    encoder_req.disaggregated_params = Some(sglang::DisaggregatedParams::default());
-                }
-                if let Some(ref mut params) = encoder_req.disaggregated_params {
-                    params.encode_bootstrap_room = Some(encode_bootstrap_room);
-                }
+                // Set encode bootstrap room from injected metadata
+                encoder_req.disaggregated_params = Some(sglang::DisaggregatedParams {
+                    // Encoder doesn't need prefill bootstrap info
+                    bootstrap_host: String::new(),
+                    bootstrap_port: 0,
+                    bootstrap_room: 0,
+                    // Use the encode bootstrap room from injected metadata
+                    encode_bootstrap_host: disagg_params.encode_bootstrap_host.clone(),
+                    encode_bootstrap_port: disagg_params.encode_bootstrap_port,
+                    encode_bootstrap_room: disagg_params.encode_bootstrap_room,
+                });
                 ProtoGenerateRequest::Sglang(Box::new(encoder_req))
             }
             ProtoGenerateRequest::Vllm(_) => {
@@ -463,31 +475,18 @@ impl RequestExecutionStage {
     /// Build request for Prefill worker in EPD mode
     ///
     /// Prefill receives text tokens and waits for embeddings from Encoder.
+    /// Uses both prefill bootstrap (for decode) and encode bootstrap (to receive from encoder).
     fn build_prefill_request_epd(
         proto_request: &ProtoGenerateRequest,
-        prefill_bootstrap_host: &str,
-        prefill_bootstrap_port: i32,
-        prefill_bootstrap_room: i32,
-        encode_bootstrap_host: &str,
-        encode_bootstrap_port: i32,
-        encode_bootstrap_room: i32,
+        disagg_params: &sglang::DisaggregatedParams,
     ) -> ProtoGenerateRequest {
         match proto_request {
             ProtoGenerateRequest::Sglang(req) => {
                 let mut prefill_req = (**req).clone();
                 // Clear multimodal inputs - encoder processes those
                 prefill_req.mm_inputs = None;
-                // Set disaggregated params
-                prefill_req.disaggregated_params = Some(sglang::DisaggregatedParams {
-                    // Prefill's bootstrap info (for decode to connect)
-                    bootstrap_host: prefill_bootstrap_host.to_string(),
-                    bootstrap_port: prefill_bootstrap_port,
-                    bootstrap_room: prefill_bootstrap_room,
-                    // Encode bootstrap info (for prefill to receive embeddings)
-                    encode_bootstrap_host: Some(encode_bootstrap_host.to_string()),
-                    encode_bootstrap_port: Some(encode_bootstrap_port),
-                    encode_bootstrap_room: Some(encode_bootstrap_room),
-                });
+                // Use the full injected metadata - prefill needs both encode and prefill bootstrap info
+                prefill_req.disaggregated_params = Some(disagg_params.clone());
                 ProtoGenerateRequest::Sglang(Box::new(prefill_req))
             }
             ProtoGenerateRequest::Vllm(_) => {
@@ -499,11 +498,10 @@ impl RequestExecutionStage {
     /// Build request for Decode worker in EPD mode
     ///
     /// Decode receives KV cache from Prefill.
+    /// Uses prefill bootstrap info to know where to receive KV cache.
     fn build_decode_request_epd(
         proto_request: &ProtoGenerateRequest,
-        prefill_bootstrap_host: &str,
-        prefill_bootstrap_port: i32,
-        prefill_bootstrap_room: i32,
+        disagg_params: &sglang::DisaggregatedParams,
     ) -> ProtoGenerateRequest {
         match proto_request {
             ProtoGenerateRequest::Sglang(req) => {
@@ -515,11 +513,12 @@ impl RequestExecutionStage {
                     original_text: String::new(),
                     input_ids: Vec::new(),
                 });
-                // Set prefill bootstrap info for decode to receive KV cache
+                // Decode only needs prefill bootstrap info (to receive KV cache)
                 decode_req.disaggregated_params = Some(sglang::DisaggregatedParams {
-                    bootstrap_host: prefill_bootstrap_host.to_string(),
-                    bootstrap_port: prefill_bootstrap_port,
-                    bootstrap_room: prefill_bootstrap_room,
+                    bootstrap_host: disagg_params.bootstrap_host.clone(),
+                    bootstrap_port: disagg_params.bootstrap_port,
+                    bootstrap_room: disagg_params.bootstrap_room,
+                    // Decode doesn't need encode bootstrap info
                     encode_bootstrap_host: None,
                     encode_bootstrap_port: None,
                     encode_bootstrap_room: None,
