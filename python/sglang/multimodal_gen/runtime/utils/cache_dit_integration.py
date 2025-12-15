@@ -25,6 +25,7 @@ from cache_dit import (
     steps_mask,
 )
 from cache_dit.caching.block_adapters import BlockAdapterRegister
+from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 
 def get_scm_mask(
@@ -118,6 +119,8 @@ def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
     model_name: str = "transformer",
+    sp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
@@ -126,6 +129,8 @@ def enable_cache_on_transformer(
 
     Args:
         model_name: Name of the model for logging purposes.
+        sp_group: Sequence parallel process group (for Ulysses/Ring).
+        tp_group: Tensor parallel process group.
 
     """
     if not config.enabled:
@@ -194,10 +199,53 @@ def enable_cache_on_transformer(
             config.steps_computation_policy,
         )
 
+    parallelism_config = None
+    if sp_group is not None or tp_group is not None:
+        ulysses_size = None
+        ring_size = None
+        tp_size = None
+
+        if sp_group is not None:
+            import torch.distributed as dist
+
+            sp_world_size = dist.get_world_size(sp_group)
+            ulysses_size = sp_world_size
+            logger.info(
+                "Detected SP group with world_size=%d, using ulysses_size=%d",
+                sp_world_size,
+                ulysses_size,
+            )
+
+        if tp_group is not None:
+            import torch.distributed as dist
+
+            tp_world_size = dist.get_world_size(tp_group)
+            tp_size = tp_world_size
+            logger.info(
+                "Detected TP group with world_size=%d, using tp_size=%d",
+                tp_world_size,
+                tp_size,
+            )
+
+        parallelism_config = ParallelismConfig(
+            backend=(
+                ParallelismBackend.NATIVE_DIFFUSER
+                if ulysses_size or ring_size
+                else ParallelismBackend.NATIVE_PYTORCH
+            ),
+            ulysses_size=ulysses_size,
+            ring_size=ring_size,
+            tp_size=tp_size,
+        )
+        logger.info(
+            "Created parallelism config: %s", parallelism_config.strify(details=True)
+        )
+
     cache_dit.enable_cache(
         transformer,
         cache_config=cache_config,
         calibrator_config=calibrator_config,
+        parallelism_config=parallelism_config,
     )
 
     return transformer
@@ -209,6 +257,8 @@ def enable_cache_on_dual_transformer(
     primary_config: CacheDitConfig,
     secondary_config: CacheDitConfig,
     model_name: str = "wan2.2",
+    sp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
@@ -219,6 +269,8 @@ def enable_cache_on_dual_transformer(
     Args:
         primary_config: CacheDitConfig for primary transformer.
         secondary_config: CacheDitConfig for secondary transformer.
+        sp_group: Sequence parallel process group (for Ulysses/Ring).
+        tp_group: Tensor parallel process group.
     """
     _supported_dual_transformer_models = [
         "wan2.2",  # Currently, only Wan2.2 will run into dual-transformer case
@@ -320,6 +372,49 @@ def enable_cache_on_dual_transformer(
             primary_config.steps_computation_policy,
         )
 
+    parallelism_config = None
+    if sp_group is not None or tp_group is not None:
+        ulysses_size = None
+        ring_size = None
+        tp_size = None
+
+        if sp_group is not None:
+            import torch.distributed as dist
+
+            sp_world_size = dist.get_world_size(sp_group)
+            ulysses_size = sp_world_size
+            logger.info(
+                "Detected SP group with world_size=%d, using ulysses_size=%d",
+                sp_world_size,
+                ulysses_size,
+            )
+
+        if tp_group is not None:
+            import torch.distributed as dist
+
+            tp_world_size = dist.get_world_size(tp_group)
+            tp_size = tp_world_size
+            logger.info(
+                "Detected TP group with world_size=%d, using tp_size=%d",
+                tp_world_size,
+                tp_size,
+            )
+
+        parallelism_config = ParallelismConfig(
+            backend=(
+                ParallelismBackend.NATIVE_DIFFUSER
+                if ulysses_size or ring_size
+                else ParallelismBackend.NATIVE_PYTORCH
+            ),
+            ulysses_size=ulysses_size,
+            ring_size=ring_size,
+            tp_size=tp_size,
+        )
+        logger.info(
+            "Created parallelism config for dual-transformer: %s",
+            parallelism_config.strify(details=True),
+        )
+
     # Get blocks attribute - Wan transformers use 'blocks' attribute
     transformer_blocks = getattr(transformer, "blocks", None)
     transformer_2_blocks = getattr(transformer_2, "blocks", None)
@@ -345,6 +440,7 @@ def enable_cache_on_dual_transformer(
                 params_modifiers=[primary_modifier, secondary_modifier],
                 has_separate_cfg=True,
             ),
+            parallelism_config=parallelism_config,
         )
     else:
         raise ValueError(

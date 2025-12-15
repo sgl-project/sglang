@@ -192,7 +192,11 @@ class DenoisingStage(PipelineStage):
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
 
-        from sglang.multimodal_gen.runtime.distributed import get_world_size
+        from sglang.multimodal_gen.runtime.distributed import (
+            get_sp_group,
+            get_tp_group,
+            get_world_size,
+        )
         from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
             CacheDitConfig,
             enable_cache_on_dual_transformer,
@@ -200,13 +204,31 @@ class DenoisingStage(PipelineStage):
             get_scm_mask,
         )
 
-        if get_world_size() > 1:
-            logger.warning(
-                "cache-dit is disabled in distributed environment (world_size=%d). "
-                "Distributed support will be added in a future version.",
-                get_world_size(),
+        world_size = get_world_size()
+        parallelized = world_size > 1
+
+        sp_group = None
+        tp_group = None
+        if parallelized:
+            sp_group = get_sp_group()
+            tp_group = get_tp_group()
+
+            has_sp = sp_group is not None
+            has_tp = tp_group is not None
+
+            if has_sp and has_tp:
+                raise ValueError(
+                    "cache-dit does not support hybrid parallelism (SP + TP). "
+                    "Please use either sequence parallelism or tensor parallelism, not both."
+                )
+
+            logger.info(
+                "cache-dit enabled in distributed environment (world_size=%d, "
+                "sp_group=%s, tp_group=%s)",
+                world_size,
+                has_sp,
+                has_tp,
             )
-            return
         # === Parse SCM configuration from envs ===
         # SCM is shared between primary and secondary transformers
         scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
@@ -288,6 +310,8 @@ class DenoisingStage(PipelineStage):
                 primary_config,
                 secondary_config,
                 model_name="wan2.2",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d)",
@@ -299,6 +323,8 @@ class DenoisingStage(PipelineStage):
                 self.transformer,
                 primary_config,
                 model_name="transformer",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
