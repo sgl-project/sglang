@@ -316,10 +316,10 @@ void fused_add_layernorm_kernel_impl(
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
-  AT_DISPATCH_BOOL(residual != nullptr, has_residual);
   constexpr int kVecSize = bVec::size();
 
-  int64_t parallel_size{batch_size * seq_len};
+  const bool has_residual{resudual != nullptr};
+  const int64_t parallel_size{batch_size * seq_len};
   at::parallel_for(0, parallel_size, 0, [&](int64_t begin, int64_t end) {
     float* __restrict__ buffer_ptr = buffer + at::get_thread_num() * hidden_size;
 
