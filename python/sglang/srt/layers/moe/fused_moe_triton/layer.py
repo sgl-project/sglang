@@ -278,12 +278,7 @@ class FusedMoE(torch.nn.Module):
     def _maybe_apply_routed_scaling_factor_to_output(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """Apply routed scaling factor (if needed) inside the MoE module.
-
-        Historically, some call sites applied `routed_scaling_factor` outside the
-        MoE layer for specific backends (e.g. CPU paths or KT wrapper).
-        This helper centralizes that logic inside the MoE module.
-        """
+        """Apply routed scaling factor (if needed) inside the MoE module."""
         routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
         if routed_scaling_factor is None or routed_scaling_factor == 1.0:
             return hidden_states
@@ -298,7 +293,7 @@ class FusedMoE(torch.nn.Module):
         if self.moe_runner_config.no_combine:
             return hidden_states
 
-        # NOTE: For most GPU runners, routed scaling is handled internally by
+        # NOTE: routed scaling is handled internally by
         # the runner kernels. The remaining cases historically required the
         # scaling to be applied at the Python layer.
         if (
