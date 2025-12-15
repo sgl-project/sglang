@@ -38,16 +38,30 @@ def _patch_cache_dit_similarity():
     if _original_similarity is None:
         _original_similarity = cache_manager.CachedContextManager.similarity
 
-    def patched_similarity(self, t1, t2, threshold, parallelized, prefix=""):
+    def patched_similarity(self, t1, t2, *, threshold, parallelized=False, prefix="Fn"):
         if not parallelized:
-            return _original_similarity(self, t1, t2, threshold, parallelized, prefix)
+            return _original_similarity(
+                self,
+                t1,
+                t2,
+                threshold=threshold,
+                parallelized=parallelized,
+                prefix=prefix,
+            )
 
         sp_group = getattr(self, "_sglang_sp_group", None)
         tp_group = getattr(self, "_sglang_tp_group", None)
         target_group = sp_group or tp_group
 
         if target_group is None:
-            return _original_similarity(self, t1, t2, threshold, parallelized, prefix)
+            return _original_similarity(
+                self,
+                t1,
+                t2,
+                threshold=threshold,
+                parallelized=parallelized,
+                prefix=prefix,
+            )
 
         condition_thresh = self.get_important_condition_threshold()
         if condition_thresh > 0.0:
