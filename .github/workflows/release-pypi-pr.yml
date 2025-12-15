@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   build-pr-wheel:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'dougyster/sglang'
     runs-on: ubuntu-latest
     outputs:
       wheel_version: ${{ steps.gen_version.outputs.wheel_version }}
@@ -133,7 +133,7 @@ jobs:
         with:
           tag_name: pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}
           name: PR #${{ inputs.pr_number }} Build ${{ needs.build-pr-wheel.outputs.build_date }} (${{ needs.build-pr-wheel.outputs.commit_hash }})
-          repository: sgl-project/whl
+          repository: dougyster/test-whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           prerelease: true
           body: |
@@ -156,7 +156,7 @@ jobs:
 
       - name: Clone wheel index repository
         run: |
-          git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+          git clone https://oauth2:${WHL_TOKEN}@github.com/dougyster/test-whl.git sgl-whl
           cd sgl-whl
           git config --local user.name "sglang-bot"
           git config --local user.email "sglangbot@gmail.com"

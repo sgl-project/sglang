@@ -44,7 +44,7 @@ def update_wheel_index(
         return
 
     # Base URL for wheels stored in GitHub Releases
-    base_url = "https://github.com/sgl-project/whl/releases/download"
+    base_url = "https://github.com/dougyster/test-whl/releases/download"
     release_tag = f"pr-{pr_number}-{build_date}-{commit_hash}"
 
     # Create pr directory structure following PEP 503
