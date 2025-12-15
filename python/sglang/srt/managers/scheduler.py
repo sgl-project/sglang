@@ -1849,11 +1849,11 @@ class Scheduler(
                 if not self.tp_worker.can_run_lora_batch(
                     next_batch_loras | {req.lora_id}
                 ):
-                    draining_loras.update(
+                    draining_loras = {
                         lora_id
                         for lora_id in running_batch_loras
                         if lora_id is not None
-                    )
+                    }
 
                     continue
 
