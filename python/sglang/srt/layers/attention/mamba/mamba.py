@@ -379,7 +379,6 @@ class MambaMixer2(torch.nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
-            reduce_results=False,
         )
 
         self.norm = Mixer2RMSNormGated(

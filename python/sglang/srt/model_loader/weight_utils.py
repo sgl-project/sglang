@@ -398,14 +398,17 @@ def _find_local_hf_snapshot_dir_unlocked(
                     )
                     return None
                 else:
-                    # Cannot selectively clean (e.g., missing shards) - remove entire cache
+                    # Missing shards (not corruption) - let snapshot_download handle it.
+                    # IMPORTANT: Do NOT delete the entire cache here, as other processes
+                    # (TP/EP ranks) may already be loading weights from these files.
+                    # Deleting the cache while other processes are using it causes
+                    # FileNotFoundError race conditions. Instead, just return None
+                    # to trigger a download - snapshot_download will only fetch
+                    # missing files without disturbing existing ones.
                     log_info_on_rank0(
                         logger,
                         f"Validation failed for {model_name_or_path}: {error_msg}. "
-                        "Will remove entire cache and re-download.",
-                    )
-                    _cleanup_corrupted_model_cache(
-                        model_name_or_path, found_local_snapshot_dir, error_msg
+                        "Will attempt to download missing files.",
                     )
                     return None
 
