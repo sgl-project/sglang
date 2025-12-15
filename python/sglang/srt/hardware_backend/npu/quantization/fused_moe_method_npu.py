@@ -142,7 +142,8 @@ def npu_fused_moe_without_routing_weights_bf16(
 
 class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 
-    def release_weight_cache(self, weight: torch.Tensor):
+    @classmethod
+    def release_weight_cache(cls, weight: torch.Tensor):
         # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
         origin_weight = weight.data.transpose(1, 2)
         new_weight = origin_weight.contiguous()
@@ -249,14 +250,11 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 
 class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 
-    def __init__(self) -> None:
-        self.group_size = 0 ### TODO or 256
-        self.tp_size = 1
-        self.is_per_channel_weight = self.group_size == 0
-
-    def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
+    @classmethod
+    def process_scale(cls, weight: torch.Tensor, scale, per_group_scale):
         scale = scale.transpose(1, 2).contiguous()
-        if self.is_per_channel_weight:
+        #if cls.is_per_channel_weight:
+        if True:
             scale_np = scale.cpu().numpy()
             scale_np.dtype = np.uint32
             scale_uint64_tensor = torch.from_numpy(scale_np.astype(
@@ -286,7 +284,8 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         sscale_uint64_tensor = sscale_uint64_tensor.npu()
         return sscale_uint64_tensor, bias
 
-    def update_bias(self, layer, w13_bias, w2_bias):
+    @classmethod
+    def update_bias(cls, layer, w13_bias, w2_bias):
         layer.w13_scale_bias.data = (
             layer.w13_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
         )
@@ -294,7 +293,8 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
             layer.w2_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
         )
 
-    def pack_to_int32(self, weight: torch.Tensor):
+    @classmethod
+    def pack_to_int32(cls, weight: torch.Tensor):
         # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
         assert (
             weight.shape[-1] % 4 == 0
@@ -337,12 +337,11 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
-        layer.w13_weight.data = self.pack_to_int32(layer.w13_weight.data)
-        layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
+        layer.w13_weight.data = cls.pack_to_int32(layer.w13_weight.data)
+        layer.w2_weight.data = cls.pack_to_int32(layer.w2_weight.data)
 
-    @classmethod
+    staticmethod
     def apply(
-        cls,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
@@ -354,9 +353,8 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
         top_k=topk_ids.shape[1]
         group_list_type = 1
-
-        cls.original_shape = hidden_states.shape
-        cls.topk_weights = topk_weights
+        original_shape = hidden_states.shape
+        topk_weights = topk_weights
         
         num_tokens = hidden_states.shape[:-1].numel()
 
@@ -364,7 +362,7 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         last_expert_idx = 128
         global_num_experts = 128
 
-        sorted_hidden_states, cls.expanded_row_idx, expert_tokens, pertoken_scale = (
+        sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,
                 topk_ids,
@@ -415,30 +413,19 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
             output_dtype=_output_dtype,
         )[0]
 
-        final_hidden_states = cls.token_combine(hidden_states=output)
+        assert original_shape is not None
+        final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
+            permuted_tokens=output,
+            sorted_indices=torch.abs(expanded_row_idx),
+            probs=topk_weights)
+        if len(original_shape) == 3:
+            final_hidden_states = final_hidden_states.view(original_shape)
 
         return StandardCombineInput(hidden_states=final_hidden_states)
 
-    def token_combine(self, 
-                      hidden_states: torch.Tensor,
-                      bias: torch.Tensor = None):
-        assert self.original_shape is not None
-        final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
-            permuted_tokens=hidden_states,
-            sorted_indices=torch.abs(self.expanded_row_idx),
-            probs=self.topk_weights)
-        if len(self.original_shape) == 3:
-            final_hidden_states = final_hidden_states.view(self.original_shape)
-
-        # these values are no longer used, so they need to be set to None for memory release.
-        self.expert_map = None
-        self.topk_weights = None
-        self.topk_ids = None
-        self.expanded_row_idx = None
-        return final_hidden_states
-
     @staticmethod
     def apply_without_routing_weights(
+        cls,
         layer,
         hidden_states,
         hidden_states_scale,
