@@ -250,20 +250,19 @@ class MooncakeStore(HiCacheStorage):
                 self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
-                self.enable_pp = self.pp_size > 1
-                if self.enable_pp:
-                    self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-                    self.mla_suffix = f"{self.pp_rank}"
-                else:
-                    self.mha_suffix = f"{self.local_rank}"
-                    self.mla_suffix = ""
             else:
                 self.is_mla_backend = False
                 self.local_rank = 0
                 self.pp_rank = 0
                 self.pp_size = 1
-                self.enable_pp = False
-                self.suffix = f"{self.local_rank}"
+
+            self.enable_pp = self.pp_size > 1
+            if self.enable_pp:
+                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                self.mla_suffix = f"{self.pp_rank}"
+            else:
+                self.mha_suffix = f"{self.local_rank}"
+                self.mla_suffix = ""
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
