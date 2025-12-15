@@ -22,12 +22,70 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     unpad_draft_extend_output_kernel,
 )
 
+try:
+    import cutlass.cute.testing as cute_testing  # type: ignore
+except Exception:
+    cute_testing = None
 
-def _bench_ms(fn, warmup: int, iters: int) -> float:
-    # First call triggers compilation (Triton/CuTe). Exclude it from timing.
-    fn()
+
+def _bench_ms(
+    *,
+    timer: str,
+    fn,
+    warmup: int,
+    iters: int,
+    workspace_generator=None,
+    workspace_count: int = 1,
+    use_cuda_graphs: bool = False,
+) -> float:
+    """
+    Returns time in milliseconds.
+
+    timer="triton": uses triton.testing.do_bench (CUDA events)
+    timer="cute": uses cutlass.cute.testing.benchmark (CUDA events + workspace cycling + optional CUDA graphs)
+    """
+    if timer == "cute":
+        if cute_testing is None:
+            raise RuntimeError(
+                "cutlass.cute.testing is not available; use --timer triton"
+            )
+        if workspace_generator is None:
+            us = cute_testing.benchmark(
+                fn,
+                warmup_iterations=warmup,
+                iterations=iters,
+                use_cuda_graphs=use_cuda_graphs,
+            )
+        else:
+            us = cute_testing.benchmark(
+                fn,
+                warmup_iterations=warmup,
+                iterations=iters,
+                workspace_generator=workspace_generator,
+                workspace_count=workspace_count,
+                use_cuda_graphs=use_cuda_graphs,
+            )
+        return float(us) / 1000.0
+
+    # timer == "triton": do_bench expects a zero-arg callable.
+    if workspace_generator is None or workspace_count <= 1:
+        # First call triggers compilation (Triton/CuTe). Exclude it from timing.
+        fn()
+        torch.cuda.synchronize()
+        return float(do_bench(fn, warmup=warmup, rep=iters))
+
+    # Workspace cycling to reduce L2 effects.
+    workspaces = [workspace_generator() for _ in range(workspace_count)]
+    idx = {"i": 0}
+
+    def run():
+        ws = workspaces[idx["i"]]
+        idx["i"] = (idx["i"] + 1) % workspace_count
+        fn(*ws)
+
+    run()
     torch.cuda.synchronize()
-    return float(do_bench(fn, warmup=warmup, rep=iters))
+    return float(do_bench(run, warmup=warmup, rep=iters))
 
 
 def _make_pad_inputs(
@@ -97,17 +155,17 @@ def benchmark_pad_triton(
     fill_ratio: float,
     warmup: int,
     iters: int,
+    timer: str = "triton",
+    workspace_count: int = 1,
+    use_cuda_graphs: bool = False,
 ):
     """Benchmark Triton pad kernel."""
-    q, padded_q, seq_lens, cumsum = _make_pad_inputs(
-        batch_size, max_seq_len, num_heads, head_dim, dtype, fill_ratio
-    )
     BLOCK_SIZE = 64
     num_head_blocks = triton.cdiv(num_heads, BLOCK_SIZE)
     num_dim_blocks = triton.cdiv(head_dim, BLOCK_SIZE)
     grid = (batch_size * max_seq_len, num_head_blocks, num_dim_blocks)
 
-    def run():
+    def kernel(q, padded_q, seq_lens, cumsum):
         pad_draft_extend_query_kernel[grid](
             q_ptr=q,
             padded_q_ptr=padded_q,
@@ -120,10 +178,41 @@ def benchmark_pad_triton(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-    ms = _bench_ms(run, warmup=warmup, iters=iters)
-    active_tokens = int(cumsum[-1].item())
+    def workspace():
+        return _make_pad_inputs(
+            batch_size, max_seq_len, num_heads, head_dim, dtype, fill_ratio
+        )
+
+    q0, padded0, seq0, cumsum0 = workspace()
+    active_tokens = int(cumsum0[-1].item())
     elems = active_tokens * num_heads * head_dim
     gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+
+    if timer == "cute":
+
+        def ws_gen():
+            q, p, s, c = workspace()
+            return cute_testing.JitArguments(q, p, s, c)
+
+        ms = _bench_ms(
+            timer=timer,
+            fn=kernel,
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=ws_gen,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
+    else:
+        ms = _bench_ms(
+            timer=timer,
+            fn=lambda: kernel(q0, padded0, seq0, cumsum0),
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=workspace,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
     return ms, gb
 
 
@@ -137,19 +226,50 @@ def benchmark_pad_cute(
     fill_ratio: float,
     warmup: int,
     iters: int,
+    timer: str = "triton",
+    workspace_count: int = 1,
+    use_cuda_graphs: bool = False,
 ):
     """Benchmark CuTe pad kernel."""
-    q, padded_q, seq_lens, cumsum = _make_pad_inputs(
-        batch_size, max_seq_len, num_heads, head_dim, dtype, fill_ratio
-    )
 
-    def run():
+    def kernel(q, padded_q, seq_lens, cumsum):
         pad_kernel(q=q, padded_q=padded_q, seq_lens_q=seq_lens, cumsum=cumsum)
 
-    ms = _bench_ms(run, warmup=warmup, iters=iters)
-    active_tokens = int(cumsum[-1].item())
+    def workspace():
+        return _make_pad_inputs(
+            batch_size, max_seq_len, num_heads, head_dim, dtype, fill_ratio
+        )
+
+    q0, padded0, seq0, cumsum0 = workspace()
+    active_tokens = int(cumsum0[-1].item())
     elems = active_tokens * num_heads * head_dim
     gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+
+    if timer == "cute":
+
+        def ws_gen():
+            q, p, s, c = workspace()
+            return cute_testing.JitArguments(q, p, s, c)
+
+        ms = _bench_ms(
+            timer=timer,
+            fn=kernel,
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=ws_gen,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
+    else:
+        ms = _bench_ms(
+            timer=timer,
+            fn=lambda: kernel(q0, padded0, seq0, cumsum0),
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=workspace,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
     return ms, gb
 
 
@@ -162,17 +282,17 @@ def benchmark_unpad_triton(
     fill_ratio: float,
     warmup: int,
     iters: int,
+    timer: str = "triton",
+    workspace_count: int = 1,
+    use_cuda_graphs: bool = False,
 ):
     """Benchmark Triton unpad kernel."""
-    raw_out, output, accept_lengths, cumsum = _make_unpad_inputs(
-        batch_size, token_per_batch, num_heads, head_dim, dtype, fill_ratio
-    )
     BLOCK_SIZE = 64
     num_head_blocks = triton.cdiv(num_heads, BLOCK_SIZE)
     num_dim_blocks = triton.cdiv(head_dim, BLOCK_SIZE)
     grid = (batch_size * token_per_batch, num_head_blocks, num_dim_blocks)
 
-    def run():
+    def kernel(raw_out, output, accept_lengths, cumsum):
         unpad_draft_extend_output_kernel[grid](
             raw_out_ptr=raw_out,
             output_ptr=output,
@@ -185,10 +305,41 @@ def benchmark_unpad_triton(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
-    ms = _bench_ms(run, warmup=warmup, iters=iters)
-    active_tokens = int(cumsum[-1].item())
+    def workspace():
+        return _make_unpad_inputs(
+            batch_size, token_per_batch, num_heads, head_dim, dtype, fill_ratio
+        )
+
+    raw0, out0, acc0, cumsum0 = workspace()
+    active_tokens = int(cumsum0[-1].item())
     elems = active_tokens * num_heads * head_dim
     gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+
+    if timer == "cute":
+
+        def ws_gen():
+            r, o, a, c = workspace()
+            return cute_testing.JitArguments(r, o, a, c)
+
+        ms = _bench_ms(
+            timer=timer,
+            fn=kernel,
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=ws_gen,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
+    else:
+        ms = _bench_ms(
+            timer=timer,
+            fn=lambda: kernel(raw0, out0, acc0, cumsum0),
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=workspace,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
     return ms, gb
 
 
@@ -202,13 +353,13 @@ def benchmark_unpad_cute(
     fill_ratio: float,
     warmup: int,
     iters: int,
+    timer: str = "triton",
+    workspace_count: int = 1,
+    use_cuda_graphs: bool = False,
 ):
     """Benchmark CuTe unpad kernel."""
-    raw_out, output, accept_lengths, cumsum = _make_unpad_inputs(
-        batch_size, token_per_batch, num_heads, head_dim, dtype, fill_ratio
-    )
 
-    def run():
+    def kernel(raw_out, output, accept_lengths, cumsum):
         unpad_kernel(
             raw_out=raw_out,
             output=output,
@@ -216,10 +367,41 @@ def benchmark_unpad_cute(
             cumsum=cumsum,
         )
 
-    ms = _bench_ms(run, warmup=warmup, iters=iters)
-    active_tokens = int(cumsum[-1].item())
+    def workspace():
+        return _make_unpad_inputs(
+            batch_size, token_per_batch, num_heads, head_dim, dtype, fill_ratio
+        )
+
+    raw0, out0, acc0, cumsum0 = workspace()
+    active_tokens = int(cumsum0[-1].item())
     elems = active_tokens * num_heads * head_dim
     gb = (2 * elems * torch.tensor([], dtype=dtype).element_size()) / 1e9
+
+    if timer == "cute":
+
+        def ws_gen():
+            r, o, a, c = workspace()
+            return cute_testing.JitArguments(r, o, a, c)
+
+        ms = _bench_ms(
+            timer=timer,
+            fn=kernel,
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=ws_gen,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
+    else:
+        ms = _bench_ms(
+            timer=timer,
+            fn=lambda: kernel(raw0, out0, acc0, cumsum0),
+            warmup=warmup,
+            iters=iters,
+            workspace_generator=workspace,
+            workspace_count=workspace_count,
+            use_cuda_graphs=use_cuda_graphs,
+        )
     return ms, gb
 
 
@@ -238,6 +420,24 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--timer",
+        type=str,
+        default="triton",
+        choices=["triton", "cute"],
+        help="Timing backend: triton.do_bench or cutlass.cute.testing.benchmark",
+    )
+    parser.add_argument(
+        "--workspace-count",
+        type=int,
+        default=1,
+        help="Cycle through N workspaces to reduce L2 effects.",
+    )
+    parser.add_argument(
+        "--use-cuda-graphs",
+        action="store_true",
+        help="Use CUDA graphs in cutlass.cute.testing.benchmark (timer=cute).",
+    )
     parser.add_argument(
         "--fill-ratio",
         type=float,
@@ -265,7 +465,9 @@ def main():
     print(
         f"Config: max_seq_len={args.max_seq_len}, "
         f"heads={args.num_heads}, head_dim={args.head_dim}, "
-        f"dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}, fill_ratio={args.fill_ratio}"
+        f"dtype={args.dtype}, warmup={args.warmup}, iters={args.iters}, "
+        f"fill_ratio={args.fill_ratio}, timer={args.timer}, "
+        f"workspace_count={args.workspace_count}, cuda_graphs={args.use_cuda_graphs}"
     )
 
     # Generate batch sizes
@@ -305,6 +507,9 @@ def main():
                     args.fill_ratio,
                     args.warmup,
                     args.iters,
+                    timer=args.timer,
+                    workspace_count=args.workspace_count,
+                    use_cuda_graphs=args.use_cuda_graphs,
                 )
                 c_ms, c_gb = benchmark_pad_cute(
                     pad_kernel,
@@ -316,6 +521,9 @@ def main():
                     args.fill_ratio,
                     args.warmup,
                     args.iters,
+                    timer=args.timer,
+                    workspace_count=args.workspace_count,
+                    use_cuda_graphs=args.use_cuda_graphs,
                 )
                 speedup = t_ms / c_ms if c_ms > 0 else 0.0
                 t_bw = t_gb / (t_ms / 1e3) if t_ms > 0 else 0.0
@@ -346,6 +554,9 @@ def main():
                     args.fill_ratio,
                     args.warmup,
                     args.iters,
+                    timer=args.timer,
+                    workspace_count=args.workspace_count,
+                    use_cuda_graphs=args.use_cuda_graphs,
                 )
                 c_ms, c_gb = benchmark_unpad_cute(
                     unpad_kernel,
@@ -357,6 +568,9 @@ def main():
                     args.fill_ratio,
                     args.warmup,
                     args.iters,
+                    timer=args.timer,
+                    workspace_count=args.workspace_count,
+                    use_cuda_graphs=args.use_cuda_graphs,
                 )
                 speedup = t_ms / c_ms if c_ms > 0 else 0.0
                 t_bw = t_gb / (t_ms / 1e3) if t_ms > 0 else 0.0
