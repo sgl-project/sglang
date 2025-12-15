@@ -79,7 +79,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestDisaggregationHybridAttentionMamba2(PDDisaggregationServerBase):
+class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
