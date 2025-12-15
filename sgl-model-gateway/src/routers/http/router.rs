@@ -157,6 +157,15 @@ impl Router {
         };
 
         let idx = policy.select_worker(&available, text)?;
+
+        // Record worker selection metric (Layer 3)
+        SmgMetrics::record_worker_selection(
+            smg_labels::WORKER_REGULAR,
+            smg_labels::CONNECTION_HTTP,
+            model_id.unwrap_or("default"),
+            policy.name(),
+        );
+
         Some(available[idx].clone())
     }
 
@@ -206,9 +215,15 @@ impl Router {
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
                 RouterMetrics::record_retry_backoff_duration(delay, attempt);
+                // Layer 3 worker metrics
+                SmgMetrics::record_worker_retry(smg_labels::WORKER_REGULAR, endpoint);
+                SmgMetrics::record_worker_retry_backoff(attempt, delay);
             },
             // on_exhausted hook
-            || RouterMetrics::record_retries_exhausted(route),
+            || {
+                RouterMetrics::record_retries_exhausted(route);
+                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_REGULAR, endpoint);
+            },
         )
         .await;
 
@@ -290,7 +305,17 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        worker.record_outcome(response.status().is_success());
+        let status = response.status();
+        worker.record_outcome(status.is_success());
+
+        // Record worker errors for server errors (5xx)
+        if status.is_server_error() {
+            SmgMetrics::record_worker_error(
+                smg_labels::WORKER_REGULAR,
+                smg_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+        }
 
         response
     }
