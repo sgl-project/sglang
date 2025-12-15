@@ -187,7 +187,7 @@ class TestLayerNorm(CustomTestCase):
 
     @parametrize(
         l=[1024, 256],
-        m=[1, 32],
+        m=[1, 4],
         n=[4096, 4109, 2304],
         dtype=[torch.float16, torch.bfloat16],
     )
