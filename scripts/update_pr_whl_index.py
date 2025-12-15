@@ -127,7 +127,7 @@ def update_wheel_index(
     print(f"  Written {len(unique_links)} total wheels to {package_index}")
     print(f"\nDone! Users can install with:")
     print(
-        f"  pip install sglang --pre --extra-index-url https://sgl-project.github.io/whl/pr/"
+        f"  pip install sglang=version --index-url https://sgl-project.github.io/whl/pr/"
     )
     print(f"\nOr install specific PR #{pr_number} wheel directly:")
     if new_links:
