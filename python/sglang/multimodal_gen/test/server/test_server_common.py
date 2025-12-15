@@ -16,6 +16,7 @@ import pytest
 import requests
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.utils.common import is_hip
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
@@ -47,9 +48,18 @@ logger = init_logger(__name__)
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
+    server_args = case.server_args
+
+    # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
+    # which is not available on AMD. Use Ulysses parallelism instead.
+    if is_hip() and server_args.ring_degree is not None and server_args.ring_degree > 1:
+        pytest.skip(
+            f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
+            "requires Flash Attention which is not available on AMD/ROCm"
+        )
+
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    server_args = case.server_args
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args += f" --num-gpus {server_args.num_gpus}"
