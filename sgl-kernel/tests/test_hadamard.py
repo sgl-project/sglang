@@ -3,18 +3,35 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
-from scipy.linalg import hadamard
 from sgl_kernel import hadamard_transform
 
 
-def hadamard_transform_ref(x, scale=1.0):
+def _fwht_pow2_in_float32(x: torch.Tensor) -> torch.Tensor:
+    """Fast Walsh–Hadamard transform for last-dim power-of-2 length.
+
+    Computes the unnormalized Hadamard transform in float32 for stability.
+    """
+    n = x.shape[-1]
+    x = x.reshape(-1, n).to(torch.float32)
+    h = 1
+    # Iterative butterfly: O(n log n), no materialized Hadamard matrix.
+    while h < n:
+        x = x.view(-1, n // (2 * h), 2, h)
+        a = x[:, :, 0, :]
+        b = x[:, :, 1, :]
+        y = torch.empty_like(x)
+        y[:, :, 0, :] = a + b
+        y[:, :, 1, :] = a - b
+        x = y.view(-1, n)
+        h *= 2
+    return x
+
+
+def hadamard_transform_ref(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     """
     x: (..., dim)
     out: (..., dim)
     """
-    if hadamard is None:
-        raise ImportError("Please install scipy")
     x_shape = x.shape
     dim = x.shape[-1]
     x = x.reshape(-1, dim)
@@ -22,12 +39,10 @@ def hadamard_transform_ref(x, scale=1.0):
     dim_padded = 2**log_dim
     if dim != dim_padded:
         x = F.pad(x, (0, dim_padded - dim))
-    out = F.linear(
-        x,
-        torch.tensor(hadamard(dim_padded, dtype=float), dtype=x.dtype, device=x.device),
-    )
-    out = out * scale
-    return out[..., :dim].reshape(*x_shape)
+    out_f = _fwht_pow2_in_float32(x)
+    out_f = out_f * scale
+    out = out_f[..., :dim].to(dtype=x.dtype).reshape(*x_shape)
+    return out
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
