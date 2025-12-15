@@ -63,6 +63,7 @@ def _patch_cache_dit_similarity():
                 prefix=prefix,
             )
 
+        # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
         condition_thresh = self.get_important_condition_threshold()
         if condition_thresh > 0.0:
             raw_diff = (t1 - t2).abs()
