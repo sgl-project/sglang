@@ -65,6 +65,7 @@ impl RequestPipeline {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            smg_labels::BACKEND_REGULAR,
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
@@ -171,6 +172,7 @@ impl RequestPipeline {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            smg_labels::BACKEND_PD,
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
