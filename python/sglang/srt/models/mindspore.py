@@ -36,7 +36,7 @@ def tensor_torch2ms(x: torch.Tensor):
     return ms_tensor
 
 
-def tensor_ms2torch(x: ms.Tensor):
+def tensor_ms2torch(x: "ms.Tensor"):
     if x is None or not isinstance(x, ms.Tensor):
         return x
 

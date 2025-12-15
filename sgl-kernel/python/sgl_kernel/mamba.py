@@ -117,4 +117,5 @@ def chunk_gated_delta_rule_cpu(
             use_qk_l2norm_in_kernel,
         )
     )
-    return core_attn_out, last_recurrent_state
+    h = None # todo: add return h support
+    return core_attn_out, last_recurrent_state, h
