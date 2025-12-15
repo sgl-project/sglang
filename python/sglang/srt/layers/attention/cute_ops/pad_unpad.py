@@ -130,7 +130,8 @@ class CutePadDraftExtendQueryKernel:
             cute.ceil_div(num_heads, self.cfg.block_head),
             cute.ceil_div(head_dim, self.cfg.block_dim),
         )
-        block = (self.cfg.block_head, self.cfg.block_dim, 1)
+        # Map threadIdx.x to contiguous dim for coalesced gmem access.
+        block = (self.cfg.block_dim, self.cfg.block_head, 1)
 
         self.kernel(
             mQ,
@@ -161,13 +162,11 @@ class CutePadDraftExtendQueryKernel:
         seq_pos = bidx - batch_id * max_seq_len
 
         seq_len = mSeqLens[batch_id]
-        if seq_pos >= seq_len:
-            return
+        # NOTE: Early `return` is not allowed in CuTe kernels. Use predication instead.
+        head_id = bidy * block_head + tidy
+        dim_id = bidz * block_dim + tidx
 
-        head_id = bidy * block_head + tidx
-        dim_id = bidz * block_dim + tidy
-
-        if head_id < num_heads and dim_id < head_dim:
+        if seq_pos < seq_len and head_id < num_heads and dim_id < head_dim:
             input_start = mCumsum[batch_id]
             input_pos = input_start + seq_pos
             mPadded[batch_id, seq_pos, head_id, dim_id] = mQ[input_pos, head_id, dim_id]
@@ -274,7 +273,8 @@ class CuteUnpadDraftExtendOutputKernel:
             cute.ceil_div(tp_q_head_num, self.cfg.block_head),
             cute.ceil_div(v_head_dim, self.cfg.block_dim),
         )
-        block = (self.cfg.block_head, self.cfg.block_dim, 1)
+        # Map threadIdx.x to contiguous dim for coalesced gmem access.
+        block = (self.cfg.block_dim, self.cfg.block_head, 1)
 
         self.kernel(mRaw, mOut, mAccept, mCumsum).launch(
             grid=grid, block=block, stream=stream
@@ -302,13 +302,11 @@ class CuteUnpadDraftExtendOutputKernel:
         seq_pos = bidx - batch_id * token_per_batch
 
         accept_len = mAccept[batch_id]
-        if seq_pos >= accept_len:
-            return
+        # NOTE: Early `return` is not allowed in CuTe kernels. Use predication instead.
+        head_id = bidy * block_head + tidy
+        dim_id = bidz * block_dim + tidx
 
-        head_id = bidy * block_head + tidx
-        dim_id = bidz * block_dim + tidy
-
-        if head_id < tp_q_head_num and dim_id < v_head_dim:
+        if seq_pos < accept_len and head_id < tp_q_head_num and dim_id < v_head_dim:
             output_start = mCumsum[batch_id]
             output_pos = output_start + seq_pos
             mOut[output_pos, head_id, dim_id] = mRaw[batch_id, seq_pos, head_id, dim_id]
