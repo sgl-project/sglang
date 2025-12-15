@@ -38,8 +38,8 @@ def _patch_cache_dit_similarity():
         if not parallelized:
             return original_similarity(self, t1, t2, threshold, parallelized, prefix)
 
-        sp_group = getattr(self.transformer, "_sglang_sp_group", None)
-        tp_group = getattr(self.transformer, "_sglang_tp_group", None)
+        sp_group = getattr(self, "_sglang_sp_group", None)
+        tp_group = getattr(self, "_sglang_tp_group", None)
         target_group = sp_group or tp_group
 
         if target_group is None:
@@ -101,8 +101,6 @@ def _mark_transformer_parallelized(transformer, config, sp_group, tp_group):
 
     transformer._is_parallelized = True
     transformer._parallelism_config = config
-    transformer._sglang_sp_group = sp_group
-    transformer._sglang_tp_group = tp_group
 
 
 def get_scm_mask(
@@ -289,6 +287,12 @@ def enable_cache_on_transformer(
         parallelism_config=None,
     )
 
+    if parallelism_config is not None:
+        context_manager = getattr(transformer, "_context_manager", None)
+        if context_manager is not None:
+            context_manager._sglang_sp_group = sp_group
+            context_manager._sglang_tp_group = tp_group
+
     return transformer
 
 
@@ -453,5 +457,12 @@ def enable_cache_on_dual_transformer(
         raise ValueError(
             f"Dual-transformer is not implemented for model {model_name} yet."
         )
+
+    if parallelism_config is not None:
+        for t in [transformer, transformer_2]:
+            context_manager = getattr(t, "_context_manager", None)
+            if context_manager is not None:
+                context_manager._sglang_sp_group = sp_group
+                context_manager._sglang_tp_group = tp_group
 
     return transformer, transformer_2
