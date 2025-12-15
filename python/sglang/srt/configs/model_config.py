@@ -100,7 +100,6 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
-        moe_router_dtype: str = "auto",
         is_mtp: bool = False,
     ) -> None:
         # Parse args
@@ -129,8 +128,6 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
-        if getattr(self.hf_config, "moe_router_dtype", None) is None:
-            setattr(self.hf_config, "moe_router_dtype", moe_router_dtype)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
@@ -244,7 +241,6 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
-            moe_router_dtype=server_args.moe_router_dtype,
             is_mtp=server_args.enable_mtp,
             **kwargs,
         )

@@ -130,16 +130,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        # todo dtype implement not here
-        dtype = getattr(config, "moe_router_dtype", "float32")
-        if dtype == "auto":
-            self.dtype = None
-        elif dtype == "float" or dtype == "float32":
-            self.dtype = torch.float32
-        elif dtype == "bfloat16":
-            self.dtype = torch.bfloat16
-        elif dtype == "half" or dtype == "float16":
-            self.dtype = torch.float16
+        self.dtype = torch.float32
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
