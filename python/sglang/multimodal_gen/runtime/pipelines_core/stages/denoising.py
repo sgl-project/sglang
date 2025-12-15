@@ -219,18 +219,11 @@ class DenoisingStage(PipelineStage):
             has_sp = sp_world_size > 1
             has_tp = tp_world_size > 1
 
-            if has_sp and has_tp:
-                raise ValueError(
-                    "cache-dit does not support hybrid parallelism (SP + TP). "
-                    "Please use either sequence parallelism or tensor parallelism, not both."
-                )
-
             sp_group = sp_group_candidate.device_group if has_sp else None
             tp_group = tp_group_candidate.device_group if has_tp else None
 
             logger.info(
-                "cache-dit enabled in distributed environment (world_size=%d, "
-                "sp_group=%s, tp_group=%s)",
+                "cache-dit enabled in distributed environment (world_size=%d, has_sp=%s, has_tp=%s)",
                 world_size,
                 has_sp,
                 has_tp,

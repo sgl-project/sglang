@@ -956,6 +956,17 @@ class ServerArgs:
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
                 )
 
+        from sglang.multimodal_gen.runtime.utils import envs
+
+        if envs.SGLANG_CACHE_DIT_ENABLED:
+            has_sp = self.sp_degree > 1
+            has_tp = self.tp_size > 1
+            if has_sp and has_tp:
+                raise ValueError(
+                    "cache-dit does not support hybrid parallelism (SP + TP). "
+                    "Please use either sequence parallelism or tensor parallelism, not both."
+                )
+
 
 @dataclasses.dataclass
 class PortArgs:
