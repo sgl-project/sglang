@@ -58,6 +58,7 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, : len(req.fill_ids)
         ]
         self.protected_size_ += len(kv_indices) - len(req.prefix_indices)
+        req.cache_protected_len = len(kv_indices)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
