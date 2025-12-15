@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import requests
 from pydantic import BaseModel
+from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.bench_serving import (
@@ -399,17 +400,6 @@ def get_report_summary(
     summary = (
         f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
     )
-    summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
-
-    if bench_args.profile:
-        summary += " profile |"
-
-    summary += "\n"
-    summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
-
-    if bench_args.profile:
-        summary += "-------------|"
-    summary += "\n"
 
     if is_blackwell():
         hourly_cost_per_gpu = 4  # $4/hour for one B200
@@ -419,27 +409,48 @@ def get_report_summary(
 
     # sort result by input_len
     results.sort(key=lambda x: x.input_len)
+    rows = []
+    headers = [
+        "batch size",
+        "input len",
+        "latency (s)",
+        "input throughput (tok/s)",
+        "output throughput (tok/s)",
+        "acc length",
+        "ITL (ms)",
+        "input cost ($/1M)",
+        "output cost ($/1M)",
+    ]
+    if bench_args.profile:
+        headers.append("profile")
+
     for res in results:
         hourly_cost = hourly_cost_per_gpu * server_args.tp_size
-        accept_length = round(res.acc_length, 2) if res.acc_length > 0 else "n/a"
-        line = (
-            f"| {res.batch_size} | "
-            f"{res.input_len} | "
-            f"{res.latency:.2f} | "
-            f"{res.input_throughput:.2f} | "
-            f"{res.output_throughput:.2f} | "
-            f"{accept_length} | "
-            f"{1 / (res.output_throughput/res.batch_size) * 1000:.2f} | "
-            f"{1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / res.output_throughput / 3600 * hourly_cost:.2f} |"
-        )
+        accept_length = f"{res.acc_length:.2f}" if res.acc_length > 0 else "n/a"
+        itl_ms = 1000 * res.batch_size / res.output_throughput
+        input_cost = 1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost
+        output_cost = 1e6 / res.output_throughput / 3600 * hourly_cost
+
+        row = [
+            res.batch_size,
+            res.input_len,
+            f"{res.latency:.2f}",
+            f"{res.input_throughput:.2f}",
+            f"{res.output_throughput:.2f}",
+            accept_length,
+            f"{itl_ms:.2f}",
+            f"{input_cost:.2f}",
+            f"{output_cost:.2f}",
+        ]
         if bench_args.profile:
             if res.profile_link:
-                line += f" [Profile]({res.profile_link}) |"
+                row.append(f"[Profile]({res.profile_link})")
             else:
-                line += f" n/a |"
-        line += "\n"
-        summary += line
+                row.append("n/a")
+        rows.append(row)
+
+    summary += tabulate(rows, headers=headers, tablefmt="github")
+    summary += "\n"
 
     return summary
 
@@ -578,8 +589,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     if is_in_ci() and bench_args.append_to_github_summary:
         write_github_step_summary(summary)
-    else:
-        print(summary)
 
     # Save results as pydantic models in the JSON format
     if bench_args.pydantic_result_filename:
