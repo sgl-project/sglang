@@ -46,9 +46,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     select_top_k_tokens,
 )
-from sglang.srt.utils.common import empty_context, fast_topk, is_npu, next_power_of_2
-
-_is_npu = is_npu()
+from sglang.srt.utils.common import empty_context, fast_topk, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +285,7 @@ class MTPDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
-        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+        _, hidden_states, scores, tree_info = select_top_k_tokens(
             0, topk_p, topk_index, hidden_states, scores, self.topk
         )
         if self.speculative_num_steps == 1:
