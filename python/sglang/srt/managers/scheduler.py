@@ -969,10 +969,7 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
     def init_overlap(self):
-        self.future_map = None
-
         self.device_module = torch.get_device_module(self.device)
-
         self.default_stream: CudaStream = self.device_module.current_stream()
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
@@ -987,6 +984,7 @@ class Scheduler(
         )
 
         if not self.enable_overlap:
+            self.future_map = None
             return
 
         self.future_map = FutureMap(
@@ -1022,15 +1020,17 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-
             if self._engine_paused:
                 continue
 
+            # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -1038,8 +1038,8 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            # Update the last batch
             self.last_batch = batch
-
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
@@ -1047,9 +1047,6 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
-        disable_consecutive_prefill_overlap = (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
-        )
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1057,52 +1054,68 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-
             if self._engine_paused:
                 continue
 
+            # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
-            disable_overlap_for_batch = (
-                disable_consecutive_prefill_overlap
-                and batch
-                and batch.forward_mode.is_extend()
-                and self.last_batch
-                and self.last_batch.forward_mode.is_extend()
-            )
-
-            # FIXME(lsyin): remove this grammar sync
-            need_grammar_sync = (
-                batch is not None
-                and batch.forward_mode.is_decode()
-                and batch.has_grammar
-                and batch.is_v2_eagle
-                and len(self.result_queue) > 0
-            )
-
-            if disable_overlap_for_batch or need_grammar_sync:
+            # If we do not need to overlap the current batch with the last batch,
+            # we can process the last batch immediately.
+            if disable_overlap_for_batch:
                 pop_and_process()
 
+            # Launch the current batch
             batch_result = None
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
+            # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch and not need_grammar_sync:
+                if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
-            self.last_batch = batch
 
+            # Update the last batch
+            self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+    def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
+        # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
+        # This might slightly hurt the throughput, so we use an environment variable to control it.
+        disable_overlap_for_batch = (
+            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
+            and batch
+            and batch.forward_mode.is_extend()
+            and self.last_batch
+            and self.last_batch.forward_mode.is_extend()
+        )
+
+        # We do not support overlap + spec + grammar yet,
+        # so we need to turn off overlap for this batch.
+        # TODO(lsyin): support overlap + spec + grammar
+        need_grammar_sync = (
+            batch
+            and batch.is_v2_eagle
+            and batch.has_grammar
+            and batch.forward_mode.is_decode()
+            and len(self.result_queue) > 0
+        )
+
+        return disable_overlap_for_batch or need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -1226,8 +1239,7 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
-
-        # Process MM requests under E disaggregation
+        # Process MM requests under EPD-disaggregation mode
         if (
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
@@ -1246,11 +1258,11 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if isinstance(output, RpcReqOutput):
+                if not isinstance(output, RpcReqOutput):
+                    self.send_to_tokenizer.send_output(output, recv_req)
+                else:
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
-                else:
-                    self.send_to_tokenizer.send_output(output, recv_req)
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
