@@ -24,7 +24,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::RouterMetrics,
+        metrics::{smg_labels, RouterMetrics, SmgMetrics},
         otel_trace::inject_trace_context_http,
     },
     policies::PolicyRegistry,
@@ -38,7 +38,11 @@ use crate::{
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{error, header_utils, RouterTrait},
+    routers::{
+        error,
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 /// Regular router that uses injected load balancing policies
@@ -166,6 +170,18 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let model = model_id.unwrap_or("default");
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_HTTP,
+            smg_labels::BACKEND_REGULAR,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            is_stream,
+        );
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -200,8 +216,24 @@ impl Router {
             let duration = start.elapsed();
             RouterMetrics::record_request(route);
             RouterMetrics::record_generate_duration(duration);
+            SmgMetrics::record_router_duration(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_REGULAR,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
         } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
+            SmgMetrics::record_router_error(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_REGULAR,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
         }
 
         response
@@ -543,6 +575,7 @@ impl Router {
                         }
                     }
                 }
+                drop(load_guard);
             });
 
             let stream = UnboundedReceiverStream::new(rx);
