@@ -554,7 +554,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
         model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         lora_paths = ["ash256/sglang_embedding_lora_test_adapter"]
-        prompts = DEFAULT_TEST_PROMPTS[:2]
+        prompts = DEFAULT_TEST_PROMPTS
 
         # Embedding LoRA has higher numerical variance due to vocab-sized operations,
         # but outputs should still match
@@ -584,7 +584,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
         model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         lora_paths = ["ash256/sglang_embedding_lora_test_adapter"]
-        prompts = DEFAULT_TEST_PROMPTS[:2]
+        prompts = DEFAULT_TEST_PROMPTS
 
         global LOGPROB_THRESHOLD
         original_threshold = LOGPROB_THRESHOLD

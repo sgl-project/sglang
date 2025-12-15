@@ -87,44 +87,22 @@ class TestLoRAEviction(CustomTestCase):
         lora_target_modules=["all"] which includes embed_tokens and lm_head layers.
         Uses TinyLlama base model with the ash256/sglang_embedding_lora_test_adapter.
         """
-        max_new_tokens = 64
-        torch_dtype = torch.float16
-
-        with SRTRunner(
-            EMBEDDING_LORA_BASE_MODEL,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            lora_paths=[EMBEDDING_LORA_ADAPTER],
-            max_loras_per_batch=1,
-            enable_lora=True,
+        output_history = {}
+        self._run_test(
+            [EMBEDDING_LORA_ADAPTER],
+            output_history,
+            base_model=EMBEDDING_LORA_BASE_MODEL,
+            lora_target_modules=["all"],
             max_lora_rank=16,
-            lora_target_modules=["all"],  # This includes embed_tokens and lm_head
-        ) as srt_runner:
-            output_history = {}
-            # Run inference multiple times to ensure consistent outputs
-            for repeat in range(2):
-                for prompt in PROMPTS:
-                    print(
-                        f"\n========== Testing embedding LoRA eviction, repeat {repeat + 1}/2 =========="
-                    )
-                    print(f"prompt: {prompt[:50]}...")
-                    srt_outputs = srt_runner.forward(
-                        [prompt],
-                        max_new_tokens=max_new_tokens,
-                        lora_paths=[EMBEDDING_LORA_ADAPTER],
-                    )
-                    output = srt_outputs.output_strs[0].strip()
-                    print(f"output: {output[:100]}...")
-
-                    prev_output = output_history.get(prompt)
-                    if prev_output is not None:
-                        self.assertEqual(
-                            prev_output,
-                            output,
-                            f"Output mismatch for embedding LoRA adapter and prompt '{prompt[:30]}...' on repeat {repeat + 1}",
-                        )
-                    else:
-                        output_history[prompt] = output
+        )
+        self._run_test(
+            [EMBEDDING_LORA_ADAPTER],
+            output_history,
+            reverse=True,
+            base_model=EMBEDDING_LORA_BASE_MODEL,
+            lora_target_modules=["all"],
+            max_lora_rank=16,
+        )
 
     def _run_test(
         self,
@@ -133,26 +111,16 @@ class TestLoRAEviction(CustomTestCase):
         reverse: bool = False,
         repeat: int = 2,
         reuse_lora_name: bool = False,
+        base_model: str = BASE_MODEL,
+        lora_target_modules: List[str] = None,
+        max_lora_rank: int = 256,
     ):
         REUSED_LORA_NAME = "lora"
         max_new_tokens = 256
         torch_dtype = torch.float16
-        base_path = BASE_MODEL
-        assert len(lora_paths) >= 2
 
-        initial_lora_paths = lora_paths if not reuse_lora_name else None
-        # Initialize runners
-        with SRTRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            lora_paths=initial_lora_paths,
-            max_loras_per_batch=1,
-            enable_lora=True,
-            max_lora_rank=256,
-            # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-            # lora_target_modules=["all"],
-            lora_target_modules=[
+        if lora_target_modules is None:
+            lora_target_modules = [
                 "q_proj",
                 "k_proj",
                 "v_proj",
@@ -160,7 +128,19 @@ class TestLoRAEviction(CustomTestCase):
                 "gate_proj",
                 "up_proj",
                 "down_proj",
-            ],
+            ]
+
+        initial_lora_paths = lora_paths if not reuse_lora_name else None
+        # Initialize runners
+        with SRTRunner(
+            base_model,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            lora_paths=initial_lora_paths,
+            max_loras_per_batch=1,
+            enable_lora=True,
+            max_lora_rank=max_lora_rank,
+            lora_target_modules=lora_target_modules,
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 
