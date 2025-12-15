@@ -31,7 +31,6 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
-    select_top_k_tokens_tmp,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
@@ -42,7 +41,11 @@ from sglang.srt.speculative.mtp_utils import (
     rotate_input_ids_triton,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import detect_nan, draft_tp_context
+from sglang.srt.speculative.spec_utils import (
+    detect_nan,
+    draft_tp_context,
+    select_top_k_tokens,
+)
 from sglang.srt.utils.common import empty_context, fast_topk, is_npu, next_power_of_2
 
 _is_npu = is_npu()
@@ -284,7 +287,7 @@ class MTPDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
-        input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
+        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
             0, topk_p, topk_index, hidden_states, scores, self.topk
         )
         if self.speculative_num_steps == 1:
