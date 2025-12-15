@@ -217,6 +217,11 @@ class SchedulerStats:
     # CUDA graph
     is_cuda_graph: float = 0.0
 
+    # Realtime token counters (updated on each log interval)
+    realtime_prefill_compute_tokens_accumulator: int = 0
+    realtime_prefill_cache_tokens_accumulator: int = 0
+    realtime_decode_tokens_accumulator: int = 0
+
 
 class SchedulerMetricsCollector:
 
@@ -619,6 +624,22 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.realtime_prefill_compute_tokens_total = Counter(
+            name="sglang:realtime_prefill_compute_tokens_total",
+            documentation="Total number of prefill compute tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_prefill_cache_tokens_total = Counter(
+            name="sglang:realtime_prefill_cache_tokens_total",
+            documentation="Total number of prefill cache tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_decode_tokens_total = Counter(
+            name="sglang:realtime_decode_tokens_total",
+            documentation="Total number of decode tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -703,6 +724,14 @@ class SchedulerMetricsCollector:
 
         # CUDA graph
         self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
+
+        # Realtime token counters
+        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(stats.realtime_prefill_compute_tokens_accumulator)
+        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(stats.realtime_prefill_cache_tokens_accumulator)
+        self.realtime_decode_tokens_total.labels(**self.labels).inc(stats.realtime_decode_tokens_accumulator)
+        stats.realtime_prefill_compute_tokens_accumulator = 0
+        stats.realtime_prefill_cache_tokens_accumulator = 0
+        stats.realtime_decode_tokens_accumulator = 0
 
         self.last_log_time = time.perf_counter()
 

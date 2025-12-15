@@ -199,6 +199,9 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
+            self.stats.realtime_prefill_compute_tokens_accumulator += adder.log_input_tokens
+            self.stats.realtime_prefill_cache_tokens_accumulator += adder.log_hit_tokens
+
             # Others
             self.calculate_utilization()
             self.metrics_collector.log_stats(self.stats)
@@ -210,6 +213,7 @@ class SchedulerMetricsMixin:
     ):
         batch = running_batch or self.running_batch
 
+        last_num_generated_tokens = self.num_generated_tokens
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
@@ -349,6 +353,8 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
+
+            self.stats.realtime_decode_tokens_accumulator += last_num_generated_tokens
 
             # Others
             self.calculate_utilization()
