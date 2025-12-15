@@ -756,6 +756,7 @@ pub mod smg_labels {
     pub const BACKEND_REGULAR: &str = "regular";
     pub const BACKEND_PD: &str = "pd";
     pub const BACKEND_EXTERNAL: &str = "external";
+    pub const BACKEND_HARMONY: &str = "harmony";
 
     // Connection modes
     pub const CONNECTION_HTTP: &str = "http";
@@ -802,6 +803,18 @@ pub mod smg_labels {
     pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
     pub const DISCOVERY_CONSUL: &str = "consul";
     pub const DISCOVERY_MANUAL: &str = "manual";
+
+    // Discovery registration results
+    pub const REGISTRATION_SUCCESS: &str = "success";
+    pub const REGISTRATION_FAILED: &str = "failed";
+    pub const REGISTRATION_DUPLICATE: &str = "duplicate";
+
+    // Deregistration reasons
+    pub const DEREGISTRATION_HEALTH_CHECK_FAILED: &str = "health_check_failed";
+    pub const DEREGISTRATION_TIMEOUT: &str = "timeout";
+    pub const DEREGISTRATION_MANUAL: &str = "manual";
+    pub const DEREGISTRATION_SHUTDOWN: &str = "shutdown";
+    pub const DEREGISTRATION_POD_DELETED: &str = "pod_deleted";
 
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
