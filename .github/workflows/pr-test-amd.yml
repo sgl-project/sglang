@@ -135,6 +135,11 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Check storage I/O
+        run: |
+          docker exec ci_sglang bash /sglang-checkout/scripts/check_disk_io.sh
+          docker exec ci_sglang bash /sglang-checkout/scripts/validate_hf_cache.sh
+
       - name: Run test
         timeout-minutes: 10
         run: |
@@ -173,6 +178,10 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Validate HF cache
+        run: |
+          docker exec ci_sglang bash /sglang-checkout/scripts/validate_hf_cache.sh
+
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -210,6 +219,10 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Validate HF cache
+        run: |
+          docker exec ci_sglang bash /sglang-checkout/scripts/validate_hf_cache.sh
 
       - name: Run test
         timeout-minutes: 30

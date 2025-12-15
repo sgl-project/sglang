@@ -147,6 +147,83 @@ else
     CACHE_VOLUME=""
 fi
 
+# Measure NFS bandwidth using a safetensor file read test
+# If bandwidth > 10GB/s, use NFS for HF cache; otherwise use local storage
+# This handles NFS performance "cliff" where busy NFS is slower than direct download
+measure_nfs_bandwidth() {
+    local test_dir="${CACHE_HOST}/hf-cache/hub"
+    local safetensor_file=""
+
+    # Find a safetensor file to test bandwidth (look for any .safetensors file)
+    if [[ -d "$test_dir" ]]; then
+        safetensor_file=$(find "$test_dir" -name "*.safetensors" -type f 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$safetensor_file" ]]; then
+        echo "No safetensor file found for bandwidth test, assuming NFS is available"
+        echo "10.1"  # Default to "good" bandwidth if no test file exists
+        return
+    fi
+
+    # Get file size in bytes
+    local file_size=$(stat -c %s "$safetensor_file" 2>/dev/null || echo "0")
+    if [[ "$file_size" -lt 1048576 ]]; then  # Less than 1MB
+        echo "Test file too small, assuming NFS is available"
+        echo "10.1"
+        return
+    fi
+
+    # Clear page cache to get real disk/NFS read speed (requires root)
+    sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    # Time how long it takes to read the file
+    local start_time=$(date +%s.%N)
+    dd if="$safetensor_file" of=/dev/null bs=4M 2>/dev/null
+    local end_time=$(date +%s.%N)
+
+    # Calculate bandwidth in GB/s
+    local elapsed=$(echo "$end_time - $start_time" | bc)
+    if [[ $(echo "$elapsed > 0" | bc) -eq 1 ]]; then
+        local bandwidth=$(echo "scale=2; $file_size / $elapsed / 1073741824" | bc)
+        echo "$bandwidth"
+    else
+        echo "10.1"  # Default if timing failed
+    fi
+}
+
+# Check NFS bandwidth and decide HF cache strategy
+USE_NFS_HF_CACHE="1"
+if [[ -d "$CACHE_HOST" ]]; then
+    echo "Measuring NFS bandwidth..."
+    NFS_BANDWIDTH=$(measure_nfs_bandwidth)
+    echo "NFS bandwidth: ${NFS_BANDWIDTH} GB/s"
+
+    if (( $(echo "$NFS_BANDWIDTH < 10" | bc -l) )); then
+        echo "WARNING: NFS bandwidth (${NFS_BANDWIDTH} GB/s) below 10 GB/s threshold"
+        echo "Using local storage for HF cache to avoid NFS congestion"
+        USE_NFS_HF_CACHE="0"
+    else
+        echo "NFS bandwidth sufficient, using NFS for HF cache"
+    fi
+fi
+
+# AITER and MIOpen caches should ALWAYS use NFS if available
+# These are kernel caches that are expensive to rebuild and benefit from persistence
+AITER_CACHE_DIR="/sgl-data/aiter-kernels"
+MIOPEN_CACHE_DIR="/sgl-data/miopen-cache"
+
+# HF cache location depends on bandwidth check
+if [[ "$USE_NFS_HF_CACHE" == "1" ]]; then
+    HF_CACHE_DIR="/sgl-data/hf-cache"
+else
+    HF_CACHE_DIR="/tmp/hf-cache"
+fi
+
+echo "Cache configuration:"
+echo "  AITER cache:  ${AITER_CACHE_DIR} (always NFS)"
+echo "  MIOpen cache: ${MIOPEN_CACHE_DIR} (always NFS)"
+echo "  HF cache:     ${HF_CACHE_DIR}"
+
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
@@ -155,7 +232,11 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
-  -e HF_HOME=/sgl-data/hf-cache \
+  -e HF_HOME="${HF_CACHE_DIR}" \
+  -e AITER_JIT_DIR="${AITER_CACHE_DIR}" \
+  -e MIOPEN_USER_DB_PATH="${MIOPEN_CACHE_DIR}" \
+  -e MIOPEN_CUSTOM_CACHE_DIR="${MIOPEN_CACHE_DIR}" \
+  -e SGLANG_NFS_HF_CACHE="${USE_NFS_HF_CACHE}" \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \
