@@ -36,6 +36,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -267,9 +268,19 @@ class PiecewiseCudaGraphRunner:
                     compile_config=self.compile_config,
                     graph_pool=get_global_graph_memory_pool(),
                 )
-
-                with set_compiled(True):
-                    self.warmup_torch_compile()
+                with freeze_gc(
+                    self.model_runner.server_args.enable_cudagraph_gc
+                ), graph_capture() as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with set_compiled(True):
+                        self.device_module.synchronize()
+                        self.model_runner.tp_group.barrier()
+                        self.warmup_torch_compile(num_tokens=8)
+                        # self.device_module.synchronize()
+                        # self.model_runner.tp_group.barrier()
+                        # self.warmup_torch_compile(num_tokens=256)
+                        # self.warmup_torch_compile(num_tokens=2048)
+                        # self.warmup_torch_compile(num_tokens=4096)
 
                 # Capture
                 try:
@@ -281,31 +292,26 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
-    def warmup_torch_compile(self):
+    def warmup_torch_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
-        num_tokens = 2
-
+        input_ids = self.input_ids[:num_tokens]
+        input_embeds = self.input_embeds[:num_tokens] if self.is_multimodal else None
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = (
             self.out_cache_loc_swa[:num_tokens]
             if self.out_cache_loc_swa is not None
             else None
         )
+        positions = self.positions[:num_tokens]
+        mrope_positions = (
+            self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+        )
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=1,
-                input_ids=(torch.randint(0, 100, (num_tokens,), device=self.device)),
-                input_embeds=(
-                    torch.randn(
-                        num_tokens,
-                        self.model_runner.model_config.hidden_size,
-                        dtype=self.model_runner.dtype,
-                        device=self.device,
-                    )
-                    if self.is_multimodal
-                    else None
-                ),
+                input_ids=input_ids,
+                input_embeds=input_embeds,
                 req_pool_indices=torch.arange(1, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
@@ -326,14 +332,12 @@ class PiecewiseCudaGraphRunner:
                 extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                positions=torch.arange(num_tokens, device=self.device),
+                positions=positions,
                 global_num_tokens_gpu=None,
                 global_num_tokens_for_logprob_gpu=None,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
-                mrope_positions=(
-                    self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
-                ),
+                mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -346,7 +350,7 @@ class PiecewiseCudaGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         with set_forward_context(
             forward_batch, self.attention_layers, self.quant_config, self.moe_layers
-        ), disable_ca_comm(self.model_runner.tp_group):
+        ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -374,9 +378,12 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        # ca_comm = self.model_runner.tp_group.ca_comm
+        # maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
         with freeze_gc(
             self.model_runner.server_args.enable_cudagraph_gc
-        ), disable_ca_comm(self.model_runner.tp_group):
+        ), graph_capture() as graph_capture_context:
+            self.stream = graph_capture_context.stream
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -479,6 +486,12 @@ class PiecewiseCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            print(
+                f"[rank {get_tensor_model_parallel_rank()}] "
+                f"capture num_tokens={num_tokens}, "
+                f"dp_padding_mode={forward_batch.dp_padding_mode}, "
+                f"is_max_len={forward_batch.dp_padding_mode.is_max_len()}"
+            )
             set_dp_buffer_len(
                 global_dp_buffer_len,
                 num_tokens,
@@ -500,7 +513,7 @@ class PiecewiseCudaGraphRunner:
                 )
             return
 
-        for _ in range(3):
+        for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
@@ -610,7 +623,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
+        with enable_piecewise_cuda_graph():
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
