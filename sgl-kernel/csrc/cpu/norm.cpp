@@ -318,7 +318,7 @@ void fused_add_layernorm_kernel_impl(
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
-  const bool has_residual{resudual != nullptr};
+  const bool has_residual{residual != nullptr};
   const int64_t parallel_size{batch_size * seq_len};
   at::parallel_for(0, parallel_size, 0, [&](int64_t begin, int64_t end) {
     float* __restrict__ buffer_ptr = buffer + at::get_thread_num() * hidden_size;
@@ -594,7 +594,7 @@ at::Tensor fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::
     CHECK_EQ(input.size(1), weight.size(0));
   }
 
-  int64_t batch_size{input.size(0)}, seq_len{0}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
+  int64_t batch_size{input.size(0)}, seq_len{1}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
     seq_len = input.size(1);
     hidden_size = input.size(2);
