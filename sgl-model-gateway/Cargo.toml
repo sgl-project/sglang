@@ -31,8 +31,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
-axum-server = { version = "0.7.3", default_features = false, features = ["tls-rustls"] }
+axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde = { version = "1.0", features = ["derive"] }
