@@ -196,9 +196,8 @@ jobs:
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 45
         run: |
-          # AMD CI Step 1: Only run T2V tests (simplest - no image input)
-          # Removed SGLANG_TEST_OUTPUT_SIZE - let each test use model's supported resolution
-          # Tests: wan2_1_t2v_1.3b, fast_hunyuan_video
+          # AMD CI Step 2: T2V + T2I tests (no image input)
+          # Tests: wan2_1_t2v_1.3b, fast_hunyuan_video, qwen_image_t2i, flux_image_t2i, flux_2_image_t2i, zimage_image_t2i
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
@@ -214,7 +213,7 @@ jobs:
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
               --total-partitions 2 \
-              -k "(t2v or hunyuan) and not lora"
+              -k "(t2v or hunyuan or t2i) and not lora"
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
@@ -265,9 +264,8 @@ jobs:
       - name: Run diffusion server tests (2-GPU)
         timeout-minutes: 80
         run: |
-          # AMD CI Step 1: Only run T2V tests (simplest - no image input)
-          # Removed SGLANG_TEST_OUTPUT_SIZE - let each test use model's supported resolution
-          # Tests: wan2_2_t2v_a14b_2gpu, wan2_1_t2v_14b_2gpu
+          # AMD CI Step 2: T2V + T2I tests (no image input)
+          # Tests: wan2_2_t2v_a14b_2gpu, wan2_1_t2v_14b_2gpu, qwen_image_t2i_2_gpus, flux_image_t2i_2_gpus
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
@@ -283,7 +281,7 @@ jobs:
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
               --total-partitions 2 \
-              -k "t2v and not lora"
+              -k "(t2v or t2i) and not lora"
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
