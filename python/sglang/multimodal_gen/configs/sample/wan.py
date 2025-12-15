@@ -22,6 +22,14 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
     )
     num_inference_steps: int = 50
 
+    # Wan T2V 1.3B supported resolutions
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (832, 480),  # 16:9
+            (480, 832),  # 9:16
+        ]
+    )
+
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(
             teacache_thresh=0.08,
@@ -58,6 +66,16 @@ class WanT2V_14B_SamplingParams(SamplingParams):
     )
     num_inference_steps: int = 50
 
+    # Wan T2V 14B supported resolutions
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (1280, 720),  # 16:9
+            (720, 1280),  # 9:16
+            (832, 480),  # 16:9
+            (480, 832),  # 9:16
+        ]
+    )
+
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(
             teacache_thresh=0.20,
@@ -87,6 +105,14 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
     num_inference_steps: int = 50
     # num_inference_steps: int = 40
 
+    # Wan I2V 480P supported resolutions (override parent)
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (832, 480),  # 16:9
+            (480, 832),  # 9:16
+        ]
+    )
+
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(
             teacache_thresh=0.26,
@@ -114,6 +140,16 @@ class WanI2V_14B_720P_SamplingParam(WanT2V_14B_SamplingParams):
     guidance_scale: float = 5.0
     num_inference_steps: int = 50
     # num_inference_steps: int = 40
+
+    # Wan I2V 720P supported resolutions (override parent)
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (1280, 720),  # 16:9
+            (720, 1280),  # 9:16
+            (832, 480),  # 16:9
+            (480, 832),  # 9:16
+        ]
+    )
 
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(
@@ -188,6 +224,14 @@ class Wan2_2_TI2V_5B_SamplingParam(Wan2_2_Base_SamplingParams):
     guidance_scale: float = 5.0
     num_inference_steps: int = 50
 
+    # Wan2.2 TI2V 5B supported resolutions
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (1280, 704),  # 16:9-ish
+            (704, 1280),  # 9:16-ish
+        ]
+    )
+
 
 @dataclass
 class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
@@ -198,6 +242,16 @@ class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     # NOTE(will): default boundary timestep is tracked by PipelineConfig, but
     # can be overridden during sampling
 
+    # Wan2.2 T2V A14B supported resolutions
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (1280, 720),  # 16:9
+            (720, 1280),  # 9:16
+            (832, 480),  # 16:9
+            (480, 832),  # 9:16
+        ]
+    )
+
 
 @dataclass
 class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
@@ -207,6 +261,16 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     fps: int = 16
     # NOTE(will): default boundary timestep is tracked by PipelineConfig, but
     # can be overridden during sampling
+
+    # Wan2.2 I2V A14B supported resolutions
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (1280, 720),  # 16:9
+            (720, 1280),  # 9:16
+            (832, 480),  # 16:9
+            (480, 832),  # 9:16
+        ]
+    )
 
 
 # =============================================
