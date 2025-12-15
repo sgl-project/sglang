@@ -330,6 +330,7 @@ class LayerNorm(CustomOp):
     def forward_cuda(
         self,
         x: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
         if (
             _flashinfer_layernorm_available
@@ -338,11 +339,12 @@ class LayerNorm(CustomOp):
         ):
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         else:
-            return self.forward_native(x)
+            return self.forward_native(x, **kwargs)
 
     def forward_native(
         self,
         x: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
         weight = self.weight if self.elementwise_affine else None
         bias = self.bias if self.use_bias else None
@@ -359,25 +361,28 @@ class LayerNorm(CustomOp):
     def forward_hip(
         self,
         x: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        return self.forward_native(x, **kwargs)
 
     def forward_npu(
         self,
         x: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        return self.forward_native(x, **kwargs)
 
     def forward_cpu(
         self,
         x: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
         if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.layernorm_cpu(
                 x, self.weight.data, self.variance_epsilon
             )
         else:
-            return self.forward_native(x)
+            return self.forward_native(x, **kwargs)
 
 
 class GemmaRMSNorm(CustomOp):
