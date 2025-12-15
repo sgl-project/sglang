@@ -1849,8 +1849,8 @@ class Scheduler(
         )
 
         has_small_req_in_waiting_queue = (
-            not self.disaggregation_prefill_enable_interleave 
-            or any(len(req.origin_input_ids) <= self.chunked_prefill_size for req in self.waiting_queue)
+            self.disaggregation_prefill_enable_interleave 
+            and any(len(req.origin_input_ids) <= self.chunked_prefill_size for req in self.waiting_queue)
         )
 
         chunked_req_added = False
