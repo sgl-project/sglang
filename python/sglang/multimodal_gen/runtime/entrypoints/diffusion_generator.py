@@ -15,15 +15,16 @@ from typing import Any
 
 import numpy as np
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request, post_process_sample
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    post_process_sample,
+    prepare_request,
+)
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch

@@ -17,10 +17,13 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams, DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger, CYAN, RESET
+from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.utils import shallow_asdict
 
 logger = init_logger(__name__)

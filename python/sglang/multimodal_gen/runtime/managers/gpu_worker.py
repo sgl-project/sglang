@@ -34,7 +34,6 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 logger = init_logger(__name__)
 
 
-
 class GPUWorker:
     """
     A worker that executes the model on a single GPU.
