@@ -42,9 +42,11 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     per_tensor_dequantize,
     requantize_with_max_scale,
+    swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils.common import (
+    direct_register_custom_op,
     get_bool_env_var,
     is_cuda,
     is_sm120_supported,
@@ -100,7 +102,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
 def _sglang_fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -119,7 +120,6 @@ def _sglang_fp4_gemm(
         return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
-@torch.library.register_fake("sglang::fp4_gemm")
 def _sglang_fp4_gemm_fake(
     input,
     weight,
@@ -132,6 +132,14 @@ def _sglang_fp4_gemm_fake(
     M = input.shape[-2]
     N = int(out_features)
     return input.new_empty((M, N), dtype=out_dtype)
+
+
+direct_register_custom_op(
+    op_name="fp4_gemm",
+    op_func=_sglang_fp4_gemm,
+    mutates_args=[],
+    fake_impl=_sglang_fp4_gemm_fake,
+)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -1333,7 +1341,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # Only use `swizzle_blockscale` for shapes, not for real content
         layer.w13_blockscale_swizzled = Parameter(
-            self.swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+            swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
         )
 
         w2_weight_scale = ModelWeightParameter(
@@ -1350,7 +1358,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
         layer.w2_blockscale_swizzled = Parameter(
-            self.swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+            swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
         )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
@@ -1394,31 +1402,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
-
-    def swizzle_blockscale(self, scale: torch.Tensor):
-        assert scale.dtype == torch.float8_e4m3fn
-        # Pad and blockwise interleave weight_scale
-        scale_ndim = scale.ndim
-        if scale.ndim == 2:
-            scale = scale.unsqueeze(0)
-        assert scale.ndim == 3
-        B, M, K = scale.shape
-        round_up_multiple = lambda x, m: (x + m - 1) // m * m
-        M_padded = round_up_multiple(M, 128)
-        K_padded = round_up_multiple(K, 4)
-        padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
-        padded_scale[:B, :M, :K] = scale
-        batches, rows, cols = padded_scale.shape
-        assert rows % 128 == 0
-        assert cols % 4 == 0
-        padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-        swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-        swizzled_scale = swizzled_scale.contiguous().cuda()
-        return (
-            swizzled_scale.reshape(M_padded, K_padded)
-            if scale_ndim == 2
-            else swizzled_scale.reshape(B, M_padded, K_padded)
-        )
 
     def prepare_static_weights_for_kernel(
         self,
@@ -1694,7 +1677,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # CUTLASS processing - handle w13 and w2 separately
 
             # Process w13 weights
-            w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
+            w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
             del layer.w13_weight_scale
             layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
 
@@ -1727,13 +1710,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
                 layer.w2_blockscale_swizzled = Parameter(
-                    self.swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+                    swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
                 )
 
             layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
             # Process w2 weights
-            w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
+            w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
             del layer.w2_weight_scale
             layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
 

@@ -245,6 +245,11 @@ class ReplicatedLinear(LinearBase):
                 else:
                     raise ValueError(f"{loaded_weight} are not all equal")
 
+            if param.dtype == torch.int8 or loaded_weight.dtype == torch.int8:
+                assert (
+                    param.dtype == loaded_weight.dtype
+                ), "init para dtype and loaded weight dtype should be the same"
+
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 

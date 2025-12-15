@@ -177,6 +177,7 @@ struct Router {
     bootstrap_port_annotation: String,
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
+    prometheus_duration_buckets: Option<Vec<f64>>,
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
@@ -225,6 +226,8 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
     enable_trace: bool,
     otlp_traces_endpoint: String,
 }
@@ -406,6 +409,10 @@ impl Router {
                 self.client_key_path.as_ref(),
             )
             .add_ca_certificates(self.ca_cert_paths.clone())
+            .maybe_server_cert_and_key(
+                self.server_cert_path.as_ref(),
+                self.server_key_path.as_ref(),
+            )
             .build()
     }
 }
@@ -439,6 +446,7 @@ impl Router {
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
+        prometheus_duration_buckets = None,
         request_timeout_secs = 1800,
         request_id_headers = None,
         pd_disaggregation = false,
@@ -486,6 +494,8 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        server_cert_path = None,
+        server_key_path = None,
         enable_trace = false,
         otlp_traces_endpoint = String::from("localhost:4317"),
     ))]
@@ -516,6 +526,7 @@ impl Router {
         bootstrap_port_annotation: String,
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
+        prometheus_duration_buckets: Option<Vec<f64>>,
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
@@ -563,6 +574,8 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        server_cert_path: Option<String>,
+        server_key_path: Option<String>,
         enable_trace: bool,
         otlp_traces_endpoint: String,
     ) -> PyResult<Self> {
@@ -606,6 +619,7 @@ impl Router {
             bootstrap_port_annotation,
             prometheus_port,
             prometheus_host,
+            prometheus_duration_buckets,
             request_timeout_secs,
             request_id_headers,
             pd_disaggregation,
@@ -654,6 +668,8 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            server_cert_path,
+            server_key_path,
             enable_trace,
             otlp_traces_endpoint,
         })
@@ -695,6 +711,7 @@ impl Router {
                 .prometheus_host
                 .clone()
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
+            duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
         let runtime = tokio::runtime::Runtime::new()
