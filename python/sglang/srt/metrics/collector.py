@@ -216,6 +216,11 @@ class SchedulerStats:
     # CUDA graph
     is_cuda_graph: float = 0.0
 
+    # LoRA pool metrics
+    lora_pool_slots_used: int = 0
+    lora_pool_slots_total: int = 0
+    lora_pool_utilization: float = 0.0
+
 
 class SchedulerMetricsCollector:
 
@@ -605,6 +610,26 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        # LoRA pool metrics
+        self.lora_pool_slots_used = Gauge(
+            name="sglang:lora_pool_slots_used",
+            documentation="Number of LoRA adapter slots currently occupied in GPU memory.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.lora_pool_slots_total = Gauge(
+            name="sglang:lora_pool_slots_total",
+            documentation="Total number of LoRA adapter slots available (max_loras_per_batch).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.lora_pool_utilization = Gauge(
+            name="sglang:lora_pool_utilization",
+            documentation="LoRA pool utilization ratio (used/total). 1.0 means pool is full.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -695,6 +720,11 @@ class SchedulerMetricsCollector:
 
         # CUDA graph
         self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
+
+        # LoRA pool metrics
+        self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
+        self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
+        self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
         self.last_log_time = time.perf_counter()
 

@@ -201,6 +201,7 @@ class SchedulerMetricsMixin:
 
             # Others
             self.calculate_utilization()
+            self.update_lora_metrics()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -351,6 +352,7 @@ class SchedulerMetricsMixin:
 
             # Others
             self.calculate_utilization()
+            self.update_lora_metrics()
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
@@ -382,6 +384,50 @@ class SchedulerMetricsMixin:
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+    def update_lora_metrics(self: Scheduler):
+        """Update LoRA pool metrics for monitoring and autoscaling."""
+        if not self.enable_lora:
+            return
+
+        try:
+            # Get LoRA memory pool stats
+            lora_manager = self.tp_worker.model_runner.lora_manager
+            if lora_manager is None or lora_manager.memory_pool is None:
+                return
+
+            mem_pool = lora_manager.memory_pool
+            slots_total = mem_pool.max_loras_per_batch
+
+            # Calculate active adapters from running batch
+            # This gives a true measure of current load for autoscaling purposes
+            active_lora_ids = set()
+
+            # For PP mode, check all running micro batches
+            if hasattr(self, "running_mbs") and self.running_mbs:
+                for batch in self.running_mbs:
+                    if batch and hasattr(batch, "reqs"):
+                        for req in batch.reqs:
+                            if hasattr(req, "lora_id") and req.lora_id is not None:
+                                active_lora_ids.add(req.lora_id)
+            # For normal mode, check running_batch
+            elif hasattr(self, "running_batch") and self.running_batch:
+                if hasattr(self.running_batch, "reqs"):
+                    for req in self.running_batch.reqs:
+                        if hasattr(req, "lora_id") and req.lora_id is not None:
+                            active_lora_ids.add(req.lora_id)
+
+            # Count active adapters (excluding None for base model)
+            slots_used = len(active_lora_ids)
+            utilization = slots_used / slots_total if slots_total > 0 else 0.0
+
+            # Update stats
+            self.stats.lora_pool_slots_used = slots_used
+            self.stats.lora_pool_slots_total = slots_total
+            self.stats.lora_pool_utilization = utilization
+
+        except Exception as e:
+            logger.warning(f"Failed to update LoRA metrics: {e}")
 
     def calculate_utilization(self):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
