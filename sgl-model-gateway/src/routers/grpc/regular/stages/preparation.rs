@@ -49,6 +49,7 @@ impl PipelineStage for PreparationStage {
                     "RequestType::Responses reached regular preparation stage"
                 );
                 Err(grpc_error::internal_error(
+                    "responses_in_wrong_pipeline",
                     "RequestType::Responses reached regular preparation stage",
                 ))
             }

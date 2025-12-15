@@ -22,7 +22,7 @@ use crate::{
     },
     mcp::McpConfig,
     observability::metrics::RouterMetrics,
-    protocols::worker_spec::{JobStatus, WorkerConfigRequest},
+    protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
     workflow::{WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus},
 };
 
@@ -31,6 +31,10 @@ use crate::{
 pub enum Job {
     AddWorker {
         config: Box<WorkerConfigRequest>,
+    },
+    UpdateWorker {
+        url: String,
+        update: Box<WorkerUpdateRequest>,
     },
     RemoveWorker {
         url: String,
@@ -54,9 +58,10 @@ pub enum Job {
 
 impl Job {
     /// Get job type as string for logging
-    pub fn job_type(&self) -> &str {
+    pub fn job_type(&self) -> &'static str {
         match self {
             Job::AddWorker { .. } => "AddWorker",
+            Job::UpdateWorker { .. } => "UpdateWorker",
             Job::RemoveWorker { .. } => "RemoveWorker",
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
             Job::InitializeMcpServers { .. } => "InitializeMcpServers",
@@ -70,6 +75,7 @@ impl Job {
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config } => &config.url,
+            Job::UpdateWorker { url, .. } => url,
             Job::RemoveWorker { url } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
             Job::InitializeMcpServers { .. } => "startup",
@@ -231,13 +237,13 @@ impl JobQueue {
         }
 
         // Extract values before moving job
-        let job_type = job.job_type().to_string();
+        let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
 
         // Record pending status
         self.status_map.insert(
             worker_url.clone(),
-            JobStatus::pending(&job_type, &worker_url),
+            JobStatus::pending(job_type, &worker_url),
         );
 
         match self.tx.send(job).await {
@@ -280,14 +286,14 @@ impl JobQueue {
         status_map: Arc<DashMap<String, JobStatus>>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        let job_type = job.job_type().to_string();
+        let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
 
         // Update to processing
         status_map.insert(
             worker_url.clone(),
-            JobStatus::processing(&job_type, &worker_url),
+            JobStatus::processing(job_type, &worker_url),
         );
 
         debug!("Processing job: type={}, worker={}", job_type, worker_url);
@@ -297,13 +303,13 @@ impl JobQueue {
             Some(ctx) => {
                 let result = Self::execute_job(&job, &ctx).await;
                 let duration = start.elapsed();
-                Self::record_job_completion(&job_type, &worker_url, duration, &result, &status_map);
+                Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
                 status_map.insert(
                     worker_url.clone(),
-                    JobStatus::failed(&job_type, &worker_url, error_msg),
+                    JobStatus::failed(job_type, &worker_url, error_msg),
                 );
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
@@ -341,6 +347,24 @@ impl JobQueue {
                     timeout_duration,
                 )
                 .await
+            }
+            Job::UpdateWorker { url, update } => {
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let instance_id =
+                    Self::start_worker_update_workflow(engine, url, update, context).await?;
+
+                debug!(
+                    "Started worker update workflow for {} (instance: {})",
+                    url, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(30);
+
+                Self::wait_for_workflow_completion(engine, instance_id, url, timeout_duration).await
             }
             Job::RemoveWorker { url } => {
                 let engine = context
@@ -654,7 +678,7 @@ impl JobQueue {
         // Select workflow based on runtime field
         let workflow_id = match config.runtime.as_deref() {
             Some("external") => WorkflowId::new("external_worker_registration"),
-            _ => WorkflowId::new("worker_registration"),
+            _ => WorkflowId::new("local_worker_registration"),
         };
 
         engine
@@ -682,6 +706,26 @@ impl JobQueue {
             .start_workflow(WorkflowId::new("worker_removal"), workflow_context)
             .await
             .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))
+    }
+
+    /// Start worker update workflow
+    async fn start_worker_update_workflow(
+        engine: &Arc<WorkflowEngine>,
+        url: &str,
+        update: &WorkerUpdateRequest,
+        context: &Arc<AppContext>,
+    ) -> Result<WorkflowInstanceId, String> {
+        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+        // Pass URL and dp_aware separately, workflow step handles the rest
+        workflow_context.set("worker_url", url.to_string());
+        workflow_context.set("dp_aware", context.router_config.dp_aware);
+        workflow_context.set("update_request", update.clone());
+        workflow_context.set_arc("app_context", Arc::clone(context));
+
+        engine
+            .start_workflow(WorkflowId::new("worker_update"), workflow_context)
+            .await
+            .map_err(|e| format!("Failed to start worker update workflow: {:?}", e))
     }
 
     /// Start MCP server registration workflow
@@ -764,7 +808,7 @@ impl JobQueue {
 
     /// Record job completion metrics and update status
     fn record_job_completion(
-        job_type: &str,
+        job_type: &'static str,
         worker_url: &str,
         duration: Duration,
         result: &Result<String, String>,

@@ -329,6 +329,7 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        prefill_max_requests: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -368,6 +369,7 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.prefill_max_requests = prefill_max_requests
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -493,7 +495,7 @@ class PrefillAdder:
             finally:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
+    def add_one_req_ignore_eos(self, req: Req):
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -583,8 +585,12 @@ class PrefillAdder:
         # therefore, the prefill-batch setting is temporarily set to 1.
         if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
+
+        if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+            return AddReqResult.OTHER
+
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req, has_chunked_req)
+            return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
