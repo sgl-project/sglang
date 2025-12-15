@@ -41,7 +41,6 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         w, h = int(parts[0]), int(parts[1])
         return w, h
     except Exception:
-        # Fallback to default portrait 720x1280
         return None, None
 
 
