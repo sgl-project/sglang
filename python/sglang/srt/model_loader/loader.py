@@ -840,9 +840,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         from sglang.srt.layers.quantization.blockwise_fp8_utils import (
             scaled_fp8_blockwise,
         )
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            per_token_group_quant_fp8,
-        )
+
         from sglang.srt.layers.parameter import BlockQuantScaleParameter
         from torch.nn.parameter import Parameter
 
@@ -851,80 +849,69 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                with device_loading_context(module, target_device):
-                    # Check if this module should be skipped
-                    if any(
-                        skip in name
-                        for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+            if quant_method is None:
+                continue
+
+            with device_loading_context(module, target_device):
+                # 1) Skip modules that should not be quantized (lm_head, embeddings, layer norms, etc.)
+                if any(
+                    skip in name
+                    for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+                ):
+                    logger.info(
+                        f"[QuantizedRL] Skip quantization for module: {name}"
+                    )
+                    continue
+
+                # 2) Modules without a weight tensor 
+                if not hasattr(module, "weight") or module.weight is None:
+                    continue
+
+                weight = module.weight
+
+                # 3) Only attempt blockwise quantization for 2D BF16/FP16/FP32 weights
+                if weight.dtype not in [
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float32,
+                ]:
+                    logger.info(
+                        f"[QuantizedRL] module: {name} not BF16/FP16/FP32 weights"
+                    )
+                    continue
+
+                use_blockwise = False
+
+                if weight.ndim == 2:
+                    # Check whether both dimensions are divisible by the block size
+                    if (
+                        weight.shape[0] % default_block_size[0] == 0
+                        and weight.shape[1] % default_block_size[1] == 0
                     ):
-                        logger.info(
-                            f"[QuantizedRL] Skip quantization for module: {name}"
-                        )
-                        # Still call process_weights_after_loading for non-quantized layers
-                        quant_method.process_weights_after_loading(module)
-                        continue
+                        try:
+                            qweight, scale = scaled_fp8_blockwise(
+                                weight.data, default_block_size
+                            )
+                            # Scale shape is (blk_m, blk_n, 1); squeeze the last dim
+                            scale = scale.squeeze(-1)
 
-                    # Check if module has weight parameter
-                    if not hasattr(module, "weight") or module.weight is None:
-                        quant_method.process_weights_after_loading(module)
-                        continue
+                            # Remove existing weight_scale
+                            if hasattr(module, "weight_scale"):
+                                delattr(module, "weight_scale")
 
-                    weight = module.weight
-                    # Only quantize if weight is in BF16/FP16/FP32
-                    if weight.dtype not in [
-                        torch.bfloat16,
-                        torch.float32,
-                        torch.float16,
-                    ]:
-                        quant_method.process_weights_after_loading(module)
-                        continue
-
-                    # Try blockwise quantization first
-                    use_blockwise = False
-                    if len(weight.shape) == 2:
-                        # Check if shape is compatible with blockwise quantization
-                        if (
-                            weight.shape[0] % default_block_size[0] == 0
-                            and weight.shape[1] % default_block_size[1] == 0
-                        ):
-                            try:
-                                qweight, scale = scaled_fp8_blockwise(
-                                    weight.data, default_block_size
-                                )
-                                # scale shape is (blk_m, blk_n, 1), need to squeeze
-                                scale = scale.squeeze(-1)
-
-                                # Clean up old weight_scale if exists (for per-channel quantization)
-                                if hasattr(module, "weight_scale"):
-                                    delattr(module, "weight_scale")
-
-                                # Check if module has weight_scale_inv (for blockwise)
-                                if hasattr(module, "weight_scale_inv"):
-                                    # Update weight_scale_inv for blockwise quantization
-                                    if isinstance(
-                                        module.weight_scale_inv, BlockQuantScaleParameter
-                                    ):
-                                        # Check if scale shape matches
-                                        if module.weight_scale_inv.data.shape == scale.shape:
-                                            module.weight_scale_inv.data.copy_(scale)
-                                        else:
-                                            logger.warning(
-                                                f"[QuantizedRL] Scale shape mismatch for {name}: "
-                                                f"expected {module.weight_scale_inv.data.shape}, "
-                                                f"got {scale.shape}. Recreating scale parameter."
-                                            )
-                                            # Recreate with correct shape
-                                            scale_param = BlockQuantScaleParameter(
-                                                data=scale,
-                                                input_dim=1,
-                                                output_dim=0,
-                                            )
-                                            module.register_parameter(
-                                                "weight_scale_inv", scale_param
-                                            )
+                            # Update or create weight_scale_inv used for blockwise quantization
+                            if hasattr(module, "weight_scale_inv"):
+                                if isinstance(
+                                    module.weight_scale_inv, BlockQuantScaleParameter
+                                ):
+                                    if module.weight_scale_inv.data.shape == scale.shape:
+                                        module.weight_scale_inv.data.copy_(scale)
                                     else:
-                                        # Replace non-BlockQuantScaleParameter with BlockQuantScaleParameter
+                                        logger.warning(
+                                            f"[QuantizedRL] Scale shape mismatch for {name}: "
+                                            f"expected {module.weight_scale_inv.data.shape}, "
+                                            f"got {scale.shape}. Recreating scale parameter."
+                                        )
                                         scale_param = BlockQuantScaleParameter(
                                             data=scale,
                                             input_dim=1,
@@ -934,7 +921,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                                             "weight_scale_inv", scale_param
                                         )
                                 else:
-                                    # Create weight_scale_inv if it doesn't exist
+                                    # Replace with BlockQuantScaleParameter
                                     scale_param = BlockQuantScaleParameter(
                                         data=scale,
                                         input_dim=1,
@@ -943,51 +930,43 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                                     module.register_parameter(
                                         "weight_scale_inv", scale_param
                                     )
-
-                                # Update weight
-                                module.weight = Parameter(
-                                    qweight.t(), requires_grad=False
+                            else:
+                                # No existing weight_scale_inv; create a new one
+                                scale_param = BlockQuantScaleParameter(
+                                    data=scale,
+                                    input_dim=1,
+                                    output_dim=0,
                                 )
-                                use_blockwise = True
-                                logger.info(
-                                    f"[QuantizedRL] Quantize (blockwise): {name} "
-                                    f"{weight.dtype}→FP8 "
-                                    f"(shape={weight.shape}, block_size={default_block_size})"
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
-                                    "falling back to per_token_group_quant_fp8"
+                                module.register_parameter(
+                                    "weight_scale_inv", scale_param
                                 )
 
-                    # Fallback to per-channel quantization if blockwise failed or not applicable
-                    if not use_blockwise:
-                        qweight, weight_scale = per_token_group_quant_fp8(
-                            weight.data, weight.shape[-1]
-                        )
-                        weight_scale = weight_scale.t().contiguous()
-
-                        # Clean up weight_scale_inv if exists (for blockwise)
-                        if hasattr(module, "weight_scale_inv"):
-                            delattr(module, "weight_scale_inv")
-
-                        # Update weight and scale
-                        module.weight = Parameter(qweight.t(), requires_grad=False)
-                        if hasattr(module, "weight_scale"):
-                            module.weight_scale = Parameter(
-                                weight_scale, requires_grad=False
+                            # Update the weight; keep the same transposed layout as native FP8 path
+                            module.weight = Parameter(
+                                qweight.t(), requires_grad=False
                             )
-                        else:
-                            module.register_parameter(
-                                "weight_scale", Parameter(weight_scale, requires_grad=False)
+                            use_blockwise = True
+                            logger.info(
+                                f"[QuantizedRL] Quantize (blockwise, initial load): {name} "
+                                f"{weight.dtype}→FP8 "
+                                f"(shape={weight.shape}, block_size={default_block_size})"
                             )
-                        if hasattr(module, "input_scale"):
-                            module.input_scale = None
+                        except Exception as e:
+                            logger.warning(
+                                f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
+                                "skipping blockwise quantization for this module"
+                            )
 
-                        logger.info(
-                            f"[QuantizedRL] Quantize (per_token_group): {name} "
-                            f"{weight.dtype}→FP8"
-                        )
+                # 4) If blockwise is not applicable or fails, we keep the original BF16/FP16/FP32
+                #    weights for this module and do not attempt per-channel FP8 here. FP8
+                #    conversion for reload will be handled by rebinding_and_load_weights.
+                if not use_blockwise:
+                    logger.info(
+                        f"[QuantizedRL] Disabled or failed blockwise fp8 for module: {name}; "
+                        f"keeping original weight dtype {weight.dtype} on initial load"
+                    )
+
+
 
         model.flash_rl_initial_load_complete = True
         self._initial_load_complete = True
@@ -2867,67 +2846,25 @@ def get_model_loader(
             "Using QuantizedRLModelLoader for RL training with native FP8 quantization."
         )
         logger.info(
-            "FP8 approach: Model loads with native SGLang FP8 quantization. "
+            "FP8 approach: Model loads and gets blockwise fp8 quantization on    . "
             "Same model path for both training and inference."
         )
-
-        # Automatically set quantization to FP8 for flash_rl load format
-        if model_config:
-            
-            # Force set quantization to fp8 for flash_rl format
-            if not model_config.quantization or model_config.quantization != "fp8":
-                logger.info(
-                    "QuantizedRL: Current model quantization config is not fp8, "
-                    "Automatically setting quantization to fp8 for flash_rl load format. "
-                    
-                )
-                model_config.quantization = "fp8"
-            
-            # Set quantization_config following verl's logic for blockwise FP8 quantization
-            # Default FP8 blockwise quantization config following verl's logic
-            FP8_BLOCK_QUANT_KWARGS = {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-            }
-            
-            # Check if quantization_config is already set (e.g., from json_model_override_args)
-            existing_quant_config = getattr(model_config.hf_config, "quantization_config", None)
-            
-
-            # TODO: Simplify the code below?
-            if existing_quant_config is None:
-                # Set default FP8 blockwise quantization config
-                fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-                logger.info(
-                    "QuantizedRL: Setting quantization_config with blockwise FP8 parameters. "
-                    f"Config: {fp8_block_quant_kwargs}"
-                )
-                model_config.hf_config.quantization_config = fp8_block_quant_kwargs
+        if model_config and not model_config.quantization:
+            logger.info(
+                "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
+                "Model will be loaded with FP8 infrastructure"
+            )
+            use_blockwise = True
+            if use_blockwise:
+                model_config.hf_config.quantization_config = {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                }
             else:
-                # Merge with existing config, prioritizing existing values but filling in missing keys
-                if isinstance(existing_quant_config, dict):
-                    # Update existing config with default values for missing keys
-                    updated = False
-                    for key, default_value in FP8_BLOCK_QUANT_KWARGS.items():
-                        if key not in existing_quant_config:
-                            existing_quant_config[key] = default_value
-                            updated = True
-                            logger.info(
-                                f"QuantizedRL: Added missing quantization_config key '{key}' = {default_value}"
-                            )
-                    if updated:
-                        model_config.hf_config.quantization_config = existing_quant_config
-                    else:
-                        logger.info(
-                            "QuantizedRL: quantization_config already complete, no updates needed"
-                        )
-                else:
-                    logger.info(
-                        "QuantizedRL: quantization_config already exists and is not a dict, "
-                        "keeping existing configuration"
-                    )
+                model_config.quantization = "fp8"
+
 
         return QuantizedRLModelLoader(load_config)
 
