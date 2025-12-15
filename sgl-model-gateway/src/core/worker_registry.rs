@@ -7,10 +7,7 @@ use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::{
-    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
-    observability::metrics::RouterMetrics,
-};
+use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -142,7 +139,6 @@ impl WorkerRegistry {
             }
 
             worker.set_healthy(false);
-            RouterMetrics::remove_worker_metrics(worker.url());
 
             Some(worker)
         } else {
