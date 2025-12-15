@@ -367,45 +367,49 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             dw = w_idxs - w_idxs_floor
 
             idx_list[0].append(
-                ((h_idxs_floor * num_grid_per_side).unsqueeze(-1) + w_idxs_floor.unsqueeze(0))
+                (
+                    (h_idxs_floor * num_grid_per_side).unsqueeze(-1)
+                    + w_idxs_floor.unsqueeze(0)
+                )
                 .flatten()
                 .repeat(t)
             )
             idx_list[1].append(
-                ((h_idxs_floor * num_grid_per_side).unsqueeze(-1) + w_idxs_ceil.unsqueeze(0))
+                (
+                    (h_idxs_floor * num_grid_per_side).unsqueeze(-1)
+                    + w_idxs_ceil.unsqueeze(0)
+                )
                 .flatten()
                 .repeat(t)
             )
             idx_list[2].append(
-                ((h_idxs_ceil * num_grid_per_side).unsqueeze(-1) + w_idxs_floor.unsqueeze(0))
+                (
+                    (h_idxs_ceil * num_grid_per_side).unsqueeze(-1)
+                    + w_idxs_floor.unsqueeze(0)
+                )
                 .flatten()
                 .repeat(t)
             )
             idx_list[3].append(
-                ((h_idxs_ceil * num_grid_per_side).unsqueeze(-1) + w_idxs_ceil.unsqueeze(0))
+                (
+                    (h_idxs_ceil * num_grid_per_side).unsqueeze(-1)
+                    + w_idxs_ceil.unsqueeze(0)
+                )
                 .flatten()
                 .repeat(t)
             )
 
             weight_list[0].append(
-                ((1 - dh).unsqueeze(-1) * (1 - dw).unsqueeze(0))
-                .flatten()
-                .repeat(t)
+                ((1 - dh).unsqueeze(-1) * (1 - dw).unsqueeze(0)).flatten().repeat(t)
             )
             weight_list[1].append(
-                ((1 - dh).unsqueeze(-1) * dw.unsqueeze(0))
-                .flatten()
-                .repeat(t)
+                ((1 - dh).unsqueeze(-1) * dw.unsqueeze(0)).flatten().repeat(t)
             )
             weight_list[2].append(
-                (dh.unsqueeze(-1) * (1 - dw).unsqueeze(0))
-                .flatten()
-                .repeat(t)
+                (dh.unsqueeze(-1) * (1 - dw).unsqueeze(0)).flatten().repeat(t)
             )
             weight_list[3].append(
-                (dh.unsqueeze(-1) * dw.unsqueeze(0))
-                .flatten()
-                .repeat(t)
+                (dh.unsqueeze(-1) * dw.unsqueeze(0)).flatten().repeat(t)
             )
 
         if len(grid_thw) > 1:
@@ -415,22 +419,18 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             idx_list = [items[0] for items in idx_list]
             weight_list = [items[0] for items in weight_list]
 
-        p0 = (
-            self.pos_embed(idx_list[0].to(torch.long))
-            * weight_list[0].to(self.dtype).unsqueeze(-1)
-        )
-        p1 = (
-            self.pos_embed(idx_list[1].to(torch.long))
-            * weight_list[1].to(self.dtype).unsqueeze(-1)
-        )
-        p2 = (
-            self.pos_embed(idx_list[2].to(torch.long))
-            * weight_list[2].to(self.dtype).unsqueeze(-1)
-        )
-        p3 = (
-            self.pos_embed(idx_list[3].to(torch.long))
-            * weight_list[3].to(self.dtype).unsqueeze(-1)
-        )
+        p0 = self.pos_embed(idx_list[0].to(torch.long)) * weight_list[0].to(
+            self.dtype
+        ).unsqueeze(-1)
+        p1 = self.pos_embed(idx_list[1].to(torch.long)) * weight_list[1].to(
+            self.dtype
+        ).unsqueeze(-1)
+        p2 = self.pos_embed(idx_list[2].to(torch.long)) * weight_list[2].to(
+            self.dtype
+        ).unsqueeze(-1)
+        p3 = self.pos_embed(idx_list[3].to(torch.long)) * weight_list[3].to(
+            self.dtype
+        ).unsqueeze(-1)
 
         patch_pos_embeds = p0 + p1 + p2 + p3
         patch_pos_embeds = patch_pos_embeds.split([t * h * w for t, h, w in grid_thw])
