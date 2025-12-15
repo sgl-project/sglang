@@ -21,8 +21,8 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 from flash_attn_origin.cute import utils
 from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn_origin.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 
 def maybe_contiguous(x):
@@ -257,10 +257,28 @@ def _flash_attn_fwd(
             pack_gqa = False
 
     if num_splits < 1:
-        max_seqlen_k = seqlen_k if cu_seqlens_k is None else (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
-        max_seqlen_q = seqlen_q if cu_seqlens_q is None else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+        max_seqlen_k = (
+            seqlen_k
+            if cu_seqlens_k is None
+            else (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+        )
+        max_seqlen_q = (
+            seqlen_q
+            if cu_seqlens_q is None
+            else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+        )
         seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-        seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
+        seqlen_k_loaded = (
+            max_seqlen_k
+            if not local
+            else max(
+                0,
+                min(
+                    max_seqlen_k,
+                    window_size_right + window_size_left + 1 + m_block_size,
+                ),
+            )
+        )
         num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
         num_m_blocks = (seqlen_q_packgqa + m_block_size - 1) // m_block_size
         total_mblocks = batch_size * num_head_kv * num_m_blocks
@@ -273,8 +291,17 @@ def _flash_attn_fwd(
 
     is_split_kv = num_splits > 1
     if is_split_kv:
-        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        out_partial = torch.empty(
+            num_splits,
+            *q_batch_seqlen_shape,
+            num_head,
+            head_dim_v,
+            dtype=torch.float32,
+            device=device,
+        )
+        lse_partial = torch.empty(
+            num_splits, *lse_shape, dtype=torch.float32, device=device
+        )
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -284,9 +311,13 @@ def _flash_attn_fwd(
         for t in (q, k, v, out if not is_split_kv else out_partial)
     ]
     if is_split_kv:
-        lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
+        lse_tensor = from_dlpack(
+            lse_partial.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
     elif lse is not None:
-        lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
+        lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=lse.ndim - 1
+        )
     else:
         lse_tensor = None
     (
@@ -423,8 +454,7 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 has_buffers=buffers is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
-                is_varlen_q=cu_seqlens_q is not None
-                or seqused_q is not None,
+                is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
             )
         else:
             raise ValueError(
@@ -518,13 +548,19 @@ def _flash_attn_fwd_combine(
     # Input validation
     assert out_partial.dim() in [4, 5], "out_partial must have 4 or 5 dimensions"
     assert lse_partial.dim() in [3, 4], "lse_partial must have 3 or 4 dimensions"
-    assert out_partial.dtype in [torch.float16, torch.bfloat16, torch.float32], (
-        "out_partial must be fp16, bf16, or fp32"
-    )
+    assert out_partial.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], "out_partial must be fp16, bf16, or fp32"
     assert lse_partial.dtype == torch.float32, "lse_partial must be fp32"
     assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
-    assert out_partial.stride(-1) == 1, "out_partial must be contiguous in the last dimension"
-    assert lse_partial.stride(-2) == 1, "lse_partial must be contiguous in the seqlen dimension"
+    assert (
+        out_partial.stride(-1) == 1
+    ), "out_partial must be contiguous in the last dimension"
+    assert (
+        lse_partial.stride(-2) == 1
+    ), "lse_partial must be contiguous in the seqlen dimension"
     assert lse_partial.shape == out_partial.shape[:-1]
 
     # Determine if this is variable length based on dimensions
@@ -555,7 +591,9 @@ def _flash_attn_fwd_combine(
     k_block_size = 64 if head_dim <= 64 else 128
     # We want kBlockM to be as small as possible to maximize parallelism.
     # E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
-    m_block_size = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
+    m_block_size = (
+        8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
+    )
     log_max_splits = max(math.ceil(math.log2(num_splits)), 4)
     if m_block_size == 8:
         # If kBlockM == 8 then the minimum number of splits is 32.
@@ -563,23 +601,29 @@ def _flash_attn_fwd_combine(
         log_max_splits = max(log_max_splits, 5)
 
     # Convert to cute tensors (using kernel-formatted tensors)
-    out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=4 if not is_varlen else 3
+    out_partial_tensor = from_dlpack(
+        out_partial.detach(), assumed_align=16
+    ).mark_layout_dynamic(leading_dim=4 if not is_varlen else 3)
+    lse_partial_tensor = from_dlpack(
+        lse_partial.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=lse_partial.ndim - 2)
+    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=3 if not is_varlen else 2
     )
-    lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=lse_partial.ndim - 2
-    )
-    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
     lse_tensor = (
-        from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 2)
+        from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=lse.ndim - 2
+        )
         if lse is not None
         else None
     )
 
     optional_tensors = [
-        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if t is not None
-        else None
+        (
+            from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            if t is not None
+            else None
+        )
         for t in (cu_seqlens, seqused, num_splits_dynamic_ptr, semaphore_to_reset)
     ]
     cu_seqlens_tensor, seqused_tensor, num_splits_dynamic_tensor, semaphore_tensor = (
