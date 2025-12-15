@@ -121,9 +121,22 @@ class SchedulerRuntimeCheckerMixin:
             full_num_used != self.tree_cache.full_protected_size()
             or mamba_num_used != self.tree_cache.mamba_protected_size()
         )
+        free_full_pages = set(
+            self.token_to_kv_pool_allocator.free_pages.tolist()
+            + self.token_to_kv_pool_allocator.release_pages.tolist()
+        )
+        cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
+        expected_full_pages = set(range(1, self.token_to_kv_pool_allocator.size + 1))
+        leaked_full_pages = expected_full_pages - free_full_pages - cached_full_pages
+        free_mamba_pages = set(self.req_to_token_pool.mamba_pool.free_slots.tolist())
+        cached_mamba_pages = set(self.tree_cache.all_mamba_values_flatten().tolist())
+        expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+        leaked_mamba_pages = (
+            expected_mamba_pages - free_mamba_pages - cached_mamba_pages
+        )
         token_msg = (
             f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
+            f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
         )
         return memory_leak, token_msg
 
@@ -207,7 +220,7 @@ class SchedulerRuntimeCheckerMixin:
     def check_memory(self: Scheduler):
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache):
+        elif self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache):
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
@@ -242,7 +255,7 @@ class SchedulerRuntimeCheckerMixin:
                 ) = self._get_swa_token_info()
                 num_used = max(full_num_used, swa_num_used)
                 token_usage = max(full_token_usage, swa_token_usage)
-            elif self.is_ssm_model:
+            elif self.is_hybrid_ssm:
                 (
                     num_used,
                     _,
@@ -281,7 +294,7 @@ class SchedulerRuntimeCheckerMixin:
 
     def check_tree_cache(self: Scheduler):
         if (self.is_hybrid_swa and isinstance(self.tree_cache, SWARadixCache)) or (
-            self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache)
+            self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache)
         ):
             self.tree_cache.sanity_check()
 
@@ -344,7 +357,7 @@ class SchedulerWatchdog:
             # Print batch size and memory pool info to check whether there are de-sync issues.
             if self.scheduler.is_hybrid_swa:
                 _, info_msg = self.scheduler._check_hybrid_memory()
-            elif self.scheduler.is_ssm_model and isinstance(
+            elif self.scheduler.is_hybrid_ssm and isinstance(
                 self.scheduler.tree_cache, MambaRadixCache
             ):
                 _, info_msg = self.scheduler._check_mamba_memory()
