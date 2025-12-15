@@ -105,24 +105,27 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
-            return self.forward_native(x, residual, post_residual_addition)
+            return self.forward_native(x, residual, **kwargs)
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
                 or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
-                return self.forward_native(x, residual, post_residual_addition)
+                return self.forward_native(x, residual, **kwargs)
             return rms_norm_batch_invariant(
                 x,
                 self.weight.data,
                 self.variance_epsilon,
             )
         if residual is not None:
-            # TODO: Ideally we want to have (a+b)+c. but right now we can only have a+(b+c).
-            # (a+b)+c != a+(b+c), we probably need to add another parameter to fused_add_rmsnorm
+            # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition. 
+            # but right now we can only have hidden_states+(residual+post_residual_addition).
+            # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition), 
+            # we probably need to add another parameter to fused_add_rmsnorm
+            post_residual_addition = kwargs.get("post_residual_addition")
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
@@ -134,6 +137,7 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
             out, _, residual_out = torch_npu.npu_add_rms_norm(
@@ -146,6 +150,7 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
             residual_out = torch.empty_like(x)
@@ -165,6 +170,7 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
@@ -184,13 +190,14 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
         x = x.to(torch.float32)
         if residual is not None:
+            post_residual_addition = kwargs.get("post_residual_addition")
             x = (
                 x
                 + residual.to(torch.float32)
@@ -240,6 +247,7 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
             if residual is not None:
@@ -251,15 +259,16 @@ class RMSNorm(CustomOp):
                 x, self.weight.data, self.variance_epsilon
             )
         else:
-            return self.forward_native(x, residual)
+            return self.forward_native(x, residual, **kwargs)
 
     def forward_xpu(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
-            return self.forward_native(x, residual)
+            return self.forward_native(x, residual, **kwargs)
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
@@ -389,6 +398,7 @@ class GemmaRMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
             gemma_fused_add_rmsnorm(
@@ -402,6 +412,7 @@ class GemmaRMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         orig_dtype = x.dtype
         if residual is not None:
@@ -419,13 +430,15 @@ class GemmaRMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self._forward_impl(x, residual)
+        return self._forward_impl(x, residual, **kwargs)
 
     def forward_cpu(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
             if residual is not None:
@@ -436,12 +449,13 @@ class GemmaRMSNorm(CustomOp):
             return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
                 x, self.weight.data, self.variance_epsilon
             )
-        return self.forward_native(x, residual)
+        return self.forward_native(x, residual, **kwargs)
 
     def forward_npu(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
             x = x + residual
@@ -454,8 +468,9 @@ class GemmaRMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self._forward_impl(x, residual)
+        return self._forward_impl(x, residual, **kwargs)
 
 
 class Gemma3RMSNorm(CustomOp):
@@ -468,22 +483,22 @@ class Gemma3RMSNorm(CustomOp):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward_native(self, x):
+    def forward_native(self, x, **kwargs):
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
-    def forward_cpu(self, x):
+    def forward_cpu(self, x, **kwargs):
         if _is_cpu_amx_available and x.stride(-1) == 1:
             return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
-        return self.forward_native(x)
+        return self.forward_native(x, **kwargs)
 
-    def forward_cuda(self, x):
-        return self.forward_native(x)
+    def forward_cuda(self, x, **kwargs):
+        return self.forward_native(x, **kwargs)
 
-    def forward_npu(self, x):
+    def forward_npu(self, x, **kwargs):
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
         return output
 
