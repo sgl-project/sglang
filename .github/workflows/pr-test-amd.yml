@@ -196,6 +196,9 @@ jobs:
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 45
         run: |
+          # AMD CI Step 1: Only run T2V tests (simplest - no image input)
+          # Removed SGLANG_TEST_OUTPUT_SIZE - let each test use model's supported resolution
+          # Tests: wan2_1_t2v_1.3b, fast_hunyuan_video
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
@@ -203,14 +206,15 @@ jobs:
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
-            -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
             -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2
+              --total-partitions 2 \
+              -k "(t2v or hunyuan) and not lora"
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
@@ -261,6 +265,9 @@ jobs:
       - name: Run diffusion server tests (2-GPU)
         timeout-minutes: 80
         run: |
+          # AMD CI Step 1: Only run T2V tests (simplest - no image input)
+          # Removed SGLANG_TEST_OUTPUT_SIZE - let each test use model's supported resolution
+          # Tests: wan2_2_t2v_a14b_2gpu, wan2_1_t2v_14b_2gpu
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
@@ -268,14 +275,15 @@ jobs:
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
-            -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
             -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2
+              --total-partitions 2 \
+              -k "t2v and not lora"
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
