@@ -134,6 +134,12 @@ impl CacheAwarePolicy {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
+                        // Update tree size metrics per worker (tenant)
+                        for entry in tree.tenant_char_count.iter() {
+                            RouterMetrics::set_tree_size(entry.key(), *entry.value());
+                        }
+
                         debug!(
                             "Cache eviction completed for model {}, max_size: {}",
                             model_id, max_tree_size

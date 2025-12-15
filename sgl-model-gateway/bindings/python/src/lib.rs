@@ -226,6 +226,8 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
     enable_trace: bool,
     otlp_traces_endpoint: String,
 }
@@ -407,6 +409,10 @@ impl Router {
                 self.client_key_path.as_ref(),
             )
             .add_ca_certificates(self.ca_cert_paths.clone())
+            .maybe_server_cert_and_key(
+                self.server_cert_path.as_ref(),
+                self.server_key_path.as_ref(),
+            )
             .build()
     }
 }
@@ -488,6 +494,8 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        server_cert_path = None,
+        server_key_path = None,
         enable_trace = false,
         otlp_traces_endpoint = String::from("localhost:4317"),
     ))]
@@ -566,6 +574,8 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        server_cert_path: Option<String>,
+        server_key_path: Option<String>,
         enable_trace: bool,
         otlp_traces_endpoint: String,
     ) -> PyResult<Self> {
@@ -658,6 +668,8 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            server_cert_path,
+            server_key_path,
             enable_trace,
             otlp_traces_endpoint,
         })

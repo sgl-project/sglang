@@ -86,6 +86,28 @@ impl WorkflowStateStore {
         Ok(())
     }
 
+    /// Get just the workflow context without cloning the entire state.
+    /// More efficient when you only need the context for step execution.
+    pub fn get_context(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<super::types::WorkflowContext> {
+        self.states
+            .read()
+            .get(&instance_id)
+            .map(|s| s.context.clone())
+            .ok_or(WorkflowError::NotFound(instance_id))
+    }
+
+    /// Check if workflow is cancelled without loading full state
+    pub fn is_cancelled(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<bool> {
+        self.states
+            .read()
+            .get(&instance_id)
+            .map(|s| s.status == WorkflowStatus::Cancelled)
+            .ok_or(WorkflowError::NotFound(instance_id))
+    }
+
     /// Get count of workflows by status
     pub fn count_by_status(&self, status: WorkflowStatus) -> usize {
         self.states

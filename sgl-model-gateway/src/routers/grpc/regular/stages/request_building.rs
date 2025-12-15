@@ -40,6 +40,7 @@ impl PipelineStage for RequestBuildingStage {
                     "RequestType::Responses reached regular request building stage"
                 );
                 Err(grpc_error::internal_error(
+                    "responses_in_wrong_pipeline",
                     "RequestType::Responses reached regular request building stage",
                 ))
             }

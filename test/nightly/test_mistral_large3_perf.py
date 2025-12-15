@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from nightly_utils import NightlyBenchmarkRunner
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,8 +12,6 @@ from sglang.test.test_utils import (
     _parse_int_list_env,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=600, suite="nightly-8-gpu-b200", nightly=True)
 
 MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"

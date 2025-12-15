@@ -24,3 +24,5 @@ class CacheInitParams:
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
+
+    enable_mamba_extra_buffer: bool = False

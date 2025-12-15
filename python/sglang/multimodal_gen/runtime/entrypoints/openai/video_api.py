@@ -61,20 +61,31 @@ def _build_sampling_params_from_request(
         request.num_frames if request.num_frames is not None else derived_num_frames
     )
     server_args = get_global_server_args()
+    sampling_kwargs = {
+        "request_id": request_id,
+        "prompt": request.prompt,
+        "num_frames": num_frames,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "image_path": request.input_reference,
+        "save_output": True,
+        "output_file_name": request_id,
+        "seed": request.seed,
+        "generator_device": request.generator_device,
+    }
+    if request.num_inference_steps is not None:
+        sampling_kwargs["num_inference_steps"] = request.num_inference_steps
+    if request.guidance_scale is not None:
+        sampling_kwargs["guidance_scale"] = request.guidance_scale
+    if request.guidance_scale_2 is not None:
+        sampling_kwargs["guidance_scale_2"] = request.guidance_scale_2
+    if request.negative_prompt is not None:
+        sampling_kwargs["negative_prompt"] = request.negative_prompt
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
-        request_id=request_id,
-        prompt=request.prompt,
-        num_frames=num_frames,
-        fps=fps,
-        width=width,
-        height=height,
-        image_path=request.input_reference,
-        save_output=True,
         server_args=server_args,
-        output_file_name=request_id,
-        seed=request.seed,
-        generator_device=request.generator_device,
+        **sampling_kwargs,
     )
 
     return sampling_params
@@ -166,7 +177,7 @@ async def create_video(
             input_reference=input_path,
             model=model,
             seconds=seconds if seconds is not None else 4,
-            size=size or "720x1280",
+            size=size,
             fps=fps_val,
             num_frames=num_frames_val,
         )

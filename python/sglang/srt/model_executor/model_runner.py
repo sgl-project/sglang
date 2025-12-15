@@ -136,10 +136,9 @@ from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    RemoteInstanceWeightLoaderBackend,
-    register_memory_region_v2,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -159,7 +158,6 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
-    get_local_ip_auto,
     init_custom_process_group,
     is_cuda,
     is_float4_e2m1fn_x2,
@@ -240,8 +238,10 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
-# the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
+# the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
@@ -319,17 +319,12 @@ class ModelRunner:
         self.forward_pass_id = 0
         self.init_new_workspace = False
 
-        self.remote_instance_transfer_engine = None
-        self.remote_instance_transfer_engine_session_id = ""
-        self.remote_instance_transfer_engine_weight_info = None
-
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
 
         # Model-specific adjustment
         self.model_specific_adjustment()
-        self.check_quantized_moe_compatibility()
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -361,6 +356,7 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
+        self.check_quantized_moe_compatibility()
 
         # Temporary cached values
         self.support_pp = (
@@ -396,9 +392,6 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
-
-        if self.server_args.remote_instance_weight_loader_support_transfer_engine:
-            self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
@@ -439,16 +432,6 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
-
-        if (
-            self.server_args.remote_instance_weight_loader_support_transfer_engine
-            and self.remote_instance_transfer_engine_weight_info is None
-        ):
-            self.remote_instance_transfer_engine_weight_info = (
-                register_memory_region_v2(
-                    self.model, self.remote_instance_transfer_engine
-                )
-            )
 
         # Check if the model is using hybrid SWA
         if (
@@ -563,23 +546,6 @@ class ModelRunner:
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
-
-    def remote_instance_init_transfer_engine(self):
-        try:
-            from mooncake.engine import TransferEngine
-        except ImportError as e:
-            logger.warning(
-                "Please install mooncake for using remote instance transfer engine: pip install mooncake"
-            )
-            return
-        self.remote_instance_transfer_engine = TransferEngine()
-        local_ip = get_local_ip_auto()
-        self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.value
-        )
-        self.remote_instance_transfer_engine_session_id = (
-            f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
-        )
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -798,8 +764,6 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
-            remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
-            remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
         )
@@ -808,11 +772,7 @@ class ModelRunner:
                 self.model_config, self.load_config, self.tp_size
             )
 
-        if (
-            self.server_args.load_format == LoadFormat.REMOTE_INSTANCE
-            and self.server_args.remote_instance_weight_loader_backend
-            == RemoteInstanceWeightLoaderBackend.NCCL
-        ):
+        if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
             if self.tp_rank == 0:
                 instance_ip = socket.gethostbyname(socket.gethostname())
                 t = threading.Thread(
@@ -837,18 +797,11 @@ class ModelRunner:
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
-            self.loader = get_model_loader(
+            self.model = get_model(
+                model_config=self.model_config,
                 load_config=self.load_config,
-                model_config=self.model_config,
-            )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_transfer_engine_weight_info = (
-                    self.loader.remote_instance_transfer_engine_weight_info
-                )
         monkey_patch_vllm_parallel_state(reverse=True)
 
         get_offloader().post_init()
@@ -1495,14 +1448,9 @@ class ModelRunner:
         server_args = self.server_args
         assert config is not None
 
-        speculativa_ratio = (
-            0
-            if server_args.speculative_num_draft_tokens is None
-            else server_args.speculative_num_draft_tokens
-        )
         if (
             server_args.disable_radix_cache
-            or config.mamba2_cache_params.mamba_cache_per_req == 0
+            or server_args.max_mamba_cache_size is not None
         ):
             # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
             if server_args.max_mamba_cache_size is None:
@@ -1510,7 +1458,25 @@ class ModelRunner:
                     server_args.max_mamba_cache_size = server_args.max_running_requests
                 else:
                     server_args.max_mamba_cache_size = 512
+            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
         else:
+            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            # reserve the memory for the intermediate mamba states used for spec dec
+            if not self.spec_algorithm.is_none():
+                assert server_args.speculative_num_draft_tokens is not None
+                assert server_args.max_running_requests is not None
+
+                mamba_state_intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * server_args.max_running_requests
+                    * server_args.speculative_num_draft_tokens
+                )
+                total_rest_memory = total_rest_memory - (
+                    mamba_state_intermediate_size / (1 << 30)
+                )
+
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
             # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
@@ -1524,20 +1490,21 @@ class ModelRunner:
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
                 // config.mamba2_cache_params.mamba_cache_per_req
-                // (1 + speculativa_ratio)
             )
 
-        if self.hybrid_gdn_config is not None:
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
-            )
         mamba_state_memory = (
             server_args.max_mamba_cache_size
             * config.mamba2_cache_params.mamba_cache_per_req
-            * (1 + speculativa_ratio)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    @property
+    def qwen3_next_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, Qwen3NextConfig):
+            return config
+        return None
 
     @property
     def hybrid_gdn_config(self):
@@ -1715,7 +1682,9 @@ class ModelRunner:
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
-            # Use a small KV cache pool size for local tests
+            logger.info(
+                f"Use a small KV cache pool size ({small_kv_size}) for local tests"
+            )
             self.max_total_num_tokens = small_kv_size
 
         if max_num_reqs is None:
@@ -1730,11 +1699,18 @@ class ModelRunner:
             )
 
         if self.mambaish_config is not None:
-            ratio = (
-                MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
-                if not self.server_args.disable_radix_cache
-                else 1
-            )
+            additional_ratio = 0
+            if (
+                self.server_args.enable_mamba_extra_buffer()
+                and not self.spec_algorithm.is_none()
+            ):
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+            else:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            if self.server_args.disable_radix_cache:
+                ratio = 1
+            else:
+                ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
@@ -1836,11 +1812,13 @@ class ModelRunner:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
+                    mamba_spec_state_size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
+                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:

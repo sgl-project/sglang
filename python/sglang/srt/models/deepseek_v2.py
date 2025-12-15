@@ -484,6 +484,10 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
+        if not hasattr(self.gate_up_proj, "weight"):
+            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
+        if not hasattr(self.down_proj, "weight"):
+            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -1460,7 +1464,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # TODO: Design a finer way to determine the threshold
         self.chunked_prefix_cache_threshold = get_int_env_var(
-            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+            "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
@@ -3016,7 +3020,11 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_npu else None
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
