@@ -1870,7 +1870,7 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.disaggregation_prefill_enable_interleave and len(req.origin_input_ids) > self.chunked_prefill_size:
+            if self.disaggregation_prefill_enable_interleave and self.chunked_req is not None and len(req.origin_input_ids) > self.chunked_prefill_size:
                 continue
 
             if self.enable_lora:
