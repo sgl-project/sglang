@@ -149,6 +149,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner: [linux-mi325-gpu-1]
         part: [0, 1, 2, 3]
@@ -199,6 +200,7 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         runner: [linux-mi325-gpu-2]
         part: [0, 1, 2, 3]
