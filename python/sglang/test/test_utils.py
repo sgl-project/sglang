@@ -1786,17 +1786,19 @@ def check_evaluation_test_results(
     model_count=None,
 ):
     """
-    results: list of tuple of (model_path, accuracy, latency)
+    results: list of tuple of (model_path, accuracy, latency) or (model_path, accuracy, latency, error)
     """
     failed_models = []
     if model_latency_thresholds is not None:
-        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | ----- | \n"
     else:
-        summary = " | model | status | score | score_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | \n"
+        summary = " | model | status | score | score_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ----- | \n"
 
-    results_dict = {res[0]: (res[1], res[2]) for res in results}
+    results_dict = {
+        res[0]: (res[1], res[2], res[3] if len(res) == 4 else None) for res in results
+    }
 
     for model, accuracy_threshold in sorted(model_accuracy_thresholds.items()):
         latency_threshold = (
@@ -1805,8 +1807,15 @@ def check_evaluation_test_results(
             else 1e9
         )
 
-        if model in results_dict:
-            accuracy, latency = results_dict[model]
+        # check for error here
+        error = (
+            results_dict.get(model, (None, None, None))[2]
+            if model in results_dict
+            else None
+        )
+
+        if model in results_dict and error is None:
+            accuracy, latency, _ = results_dict[model]
             is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
             status_emoji = "✅" if is_success else "❌"
 
@@ -1823,18 +1832,17 @@ def check_evaluation_test_results(
                     )
 
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold} | - |\n"
             else:
-                line = (
-                    f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
-                )
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | - |\n"
         else:
             status_emoji = "❌"
+            error_display = error if error else "Model not evaluated"
             failed_models.append(f"Model failed to launch or be evaluated: {model}")
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold} | {error_display} |\n"
             else:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | {error_display} |\n"
 
         summary += line
 

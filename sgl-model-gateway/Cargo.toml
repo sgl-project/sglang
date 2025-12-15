@@ -31,7 +31,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
+axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -81,6 +82,8 @@ tiktoken-rs = { version = "0.7.0" }
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2.2"
 openssl = "0.10.73"
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 rmcp = { version = "0.8.3", features = ["client", "server",

@@ -192,7 +192,11 @@ class DenoisingStage(PipelineStage):
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
 
-        from sglang.multimodal_gen.runtime.distributed import get_world_size
+        from sglang.multimodal_gen.runtime.distributed import (
+            get_sp_group,
+            get_tp_group,
+            get_world_size,
+        )
         from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
             CacheDitConfig,
             enable_cache_on_dual_transformer,
@@ -200,13 +204,30 @@ class DenoisingStage(PipelineStage):
             get_scm_mask,
         )
 
-        if get_world_size() > 1:
-            logger.warning(
-                "cache-dit is disabled in distributed environment (world_size=%d). "
-                "Distributed support will be added in a future version.",
-                get_world_size(),
+        world_size = get_world_size()
+        parallelized = world_size > 1
+
+        sp_group = None
+        tp_group = None
+        if parallelized:
+            sp_group_candidate = get_sp_group()
+            tp_group_candidate = get_tp_group()
+
+            sp_world_size = sp_group_candidate.world_size if sp_group_candidate else 1
+            tp_world_size = tp_group_candidate.world_size if tp_group_candidate else 1
+
+            has_sp = sp_world_size > 1
+            has_tp = tp_world_size > 1
+
+            sp_group = sp_group_candidate.device_group if has_sp else None
+            tp_group = tp_group_candidate.device_group if has_tp else None
+
+            logger.info(
+                "cache-dit enabled in distributed environment (world_size=%d, has_sp=%s, has_tp=%s)",
+                world_size,
+                has_sp,
+                has_tp,
             )
-            return
         # === Parse SCM configuration from envs ===
         # SCM is shared between primary and secondary transformers
         scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
@@ -288,6 +309,8 @@ class DenoisingStage(PipelineStage):
                 primary_config,
                 secondary_config,
                 model_name="wan2.2",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d)",
@@ -299,6 +322,8 @@ class DenoisingStage(PipelineStage):
                 self.transformer,
                 primary_config,
                 model_name="transformer",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -933,6 +958,8 @@ class DenoisingStage(PipelineStage):
         denoising_start_time = time.time()
 
         # to avoid device-sync caused by timestep comparison
+
+        self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
@@ -1087,10 +1114,8 @@ class DenoisingStage(PipelineStage):
             A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
-        if local_rank == 0:
-            return tqdm(iterable=iterable, total=total)
-        else:
-            return tqdm(iterable=iterable, total=total, disable=True)
+        disable = local_rank != 0
+        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def rescale_noise_cfg(
         self, noise_cfg, noise_pred_text, guidance_rescale=0.0

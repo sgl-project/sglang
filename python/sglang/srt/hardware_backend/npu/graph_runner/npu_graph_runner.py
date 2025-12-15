@@ -77,13 +77,19 @@ class NPUGraphRunner(CudaGraphRunner):
             out = run_once_fn()
         return out
 
-    def _get_update_attr_name(self, model_runner):
-        if self.bs < get_attention_tp_size():
+    def _get_update_attr_name(self, model_runner, forward_batch):
+        if (
+            self.bs < get_attention_tp_size()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             return self.attr_name[AttentionArch.MLA]
         return self.attr_name[model_runner.model_config.attention_arch]
 
-    def _get_update_attr_type(self, model_runner):
-        if self.bs < get_attention_tp_size():
+    def _get_update_attr_type(self, model_runner, forward_batch):
+        if (
+            self.bs < get_attention_tp_size()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             return self.attr_type[AttentionArch.MLA]
         return self.attr_type[model_runner.model_config.attention_arch]
 
@@ -139,8 +145,12 @@ class NPUGraphRunner(CudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        self.update_attr_name = self._get_update_attr_name(self.model_runner)
-        self.update_attr_type = self._get_update_attr_type(self.model_runner)
+        self.update_attr_name = self._get_update_attr_name(
+            self.model_runner, forward_batch
+        )
+        self.update_attr_type = self._get_update_attr_type(
+            self.model_runner, forward_batch
+        )
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():

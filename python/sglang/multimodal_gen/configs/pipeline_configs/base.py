@@ -104,7 +104,8 @@ def shard_rotary_emb_for_sp(emb):
 
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
-    target_tokens = batch.raw_latent_shape[-1] * batch.raw_latent_shape[-2]
+    width, height = batch.raw_latent_shape[-1], batch.raw_latent_shape[-2]
+    target_tokens = width * height
     if latents.shape[1] > target_tokens:
         latents = latents[:, :target_tokens, :]
     return latents
@@ -208,7 +209,10 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
-    def prepare_image_processor_kwargs(self, batch):
+    def prepare_calculated_size(self, image):
+        return self.calculate_condition_image_size(image, image.width, image.height)
+
+    def prepare_image_processor_kwargs(self, batch, neg=False):
         return {}
 
     def postprocess_image_latent(self, latent_condition, batch):
@@ -297,19 +301,32 @@ class PipelineConfig:
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
 
+    def preprocess_vae_image(self, batch, vae_image_processor):
+        pass
+
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
-        if time_dim > 0 and time_dim % sp_world_size == 0:
-            sharded_tensor = rearrange(
-                latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
-            ).contiguous()
-            sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
-            return sharded_tensor, True
-        return latents, False
+
+        # Pad to next multiple of SP degree if needed
+        if time_dim > 0 and time_dim % sp_world_size != 0:
+            pad_len = sp_world_size - (time_dim % sp_world_size)
+            pad = torch.zeros(
+                (*latents.shape[:2], pad_len, *latents.shape[3:]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=2)
+
+        assert latents.shape[2] % sp_world_size == 0
+        sharded_tensor = rearrange(
+            latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
+        ).contiguous()
+        sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
+        return sharded_tensor, True
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
@@ -630,6 +647,7 @@ class ImagePipelineConfig(PipelineConfig):
         return sigmas
 
     def shard_latents_for_sp(self, batch, latents):
+        # latents: [B, H * W, C]
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         seq_len = latents.shape[1]
 
@@ -642,8 +660,6 @@ class ImagePipelineConfig(PipelineConfig):
                 device=latents.device,
             )
             latents = torch.cat([latents, pad], dim=1)
-            # Record padding length for later unpad
-            batch.sp_seq_pad = int(getattr(batch, "sp_seq_pad", 0)) + pad_len
 
         sharded_tensor = rearrange(
             latents, "b (n s) d -> b n s d", n=sp_world_size

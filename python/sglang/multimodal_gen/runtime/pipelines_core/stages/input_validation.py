@@ -80,41 +80,48 @@ class InputValidationStage(PipelineStage):
         """
         if server_args.pipeline_config.task_type == ModelTaskType.I2I:
             # calculate new condition image size
-            calculated_size = (
-                server_args.pipeline_config.calculate_condition_image_size(
-                    batch.condition_image,
-                    condition_image_width,
-                    condition_image_height,
-                )
-            )
+            if not isinstance(batch.condition_image, list):
+                batch.condition_image = [batch.condition_image]
 
-            # preprocess condition image if necessary
-            if calculated_size is not None:
-                calculated_width, calculated_height = calculated_size
-                condition_image, calculated_size = (
-                    server_args.pipeline_config.preprocess_condition_image(
-                        batch.condition_image,
-                        calculated_width,
-                        calculated_height,
-                        self.vae_image_processor,
+            processed_images = []
+            final_image = batch.condition_image[-1]
+            config = server_args.pipeline_config
+            config.preprocess_vae_image(batch, self.vae_image_processor)
+
+            for img in batch.condition_image:
+                size = config.calculate_condition_image_size(img, img.width, img.height)
+                if size is not None:
+                    width, height = size
+                    img, _ = config.preprocess_condition_image(
+                        img, width, height, self.vae_image_processor
                     )
-                )
-                batch.condition_image = condition_image
+
+                processed_images.append(img)
+
+            batch.condition_image = processed_images
+            calculated_size = config.prepare_calculated_size(final_image)
 
             # adjust output image size
-            calculated_width, calculated_height = calculated_size
-            width = batch.width or calculated_width
-            height = batch.height or calculated_height
-            multiple_of = (
-                server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
-            )
-            width = width // multiple_of * multiple_of
-            height = height // multiple_of * multiple_of
-            batch.width = width
-            batch.height = height
+            if calculated_size is not None:
+                calculated_width, calculated_height = calculated_size
+                width = batch.width or calculated_width
+                height = batch.height or calculated_height
+                multiple_of = (
+                    server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
+                )
+                width = width // multiple_of * multiple_of
+                height = height // multiple_of * multiple_of
+                batch.width = width
+                batch.height = height
+
         elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
             # duplicate with vae_image_processor
             # further processing for ti2v task
+            if isinstance(
+                batch.condition_image, list
+            ):  # not support multi image input yet.
+                batch.condition_image = batch.condition_image[0]
+
             img = batch.condition_image
             ih, iw = img.height, img.width
             patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
@@ -146,6 +153,11 @@ class InputValidationStage(PipelineStage):
         elif isinstance(server_args.pipeline_config, WanI2V480PConfig):
             # TODO: could we merge with above?
             # resize image only, Wan2.1 I2V
+            if isinstance(batch.condition_image, list):
+                batch.condition_image = batch.condition_image[
+                    0
+                ]  # not support multi image input yet.
+
             max_area = server_args.pipeline_config.max_area
             aspect_ratio = condition_image_height / condition_image_width
             mod_value = (
@@ -207,13 +219,33 @@ class InputValidationStage(PipelineStage):
         # for i2v, get image from image_path
         # @TODO(Wei) hard-coded for wan2.2 5b ti2v for now. Should put this in image_encoding stage
         if batch.image_path is not None:
-            if batch.image_path.endswith(".mp4"):
-                image = load_video(batch.image_path)[0]
+            if isinstance(batch.image_path, list):
+                batch.condition_image = []
+                for path in batch.image_path:
+                    if path.endswith(".mp4"):
+                        image = load_video(path)[0]
+                    else:
+                        image = load_image(path)
+                    batch.condition_image.append(image)
+
+                # Use the first image for size reference
+                condition_image_width = batch.condition_image[0].width
+                condition_image_height = batch.condition_image[0].height
+                batch.original_condition_image_size = (
+                    condition_image_width,
+                    condition_image_height,
+                )
             else:
-                image = load_image(batch.image_path)
-            batch.condition_image = image
-            condition_image_width, condition_image_height = image.width, image.height
-            batch.original_condition_image_size = image.size
+                if batch.image_path.endswith(".mp4"):
+                    image = load_video(batch.image_path)[0]
+                else:
+                    image = load_image(batch.image_path)
+                batch.condition_image = image
+                condition_image_width, condition_image_height = (
+                    image.width,
+                    image.height,
+                )
+                batch.original_condition_image_size = image.size
 
             self.preprocess_condition_image(
                 batch, server_args, condition_image_width, condition_image_height
@@ -221,7 +253,7 @@ class InputValidationStage(PipelineStage):
 
         # if height or width is not specified at this point, set default to 720p
         default_height = 720
-        default_width = 1080
+        default_width = 1280
         if batch.height is None and batch.width is None:
             batch.height = default_height
             batch.width = default_width
@@ -261,12 +293,16 @@ class InputValidationStage(PipelineStage):
         result = VerificationResult()
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
-        # Validate height and width
 
-        if batch.height % 8 != 0 or batch.width % 8 != 0:
-            raise ValueError(
-                f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
-            )
+        # Validate height and width
+        def check_size(value: int, name: str):
+            if value % (8 * server_args.num_gpus) != 0:
+                raise ValueError(
+                    f"{name} must be divisible by (8 x num_gpus) but {value} % (8 * {server_args.num_gpus}) != 0."
+                )
+
+        check_size(batch.height, "Height")
+        check_size(batch.width, "Width")
         result.add_check("seeds", batch.seeds, V.list_not_empty)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         return result

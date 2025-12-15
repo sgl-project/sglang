@@ -19,6 +19,10 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
+# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+MAMBA_STATE_PER_REQ_NO_CACHE = 1
+
 logger = logging.getLogger(__name__)
 
 
@@ -300,9 +304,15 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
-        if mamba_available_size < num_reqs:
+        factor = (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            if isinstance(tree_cache, MambaRadixCache)
+            else MAMBA_STATE_PER_REQ_NO_CACHE
+        )
+        mamba_state_needed = num_reqs * factor
+        if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
-                mamba_num = max(0, num_reqs - mamba_available_size)
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict_mamba(mamba_num)
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:

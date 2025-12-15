@@ -43,7 +43,7 @@ jobs:
   per-commit-1-npu-a2:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-arm64-npu-1
+    runs-on: linux-aarch64-a2-1
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-910b-ubuntu22.04-py3.11
     steps:
@@ -82,7 +82,7 @@ jobs:
   per-commit-2-npu-a2:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-arm64-npu-2
+    runs-on: linux-aarch64-a2-2
     strategy:
       fail-fast: true
       matrix:
@@ -125,7 +125,7 @@ jobs:
   per-commit-4-npu-a2:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-arm64-npu-4
+    runs-on: linux-aarch64-a2-4
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-910b-ubuntu22.04-py3.11
     steps:

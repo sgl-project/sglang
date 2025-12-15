@@ -2,7 +2,7 @@ import os
 
 import torch
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
 logger = init_logger(__name__)
 
@@ -127,7 +127,7 @@ class SGLDiffusionProfiler:
                     f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
                 )
             )
-            logger.info(f"Saving profiler traces to: {trace_path}")
             self.profiler.export_chrome_trace(trace_path)
+            logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
         except Exception as e:
-            logger.error(f"Failed to export trace: {e}")
+            logger.error(f"Failed to save trace: {e}")

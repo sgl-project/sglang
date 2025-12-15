@@ -29,6 +29,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlusPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -43,7 +44,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
@@ -425,6 +429,12 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
     )
 
 

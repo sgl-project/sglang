@@ -49,12 +49,14 @@ jobs:
           COMMIT_HASH=$(git rev-parse --short HEAD)
           COMMIT_COUNT=$(git rev-list --count HEAD)
 
-          # Get current date in YYYY-MM-DD format
+          # Get current date in YYYY-MM-DD format for release tag
           BUILD_DATE=$(date -u +%Y-%m-%d)
+          # Get compact date format for wheel filename (YYYYMMDD)
+          BUILD_DATE_COMPACT=$(date -u +%Y%m%d)
 
           # Generate nightly version following PEP 440
-          # Format: {base_version}.dev{commit_count}+g{commit_hash}
-          NIGHTLY_VERSION="${BASE_VERSION}.dev${COMMIT_COUNT}+g${COMMIT_HASH}"
+          # Format: {base_version}.dev{commit_count}+{date}.g{commit_hash}
+          NIGHTLY_VERSION="${BASE_VERSION}.dev${COMMIT_COUNT}+${BUILD_DATE_COMPACT}.g${COMMIT_HASH}"
 
           echo "Base version: ${BASE_VERSION}"
           echo "Nightly version: ${NIGHTLY_VERSION}"

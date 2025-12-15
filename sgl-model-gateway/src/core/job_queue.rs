@@ -21,7 +21,6 @@ use crate::{
         WorkerRemovalRequest,
     },
     mcp::McpConfig,
-    observability::metrics::RouterMetrics,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
     workflow::{WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus},
 };
@@ -58,7 +57,7 @@ pub enum Job {
 
 impl Job {
     /// Get job type as string for logging
-    pub fn job_type(&self) -> &str {
+    pub fn job_type(&self) -> &'static str {
         match self {
             Job::AddWorker { .. } => "AddWorker",
             Job::UpdateWorker { .. } => "UpdateWorker",
@@ -232,24 +231,22 @@ impl JobQueue {
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         if self.context.upgrade().is_none() {
-            RouterMetrics::record_job_shutdown_rejected();
             return Err("Job queue shutting down: AppContext dropped".to_string());
         }
 
         // Extract values before moving job
-        let job_type = job.job_type().to_string();
+        let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
 
         // Record pending status
         self.status_map.insert(
             worker_url.clone(),
-            JobStatus::pending(&job_type, &worker_url),
+            JobStatus::pending(job_type, &worker_url),
         );
 
         match self.tx.send(job).await {
             Ok(_) => {
                 let (queue_depth, available_permits) = self.get_load_info();
-                RouterMetrics::set_job_queue_depth(queue_depth);
                 debug!(
                     "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
                     job_type, worker_url, queue_depth, available_permits
@@ -257,7 +254,6 @@ impl JobQueue {
                 Ok(())
             }
             Err(_) => {
-                RouterMetrics::record_job_queue_full();
                 self.status_map.remove(&worker_url);
                 let (queue_depth, _) = self.get_load_info();
                 Err(format!(
@@ -286,14 +282,14 @@ impl JobQueue {
         status_map: Arc<DashMap<String, JobStatus>>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        let job_type = job.job_type().to_string();
+        let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
 
         // Update to processing
         status_map.insert(
             worker_url.clone(),
-            JobStatus::processing(&job_type, &worker_url),
+            JobStatus::processing(job_type, &worker_url),
         );
 
         debug!("Processing job: type={}, worker={}", job_type, worker_url);
@@ -303,13 +299,13 @@ impl JobQueue {
             Some(ctx) => {
                 let result = Self::execute_job(&job, &ctx).await;
                 let duration = start.elapsed();
-                Self::record_job_completion(&job_type, &worker_url, duration, &result, &status_map);
+                Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
                 status_map.insert(
                     worker_url.clone(),
-                    JobStatus::failed(&job_type, &worker_url, error_msg),
+                    JobStatus::failed(job_type, &worker_url, error_msg),
                 );
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
@@ -806,40 +802,30 @@ impl JobQueue {
         }
     }
 
-    /// Record job completion metrics and update status
+    /// Update job status on completion
     fn record_job_completion(
-        job_type: &str,
+        job_type: &'static str,
         worker_url: &str,
-        duration: Duration,
+        _duration: Duration,
         result: &Result<String, String>,
         status_map: &Arc<DashMap<String, JobStatus>>,
     ) {
-        RouterMetrics::record_job_duration(job_type, duration);
-
         match result {
             Ok(message) => {
-                RouterMetrics::record_job_success(job_type);
                 status_map.remove(worker_url);
                 debug!(
-                    "Completed job: type={}, worker={}, duration={:.3}s, result={}",
-                    job_type,
-                    worker_url,
-                    duration.as_secs_f64(),
-                    message
+                    "Completed job: type={}, worker={}, result={}",
+                    job_type, worker_url, message
                 );
             }
             Err(error) => {
-                RouterMetrics::record_job_failure(job_type);
                 status_map.insert(
                     worker_url.to_string(),
                     JobStatus::failed(job_type, worker_url, error.clone()),
                 );
                 warn!(
-                    "Failed job: type={}, worker={}, duration={:.3}s, error={}",
-                    job_type,
-                    worker_url,
-                    duration.as_secs_f64(),
-                    error
+                    "Failed job: type={}, worker={}, error={}",
+                    job_type, worker_url, error
                 );
             }
         }
