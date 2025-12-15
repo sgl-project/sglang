@@ -178,17 +178,20 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
-      - name: Setup AITER kernel cache
+      - name: Setup kernel caches
         run: |
           # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
           # This directory persists across container restarts on the self-hosted runner
-          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels
-          # Check if we have cached kernels
+          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache
+          # Check AITER cache
           if docker exec ci_sglang test -f /sgl-data/aiter-kernels/mha_fwd_bf16_nbias_nmask_nlse_ndropout.so; then
             echo "Found cached AITER kernels in /sgl-data/aiter-kernels"
           else
             echo "No cached AITER kernels found - will be built on first use"
           fi
+          # Check MIOpen cache (VAE convolution kernels)
+          miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
+          echo "Found ${miopen_files} MIOpen cache files"
 
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 45
@@ -243,15 +246,17 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
-      - name: Setup AITER kernel cache
+      - name: Setup kernel caches
         run: |
           # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
-          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels
+          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache
           if docker exec ci_sglang test -f /sgl-data/aiter-kernels/mha_fwd_bf16_nbias_nmask_nlse_ndropout.so; then
             echo "Found cached AITER kernels in /sgl-data/aiter-kernels"
           else
             echo "No cached AITER kernels found - will be built on first use"
           fi
+          miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
+          echo "Found ${miopen_files} MIOpen cache files"
 
       - name: Run diffusion server tests (2-GPU)
         timeout-minutes: 80
