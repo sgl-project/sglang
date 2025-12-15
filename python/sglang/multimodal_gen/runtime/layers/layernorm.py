@@ -19,10 +19,6 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_npu = is_npu()
-_is_cpu = is_cpu()
-_is_xpu = is_xpu()
 
 from sgl_kernel import (
     fused_add_rmsnorm,
@@ -30,6 +26,7 @@ from sgl_kernel import (
     fused_scale_residual_layernorm_scale_shift,
     rmsnorm,
 )
+
 
 # Copied and adapted from sglang
 @CustomOp.register("rms_norm")
@@ -396,7 +393,6 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             else:
                 raise ValueError(f"Gate type {type(gate)} not supported")
 
-            # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
             y_2d, residual_output = fused_scale_residual_layernorm_scale_shift(
                 residual_2d,
                 x_2d,

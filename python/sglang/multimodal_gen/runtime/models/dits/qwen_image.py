@@ -15,15 +15,12 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm, LayerNormScaleShift
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
 )
-from sglang.multimodal_gen.runtime.layers.triton_ops import (
-    apply_rotary_embedding,
-    fuse_scale_shift_kernel,
-)
+from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
