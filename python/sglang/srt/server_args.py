@@ -2376,7 +2376,7 @@ class ServerArgs:
                 logger.warning(
                     "Prefill interleave mode is only supported in prefill disaggregation mode, when dp attention is disabled, and when chunked prefill size is set and greater than 0."
                 )
-                self.enable_prefill_interleave = False
+                self.disaggregation_prefill_enable_interleave = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
