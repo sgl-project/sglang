@@ -32,6 +32,8 @@ class ZImageArchConfig(DiTArchConfig):
             (".to_qkv", ".to_q", "q"),
             (".to_qkv", ".to_k", "k"),
             (".to_qkv", ".to_v", "v"),
+            (".feed_forward.w13", ".feed_forward.w1", "gate"),
+            (".feed_forward.w13", ".feed_forward.w3", "up"),
         ]
     )
 
@@ -40,6 +42,8 @@ class ZImageArchConfig(DiTArchConfig):
             r"(.*)\.to_q\.weight$": (r"\1.to_qkv.weight", 0, 3),
             r"(.*)\.to_k\.weight$": (r"\1.to_qkv.weight", 1, 3),
             r"(.*)\.to_v\.weight$": (r"\1.to_qkv.weight", 2, 3),
+            r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
+            r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
         }
     )
 
