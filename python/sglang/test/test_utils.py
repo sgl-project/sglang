@@ -129,7 +129,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
+DEFAULT_IMAGE_URL = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
@@ -1786,17 +1786,19 @@ def check_evaluation_test_results(
     model_count=None,
 ):
     """
-    results: list of tuple of (model_path, accuracy, latency)
+    results: list of tuple of (model_path, accuracy, latency) or (model_path, accuracy, latency, error)
     """
     failed_models = []
     if model_latency_thresholds is not None:
-        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | ----- | \n"
     else:
-        summary = " | model | status | score | score_threshold | \n"
-        summary += "| ----- | ------ | ----- | --------------- | \n"
+        summary = " | model | status | score | score_threshold | error | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ----- | \n"
 
-    results_dict = {res[0]: (res[1], res[2]) for res in results}
+    results_dict = {
+        res[0]: (res[1], res[2], res[3] if len(res) == 4 else None) for res in results
+    }
 
     for model, accuracy_threshold in sorted(model_accuracy_thresholds.items()):
         latency_threshold = (
@@ -1805,8 +1807,15 @@ def check_evaluation_test_results(
             else 1e9
         )
 
-        if model in results_dict:
-            accuracy, latency = results_dict[model]
+        # check for error here
+        error = (
+            results_dict.get(model, (None, None, None))[2]
+            if model in results_dict
+            else None
+        )
+
+        if model in results_dict and error is None:
+            accuracy, latency, _ = results_dict[model]
             is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
             status_emoji = "✅" if is_success else "❌"
 
@@ -1823,18 +1832,17 @@ def check_evaluation_test_results(
                     )
 
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold} | - |\n"
             else:
-                line = (
-                    f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
-                )
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | - |\n"
         else:
             status_emoji = "❌"
+            error_display = error if error else "Model not evaluated"
             failed_models.append(f"Model failed to launch or be evaluated: {model}")
             if model_latency_thresholds is not None:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold} | {error_display} |\n"
             else:
-                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold}\n"
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | {error_display} |\n"
 
         summary += line
 
