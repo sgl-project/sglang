@@ -90,7 +90,6 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_path = self.server_args.lora_path
         self.lora_nickname = self.server_args.lora_nickname
         if self.lora_path is not None:
-            self.convert_to_lora_layers()
             self.set_lora(
                 self.lora_nickname, self.lora_path  # type: ignore
             )  # type: ignore
@@ -147,6 +146,7 @@ class LoRAPipeline(ComposedPipelineBase):
         module_name: str,
         target_lora_layers: dict[str, BaseLayerWithLoRA],
         check_exclude: bool = True,
+        whitelist: set[str] | None = None,
     ) -> int:
         """
         Convert layers in a module to LoRA layers.
@@ -156,19 +156,29 @@ class LoRAPipeline(ComposedPipelineBase):
             module_name: The name of the module (for replace_submodule).
             target_lora_layers: The dictionary to store the converted LoRA layers.
             check_exclude: Whether to check the exclude_lora_layers list.
+            whitelist: A set of module names that contain valid LoRA weights, checked with .lora_A and .lora_B. If not provided, all layers will be converted.
 
         Returns:
             The number of layers converted.
         """
-        name_list = []
-        for name, layer in module.named_modules():
-            name_list.append(name)
-        logger.info("===================name_list: %s", name_list)
-        
+        if whitelist is not None:
+            name_set = {name for name, _ in module.named_modules()}
+            common_items = whitelist & name_set
+            logger.info(
+                "whitelist overlap with name_list count: %d / %d",
+                len(common_items),
+                len(whitelist),
+            )
+
         converted_count = 0
         for name, layer in module.named_modules():
-            if not self.is_target_layer(name):
-                continue
+            if whitelist is not None:
+                if name not in whitelist:
+                    continue
+            else:
+                # Fallback to old behavior (static config check) only if no whitelist provided
+                if not self.is_target_layer(name):
+                    continue
 
             if check_exclude:
                 excluded = any(
@@ -188,9 +198,11 @@ class LoRAPipeline(ComposedPipelineBase):
                 converted_count += 1
         return converted_count
 
-    def convert_to_lora_layers(self) -> None:
+    def convert_to_lora_layers(self, whitelist: set[str] | None = None) -> None:
         """
         Unified method to convert the transformer to a LoRA transformer.
+        Args:
+            whitelist: A set of module names that contain valid LoRA weights, checked with .lora_A and .lora_B. If not provided, all layers will be converted.
         """
         if self.lora_initialized:
             return
@@ -202,10 +214,11 @@ class LoRAPipeline(ComposedPipelineBase):
             "transformer",
             self.lora_layers,
             check_exclude=True,
+            whitelist=whitelist,  # Pass whitelist
         )
         logger.info("Converted %d layers to LoRA layers", converted_count)
 
-        # Convert transformer_2 if exists (e.g., Wan2.2 A14B dual-transformer)
+        # Convert transformer_2 if exists
         if (
             "transformer_2" in self.modules
             and self.modules["transformer_2"] is not None
@@ -215,6 +228,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 "transformer_2",
                 self.lora_layers_transformer_2,
                 check_exclude=True,
+                whitelist=whitelist,  # Pass whitelist
             )
             logger.info(
                 "Converted %d layers to LoRA layers in transformer_2", converted_count_2
@@ -227,6 +241,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 "fake_score_transformer",
                 self.lora_layers_critic,
                 check_exclude=False,
+                whitelist=whitelist,  # Pass whitelist
             )
             logger.info(
                 "Converted %d layers to LoRA layers in the critic model",
@@ -360,15 +375,6 @@ class LoRAPipeline(ComposedPipelineBase):
     ):  # type: ignore
         """
         Load a LoRA adapter into the pipeline and apply it to the specified transformer(s).
-
-        Args:
-            lora_nickname: The "nick name" of the adapter when referenced in the pipeline.
-            lora_path: The path to the adapter, either a local path or a Hugging Face repo id.
-            target: Which transformer(s) to apply the LoRA to. One of:
-                - "all": Apply to all transformers (default, backward compatible)
-                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
-                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
-                - "critic": Apply only to the critic model (fake_score_transformer)
         """
         if target not in self.VALID_TARGETS:
             raise ValueError(
@@ -389,22 +395,10 @@ class LoRAPipeline(ComposedPipelineBase):
                     "Please call 'unmerge_lora_weights' before setting a new LoRA."
                 )
 
-        if lora_nickname not in self.lora_adapters and lora_path is None:
-            raise ValueError(
-                f"Adapter {lora_nickname} not found in the pipeline. Please provide lora_path to load it."
-            )
-        if not self.lora_initialized:
-            self.convert_to_lora_layers()
-
-        # Re-fetch target_modules after convert_to_lora_layers() to get populated dicts
-        target_modules, error = self._get_target_lora_layers(target)
-        if error:
-            logger.warning("set_lora: %s", error)
-
-        adapter_updated = False
         rank = dist.get_rank()
-
+        adapter_updated = False
         should_load = False
+
         if lora_path is not None:
             if lora_nickname not in self.loaded_adapter_paths:
                 should_load = True
@@ -412,8 +406,34 @@ class LoRAPipeline(ComposedPipelineBase):
                 should_load = True
 
         if should_load:
+            if lora_path is None:
+                raise ValueError(
+                    f"Adapter {lora_nickname} not found and lora_path is None"
+                )
             adapter_updated = True
             self.load_lora_adapter(lora_path, lora_nickname, rank)
+
+        if lora_nickname not in self.lora_adapters:
+            raise ValueError(f"Adapter {lora_nickname} not found in memory.")
+
+        current_weights = self.lora_adapters[lora_nickname]
+        valid_lora_module_names = set()
+
+        for weight_name in current_weights.keys():
+            if weight_name.endswith(".lora_A"):
+                module_name = weight_name[:-7]  # remove ".lora_A" suffix
+                lora_B_key = module_name + ".lora_B"
+                if lora_B_key in current_weights:
+                    valid_lora_module_names.add(module_name)
+
+        # whitelist only contains the layers that have LoRA weights
+        if not self.lora_initialized:
+            self.convert_to_lora_layers(whitelist=valid_lora_module_names)
+
+            # Re-fetch target_modules after conversion to get populated dicts
+            target_modules, error = self._get_target_lora_layers(target)
+            if error:
+                logger.warning("set_lora: %s", error)
 
         # Check if we can skip (same adapter already applied to all target modules)
         all_already_applied = all(
@@ -425,7 +445,7 @@ class LoRAPipeline(ComposedPipelineBase):
         if all_already_applied:
             return
 
-        # Apply LoRA to target modules
+        # 4. Apply LoRA weights
         adapted_count = 0
         for module_name, lora_layers_dict in target_modules:
             count = self._apply_lora_to_layers(
@@ -525,3 +545,4 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
             self.is_lora_merged[module_name] = False
             logger.info("LoRA weights unmerged for %s", module_name)
+ 
