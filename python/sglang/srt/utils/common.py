@@ -1826,9 +1826,6 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "npu") and torch.npu.is_available():
         return torch.npu.get_device_name(device_id)
 
-    if hasattr(torch, "cpu") and torch.cpu.is_available():
-        return torch.cpu.current_device()
-
 
 @lru_cache(maxsize=1)
 def is_habana_available() -> bool:

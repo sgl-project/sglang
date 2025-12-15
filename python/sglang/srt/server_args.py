@@ -1429,7 +1429,7 @@ class ServerArgs:
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
-        device_name = get_device_name()
+        device_name = get_device_name() if self.device is not "cpu" else "CPU"
         is_h20_device = "H20" in device_name and "H200" not in device_name
         if (
             not self.enable_flashinfer_allreduce_fusion
