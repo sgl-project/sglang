@@ -121,26 +121,39 @@ class GPUWorker:
         finally:
             return output_batch
 
-    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
+    def set_lora(
+        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+    ) -> None:
         """
         Set the LoRA adapter for the pipeline.
+
+        Args:
+            lora_nickname: The nickname of the adapter.
+            lora_path: Path to the LoRA adapter.
+            target: Which transformer(s) to apply the LoRA to.
         """
         assert self.pipeline is not None
-        self.pipeline.set_lora(lora_nickname, lora_path)
+        self.pipeline.set_lora(lora_nickname, lora_path, target)
 
-    def merge_lora_weights(self) -> None:
+    def merge_lora_weights(self, target: str = "all") -> None:
         """
         Merge LoRA weights.
+
+        Args:
+            target: Which transformer(s) to merge.
         """
         assert self.pipeline is not None
-        self.pipeline.merge_lora_weights()
+        self.pipeline.merge_lora_weights(target)
 
-    def unmerge_lora_weights(self) -> None:
+    def unmerge_lora_weights(self, target: str = "all") -> None:
         """
         Unmerge LoRA weights.
+
+        Args:
+            target: Which transformer(s) to unmerge.
         """
         assert self.pipeline is not None
-        self.pipeline.unmerge_lora_weights()
+        self.pipeline.unmerge_lora_weights(target)
 
 
 def run_scheduler_process(

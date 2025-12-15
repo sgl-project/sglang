@@ -205,7 +205,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
                 "but FlashInfer is not available or not supported on this hardware. "
                 "FlashInfer FP8 GEMM requires Blackwell GPUs and FlashInfer to be installed."
             )
-        return flashinfer_gemm_w8a8_block_fp8_linear
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_cutlass():
         if not _check_cutlass_block_fp8_hardware_support():
@@ -253,7 +253,7 @@ def _dispatch_auto_backend() -> Callable:
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif is_blackwell_supported() and is_flashinfer_available():
-        return flashinfer_gemm_w8a8_block_fp8_linear
+        return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
@@ -297,7 +297,7 @@ def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     return FP8_GEMM_RUNNER_BACKEND
 
 
-def flashinfer_gemm_w8a8_block_fp8_linear(
+def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
@@ -307,7 +307,18 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
 ) -> torch.Tensor:
     assert input_scale is None
 
+    # FlashInfer TRTLLM backend requires K dimension >= 256
+    # Check shape before quantizing, otherwise we run into Flashinfer assertion.
+    # TODO(brayden): make a better fallback here, maybe to cutlass backend?
     input_2d = input.view(-1, input.shape[-1])
+    k_dim = input_2d.shape[1]  # K dimension
+
+    if k_dim < 256:
+        # Fallback to Triton for shapes that don't meet TRTLLM constraint.
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(

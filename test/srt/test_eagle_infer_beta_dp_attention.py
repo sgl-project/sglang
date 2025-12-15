@@ -80,11 +80,4 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
 
 
 if __name__ == "__main__":
-    s = unittest.TestSuite()
-    small_test = unittest.defaultTestLoader.loadTestsFromTestCase(
-        TestEagleDPAttnServerSmall
-    )
-    s.addTest(small_test)
-
-    runner = unittest.TextTestRunner()
-    runner.run(s)
+    unittest.main()

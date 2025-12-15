@@ -80,16 +80,6 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
-def handle_rope_parameters(config: PretrainedConfig):
-    if hasattr(config, "rope_scaling"):
-        rope_scaling = config.rope_scaling
-        if isinstance(rope_scaling, dict):
-            for k, v in rope_scaling.items():
-                if not hasattr(config, k):
-                    setattr(config, k, v)
-    return
-
-
 class ModelConfig:
     def __init__(
         self,
@@ -110,6 +100,8 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        encoder_only: bool = False,
+        language_only: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -137,8 +129,6 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        handle_rope_parameters(self.hf_text_config)
-        handle_rope_parameters(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -217,6 +207,8 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
+        self._verify_transformers_version()
+
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
 
@@ -227,6 +219,9 @@ class ModelConfig:
         self.image_token_id = getattr(
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
+
+        self.hf_config.encoder_only = encoder_only
+        self.hf_config.language_only = language_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -258,6 +253,8 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
+            language_only=server_args.language_only,
+            encoder_only=server_args.encoder_only,
             **kwargs,
         )
 
@@ -370,10 +367,9 @@ class ModelConfig:
                 mscale_all_dim = self.hf_config.rope_scaling.get(
                     "mscale_all_dim", False
                 )
-                scaling_factor = self.hf_config.rope_scaling.get("factor")
-                if scaling_factor is not None:
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -785,6 +781,41 @@ class ModelConfig:
                 self.hf_config.dual_chunk_attention_config[
                     "sparse_attention_enabled"
                 ] = True
+
+    def _verify_transformers_version(self):
+        import transformers
+        from packaging import version
+
+        tf_version_str = getattr(transformers, "__version__", None)
+        if tf_version_str is None:
+            return
+
+        vision_config = getattr(self.hf_config, "vision_config", None)
+        is_glm_46vmoe = "glm-4.6v" in self.model_path.lower() or (
+            vision_config is not None
+            and getattr(vision_config, "model_type", None) == "glm4v_moe_vision"
+            # The vision config model type for GLM-4.5v is 'glm4v_moe',
+            # while for GLM-4.6v, it is 'glm4v_moe_vision'.
+        )
+        needs_tf_v5 = is_glm_46vmoe
+
+        tf_version = version.parse(tf_version_str)
+        required_version = version.parse("5.0.0")
+
+        if tf_version < required_version:
+            if needs_tf_v5:
+                raise ValueError(
+                    f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
+                    f"or model type {self.hf_config.model_type}. "
+                    "Please upgrade transformers to >= 5.0.0."
+                )
+        elif not needs_tf_v5:
+            logger.warning(
+                f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
+                "If you experience issues related to RoPE parameters, "
+                "they may be due to incompatibilities between Transformers >=5.0.0 and some models. "
+                "You can try downgrading to transformers==4.57.1 as a workaround."
+            )
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
