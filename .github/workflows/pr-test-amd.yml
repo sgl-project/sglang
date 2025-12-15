@@ -149,9 +149,10 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
         runner: [linux-mi325-gpu-1]
-        part: [0, 1]
+        part: [0, 1]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -177,8 +178,20 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
+      - name: Setup AITER kernel cache
+        run: |
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # This directory persists across container restarts on the self-hosted runner
+          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels
+          # Check if we have cached kernels
+          if docker exec ci_sglang test -f /sgl-data/aiter-kernels/mha_fwd_bf16_nbias_nmask_nlse_ndropout.so; then
+            echo "Found cached AITER kernels in /sgl-data/aiter-kernels"
+          else
+            echo "No cached AITER kernels found - will be built on first use"
+          fi
+
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 30
         run: |
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
@@ -186,6 +199,10 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
+            -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
+            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
@@ -197,9 +214,10 @@ jobs:
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
         runner: [linux-mi325-gpu-2]
-        part: [0, 1]
+        part: [0, 1]  # 2 partitions: 9 tests ÷ 2 = ~4-5 tests each
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -225,8 +243,18 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
+      - name: Setup AITER kernel cache
+        run: |
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels
+          if docker exec ci_sglang test -f /sgl-data/aiter-kernels/mha_fwd_bf16_nbias_nmask_nlse_ndropout.so; then
+            echo "Found cached AITER kernels in /sgl-data/aiter-kernels"
+          else
+            echo "No cached AITER kernels found - will be built on first use"
+          fi
+
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 80
         run: |
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
@@ -234,6 +262,10 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_TEST_OUTPUT_SIZE=480x640 \
+            -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
+            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \

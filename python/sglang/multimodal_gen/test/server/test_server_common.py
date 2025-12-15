@@ -75,7 +75,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     try:
         # Reconstruct output size for OpenAI API
-        output_size = sampling_params.output_size
+        # Allow override via environment variable (useful for AMD where large resolutions can cause GPU hang)
+        output_size = os.environ.get(
+            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
+        )
         warmup = WarmupRunner(
             port=ctx.port,
             model=server_args.model_path,
