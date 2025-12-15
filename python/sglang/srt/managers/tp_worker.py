@@ -366,16 +366,11 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-    def get_remote_instance_transfer_engine_info(self):
-        return (
-            self.model_runner.remote_instance_transfer_engine_session_id,
-            self.model_runner.remote_instance_transfer_engine_weight_info,
-        )
-
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
         forward_batch: Optional[ForwardBatch] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
@@ -390,14 +385,6 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-
-        pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
-                    all_gather_group=self.get_attention_tp_group()
-                )
-            )
 
         if self.pp_group.is_last_rank:
             if self.is_dllm():
