@@ -219,7 +219,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        print(layer)
         NPUW4A8Int8DynamicMoEMethod.process_weights_after_loading(layer)
 
     def create_moe_runner(
