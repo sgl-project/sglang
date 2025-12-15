@@ -155,17 +155,6 @@ class NightlyBenchmarkRunner:
         flush_cache_url = f"http://{self.host}:{self.port}/flush_cache"
         requests.post(flush_cache_url)
 
-        # Run the command
-        subprocess.run(
-            [
-                "python3",
-                "-m",
-                "sglang.srt.mem_cache.flush_cache",
-                "--url",
-                self.base_url,
-            ]
-        )
-
         print(f"Running command: {' '.join(command)}")
         result = subprocess.run(command, capture_output=True, text=True)
 
