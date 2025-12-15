@@ -5,12 +5,14 @@ use axum::response::Response;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::routers::grpc::{
-    client::GrpcClient,
-    common::stages::{helpers, PipelineStage},
-    context::{ClientSelection, RequestContext, WorkerSelection},
+use crate::routers::{
     error,
-    proto_wrapper::ProtoGenerateRequest,
+    grpc::{
+        client::GrpcClient,
+        common::stages::{helpers, PipelineStage},
+        context::{ClientSelection, RequestContext, WorkerSelection},
+        proto_wrapper::ProtoGenerateRequest,
+    },
 };
 
 /// Generate request building stage
@@ -34,7 +36,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 function = "GenerateRequestBuildingStage::execute",
                 "Preparation not completed"
             );
-            error::internal_error("Preparation not completed")
+            error::internal_error("preparation_not_completed", "Preparation not completed")
         })?;
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
@@ -42,7 +44,10 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 function = "GenerateRequestBuildingStage::execute",
                 "Client acquisition not completed"
             );
-            error::internal_error("Client acquisition not completed")
+            error::internal_error(
+                "client_acquisition_not_completed",
+                "Client acquisition not completed",
+            )
         })?;
 
         let generate_request = ctx.generate_request_arc();
@@ -71,7 +76,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
-                        error::bad_request(e)
+                        error::bad_request("build_request_failed", e)
                     })?;
                 ProtoGenerateRequest::Sglang(Box::new(req))
             }
@@ -85,7 +90,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build vLLM generate request");
-                        error::bad_request(e)
+                        error::bad_request("build_request_failed", e)
                     })?;
                 ProtoGenerateRequest::Vllm(Box::new(req))
             }

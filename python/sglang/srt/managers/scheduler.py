@@ -18,7 +18,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 import time
 from collections import deque
 from concurrent import futures
@@ -48,6 +47,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -65,6 +65,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -132,6 +133,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_enhancer import SchedulerEnhancer
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -145,6 +147,7 @@ from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
+    SchedulerWatchdog,
 )
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
@@ -154,7 +157,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -200,6 +203,7 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+SCHEDULER_DECREASE_PREFILL_IDLE = envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -305,6 +309,9 @@ class Scheduler(
         # Init moe config
         self.init_moe_config()
 
+        # Init GEMM config (FP8 GEMM, etc.)
+        self.init_gemm_config()
+
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
@@ -398,7 +405,7 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        self.is_ssm_model = (
+        self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
         )
@@ -468,6 +475,21 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
+        self.enable_dynamic_chunking = (
+            server_args.enable_dynamic_chunking and self.pp_size > 1
+        )
+
+        # Init the dynamic chunking predictor for PP
+        if self.enable_dynamic_chunking:
+            try:
+                self.profile_and_init_predictor()
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    "Dynamic chunking will be disabled."
+                )
+                self.enable_dynamic_chunking = False
+
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
@@ -488,6 +510,15 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
+        self.schedule_enhancer = None
+        if SCHEDULER_DECREASE_PREFILL_IDLE:
+            self.schedule_enhancer = SchedulerEnhancer(
+                self.dp_size,
+                self.attn_tp_size,
+                self.tp_worker,
+                self.max_running_requests,
+                server_args,
+            )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
         self.init_new_token_ratio = min(
@@ -505,10 +536,11 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
-        self.watchdog_timeout = server_args.watchdog_timeout
-        t = threading.Thread(target=self.watchdog_thread, daemon=True)
-        t.start()
-        self.parent_process = psutil.Process().parent()
+        self.watchdog = SchedulerWatchdog(
+            self, watchdog_timeout=server_args.watchdog_timeout
+        )
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = SchedulerWatchdog(self, watchdog_timeout=x, soft=True)
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -540,6 +572,17 @@ class Scheduler(
 
         # Init mlp sync flag
         self.require_mlp_sync = require_mlp_sync(server_args)
+
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            self.mm_receiver = MMReceiver(
+                server_args,
+                hf_config=self.model_config.hf_config,
+                tp_rank=self.tp_rank,
+                pp_rank=self.pp_rank,
+            )
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -729,6 +772,7 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         )
 
         if (
@@ -765,7 +809,7 @@ class Scheduler(
                 self.tree_cache = SWARadixCache(
                     params=params, sliding_window_size=self.sliding_window_size
                 )
-            elif self.is_ssm_model:
+            elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
@@ -882,6 +926,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                pp_rank=self.pp_rank,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
@@ -930,8 +975,7 @@ class Scheduler(
 
     def init_overlap(self):
         self.future_map = None
-
-        if not self.enable_overlap:
+        if not self.enable_overlap and self.pp_size == 1:
             return
 
         self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
@@ -942,6 +986,9 @@ class Scheduler(
         self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
             self.device
         ).stream(self.copy_stream)
+
+        if not self.enable_overlap:
+            return
 
         self.future_map = FutureMap(
             self.max_running_requests,
@@ -965,6 +1012,12 @@ class Scheduler(
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
+
+    def init_gemm_config(self):
+        # Initialize GEMM-related configuration (currently FP8 Blockwise GEMM backend).
+        # Other GEMM backends (e.g. FP4, BF16, etc.) can be added here in the future.
+        # This is needed for FP8 quantization.
+        initialize_fp8_gemm_config(self.server_args)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1098,7 +1151,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.device_group,
+                    self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
@@ -1174,6 +1227,14 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+
+        # Process MM requests under E disaggregation
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1304,7 +1365,7 @@ class Scheduler(
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
-                reasoning=recv_req.reasoning,
+                require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -1433,7 +1494,7 @@ class Scheduler(
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                    key, req.reasoning
+                    key, req.require_reasoning
                 )
                 req.grammar = value
 
@@ -1716,6 +1777,11 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
+            self.running_batch
+        ):
+            # Decrease prefill idle as much as possible during high dp load.
+            return None
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1756,6 +1822,16 @@ class Scheduler(
             # in the waiting queue.
             return None
 
+        # Determine chunked_prefill_size for this batch
+        chunked_prefill_size = self.chunked_prefill_size
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            if self.enable_dynamic_chunking:
+                history_len = len(self.chunked_req.prefix_indices)
+                dynamic_size = self.predict_next_chunk_size(history_len)
+                if dynamic_size is not None:
+                    chunked_prefill_size = dynamic_size
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -1764,9 +1840,10 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            prefill_max_requests=self.server_args.prefill_max_requests,
         )
 
         if self.chunked_req is not None:
@@ -1779,13 +1856,21 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
-            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
-                lora_set
-                | set([req.lora_id for req in adder.can_run_list])
-                | set([req.lora_id])
-            ):
-                self.running_batch.batch_is_full = True
-                break
+            if self.enable_lora:
+                new_lora_set = (
+                    lora_set
+                    | set([req.lora_id for req in adder.can_run_list])
+                    | set([req.lora_id])
+                )
+                if not self.tp_worker.can_run_lora_batch(new_lora_set):
+                    # If this is a LoRA request that would exceed the LoRA slot limit,
+                    # skip it and continue to try scheduling non-LoRA requests.
+                    # Non-LoRA requests (lora_id=None) share a single reserved slot
+                    # and should never cause this check to fail.
+                    if req.lora_id is not None:
+                        # Skip this LoRA request - it would trigger adapter eviction/loading
+                        # which is slow. We'll try to schedule it in a future iteration.
+                        continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -1890,7 +1975,7 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch()
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
@@ -1907,7 +1992,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch()
+        batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -1918,7 +2003,7 @@ class Scheduler(
         ):
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args, self.decode_mem_cache_buf_multiplier
             )
             self.num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
@@ -1956,7 +2041,9 @@ class Scheduler(
         pass
 
     def run_batch(
-        self, batch: ScheduleBatch
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
@@ -2004,6 +2091,7 @@ class Scheduler(
                     self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
+                        # here pp is not compatible with overlap
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -2037,8 +2125,13 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
                 batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
+                    batch_or_worker_batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -2439,11 +2532,22 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
-            self.last_batch = None
-            self.cur_batch = None
+
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            chunked_req_to_exclude = set()
+            if recv_req.mode == "in_place":
+                if self.chunked_req is not None:
+                    chunked_req_to_exclude.add(self.chunked_req)
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            self.running_batch.merge_batch(self.last_batch)
+
+        self.last_batch = None
+        self.cur_batch = None
 
         if recv_req.mode == "retract":
-            self.running_batch.filter_batch()
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
@@ -2696,7 +2800,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_decode()
             else:
-                scheduler.event_loop_normal_disagg_decode()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_decode()
+                else:
+                    scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()

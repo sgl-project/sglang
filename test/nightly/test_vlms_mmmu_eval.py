@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
     ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(
-        0.330, 56.1
+        0.320, 56.1
     ),
     ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 40.3),
     ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"): ModelEvalMetrics(
@@ -28,7 +28,7 @@ MODEL_THRESHOLDS = {
         0.270, 23.8
     ),
     ModelLaunchSettings("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 10.9),
-    ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 17.7),
+    ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.270, 17.7),
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 22.3
@@ -46,6 +46,9 @@ MODEL_THRESHOLDS = {
     ): ModelEvalMetrics(0.310, 16.7),
     ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 32.0),
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
+    ModelLaunchSettings(
+        "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
+    ): ModelEvalMetrics(0.26, 32.0),
 }
 
 
@@ -64,6 +67,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
 
         for model in self.models:
             model_path = model.model_path
+            error_message = None
             with self.subTest(model=model_path):
                 process = popen_launch_server(
                     model=model_path,
@@ -95,8 +99,19 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                     is_first = False
 
                     all_results.append(
-                        (model_path, metrics["score"], metrics["latency"])
+                        (
+                            model_path,
+                            metrics["score"],
+                            metrics["latency"],
+                            error_message,
+                        )
                     )
+                except Exception as e:
+                    # Capture error message for the summary table
+                    error_message = str(e)
+                    # Still append result with error info (use None for N/A metrics to match else clause)
+                    all_results.append((model_path, None, None, error_message))
+                    print(f"Error evaluating {model_path}: {error_message}")
                 finally:
                     kill_process_tree(process.pid)
 

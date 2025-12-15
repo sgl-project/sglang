@@ -2,19 +2,8 @@ name: CI Failure Monitor
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # Every 30 minutes
+    - cron: '0 */3 * * *' # Every 3 hour
   workflow_dispatch:
-    inputs:
-      limit:
-        description: 'Number of workflow runs to analyze (across all workflows)'
-        required: false
-        default: '1000'
-        type: string
-      threshold:
-        description: 'Alert threshold for consecutive failures'
-        required: false
-        default: '4'
-        type: string
 
 concurrency:
   group: ci-failure-monitor-${{ github.ref }}
@@ -40,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests slack_sdk
 
       - name: Run Failure Analysis
         env:
@@ -51,8 +40,7 @@ jobs:
           cd scripts/ci_monitor
           python ci_failures_analysis.py \
             --token $GITHUB_TOKEN \
-            --limit ${{ inputs.limit || '1000' }} \
-            --threshold ${{ inputs.threshold || '4' }} \
+            --limit 100 \
             --output ci_failure_analysis_$(date +%Y%m%d_%H%M%S).json
 
       - name: Upload Analysis Results
@@ -62,3 +50,22 @@ jobs:
           path: |
             scripts/ci_monitor/ci_failure_analysis_*.json
           retention-days: 7
+
+      - name: Send Slack Notification
+        if: always()
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+        run: |
+          cd scripts/ci_monitor
+          LATEST_REPORT=$(ls -t ci_failure_analysis_*.json | head -1)
+
+          if [ ! -f "$LATEST_REPORT" ]; then
+            echo "No report found, so skipping Slack notification"
+            exit 0
+          fi
+
+          if [ -n "$SGLANG_DIFFUSION_SLACK_TOKEN" ]; then
+            python3 post_ci_failures_to_slack.py --report-file "$LATEST_REPORT"
+          else
+            echo "SGLANG_DIFFUSION_SLACK_TOKEN not configured, skipping notification"
+          fi

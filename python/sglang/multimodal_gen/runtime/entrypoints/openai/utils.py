@@ -25,16 +25,17 @@ logger = init_logger(__name__)
 class SetLoraReq:
     lora_nickname: str
     lora_path: Optional[str] = None
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 @dataclasses.dataclass
 class MergeLoraWeightsReq:
-    pass
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 @dataclasses.dataclass
 class UnmergeLoraWeightsReq:
-    pass
+    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
 
 
 def post_process_sample(
@@ -78,7 +79,7 @@ def post_process_sample(
     return frames
 
 
-def _parse_size(size: str) -> tuple[int, int]:
+def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
     try:
         parts = size.lower().replace(" ", "").split("x")
         if len(parts) != 2:
@@ -87,7 +88,7 @@ def _parse_size(size: str) -> tuple[int, int]:
         return w, h
     except Exception:
         # Fallback to default portrait 720x1280
-        return 720, 1280
+        return None, None
 
 
 # Helpers

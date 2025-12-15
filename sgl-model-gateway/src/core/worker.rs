@@ -16,15 +16,24 @@ use super::{
     CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
 };
 use crate::{
-    core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
-    observability::metrics::RouterMetrics,
+    core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
+    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
 };
 
+/// Default worker priority (mid-range on 0-100 scale)
+pub const DEFAULT_WORKER_PRIORITY: u32 = 50;
+
+/// Default worker cost factor (baseline cost)
+pub const DEFAULT_WORKER_COST: f32 = 1.0;
+
+/// Default HTTP client timeout for worker requests (in seconds)
+pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
+
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
         .build()
         .expect("Failed to create worker HTTP client")
 });
@@ -37,10 +46,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the worker's API key
     fn api_key(&self) -> &Option<String>;
     /// Get the worker's type (Regular, Prefill, or Decode)
-    fn worker_type(&self) -> WorkerType;
+    /// Returns a reference to avoid cloning on every access
+    fn worker_type(&self) -> &WorkerType;
 
     /// Get the worker's connection mode (HTTP or gRPC)
-    fn connection_mode(&self) -> ConnectionMode;
+    /// Returns a reference to avoid cloning on every access
+    fn connection_mode(&self) -> &ConnectionMode;
 
     /// Get the bootstrap hostname for PD mode
     /// Returns cached hostname parsed from URL at construction time
@@ -64,6 +75,18 @@ pub trait Worker: Send + Sync + fmt::Debug {
     async fn check_health_async(&self) -> WorkerResult<()>;
 
     /// Synchronous health check wrapper (for compatibility)
+    ///
+    /// # Deprecation Notice
+    /// This method creates a new Tokio runtime for each call, which is expensive.
+    /// Prefer using `check_health_async()` within an async context instead.
+    ///
+    /// # Performance Warning
+    /// Creating a runtime per call has significant overhead. Only use this
+    /// method when you cannot use the async version.
+    #[deprecated(
+        since = "0.4.6",
+        note = "Use check_health_async() instead. This method creates a new Tokio runtime per call."
+    )]
     fn check_health(&self) -> WorkerResult<()> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -106,33 +129,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Record the outcome of a request to this worker
     fn record_outcome(&self, success: bool) {
-        let outcome_str = if success { "success" } else { "failure" };
-        RouterMetrics::record_cb_outcome(self.url(), outcome_str);
-
-        let before = self.circuit_breaker().state();
         self.circuit_breaker().record_outcome(success);
-        let after = self.circuit_breaker().state();
-
-        if before != after {
-            let from = match before {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            let to = match after {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            RouterMetrics::record_cb_state_transition(self.url(), from, to);
-        }
-
-        let state_code = match self.circuit_breaker().state() {
-            CircuitState::Closed => 0u8,
-            CircuitState::Open => 1u8,
-            CircuitState::HalfOpen => 2u8,
-        };
-        RouterMetrics::set_cb_state(self.url(), state_code);
     }
 
     /// Check if this worker is DP-aware
@@ -191,16 +188,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .labels
             .get("priority")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(50) // Default priority is 50 (mid-range)
+            .unwrap_or(DEFAULT_WORKER_PRIORITY)
     }
 
-    /// Get the cost factor of this worker (1.0 = baseline)
+    /// Get the cost factor of this worker (baseline = 1.0)
     fn cost(&self) -> f32 {
         self.metadata()
             .labels
             .get("cost")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0)
+            .unwrap_or(DEFAULT_WORKER_COST)
     }
 
     /// Get tokenizer path for a specific model.
@@ -313,6 +310,14 @@ impl ConnectionMode {
             _ => false,
         }
     }
+
+    /// Get the metric label for this connection mode
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            ConnectionMode::Http => smg_labels::CONNECTION_HTTP,
+            ConnectionMode::Grpc { .. } => smg_labels::CONNECTION_GRPC,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionMode {
@@ -391,6 +396,17 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+        }
+    }
+}
+
+impl WorkerType {
+    /// Get the metric label for this worker type
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            WorkerType::Regular => smg_labels::WORKER_REGULAR,
+            WorkerType::Prefill { .. } => smg_labels::WORKER_PREFILL,
+            WorkerType::Decode => smg_labels::WORKER_DECODE,
         }
     }
 }
@@ -538,6 +554,12 @@ impl BasicWorker {
             Ok(self.url())
         }
     }
+
+    fn update_running_requests_metrics(&self) {
+        let load = self.load();
+        RouterMetrics::set_running_requests(self.url(), load);
+        SmgMetrics::set_worker_requests_active(self.url(), load);
+    }
 }
 
 #[async_trait]
@@ -550,12 +572,12 @@ impl Worker for BasicWorker {
         &self.metadata.api_key
     }
 
-    fn worker_type(&self) -> WorkerType {
-        self.metadata.worker_type.clone()
+    fn worker_type(&self) -> &WorkerType {
+        &self.metadata.worker_type
     }
 
-    fn connection_mode(&self) -> ConnectionMode {
-        self.metadata.connection_mode.clone()
+    fn connection_mode(&self) -> &ConnectionMode {
+        &self.metadata.connection_mode
     }
 
     fn is_healthy(&self) -> bool {
@@ -573,9 +595,15 @@ impl Worker for BasicWorker {
             ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
         };
 
+        // Get worker type label for metrics
+        let worker_type_str = self.metadata.worker_type.as_metric_label();
+
         if health_result {
             self.consecutive_failures.store(0, Ordering::Release);
             let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Record health check success metric
+            SmgMetrics::record_worker_health_check(worker_type_str, smg_labels::CB_SUCCESS);
 
             if !self.is_healthy()
                 && successes >= self.metadata.health_config.success_threshold as usize
@@ -587,6 +615,9 @@ impl Worker for BasicWorker {
         } else {
             self.consecutive_successes.store(0, Ordering::Release);
             let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Record health check failure metric
+            SmgMetrics::record_worker_health_check(worker_type_str, smg_labels::CB_FAILURE);
 
             if self.is_healthy()
                 && failures >= self.metadata.health_config.failure_threshold as usize
@@ -608,18 +639,28 @@ impl Worker for BasicWorker {
 
     fn increment_load(&self) {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn decrement_load(&self) {
-        self.load_counter
+        if self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
-            .ok();
+            .is_err()
+        {
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                "Attempted to decrement load counter that is already at 0"
+            );
+        }
+        self.update_running_requests_metrics();
     }
 
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn processed_requests(&self) -> usize {
@@ -832,11 +873,11 @@ impl Worker for DPAwareWorker {
         self.base_worker.api_key()
     }
 
-    fn worker_type(&self) -> WorkerType {
+    fn worker_type(&self) -> &WorkerType {
         self.base_worker.worker_type()
     }
 
-    fn connection_mode(&self) -> ConnectionMode {
+    fn connection_mode(&self) -> &ConnectionMode {
         self.base_worker.connection_mode()
     }
 
@@ -1023,6 +1064,24 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
 }
 
+// TODO migrate code to V2 (and then remove this name suffix)
+pub struct WorkerLoadGuardV2 {
+    worker: Arc<dyn Worker>,
+}
+
+impl WorkerLoadGuardV2 {
+    pub fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self { worker }
+    }
+}
+
+impl Drop for WorkerLoadGuardV2 {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+    }
+}
+
 /// RAII guard for worker load management
 pub struct WorkerLoadGuard<'a> {
     workers: Vec<&'a dyn Worker>,
@@ -1085,24 +1144,24 @@ impl HealthChecker {
 
 /// Helper to convert Worker trait object to WorkerInfo struct
 pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
-    // Cache values that are used multiple times to avoid redundant clones/allocations
+    // Cache references that are used multiple times to avoid redundant method calls
     let worker_type = worker.worker_type();
     let connection_mode = worker.connection_mode();
     let url = worker.url();
     let model_id = worker.model_id();
 
-    let worker_type_str = match &worker_type {
+    let worker_type_str = match worker_type {
         WorkerType::Regular => "regular",
         WorkerType::Prefill { .. } => "prefill",
         WorkerType::Decode => "decode",
     };
 
-    let bootstrap_port = match &worker_type {
+    let bootstrap_port = match worker_type {
         WorkerType::Prefill { bootstrap_port } => *bootstrap_port,
         _ => None,
     };
 
-    let runtime_type = match &connection_mode {
+    let runtime_type = match connection_mode {
         ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
         ConnectionMode::Http => None,
     };
@@ -1133,7 +1192,7 @@ mod tests {
     use std::{thread, time::Duration};
 
     use super::*;
-    use crate::core::CircuitBreakerConfig;
+    use crate::core::{CircuitBreakerConfig, CircuitState};
 
     #[test]
     fn test_worker_type_display() {
@@ -1219,7 +1278,7 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .build();
         assert_eq!(worker.url(), "http://test:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
         assert!(worker.is_healthy());
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.processed_requests(), 0);
@@ -1276,7 +1335,7 @@ mod tests {
         let regular = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)
             .build();
-        assert_eq!(regular.worker_type(), WorkerType::Regular);
+        assert_eq!(regular.worker_type(), &WorkerType::Regular);
 
         let prefill = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Prefill {
@@ -1285,7 +1344,7 @@ mod tests {
             .build();
         assert_eq!(
             prefill.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: Some(9090)
             }
         );
@@ -1293,7 +1352,7 @@ mod tests {
         let decode = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Decode)
             .build();
-        assert_eq!(decode.worker_type(), WorkerType::Decode);
+        assert_eq!(decode.worker_type(), &WorkerType::Decode);
     }
 
     #[test]
@@ -1444,7 +1503,7 @@ mod tests {
                 .build(),
         );
         assert_eq!(worker.url(), "http://regular:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
     }
 
     #[test]
@@ -1459,7 +1518,7 @@ mod tests {
         assert_eq!(worker1.url(), "http://prefill:8080");
         assert_eq!(
             worker1.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: Some(9090)
             }
         );
@@ -1473,7 +1532,7 @@ mod tests {
         );
         assert_eq!(
             worker2.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: None
             }
         );
@@ -1487,7 +1546,7 @@ mod tests {
                 .build(),
         );
         assert_eq!(worker.url(), "http://decode:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Decode);
+        assert_eq!(worker.worker_type(), &WorkerType::Decode);
     }
 
     #[test]
@@ -1573,7 +1632,7 @@ mod tests {
         assert_eq!(workers.len(), 2);
         assert_eq!(workers[0].url(), "http://w1:8080");
         assert_eq!(workers[1].url(), "http://w2:8080");
-        assert_eq!(workers[0].worker_type(), WorkerType::Regular);
+        assert_eq!(workers[0].worker_type(), &WorkerType::Regular);
     }
 
     #[test]
@@ -1595,14 +1654,15 @@ mod tests {
         assert_eq!(urls, vec!["http://w1:8080", "http://w2:8080"]);
     }
 
-    #[test]
-    fn test_check_health_sync_wrapper() {
+    #[tokio::test]
+    async fn test_check_health_async() {
         use crate::core::BasicWorkerBuilder;
         let worker = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)
             .build();
 
-        let result = worker.check_health();
+        // Health check should fail since there's no actual server
+        let result = worker.check_health_async().await;
         assert!(result.is_err());
     }
 
@@ -1640,7 +1700,7 @@ mod tests {
         assert!(dp_worker.is_dp_aware());
         assert_eq!(dp_worker.dp_rank(), Some(2));
         assert_eq!(dp_worker.dp_size(), Some(4));
-        assert_eq!(dp_worker.worker_type(), WorkerType::Regular);
+        assert_eq!(dp_worker.worker_type(), &WorkerType::Regular);
     }
 
     #[test]
@@ -1655,7 +1715,7 @@ mod tests {
         assert!(dp_worker.is_dp_aware());
         assert_eq!(
             dp_worker.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: Some(9090)
             }
         );
@@ -1669,7 +1729,7 @@ mod tests {
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@0");
         assert!(dp_worker.is_dp_aware());
-        assert_eq!(dp_worker.worker_type(), WorkerType::Decode);
+        assert_eq!(dp_worker.worker_type(), &WorkerType::Decode);
     }
 
     #[tokio::test]
@@ -1760,7 +1820,7 @@ mod tests {
         assert!(worker.is_dp_aware());
         assert_eq!(worker.dp_rank(), Some(1));
         assert_eq!(worker.dp_size(), Some(4));
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
     }
 
     #[tokio::test]
@@ -1779,7 +1839,7 @@ mod tests {
         assert!(worker.is_dp_aware());
         assert_eq!(
             worker.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: Some(8090)
             }
         );
@@ -1919,22 +1979,22 @@ mod tests {
         assert!(workers[4].is_dp_aware());
         assert!(workers[5].is_dp_aware());
 
-        assert_eq!(workers[0].worker_type(), WorkerType::Regular);
+        assert_eq!(workers[0].worker_type(), &WorkerType::Regular);
         assert_eq!(
             workers[1].worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: Some(9090)
             }
         );
-        assert_eq!(workers[2].worker_type(), WorkerType::Decode);
-        assert_eq!(workers[3].worker_type(), WorkerType::Regular);
+        assert_eq!(workers[2].worker_type(), &WorkerType::Decode);
+        assert_eq!(workers[3].worker_type(), &WorkerType::Regular);
         assert_eq!(
             workers[4].worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: None
             }
         );
-        assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+        assert_eq!(workers[5].worker_type(), &WorkerType::Decode);
     }
 
     // === Phase 1.3: WorkerMetadata model methods tests ===
