@@ -122,7 +122,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: pr-${{ inputs.pr_number }}-${{ needs.build-pr-wheel.outputs.build_date }}-${{ needs.build-pr-wheel.outputs.commit_hash }}
-          name: PR #${{ inputs.pr_number }} Build (${{ needs.build-pr-wheel.outputs.commit_hash }})
+          name: "PR #${{ inputs.pr_number }} Build (${{ needs.build-pr-wheel.outputs.commit_hash }})"
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           prerelease: true
