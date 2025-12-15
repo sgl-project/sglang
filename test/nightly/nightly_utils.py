@@ -6,6 +6,8 @@ import subprocess
 import time
 from typing import List, Optional, Tuple
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
@@ -43,6 +45,8 @@ class NightlyBenchmarkRunner:
         self.test_name = test_name
         self.base_url = base_url
         self.gpu_config = gpu_config or os.environ.get("GPU_CONFIG", "")
+        self.host = self.base_url.split("://")[1].split(":")[0]
+        self.port = int(self.base_url.split(":")[-1])
 
         # Include GPU config in report header if available
         header = f"## {test_name}"
@@ -146,6 +150,22 @@ class NightlyBenchmarkRunner:
         Returns:
             Tuple of (CompletedProcess, success_bool)
         """
+
+        # Flush radix cache before running the command
+        flush_cache_url = f"http://{self.host}:{self.port}/flush_cache"
+        requests.post(flush_cache_url)
+
+        # Run the command
+        subprocess.run(
+            [
+                "python3",
+                "-m",
+                "sglang.srt.mem_cache.flush_cache",
+                "--url",
+                self.base_url,
+            ]
+        )
+
         print(f"Running command: {' '.join(command)}")
         result = subprocess.run(command, capture_output=True, text=True)
 
