@@ -33,7 +33,7 @@
 #include "vec.h"
 
 // [NOTE] Preprocessor Optimization
-//   1. this file is apple to apple to `Qwen2VLImageProcessorFast`.
+//   1. this file is apple-to-apple to `Qwen2VLImageProcessorFast`.
 //   2. `out_dtype` set to torch.bfloat16 skips outplace dtype conversion.
 //   3. skip all redundant memory copy and dtype conversion.
 //   4. TODO: rewrite `_upsample_bicubic2d_aa`.
@@ -243,8 +243,8 @@ void rescale_and_normalize_image(
     int64_t grid_offset,
     int64_t grid_stride) {
   // update mean and std
-  std::vector<float> mean_vec(3), std_vec(3);
-  for (size_t c = 0; c < mean_vec.size(); ++c) {
+  std::vector<float> mean_vec(channel), std_vec(channel);
+  for (int64_t c = 0; c < channel; ++c) {
     mean_vec[c] = static_cast<float>(image_mean[c] * (1 / rescale_factor));
     std_vec[c] = static_cast<float>(image_std[c] * (1 / rescale_factor));
   }
@@ -287,7 +287,7 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
   // TODO: lift C++ kernel limitations
   TORCH_CHECK(interpolation == "bicubic", "image_preprocess_cpu: support only bicubic mode.");
   TORCH_CHECK(do_rescale && do_normalize, "image_preprocess_cpu: support only do_rescale and do_normalize.");
-  TORCH_CHECK(disable_grouping, "image_preprocess_cpu: support obly disable_grouping.");
+  TORCH_CHECK(disable_grouping, "image_preprocess_cpu: support only disable_grouping.");
 
   // support only float32 or bfloat16 as output
   TORCH_CHECK(
@@ -298,6 +298,7 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
   int64_t channel = image_mean.size();
   CHECK_GT(batch_size, 0);
   CHECK_EQ(channel, image_std.size());
+  CHECK_EQ(channel, 3);
 
   const at::Tensor& first_image = images[0];
   const auto options = first_image.options();
