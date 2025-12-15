@@ -181,6 +181,7 @@ class SchedulerRuntimeCheckerMixin:
             warnings.warn(
                 "Runtime memory check (busy) is not supported when speculation topk > 1."
             )
+            return
 
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
