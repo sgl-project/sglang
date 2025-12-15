@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+indexer_weight_stream = None
 
 
 class NPUACLFormat(IntEnum):
@@ -110,3 +111,10 @@ def npu_format_cast(
     import torch_npu
 
     return torch_npu.npu_format_cast(tensor, acl_format.value)
+
+
+def get_indexer_weight_stream():
+    global indexer_weight_stream
+    if indexer_weight_stream is None:
+        indexer_weight_stream = torch.npu.Stream()
+    return indexer_weight_stream
