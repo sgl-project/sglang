@@ -29,7 +29,7 @@ class TestRetractDecode(CustomTestCase):
         launch_args = ["--chunked-prefill-size", "128"] + cls.other_args
         with envs.SGLANG_TEST_RETRACT.override(
             True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

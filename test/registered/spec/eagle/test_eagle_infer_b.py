@@ -319,7 +319,7 @@ class TestEAGLEServerPageSize(TestEAGLEServerBasic):
     @classmethod
     def setUpClass(cls):
         # Runtime check only supported for topk=1, and can help to find a leak.
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             super().setUpClass()
 
 

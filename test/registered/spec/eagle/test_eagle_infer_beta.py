@@ -59,7 +59,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         launch_args.extend(cls.other_launch_args)
         with envs.SGLANG_ENABLE_SPEC_V2.override(
             True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
