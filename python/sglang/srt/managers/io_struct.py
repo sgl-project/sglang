@@ -246,6 +246,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Whether to return entropy
     return_entropy: bool = False
 
+    need_wait_for_image: Optional[bool] = None
+    num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -721,6 +725,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: bool = False
+    num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
 
     # For observability
     trace_metric_ctx: Optional[Union[TraceMetricContext, Dict]] = None

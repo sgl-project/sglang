@@ -69,6 +69,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_setup in self.models:
             with self.subTest(model=model_setup.model_path):
                 other_args = list(model_setup.extra_args)
+                error_message = None
 
                 if model_setup.model_path == "meta-llama/Llama-3.1-70B-Instruct":
                     other_args.extend(["--mem-fraction-static", "0.9"])
@@ -99,8 +100,18 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     )
                     is_first = False
 
-                    # 0.0 for empty latency
-                    all_results.append((model_setup.model_path, metrics["score"], 0.0))
+                    # 0.0 for empty latency, None for no error
+                    all_results.append(
+                        (model_setup.model_path, metrics["score"], 0.0, error_message)
+                    )
+                except Exception as e:
+                    # Capture error message for the summary table
+                    error_message = str(e)
+                    # Still append result with error info (use None for N/A metrics to match else clause)
+                    all_results.append(
+                        (model_setup.model_path, None, None, error_message)
+                    )
+                    print(f"Error evaluating {model_setup.model_path}: {error_message}")
                 finally:
                     kill_process_tree(process.pid)
 
