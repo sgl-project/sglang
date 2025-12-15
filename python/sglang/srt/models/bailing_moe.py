@@ -771,7 +771,6 @@ class BailingMoEModel(nn.Module):
                     
         if len(aux_hidden_states) == 0:
             return hidden_states
-            
         return hidden_states, aux_hidden_states
 
 
@@ -1008,12 +1007,11 @@ class BailingMoEForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
+        self.capture_aux_hidden_states = True
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             # Add +1 because in SGLang, for the i-th layer, the auxiliary hidden state
             # corresponds to the output of layer (i - 1).
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
