@@ -197,12 +197,7 @@ class ModelSlimConfig(QuantizationConfig):
         ) -> ModelSlimScheme:
 
         quant_type = self.quant_description[layer_name + '.weight']
-        if quant_type == "W8A8_DYNAMIC":
-            return ModelSlimW8A8Int8(
-                quant_config=self.quant_description,
-                prefix=layer_name
-            )
-        elif quant_type == "W8A8":
+        if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
             return ModelSlimW8A8Int8(
                 quant_config=self.quant_description,
                 prefix=layer_name
