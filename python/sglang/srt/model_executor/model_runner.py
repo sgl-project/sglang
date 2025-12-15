@@ -1544,7 +1544,8 @@ class ModelRunner:
         return None
 
     @property
-    def max_pool_size(self):
+    def max_token_pool_size(self):
+        """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
             return min(self.swa_max_total_num_tokens, self.max_total_num_tokens)
         else:

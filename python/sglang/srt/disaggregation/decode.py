@@ -229,7 +229,7 @@ class DecodePreallocQueue:
         self.retracted_queue: List[Req] = []
         self.prefill_pp_size = prefill_pp_size
         self.kv_manager = self._init_kv_manager()
-        self.max_pool_size = self.scheduler.tp_worker.model_runner.max_pool_size
+        self.max_pool_size = self.scheduler.tp_worker.model_runner.max_token_pool_size
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
