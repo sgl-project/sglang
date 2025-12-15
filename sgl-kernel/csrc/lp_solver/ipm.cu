@@ -124,10 +124,12 @@ extern "C" __global__ void kernel_solve(int* avail_num, float* result, float* in
 
     if (tid < 32) {
       d_max = 0.f;
-      for (int j = tid; j < NV; j += 32)
+      for (int j = tid; j < NV; j += 32) {
         d_max = d[j] = x[j] * (c[j] - r[j]);
-      for (int offset = 16; offset > 0; offset >>= 1)
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
         d_max = fmaxf(d_max, __shfl_xor_sync(0xffffffff, d_max, offset));
+      }
       if (tid == 0) alpha = 0.999 / d_max;
     }
     __syncthreads();
