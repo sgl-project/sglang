@@ -41,6 +41,7 @@ from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
     get_device_memory_capacity,
+    get_device_name,
     get_device_sm,
     is_blackwell_supported,
     is_cuda,
@@ -1109,12 +1110,6 @@ class ServerArgs:
 
             # common to all Deepseek MoE models
             if is_cuda() and is_sm100_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
-                    )
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1166,13 +1161,6 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            if is_blackwell_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                    )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -1436,6 +1424,32 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
+
+        # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
+        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
+        # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
+        # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
+        device_name = get_device_name()
+        is_h20_device = "H20" in device_name and "H200" not in device_name
+        if (
+            not self.enable_flashinfer_allreduce_fusion
+            and model_arch
+            in [
+                "DeepseekV3ForCausalLM",
+                "GptOssForCausalLM",
+                "Glm4MoeForCausalLM",
+                "Qwen3MoeForCausalLM",
+            ]
+            and (is_sm90_supported() or is_blackwell_supported())
+            and not self.enable_dp_attention
+            and self.nnodes == 1
+            and not is_h20_device
+            and self.moe_a2a_backend == "none"
+        ):
+            self.enable_flashinfer_allreduce_fusion = True
+            logger.info(
+                f"Enable FlashInfer AllReduce Fusion by default for {model_arch}"
+            )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
