@@ -836,6 +836,26 @@ pub mod smg_labels {
 /// SMG Metrics helper struct for the new layered metrics architecture
 pub struct SmgMetrics;
 
+/// Parameters for recording streaming metrics.
+pub struct StreamingMetricsParams<'a> {
+    /// Router type label (e.g., "grpc", "http")
+    pub router_type: &'static str,
+    /// Backend type label (e.g., "regular", "pd")
+    pub backend_type: &'static str,
+    /// Model identifier (will be converted to owned String for metrics)
+    pub model_id: &'a str,
+    /// Endpoint label (e.g., "chat", "generate")
+    pub endpoint: &'static str,
+    /// Time to first token (None if no tokens were generated)
+    pub ttft: Option<Duration>,
+    /// Total generation time
+    pub generation_duration: Duration,
+    /// Input token count (None for endpoints that don't track this)
+    pub input_tokens: Option<u64>,
+    /// Output token count
+    pub output_tokens: u64,
+}
+
 impl SmgMetrics {
     /// Record an HTTP request
     pub fn record_http_request(method: &str, path: &str, status_class: &str) {
@@ -1053,6 +1073,86 @@ impl SmgMetrics {
             "endpoint" => endpoint
         )
         .record(duration.as_secs_f64());
+    }
+
+    /// Record all streaming metrics in a single batch call.
+    ///
+    /// This consolidates TTFT, TPOT, generation duration, and token metrics
+    /// into one function, handling TPOT calculation internally.
+    pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
+        let StreamingMetricsParams {
+            router_type,
+            backend_type,
+            model_id,
+            endpoint,
+            ttft,
+            generation_duration,
+            input_tokens,
+            output_tokens,
+        } = params;
+        // metrics-rs requires owned strings for dynamic labels (uses Cow<'static, str>).
+        // We allocate once and clone for each metric - unavoidable with this API.
+        let model = model_id.to_string();
+
+        // TTFT and TPOT (only if we have a first token time)
+        if let Some(ttft_duration) = ttft {
+            histogram!(
+                "smg_router_ttft_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model.clone(),
+                "endpoint" => endpoint
+            )
+            .record(ttft_duration.as_secs_f64());
+
+            // TPOT - only meaningful with >1 output token
+            if output_tokens > 1 {
+                let time_after_first = generation_duration.saturating_sub(ttft_duration);
+                let tpot = time_after_first / (output_tokens as u32 - 1);
+                histogram!(
+                    "smg_router_tpot_seconds",
+                    "router_type" => router_type,
+                    "backend_type" => backend_type,
+                    "model" => model.clone(),
+                    "endpoint" => endpoint
+                )
+                .record(tpot.as_secs_f64());
+            }
+        }
+
+        // Generation duration
+        histogram!(
+            "smg_router_generation_duration_seconds",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model.clone(),
+            "endpoint" => endpoint
+        )
+        .record(generation_duration.as_secs_f64());
+
+        // Input tokens (if available)
+        if let Some(input) = input_tokens {
+            counter!(
+                "smg_router_tokens_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model.clone(),
+                "endpoint" => endpoint,
+                "token_type" => smg_labels::TOKEN_INPUT
+            )
+            .increment(input);
+        }
+
+        // Output tokens
+        counter!(
+            "smg_router_tokens_total",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model,
+            "endpoint" => endpoint,
+            "token_type" => smg_labels::TOKEN_OUTPUT
+        )
+        .increment(output_tokens);
     }
 
     // ========================================================================
