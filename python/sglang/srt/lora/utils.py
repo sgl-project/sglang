@@ -78,10 +78,14 @@ def get_hidden_dim(
                 head_dim * config.num_attention_heads,
                 config.hidden_size,
             )
-        elif module_name == "gate_up_proj" or module_name == "gate_up_proj_moe":
+        elif module_name == "gate_up_proj":
             return config.hidden_size, config.intermediate_size * 2
-        elif module_name == "down_proj" or module_name == "down_proj_moe":
+        elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return config.hidden_size, config.moe_intermediate_size
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
