@@ -352,6 +352,7 @@ class Scheduler(
         if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
+        # FIXME: refactor the draft worker registration logic
         if self.enable_mtp:
             if self.enable_overlap:
                 from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
