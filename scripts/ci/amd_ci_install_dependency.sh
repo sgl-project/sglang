@@ -24,9 +24,13 @@ fi
 docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
+docker exec ci_sglang pip uninstall sglang -y || true
 # Clear Python cache to ensure latest code is used
 docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
 docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
+# Also clear cache in sglang-checkout
+docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
+docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
 docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
 
 # Helper function to install with retries and fallback PyPI mirror
