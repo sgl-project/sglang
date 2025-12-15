@@ -411,6 +411,7 @@ class PiecewiseNPUGraphRunnerDecode:
             model=self.model_runner.model,
             compilation_config=self.compilation_config,
             compilation_context=self.compilation_context,
+            batch_size=bs,
         )
 
         patch_dynamo_context_call()

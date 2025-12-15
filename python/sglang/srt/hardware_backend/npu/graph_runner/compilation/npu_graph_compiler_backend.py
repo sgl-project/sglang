@@ -44,7 +44,7 @@ class NpuGraphCompilerBackend:
             self.apply_passes(graph)
         return graph
 
-    def init(self, config):
+    def init(self, config, batch_size: int):
         config = config.hf_config
 
         hidden_size = config.hidden_size
@@ -67,8 +67,8 @@ class NpuGraphCompilerBackend:
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
 
-        self.q_shape = (self.head_dim, self.q_size)
-        self.k_shape = (self.head_dim, self.kv_size)
+        self.q_shape = (batch_size, self.q_size)
+        self.k_shape = (batch_size, self.kv_size)
 
     def apply_passes(self, graph_module: torch.fx.GraphModule):
         passManager = PassManager(graph_module)

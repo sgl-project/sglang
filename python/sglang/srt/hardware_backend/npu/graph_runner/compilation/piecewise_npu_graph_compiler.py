@@ -31,6 +31,7 @@ class PiecewiseNpuGraphCompiler:
         model: torch.nn.Module,
         compilation_config: CompilationConfig,
         compilation_context: CompilationContext,
+        batch_size: int,
     ):
         if compilation_config is None:
             compilation_config = CompilationConfig(compiler="piecewise")
@@ -40,7 +41,7 @@ class PiecewiseNpuGraphCompiler:
             compilation_config=compilation_config,
             compilation_context=compilation_context,
         )
-        backend.init(model_runner.model_config)
+        backend.init(model_runner.model_config, batch_size)
 
         torch._dynamo.reset()
         torch.compiler.allow_in_graph(sys.intern)

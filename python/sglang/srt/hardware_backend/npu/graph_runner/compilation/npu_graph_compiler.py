@@ -24,6 +24,7 @@ class NpuGraphCompiler:
         model_runner,
         model: torch.nn.Module,
         compilation_config: CompilationConfig,
+        batch_size: int,
     ):
         torch._dynamo.reset()
 
@@ -33,7 +34,7 @@ class NpuGraphCompiler:
         backend = get_compiler_backend(
             compilation_config=compilation_config, model_runner=model_runner
         )
-        backend.init(model_runner.model_config)
+        backend.init(model_runner.model_config, batch_size)
 
         self.compiled_callable = torch.compile(
             model, fullgraph=True, dynamic=False, backend=backend

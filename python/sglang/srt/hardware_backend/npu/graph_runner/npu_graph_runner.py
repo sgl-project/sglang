@@ -123,6 +123,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 model_runner=self.model_runner,
                 model=run_once_fn,
                 compilation_config=get_global_server_args().compilation_config,
+                batch_size=bs,
             )
 
             patch_dynamo_context_call()

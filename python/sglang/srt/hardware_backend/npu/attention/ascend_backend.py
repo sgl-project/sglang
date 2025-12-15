@@ -222,7 +222,6 @@ class AscendAttnBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.enable_piecewise_npu_graph_decode = (
             model_runner.server_args.enable_piecewise_npu_graph_decode
         )
