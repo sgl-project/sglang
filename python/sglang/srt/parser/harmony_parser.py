@@ -511,6 +511,13 @@ class HarmonyParser:
             ""  # Track partial commentary being built across chunks
         )
 
+    def reset(self):
+        """Reset parser state for reuse. Call this between requests."""
+        self.strategy = None
+        self._buffer = ""
+        self._should_filter_commentary = False
+        self._partial_commentary = ""
+
     def parse(self, chunk: str) -> List[Event]:
         self._buffer += chunk
 

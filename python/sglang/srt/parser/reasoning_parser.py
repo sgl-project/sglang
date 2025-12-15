@@ -194,6 +194,9 @@ class KimiDetector(BaseReasoningFormatDetector):
 class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
+
+    Extended with reset() method to prevent state leakage between requests
+    when the detector instance is reused across multiple parsing operations.
     """
 
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
@@ -205,7 +208,14 @@ class GptOssDetector(BaseReasoningFormatDetector):
         )
         self.parser = HarmonyParser()
 
+    def reset(self):
+        """Reset detector state for reuse. Call this between requests."""
+        self.parser.reset()
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
+        # Reset parser for clean one-shot parsing (prevent state leakage)
+        self.parser.reset()
+
         events = self.parser.parse(text)
         # Flush the buffer for one-shot parsing
         events += self.parser.parse("")

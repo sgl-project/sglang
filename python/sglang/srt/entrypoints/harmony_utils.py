@@ -269,7 +269,8 @@ def parse_output_message(message: Message):
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
         if message.recipient.startswith("functions."):
-            function_name = message.recipient.split(".")[-1]
+            # Strip "functions." prefix - tool name may contain dots (e.g., "patient.get_mri_report")
+            function_name = message.recipient[len("functions.") :]
             for content in message.content:
                 random_id = random_uuid()
                 response_item = ResponseFunctionToolCall(
