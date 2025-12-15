@@ -604,6 +604,7 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    disaggregation_prefill_enable_interleave: bool = False
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -722,6 +723,9 @@ class ServerArgs:
 
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
+
+        # Handle disaggregation prefill interleave.
+        self._handle_pd_disaggregation_prefill_interleave_validations()
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -2360,6 +2364,19 @@ class ServerArgs:
             self.remote_instance_weight_loader_support_transfer_engine = False
         else:
             self.remote_instance_weight_loader_support_transfer_engine = True
+
+    def _handle_pd_disaggregation_prefill_interleave_validations(self):
+        if self.disaggregation_prefill_enable_interleave:
+            if (
+                self.disaggregation_mode != "prefill" 
+                or self.enable_dp_attention
+                or self.chunked_prefill_size is None
+                or self.chunked_prefill_size <= 0
+            ):
+                logger.warning(
+                    "Prefill interleave mode is only supported in prefill disaggregation mode, when dp attention is disabled, and when chunked prefill size is set and greater than 0."
+                )
+                self.enable_prefill_interleave = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -4218,6 +4235,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--disaggregation-prefill-enable-interleave",
+            action="store_true",
+            default=ServerArgs.disaggregation_prefill_enable_interleave,
+            help="Enable prefill interleave in PD disaggregation prefill mode. This is only supported in PD disaggregation prefill mode, when dp attention is disabled, and when chunked prefill size is set and greater than 0.",
         )
 
         # Custom weight loader

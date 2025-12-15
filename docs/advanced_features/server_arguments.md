@@ -432,6 +432,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disaggregation-decode-enable-offload-kvcache` | Enable async KV cache offloading on decode server (PD mode). | `False` | bool flag (set to enable) |
 | `--num-reserved-decode-tokens` | Number of decode tokens that will have memory reserved when adding new request to the running batch. | `512` | Type: int |
 | `--disaggregation-decode-polling-interval` | The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
+| `--disaggregation-prefill-enable-interleave` | Enable prefill interleave in PD disaggregation prefill mode. | `False` | bool flag (set to enable) |
 
 ## Custom weight loader
 | Argument | Description | Defaults | Options |
