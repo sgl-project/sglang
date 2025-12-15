@@ -783,6 +783,19 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         """
         logger.info("[QuantizedRL] Initial load with FP8 quantization")
 
+        original_load_weights = model.load_weights
+
+        def load_weights_proxy(weights):
+            if QuantizedRLModelLoader.is_reload_scenario(model):
+                logger.info("[QuantizedRL] Using fast path reload in load_weights")
+                QuantizedRLModelLoader.rebinding_and_load_weights(
+                    model, original_load_weights, weights
+                )
+            else:
+                original_load_weights(weights)
+
+        model.load_weights = load_weights_proxy
+
         model.load_weights(weights)
         original_weights = dict(model.named_parameters())
 
@@ -2584,5 +2597,14 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.PRIVATE:
+        import importlib
+
+        try:
+            module = importlib.import_module("sglang.private.private_model_loader")
+            return module.PrivateModelLoader(load_config)
+        except ImportError:
+            raise ValueError("Failed to import sglang.private.private_model_loader")
 
     return DefaultModelLoader(load_config)
