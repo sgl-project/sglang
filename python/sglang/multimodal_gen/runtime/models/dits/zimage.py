@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -360,7 +361,9 @@ class ZImageTransformer2DModel(CachableDiT):
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
 
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
-    reverse_param_names_mapping = ZImageDitConfig().arch_config.reverse_param_names_mapping
+    reverse_param_names_mapping = (
+        ZImageDitConfig().arch_config.reverse_param_names_mapping
+    )
 
     def __init__(
         self,
