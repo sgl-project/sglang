@@ -211,10 +211,10 @@ class CutePadDraftExtendQueryKernel:
         tQgQ = tiled_copy.partition_S(gQ)
         tPgP = tiled_copy.partition_D(gP)
         tQc = tiled_copy.partition_S(cHD)
-        # Per-element predicate (must be a Tensor/Fragment, not a scalar Boolean)
-        pred = cute.make_fragment_like(tQgQ, Boolean)
-        for i in cutlass.range(cute.size(tQc), unroll_full=True):
-            pred[i] = (tQc[i][0] < num_heads) & (tQc[i][1] < head_dim) & token_valid
+        # Predicate is per-vector-copy (not per-lane). Ensure the entire vector is in-bounds.
+        pred = cute.make_fragment(1, Boolean)
+        last = const_expr(vec - 1)
+        pred[0] = (tQc[0][0] < num_heads) & (tQc[last][1] < head_dim) & token_valid
         cute.copy(copy_atom, tQgQ, tPgP, pred=pred)
 
 
@@ -394,9 +394,9 @@ class CuteUnpadDraftExtendOutputKernel:
         tRgR = tiled_copy.partition_S(gR)
         tOgO = tiled_copy.partition_D(gO)
         tRc = tiled_copy.partition_S(cHD)
-        pred = cute.make_fragment_like(tRgR, Boolean)
-        for i in cutlass.range(cute.size(tRc), unroll_full=True):
-            pred[i] = (
-                (tRc[i][0] < tp_q_head_num) & (tRc[i][1] < v_head_dim) & token_valid
-            )
+        pred = cute.make_fragment(1, Boolean)
+        last = const_expr(vec - 1)
+        pred[0] = (
+            (tRc[0][0] < tp_q_head_num) & (tRc[last][1] < v_head_dim) & token_valid
+        )
         cute.copy(copy_atom, tRgR, tOgO, pred=pred)
