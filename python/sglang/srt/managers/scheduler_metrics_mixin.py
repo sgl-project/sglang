@@ -199,8 +199,10 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.stats.realtime_prefill_compute_tokens_accumulator += adder.log_input_tokens
-            self.stats.realtime_prefill_cache_tokens_accumulator += adder.log_hit_tokens
+            self.stats.increment_realtime_tokens(
+                prefill_compute_tokens=adder.log_input_tokens,
+                prefill_cache_tokens=adder.log_hit_tokens,
+            )
 
             # Others
             self.calculate_utilization()
@@ -354,7 +356,7 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            self.stats.realtime_decode_tokens_accumulator += last_num_generated_tokens
+            self.stats.increment_realtime_tokens(decode_tokens=last_num_generated_tokens)
 
             # Others
             self.calculate_utilization()

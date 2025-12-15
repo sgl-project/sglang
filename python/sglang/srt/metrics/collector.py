@@ -660,6 +660,11 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
+    def increment_realtime_tokens(self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0):
+        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(prefill_compute_tokens)
+        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(prefill_cache_tokens)
+        self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -724,14 +729,6 @@ class SchedulerMetricsCollector:
 
         # CUDA graph
         self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
-
-        # Realtime token counters
-        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(stats.realtime_prefill_compute_tokens_accumulator)
-        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(stats.realtime_prefill_cache_tokens_accumulator)
-        self.realtime_decode_tokens_total.labels(**self.labels).inc(stats.realtime_decode_tokens_accumulator)
-        stats.realtime_prefill_compute_tokens_accumulator = 0
-        stats.realtime_prefill_cache_tokens_accumulator = 0
-        stats.realtime_decode_tokens_accumulator = 0
 
         self.last_log_time = time.perf_counter()
 
