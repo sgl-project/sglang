@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
-    observability::metrics::RouterMetrics,
+    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
 };
@@ -310,6 +310,14 @@ impl ConnectionMode {
             _ => false,
         }
     }
+
+    /// Get the metric label for this connection mode
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            ConnectionMode::Http => smg_labels::CONNECTION_HTTP,
+            ConnectionMode::Grpc { .. } => smg_labels::CONNECTION_GRPC,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionMode {
@@ -388,6 +396,17 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+        }
+    }
+}
+
+impl WorkerType {
+    /// Get the metric label for this worker type
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            WorkerType::Regular => smg_labels::WORKER_REGULAR,
+            WorkerType::Prefill { .. } => smg_labels::WORKER_PREFILL,
+            WorkerType::Decode => smg_labels::WORKER_DECODE,
         }
     }
 }
@@ -537,7 +556,9 @@ impl BasicWorker {
     }
 
     fn update_running_requests_metrics(&self) {
-        RouterMetrics::set_running_requests(self.url(), self.load());
+        let load = self.load();
+        RouterMetrics::set_running_requests(self.url(), load);
+        SmgMetrics::set_worker_requests_active(self.url(), load);
     }
 }
 
@@ -574,9 +595,15 @@ impl Worker for BasicWorker {
             ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
         };
 
+        // Get worker type label for metrics
+        let worker_type_str = self.metadata.worker_type.as_metric_label();
+
         if health_result {
             self.consecutive_failures.store(0, Ordering::Release);
             let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Record health check success metric
+            SmgMetrics::record_worker_health_check(worker_type_str, smg_labels::CB_SUCCESS);
 
             if !self.is_healthy()
                 && successes >= self.metadata.health_config.success_threshold as usize
@@ -588,6 +615,9 @@ impl Worker for BasicWorker {
         } else {
             self.consecutive_successes.store(0, Ordering::Release);
             let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Record health check failure metric
+            SmgMetrics::record_worker_health_check(worker_type_str, smg_labels::CB_FAILURE);
 
             if self.is_healthy()
                 && failures >= self.metadata.health_config.failure_threshold as usize

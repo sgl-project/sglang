@@ -38,7 +38,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             return False
 
         # CI failures channel
-        channel_id = "C09HCG2HM1T"
+        channel_id = "C0A2DG0R7CJ"
 
         # Get GitHub run ID for linking to the workflow run
         run_id = os.environ.get("GITHUB_RUN_ID", "")
