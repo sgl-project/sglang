@@ -224,7 +224,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
 }
 
 /// Label constants for consistent metric labeling
-pub mod smg_labels {
+pub mod metrics_labels {
     // Router types
     pub const ROUTER_OPENAI: &str = "openai";
     pub const ROUTER_HTTP: &str = "http";
@@ -286,6 +286,7 @@ pub mod smg_labels {
     pub const REGISTRATION_SUCCESS: &str = "success";
     pub const REGISTRATION_FAILED: &str = "failed";
     pub const REGISTRATION_DUPLICATE: &str = "duplicate";
+    pub const DEREGISTRATION_POD_DELETED: &str = "pod_deleted";
 
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
@@ -309,7 +310,7 @@ pub mod smg_labels {
 }
 
 /// SMG Metrics helper struct for the new layered metrics architecture
-pub struct SmgMetrics;
+pub struct Metrics;
 
 /// Parameters for recording streaming metrics.
 pub struct StreamingMetricsParams<'a> {
@@ -331,7 +332,7 @@ pub struct StreamingMetricsParams<'a> {
     pub output_tokens: u64,
 }
 
-impl SmgMetrics {
+impl Metrics {
     /// Record an HTTP request
     pub fn record_http_request(method: &str, path: &str, status_class: &str) {
         counter!(
@@ -613,7 +614,7 @@ impl SmgMetrics {
                 "backend_type" => backend_type,
                 "model" => model.clone(),
                 "endpoint" => endpoint,
-                "token_type" => smg_labels::TOKEN_INPUT
+                "token_type" => metrics_labels::TOKEN_INPUT
             )
             .increment(input);
         }
@@ -625,7 +626,7 @@ impl SmgMetrics {
             "backend_type" => backend_type,
             "model" => model,
             "endpoint" => endpoint,
-            "token_type" => smg_labels::TOKEN_OUTPUT
+            "token_type" => metrics_labels::TOKEN_OUTPUT
         )
         .increment(output_tokens);
     }

@@ -22,7 +22,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{smg_labels, SmgMetrics},
+        metrics::{metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
@@ -282,10 +282,10 @@ impl PDRouter {
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
-        SmgMetrics::record_router_request(
-            smg_labels::ROUTER_HTTP,
-            smg_labels::BACKEND_PD,
-            smg_labels::CONNECTION_HTTP,
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_PD,
+            metrics_labels::CONNECTION_HTTP,
             model,
             endpoint,
             context.is_stream,
@@ -351,14 +351,14 @@ impl PDRouter {
                         // Record worker errors for server errors (5xx)
                         if status.is_server_error() {
                             let error_type = error_type_from_status(status);
-                            SmgMetrics::record_worker_error(
-                                smg_labels::WORKER_PREFILL,
-                                smg_labels::CONNECTION_HTTP,
+                            Metrics::record_worker_error(
+                                metrics_labels::WORKER_PREFILL,
+                                metrics_labels::CONNECTION_HTTP,
                                 error_type,
                             );
-                            SmgMetrics::record_worker_error(
-                                smg_labels::WORKER_DECODE,
-                                smg_labels::CONNECTION_HTTP,
+                            Metrics::record_worker_error(
+                                metrics_labels::WORKER_DECODE,
+                                metrics_labels::CONNECTION_HTTP,
                                 error_type,
                             );
                         }
@@ -370,13 +370,13 @@ impl PDRouter {
             |res, _attempt| is_retryable_status(res.status()),
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
-                SmgMetrics::record_worker_retry(smg_labels::WORKER_PREFILL, endpoint);
-                SmgMetrics::record_worker_retry(smg_labels::WORKER_DECODE, endpoint);
-                SmgMetrics::record_worker_retry_backoff(attempt, delay);
+                Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_PREFILL, endpoint);
-                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_DECODE, endpoint);
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
             },
         )
         .await;
@@ -384,19 +384,19 @@ impl PDRouter {
         // Record Layer 2 metrics
         let duration = start_time.elapsed();
         if response.status().is_success() {
-            SmgMetrics::record_router_duration(
-                smg_labels::ROUTER_HTTP,
-                smg_labels::BACKEND_PD,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
                 model,
                 endpoint,
                 duration,
             );
         } else if !is_retryable_status(response.status()) {
-            SmgMetrics::record_router_error(
-                smg_labels::ROUTER_HTTP,
-                smg_labels::BACKEND_PD,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_PD,
+                metrics_labels::CONNECTION_HTTP,
                 model,
                 endpoint,
                 error_type_from_status(response.status()),
@@ -741,15 +741,15 @@ impl PDRouter {
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or("default");
-        SmgMetrics::record_worker_selection(
-            smg_labels::WORKER_PREFILL,
-            smg_labels::CONNECTION_HTTP,
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_HTTP,
             model,
             prefill_policy.name(),
         );
-        SmgMetrics::record_worker_selection(
-            smg_labels::WORKER_DECODE,
-            smg_labels::CONNECTION_HTTP,
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_HTTP,
             model,
             decode_policy.name(),
         );

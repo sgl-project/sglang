@@ -24,7 +24,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{smg_labels, SmgMetrics},
+        metrics::{metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
     policies::PolicyRegistry,
@@ -159,9 +159,9 @@ impl Router {
         let idx = policy.select_worker(&available, text)?;
 
         // Record worker selection metric (Layer 3)
-        SmgMetrics::record_worker_selection(
-            smg_labels::WORKER_REGULAR,
-            smg_labels::CONNECTION_HTTP,
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
             model_id.unwrap_or("default"),
             policy.name(),
         );
@@ -183,10 +183,10 @@ impl Router {
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
-        SmgMetrics::record_router_request(
-            smg_labels::ROUTER_HTTP,
-            smg_labels::BACKEND_REGULAR,
-            smg_labels::CONNECTION_HTTP,
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
             model,
             endpoint,
             is_stream,
@@ -204,31 +204,31 @@ impl Router {
             // on_backoff hook
             |delay, attempt| {
                 // Layer 3 worker metrics
-                SmgMetrics::record_worker_retry(smg_labels::WORKER_REGULAR, endpoint);
-                SmgMetrics::record_worker_retry_backoff(attempt, delay);
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
             },
             // on_exhausted hook
             || {
-                SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
             },
         )
         .await;
 
         if response.status().is_success() {
             let duration = start.elapsed();
-            SmgMetrics::record_router_duration(
-                smg_labels::ROUTER_HTTP,
-                smg_labels::BACKEND_REGULAR,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
                 model,
                 endpoint,
                 duration,
             );
         } else if !is_retryable_status(response.status()) {
-            SmgMetrics::record_router_error(
-                smg_labels::ROUTER_HTTP,
-                smg_labels::BACKEND_REGULAR,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
                 model,
                 endpoint,
                 error_type_from_status(response.status()),
@@ -293,9 +293,9 @@ impl Router {
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
-            SmgMetrics::record_worker_error(
-                smg_labels::WORKER_REGULAR,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
                 error_type_from_status(status),
             );
         }

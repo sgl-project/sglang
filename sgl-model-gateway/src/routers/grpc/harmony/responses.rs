@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
     mcp::{self, McpManager},
-    observability::metrics::{smg_labels, SmgMetrics},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
@@ -326,7 +326,7 @@ async fn execute_with_mcp_loop(
         iteration_count += 1;
 
         // Record tool loop iteration metric
-        SmgMetrics::record_mcp_tool_iteration(&current_request.model);
+        Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
@@ -770,7 +770,7 @@ async fn execute_mcp_tool_loop_streaming(
         iteration_count += 1;
 
         // Record tool loop iteration metric
-        SmgMetrics::record_mcp_tool_iteration(&current_request.model);
+        Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
@@ -1253,18 +1253,18 @@ async fn execute_mcp_tools(
                 );
 
                 // Record MCP tool metrics
-                SmgMetrics::record_mcp_tool_duration(
+                Metrics::record_mcp_tool_duration(
                     model_id,
                     &tool_call.function.name,
                     tool_duration,
                 );
-                SmgMetrics::record_mcp_tool_call(
+                Metrics::record_mcp_tool_call(
                     model_id,
                     &tool_call.function.name,
                     if is_error {
-                        smg_labels::RESULT_ERROR
+                        metrics_labels::RESULT_ERROR
                     } else {
-                        smg_labels::RESULT_SUCCESS
+                        metrics_labels::RESULT_SUCCESS
                     },
                 );
 
@@ -1301,15 +1301,15 @@ async fn execute_mcp_tools(
                 );
 
                 // Record MCP tool metrics
-                SmgMetrics::record_mcp_tool_duration(
+                Metrics::record_mcp_tool_duration(
                     model_id,
                     &tool_call.function.name,
                     tool_duration,
                 );
-                SmgMetrics::record_mcp_tool_call(
+                Metrics::record_mcp_tool_call(
                     model_id,
                     &tool_call.function.name,
-                    smg_labels::RESULT_ERROR,
+                    metrics_labels::RESULT_ERROR,
                 );
 
                 // Return error result to model (let it handle gracefully)

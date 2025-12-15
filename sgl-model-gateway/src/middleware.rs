@@ -26,7 +26,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{smg_labels, SmgMetrics},
+    observability::metrics::{metrics_labels, Metrics},
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -338,7 +338,7 @@ impl<B> OnResponse<B> for ResponseLogger {
         let error_code = extract_error_code_from_response(response);
 
         // Layer 1: HTTP metrics
-        SmgMetrics::record_http_response(status_code, error_code);
+        Metrics::record_http_response(status_code, error_code);
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status_code);
@@ -514,7 +514,7 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
-        SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_ALLOWED);
+        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
@@ -548,7 +548,7 @@ pub async fn concurrency_limit_middleware(
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
-                            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_ALLOWED);
+                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
@@ -563,7 +563,7 @@ pub async fn concurrency_limit_middleware(
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
-                            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             // Dequeue for embeddings on error
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
@@ -572,7 +572,7 @@ pub async fn concurrency_limit_middleware(
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
-                            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                             // Dequeue for embeddings on channel error
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
@@ -583,13 +583,13 @@ pub async fn concurrency_limit_middleware(
                 }
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
-                    SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+                    Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
-            SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
     }
@@ -650,22 +650,22 @@ where
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            SmgMetrics::set_http_connections_active(active as usize);
+            Metrics::set_http_connections_active(active as usize);
 
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            SmgMetrics::set_http_connections_active(active as usize);
+            Metrics::set_http_connections_active(active as usize);
 
             let response = result?;
 
             let duration = start.elapsed();
             let status_class = status_to_class(response.status().as_u16());
 
-            SmgMetrics::record_http_request(&method, &path, status_class);
-            SmgMetrics::record_http_duration(&method, &path, duration);
+            Metrics::record_http_request(&method, &path, status_class);
+            Metrics::record_http_duration(&method, &path, duration);
 
             Ok(response)
         })

@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
-    observability::metrics::SmgMetrics,
+    observability::metrics::Metrics,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -80,7 +80,7 @@ impl StepExecutor for RemoveFromWorkerRegistryStep {
                 )
                 .len();
 
-            SmgMetrics::set_worker_pool_size(
+            Metrics::set_worker_pool_size(
                 worker_type_label,
                 connection_mode_label,
                 &model_id,
