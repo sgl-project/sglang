@@ -196,25 +196,7 @@ class ModelConfig:
         self._derive_model_shapes()
 
         # Update hybrid model
-        # Use self.context_len after it has been initialized to prevent using context_len which may be None.
-        self.is_hybrid_swa = is_hybrid_model(
-            self.hf_config.architectures,
-            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
-            context_length=self.context_len,
-            attention_chunk_size=self.attention_chunk_size,
-        )
-        if self.is_hybrid_swa is not None:
-            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
-                get_hybrid_layer_ids(
-                    self.hf_config.architectures,
-                    self.hf_text_config.num_hidden_layers,
-                    getattr(self.hf_text_config, "hybrid_layer_pattern", None),
-                )
-            )
-        self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
-            "MiMoV2FlashForCausalLM",
-            "MiMoV2MTP",
-        ]
+        self._derive_hybrid_model(hybrid_kvcache_ratio)
 
         # Verify quantization
         self._verify_quantization()
@@ -307,6 +289,28 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+
+    def _derive_hybrid_model(self, hybrid_kvcache_ratio: Optional[float] = None):
+        # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        self.is_hybrid_swa = is_hybrid_model(
+            self.hf_config.architectures,
+            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
+            context_length=self.context_len,
+            attention_chunk_size=self.attention_chunk_size,
+        )
+        if self.is_hybrid_swa is not None:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures,
+                    self.hf_text_config.num_hidden_layers,
+                    getattr(self.hf_text_config, "hybrid_layer_pattern", None),
+                )
+            )
+
+        self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
+            "MiMoV2FlashForCausalLM",
+            "MiMoV2MTP",
+        ]
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
