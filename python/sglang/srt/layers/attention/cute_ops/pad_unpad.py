@@ -57,6 +57,8 @@ class CutePadDraftExtendQueryKernel:
     ) -> None:
         assert q.is_cuda and padded_q.is_cuda and seq_lens_q.is_cuda and cumsum.is_cuda
         assert seq_lens_q.dtype == torch.int32 and cumsum.dtype == torch.int32
+        # Kernel only reads cumsum[batch_id], so we can drop the trailing element.
+        cumsum = cumsum[:-1].contiguous()
 
         # Compile once per (dtype, max_seq_len, heads, dim, tile)
         max_seq_len = padded_q.shape[1]
@@ -90,8 +92,9 @@ class CutePadDraftExtendQueryKernel:
             mSeqLens_fake = make_fake_compact_tensor(
                 i32, (batch_sym,), stride_order=(0,)
             )
+            # Avoid SymInt + int; we only need cumsum[batch_id].
             mCumsum_fake = make_fake_compact_tensor(
-                i32, (batch_sym + 1,), stride_order=(0,)
+                i32, (batch_sym,), stride_order=(0,)
             )
 
             compiled = cute.compile(
@@ -199,6 +202,8 @@ class CuteUnpadDraftExtendOutputKernel:
             and cumsum.is_cuda
         )
         assert accept_lengths.dtype == torch.int32 and cumsum.dtype == torch.int32
+        # Kernel only reads cumsum[batch_id], so we can drop the trailing element.
+        cumsum = cumsum[:-1].contiguous()
 
         token_per_batch = raw_out.shape[1]
         tp_q_head_num = raw_out.shape[2]
@@ -232,8 +237,9 @@ class CuteUnpadDraftExtendOutputKernel:
             mAccept_fake = make_fake_compact_tensor(
                 i32, (batch_sym,), stride_order=(0,)
             )
+            # Avoid SymInt + int; we only need cumsum[batch_id].
             mCumsum_fake = make_fake_compact_tensor(
-                i32, (batch_sym + 1,), stride_order=(0,)
+                i32, (batch_sym,), stride_order=(0,)
             )
 
             compiled = cute.compile(
