@@ -454,11 +454,6 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.sessions: Dict[str, Session] = {}
-        self.default_stream: CudaStream = torch.get_device_module(
-            self.device
-        ).current_stream()
-        if self.device == "cpu":
-            self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -975,17 +970,21 @@ class Scheduler(
 
     def init_overlap(self):
         self.future_map = None
-        if not self.enable_overlap and self.pp_size == 1:
-            return
 
-        self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
-        self.forward_stream_ctx: CudaStreamContext = torch.get_device_module(
-            self.device
-        ).stream(self.forward_stream)
-        self.copy_stream: CudaStream = torch.get_device_module(self.device).Stream()
-        self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
-            self.device
-        ).stream(self.copy_stream)
+        self.device_module = torch.get_device_module(self.device)
+
+        self.default_stream: CudaStream = self.device_module.current_stream()
+        if self.device == "cpu":
+            self.default_stream.synchronize = lambda: None  # No-op for CPU
+
+        self.forward_stream: CudaStream = self.device_module.Stream()
+        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.forward_stream
+        )
+        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.copy_stream
+        )
 
         if not self.enable_overlap:
             return
@@ -2066,19 +2065,19 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            batch_or_worker_batch = batch
-
-            if self.enable_overlap or self.spec_algorithm.is_none():
-                # FIXME(lsyin): remove this if and finally unify the abstraction
-                batch_or_worker_batch = batch.get_model_worker_batch()
+            if self.spec_algorithm.is_none() or self.enable_overlap:
+                # In most cases, we use the model worker batch to run the forward.
+                worker_batch_or_batch = batch.get_model_worker_batch()
+            else:
+                # In speculative decoding v1 (non-overlap) case, we use the batch directly.
+                # TODO(lsyin): delete this branch after unifying the abstraction.
+                worker_batch_or_batch = batch
 
             if self.enable_overlap:
-                # FIXME: remove this assert
-                assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
-                model_worker_batch = batch_or_worker_batch
+                model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
-                # Sampling info will be modified during forward
+                # Sampling info will be modified during forward, so we store a copy.
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
