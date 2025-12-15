@@ -39,6 +39,12 @@ ADAPTERS = [
 
 BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
+# Embedding LoRA test configuration (TinyLlama with lora_target_modules=["all"])
+EMBEDDING_LORA_BASE_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+EMBEDDING_LORA_ADAPTER = (
+    "ash256/sglang_embedding_lora_test_adapter"  # includes embed_tokens and lm_head
+)
+
 
 @contextlib.contextmanager
 def dynamically_loaded_adapter(runner, lora_path: str, lora_name: str):
@@ -72,6 +78,53 @@ class TestLoRAEviction(CustomTestCase):
         output_history = {}
         self._run_test(ADAPTERS, output_history, reuse_lora_name=True, repeat=1)
         self._run_test(ADAPTERS, output_history, reuse_lora_name=False, repeat=1)
+
+    def test_lora_eviction_with_embedding_lora_all_target_modules(self):
+        """
+        Test LoRA eviction with lora_target_modules=["all"] using an embedding LoRA adapter.
+
+        This test verifies that the csgmv backend properly handles eviction when using
+        lora_target_modules=["all"] which includes embed_tokens and lm_head layers.
+        Uses TinyLlama base model with the ash256/sglang_embedding_lora_test_adapter.
+        """
+        max_new_tokens = 64
+        torch_dtype = torch.float16
+
+        with SRTRunner(
+            EMBEDDING_LORA_BASE_MODEL,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            lora_paths=[EMBEDDING_LORA_ADAPTER],
+            max_loras_per_batch=1,
+            enable_lora=True,
+            max_lora_rank=16,
+            lora_target_modules=["all"],  # This includes embed_tokens and lm_head
+        ) as srt_runner:
+            output_history = {}
+            # Run inference multiple times to ensure consistent outputs
+            for repeat in range(2):
+                for prompt in PROMPTS:
+                    print(
+                        f"\n========== Testing embedding LoRA eviction, repeat {repeat + 1}/2 =========="
+                    )
+                    print(f"prompt: {prompt[:50]}...")
+                    srt_outputs = srt_runner.forward(
+                        [prompt],
+                        max_new_tokens=max_new_tokens,
+                        lora_paths=[EMBEDDING_LORA_ADAPTER],
+                    )
+                    output = srt_outputs.output_strs[0].strip()
+                    print(f"output: {output[:100]}...")
+
+                    prev_output = output_history.get(prompt)
+                    if prev_output is not None:
+                        self.assertEqual(
+                            prev_output,
+                            output,
+                            f"Output mismatch for embedding LoRA adapter and prompt '{prompt[:30]}...' on repeat {repeat + 1}",
+                        )
+                    else:
+                        output_history[prompt] = output
 
     def _run_test(
         self,
