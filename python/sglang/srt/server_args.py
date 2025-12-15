@@ -1266,6 +1266,9 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
+            assert (
+                not self.enable_mamba_extra_buffer()
+            ), f"mamba extra_buffer is not supported for {model_arch} model"
             model_config = self.get_model_config()
             if model_config.quantization in [
                 "modelopt",
