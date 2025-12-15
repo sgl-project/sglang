@@ -220,11 +220,25 @@ async def edits(
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         return ImageResponse(
-            data=[ImageResponseData(b64_json=b64, revised_prompt=prompt, file_path=os.path.abspath(save_file_path))]
+            data=[
+                ImageResponseData(
+                    b64_json=b64,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(save_file_path),
+                )
+            ]
         )
     else:
         url = f"/v1/images/{request_id}/content"
-        return ImageResponse(data=[ImageResponseData(url=url, revised_prompt=prompt, file_path=os.path.abspath(save_file_path))])
+        return ImageResponse(
+            data=[
+                ImageResponseData(
+                    url=url,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(save_file_path),
+                )
+            ]
+        )
 
 
 @router.get("/{image_id}/content")
