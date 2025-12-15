@@ -286,23 +286,16 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         if self.use_dpsk_v32_encoding:
-            if request.chat_template_kwargs and request.chat_template_kwargs.get(
+            thinking_mode = (
                 "thinking"
-            ):
-                thinking_mode = "thinking"
-            else:
-                thinking_mode = "chat"
+                if (request.chat_template_kwargs or {}).get("thinking")
+                else "chat"
+            )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
-            if messages[0]["role"] != "system":
-                messages.insert(
-                    0, {"role": "system", "content": "You are a helpful Assistant."}
-                )
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(
-                messages, thinking_mode=thinking_mode, drop_thinking=False
-            )
+            real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
         else:
             for message in request.messages:
@@ -1072,8 +1065,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45"]:
-            # qwen3 and glm45 are reasoning by default
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3"]:
+            # qwen3, glm45, and nano_v3 are reasoning by default
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking", True) is True
