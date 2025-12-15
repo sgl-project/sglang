@@ -193,11 +193,42 @@ jobs:
           miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
           echo "Found ${miopen_files} MIOpen cache files"
 
+      - name: Diagnose HF cache and system resources
+        run: |
+          echo "=== System Memory Status ==="
+          free -h
+          echo ""
+          echo "=== Disk Space ==="
+          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          echo ""
+          echo "=== HF Cache Directory Structure ==="
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/hub/ 2>/dev/null || echo "HF hub cache not found"
+          echo ""
+          echo "=== Checking for cached diffusion models (1-GPU tests) ==="
+          # Models used in 1-GPU tests: Wan2.1-T2V-1.3B, HunyuanVideo, Qwen-Image, FLUX.1, FLUX.2
+          for model in "Wan-AI--Wan2.1-T2V-1.3B-Diffusers" "tencent--HunyuanVideo" "Qwen--Qwen-Image" "black-forest-labs--FLUX.1-dev" "black-forest-labs--FLUX.2-dev"; do
+            cache_path="/sgl-data/hf-cache/hub/models--${model}"
+            if docker exec ci_sglang test -d "$cache_path"; then
+              size=$(docker exec ci_sglang du -sh "$cache_path" 2>/dev/null | cut -f1)
+              echo "✓ CACHED: $model ($size)"
+            else
+              echo "✗ NOT CACHED: $model"
+            fi
+          done
+          echo ""
+          echo "=== GPU Memory Status ==="
+          docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
+
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 45
         run: |
           # AMD CI Step 2: T2V + T2I tests (no image input)
           # Tests: wan2_1_t2v_1.3b, fast_hunyuan_video, qwen_image_t2i, flux_image_t2i, flux_2_image_t2i, zimage_image_t2i
+          #
+          # HF download env vars:
+          # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
+          # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
@@ -208,12 +239,18 @@ jobs:
             -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+            -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
               --total-partitions 2 \
               -k "(t2v or hunyuan or t2i) and not lora"
+          
+          # Post-test diagnostics
+          echo "=== Post-test System Memory Status ==="
+          free -h
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
@@ -261,11 +298,42 @@ jobs:
           miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
           echo "Found ${miopen_files} MIOpen cache files"
 
+      - name: Diagnose HF cache and system resources
+        run: |
+          echo "=== System Memory Status ==="
+          free -h
+          echo ""
+          echo "=== Disk Space ==="
+          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          echo ""
+          echo "=== HF Cache Directory Structure ==="
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/hub/ 2>/dev/null || echo "HF hub cache not found"
+          echo ""
+          echo "=== Checking for cached diffusion models (2-GPU tests) ==="
+          # Models used in 2-GPU tests: Wan2.2-T2V-A14B, Wan2.1-T2V-14B, Qwen-Image, FLUX.1
+          for model in "Wan-AI--Wan2.2-T2V-A14B-Diffusers" "Wan-AI--Wan2.1-T2V-14B-Diffusers" "Qwen--Qwen-Image" "black-forest-labs--FLUX.1-dev"; do
+            cache_path="/sgl-data/hf-cache/hub/models--${model}"
+            if docker exec ci_sglang test -d "$cache_path"; then
+              size=$(docker exec ci_sglang du -sh "$cache_path" 2>/dev/null | cut -f1)
+              echo "✓ CACHED: $model ($size)"
+            else
+              echo "✗ NOT CACHED: $model"
+            fi
+          done
+          echo ""
+          echo "=== GPU Memory Status ==="
+          docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
+
       - name: Run diffusion server tests (2-GPU)
         timeout-minutes: 80
         run: |
           # AMD CI Step 2: T2V + T2I tests (no image input)
           # Tests: wan2_2_t2v_a14b_2gpu, wan2_1_t2v_14b_2gpu, qwen_image_t2i_2_gpus, flux_image_t2i_2_gpus
+          #
+          # HF download env vars:
+          # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
+          # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
           docker exec \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
@@ -276,12 +344,18 @@ jobs:
             -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+            -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
               --total-partitions 2 \
               -k "(t2v or t2i) and not lora"
+          
+          # Post-test diagnostics
+          echo "=== Post-test System Memory Status ==="
+          free -h
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
