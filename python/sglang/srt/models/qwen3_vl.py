@@ -412,12 +412,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 (dh.unsqueeze(-1) * dw.unsqueeze(0)).flatten().repeat(t)
             )
 
-        if len(grid_thw) > 1:
-            idx_list = [torch.concat(items, dim=0) for items in idx_list]
-            weight_list = [torch.concat(items, dim=0) for items in weight_list]
-        else:
-            idx_list = [items[0] for items in idx_list]
-            weight_list = [items[0] for items in weight_list]
+        idx_list = [torch.concat(items, dim=0) for items in idx_list]
+        weight_list = [torch.concat(items, dim=0) for items in weight_list]
 
         p0 = self.pos_embed(idx_list[0].to(torch.long)) * weight_list[0].to(
             self.dtype
