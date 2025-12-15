@@ -23,7 +23,7 @@
    # Compile sgl-kernel
    pip install --upgrade pip
    cd sgl-kernel
-   python setup_rocm.py install
+   python3 setup_rocm.py install
 
    # Install sglang python package
    cd ..
@@ -73,6 +73,7 @@
         2>&1 | tee log.server.log &
 
     ```
+    You can also add `--mm-enable-dp-encoder` when launch server, this command can reduces TTFT for multi-modal workloads under some testing conditions.
 
 # Curl request
 1. curl a single request to quickly check the functionality
@@ -249,7 +250,7 @@ Vision model is evaluated on MMMU dataset. More information you can find in the 
 1. Start evaluating. Example:
 
     ```bash
-    python benchmark/mmmu/bench_sglang.py --port 9000 --concurrency 16
+    python3 benchmark/mmmu/bench_sglang.py --port 9000 --concurrency 16
     ```
     The result of TP4 on MI308 should be:
     ```
