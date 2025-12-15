@@ -195,6 +195,24 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+
+  /*
+   * From hadamard
+   */
+  m.def("fast_hadamard_transform(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform", torch::kCUDA, &fast_hadamard_transform);
+
+  m.def("fast_hadamard_transform_12N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_12N", torch::kCUDA, &fast_hadamard_transform_12N);
+
+  m.def("fast_hadamard_transform_20N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_20N", torch::kCUDA, &fast_hadamard_transform_20N);
+
+  m.def("fast_hadamard_transform_28N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_28N", torch::kCUDA, &fast_hadamard_transform_28N);
+
+  m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
 }
 
 REGISTER_EXTENSION(common_ops)

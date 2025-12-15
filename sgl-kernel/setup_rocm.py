@@ -52,9 +52,12 @@ sources = [
     "csrc/speculative/eagle_utils.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/elementwise/pos_enc.cu",
+    # Hadamard: compile the shared CUDA sources with USE_ROCM enabled.
+    "csrc/hadamard/fast_hadamard_transform_gpu.cu",
+    "csrc/hadamard/fast_hadamard_transform.cpp",
 ]
 
-cxx_flags = ["-O3"]
+cxx_flags = ["-O3", "-DSGL_KERNEL_BUILD", "-DUSE_ROCM"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
@@ -90,6 +93,8 @@ hipcc_flags = [
     "-DENABLE_BF16",
     "-DENABLE_FP8",
     fp8_macro,
+    "-DSGL_KERNEL_BUILD",
+    "-DUSE_ROCM",
 ]
 
 ext_modules = [
