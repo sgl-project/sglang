@@ -361,6 +361,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             if get_global_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
+
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -682,7 +683,9 @@ class Glm4MoeDecoderLayer(nn.Module):
         self.config = config
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        partial_rotary_factor = getattr(
+            getattr(config, "rope_parameters", None), "partial_rotary_factor", None
+        ) or getattr(config, "partial_rotary_factor", 0.5)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -711,12 +714,14 @@ class Glm4MoeDecoderLayer(nn.Module):
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:

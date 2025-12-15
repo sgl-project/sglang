@@ -19,8 +19,10 @@ class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
 
-    def register(self, package_name: str, overwrite: bool = False):
-        new_models = import_model_classes(package_name)
+    def register(
+        self, package_name: str, overwrite: bool = False, strict: bool = False
+    ):
+        new_models = import_model_classes(package_name, strict=strict)
         if overwrite:
             self.models.update(new_models)
         else:
@@ -88,7 +90,7 @@ class _ModelRegistry:
 
 
 @lru_cache()
-def import_model_classes(package_name: str):
+def import_model_classes(package_name: str, strict: bool = False):
     model_arch_name_to_cls = {}
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
@@ -100,6 +102,8 @@ def import_model_classes(package_name: str):
             try:
                 module = importlib.import_module(name)
             except Exception as e:
+                if strict:
+                    raise
                 logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):

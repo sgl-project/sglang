@@ -570,6 +570,11 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if name.endswith(".activation_scale"):
+                name = name.replace(".activation_scale", ".input_scale")
+            if name.endswith(".weight_scale_inv"):
+                name = name.replace(".weight_scale_inv", ".weight_scale")
+
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
