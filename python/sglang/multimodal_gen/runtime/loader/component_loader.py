@@ -8,7 +8,6 @@ import importlib.util
 import json
 import os
 import time
-import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
@@ -129,10 +128,7 @@ class ComponentLoader(ABC):
             )
             source = "customized"
         except Exception as _e:
-            traceback.print_exc()
-            logger.error(
-                f"Error while loading customized {module_name}, falling back to native version"
-            )
+            logger.info(f"Try to load native version of {module_name}.")
             # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
@@ -141,8 +137,8 @@ class ComponentLoader(ABC):
             target_device = self.target_device(should_offload)
             component = component.to(device=target_device)
             source = "native"
-            logger.warning(
-                "Native module %s: %s is loaded, performance may be sub-optimal",
+            logger.info(
+                "Native module %s: %s is loaded.",
                 module_name,
                 component.__class__.__name__,
             )
