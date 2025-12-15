@@ -26,8 +26,8 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
 
     for (name, value) in reqwest_headers.iter() {
         // Skip hop-by-hop headers that shouldn't be forwarded
-        let name_str = name.as_str().to_lowercase();
-        if should_forward_header(&name_str) {
+        // Use eq_ignore_ascii_case to avoid string allocation
+        if should_forward_header_no_alloc(name.as_str()) {
             // The original name and value are already valid, so we can just clone them
             headers.insert(name.clone(), value.clone());
         }
@@ -36,22 +36,20 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     headers
 }
 
-/// Determine if a header should be forwarded from backend to client
-fn should_forward_header(name: &str) -> bool {
+/// Determine if a header should be forwarded without allocating (case-insensitive)
+fn should_forward_header_no_alloc(name: &str) -> bool {
     // List of headers that should NOT be forwarded (hop-by-hop headers)
-    !matches!(
-        name,
-        "connection" |
-        "keep-alive" |
-        "proxy-authenticate" |
-        "proxy-authorization" |
-        "te" |
-        "trailers" |
-        "transfer-encoding" |
-        "upgrade" |
-        "content-encoding" | // Let axum/hyper handle encoding
-        "host" // Should not forward the backend's host header
-    )
+    // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
+    !(name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailers")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("content-encoding")
+        || name.eq_ignore_ascii_case("host"))
 }
 
 /// Apply headers to a reqwest request builder, filtering out headers that shouldn't be forwarded
@@ -70,24 +68,27 @@ pub fn apply_request_headers(
     }
 
     // Forward other headers, filtering out problematic ones
+    // Use eq_ignore_ascii_case to avoid to_lowercase() allocation per header
     for (key, value) in headers.iter() {
-        let key_str = key.as_str().to_lowercase();
+        let key_str = key.as_str();
 
         // Skip headers that:
         // - Are set automatically by reqwest (content-type, content-length for POST/PUT)
         // - We already handled (authorization)
         // - Are hop-by-hop headers (connection, transfer-encoding)
         // - Should not be forwarded (host)
-        let should_skip = key_str == "authorization" || // Already handled above
-            key_str == "host" ||
-            key_str == "connection" ||
-            key_str == "transfer-encoding" ||
-            key_str == "keep-alive" ||
-            key_str == "te" ||
-            key_str == "trailers" ||
-            key_str == "accept-encoding" ||
-            key_str == "upgrade" ||
-            (skip_content_headers && (key_str == "content-type" || key_str == "content-length"));
+        let should_skip = key_str.eq_ignore_ascii_case("authorization") // Already handled above
+            || key_str.eq_ignore_ascii_case("host")
+            || key_str.eq_ignore_ascii_case("connection")
+            || key_str.eq_ignore_ascii_case("transfer-encoding")
+            || key_str.eq_ignore_ascii_case("keep-alive")
+            || key_str.eq_ignore_ascii_case("te")
+            || key_str.eq_ignore_ascii_case("trailers")
+            || key_str.eq_ignore_ascii_case("accept-encoding")
+            || key_str.eq_ignore_ascii_case("upgrade")
+            || (skip_content_headers
+                && (key_str.eq_ignore_ascii_case("content-type")
+                    || key_str.eq_ignore_ascii_case("content-length")));
 
         if !should_skip {
             request_builder = request_builder.header(key.clone(), value.clone());

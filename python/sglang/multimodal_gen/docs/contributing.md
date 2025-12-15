@@ -39,7 +39,7 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 
 3.  **Compare**: run the compare script, which will print a Markdown table to the console
     ```bash
-    $ python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json
+    $ python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json new.json [new2.json ...]
     ### Performance Comparison Report
     ...
     ```
