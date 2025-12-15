@@ -276,16 +276,11 @@ def _find_local_hf_snapshot_dir_unlocked(
     to prevent race conditions during validation and cleanup.
 
     If the weights are already local, skip downloading and returns the path.
-
-    NOTE: This function only performs cache validation in CI environments.
-    Outside of CI, it returns None to skip the validation overhead and let
-    snapshot_download handle the cache lookup natively.
     """
     if os.path.isdir(model_name_or_path):
         return None
 
     # Skip cache validation entirely outside CI to avoid unnecessary overhead
-    # for regular users. Let snapshot_download handle cache lookup natively.
     if not is_in_ci():
         return None
 
