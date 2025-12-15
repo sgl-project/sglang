@@ -2003,8 +2003,6 @@ def get_compiler_backend(
                     "Please install torchair for torch.compile support on NPU."
                 )
             compiler_config = CompilerConfig()
-
-            # TODO(iforgetmyname): Change this default value once torch_npu version 7.2.0
             compiler_config.mode = "max-autotune" if mode is None else mode
 
             npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)

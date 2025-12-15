@@ -32,8 +32,6 @@ class TestAscendNpuGraphCompile(CustomTestCase):
                 "--enable-torch-compile",
                 "--cuda-graph-bs",
                 "128",
-                "--cuda-graph-max-bs",
-                "128",
                 "--tp-size",
                 "1",
             ],

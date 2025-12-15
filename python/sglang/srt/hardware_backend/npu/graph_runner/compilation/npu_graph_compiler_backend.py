@@ -20,14 +20,12 @@ from torch._dynamo.eval_frame import DisableContext
 from sglang.srt.hardware_backend.npu.graph_runner.compilation.pass_manager import (
     PassManager,
 )
-from sglang.srt.hardware_backend.npu.graph_runner.compilation.passes.fp16 import (
-    SplitQkvRmsnormRopeFuse,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.compilation.passes.w8a8_int8 import (
+from sglang.srt.hardware_backend.npu.graph_runner.compilation.passes import (
     DivFuse,
     EraseCopy,
     NpuAddRmsNormDynamicQuantFuse,
     NpuAddRmsNormQuantFuse,
+    SplitQkvRmsnormRopeFuse,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 

@@ -32,8 +32,6 @@ class TestAscendNpuPiecewiseGraph(CustomTestCase):
                 "--enable-piecewise-npu-graph-decode",
                 "--cuda-graph-bs",
                 "128",
-                "--cuda-graph-max-bs",
-                "128",
                 "--tp-size",
                 "1",
             ],
