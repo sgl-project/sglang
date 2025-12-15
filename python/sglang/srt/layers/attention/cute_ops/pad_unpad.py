@@ -83,19 +83,23 @@ class CutePadDraftExtendQueryKernel:
 
             # Row-major compact tensors: last dim contiguous
             mQ_fake = make_fake_compact_tensor(
-                q_dt, (total_seq_sym, num_heads, head_dim), stride_order=(2, 1, 0)
+                q_dt,
+                (total_seq_sym, num_heads, head_dim),
+                stride_order=(2, 1, 0),
+                assumed_align=16,
             )
             mPadded_fake = make_fake_compact_tensor(
                 q_dt,
                 (batch_sym, max_seq_len, num_heads, head_dim),
                 stride_order=(3, 2, 1, 0),
+                assumed_align=16,
             )
             mSeqLens_fake = make_fake_compact_tensor(
-                i32, (batch_sym,), stride_order=(0,)
+                i32, (batch_sym,), stride_order=(0,), assumed_align=4
             )
             # Avoid SymInt + int; we only need cumsum[batch_id].
             mCumsum_fake = make_fake_compact_tensor(
-                i32, (batch_sym,), stride_order=(0,)
+                i32, (batch_sym,), stride_order=(0,), assumed_align=4
             )
 
             compiled = cute.compile(
@@ -274,18 +278,20 @@ class CuteUnpadDraftExtendOutputKernel:
                 out_dt,
                 (batch_sym, token_per_batch, tp_q_head_num, v_head_dim),
                 stride_order=(3, 2, 1, 0),
+                assumed_align=16,
             )
             mOut_fake = make_fake_compact_tensor(
                 out_dt,
                 (total_tokens_sym, tp_q_head_num, v_head_dim),
                 stride_order=(2, 1, 0),
+                assumed_align=16,
             )
             mAccept_fake = make_fake_compact_tensor(
-                i32, (batch_sym,), stride_order=(0,)
+                i32, (batch_sym,), stride_order=(0,), assumed_align=4
             )
             # Avoid SymInt + int; we only need cumsum[batch_id].
             mCumsum_fake = make_fake_compact_tensor(
-                i32, (batch_sym,), stride_order=(0,)
+                i32, (batch_sym,), stride_order=(0,), assumed_align=4
             )
 
             compiled = cute.compile(
