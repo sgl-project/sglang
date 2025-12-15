@@ -334,7 +334,8 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     int64_t patch_size,
     int64_t temporal_patch_size,
     int64_t merge_size,
-    bool disable_grouping);
+    bool disable_grouping,
+    at::ScalarType out_dtype);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
@@ -519,8 +520,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "image_preprocess_cpu(Tensor[] images, bool do_convert_rgb, bool do_resize, int shortest_edge, int longest_edge,"
       "str interpolation, bool do_rescale, float rescale_factor, bool do_normalize, float[] image_mean, float[] "
-      "image_std,"
-      "int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping) -> (Tensor, Tensor)");
+      "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
+      "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
 }
 

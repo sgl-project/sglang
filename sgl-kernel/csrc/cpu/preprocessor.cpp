@@ -53,6 +53,42 @@ inline void normalize<float>(
     }
   }
 }
+
+template <>
+inline void normalize<at::BFloat16>(
+    at::BFloat16* __restrict__ out,
+    const uint8_t* __restrict__ input,
+    const std::vector<float>& image_mean,
+    const std::vector<float>& image_std,
+    int64_t channel,
+    int64_t temporal_patch_size,
+    int64_t patch_size,
+    int64_t stride_ch,
+    int64_t stride_pt,
+    int64_t stride_ph) {
+  // we do vectorization on patch_size dim
+  assert(patch_size == 16);
+
+  // loop last 4 dimensions:
+  //  {channel, patch_t(repeated), patch_h, patch_w}
+  for (int64_t c = 0; c < channel; ++c) {
+    __m512 vmean = _mm512_set1_ps(image_mean[c]);
+    __m512 vrstd = _mm512_set1_ps(1.f / image_std[c]);
+
+    at::BFloat16* __restrict__ out_ptr = out + c * temporal_patch_size * patch_size * patch_size;
+#pragma GCC unroll 4
+    for (int64_t ph = 0; ph < patch_size; ++ph) {
+      __m128i u8 = _mm_loadu_si128((const __m128i*)(input + c * stride_ch + /* pt */ 0 * stride_pt + ph * stride_ph));
+      __m512 x = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(u8));
+      x = _mm512_mul_ps(_mm512_sub_ps(x, vmean), vrstd);
+      __m256i x16 = (__m256i)_mm512_cvtneps_pbh(x);
+#pragma GCC unroll 2
+      for (int64_t pt = 0; pt < temporal_patch_size; ++pt) {
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(out_ptr + pt * patch_size * patch_size + ph * patch_size), x16);
+      }
+    }
+  }
+}
 #endif
 
 template <typename scalar_t>
@@ -204,13 +240,19 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     int64_t patch_size,
     int64_t temporal_patch_size,
     int64_t merge_size,
-    bool disable_grouping) {
+    bool disable_grouping,
+    at::ScalarType out_dtype) {
   RECORD_FUNCTION("sgl_kernel::image_preprocess_cpu", std::vector<c10::IValue>({}));
 
   // TODO: lift C++ kernel limitations
   TORCH_CHECK(interpolation == "bicubic", "image_preprocess_cpu: support only bicubic mode.");
   TORCH_CHECK(do_rescale && do_normalize, "image_preprocess_cpu: support only do_rescale and do_normalize.");
   TORCH_CHECK(disable_grouping, "image_preprocess_cpu: support obly disable_grouping.");
+
+  // support only float32 or bfloat16 as output
+  TORCH_CHECK(
+      out_dtype == at::kFloat || out_dtype == at::kBFloat16,
+      "image_preprocess_cpu: support only float32 and bfloat16 as pixel_values dtype.");
 
   int64_t batch_size = images.size();
   int64_t channel = image_mean.size();
@@ -219,7 +261,7 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
 
   const at::Tensor& first_image = images[0];
   const auto options = first_image.options();
-  at::Tensor pixel_values = at::empty({}, options.dtype(at::kFloat));
+  at::Tensor pixel_values = at::empty({}, options.dtype(out_dtype));
   at::Tensor image_grid_thw = at::empty({batch_size, channel}, options.dtype(at::kLong));
 
   // index type use int64_t
