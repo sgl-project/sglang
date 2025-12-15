@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import inspect
 import json
+import os
 import random
 import sys
 import tempfile
@@ -956,9 +957,7 @@ class ServerArgs:
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
                 )
 
-        from sglang.multimodal_gen.runtime.utils import envs
-
-        if envs.SGLANG_CACHE_DIT_ENABLED:
+        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
             has_sp = self.sp_degree > 1
             has_tp = self.tp_size > 1
             if has_sp and has_tp:
