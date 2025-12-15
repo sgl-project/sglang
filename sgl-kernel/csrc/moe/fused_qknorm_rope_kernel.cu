@@ -218,7 +218,7 @@ __global__ void fusedQKNormRopeKernel(
     __syncwarp();
     if (in_rotary) {
       int const half_rotary_lanes = rotary_lanes / 2;
-      unsigned int active_mask = (1u << rotary_lanes) - 1;  // 低16位为1: 0x0000FFFF
+      unsigned int active_mask = (1u << rotary_lanes) - 1;
       for (int i = 0; i < numElemsPerThread; i++) {
         elements2[i] = __shfl_xor_sync(active_mask, elements[i], half_rotary_lanes);
         if (laneId < half_rotary_lanes) {
@@ -388,7 +388,9 @@ void fused_qk_norm_rope(
   TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
   TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
   TORCH_CHECK(rotary_dim % (head_dim / 32) == 0, "rotary_dim must be divisible by numElemsPerThread");
-  TORCH_CHECK((rotary_dim / (head_dim / 32)) % 2 == 0, "rotary_lanes must be even for neox style");
+  if (is_neox) {
+    TORCH_CHECK((rotary_dim / (head_dim / 32)) % 2 == 0, "rotary_lanes must be even for neox style");
+  }
   CHECK_INPUT(qkv, torch::kBFloat16);
   CHECK_INPUT(position_ids, torch::kInt32);
   CHECK_INPUT(q_weight, torch::kBFloat16);
