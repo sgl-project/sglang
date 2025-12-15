@@ -120,8 +120,8 @@ __global__ void fusedQKNormRopeKernel(
     float factor,  // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
     float low,     // threshold for high frequency
     float high,    // threshold for low frequency
-    float attention_factor  // attention_factor applied on cos and sin
-) {
+    float attention_factor,  // attention_factor applied on cos and sin
+    int const rotary_dim) {
   int const warpsPerBlock = blockDim.x / 32;
   int const warpId = threadIdx.x / 32;
   int const laneId = threadIdx.x % 32;
@@ -195,43 +195,54 @@ __global__ void fusedQKNormRopeKernel(
   float cos_vals[numElemsPerThread];
   float sin_vals[numElemsPerThread];
   float pos_id = static_cast<float>(position_ids[tokenIdx]);
+  int const rotary_lanes = rotary_dim / numElemsPerThread;  // rotary range
+  bool const in_rotary = (laneId < rotary_lanes);
 
   if constexpr (interleave) {
     // Perform interleaving. Fill cos_vals and sin_vals.
-    for (int i = 0; i < numElemsPerThread; i++) {
-      if (i % 2 == 0) {
-        elements2[i] = -elements[i + 1];
-      } else {
-        elements2[i] = elements[i - 1];
+    if (in_rotary) {
+      for (int i = 0; i < numElemsPerThread; i++) {
+        elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
+
+        int dim_idx = laneId * numElemsPerThread + i;
+        int half_dim = dim_idx / 2;
+        float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
+        float theta = pos_id * freq;
+        __sincosf(theta, &sin_vals[i], &cos_vals[i]);
       }
-      int dim_idx = laneId * numElemsPerThread + i;
-      int half_dim = dim_idx / 2;
-      float freq = compute_freq_yarn(base, head_dim, half_dim, factor, low, high);
-      float theta = pos_id * freq;
-      __sincosf(theta, &sin_vals[i], &cos_vals[i]);
     }
+
   } else {
+    // Neox style
     // Before data exchange with in warp, we need to sync.
     __syncwarp();
-    // Get the data from the other half of the warp. Fill cos_vals and sin_vals.
-    for (int i = 0; i < numElemsPerThread; i++) {
-      elements2[i] = __shfl_xor_sync(0xffffffff, elements[i], 16);
-      if (laneId < 16) {
-        elements2[i] = -elements2[i];
+    if (in_rotary) {
+      int const half_rotary_lanes = rotary_lanes / 2;
+      unsigned int active_mask = (1u << rotary_lanes) - 1;  // 低16位为1: 0x0000FFFF
+      for (int i = 0; i < numElemsPerThread; i++) {
+        elements2[i] = __shfl_xor_sync(active_mask, elements[i], half_rotary_lanes);
+        if (laneId < half_rotary_lanes) {
+          elements2[i] = -elements2[i];
+        }
+
+        int dim_idx = laneId * numElemsPerThread + i;
+        dim_idx = (dim_idx * 2) % rotary_dim;
+        int half_dim = dim_idx / 2;
+        float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
+        float theta = pos_id * freq;
+        __sincosf(theta, &sin_vals[i], &cos_vals[i]);
       }
-      int dim_idx = laneId * numElemsPerThread + i;
-      dim_idx = (dim_idx * 2) % head_dim;
-      int half_dim = dim_idx / 2;
-      float freq = compute_freq_yarn(base, head_dim, half_dim, factor, low, high);
-      float theta = pos_id * freq;
-      __sincosf(theta, &sin_vals[i], &cos_vals[i]);
     }
     // __shfl_xor_sync does not provide memfence. Need to sync again.
     __syncwarp();
   }
-  for (int i = 0; i < numElemsPerThread; i++) {
-    elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
+
+  if (in_rotary) {
+    for (int i = 0; i < numElemsPerThread; i++) {
+      elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
+    }
   }
+
   // Store.
   {
     vec_T vec;
@@ -270,6 +281,7 @@ void launchFusedQKNormRope(
     float low,
     float high,
     float attention_factor,
+    int const rotary_dim,
     cudaStream_t stream) {
   constexpr int blockSize = 256;
   int const warpsPerBlock = blockSize / 32;
@@ -297,7 +309,8 @@ void launchFusedQKNormRope(
             factor,
             low,
             high,
-            attention_factor);
+            attention_factor,
+            rotary_dim);
       });
       break;
     case 128:
@@ -316,7 +329,8 @@ void launchFusedQKNormRope(
             factor,
             low,
             high,
-            attention_factor);
+            attention_factor,
+            rotary_dim);
       });
       break;
     case 256:
@@ -335,7 +349,8 @@ void launchFusedQKNormRope(
             factor,
             low,
             high,
-            attention_factor);
+            attention_factor,
+            rotary_dim);
       });
       break;
     default:
@@ -363,8 +378,8 @@ void fused_qk_norm_rope(
     double factor,  // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
     double low,     // threshold for high frequency
     double high,    // threshold for low frequency
-    double attention_factor  // attention_factor applied on cos and sin
-) {
+    double attention_factor,  // attention_factor applied on cos and sin
+    int64_t rotary_dim) {
   // Input validation
   TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]");
   TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
@@ -372,7 +387,8 @@ void fused_qk_norm_rope(
   TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
   TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
   TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
-
+  TORCH_CHECK(rotary_dim % (head_dim / 32) == 0, "rotary_dim must be divisible by numElemsPerThread");
+  TORCH_CHECK((rotary_dim / (head_dim / 32)) % 2 == 0, "rotary_lanes must be even for neox style");
   CHECK_INPUT(qkv, torch::kBFloat16);
   CHECK_INPUT(position_ids, torch::kInt32);
   CHECK_INPUT(q_weight, torch::kBFloat16);
@@ -404,5 +420,6 @@ void fused_qk_norm_rope(
       static_cast<float>(low),
       static_cast<float>(high),
       static_cast<float>(attention_factor),
+      static_cast<int>(rotary_dim),
       stream);
 }
