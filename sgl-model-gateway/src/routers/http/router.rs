@@ -19,11 +19,12 @@ use tracing::{debug, error};
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuardV2,
+        WorkerRegistry, WorkerType,
     },
     observability::{
         events::{self, Event},
-        metrics::RouterMetrics,
+        metrics::{smg_labels, RouterMetrics, SmgMetrics},
         otel_trace::inject_trace_context_http,
     },
     policies::PolicyRegistry,
@@ -37,7 +38,11 @@ use crate::{
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{error, header_utils, RouterTrait},
+    routers::{
+        error,
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 /// Regular router that uses injected load balancing policies
@@ -165,6 +170,18 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let model = model_id.unwrap_or("default");
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_HTTP,
+            smg_labels::BACKEND_REGULAR,
+            smg_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            is_stream,
+        );
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -199,8 +216,24 @@ impl Router {
             let duration = start.elapsed();
             RouterMetrics::record_request(route);
             RouterMetrics::record_generate_duration(duration);
+            SmgMetrics::record_router_duration(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_REGULAR,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
         } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
+            SmgMetrics::record_router_error(
+                smg_labels::ROUTER_HTTP,
+                smg_labels::BACKEND_REGULAR,
+                smg_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
         }
 
         response
@@ -233,19 +266,8 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_incremented = if policy.name() == "cache_aware" {
-            worker.increment_load();
-            true
-        } else {
-            false
-        };
-
-        // Keep a clone for potential cleanup on retry
-        let worker_for_cleanup = if load_incremented {
-            Some(worker.clone())
-        } else {
-            None
-        };
+        let load_guard =
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuardV2::new(worker.clone()));
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
@@ -262,21 +284,13 @@ impl Router {
                 route,
                 worker.url(),
                 is_stream,
-                load_incremented,
+                load_guard,
             )
             .await;
 
         events::RequestReceivedEvent {}.emit();
 
         worker.record_outcome(response.status().is_success());
-
-        // For retryable failures, we need to decrement load since send_typed_request
-        // won't have done it (it only decrements on success or non-retryable failures)
-        if is_retryable_status(response.status()) && load_incremented {
-            if let Some(cleanup_worker) = worker_for_cleanup {
-                cleanup_worker.decrement_load();
-            }
-        }
 
         response
     }
@@ -421,7 +435,7 @@ impl Router {
         route: &'static str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        mut load_guard: Option<WorkerLoadGuardV2>,
     ) -> Response {
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
@@ -504,13 +518,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(ref w) = worker {
-                        w.decrement_load();
-                    }
-                }
-
                 return convert_reqwest_error(e);
             }
         };
@@ -535,19 +542,9 @@ impl Router {
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(ref w) = worker {
-                    w.decrement_load();
-                }
-            }
-
+            drop(load_guard);
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            // Clone the worker Arc for the async block instead of looking it up again
-            let stream_worker = worker.clone();
-
+        } else {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -559,16 +556,14 @@ impl Router {
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut decremented = false;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
                             // Check for stream end marker using memmem for efficiency
-                            if memmem::find(&bytes, b"data: [DONE]").is_some() {
-                                if let Some(ref w) = stream_worker {
-                                    w.decrement_load();
-                                    decremented = true;
-                                }
+                            if load_guard.is_some()
+                                && memmem::find(&bytes, b"data: [DONE]").is_some()
+                            {
+                                load_guard = None;
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
@@ -580,46 +575,7 @@ impl Router {
                         }
                     }
                 }
-                if !decremented {
-                    if let Some(ref w) = stream_worker {
-                        w.decrement_load();
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
+                drop(load_guard);
             });
 
             let stream = UnboundedReceiverStream::new(rx);
