@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -581,7 +581,7 @@ class MHATokenToKVPool(KVCache):
         else:
             bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
 
-        # Fixed num_locs_upper to avoid large Triton specialization (e.g. 8192)
+        # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
         chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
 
         self._kv_copy_config = {
@@ -810,20 +810,36 @@ class MHATokenToKVPool(KVCache):
         ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
 
         cfg = self._kv_copy_config
+        cap = int(cfg.get("num_locs_upper", 256))
         grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
-        chunk_upper = int(cfg.get("num_locs_upper", 256))
 
-        for start in range(0, N, chunk_upper):
-            end = min(start + chunk_upper, N)
-            tgt_chunk = tgt_loc[start:end]
-            src_chunk = src_loc[start:end]
+        if N <= cap:
+            upper = next_power_of_2(N)
             copy_all_layer_kv_cache_tiled[grid](
                 self.data_ptrs,
                 self.data_strides,
-                tgt_chunk,
-                src_chunk,
-                end - start,
-                chunk_upper,
+                tgt_loc,
+                src_loc,
+                N,
+                upper,
+                BYTES_PER_TILE=cfg["bytes_per_tile"],
+                num_warps=cfg["num_warps"],
+                num_stages=2,
+            )
+            return
+
+        # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
+        for start in range(0, N, cap):
+            end = min(start + cap, N)
+            chunk_len = end - start
+            upper = next_power_of_2(chunk_len)
+            copy_all_layer_kv_cache_tiled[grid](
+                self.data_ptrs,
+                self.data_strides,
+                tgt_loc[start:end],
+                src_loc[start:end],
+                chunk_len,
+                upper,
                 BYTES_PER_TILE=cfg["bytes_per_tile"],
                 num_warps=cfg["num_warps"],
                 num_stages=2,
