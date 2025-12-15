@@ -41,30 +41,24 @@ global_zero_init_workspace_buffer = None
 
 def _get_trtllm_mha_workspace_size(
     default_mb: int = DEFAULT_WORKSPACE_SIZE_MB,
-) -> tuple[int, bool, Optional[float]]:
+) -> int:
     """
     Get workspace size for TRTLLM MHA backend.
 
-    Preserves user's SGLANG_FLASHINFER_WORKSPACE_SIZE setting even if it gets
+    Captures user's SGLANG_FLASHINFER_WORKSPACE_SIZE setting before it may be
     overridden by FlashInferAttnBackend.__init__().
 
     Args:
         default_mb: Default workspace size in MB for TRTLLM MHA (default: 512 MB)
 
     Returns:
-        tuple: (workspace_size_bytes, is_user_set, user_value_mb)
+        Workspace size in bytes.
     """
     env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
-    is_user_set = env_var.is_set()
-    user_value_bytes = env_var.get() if is_user_set else None
-    default_bytes = default_mb * 1024 * 1024
+    if env_var.is_set():
+        return env_var.get()
 
-    if is_user_set and user_value_bytes is not None:
-        # Preserve user's setting (may be overridden by super().__init__())
-        env_var.set(user_value_bytes)
-        return user_value_bytes, True, user_value_bytes / (1024 * 1024)
-
-    return default_bytes, False, None
+    return default_mb * 1024 * 1024
 
 
 @dataclass
@@ -95,9 +89,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         speculative_step_id: int = 0,
     ):
         # Get workspace size before super().__init__() to preserve user's environment variable
-        workspace_size_bytes, user_env_var_set, user_env_var_value_mb = (
-            _get_trtllm_mha_workspace_size(DEFAULT_WORKSPACE_SIZE_MB)
-        )
+        workspace_size_bytes = _get_trtllm_mha_workspace_size(DEFAULT_WORKSPACE_SIZE_MB)
 
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
