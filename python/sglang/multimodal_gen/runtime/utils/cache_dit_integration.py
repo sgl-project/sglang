@@ -106,7 +106,7 @@ def _build_parallelism_config(sp_group, tp_group):
 
     tp_size = None
     if tp_group is not None:
-        tp_size = dist.get_world_size(tp_group.device_group)
+        tp_size = dist.get_world_size(tp_group)
 
     return ParallelismConfig(
         backend=ParallelismBackend.NATIVE_PYTORCH,
