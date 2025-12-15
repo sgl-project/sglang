@@ -738,6 +738,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         "input_scale",
         "output_scale",
         ".bias",
+        "lm_head",
         "lm_head.weight",
         "model.norm.weight",
         "embed_tokens",  # BF16 params
@@ -899,46 +900,25 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             if hasattr(module, "weight_scale"):
                                 delattr(module, "weight_scale")
 
-                            # Update or create weight_scale_inv used for blockwise quantization
+                            # Update or create weight_scale_inv using a plain Parameter
                             if hasattr(module, "weight_scale_inv"):
-                                if isinstance(
-                                    module.weight_scale_inv, BlockQuantScaleParameter
-                                ):
-                                    if module.weight_scale_inv.data.shape == scale.shape:
-                                        module.weight_scale_inv.data.copy_(scale)
-                                    else:
-                                        logger.warning(
-                                            f"[QuantizedRL] Scale shape mismatch for {name}: "
-                                            f"expected {module.weight_scale_inv.data.shape}, "
-                                            f"got {scale.shape}. Recreating scale parameter."
-                                        )
-                                        scale_param = BlockQuantScaleParameter(
-                                            data=scale,
-                                            input_dim=1,
-                                            output_dim=0,
-                                        )
-                                        module.register_parameter(
-                                            "weight_scale_inv", scale_param
-                                        )
+                                # Keep the existing Parameter type; just update data if shape matches
+                                if module.weight_scale_inv.data.shape == scale.shape:
+                                    module.weight_scale_inv.data.copy_(scale)
                                 else:
-                                    # Replace with BlockQuantScaleParameter
-                                    scale_param = BlockQuantScaleParameter(
-                                        data=scale,
-                                        input_dim=1,
-                                        output_dim=0,
+                                    logger.warning(
+                                        f"[QuantizedRL] Scale shape mismatch for {name}: "
+                                        f"expected {module.weight_scale_inv.data.shape}, "
+                                        f"got {scale.shape}. Recreating scale parameter as plain Parameter."
                                     )
-                                    module.register_parameter(
-                                        "weight_scale_inv", scale_param
+                                    module.weight_scale_inv = Parameter(
+                                        scale, requires_grad=False
                                     )
                             else:
-                                # No existing weight_scale_inv; create a new one
-                                scale_param = BlockQuantScaleParameter(
-                                    data=scale,
-                                    input_dim=1,
-                                    output_dim=0,
-                                )
+                                # No existing weight_scale_inv; create a new plain Parameter
                                 module.register_parameter(
-                                    "weight_scale_inv", scale_param
+                                    "weight_scale_inv",
+                                    Parameter(scale, requires_grad=False),
                                 )
 
                             # Update the weight; keep the same transposed layout as native FP8 path
@@ -2855,6 +2835,7 @@ def get_model_loader(
                 "Model will be loaded with FP8 infrastructure"
             )
             use_blockwise = True
+            model_config.quantization = "fp8"
             if use_blockwise:
                 model_config.hf_config.quantization_config = {
                     "activation_scheme": "dynamic",
@@ -2863,7 +2844,7 @@ def get_model_loader(
                     "weight_block_size": [128, 128],
                 }
             else:
-                model_config.quantization = "fp8"
+                pass
 
 
         return QuantizedRLModelLoader(load_config)
