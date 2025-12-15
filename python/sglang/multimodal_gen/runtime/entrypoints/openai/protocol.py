@@ -9,6 +9,7 @@ class ImageResponseData(BaseModel):
     b64_json: Optional[str] = None
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
+    file_path: Optional[str] = None
 
 
 class ImageResponse(BaseModel):
@@ -46,6 +47,7 @@ class VideoResponse(BaseModel):
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
 
 
 class VideoGenerationsRequest(BaseModel):

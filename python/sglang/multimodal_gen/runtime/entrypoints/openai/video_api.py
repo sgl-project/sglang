@@ -107,7 +107,7 @@ def _video_job_from_sampling(
         "size": size_str,
         "seconds": str(seconds),
         "quality": "standard",
-        "file_path": sampling.output_file_path(),
+        "file_path": os.path.abspath(sampling.output_file_path()),
     }
 
 
