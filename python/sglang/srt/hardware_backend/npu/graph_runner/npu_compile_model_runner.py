@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_runner import get_batch_sizes_to_capture
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -40,11 +40,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import get_global_server_args
 
 
-class NPUCompileModelRunner:
+class NPUCompileModelRunner(CudaGraphRunner):
     def __init__(self, model_runner: ModelRunner):
-        self.model_runner = model_runner
-        _, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        self.capture()
+        super().__init__(model_runner)
 
     def capture(self) -> None:
         # Reverse the order to enable better memory sharing across cuda graphs.
@@ -52,6 +50,15 @@ class NPUCompileModelRunner:
             tqdm.tqdm(list(reversed(self.compile_bs)))
             if get_tensor_model_parallel_rank() == 0
             else reversed(self.compile_bs)
+        )
+
+        # warm up before dynamic shape compilation
+        bs = 1
+        num_tokens = bs * self.num_tokens_per_bs
+        forward_batch = self.prepare_forward_batch(bs, num_tokens)
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+        self.model_runner.model.forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
         backend = get_compiler_backend(

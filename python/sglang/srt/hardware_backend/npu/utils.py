@@ -98,6 +98,9 @@ def set_default_server_args(args: "ServerArgs"):
                     f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-piecewise-npu-graph-decode"
                 )
 
+        if args.enable_torch_npugraph_ex_compile:
+            args.enable_torch_compile = True
+
 
 @_call_once
 def init_npu_backend():
