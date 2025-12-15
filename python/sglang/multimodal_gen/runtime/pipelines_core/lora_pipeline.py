@@ -162,6 +162,14 @@ class LoRAPipeline(ComposedPipelineBase):
             The number of layers converted.
         """
         converted_count = 0
+        name_list = []
+        for name, _ in module.named_modules():
+            name_list.append(name)
+        test = set(whitelist) - set(name_list)
+        if test:
+            logger.warning(
+                "Whitelist contains modules that do not exist in the module: %s", test
+            )
         for name, layer in module.named_modules():
             if whitelist is not None:
                 if name not in whitelist:
@@ -536,4 +544,3 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
             self.is_lora_merged[module_name] = False
             logger.info("LoRA weights unmerged for %s", module_name)
- 
