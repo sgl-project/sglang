@@ -41,8 +41,9 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 # Copy just the pyproject.toml first to leverage Docker cache
 COPY python/pyproject.toml python/
 
-# Create a dummy README to satisfy the installation
-RUN mkdir -p python && echo "# Placeholder" > python/README.md
+# Copy the python source for sglang module install
+COPY python/sglang python/sglang
+
 
 # Create and activate virtual environment with specific Python version and seed
 RUN source $HOME/.local/bin/env && \
