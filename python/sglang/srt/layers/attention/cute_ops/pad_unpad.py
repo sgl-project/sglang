@@ -50,28 +50,31 @@ class CutePadDraftExtendQueryKernel:
         # Compile kernel on first use or if shape changed
         compile_key = (num_heads, head_dim, self.cfg.block_head, self.cfg.block_dim)
         if self._compiled_kernel is None or self._compile_key != compile_key:
-            # Create fake tensors for compilation
-            batch_sym = cute.sym_int()
-            total_seq_sym = cute.sym_int()
+            # Create fake tensors for compilation using concrete values
+            # Use a small batch size for compilation - kernel will work with any batch size at runtime
+            compile_batch_size = 1
+            compile_total_seq = max_seq_len
             mQ_fake = cute.runtime.make_fake_tensor(
-                q.dtype, (total_seq_sym, num_heads, head_dim)
+                q.dtype, (compile_total_seq, num_heads, head_dim)
             )
             mPadded_fake = cute.runtime.make_fake_tensor(
-                padded_q.dtype, (batch_sym, max_seq_len, num_heads, head_dim)
+                padded_q.dtype, (compile_batch_size, max_seq_len, num_heads, head_dim)
             )
             mSeqLens_fake = cute.runtime.make_fake_tensor(
-                seq_lens_q.dtype, (batch_sym,)
+                seq_lens_q.dtype, (compile_batch_size,)
             )
-            mCumsum_fake = cute.runtime.make_fake_tensor(cumsum.dtype, (batch_sym + 1,))
+            mCumsum_fake = cute.runtime.make_fake_tensor(
+                cumsum.dtype, (compile_batch_size + 1,)
+            )
 
-            # Compile the kernel
+            # Compile the kernel with compile-time batch size
             self._compiled_kernel = cute.compile(
                 self.kernel,
                 mQ_fake,
                 mPadded_fake,
                 mSeqLens_fake,
                 mCumsum_fake,
-                Int32(batch_size),
+                Int32(compile_batch_size),
                 Int32(max_seq_len),
                 Int32(num_heads),
                 Int32(head_dim),
@@ -198,28 +201,32 @@ class CuteUnpadDraftExtendOutputKernel:
             self.cfg.block_dim,
         )
         if self._compiled_kernel is None or self._compile_key != compile_key:
-            # Create fake tensors for compilation
-            batch_sym = cute.sym_int()
-            total_tokens_sym = cute.sym_int()
+            # Create fake tensors for compilation using concrete values
+            # Use a small batch size for compilation - kernel will work with any batch size at runtime
+            compile_batch_size = 1
+            compile_total_tokens = token_per_batch
             mRaw_fake = cute.runtime.make_fake_tensor(
-                raw_out.dtype, (batch_sym, token_per_batch, tp_q_head_num, v_head_dim)
+                raw_out.dtype,
+                (compile_batch_size, token_per_batch, tp_q_head_num, v_head_dim),
             )
             mOut_fake = cute.runtime.make_fake_tensor(
-                output.dtype, (total_tokens_sym, tp_q_head_num, v_head_dim)
+                output.dtype, (compile_total_tokens, tp_q_head_num, v_head_dim)
             )
             mAccept_fake = cute.runtime.make_fake_tensor(
-                accept_lengths.dtype, (batch_sym,)
+                accept_lengths.dtype, (compile_batch_size,)
             )
-            mCumsum_fake = cute.runtime.make_fake_tensor(cumsum.dtype, (batch_sym + 1,))
+            mCumsum_fake = cute.runtime.make_fake_tensor(
+                cumsum.dtype, (compile_batch_size + 1,)
+            )
 
-            # Compile the kernel
+            # Compile the kernel with compile-time batch size
             self._compiled_kernel = cute.compile(
                 self.kernel,
                 mRaw_fake,
                 mOut_fake,
                 mAccept_fake,
                 mCumsum_fake,
-                Int32(batch_size),
+                Int32(compile_batch_size),
                 Int32(token_per_batch),
                 Int32(tp_q_head_num),
                 Int32(v_head_dim),
