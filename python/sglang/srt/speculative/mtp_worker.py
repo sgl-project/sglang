@@ -58,6 +58,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
+    get_last_loc_large_page_size_large_top_k,
     load_token_map,
     select_top_k_tokens,
 )
@@ -419,6 +420,7 @@ class MTPWorker(TpModelWorker):
                     last_loc,
                     self.num_new_pages_per_topk,
                     self.extend_lens,
+                    _,
                 ) = get_last_loc_large_page_size_large_top_k(
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
@@ -1002,32 +1004,3 @@ def get_last_loc_large_page_size_top_k_1(
         prefix_lens,
     )
     return prefix_lens, seq_lens, last_loc
-
-
-# Disable torch.compile for this function because it will be
-# even slower.
-# @torch.compile(dynamic=True)
-def get_last_loc_large_page_size_large_top_k(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    speculative_num_steps: int,
-    topk: int,
-    page_size: int,
-):
-    prefix_lens = seq_lens
-    last_page_lens = prefix_lens % page_size
-    num_new_pages_per_topk = (
-        last_page_lens + speculative_num_steps + page_size - 1
-    ) // page_size
-    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
-        page_size * topk
-    )
-    extend_lens = seq_lens - prefix_lens
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
-    )
-
-    return prefix_lens, seq_lens, last_loc, num_new_pages_per_topk, extend_lens
