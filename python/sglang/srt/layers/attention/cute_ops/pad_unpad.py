@@ -18,7 +18,7 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, const_expr
+from cutlass import const_expr
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 
@@ -210,12 +210,13 @@ class CutePadDraftExtendQueryKernel:
 
         tQgQ = tiled_copy.partition_S(gQ)
         tPgP = tiled_copy.partition_D(gP)
-        tQc = tiled_copy.partition_S(cHD)
-        # Predicate is per-vector-copy (not per-lane). Ensure the entire vector is in-bounds.
-        pred = cute.make_fragment(1, Boolean)
-        last = const_expr(vec - 1)
-        pred[0] = (tQc[0][0] < num_heads) & (tQc[last][1] < head_dim) & token_valid
-        cute.copy(copy_atom, tQgQ, tPgP, pred=pred)
+        # quack-style: use scalar `if` for dynamic predicates (no early return).
+        row = tidx // gmem_threads_per_row
+        col = tidx - row * gmem_threads_per_row
+        head_id = bidy * block_head + row
+        dim_start = bidz * block_dim + col * vec
+        if token_valid and head_id < num_heads and (dim_start + vec) <= head_dim:
+            cute.copy(copy_atom, tQgQ, tPgP)
 
 
 @dataclass
@@ -393,10 +394,9 @@ class CuteUnpadDraftExtendOutputKernel:
 
         tRgR = tiled_copy.partition_S(gR)
         tOgO = tiled_copy.partition_D(gO)
-        tRc = tiled_copy.partition_S(cHD)
-        pred = cute.make_fragment(1, Boolean)
-        last = const_expr(vec - 1)
-        pred[0] = (
-            (tRc[0][0] < tp_q_head_num) & (tRc[last][1] < v_head_dim) & token_valid
-        )
-        cute.copy(copy_atom, tRgR, tOgO, pred=pred)
+        row = tidx // gmem_threads_per_row
+        col = tidx - row * gmem_threads_per_row
+        head_id = bidy * block_head + row
+        dim_start = bidz * block_dim + col * vec
+        if token_valid and head_id < tp_q_head_num and (dim_start + vec) <= v_head_dim:
+            cute.copy(copy_atom, tRgR, tOgO)
