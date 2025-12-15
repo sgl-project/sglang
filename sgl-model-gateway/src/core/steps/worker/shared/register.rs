@@ -1,6 +1,6 @@
 //! Unified worker registration step.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use tracing::debug;
@@ -8,7 +8,7 @@ use tracing::debug;
 use crate::{
     app_context::AppContext,
     core::Worker,
-    observability::metrics::RouterMetrics,
+    observability::metrics::{RouterMetrics, SmgMetrics},
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowResult},
 };
 
@@ -37,8 +37,46 @@ impl StepExecutor for RegisterWorkersStep {
             worker_ids.push(worker_id);
         }
 
-        // Update active workers metric
+        // Update active workers metric (legacy)
         RouterMetrics::set_active_workers(app_context.worker_registry.len());
+
+        // Collect unique worker configurations to avoid redundant metric updates
+        let unique_configs: HashSet<_> = workers
+            .iter()
+            .map(|w| {
+                let meta = w.metadata();
+                (
+                    meta.worker_type.clone(),
+                    meta.connection_mode.clone(),
+                    w.model_id().to_string(),
+                )
+            })
+            .collect();
+
+        // Update Layer 3 worker pool size metrics per unique type/connection/model
+        for (worker_type, connection_mode, model_id) in unique_configs {
+            // Get labels before moving values into get_workers_filtered
+            let worker_type_label = worker_type.as_metric_label();
+            let connection_mode_label = connection_mode.as_metric_label();
+
+            let pool_size = app_context
+                .worker_registry
+                .get_workers_filtered(
+                    Some(&model_id),
+                    Some(worker_type),
+                    Some(connection_mode),
+                    None,
+                    false,
+                )
+                .len();
+
+            SmgMetrics::set_worker_pool_size(
+                worker_type_label,
+                connection_mode_label,
+                &model_id,
+                pool_size,
+            );
+        }
 
         context.set("worker_ids", worker_ids);
         Ok(StepResult::Success)

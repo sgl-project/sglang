@@ -3,7 +3,7 @@
 //! This module defines the RequestPipeline orchestrator that coordinates
 //! the execution of pipeline stages from request preparation to response delivery.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::response::{IntoResponse, Response};
 use tracing::error;
@@ -13,9 +13,11 @@ use super::{
     context::*,
     harmony,
     regular::{processor, stages::*, streaming},
+    utils::error_type_from_status,
 };
 use crate::{
     core::WorkerRegistry,
+    observability::metrics::{smg_labels, SmgMetrics},
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -34,6 +36,8 @@ use crate::{
 #[derive(Clone)]
 pub struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
+    /// Backend type for metrics labeling
+    backend_type: &'static str,
 }
 
 impl RequestPipeline {
@@ -61,6 +65,7 @@ impl RequestPipeline {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            smg_labels::BACKEND_REGULAR,
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
@@ -79,6 +84,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: smg_labels::BACKEND_REGULAR,
         }
     }
 
@@ -108,6 +114,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: smg_labels::BACKEND_REGULAR,
         }
     }
 
@@ -137,6 +144,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: smg_labels::BACKEND_PD,
         }
     }
 
@@ -164,6 +172,7 @@ impl RequestPipeline {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            smg_labels::BACKEND_PD,
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
@@ -182,6 +191,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: smg_labels::BACKEND_PD,
         }
     }
 
@@ -193,22 +203,49 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
+        let start = Instant::now();
+        // Clone Arc for metrics (cheap atomic increment) to avoid borrow issues
+        let request_for_metrics = Arc::clone(&request);
+        let streaming = request.stream;
+
+        // Record request start
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_GRPC,
+            self.backend_type,
+            smg_labels::CONNECTION_GRPC,
+            &request_for_metrics.model,
+            smg_labels::ENDPOINT_CHAT,
+            streaming,
+        );
+
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
-        for (idx, stage) in self.stages.iter().enumerate() {
+        for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
-                    // Stage completed successfully with a response (e.g., streaming)
+                    // Stage completed with streaming response - record success and return
+                    SmgMetrics::record_router_duration(
+                        smg_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        smg_labels::CONNECTION_GRPC,
+                        &request_for_metrics.model,
+                        smg_labels::ENDPOINT_CHAT,
+                        start.elapsed(),
+                    );
                     return response;
                 }
-                Ok(None) => {
-                    continue;
-                }
+                Ok(None) => continue,
                 Err(response) => {
-                    // Error occurred
+                    SmgMetrics::record_router_error(
+                        smg_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        smg_labels::CONNECTION_GRPC,
+                        &request_for_metrics.model,
+                        smg_labels::ENDPOINT_CHAT,
+                        error_type_from_status(response.status()),
+                    );
                     error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
+                        "Stage {} failed with status {}",
                         stage.name(),
                         response.status()
                     );
@@ -218,11 +255,29 @@ impl RequestPipeline {
         }
 
         match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Chat(response)) => {
+                SmgMetrics::record_router_duration(
+                    smg_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    smg_labels::CONNECTION_GRPC,
+                    &request_for_metrics.model,
+                    smg_labels::ENDPOINT_CHAT,
+                    start.elapsed(),
+                );
+                axum::Json(response).into_response()
+            }
             Some(FinalResponse::Generate(_)) => {
                 error!(
                     function = "execute_chat",
                     "Wrong response type: expected Chat, got Generate"
+                );
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    smg_labels::CONNECTION_GRPC,
+                    &request_for_metrics.model,
+                    smg_labels::ENDPOINT_CHAT,
+                    smg_labels::ERROR_INTERNAL,
                 );
                 error::internal_error("wrong_response_type", "Internal error: wrong response type")
             }
@@ -230,6 +285,14 @@ impl RequestPipeline {
                 error!(
                     function = "execute_chat",
                     "No response produced by pipeline"
+                );
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    smg_labels::CONNECTION_GRPC,
+                    &request_for_metrics.model,
+                    smg_labels::ENDPOINT_CHAT,
+                    smg_labels::ERROR_INTERNAL,
                 );
                 error::internal_error("no_response_produced", "No response produced")
             }
@@ -244,22 +307,49 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
+        let start = Instant::now();
+        // Clone model_id for metrics before moving into context
+        // GenerateRequest doesn't have a model field, so we use model_id
+        let model_for_metrics = model_id.clone();
+        let streaming = request.stream;
+
+        // Record request start
+        SmgMetrics::record_router_request(
+            smg_labels::ROUTER_GRPC,
+            self.backend_type,
+            smg_labels::CONNECTION_GRPC,
+            model_for_metrics.as_deref().unwrap_or("unknown"),
+            smg_labels::ENDPOINT_GENERATE,
+            streaming,
+        );
+
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
 
-        for (idx, stage) in self.stages.iter().enumerate() {
+        for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
-                    // Stage completed successfully with a response (e.g., streaming)
+                    SmgMetrics::record_router_duration(
+                        smg_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        smg_labels::CONNECTION_GRPC,
+                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        smg_labels::ENDPOINT_GENERATE,
+                        start.elapsed(),
+                    );
                     return response;
                 }
-                Ok(None) => {
-                    continue;
-                }
+                Ok(None) => continue,
                 Err(response) => {
-                    // Error occurred
+                    SmgMetrics::record_router_error(
+                        smg_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        smg_labels::CONNECTION_GRPC,
+                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        smg_labels::ENDPOINT_GENERATE,
+                        error_type_from_status(response.status()),
+                    );
                     error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
+                        "Stage {} failed with status {}",
                         stage.name(),
                         response.status()
                     );
@@ -269,11 +359,29 @@ impl RequestPipeline {
         }
 
         match ctx.state.response.final_response {
-            Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Generate(response)) => {
+                SmgMetrics::record_router_duration(
+                    smg_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    smg_labels::CONNECTION_GRPC,
+                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    smg_labels::ENDPOINT_GENERATE,
+                    start.elapsed(),
+                );
+                axum::Json(response).into_response()
+            }
             Some(FinalResponse::Chat(_)) => {
                 error!(
                     function = "execute_generate",
                     "Wrong response type: expected Generate, got Chat"
+                );
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    smg_labels::CONNECTION_GRPC,
+                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    smg_labels::ENDPOINT_GENERATE,
+                    smg_labels::ERROR_INTERNAL,
                 );
                 error::internal_error("wrong_response_type", "Internal error: wrong response type")
             }
@@ -281,6 +389,14 @@ impl RequestPipeline {
                 error!(
                     function = "execute_generate",
                     "No response produced by pipeline"
+                );
+                SmgMetrics::record_router_error(
+                    smg_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    smg_labels::CONNECTION_GRPC,
+                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    smg_labels::ENDPOINT_GENERATE,
+                    smg_labels::ERROR_INTERNAL,
                 );
                 error::internal_error("no_response_produced", "No response produced")
             }
