@@ -175,13 +175,13 @@ class CutePadDraftExtendQueryKernel:
 
         # Tile views over (head, dim)
         input_pos = mCumsum[batch_id] + seq_pos
+        # Create rank-2 tiles (head, dim) by slicing away singleton modes.
         gQ = cute.local_tile(mQ, (1, block_head, block_dim), (input_pos, bidy, bidz))
+        gQ = cute.slice_(gQ, (0, None, None))
         gP = cute.local_tile(
             mPadded, (1, 1, block_head, block_dim), (batch_id, seq_pos, bidy, bidz)
         )
-        # Drop leading singleton modes -> (block_head, block_dim)
-        gQ = cute.group_modes(gQ, 0, 1)
-        gP = cute.group_modes(cute.group_modes(gP, 0, 1), 0, 1)
+        gP = cute.slice_(gP, (0, 0, None, None))
 
         # Identity coords for predication
         idHD = cute.make_identity_tensor((num_heads, head_dim))
@@ -359,12 +359,13 @@ class CuteUnpadDraftExtendOutputKernel:
         token_valid = seq_pos < accept_len
 
         output_pos = mCumsum[batch_id] + seq_pos
+        # Create rank-2 tiles (head, dim) by slicing away singleton modes.
         gR = cute.local_tile(
             mRaw, (1, 1, block_head, block_dim), (batch_id, seq_pos, bidy, bidz)
         )
+        gR = cute.slice_(gR, (0, 0, None, None))
         gO = cute.local_tile(mOut, (1, block_head, block_dim), (output_pos, bidy, bidz))
-        gR = cute.group_modes(cute.group_modes(gR, 0, 1), 0, 1)
-        gO = cute.group_modes(gO, 0, 1)
+        gO = cute.slice_(gO, (0, None, None))
 
         idHD = cute.make_identity_tensor((tp_q_head_num, v_head_dim))
         cHD = cute.local_tile(idHD, (block_head, block_dim), (bidy, bidz))
