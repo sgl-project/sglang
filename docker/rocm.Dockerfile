@@ -72,9 +72,6 @@ ARG TILELANG_REPO="https://github.com/HaiShaw/tilelang.git"
 ARG TILELANG_BRANCH="dsv32-mi35x"
 ARG TILELANG_COMMIT="ae938cf885743f165a19656d1122ad42bb0e30b8"
 
-ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
-ARG FHT_BRANCH="rocm"
-ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 USER root
 
 # Install some basic utilities
@@ -278,14 +275,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git submodule update --init --recursive && \
   export CMAKE_ARGS="-DLLVM_CONFIG=${LLVM_CONFIG} ${CMAKE_ARGS:-}" && \
   bash ./install_rocm.sh'
-
-# -----------------------
-# Hadamard-transform (HIP build)
-RUN /bin/bash -lc 'set -euo pipefail; \
-    git clone --branch "${FHT_BRANCH}" "${FHT_REPO}" fast-hadamard-transform; \
-    cd fast-hadamard-transform; \
-    git checkout -f "${FHT_COMMIT}"; \
-    python setup.py install'
 
 # -----------------------
 # Python tools
