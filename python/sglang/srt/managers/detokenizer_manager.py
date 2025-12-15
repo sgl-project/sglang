@@ -263,7 +263,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_strs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        output_strs = self._decode_batch_token_id_output(recv_obj)
+        # If handling idle batch, set output_strs to [].
+        output_strs = (
+            self._decode_batch_token_id_output(recv_obj)
+            if len(recv_obj.rids) > 0
+            else []
+        )
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -298,6 +303,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
+            load=recv_obj.load,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
