@@ -94,7 +94,10 @@ def _patch_cache_dit_similarity():
     cache_manager.CachedContextManager.similarity = patched_similarity
 
 
-def _build_parallelism_config(sp_group, tp_group):
+def _build_parallelism_config(
+    sp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+):
     if sp_group is None and tp_group is None:
         return None
 
