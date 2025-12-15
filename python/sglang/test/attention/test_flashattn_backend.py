@@ -414,6 +414,48 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
             self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
             self.assertTrue(torch.equal(page_table, expected_page_table))
 
+    def test_update_draft_decode_set_expand_metadata_multi_token(self):
+        """
+        Test when last_page_len + decode length span across multiple pages.
+        """
+        bs, topk, decode_length, page_size = 1, 2, 2, 2
+
+        cache_loc = torch.tensor(
+            [
+                [10, 11, 12, 13],
+                [20, 21, 22, 23],
+            ],
+            dtype=torch.int32,
+        )
+        cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
+        page_table = torch.zeros(bs * topk, decode_length, dtype=torch.int32)
+        last_page_lens = torch.tensor([1], dtype=torch.int32)
+        strided_indices_expand = torch.tensor([0, 2], dtype=torch.long)
+
+        update_draft_decode_set_expand_metadata_with_page_size(
+            cache_seqlens_int32=cache_seqlens_int32,
+            page_table=page_table,
+            cache_loc=cache_loc,
+            last_page_lens=last_page_lens,
+            strided_indices_expand=strided_indices_expand,
+            decode_length=decode_length,
+            bs=bs,
+            topk=topk,
+            page_size=page_size,
+        )
+
+        expected_cache_seqlens = torch.tensor([3, 3], dtype=torch.int32)
+        expected_page_table = torch.tensor(
+            [
+                [4, 5],
+                [9, 10],
+            ],
+            dtype=torch.int32,
+        )
+
+        self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
+        self.assertTrue(torch.equal(page_table, expected_page_table))
+
 
 if __name__ == "__main__":
     unittest.main()
