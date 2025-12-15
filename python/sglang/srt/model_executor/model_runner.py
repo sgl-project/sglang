@@ -1579,6 +1579,7 @@ class ModelRunner:
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def set_num_token_hybrid(self):
+        page_size = self.server_args.page_size
         if (
             "Llama4ForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -1596,19 +1597,29 @@ class ModelRunner:
                 4 * self.max_total_num_tokens
                 - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
             )
-            self.swa_max_total_num_tokens = int(
-                self.swa_max_total_num_tokens
-                // self.server_args.page_size
-                * self.server_args.page_size
+            self.swa_max_total_num_tokens = (
+                self.swa_max_total_num_tokens // page_size * page_size
             )
-            self.full_max_total_num_tokens = int(
-                self.full_max_total_num_tokens
-                // self.server_args.page_size
-                * self.server_args.page_size
+            self.full_max_total_num_tokens = (
+                self.full_max_total_num_tokens // page_size * page_size
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
         elif "MiMoV2MTP" in self.model_config.hf_config.architectures:
-            return
+            assert self.is_draft_worker
+            # MiMoV2MTP uses SWA, so set full KV cache to 0
+            self.full_max_total_num_tokens = 0
+            self.swa_max_total_num_tokens = (
+                self.max_total_num_tokens // page_size * page_size
+            )
+            self.max_total_num_tokens = self.swa_max_total_num_tokens
+        elif self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
+            self.full_max_total_num_tokens = (
+                self.max_total_num_tokens // page_size * page_size
+            )
+            self.swa_max_total_num_tokens = (
+                self.max_total_num_tokens // page_size * page_size
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
         else:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
             full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -1744,10 +1755,9 @@ class ModelRunner:
             else:
                 # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
                 # can be concurrently allocated, so we should give a headroom for it.
-                self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
+                extra_tokens = (
                     # draft
-                    + max_num_reqs
+                    max_num_reqs
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     # verify
@@ -1757,7 +1767,9 @@ class ModelRunner:
                 )
                 # Target worker and draft worker shares the same indices for the
                 # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                self.max_total_num_tokens += extra_tokens
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+
                 self.server_args.max_num_reqs = max_num_reqs
 
         if max_total_tokens is not None:
@@ -1787,56 +1799,6 @@ class ModelRunner:
         # create token size for hybrid cache
         if self.is_hybrid_swa:
             self.set_num_token_hybrid()
-
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
-            if self.is_draft_worker:
-                # Use parameters passed from target worker
-                if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
-                    # MiMoV2MTP uses SWA, so set full KV cache to 0
-                    self.swa_max_total_num_tokens = (
-                        self.server_args.draft_runner_cache_size_swa
-                    )
-                    self.full_max_total_num_tokens = 0
-                    self.max_total_num_tokens = self.swa_max_total_num_tokens
-                else:
-                    self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
-
-                logger.info(
-                    f"Draft worker, using draft runner cache size: {self.max_total_num_tokens}"
-                )
-            else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
-                extra_tokens = (
-                    # draft
-                    max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
-                    + 100
-                )
-
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens += extra_tokens
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
-                if (
-                    self.model_config.hf_config.architectures[0]
-                    == "MiMoV2FlashForCausalLM"
-                ):
-                    self.full_max_total_num_tokens += extra_tokens
-                    self.swa_max_total_num_tokens += extra_tokens
-                    self.server_args.draft_runner_cache_size_swa = (
-                        self.swa_max_total_num_tokens
-                    )
-                self.server_args.max_num_reqs = max_num_reqs
-
-                logger.info(
-                    f"Target worker, using draft runner cache size: {self.max_total_num_tokens}"
-                )
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
