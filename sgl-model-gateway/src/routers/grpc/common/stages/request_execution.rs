@@ -8,7 +8,6 @@ use super::PipelineStage;
 use crate::{
     grpc_client::sglang_proto as sglang,
     routers::{
-        context::{ClientSelection, ExecutionResult, RequestContext},
         error,
         grpc::{
             context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
@@ -108,22 +107,7 @@ impl PipelineStage for RequestExecutionStage {
                         .await
                 }
                 ExecutionMode::TripleDispatch => {
-<<<<<<< HEAD
-                    let workers = ctx.state.workers.as_ref().ok_or_else(|| {
-                        error!(
-                            function = "RequestExecutionStage::execute",
-                            "Worker selection not available for triple dispatch"
-                        );
-                        error::internal_error(
-                            "worker_selection_not_available",
-                            "Worker selection not available",
-                        )
-                    })?;
-                    self.execute_triple_dispatch(proto_request, clients, workers)
-                        .await
-=======
                     self.execute_triple_dispatch(proto_request, clients).await
->>>>>>> f6244831d ([model gateway] Fix EPD metadata injection to use RequestBuildingStage metadata)
                 }
             }
         }
@@ -272,47 +256,14 @@ impl RequestExecutionStage {
                 )
             })?;
 
-<<<<<<< HEAD
-        let (encode_worker, prefill_worker, _decode_worker) =
-            workers.triple().ok_or_else(|| {
-                error!(
-                    function = "execute_triple_dispatch",
-                    "Expected triple workers but selection differed"
-                );
-                error::internal_error(
-                    "expected_encode/prefill/decode_workers_but_selection_differed",
-                    "Expected encode/prefill/decode workers but selection differed",
-                )
-            })?;
-
-        // Get bootstrap info from workers
-        let encode_bootstrap_host = encode_worker.bootstrap_host();
-        let encode_bootstrap_port = match encode_worker.worker_type() {
-            WorkerType::Encode { bootstrap_port } => bootstrap_port.unwrap_or(0) as i32,
-            _ => {
-                warn!(
-                    "Encode worker has unexpected type: {:?}",
-                    encode_worker.worker_type()
-                );
-                0
-            }
-        };
-
-        let prefill_bootstrap_host = prefill_worker.bootstrap_host();
-        let prefill_bootstrap_port = prefill_worker.bootstrap_port().unwrap_or(0) as i32;
-
-        // Generate unique room ID for this request's bootstrap coordination
-        let bootstrap_room = BOOTSTRAP_ROOM_COUNTER.fetch_add(1, Ordering::Relaxed);
-=======
         // Extract bootstrap metadata that was injected by RequestBuildingStage
         let disagg_params = Self::extract_disaggregated_params(&proto_request).ok_or_else(|| {
             error!(
                 function = "execute_triple_dispatch",
                 "DisaggregatedParams not found in request - RequestBuildingStage may not have injected metadata"
             );
-            error::internal_error("EPD bootstrap metadata not found in request")
+            error::internal_error("epd_bootstrap_metadata_not_found", "EPD bootstrap metadata not found in request")
         })?;
->>>>>>> f6244831d ([model gateway] Fix EPD metadata injection to use RequestBuildingStage metadata)
 
         // Check if request has multimodal content
         let is_multimodal = Self::has_multimodal(&proto_request);

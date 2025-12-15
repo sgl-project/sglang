@@ -48,7 +48,7 @@ pub async fn collect_responses(
             utils::collect_stream_responses(&mut encode, "Encode").await?;
             encode.mark_completed();
 
-            collect_prefill_decode(&mut *prefill, decode, merge_logprobs).await?
+            collect_prefill_decode(&mut prefill, decode, merge_logprobs).await?
         }
     };
 

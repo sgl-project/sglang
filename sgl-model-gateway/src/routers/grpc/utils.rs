@@ -374,6 +374,7 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
             ChatMessage::Assistant { content, .. } => content.as_ref(),
             ChatMessage::Tool { content, .. } => Some(content),
             ChatMessage::Function { .. } => None,
+            ChatMessage::Developer { content, .. } => Some(content),
         };
 
         let Some(content) = content else { continue };
