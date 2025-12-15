@@ -28,7 +28,7 @@ class _PadKernelConfig:
     block_head: int = 32
     block_dim: int = 32
     max_copy_bits: int = 128
-    use_cp_async: bool = True
+    use_cp_async: bool = False
 
 
 def _torch_dtype_to_cutlass_dtype(dtype: torch.dtype):
@@ -61,7 +61,7 @@ class CutePadDraftExtendQueryKernel:
         block_dim: int = 32,
         *,
         max_copy_bits: int = 128,
-        use_cp_async: bool = True,
+        use_cp_async: bool = False,
     ):
         self.cfg = _PadKernelConfig(
             block_head=block_head,
@@ -295,7 +295,7 @@ class _UnpadKernelConfig:
     block_head: int = 32
     block_dim: int = 32
     max_copy_bits: int = 128
-    use_cp_async: bool = True
+    use_cp_async: bool = False
 
 
 class CuteUnpadDraftExtendOutputKernel:
@@ -309,7 +309,7 @@ class CuteUnpadDraftExtendOutputKernel:
         block_dim: int = 32,
         *,
         max_copy_bits: int = 128,
-        use_cp_async: bool = True,
+        use_cp_async: bool = False,
     ):
         self.cfg = _UnpadKernelConfig(
             block_head=block_head,
