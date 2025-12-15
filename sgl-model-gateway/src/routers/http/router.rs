@@ -543,6 +543,7 @@ impl Router {
                         }
                     }
                 }
+                drop(load_guard);
             });
 
             let stream = UnboundedReceiverStream::new(rx);
