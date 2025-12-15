@@ -8,7 +8,10 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -104,9 +107,13 @@ class ZImageAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
-        self.to_q = ReplicatedLinear(dim, dim, bias=False)
-        self.to_k = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
-        self.to_v = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            total_num_kv_heads=num_kv_heads,
+            bias=False,
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -135,9 +142,9 @@ class ZImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        q, _ = self.to_q(hidden_states)
-        k, _ = self.to_k(hidden_states)
-        v, _ = self.to_v(hidden_states)
+        qkv, _ = self.to_qkv(hidden_states)
+        kv_dim = self.head_dim * self.num_kv_heads
+        q, k, v = torch.split(qkv, [self.dim, kv_dim, kv_dim], dim=-1)
 
         q = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
         k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
@@ -344,6 +351,7 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
+    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
 
     def __init__(
         self,
