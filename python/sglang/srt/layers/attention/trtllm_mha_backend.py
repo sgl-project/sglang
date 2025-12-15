@@ -39,28 +39,6 @@ DEFAULT_WORKSPACE_SIZE_MB = 512
 global_zero_init_workspace_buffer = None
 
 
-def _get_trtllm_mha_workspace_size(
-    default_mb: int = DEFAULT_WORKSPACE_SIZE_MB,
-) -> int:
-    """
-    Get workspace size for TRTLLM MHA backend.
-
-    Captures user's SGLANG_FLASHINFER_WORKSPACE_SIZE setting before it may be
-    overridden by FlashInferAttnBackend.__init__().
-
-    Args:
-        default_mb: Default workspace size in MB for TRTLLM MHA (default: 512 MB)
-
-    Returns:
-        Workspace size in bytes.
-    """
-    env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
-    if env_var.is_set():
-        return env_var.get()
-
-    return default_mb * 1024 * 1024
-
-
 @dataclass
 class TRTLLMMHAMetadata:
     # Sequence lengths for the forward batch
@@ -88,8 +66,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
-        # Get workspace size before super().__init__() to preserve user's environment variable
-        workspace_size_bytes = _get_trtllm_mha_workspace_size(DEFAULT_WORKSPACE_SIZE_MB)
+        # Capture workspace size before super().__init__() to preserve user's
+        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
+        workspace_size_bytes = (
+            env_var.get()
+            if env_var.is_set()
+            else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        )
 
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
@@ -109,8 +93,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.device = model_runner.device
 
         # Workspace allocation
-        # Use the workspace size determined by _get_trtllm_mha_workspace_size()
-        # which handles preserving user's environment variable setting
         self.workspace_size = workspace_size_bytes
         # Allocate buffers
         global global_zero_init_workspace_buffer
