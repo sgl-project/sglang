@@ -359,8 +359,8 @@ class ZImageTransformer2DModel(CachableDiT):
     _no_split_modules = ["ZImageTransformerBlock"]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
 
-    param_names_mapping = ZImageDitConfig().param_names_mapping
-    reverse_param_names_mapping = ZImageDitConfig().reverse_param_names_mapping
+    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
+    reverse_param_names_mapping = ZImageDitConfig().arch_config.reverse_param_names_mapping
 
     def __init__(
         self,
