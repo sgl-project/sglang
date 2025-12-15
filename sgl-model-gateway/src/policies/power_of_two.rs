@@ -9,7 +9,7 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use crate::core::Worker;
 
 /// Power-of-two choices policy
 ///
@@ -100,8 +100,6 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
         // Increment processed counter
         workers[selected_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[selected_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
 
         Some(selected_idx)
     }

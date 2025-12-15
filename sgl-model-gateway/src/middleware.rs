@@ -26,7 +26,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
+    observability::metrics::{smg_labels, SmgMetrics},
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -308,8 +308,6 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
-        RouterMetrics::record_http_request();
-
         // Log the request start
         info!(
             target: "sgl_model_gateway::request",
@@ -339,11 +337,7 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         let error_code = extract_error_code_from_response(response);
 
-        // TODO support `route` information
-        RouterMetrics::record_http_status_code(status_code, error_code);
-        RouterMetrics::record_request_duration(latency);
-
-        // New SMG metrics (Layer 1: HTTP)
+        // Layer 1: HTTP metrics
         SmgMetrics::record_http_response(status_code, error_code);
 
         // Record these in the span for structured logging/observability tools
@@ -545,10 +539,9 @@ pub async fn concurrency_limit_middleware(
             // Try to send to queue
             match queue_tx.try_send(queued) {
                 Ok(_) => {
-                    // On successful enqueue, update embeddings queue gauge if applicable
+                    // On successful enqueue, update embeddings queue counter if applicable
                     if is_embeddings {
-                        let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
-                        RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                        EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed);
                     }
 
                     // Wait for token from queue processor
@@ -558,9 +551,7 @@ pub async fn concurrency_limit_middleware(
                             SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
 
                             let response = next.run(request).await;
@@ -575,9 +566,7 @@ pub async fn concurrency_limit_middleware(
                             SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
                             // Dequeue for embeddings on error
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
                             status.into_response()
                         }
@@ -586,9 +575,7 @@ pub async fn concurrency_limit_middleware(
                             SmgMetrics::record_http_rate_limit(smg_labels::RATE_LIMIT_REJECTED);
                             // Dequeue for embeddings on channel error
                             if is_embeddings {
-                                let new_val =
-                                    EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
-                                RouterMetrics::set_embeddings_queue_size(new_val as usize);
+                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }

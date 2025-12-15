@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
-    observability::metrics::{RouterMetrics, SmgMetrics},
+    observability::metrics::SmgMetrics,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -62,9 +62,6 @@ impl StepExecutor for RemoveFromWorkerRegistryStep {
         } else {
             debug!("Removed {} worker(s) from registry", removed_count);
         }
-
-        // Update active workers metric (legacy)
-        RouterMetrics::set_active_workers(app_context.worker_registry.len());
 
         // Update Layer 3 worker pool size metrics for unique configurations
         for (worker_type, connection_mode, model_id) in unique_configs {

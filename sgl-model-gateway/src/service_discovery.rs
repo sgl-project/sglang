@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     app_context::AppContext,
     core::Job,
-    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
+    observability::metrics::{smg_labels, SmgMetrics},
     protocols::worker_spec::WorkerConfigRequest,
 };
 
@@ -302,7 +302,6 @@ pub async fn start_service_discovery(
                 }
                 Err(err) => {
                     error!("Error in Kubernetes watcher: {}", err);
-                    RouterMetrics::record_discovery_watcher_error();
                     warn!(
                         "Retrying in {} seconds with exponential backoff",
                         retry_delay.as_secs()
@@ -317,7 +316,6 @@ pub async fn start_service_discovery(
                 "Kubernetes watcher exited, restarting in {} seconds",
                 config_arc.check_interval.as_secs()
             );
-            RouterMetrics::record_discovery_watcher_restart();
             time::sleep(config_arc.check_interval).await;
         }
     });
@@ -412,7 +410,6 @@ async fn handle_pod_event(
                 match job_queue.submit(job).await {
                     Ok(_) => {
                         debug!("Worker addition job submitted for: {}", worker_url);
-                        RouterMetrics::record_discovery_update(1, 0);
 
                         // Layer 4: Record successful registration from K8s discovery
                         SmgMetrics::record_discovery_registration(
@@ -498,7 +495,6 @@ async fn handle_pod_deletion(
                 );
             } else {
                 debug!("Submitted worker removal job for {}", worker_url);
-                RouterMetrics::record_discovery_update(0, 1);
 
                 // Layer 4: Record deregistration from K8s pod deletion
                 SmgMetrics::record_discovery_deregistration(

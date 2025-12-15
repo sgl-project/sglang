@@ -22,7 +22,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{smg_labels, RouterMetrics, SmgMetrics},
+        metrics::{smg_labels, SmgMetrics},
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
@@ -165,7 +165,6 @@ impl PDRouter {
 
     fn handle_server_selection_error(error: String) -> Response {
         error!("Failed to select PD pair error={}", error);
-        RouterMetrics::record_pd_error("server_selection");
         error::service_unavailable(
             "server_selection_failed",
             format!("No available servers: {}", error),
@@ -308,7 +307,6 @@ impl PDRouter {
                         {
                             Ok(pair) => pair,
                             Err(e) => {
-                                RouterMetrics::record_pd_error("server_selection");
                                 return Self::handle_server_selection_error(e);
                             }
                         };
@@ -371,15 +369,12 @@ impl PDRouter {
             },
             |res, _attempt| is_retryable_status(res.status()),
             |delay, attempt| {
-                RouterMetrics::record_retry(route);
-                RouterMetrics::record_retry_backoff_duration(delay, attempt);
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 SmgMetrics::record_worker_retry(smg_labels::WORKER_PREFILL, endpoint);
                 SmgMetrics::record_worker_retry(smg_labels::WORKER_DECODE, endpoint);
                 SmgMetrics::record_worker_retry_backoff(attempt, delay);
             },
             || {
-                RouterMetrics::record_retries_exhausted(route);
                 SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_PREFILL, endpoint);
                 SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_DECODE, endpoint);
             },
@@ -533,7 +528,7 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: &dyn Worker,
         decode: &dyn Worker,
-        start_time: Instant,
+        _start_time: Instant,
     ) -> Response {
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
@@ -577,12 +572,6 @@ impl PDRouter {
 
         events::RequestReceivedEvent {}.emit();
 
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request_duration(context.route, duration);
-        RouterMetrics::record_pd_request(context.route);
-        RouterMetrics::record_pd_prefill_request(prefill.url());
-        RouterMetrics::record_pd_decode_request(decode.url());
-
         // Process decode response
         match decode_result {
             Ok(res) => {
@@ -591,7 +580,6 @@ impl PDRouter {
                 debug!("Decode response status: {}", status);
 
                 if !status.is_success() {
-                    RouterMetrics::record_pd_decode_error(decode.url());
                     error!(
                         "Decode server returned error status decode_url={} status={}",
                         decode.url(),
@@ -691,7 +679,6 @@ impl PDRouter {
                     error = %e,
                     "Decode request failed"
                 );
-                RouterMetrics::record_pd_decode_error(decode.url());
                 error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
             }
         }
@@ -862,7 +849,6 @@ impl PDRouter {
                     Err(e) => {
                         if let Some(ref url) = decode_url {
                             error!("Stream error from decode server {}: {}", url, e);
-                            RouterMetrics::record_pd_stream_error(url);
                         }
                         let _ = tx.send(Err(format!("Stream error: {}", e)));
                         break;
@@ -957,7 +943,6 @@ impl PDRouter {
         let prefill_response = match prefill_result {
             Ok(response) => response,
             Err(e) => {
-                RouterMetrics::record_pd_prefill_error(prefill_url);
                 error!(
                     "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
                     prefill_url,
@@ -980,8 +965,6 @@ impl PDRouter {
 
         // Check if prefill succeeded
         if !prefill_status.is_success() {
-            RouterMetrics::record_pd_prefill_error(prefill_url);
-
             // Get error body from prefill
             let error_msg = prefill_response
                 .text()

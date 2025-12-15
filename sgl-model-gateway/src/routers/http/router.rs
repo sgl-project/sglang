@@ -24,7 +24,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{smg_labels, RouterMetrics, SmgMetrics},
+        metrics::{smg_labels, SmgMetrics},
         otel_trace::inject_trace_context_http,
     },
     policies::PolicyRegistry,
@@ -196,32 +196,19 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
-                    .await;
-
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                RouterMetrics::record_attempt_http_response(
-                    route,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
-
-                res
+                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .await
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
-                RouterMetrics::record_retry(route);
-                RouterMetrics::record_retry_backoff_duration(delay, attempt);
                 // Layer 3 worker metrics
                 SmgMetrics::record_worker_retry(smg_labels::WORKER_REGULAR, endpoint);
                 SmgMetrics::record_worker_retry_backoff(attempt, delay);
             },
             // on_exhausted hook
             || {
-                RouterMetrics::record_retries_exhausted(route);
                 SmgMetrics::record_worker_retries_exhausted(smg_labels::WORKER_REGULAR, endpoint);
             },
         )
@@ -229,8 +216,6 @@ impl Router {
 
         if response.status().is_success() {
             let duration = start.elapsed();
-            RouterMetrics::record_request(route);
-            RouterMetrics::record_generate_duration(duration);
             SmgMetrics::record_router_duration(
                 smg_labels::ROUTER_HTTP,
                 smg_labels::BACKEND_REGULAR,
@@ -240,7 +225,6 @@ impl Router {
                 duration,
             );
         } else if !is_retryable_status(response.status()) {
-            RouterMetrics::record_request_error(route, "non_retryable_error");
             SmgMetrics::record_router_error(
                 smg_labels::ROUTER_HTTP,
                 smg_labels::BACKEND_REGULAR,
@@ -266,7 +250,6 @@ impl Router {
         let worker = match self.select_worker_for_model(model_id, Some(text)) {
             Some(w) => w,
             None => {
-                RouterMetrics::record_request_error(route, "no_available_workers");
                 return error::service_unavailable(
                     "no_available_workers",
                     "No available workers (all circuits open or unhealthy)",
@@ -687,8 +670,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 
 use async_trait::async_trait;
 
-use crate::routers::error::extract_error_code_from_response;
-
 #[async_trait]
 impl RouterTrait for Router {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -772,22 +753,8 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Record embeddings-specific metrics in addition to general request metrics
-        let start = Instant::now();
-        let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
-            .await;
-
-        // Embedding specific metrics
-        if res.status().is_success() {
-            RouterMetrics::record_embeddings_request();
-            RouterMetrics::record_embeddings_duration(start.elapsed());
-        } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_embeddings_error(&error_type);
-        }
-
-        res
+        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .await
     }
 
     async fn route_classify(
@@ -796,22 +763,8 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Record classification-specific metrics in addition to general request metrics
-        let start = Instant::now();
-        let res = self
-            .route_typed_request(headers, body, "/v1/classify", model_id)
-            .await;
-
-        // Classification specific metrics
-        if res.status().is_success() {
-            RouterMetrics::record_classify_request();
-            RouterMetrics::record_classify_duration(start.elapsed());
-        } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_classify_error(&error_type);
-        }
-
-        res
+        self.route_typed_request(headers, body, "/v1/classify", model_id)
+            .await
     }
 
     async fn route_rerank(

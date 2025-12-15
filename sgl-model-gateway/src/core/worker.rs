@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
-    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
+    observability::metrics::{smg_labels, SmgMetrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
 };
@@ -557,7 +557,6 @@ impl BasicWorker {
 
     fn update_running_requests_metrics(&self) {
         let load = self.load();
-        RouterMetrics::set_running_requests(self.url(), load);
         SmgMetrics::set_worker_requests_active(self.url(), load);
     }
 }
@@ -586,7 +585,6 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
-        RouterMetrics::set_worker_health(self.url(), healthy);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
