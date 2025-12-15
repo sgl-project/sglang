@@ -959,6 +959,36 @@ class TokenizerMetricsCollector:
             ],
         )
 
+        # Per-request output throughput histogram (tokens/second)
+        self.histogram_request_output_throughput = Histogram(
+            name="sglang:request_output_throughput_tokens_per_second",
+            documentation="Histogram of per-request output throughput in tokens per second.",
+            labelnames=labels.keys(),
+            buckets=[
+                1,
+                2,
+                5,
+                10,
+                20,
+                30,
+                40,
+                50,
+                75,
+                100,
+                150,
+                200,
+                300,
+                400,
+                500,
+                750,
+                1000,
+                1500,
+                2000,
+                3000,
+                5000,
+            ],
+        )
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -968,6 +998,7 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
+        output_throughput: Optional[float] = None,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
@@ -983,6 +1014,11 @@ class TokenizerMetricsCollector:
                 float(generation_tokens)
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
+        # Per-request output throughput (tokens/second)
+        if output_throughput is not None and output_throughput > 0:
+            self.histogram_request_output_throughput.labels(**labels).observe(
+                output_throughput
+            )
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)

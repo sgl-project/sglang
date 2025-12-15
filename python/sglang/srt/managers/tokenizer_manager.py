@@ -1921,6 +1921,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
+            # Calculate per-request output throughput (tokens/second)
+            output_throughput = None
+            if (
+                state.first_token_time_perf > 0.0
+                and state.finished_time_perf > 0.0
+                and completion_tokens > 0
+            ):
+                decode_time = state.finished_time_perf - state.first_token_time_perf
+                if decode_time > 0:
+                    output_throughput = completion_tokens / decode_time
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1929,6 +1940,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 has_grammar,
                 retraction_count,
+                output_throughput,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
