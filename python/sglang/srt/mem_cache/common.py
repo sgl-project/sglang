@@ -250,7 +250,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
-            tree_cache.evict(num_tokens)
+            tree_cache.evict(num_tokens - allocator.available_size())
 
 
 def alloc_paged_token_slots_extend(
