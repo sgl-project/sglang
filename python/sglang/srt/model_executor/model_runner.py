@@ -1725,14 +1725,14 @@ class ModelRunner:
             max_running_requests = min(max(heuristic, 2048), 4096)
             log_info_on_rank0(
                 logger,
-                f"req_to_token_pool: size={max_running_requests} "
+                f"req_to_token_pool: max_running_requests={max_running_requests} "
                 f"(heuristic={heuristic}, clamp=[2048,4096]), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
         else:
             log_info_on_rank0(
                 logger,
-                f"req_to_token_pool: size={max_running_requests} (from arg), "
+                f"req_to_token_pool: max_running_requests={max_running_requests} (from arg), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
 
