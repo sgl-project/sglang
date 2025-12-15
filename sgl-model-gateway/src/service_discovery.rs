@@ -19,7 +19,9 @@ use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    app_context::AppContext, core::Job, observability::metrics::RouterMetrics,
+    app_context::AppContext,
+    core::Job,
+    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
     protocols::worker_spec::WorkerConfigRequest,
 };
 
@@ -333,7 +335,8 @@ async fn handle_pod_event(
     let worker_url = pod_info.worker_url(port);
 
     if pod_info.is_healthy() {
-        let should_add = {
+        // Track whether to add and get count in single lock acquisition
+        let (should_add, tracked_count) = {
             let mut tracker = match tracked_pods.lock() {
                 Ok(tracker) => tracker,
                 Err(e) => {
@@ -343,10 +346,10 @@ async fn handle_pod_event(
             };
 
             if tracker.contains(pod_info) {
-                false
+                (false, tracker.len())
             } else {
                 tracker.insert(pod_info.clone());
-                true
+                (true, tracker.len())
             }
         };
 
@@ -410,12 +413,31 @@ async fn handle_pod_event(
                     Ok(_) => {
                         debug!("Worker addition job submitted for: {}", worker_url);
                         RouterMetrics::record_discovery_update(1, 0);
+
+                        // Layer 4: Record successful registration from K8s discovery
+                        SmgMetrics::record_discovery_registration(
+                            smg_labels::DISCOVERY_KUBERNETES,
+                            smg_labels::REGISTRATION_SUCCESS,
+                        );
+
+                        // Update workers discovered gauge (using count from initial lock)
+                        SmgMetrics::set_discovery_workers_discovered(
+                            smg_labels::DISCOVERY_KUBERNETES,
+                            tracked_count,
+                        );
                     }
                     Err(e) => {
                         error!(
                             "Failed to submit worker addition job for {}: {}",
                             worker_url, e
                         );
+
+                        // Layer 4: Record failed registration
+                        SmgMetrics::record_discovery_registration(
+                            smg_labels::DISCOVERY_KUBERNETES,
+                            smg_labels::REGISTRATION_FAILED,
+                        );
+
                         if let Ok(mut tracker) = tracked_pods.lock() {
                             tracker.remove(pod_info);
                         }
@@ -427,6 +449,12 @@ async fn handle_pod_event(
                     worker_url
                 );
             }
+        } else {
+            // Pod already tracked - this is a duplicate event
+            SmgMetrics::record_discovery_registration(
+                smg_labels::DISCOVERY_KUBERNETES,
+                smg_labels::REGISTRATION_DUPLICATE,
+            );
         }
     }
 }
@@ -439,7 +467,8 @@ async fn handle_pod_deletion(
 ) {
     let worker_url = pod_info.worker_url(port);
 
-    let was_tracked = {
+    // Remove pod and get remaining count in single lock acquisition
+    let (was_tracked, remaining_count) = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
@@ -447,7 +476,8 @@ async fn handle_pod_deletion(
                 return;
             }
         };
-        tracked.remove(pod_info)
+        let removed = tracked.remove(pod_info);
+        (removed, tracked.len())
     };
 
     if was_tracked {
@@ -469,6 +499,18 @@ async fn handle_pod_deletion(
             } else {
                 debug!("Submitted worker removal job for {}", worker_url);
                 RouterMetrics::record_discovery_update(0, 1);
+
+                // Layer 4: Record deregistration from K8s pod deletion
+                SmgMetrics::record_discovery_deregistration(
+                    smg_labels::DISCOVERY_KUBERNETES,
+                    smg_labels::DEREGISTRATION_POD_DELETED,
+                );
+
+                // Update workers discovered gauge (using count from initial lock)
+                SmgMetrics::set_discovery_workers_discovered(
+                    smg_labels::DISCOVERY_KUBERNETES,
+                    remaining_count,
+                );
             }
         } else {
             error!(
