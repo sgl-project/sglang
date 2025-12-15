@@ -142,7 +142,7 @@ class KVNVFP4QuantizeUtil:
         """
         Quantize tensor to NVFP4 format.
 
-        Mirrors TRTLLM KV-cache behavior: block scales are stored compactly as
+        Block scales are stored compactly as
         (num_heads * head_dim / 16) bytes per token (per K or V), i.e. no padding-to-128
         and no swizzled layout.
         Args:

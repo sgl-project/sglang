@@ -895,8 +895,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 k = self.head_dim
 
                 scale_block_size = 16
-                # Match TRTLLM-style KV-cache block scales:
-                # one FP8 scale per 16 FP4 values (compact, no padding-to-128).
+                # One FP8 scale per 16 FP4 values (compact, no padding-to-128).
                 scale_dim = (n * k) // scale_block_size
 
                 self.store_dtype = torch.uint8
