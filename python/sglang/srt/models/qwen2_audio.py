@@ -23,31 +23,18 @@
 # limitations under the License.
 """Inference-only Qwen2-Audio model compatible with HuggingFace weights."""
 import logging
-import math
-from functools import lru_cache, partial
-from typing import Any, Iterable, List, Optional, Tuple, Type, TypedDict
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-from transformers import AutoTokenizer, Qwen2AudioEncoderConfig, Qwen2Config
-from transformers.activations import ACT2FN
+from transformers import Qwen2AudioEncoderConfig, Qwen2Config
 from transformers.models.qwen2_audio.configuration_qwen2_audio import Qwen2AudioConfig
 from transformers.models.qwen2_audio.modeling_qwen2_audio import (
     Qwen2AudioEncoder,
     Qwen2AudioMultiModalProjector,
 )
 
-from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,

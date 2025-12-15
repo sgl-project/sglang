@@ -157,8 +157,8 @@ def _per_tensor_quant_fp8(
     reason="cutlass_w4a8_moe_mm is only supported on sm90",
 )
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16, 32])
-@pytest.mark.parametrize("k", [512, 1024, 2048, 4096, 7168])
-@pytest.mark.parametrize("n", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048, 4096, 7168])
+@pytest.mark.parametrize("n", [256, 512, 1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
 def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     torch.manual_seed(0)

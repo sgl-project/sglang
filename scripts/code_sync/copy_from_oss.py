@@ -43,13 +43,19 @@ folder_names = [
     "docker",
     "docs",
     "examples",
-    "sgl-kernel",
-    "README.md",
     "python/sglang/lang",
+    "python/sglang/jit_kernel",
     "python/sglang/srt",
     "python/sglang/test",
-    "test/lang",
+    "python/sglang/utils.py",
+    "python/sglang/README.md",
+    "sgl-kernel",
+    "test/manual",
+    "test/nightly",
+    "test/registered",
     "test/srt",
+    "test/README.md",
+    "README.md",
 ]
 
 private_repo = "your-org/sglang-private-repo"

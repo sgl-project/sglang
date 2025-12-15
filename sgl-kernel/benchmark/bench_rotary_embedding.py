@@ -1,4 +1,5 @@
 import itertools
+import os
 
 import torch
 import triton
@@ -10,19 +11,33 @@ from sgl_kernel.testing.rotary_embedding import (
     create_inputs,
 )
 
-from sglang.srt.bench_utils import bench_kineto
+from sglang.srt.utils.bench_utils import bench_kineto
 
-configs = [
-    (batch_size, seq_len, save_kv_cache)
-    for batch_size, seq_len in (
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
+
+# CI environment uses simplified parameters
+if IS_CI:
+    batch_seq_configs = [(1, 1)]  # Single config for CI
+    save_kv_configs = [False]  # Single option for CI
+else:
+    batch_seq_configs = [
         (1, 1),
         (32, 1),
         (128, 1),
         (512, 1),
         (2, 512),
         (4, 4096),
-    )
-    for save_kv_cache in (False, True)
+    ]
+    save_kv_configs = [False, True]
+
+configs = [
+    (batch_size, seq_len, save_kv_cache)
+    for batch_size, seq_len in batch_seq_configs
+    for save_kv_cache in save_kv_configs
 ]
 
 

@@ -6,6 +6,7 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -93,14 +94,18 @@ def native_w8a8_block_int8_matmul(A, B, As, Bs, block_size, output_dtype=torch.f
 
 
 # For test
-def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
+def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, topk_output, topk, block_shape):
     """This function performs fused moe with block-wise quantization using native torch."""
+
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
-    score = torch.softmax(score, dim=-1, dtype=torch.float32)
-    topk_weight, topk_ids = torch.topk(score, topk)
+    # Use topk_output instead of torch.topk for consistent equal-value handling
+    # moeTopK kernel and torch.topk may differ in tie-breaking for equal values
+    topk_weight, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
     topk_weight = topk_weight.view(-1)
     topk_ids = topk_ids.view(-1)
 
@@ -180,7 +185,7 @@ class TestW8A8BlockINT8FusedMoE(CustomTestCase):
 
         with torch.inference_mode():
             ref_out = torch_w8a8_block_int8_moe(
-                a, w1, w2, w1_s, w2_s, score, topk, block_size
+                a, w1, w2, w1_s, w2_s, topk_output, topk, block_size
             )
             out = fused_moe(
                 a,

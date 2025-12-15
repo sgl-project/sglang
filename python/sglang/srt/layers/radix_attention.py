@@ -17,7 +17,11 @@ from __future__ import annotations
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from torch import nn
+
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import direct_register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -77,6 +81,7 @@ class RadixAttention(nn.Module):
         self.k_scale_float = None
         self.v_scale_float = None
         self.quant_method = None
+
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if self.quant_method is not None:
@@ -105,12 +110,81 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        return forward_batch.attn_backend.forward(
-            q,
-            k,
-            v,
-            self,
-            forward_batch,
-            save_kv_cache,
-            **kwargs,
-        )
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+            if self.qk_head_dim != self.v_head_dim:
+                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+            else:
+                output = torch.empty_like(q)
+            torch.ops.sglang.unified_attention_with_output(
+                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+            )
+            return output
+        else:
+            return forward_batch.attn_backend.forward(
+                q,
+                k,
+                v,
+                self,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
+
+
+def unified_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+
+    kwargs = {}
+    if q_rope is not None:
+        kwargs["q_rope"] = q_rope
+    if k_rope is not None:
+        kwargs["k_rope"] = k_rope
+    if sinks is not None:
+        kwargs["sinks"] = sinks
+
+    ret = forward_batch.attn_backend.forward(
+        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
+    )
+    assert (
+        output.numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+
+    output.view(ret.shape).copy_(ret)
+    return
+
+
+def unified_attention_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="unified_attention_with_output",
+    op_func=unified_attention_with_output,
+    mutates_args=["output"],
+    fake_impl=unified_attention_with_output_fake,
+)

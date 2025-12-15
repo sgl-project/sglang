@@ -49,7 +49,6 @@ class OutlinesGrammar(BaseGrammarObject):
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
-        self.finished = False
 
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
@@ -116,7 +115,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
     def __init__(
         self,
         tokenizer,
-        whitespace_pattern: bool,
+        whitespace_pattern: str | None,
     ):
         super().__init__()
 

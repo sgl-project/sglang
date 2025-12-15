@@ -12,12 +12,6 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import safe_exp
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "USE_G": lambda args: args["g_cumsum"] is not None,
-    }
-)
 # @triton.autotune(
 #     configs=[
 #         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
@@ -74,8 +68,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             (1, 0),
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = b_k * b_beta[:, None]
-        b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
+        b_A += tl.dot(b_k, tl.trans(b_k))
 
     if USE_G:
         p_g = tl.make_block_ptr(
@@ -85,6 +78,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * safe_exp(b_g_diff)
 
+    b_A *= b_beta[:, None]
     b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0)
     p_A = tl.make_block_ptr(
         A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
@@ -145,6 +139,8 @@ def chunk_scaled_dot_kkt_fwd(
         K=K,
         BT=BT,
         BK=64,
+        IS_VARLEN=cu_seqlens is not None,
+        USE_G=g_cumsum is not None,
         num_warps=8,
         num_stages=3,
     )

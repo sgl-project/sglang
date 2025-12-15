@@ -1,6 +1,5 @@
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.deepseek_janus_pro import MultiModalityCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,

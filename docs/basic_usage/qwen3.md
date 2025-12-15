@@ -15,13 +15,19 @@ python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 4
 - `--mamba-ssm-dtype`: `bfloat16` or `float32`, use `bfloat16` to save mamba cache size and `float32` to get more accurate results. The default setting is `float32`.
 
 ### EAGLE Speculative Decoding
-**Description**: SGLang has supported Qwen3-Next models with [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding).
+**Description**: SGLang has supported Qwen3-Next models with [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding).
 
 **Usage**:
 Add arguments `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
 
 ``` bash
-python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 4 --speculative-num-steps 3  --speculative-eagle-topk 1  --speculative-num-draft-tokens 4 --speculative-algo NEXTN
+python3 -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Instruct \
+  --tp 4 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-algo NEXTN
 ```
 
 Details can be seen in [this PR](https://github.com/sgl-project/sglang/pull/10233).

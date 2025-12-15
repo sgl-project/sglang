@@ -83,7 +83,6 @@ class TestLoRAEviction(CustomTestCase):
     ):
         REUSED_LORA_NAME = "lora"
         max_new_tokens = 256
-        backend = "triton"
         torch_dtype = torch.float16
         base_path = BASE_MODEL
         assert len(lora_paths) >= 2
@@ -96,10 +95,19 @@ class TestLoRAEviction(CustomTestCase):
             model_type="generation",
             lora_paths=initial_lora_paths,
             max_loras_per_batch=1,
-            lora_backend=backend,
             enable_lora=True,
             max_lora_rank=256,
-            lora_target_modules=["all"],
+            # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
+            # lora_target_modules=["all"],
+            lora_target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 

@@ -385,6 +385,8 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t num_fused_shared_experts,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
+  TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
+
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);

@@ -20,6 +20,10 @@ limitations under the License.
 #include <torch/all.h>
 
 #ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
+
+#ifdef USE_ROCM
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
@@ -326,6 +330,13 @@ inline bool getEnvEnablePDL() {
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
+#define DISPATCH_CASE_FLOAT_TYPES(...)                 \
+  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
+  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+
+#define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
+
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
 #ifndef USE_ROCM
@@ -447,3 +458,12 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
   if (x <= 1) return 1;
   return 1u << (32 - __builtin_clz(x - 1));
 }
+
+/*
+ * LDG Support
+ */
+#ifndef USE_ROCM
+#define SGLANG_LDG(arg) __ldg(arg)
+#else
+#define SGLANG_LDG(arg) *(arg)
+#endif

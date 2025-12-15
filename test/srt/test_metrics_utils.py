@@ -81,23 +81,23 @@ class TestMetricsUtils(unittest.TestCase):
         expected = two_sides_exponential_buckets(10.0, 2.0, 4)
         self.assertEqual(result, expected)
 
-    def test_generate_buckets_customer(self):
-        """Test generate_buckets with customer rule."""
+    def test_generate_buckets_custom(self):
+        """Test generate_buckets with custom rule."""
         default_buckets = [1.0, 5.0, 10.0]
 
-        # Test with "customer" rule
+        # Test with "custom" rule
         result = generate_buckets(
-            ["customer", "1.5", "3.2", "7.8", "15.6"], default_buckets
+            ["custom", "1.5", "3.2", "7.8", "15.6"], default_buckets
         )
         expected = [1.5, 3.2, 7.8, 15.6]
         self.assertEqual(result, expected)
 
-    def test_generate_buckets_customer_with_integers(self):
-        """Test generate_buckets with customer rule using integer strings."""
+    def test_generate_buckets_custom_with_integers(self):
+        """Test generate_buckets with custom rule using integer strings."""
         default_buckets = [1.0, 5.0, 10.0]
 
         # Test with integer strings
-        result = generate_buckets(["customer", "1", "5", "10", "50"], default_buckets)
+        result = generate_buckets(["custom", "1", "5", "10", "50"], default_buckets)
         expected = [1.0, 5.0, 10.0, 50.0]
         self.assertEqual(result, expected)
 
@@ -110,9 +110,9 @@ class TestMetricsUtils(unittest.TestCase):
         self.assertEqual(result, default_buckets)
         self.assertIsInstance(result, list)
 
-        # Test customer rule with proper float conversion
+        # Test custom rule with proper float conversion
         result = generate_buckets(
-            ["customer", "100", "50", "10", "5", "1"], default_buckets
+            ["custom", "100", "50", "10", "5", "1"], default_buckets
         )
         expected = [1.0, 5.0, 10.0, 50.0, 100.0]
         self.assertEqual(result, expected)

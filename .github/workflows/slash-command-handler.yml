@@ -1,0 +1,46 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: write # Required to add labels and reactions
+  actions: write       # Required to rerun workflows
+  issues: write        # Required for comment reactions in some contexts
+
+jobs:
+  slash_command:
+    # Only run if it is a PR and the comment starts with a recognized command
+    if: >
+      github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/tag-run-ci-label') ||
+       startsWith(github.event.comment.body, '/rerun-failed-ci') ||
+       startsWith(github.event.comment.body, '/tag-and-rerun-ci') ||
+       startsWith(github.event.comment.body, '/rerun-stage'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install PyGithub
+
+      - name: Handle Slash Command
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          USER_LOGIN: ${{ github.event.comment.user.login }}
+        run: |
+          python scripts/ci/slash_command_handler.py
