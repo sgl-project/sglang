@@ -127,17 +127,13 @@ class CutePadDraftExtendQueryKernel:
         head_dim = mPadded.shape[3]
 
         # Vectorized copy along contiguous dim (up to 128-bit).
+        # NOTE: These must be compile-time constants; don't pass into kernel args.
         elem_width = const_expr(mPadded.element_type.width)
-        if const_expr(elem_width == 16):
-            vec = math.gcd(self.cfg.block_dim, 8)
-        elif const_expr(elem_width == 32):
-            vec = math.gcd(self.cfg.block_dim, 4)
-        else:
-            vec = 1
+        max_vec = const_expr(128 // elem_width)
+        vec = const_expr(math.gcd(self.cfg.block_dim, max_vec))
         vec = const_expr(max(1, vec))
         gmem_threads_per_row = const_expr(self.cfg.block_dim // vec)
         num_threads = const_expr(self.cfg.block_head * gmem_threads_per_row)
-        num_copy_bits = const_expr(vec * elem_width)
 
         grid = (
             batch_size * max_seq_len,
@@ -151,10 +147,6 @@ class CutePadDraftExtendQueryKernel:
             mPadded,
             mSeqLens,
             mCumsum,
-            const_expr(self.cfg.block_head),
-            const_expr(self.cfg.block_dim),
-            const_expr(gmem_threads_per_row),
-            const_expr(num_copy_bits),
         ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
@@ -164,13 +156,12 @@ class CutePadDraftExtendQueryKernel:
         mPadded: cute.Tensor,  # [batch, max_seq, heads, dim]
         mSeqLens: cute.Tensor,  # [batch]
         mCumsum: cute.Tensor,  # [batch + 1]
-        block_head: cute.typing.Int,
-        block_dim: cute.typing.Int,
-        gmem_threads_per_row: cute.typing.Int,
-        num_copy_bits: cute.typing.Int,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
+
+        block_head = const_expr(self.cfg.block_head)
+        block_dim = const_expr(self.cfg.block_dim)
 
         max_seq_len = mPadded.shape[1]
         num_heads = mPadded.shape[2]
@@ -196,6 +187,13 @@ class CutePadDraftExtendQueryKernel:
         idHD = cute.make_identity_tensor((num_heads, head_dim))
         cHD = cute.local_tile(idHD, (block_head, block_dim), (bidy, bidz))
 
+        elem_width = const_expr(mPadded.element_type.width)
+        max_vec = const_expr(128 // elem_width)
+        vec = const_expr(math.gcd(block_dim, max_vec))
+        vec = const_expr(max(1, vec))
+        gmem_threads_per_row = const_expr(block_dim // vec)
+        num_copy_bits = const_expr(vec * elem_width)
+
         copy_op = cute.nvgpu.CopyUniversalOp()
         copy_atom = cute.make_copy_atom(
             copy_op, mPadded.element_type, num_bits_per_copy=num_copy_bits
@@ -214,9 +212,8 @@ class CutePadDraftExtendQueryKernel:
         tPgP = tiled_copy.partition_D(gP)
         tQc = tiled_copy.partition_S(cHD)
         # Per-element predicate: token valid + in-bounds head/dim
-        pred = (tQc[0][0] < num_heads) & (tQc[0][1] < head_dim)
-        if token_valid:
-            cute.copy(copy_atom, tQgQ, tPgP, pred=pred)
+        pred = (tQc[0][0] < num_heads) & (tQc[0][1] < head_dim) & token_valid
+        cute.copy(copy_atom, tQgQ, tPgP, pred=pred)
 
 
 @dataclass
@@ -317,16 +314,11 @@ class CuteUnpadDraftExtendOutputKernel:
 
         # Vectorized copy along contiguous dim (up to 128-bit).
         elem_width = const_expr(mRaw.element_type.width)
-        if const_expr(elem_width == 16):
-            vec = math.gcd(self.cfg.block_dim, 8)
-        elif const_expr(elem_width == 32):
-            vec = math.gcd(self.cfg.block_dim, 4)
-        else:
-            vec = 1
+        max_vec = const_expr(128 // elem_width)
+        vec = const_expr(math.gcd(self.cfg.block_dim, max_vec))
         vec = const_expr(max(1, vec))
         gmem_threads_per_row = const_expr(self.cfg.block_dim // vec)
         num_threads = const_expr(self.cfg.block_head * gmem_threads_per_row)
-        num_copy_bits = const_expr(vec * elem_width)
 
         grid = (
             batch_size * token_per_batch,
@@ -340,10 +332,6 @@ class CuteUnpadDraftExtendOutputKernel:
             mOut,
             mAccept,
             mCumsum,
-            const_expr(self.cfg.block_head),
-            const_expr(self.cfg.block_dim),
-            const_expr(gmem_threads_per_row),
-            const_expr(num_copy_bits),
         ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
@@ -353,13 +341,12 @@ class CuteUnpadDraftExtendOutputKernel:
         mOut: cute.Tensor,  # [total_tokens, heads, dim]
         mAccept: cute.Tensor,  # [batch]
         mCumsum: cute.Tensor,  # [batch + 1]
-        block_head: cute.typing.Int,
-        block_dim: cute.typing.Int,
-        gmem_threads_per_row: cute.typing.Int,
-        num_copy_bits: cute.typing.Int,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
+
+        block_head = const_expr(self.cfg.block_head)
+        block_dim = const_expr(self.cfg.block_dim)
 
         token_per_batch = mRaw.shape[1]
         tp_q_head_num = mRaw.shape[2]
@@ -382,6 +369,13 @@ class CuteUnpadDraftExtendOutputKernel:
         idHD = cute.make_identity_tensor((tp_q_head_num, v_head_dim))
         cHD = cute.local_tile(idHD, (block_head, block_dim), (bidy, bidz))
 
+        elem_width = const_expr(mRaw.element_type.width)
+        max_vec = const_expr(128 // elem_width)
+        vec = const_expr(math.gcd(block_dim, max_vec))
+        vec = const_expr(max(1, vec))
+        gmem_threads_per_row = const_expr(block_dim // vec)
+        num_copy_bits = const_expr(vec * elem_width)
+
         copy_op = cute.nvgpu.CopyUniversalOp()
         copy_atom = cute.make_copy_atom(
             copy_op, mRaw.element_type, num_bits_per_copy=num_copy_bits
@@ -397,6 +391,5 @@ class CuteUnpadDraftExtendOutputKernel:
         tRgR = tiled_copy.partition_S(gR)
         tOgO = tiled_copy.partition_D(gO)
         tRc = tiled_copy.partition_S(cHD)
-        pred = (tRc[0][0] < tp_q_head_num) & (tRc[0][1] < v_head_dim)
-        if token_valid:
-            cute.copy(copy_atom, tRgR, tOgO, pred=pred)
+        pred = (tRc[0][0] < tp_q_head_num) & (tRc[0][1] < v_head_dim) & token_valid
+        cute.copy(copy_atom, tRgR, tOgO, pred=pred)
