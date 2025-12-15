@@ -604,6 +604,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -619,26 +620,30 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
+            self.config.encoder_only = getattr(config, "encoder_only", False)
+            self.config.language_only = getattr(config, "language_only", False)
 
-        self.model = language_model_cls(
-            config=self.config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
+        if not hasattr(config, "encoder_only") or not config.encoder_only:
+            self.model = language_model_cls(
+                config=self.config,
+                quant_config=quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
             else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+                self.lm_head = PPMissingLayer()
         else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
+            # encoder_only mode: no language model, so no lm_head needed
+            self.lm_head = None
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -648,7 +653,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
@@ -781,8 +786,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
 
+            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
+
+            is_visual = "visual" in name
             if (
-                layer_id is not None
+                not is_visual
+                and layer_id is not None
                 and hasattr(self.model, "start_layer")
                 and (
                     layer_id < self.model.start_layer
@@ -800,6 +815,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.encoder_only or self.config.language_only
+                ) and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -819,6 +839,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         param = params_dict[name]
                     else:
                         continue
+
                 except KeyError:
                     print(params_dict.keys())
                     raise

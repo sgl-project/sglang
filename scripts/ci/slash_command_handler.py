@@ -149,6 +149,7 @@ def handle_rerun_stage(
         "quantization-test",
         "unit-test-backend-1-gpu",
         "unit-test-backend-2-gpu",
+        "stage-b-test-4-gpu-b200",
         "unit-test-backend-4-gpu",
         "unit-test-backend-8-gpu-h200",
         "unit-test-backend-8-gpu-h20",
@@ -229,7 +230,7 @@ def handle_rerun_stage(
                 comment.create_reaction("+1")
                 pr.create_issue_comment(
                     f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
-                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                    f"It will not be shown in this page. Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
             return True
         else:
