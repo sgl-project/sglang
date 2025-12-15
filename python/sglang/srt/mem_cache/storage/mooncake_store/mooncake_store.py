@@ -248,9 +248,22 @@ class MooncakeStore(HiCacheStorage):
             if storage_config is not None:
                 self.is_mla_backend = storage_config.is_mla_model
                 self.local_rank = storage_config.tp_rank
+                self.pp_rank = storage_config.pp_rank
+                self.pp_size = storage_config.pp_size
+                self.enable_pp = self.pp_size > 1
+                if self.enable_pp:
+                    self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                    self.mla_suffix = f"{self.pp_rank}"
+                else:
+                    self.mha_suffix = f"{self.local_rank}"
+                    self.mla_suffix = ""
             else:
                 self.is_mla_backend = False
                 self.local_rank = 0
+                self.pp_rank = 0
+                self.pp_size = 1
+                self.enable_pp = False
+                self.suffix = f"{self.local_rank}"
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -324,8 +337,8 @@ class MooncakeStore(HiCacheStorage):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
         for key_ in keys:
-            key_list.append(f"{key_}_{self.local_rank}_k")
-            key_list.append(f"{key_}_{self.local_rank}_v")
+            key_list.append(f"{key_}_{self.mha_suffix}_k")
+            key_list.append(f"{key_}_{self.mha_suffix}_v")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -333,7 +346,7 @@ class MooncakeStore(HiCacheStorage):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
         for key_ in keys:
-            key_list.append(f"{key_}_k")
+            key_list.append(f"{key_}_{self.mla_suffix}_k")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -528,13 +541,13 @@ class MooncakeStore(HiCacheStorage):
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         if self.is_mla_backend:
-            query_keys = [f"{key}_k" for key in keys]
+            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
         else:
             query_keys = []
             for key in keys:
-                query_keys.append(f"{key}_{self.local_rank}_k")
-                query_keys.append(f"{key}_{self.local_rank}_v")
+                query_keys.append(f"{key}_{self.mha_suffix}_k")
+                query_keys.append(f"{key}_{self.mha_suffix}_v")
             key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
