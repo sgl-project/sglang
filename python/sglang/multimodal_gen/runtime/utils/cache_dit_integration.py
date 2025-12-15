@@ -28,6 +28,65 @@ from cache_dit.caching.block_adapters import BlockAdapterRegister
 from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 
+def build_parallelism_config(
+    sp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Optional[ParallelismConfig]:
+    """Build ParallelismConfig from process groups.
+
+    Args:
+        sp_group: Sequence parallel process group (for Ulysses/Ring).
+        tp_group: Tensor parallel process group.
+
+    Returns:
+        ParallelismConfig if any group is provided, None otherwise.
+    """
+    if sp_group is None and tp_group is None:
+        return None
+
+    ulysses_size = None
+    ring_size = None
+    tp_size = None
+
+    if sp_group is not None:
+        import torch.distributed as dist
+
+        sp_world_size = dist.get_world_size(sp_group)
+        ulysses_size = sp_world_size
+        logger.info(
+            "Detected SP group with world_size=%d, using ulysses_size=%d",
+            sp_world_size,
+            ulysses_size,
+        )
+
+    if tp_group is not None:
+        import torch.distributed as dist
+
+        tp_world_size = dist.get_world_size(tp_group)
+        tp_size = tp_world_size
+        logger.info(
+            "Detected TP group with world_size=%d, using tp_size=%d",
+            tp_world_size,
+            tp_size,
+        )
+
+    parallelism_config = ParallelismConfig(
+        backend=(
+            ParallelismBackend.NATIVE_DIFFUSER
+            if ulysses_size or ring_size
+            else ParallelismBackend.NATIVE_PYTORCH
+        ),
+        ulysses_size=ulysses_size,
+        ring_size=ring_size,
+        tp_size=tp_size,
+    )
+    logger.info(
+        "Created parallelism config: %s", parallelism_config.strify(details=True)
+    )
+
+    return parallelism_config
+
+
 def get_scm_mask(
     preset: str,
     num_inference_steps: int,
@@ -199,47 +258,7 @@ def enable_cache_on_transformer(
             config.steps_computation_policy,
         )
 
-    parallelism_config = None
-    if sp_group is not None or tp_group is not None:
-        ulysses_size = None
-        ring_size = None
-        tp_size = None
-
-        if sp_group is not None:
-            import torch.distributed as dist
-
-            sp_world_size = dist.get_world_size(sp_group)
-            ulysses_size = sp_world_size
-            logger.info(
-                "Detected SP group with world_size=%d, using ulysses_size=%d",
-                sp_world_size,
-                ulysses_size,
-            )
-
-        if tp_group is not None:
-            import torch.distributed as dist
-
-            tp_world_size = dist.get_world_size(tp_group)
-            tp_size = tp_world_size
-            logger.info(
-                "Detected TP group with world_size=%d, using tp_size=%d",
-                tp_world_size,
-                tp_size,
-            )
-
-        parallelism_config = ParallelismConfig(
-            backend=(
-                ParallelismBackend.NATIVE_DIFFUSER
-                if ulysses_size or ring_size
-                else ParallelismBackend.NATIVE_PYTORCH
-            ),
-            ulysses_size=ulysses_size,
-            ring_size=ring_size,
-            tp_size=tp_size,
-        )
-        logger.info(
-            "Created parallelism config: %s", parallelism_config.strify(details=True)
-        )
+    parallelism_config = build_parallelism_config(sp_group, tp_group)
 
     cache_dit.enable_cache(
         transformer,
@@ -372,48 +391,7 @@ def enable_cache_on_dual_transformer(
             primary_config.steps_computation_policy,
         )
 
-    parallelism_config = None
-    if sp_group is not None or tp_group is not None:
-        ulysses_size = None
-        ring_size = None
-        tp_size = None
-
-        if sp_group is not None:
-            import torch.distributed as dist
-
-            sp_world_size = dist.get_world_size(sp_group)
-            ulysses_size = sp_world_size
-            logger.info(
-                "Detected SP group with world_size=%d, using ulysses_size=%d",
-                sp_world_size,
-                ulysses_size,
-            )
-
-        if tp_group is not None:
-            import torch.distributed as dist
-
-            tp_world_size = dist.get_world_size(tp_group)
-            tp_size = tp_world_size
-            logger.info(
-                "Detected TP group with world_size=%d, using tp_size=%d",
-                tp_world_size,
-                tp_size,
-            )
-
-        parallelism_config = ParallelismConfig(
-            backend=(
-                ParallelismBackend.NATIVE_DIFFUSER
-                if ulysses_size or ring_size
-                else ParallelismBackend.NATIVE_PYTORCH
-            ),
-            ulysses_size=ulysses_size,
-            ring_size=ring_size,
-            tp_size=tp_size,
-        )
-        logger.info(
-            "Created parallelism config for dual-transformer: %s",
-            parallelism_config.strify(details=True),
-        )
+    parallelism_config = build_parallelism_config(sp_group, tp_group)
 
     # Get blocks attribute - Wan transformers use 'blocks' attribute
     transformer_blocks = getattr(transformer, "blocks", None)
