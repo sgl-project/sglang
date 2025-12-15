@@ -13,7 +13,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.batch_sizes = [1, 1, 8, 16, 64]
+        cls.batch_sizes = [1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
