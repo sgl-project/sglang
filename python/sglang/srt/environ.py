@@ -361,7 +361,7 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
 
-    # Memory cache
+    # Sliding Window Attention (SWA)
     SGLANG_SWA_EVICT_LENGTH_PER_STEP = EnvInt(128)
 
     # fmt: on
