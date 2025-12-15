@@ -16,6 +16,7 @@ import torch
 from tqdm import tqdm
 
 from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -273,6 +275,25 @@ class ComposedPipelineBase(ABC):
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
 
+        # Lazy imports for optional Nunchaku integration to avoid hard dependency.
+        try:
+            from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
+                create_nunchaku_config_from_server_args,
+                load_nunchaku_model,
+                should_use_nunchaku,
+            )
+            from sglang.multimodal_gen.runtime.models.dits.nunchaku_flux import (
+                create_nunchaku_flux_model,
+            )
+
+            _nunchaku_available = True
+        except Exception:
+            create_nunchaku_config_from_server_args = None  # type: ignore[assignment]
+            load_nunchaku_model = None  # type: ignore[assignment]
+            should_use_nunchaku = None  # type: ignore[assignment]
+            create_nunchaku_flux_model = None  # type: ignore[assignment]
+            _nunchaku_available = False
+
         components = {}
         for module_name, (
             transformers_or_diffusers,
@@ -313,12 +334,99 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
-            module = PipelineComponentLoader.load_module(
-                module_name=load_module_name,
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
-            )
+
+            # Try Nunchaku-based quantized loading for supported transformers.
+            module = None
+            if (
+                module_name == "transformer"
+                and _nunchaku_available
+                and should_use_nunchaku is not None
+                and should_use_nunchaku(server_args, component_type="transformer")
+            ):
+                # Determine which Nunchaku model to load based on the pipeline config.
+                pipeline_cfg_name = (
+                    server_args.pipeline_config.__class__.__name__
+                    if server_args.pipeline_config is not None
+                    else ""
+                )
+                model_type: str | None = None
+                if pipeline_cfg_name == "FluxPipelineConfig":
+                    model_type = "flux"
+                elif pipeline_cfg_name == "Flux2PipelineConfig":
+                    model_type = "flux_v2"
+                elif pipeline_cfg_name in (
+                    "QwenImagePipelineConfig",
+                    "QwenImageEditPipelineConfig",
+                ):
+                    model_type = "qwen_image"
+
+                if model_type is None:
+                    logger.warning(
+                        "Nunchaku quantization is enabled but pipeline config %s "
+                        "does not currently support Nunchaku-based transformer loading. "
+                        "Falling back to standard (unquantized) loading.",
+                        pipeline_cfg_name,
+                    )
+                else:
+                    assert create_nunchaku_config_from_server_args is not None
+                    assert load_nunchaku_model is not None
+
+                    quant_config = create_nunchaku_config_from_server_args(server_args)
+
+                    # Determine the dtype for non-quantized parameters from pipeline config.
+                    dit_precision = getattr(
+                        server_args.pipeline_config, "dit_precision", "bf16"
+                    )
+                    torch_dtype = PRECISION_TO_TYPE.get(
+                        dit_precision, torch.bfloat16  # type: ignore[arg-type]
+                    )
+
+                    logger.info(
+                        "Loading Nunchaku quantized transformer for model_type=%s "
+                        "with dtype=%s and config=%s",
+                        model_type,
+                        torch_dtype,
+                        quant_config,
+                    )
+                    nunchaku_model = load_nunchaku_model(
+                        model_type=model_type,
+                        quantization_config=quant_config,
+                        torch_dtype=torch_dtype,
+                        device=get_local_torch_device(),
+                    )
+
+                    # For FLUX-style models, wrap the Nunchaku model so that it
+                    # matches the expected DiT interface used in pipelines.
+                    if model_type.startswith("flux") and create_nunchaku_flux_model:
+                        module = create_nunchaku_flux_model(
+                            nunchaku_model,
+                            config={"hf_config": None},
+                            enable_fp16_attention=(
+                                quant_config.processor == "nunchaku-fp16"
+                            ),
+                            enable_offloading=quant_config.enable_offloading,
+                        )
+                    else:
+                        # For other supported model types, use the Nunchaku model directly.
+                        module = nunchaku_model
+
+                    logger.info(
+                        "Loaded module %s via Nunchaku quantization backend: %s",
+                        module_name,
+                        module.__class__.__name__,
+                    )
+
+            # Fallback: standard (unquantized) loading via ComponentLoader.
+            if module is None:
+                module = PipelineComponentLoader.load_module(
+                    module_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    server_args=server_args,
+                )
+                logger.info(
+                    "Loaded module %s from %s", module_name, component_model_path
+                )
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
