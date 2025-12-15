@@ -52,9 +52,13 @@ from sglang.utils import is_in_ci
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
 except ImportError:
+
     class PlaceholderModule:
-        def __init__(self, name): self.name = name
-        def __getattr__(self, name): raise ImportError(f"Please install {self.name}")
+        def __init__(self, name):
+            self.name = name
+
+        def __getattr__(self, name):
+            raise ImportError(f"Please install {self.name}")
 
     fastsafetensors = PlaceholderModule("fastsafetensors")
     SafeTensorsFileLoader = None
@@ -845,7 +849,9 @@ def fastsafetensors_weights_iterator(
     using fastsafetensor library to accelerate loading via GPU Direct Storage (if available).
     """
     if SafeTensorsFileLoader is None:
-        raise ImportError("Please install fastsafetensors via `pip install fastsafetensors`")
+        raise ImportError(
+            "Please install fastsafetensors via `pip install fastsafetensors`"
+        )
 
     if torch.distributed.is_initialized():
         pg = torch.distributed.group.WORLD
@@ -857,20 +863,22 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f'cuda:{rank}')
+    device = torch.device(f"cuda:{rank}")
 
     weight_files_sub_lists = [
-        hf_weights_files[i:i + pg.size()]
+        hf_weights_files[i : i + pg.size()]
         for i in range(0, len(hf_weights_files), pg.size())
     ]
 
-    _BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+    _BAR_FORMAT = (
+        "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+    )
 
     for f_list in tqdm(
-            weight_files_sub_lists,
-            desc="Loading safetensors using Fastsafetensor loader",
-            disable=False,
-            bar_format=_BAR_FORMAT,
+        weight_files_sub_lists,
+        desc="Loading safetensors using Fastsafetensor loader",
+        disable=False,
+        bar_format=_BAR_FORMAT,
     ):
         loader = SafeTensorsFileLoader(pg, device)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}

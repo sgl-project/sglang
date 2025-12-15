@@ -84,6 +84,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
@@ -95,7 +96,6 @@ from sglang.srt.model_loader.weight_utils import (
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
-    fastsafetensors_weights_iterator,
     set_runai_streamer_env,
 )
 from sglang.srt.utils import (
@@ -378,8 +378,10 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif (load_format == LoadFormat.SAFETENSORS
-              or load_format == LoadFormat.FASTSAFETENSORS):
+        elif (
+            load_format == LoadFormat.SAFETENSORS
+            or load_format == LoadFormat.FASTSAFETENSORS
+        ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == LoadFormat.MISTRAL:
