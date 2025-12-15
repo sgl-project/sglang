@@ -34,7 +34,9 @@ from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
 if not is_cpu():
     # fix import error on CPU device, no impacts when non-CPU path
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-    from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
     from sglang.srt.layers.attention.fla.kda import (
         chunk_kda,
         fused_kda_gate,
@@ -65,6 +67,7 @@ elif is_cpu():
     assert (
         cpu_has_amx_support()
     ), "CPU requires AMX support for hybrid linear attn backend"
+    _is_cpu = True
     from sgl_kernel.mamba import (
         causal_conv1d_fn_cpu,
         causal_conv1d_update_cpu,
@@ -862,9 +865,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        assert (
-            self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-        ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+        if not _is_cpu:
+            assert (
+                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
     def forward_decode(
         self,
@@ -1098,7 +1102,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
-            
+
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, forward_metadata
             )
