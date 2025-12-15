@@ -69,11 +69,12 @@
         --max-prefill-tokens 32768 \
         --disable-radix-cache \
         --page-size 64 \
+        --mm-enable-dp-encoder \
         --cuda-graph-max-bs 8
         2>&1 | tee log.server.log &
 
     ```
-    You can also add `--mm-enable-dp-encoder` when launch server, this command can reduces TTFT for multi-modal workloads under some testing conditions.
+    You can add `--mm-enable-dp-encoder` when launch server, this command can reduces TTFT for multi-modal workloads under some testing conditions.
 
 # Curl request
 1. curl a single request to quickly check the functionality
