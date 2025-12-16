@@ -686,6 +686,7 @@ torch::Tensor fused_norm_scale_shift(
       TORCH_CHECK(x.dtype() == gamma.dtype() && x.dtype() == beta.dtype(), "x, gamma, beta must have same dtype");
     }
   }
+  TORCH_CHECK(norm_type == 0 || norm_type == 1, "norm_type must be 0 (layer) or 1 (rms).");
 
   auto y = torch::empty_like(x);
   norm_fused_scale_shift_launch(
