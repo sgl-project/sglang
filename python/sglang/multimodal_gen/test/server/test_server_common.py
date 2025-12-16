@@ -491,18 +491,22 @@ These are available in the 'missing-gt' CI artifact.
 To add GT files to pass consistency tests:
 1. Download the 'missing-gt' artifact from this CI run
 
-2. Clone sgl-test-files repo and copy the frame files:
-   git clone https://github.com/sgl-project/sgl-test-files.git
-   mkdir -p sgl-test-files/images/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
-   cp -r {staging_path}/* sgl-test-files/images/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
-
-3. Commit and push to sgl-test-files:
+2. Fork and clone sgl-test-files repo:
+   # Fork https://github.com/sgl-project/sgl-test-files on GitHub first
+   git clone https://github.com/<your-username>/sgl-test-files.git
    cd sgl-test-files
+
+3. Copy the frame files:
+   mkdir -p images/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
+   cp -r <downloaded-artifact>/{gpu_dir}/{case.id}/* images/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
+
+4. Commit, push and create PR:
    git add images/diffusion-ci/consistency_gt/
    git commit -m "Add consistency GT for {case.id}"
-   git push
+   git push origin main
+   # Create a PR to sgl-project/sgl-test-files on GitHub
 
-4. After the sgl-test-files PR is merged, re-run this CI.
+5. After the sgl-test-files PR is merged, re-run this CI.
 """
             else:
                 error_msg += f"""GT staging is not enabled. To generate GT files:
