@@ -925,7 +925,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             module.weight = Parameter(
                                 qweight.t(), requires_grad=False
                             )
-                            use_blockwise = True
+                            use_blockwise = False
                             logger.info(
                                 f"[QuantizedRL] Quantize (blockwise, initial load): {name} "
                                 f"{weight.dtype}→FP8 "
@@ -945,6 +945,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         f"[QuantizedRL] Disabled or failed blockwise fp8 for module: {name}; "
                         f"keeping original weight dtype {weight.dtype} on initial load"
                     )
+                    quant_method.process_weights_after_loading(module)
 
 
 
@@ -1175,7 +1176,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                                 )
                                 # scale shape is (blk_m, blk_n, 1), need to squeeze
                                 scale = scale.squeeze(-1)
-                                use_blockwise = True
+                                use_blockwise = False
                                 logger.info(
                                     f"[QuantizedRL] Quantize (blockwise): {name} {weight.dtype}→FP8 "
                                     f"(shape={weight.shape}, block_size={default_block_size})"
@@ -2834,7 +2835,7 @@ def get_model_loader(
                 "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
                 "Model will be loaded with FP8 infrastructure"
             )
-            use_blockwise = True
+            use_blockwise = False
             model_config.quantization = "fp8"
             if use_blockwise:
                 model_config.hf_config.quantization_config = {
