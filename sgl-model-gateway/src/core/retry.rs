@@ -111,8 +111,8 @@ impl RetryExecutor {
     ///         resp
     ///     },
     ///     |res, _| matches!(res.status(), StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS | StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT),
-    ///     |delay, attempt| RouterMetrics::record_retry_backoff_duration(delay, attempt),
-    ///     || RouterMetrics::record_retries_exhausted("/route"),
+    ///     |delay, _attempt| { /* record backoff metrics */ },
+    ///     || { /* record retries exhausted */ },
     /// ).await;
     /// ```
     pub async fn execute_response_with_retry<Op, Fut, ShouldRetry, OnBackoff, OnExhausted>(

@@ -128,11 +128,16 @@ class ComponentLoader(ABC):
                 component_model_path, server_args, module_name
             )
             source = "customized"
-        except Exception as _e:
-            traceback.print_exc()
-            logger.error(
-                f"Error while loading customized {module_name}, falling back to native version"
-            )
+        except Exception as e:
+            if "Unsupported model architecture" in str(e):
+                logger.info(
+                    f"Module: {module_name} doesn't have a customized version yet, using native version"
+                )
+            else:
+                traceback.print_exc()
+                logger.error(
+                    f"Error while loading customized {module_name}, falling back to native version"
+                )
             # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
