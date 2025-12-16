@@ -133,6 +133,10 @@ message GenerateRequest {
 
   // Whether client wants streaming response
   bool stream = 17;
+
+  // EPD mode: Flag indicating request needs to wait for image embeddings from encode worker
+  // When true, the prefill scheduler will wait for embeddings via ZMQ before processing
+  optional bool need_wait_for_image = 18;
 }
 
 message TokenizedInput {

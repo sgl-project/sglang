@@ -62,12 +62,15 @@ impl PipelineStage for ClientAcquisitionStage {
                 prefill,
                 decode,
             } => {
-                let encode_client = utils::get_grpc_client_from_worker(encode).await?;
+                // EPD mode: encode uses HTTP, prefill and decode use gRPC
+                // Store encode worker URL instead of creating gRPC client
+                let encode_url = encode.url().to_string();
+
                 let prefill_client = utils::get_grpc_client_from_worker(prefill).await?;
                 let decode_client = utils::get_grpc_client_from_worker(decode).await?;
 
-                if encode_client.is_vllm() || prefill_client.is_vllm() || decode_client.is_vllm() {
-                    // TODO: I am not sure about this restriction for vLLM, need to verify
+                // vLLM does not support EPD disaggregated mode
+                if prefill_client.is_vllm() || decode_client.is_vllm() {
                     error!(
                         function = "ClientAcquisitionStage::execute",
                         "vLLM backend does not support encode/prefill/decode disaggregated mode"
@@ -79,8 +82,15 @@ impl PipelineStage for ClientAcquisitionStage {
                     ));
                 }
 
+                tracing::debug!(
+                    encode_url = %encode_url,
+                    prefill_url = %prefill.url(),
+                    decode_url = %decode.url(),
+                    "EPD mode: encode uses HTTP, prefill/decode use gRPC"
+                );
+
                 ClientSelection::Triple {
-                    encode: encode_client,
+                    encode_url,
                     prefill: prefill_client,
                     decode: decode_client,
                 }

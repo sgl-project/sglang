@@ -56,8 +56,7 @@ impl PipelineStage for ChatRequestBuildingStage {
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
-            // ToDo: Consider which worker to use for building in Triple case (encode or prefill)
-            ClientSelection::Triple { encode, .. } => encode,
+            ClientSelection::Triple { prefill, .. } => prefill,
         };
 
         // Build chat request
@@ -115,20 +114,9 @@ impl PipelineStage for ChatRequestBuildingStage {
                         _ => None,
                     })
             {
-                // Get encode worker for EPD mode
-                let encode_worker =
-                    ctx.state
-                        .workers
-                        .as_ref()
-                        .and_then(|selection| match selection {
-                            WorkerSelection::Triple { encode, .. } => Some(encode),
-                            _ => None,
-                        });
-                helpers::inject_bootstrap_metadata(
-                    &mut proto_request,
-                    prefill_worker,
-                    encode_worker,
-                );
+                // Inject PD bootstrap metadata for prefill->decode KV cache transfer
+                // Note: For EPD mode, encode worker uses HTTP REST API, not gRPC bootstrap
+                helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }
 

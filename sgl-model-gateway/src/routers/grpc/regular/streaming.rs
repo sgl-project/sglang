@@ -36,13 +36,6 @@ use crate::{
     tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser},
 };
 
-/// Triple streams for EPD (Encode-Prefill-Decode) mode
-pub struct TripleStreams {
-    pub encode: ProtoStream,
-    pub prefill: ProtoStream,
-    pub decode: ProtoStream,
-}
-
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
 pub struct StreamingProcessor {
@@ -149,43 +142,6 @@ impl StreamingProcessor {
                         .process_dual_streaming_chunks(
                             prefill,
                             *decode,
-                            dispatch,
-                            stop_params,
-                            chat_request,
-                            &tx,
-                        )
-                        .await;
-
-                    if let Err(e) = result {
-                        let error_chunk = format!(
-                            "data: {}\n\n",
-                            json!({
-                                "error": {
-                                    "message": e,
-                                    "type": "internal_error"
-                                }
-                            })
-                        );
-                        let _ = tx.send(Ok(Bytes::from(error_chunk)));
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
-                });
-            }
-            context::ExecutionResult::Triple {
-                encode,
-                prefill,
-                decode,
-            } => {
-                let processor = self.clone();
-                tokio::spawn(async move {
-                    let result = processor
-                        .process_triple_streaming_chunks(
-                            TripleStreams {
-                                encode: *encode,
-                                prefill: *prefill,
-                                decode: *decode,
-                            },
                             dispatch,
                             stop_params,
                             chat_request,
@@ -677,46 +633,6 @@ impl StreamingProcessor {
         result
     }
 
-    /// Process triple streaming chunks (encode + prefill + decode) - EPD mode
-    pub async fn process_triple_streaming_chunks(
-        &self,
-        mut streams: TripleStreams,
-        dispatch: context::DispatchMetadata,
-        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
-        original_request: Arc<ChatCompletionRequest>,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
-        if original_request.logprobs {
-            while let Some(response) = streams.encode.next().await {
-                let gen_response = response.map_err(|e| format!("Encode stream error: {}", e))?;
-                match gen_response.into_response() {
-                    ProtoResponseVariant::Complete(_complete) => break,
-                    ProtoResponseVariant::Error(error) => {
-                        return Err(format!("Encode error: {}", error.message()));
-                    }
-                    _ => continue,
-                }
-            }
-        }
-
-        let result = self
-            .process_dual_streaming_chunks(
-                streams.prefill,
-                streams.decode,
-                dispatch,
-                stop_params,
-                original_request,
-                tx,
-            )
-            .await;
-
-        if result.is_ok() {
-            streams.encode.mark_completed();
-        }
-
-        result
-    }
-
     /// Process streaming generate response and return SSE response
     ///
     /// Simpler than chat - no tool/reasoning parsing, just text accumulation
@@ -765,40 +681,6 @@ impl StreamingProcessor {
                 tokio::spawn(async move {
                     let result = Self::process_generate_streaming_dual(
                         tokenizer, prefill, *decode, ctx, &tx,
-                    )
-                    .await;
-
-                    if let Err(e) = result {
-                        let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", e);
-                        let _ = tx.send(Ok(Bytes::from(error_chunk)));
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
-                });
-            }
-            context::ExecutionResult::Triple {
-                encode,
-                prefill,
-                decode,
-            } => {
-                let tokenizer = self.tokenizer.clone();
-                let request_id = dispatch.request_id.clone();
-                let weight_version = dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
-                tokio::spawn(async move {
-                    let result = Self::process_generate_streaming_triple(
-                        tokenizer,
-                        TripleStreams {
-                            encode: *encode,
-                            prefill: *prefill,
-                            decode: *decode,
-                        },
-                        request_id,
-                        weight_version,
-                        true,
-                        &tx,
                     )
                     .await;
 
@@ -979,49 +861,6 @@ impl StreamingProcessor {
         // This ensures that if client disconnects during decode, BOTH streams send abort
         if result.is_ok() {
             prefill_stream.mark_completed();
-        }
-
-        result
-    }
-
-    async fn process_generate_streaming_triple(
-        tokenizer: Arc<dyn Tokenizer>,
-        mut streams: TripleStreams,
-        request_id: String,
-        weight_version: String,
-        include_logprobs: bool,
-        tx: &UnboundedSender<Result<Bytes, io::Error>>,
-    ) -> Result<(), String> {
-        if include_logprobs {
-            while let Some(response) = streams.encode.next().await {
-                let gen_response = response.map_err(|e| format!("Encode stream error: {}", e))?;
-                match gen_response.into_response() {
-                    ProtoResponseVariant::Complete(_complete) => break,
-                    ProtoResponseVariant::Error(error) => {
-                        return Err(format!("Encode error: {}", error.message()));
-                    }
-                    _ => continue,
-                }
-            }
-        }
-
-        let result = Self::process_generate_streaming_dual(
-            tokenizer,
-            streams.prefill,
-            streams.decode,
-            GenerateStreamContext {
-                request_id,
-                weight_version,
-                return_logprob: include_logprobs,
-                backend_type: metrics_labels::BACKEND_EPD,
-                model: "".to_string(), // Model not needed for metrics here
-            },
-            tx,
-        )
-        .await;
-
-        if result.is_ok() {
-            streams.encode.mark_completed();
         }
 
         result

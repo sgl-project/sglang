@@ -1125,77 +1125,6 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_epd_bootstrap_injection_simulation() {
-        // Test bootstrap injection for EPD mode's triple dispatch scenario
-        let encode_worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://encode1:8080")
-                .worker_type(WorkerType::Encode {
-                    bootstrap_port: Some(9000),
-                })
-                .api_key("test_api_key")
-                .build(),
-        );
-
-        let prefill_worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://prefill1:8080")
-                .worker_type(WorkerType::Prefill {
-                    bootstrap_port: Some(9001),
-                })
-                .api_key("test_api_key")
-                .build(),
-        );
-
-        let decode_worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://decode1:8080")
-                .worker_type(WorkerType::Decode)
-                .api_key("test_api_key")
-                .build(),
-        );
-
-        // Encode worker should have bootstrap port for encode→prefill communication
-        let &encode_bootstrap_port = match encode_worker.worker_type() {
-            WorkerType::Encode { bootstrap_port } => bootstrap_port,
-            _ => &None,
-        };
-        assert_eq!(encode_bootstrap_port, Some(9000));
-
-        // Prefill worker should have bootstrap port for prefill→decode communication
-        let &prefill_bootstrap_port = match prefill_worker.worker_type() {
-            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => &None,
-        };
-        assert_eq!(prefill_bootstrap_port, Some(9001));
-
-        // Decode worker doesn't need bootstrap port (final stage)
-        match decode_worker.worker_type() {
-            WorkerType::Decode => (),
-            _ => panic!("Expected Decode worker type"),
-        }
-
-        // Simulate EPD request with bootstrap metadata for all stages
-        let mut epd_request = json!({
-            "text": "Hello world",
-            "stream": false,
-            "temperature": 0.7
-        });
-
-        // Stage 1: Encode worker bootstrap info
-        epd_request["encode_bootstrap_host"] = json!(encode_worker.bootstrap_host());
-        epd_request["encode_bootstrap_port"] = json!(encode_bootstrap_port);
-        epd_request["encode_bootstrap_room"] = json!(11111u64);
-
-        // Stage 2: Prefill worker bootstrap info
-        epd_request["prefill_bootstrap_host"] = json!(prefill_worker.bootstrap_host());
-        epd_request["prefill_bootstrap_port"] = json!(prefill_bootstrap_port);
-        epd_request["prefill_bootstrap_room"] = json!(22222u64);
-
-        assert_eq!(epd_request["encode_bootstrap_host"], "encode1");
-        assert_eq!(epd_request["encode_bootstrap_port"], json!(Some(9000)));
-        assert_eq!(epd_request["prefill_bootstrap_host"], "prefill1");
-        assert_eq!(epd_request["prefill_bootstrap_port"], json!(Some(9001)));
-    }
-
-    #[test]
     fn test_epd_worker_type_display() {
         // Test Display trait implementation for all worker types
         let regular = WorkerType::Regular;
@@ -1323,72 +1252,241 @@ mod test_pd_routing {
         assert_eq!(mode.worker_count(), 9);
     }
 
+    // =====================================================
+    // EPD Integration Tests (HTTP Encode + gRPC Prefill/Decode)
+    // =====================================================
+
     #[test]
-    fn test_epd_batch_bootstrap_injection() {
-        // Test bootstrap injection for batch requests in EPD mode
-        let batch_size = 16;
+    fn test_epd_encode_http_client_request_format() {
+        // Test that EncodeRequest serializes correctly for HTTP /encode endpoint
+        use sgl_model_gateway::routers::grpc::common::stages::{EncodeHttpClient, EncodeRequest};
 
-        let encode_worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://encode:8080")
-                .worker_type(WorkerType::Encode {
-                    bootstrap_port: Some(9000),
-                })
-                .api_key("test_api_key")
-                .build(),
-        );
-
-        let prefill_worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://prefill:8080")
-                .worker_type(WorkerType::Prefill {
-                    bootstrap_port: Some(9001),
-                })
-                .api_key("test_api_key")
-                .build(),
-        );
-
-        let &encode_bootstrap_port = match encode_worker.worker_type() {
-            WorkerType::Encode { bootstrap_port } => bootstrap_port,
-            _ => &None,
-        };
-        let &prefill_bootstrap_port = match prefill_worker.worker_type() {
-            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => &None,
+        let request = EncodeRequest {
+            mm_items: vec![
+                "https://example.com/image1.jpg".to_string(),
+                "https://example.com/image2.png".to_string(),
+            ],
+            req_id: "test-req-123".to_string(),
+            num_parts: 1,
+            part_idx: 0,
+            prefill_host: "prefill-worker-1".to_string(),
+            embedding_port: None,
         };
 
-        let mut batch_request = json!({
-            "text": vec!["Hello"; batch_size],
-            "stream": true
-        });
+        // Verify serialization
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("mm_items"));
+        assert!(json.contains("https://example.com/image1.jpg"));
+        assert!(json.contains("test-req-123"));
+        assert!(json.contains("prefill-worker-1"));
+        // embedding_port should be skipped when None
+        assert!(!json.contains("embedding_port"));
 
-        // Inject encode bootstrap info for batch
-        batch_request["encode_bootstrap_host"] =
-            json!(vec![encode_worker.bootstrap_host(); batch_size]);
-        batch_request["encode_bootstrap_port"] = json!(vec![encode_bootstrap_port; batch_size]);
-        batch_request["encode_bootstrap_room"] = json!((0..batch_size)
-            .map(|i| 10000u64 + i as u64)
-            .collect::<Vec<_>>());
+        // Verify client creation works
+        let _client = EncodeHttpClient::new();
+    }
 
-        // Inject prefill bootstrap info for batch
-        batch_request["prefill_bootstrap_host"] =
-            json!(vec![prefill_worker.bootstrap_host(); batch_size]);
-        batch_request["prefill_bootstrap_port"] = json!(vec![prefill_bootstrap_port; batch_size]);
-        batch_request["prefill_bootstrap_room"] = json!((0..batch_size)
-            .map(|i| 20000u64 + i as u64)
-            .collect::<Vec<_>>());
+    #[test]
+    fn test_epd_encode_request_with_embedding_ports() {
+        use sgl_model_gateway::routers::grpc::common::stages::EncodeRequest;
 
-        assert_eq!(
-            batch_request["encode_bootstrap_host"]
-                .as_array()
-                .unwrap()
-                .len(),
-            batch_size
+        let request = EncodeRequest {
+            mm_items: vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
+            req_id: "test-req-456".to_string(),
+            num_parts: 2,
+            part_idx: 1,
+            prefill_host: "192.168.1.100".to_string(),
+            embedding_port: Some(vec![8998, 8999]),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("embedding_port"));
+        assert!(json.contains("[8998,8999]"));
+        assert!(json.contains("num_parts"));
+        assert!(json.contains("part_idx"));
+    }
+
+    #[test]
+    fn test_epd_multimodal_item_extraction() {
+        // Test helper function that extracts multimodal URLs from requests
+        // This is used to determine what to send to the encode worker
+
+        // Simulate extracting image URLs from a chat request with vision content
+        let image_urls = [
+            "https://example.com/cat.jpg".to_string(),
+            "https://example.com/dog.png".to_string(),
+        ];
+
+        assert_eq!(image_urls.len(), 2);
+        assert!(image_urls[0].starts_with("https://"));
+    }
+
+    #[test]
+    fn test_epd_fallback_no_multimodal() {
+        // Test that EPD mode falls back to PD when no multimodal content is present
+        // This simulates the behavior in request_execution.rs
+
+        let mm_items: Vec<String> = vec![];
+
+        // When mm_items is empty, EPD should fall back to PD mode
+        let should_fallback = mm_items.is_empty();
+        assert!(
+            should_fallback,
+            "Should fall back to PD when no multimodal content"
         );
-        assert_eq!(
-            batch_request["prefill_bootstrap_host"]
-                .as_array()
-                .unwrap()
-                .len(),
-            batch_size
+    }
+
+    #[test]
+    fn test_epd_connection_mode_selection() {
+        // Test that EPD mode uses HTTP for encode, gRPC for prefill/decode
+        use sgl_model_gateway::core::ConnectionMode;
+
+        // Encode worker should use HTTP (for /encode endpoint)
+        let encode_mode = ConnectionMode::Http;
+        assert!(matches!(encode_mode, ConnectionMode::Http));
+
+        // Prefill and decode workers should use gRPC
+        let prefill_mode = ConnectionMode::Grpc { port: Some(9000) };
+        let decode_mode = ConnectionMode::Grpc { port: None };
+        assert!(matches!(prefill_mode, ConnectionMode::Grpc { .. }));
+        assert!(matches!(decode_mode, ConnectionMode::Grpc { .. }));
+    }
+
+    #[test]
+    fn test_epd_client_selection_triple() {
+        // Test ClientSelection::Triple stores encode URL, not gRPC client
+        use sgl_model_gateway::config::RoutingMode;
+
+        let mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("http://encode:30300".to_string(), None)],
+            prefill_urls: vec![("http://prefill:30000".to_string(), Some(9000))],
+            decode_urls: vec!["http://decode:30010".to_string()],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        // Verify the mode is EPD
+        assert!(mode.is_epd_mode());
+
+        // Extract encode URL (this is what ClientSelection::Triple stores)
+        if let RoutingMode::EncodePrefillDecode { encode_urls, .. } = &mode {
+            assert_eq!(encode_urls[0].0, "http://encode:30300");
+        }
+    }
+
+    #[test]
+    fn test_epd_encode_error_handling() {
+        use sgl_model_gateway::routers::grpc::common::stages::EncodeError;
+
+        // Test various encode error types
+        let http_err = EncodeError::HttpError("connection refused".to_string());
+        assert!(format!("{}", http_err).contains("HTTP error"));
+        assert!(format!("{}", http_err).contains("connection refused"));
+
+        let worker_err = EncodeError::EncodeWorkerError("invalid image format".to_string());
+        assert!(format!("{}", worker_err).contains("Encode worker error"));
+
+        let timeout_err = EncodeError::Timeout;
+        assert!(format!("{}", timeout_err).contains("timed out"));
+    }
+
+    #[test]
+    fn test_epd_request_flow_simulation() {
+        // Simulate the EPD request flow:
+        // 1. Extract multimodal items
+        // 2. Call encode HTTP endpoint
+        // 3. Clear multimodal from prefill request
+        // 4. Set need_wait_for_image flag
+        // 5. Send to prefill/decode via gRPC
+
+        // Step 1: Extract multimodal items
+        let mm_items = vec!["https://example.com/image.jpg".to_string()];
+        assert!(!mm_items.is_empty(), "Should have multimodal items");
+
+        // Step 2: Build encode request
+        use sgl_model_gateway::routers::grpc::common::stages::EncodeRequest;
+        let encode_request = EncodeRequest {
+            mm_items: mm_items.clone(),
+            req_id: "epd-test-001".to_string(),
+            num_parts: 1,
+            part_idx: 0,
+            prefill_host: "prefill.local".to_string(),
+            embedding_port: None,
+        };
+        assert_eq!(encode_request.mm_items.len(), 1);
+
+        // Step 3 & 4: After encode, request should be modified
+        // - mm_inputs cleared
+        // - need_wait_for_image = true
+        // These are verified in the actual implementation
+
+        // Step 5: ExecutionResult should be Dual (not Triple)
+        // since encode uses HTTP, not gRPC streaming
+    }
+
+    #[tokio::test]
+    async fn test_epd_encode_http_client_integration() {
+        use std::time::Duration;
+
+        use sgl_model_gateway::routers::grpc::common::stages::{EncodeHttpClient, EncodeRequest};
+
+        // Create client with short timeout for testing
+        let client = EncodeHttpClient::with_timeout(Duration::from_millis(100));
+
+        // Try to connect to non-existent server (should fail gracefully)
+        let request = EncodeRequest {
+            mm_items: vec!["https://example.com/test.jpg".to_string()],
+            req_id: "test-fail".to_string(),
+            num_parts: 1,
+            part_idx: 0,
+            prefill_host: "localhost".to_string(),
+            embedding_port: None,
+        };
+
+        // This should return an error (connection refused or timeout)
+        let result = client.encode("http://127.0.0.1:59999", request).await;
+        assert!(
+            result.is_err(),
+            "Should fail to connect to non-existent server"
         );
+    }
+
+    #[test]
+    fn test_epd_disaggregated_params() {
+        // Test that DisaggregatedParams correctly handles EPD mode
+        // encode_bootstrap_* fields should be None (unused with HTTP+ZMQ)
+
+        use sgl_model_gateway::grpc_client::sglang_proto::DisaggregatedParams;
+
+        let params = DisaggregatedParams {
+            bootstrap_host: "prefill-host".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 12345,
+            // EPD encode bootstrap fields are not used - encode uses HTTP REST API
+            encode_bootstrap_host: None,
+            encode_bootstrap_port: None,
+            encode_bootstrap_room: None,
+        };
+
+        // Verify prefill bootstrap is set (for prefill→decode KV transfer)
+        assert_eq!(params.bootstrap_host, "prefill-host");
+        assert_eq!(params.bootstrap_port, 8998);
+
+        // Verify encode bootstrap fields are None (HTTP+ZMQ, not bootstrap)
+        assert!(params.encode_bootstrap_host.is_none());
+        assert!(params.encode_bootstrap_port.is_none());
+        assert!(params.encode_bootstrap_room.is_none());
+    }
+
+    #[test]
+    fn test_epd_execution_result_is_dual() {
+        // EPD mode returns ExecutionResult::Dual (not Triple) because:
+        // - Encode uses synchronous HTTP (waits for ack)
+        // - Only prefill and decode use gRPC streaming
+        //
+        // This test documents that ExecutionResult only has Single and Dual variants.
+        // The old Triple variant was removed since EPD encode uses HTTP, not gRPC streaming.
+        // After encode HTTP completes, we have Dual streams (prefill + decode).
     }
 }

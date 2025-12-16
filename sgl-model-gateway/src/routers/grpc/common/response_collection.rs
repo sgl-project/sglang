@@ -39,17 +39,6 @@ pub async fn collect_responses(
             mut prefill,
             decode,
         } => collect_prefill_decode(&mut prefill, decode, merge_logprobs).await?,
-        ExecutionResult::Triple {
-            mut encode,
-            mut prefill,
-            decode,
-        } => {
-            // Encode produces embeddings, not logprobs - just collect and complete
-            utils::collect_stream_responses(&mut encode, "Encode").await?;
-            encode.mark_completed();
-
-            collect_prefill_decode(&mut prefill, decode, merge_logprobs).await?
-        }
     };
 
     if all_responses.is_empty() {
@@ -64,7 +53,7 @@ pub async fn collect_responses(
 
 /// Collect prefill and decode streams, merge input_logprobs if requested
 ///
-/// Common logic for Dual (PD) and Triple (EPD) modes.
+/// Common logic for Dual (PD) mode.
 async fn collect_prefill_decode(
     prefill: &mut ProtoStream,
     decode: Box<ProtoStream>,

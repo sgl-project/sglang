@@ -263,41 +263,60 @@ impl WorkerSelectionStage {
         model_id: Option<&str>,
         text: Option<&str>,
     ) -> Option<EpdWorkerTriple> {
-        let all_workers = self.worker_registry.get_workers_filtered(
+        // For EPD mode:
+        // - Encode workers use HTTP REST API (not gRPC)
+        // - Prefill and decode workers use gRPC
+
+        // Get HTTP encode workers
+        let encode_workers = self.worker_registry.get_workers_filtered(
             model_id,
-            None,
-            Some(ConnectionMode::Grpc { port: None }), // Match any gRPC worker
+            Some(WorkerType::Encode {
+                bootstrap_port: None,
+            }),
+            Some(ConnectionMode::Http), // Encode workers use HTTP
             None,
             false,
         );
 
-        let (available_encode, available_prefill, available_decode): (Vec<_>, Vec<_>, Vec<_>) =
-            all_workers
-                .into_iter()
-                .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, w| {
-                    if w.is_available() {
-                        match w.metadata().worker_type {
-                            WorkerType::Encode { .. } => acc.0.push(w),
-                            WorkerType::Prefill { .. } => acc.1.push(w),
-                            WorkerType::Decode => acc.2.push(w),
-                            _ => {}
-                        }
-                    }
-                    acc
-                });
+        let available_encode: Vec<Arc<dyn Worker>> = encode_workers
+            .into_iter()
+            .filter(|w| w.is_available())
+            .collect();
 
         if available_encode.is_empty() {
-            warn!("No available encode workers");
+            warn!("No available HTTP encode workers for EPD mode");
             return None;
         }
 
+        // Get gRPC prefill and decode workers
+        let grpc_workers = self.worker_registry.get_workers_filtered(
+            model_id,
+            None,
+            Some(ConnectionMode::Grpc { port: None }), // Prefill and decode use gRPC
+            None,
+            false,
+        );
+
+        let (available_prefill, available_decode): (Vec<_>, Vec<_>) = grpc_workers
+            .into_iter()
+            .fold((Vec::new(), Vec::new()), |mut acc, w| {
+                if w.is_available() {
+                    match w.metadata().worker_type {
+                        WorkerType::Prefill { .. } => acc.0.push(w),
+                        WorkerType::Decode => acc.1.push(w),
+                        _ => {}
+                    }
+                }
+                acc
+            });
+
         if available_prefill.is_empty() {
-            warn!("No available prefill workers");
+            warn!("No available prefill workers for EPD mode");
             return None;
         }
 
         if available_decode.is_empty() {
-            warn!("No available decode workers");
+            warn!("No available decode workers for EPD mode");
             return None;
         }
 
@@ -308,6 +327,28 @@ impl WorkerSelectionStage {
         let encode_idx = encode_policy.select_worker(&available_encode, text)?;
         let prefill_idx = prefill_policy.select_worker(&available_prefill, text)?;
         let decode_idx = decode_policy.select_worker(&available_decode, text)?;
+
+        let model = model_id.unwrap_or("default");
+
+        // Record worker selection metrics
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_ENCODE,
+            metrics_labels::CONNECTION_HTTP, // Encode uses HTTP
+            model,
+            encode_policy.name(),
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            prefill_policy.name(),
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            decode_policy.name(),
+        );
 
         Some((
             available_encode[encode_idx].clone(),

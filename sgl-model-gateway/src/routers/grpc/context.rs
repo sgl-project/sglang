@@ -139,8 +139,10 @@ pub enum ClientSelection {
         prefill: GrpcClient,
         decode: GrpcClient,
     },
+    /// EPD mode: encode worker uses HTTP REST API, prefill/decode use gRPC
     Triple {
-        encode: GrpcClient,
+        /// Encode worker URL for HTTP /encode endpoint
+        encode_url: String,
         prefill: GrpcClient,
         decode: GrpcClient,
     },
@@ -480,24 +482,24 @@ impl ClientSelection {
         }
     }
 
-    pub fn triple(&self) -> Option<(&GrpcClient, &GrpcClient, &GrpcClient)> {
+    pub fn triple(&self) -> Option<(&str, &GrpcClient, &GrpcClient)> {
         match self {
             Self::Triple {
-                encode,
+                encode_url,
                 prefill,
                 decode,
-            } => Some((encode, prefill, decode)),
+            } => Some((encode_url, prefill, decode)),
             _ => None,
         }
     }
 
-    pub fn triple_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient, &mut GrpcClient)> {
+    pub fn triple_mut(&mut self) -> Option<(&str, &mut GrpcClient, &mut GrpcClient)> {
         match self {
             Self::Triple {
-                encode,
+                encode_url,
                 prefill,
                 decode,
-            } => Some((encode, prefill, decode)),
+            } => Some((encode_url, prefill, decode)),
             _ => None,
         }
     }
@@ -516,16 +518,10 @@ impl ClientSelection {
         }
     }
 
-    pub fn encode_client(&self) -> Option<&GrpcClient> {
+    /// Get the encode worker URL (EPD mode only - encode uses HTTP, not gRPC)
+    pub fn encode_url(&self) -> Option<&str> {
         match self {
-            Self::Triple { encode, .. } => Some(encode),
-            _ => None,
-        }
-    }
-
-    pub fn encode_client_mut(&mut self) -> Option<&mut GrpcClient> {
-        match self {
-            Self::Triple { encode, .. } => Some(encode),
+            Self::Triple { encode_url, .. } => Some(encode_url),
             _ => None,
         }
     }
@@ -533,17 +529,15 @@ impl ClientSelection {
 
 /// Result of request execution (streams from workers)
 /// Uses ProtoStream to automatically abort on cancellation
+///
+/// Note: EPD mode uses Dual (prefill + decode) since encode happens
+/// synchronously via HTTP before the gRPC streams are created.
 pub enum ExecutionResult {
     Single {
         stream: ProtoStream,
     },
     Dual {
         prefill: ProtoStream,
-        decode: Box<ProtoStream>,
-    },
-    Triple {
-        encode: Box<ProtoStream>,
-        prefill: Box<ProtoStream>,
         decode: Box<ProtoStream>,
     },
 }
