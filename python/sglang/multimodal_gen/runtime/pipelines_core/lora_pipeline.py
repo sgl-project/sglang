@@ -375,6 +375,15 @@ class LoRAPipeline(ComposedPipelineBase):
     ):  # type: ignore
         """
         Load a LoRA adapter into the pipeline and apply it to the specified transformer(s).
+
+        Args:
+            lora_nickname: The "nick name" of the adapter when referenced in the pipeline.
+            lora_path: The path to the adapter, either a local path or a Hugging Face repo id.
+            target: Which transformer(s) to apply the LoRA to. One of:
+                - "all": Apply to all transformers (default, backward compatible)
+                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
+                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
+                - "critic": Apply only to the critic model (fake_score_transformer)
         """
         if target not in self.VALID_TARGETS:
             raise ValueError(
