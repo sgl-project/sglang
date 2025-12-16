@@ -5,12 +5,20 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class LowConfidence(DllmAlgorithm):
+
+    def __init__(
+        self,
+        config: DllmConfig,
+    ):
+        super().__init__(config)
+        self.threshold = config.algorithm_config.get("threshold", 0.95)
 
     def run(
         self,
@@ -42,9 +50,11 @@ class LowConfidence(DllmAlgorithm):
             )
             x = torch.where(mask_index, x, forward_batch.input_ids)
             confidence = torch.where(mask_index, p, -np.inf)
-            transfer_index = torch.zeros_like(x, dtype=torch.bool, device=x.device)
-            _, select_index = torch.topk(confidence, k=1)
-            transfer_index[select_index] = True
+
+            transfer_index = confidence > self.threshold
+            if transfer_index.sum().item() == 0:
+                _, select_index = torch.topk(confidence, k=1)
+                transfer_index[select_index] = True
 
             forward_batch.input_ids[transfer_index] = x[transfer_index]
 

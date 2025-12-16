@@ -456,6 +456,40 @@ class TestMistralDetector(unittest.TestCase):
         self.assertEqual(params["decision"], "ANSWER")
         self.assertEqual(params["content"], "The answer is 42")
 
+    def test_detect_and_parse_compact_args_format(self):
+        """Test parsing compact format: [TOOL_CALLS]name[ARGS]{...}."""
+        test_text = '[TOOL_CALLS]make_next_step_decision[ARGS]{"decision":"TOOL", "content":"Use weather API"}'
+
+        result = self.detector.detect_and_parse(test_text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "make_next_step_decision")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["decision"], "TOOL")
+        self.assertEqual(params["content"], "Use weather API")
+
+    def test_streaming_compact_args_format_emits_tool_calls(self):
+        """Test streaming chunks for compact format produce tool_calls items."""
+        chunks = [
+            "[TOOL_CALLS]make_next_step_decision[ARGS]",
+            '{"decision":"TOOL", ',
+            '"content":"Use weather API"}',
+        ]
+
+        emitted = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.calls:
+                emitted.extend(result.calls)
+
+        # Expect two items: name chunk + full args chunk
+        self.assertEqual(len(emitted), 2)
+        self.assertEqual(emitted[0].name, "make_next_step_decision")
+        self.assertEqual(emitted[0].parameters, "")
+        self.assertIsNone(emitted[1].name)
+        params = json.loads(emitted[1].parameters)
+        self.assertEqual(params["decision"], "TOOL")
+        self.assertEqual(params["content"], "Use weather API")
+
 
 class TestBaseFormatDetector(unittest.TestCase):
     """Test buffer management and sequential tool index assignment in BaseFormatDetector."""
@@ -1277,6 +1311,148 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(params_str)
         self.assertEqual(params["city"], "San Francisco")
 
+    def test_detect_and_parse_no_parameters(self):
+        """Test parsing function calls with no parameters (non-streaming)"""
+        # Add a no-parameter tool
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """Let me get the current date for you.
+
+<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"""
+
+        result = self.detector.detect_and_parse(text, tools_with_no_param)
+
+        self.assertIn("Let me get the current date", result.normal_text)
+        self.assertEqual(len(result.calls), 1)
+
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_date")
+        params = json.loads(call.parameters)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters(self):
+        """Test streaming parsing of function calls with no parameters.
+
+        This test verifies the fix for the bug where functions with no parameters
+        were being silently skipped in streaming mode.
+        """
+        # Add a no-parameter tool
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"""
+
+        # Reset detector state
+        self.detector = DeepSeekV32Detector()
+
+        # Simulate streaming by splitting into small chunks
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        # Verify that the no-parameter function was correctly parsed
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+
+        # Parameters should be empty JSON object
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters_with_whitespace(self):
+        """Test streaming parsing when invoke content has only whitespace (newlines)."""
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        # This format has newlines inside the invoke tag (common model output)
+        text = """<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_date">
+
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"""
+
+        # Reset detector state
+        self.detector = DeepSeekV32Detector()
+
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        # Should still parse correctly even with whitespace-only content
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params, {})
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     def setUp(self):
@@ -1858,12 +2034,12 @@ class TestGlm4MoeDetector(unittest.TestCase):
                     and tool_call_chunk.tool_index is not None
                 ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
+                        tool_calls.append({"name": "", "parameters": ""})
                     tc = tool_calls[tool_call_chunk.tool_index]
                     if tool_call_chunk.name:
                         tc["name"] = tool_call_chunk.name
                     if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
+                        tc["parameters"] += tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
@@ -1890,12 +2066,12 @@ class TestGlm4MoeDetector(unittest.TestCase):
                     and tool_call_chunk.tool_index is not None
                 ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
+                        tool_calls.append({"name": "", "parameters": ""})
                     tc = tool_calls[tool_call_chunk.tool_index]
                     if tool_call_chunk.name:
                         tc["name"] = tool_call_chunk.name
                     if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
+                        tc["parameters"] += tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 2)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
@@ -1926,19 +2102,33 @@ class TestGlm4MoeDetector(unittest.TestCase):
 
     def test_partial_tool_call(self):
         """Test parsing a partial tool call that spans multiple chunks."""
-        text1 = "<tool_call>get_weather\n<arg_key>city</arg_key>\n"
-        result1 = self.detector.parse_streaming_increment(text1, self.tools)
-        self.assertEqual(result1.normal_text, "")
-        self.assertEqual(result1.calls, [])
-        self.assertEqual(self.detector._buffer, text1)
-        text2 = "<arg_value>Beijing</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
-        result2 = self.detector.parse_streaming_increment(text2, self.tools)
-        self.assertEqual(len(result2.calls), 1)
-        self.assertEqual(result2.calls[0].name, "get_weather")
+        chunks = [
+            "<tool_call>get_weather\n",
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
-            result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
         )
-        self.assertEqual(self.detector._buffer, "")
 
     def test_array_argument_with_escaped_json(self):
         """Test that array arguments with escaped JSON are properly handled without double-escaping."""
