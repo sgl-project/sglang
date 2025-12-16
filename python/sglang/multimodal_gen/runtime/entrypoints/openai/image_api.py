@@ -175,8 +175,10 @@ async def edits(
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
-    if not images or len(images) == 0:
-        raise HTTPException(status_code=422, detail="Field 'image' is required")
+    if (not images or len(images) == 0) and (not image_urls or len(image_urls) == 0):
+        raise HTTPException(
+            status_code=422, detail="Field 'image' or 'image_urls' is required"
+        )
 
     # Save all input images; additional images beyond the first are saved for potential future use
     uploads_dir = os.path.join("outputs", "uploads")
