@@ -39,7 +39,7 @@ inline __device__ void apply_token_rotary_embedding(
     const int x_index = 2 * rot_offset;
     const int y_index = x_index + 1;
 
-    // Directly access SMEM
+    // Directly access Global Memory
     const float cos_val = static_cast<float>(cos_ptr[rot_offset]);
     const float sin_val = static_cast<float>(sin_ptr[rot_offset]);
 
@@ -53,7 +53,7 @@ inline __device__ void apply_token_rotary_embedding(
     const int x_index = rot_offset;
     const int y_index = rot_offset + embed_dim;
 
-    // Directly access SMEM
+    // Directly access Global Memory
     const float cos_val_x = static_cast<float>(cos_ptr[rot_offset]);
     const float sin_val_x = static_cast<float>(sin_ptr[rot_offset]);
     const float cos_val_y = static_cast<float>(cos_ptr[rot_offset + embed_dim]);
@@ -93,14 +93,26 @@ inline __device__ void apply_token_rotary_embedding_vec(
     VecUnion data;
     data.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset * 2);
 
+    // Vectorized load for cos/sin: always 8 bytes (half of vector size, float2)
+    // float2 covers (kElePerVec / 2) scalar_t elements (pairs)
+    float2 cos_vec = *reinterpret_cast<const float2*>(cos_ptr + rot_offset);
+    float2 sin_vec = *reinterpret_cast<const float2*>(sin_ptr + rot_offset);
+
+    union CosSinVec {
+      float2 vec;
+      scalar_t elems[kElePerVec / 2];
+    };
+    CosSinVec cos_u, sin_u;
+    cos_u.vec = cos_vec;
+    sin_u.vec = sin_vec;
+
 #pragma unroll
     for (int i = 0; i < kElePerVec; i += 2) {
       // data.elems[i] is x, data.elems[i+1] is y
       // They correspond to pair index: rot_offset + (i / 2)
-      int curr_rot_offset = rot_offset + i / 2;
-
-      float cos_val = static_cast<float>(cos_ptr[curr_rot_offset]);
-      float sin_val = static_cast<float>(sin_ptr[curr_rot_offset]);
+      int idx = i / 2;
+      float cos_val = static_cast<float>(cos_u.elems[idx]);
+      float sin_val = static_cast<float>(sin_u.elems[idx]);
 
       float x = static_cast<float>(data.elems[i]);
       float y = static_cast<float>(data.elems[i + 1]);
@@ -120,20 +132,29 @@ inline __device__ void apply_token_rotary_embedding_vec(
     data_x.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset);
     data_y.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset + embed_dim);
 
+    // Vectorized load for cos/sin: always 16 bytes (full vector size, float4)
+    // float4 covers kElePerVec scalar_t elements
+    float4 cos_vec_x = *reinterpret_cast<const float4*>(cos_ptr + rot_offset);
+    float4 sin_vec_x = *reinterpret_cast<const float4*>(sin_ptr + rot_offset);
+    float4 cos_vec_y = *reinterpret_cast<const float4*>(cos_ptr + rot_offset + embed_dim);
+    float4 sin_vec_y = *reinterpret_cast<const float4*>(sin_ptr + rot_offset + embed_dim);
+
+    union CosSinVec {
+      float4 vec;
+      scalar_t elems[kElePerVec];
+    };
+    CosSinVec cos_u_x, sin_u_x, cos_u_y, sin_u_y;
+    cos_u_x.vec = cos_vec_x;
+    sin_u_x.vec = sin_vec_x;
+    cos_u_y.vec = cos_vec_y;
+    sin_u_y.vec = sin_vec_y;
+
 #pragma unroll
     for (int i = 0; i < kElePerVec; ++i) {
-      int curr_rot_offset = rot_offset + i;
-
-      // In non-interleaved, we might need different cos/sin for X and Y depending on implementation,
-      // but standard RoPE uses the same angle for the pair.
-      // Based on original scalar code:
-      // cos_val_x = cos_ptr[rot_offset]
-      // cos_val_y = cos_ptr[rot_offset + embed_dim]
-
-      float cos_val_x = static_cast<float>(cos_ptr[curr_rot_offset]);
-      float sin_val_x = static_cast<float>(sin_ptr[curr_rot_offset]);
-      float cos_val_y = static_cast<float>(cos_ptr[curr_rot_offset + embed_dim]);
-      float sin_val_y = static_cast<float>(sin_ptr[curr_rot_offset + embed_dim]);
+      float cos_val_x = static_cast<float>(cos_u_x.elems[i]);
+      float sin_val_x = static_cast<float>(sin_u_x.elems[i]);
+      float cos_val_y = static_cast<float>(cos_u_y.elems[i]);
+      float sin_val_y = static_cast<float>(sin_u_y.elems[i]);
 
       float x = static_cast<float>(data_x.elems[i]);
       float y = static_cast<float>(data_y.elems[i]);
@@ -183,9 +204,7 @@ __global__ void rotary_embedding_kernel_2d(
     const int num_kv_heads,
     const int head_size_arg,
     const int blocks_per_token) {
-  extern __shared__ char smem_[];
-  scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
-  scalar_t* s_sin = s_cos + rot_dim_arg;
+  // Removed shared memory allocation and loading logic
 
   const int token_idx = blockIdx.x;
   if (token_idx >= gridDim.x) {
@@ -198,29 +217,8 @@ __global__ void rotary_embedding_kernel_2d(
 
   constexpr int kVecBytes = 16;
   const int scalar_size = sizeof(scalar_t);
-  const int vec_size = kVecBytes / scalar_size;
 
-  // Load Cos/Sin to SMEM
-  // Always use vectorized load if available, but fallback to scalar loop if dim is not multiple
-  if constexpr (vectorized) {
-    using vec_t = float4;
-    const vec_t* cos_vec_ptr = reinterpret_cast<const vec_t*>(current_token_cos_ptr);
-    const vec_t* sin_vec_ptr = reinterpret_cast<const vec_t*>(current_token_sin_ptr);
-    vec_t* s_cos_vec = reinterpret_cast<vec_t*>(s_cos);
-    vec_t* s_sin_vec = reinterpret_cast<vec_t*>(s_sin);
-
-    for (int i = threadIdx.x; i < rot_dim_arg / vec_size; i += blockDim.x) {
-      s_cos_vec[i] = SGLANG_LDG(cos_vec_ptr + i);
-      s_sin_vec[i] = SGLANG_LDG(sin_vec_ptr + i);
-    }
-  } else {
-    for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
-      s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
-      s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
-    }
-  }
-  // Essential synchronization
-  __syncthreads();
+  // Removed SMEM loading and __syncthreads()
 
   scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
@@ -245,7 +243,7 @@ __global__ void rotary_embedding_kernel_2d(
 
       scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
       apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-          query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+          query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
     }
 
     if (key_for_token != nullptr) {
@@ -256,7 +254,7 @@ __global__ void rotary_embedding_kernel_2d(
 
         scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
         apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-            key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+            key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
       }
     }
   } else {
@@ -271,7 +269,7 @@ __global__ void rotary_embedding_kernel_2d(
 
       scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
       apply_token_rotary_embedding<scalar_t, interleaved>(
-          query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+          query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
     }
 
     if (key_for_token != nullptr) {
@@ -282,7 +280,7 @@ __global__ void rotary_embedding_kernel_2d(
 
         scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
         apply_token_rotary_embedding<scalar_t, interleaved>(
-            key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+            key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
       }
     }
   }
@@ -304,9 +302,7 @@ __global__ void rotary_embedding_kernel_1d(
     const int num_heads,
     const int num_kv_heads,
     const int head_size_arg) {
-  extern __shared__ char smem_[];
-  scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
-  scalar_t* s_sin = s_cos + rot_dim_arg;
+  // Removed shared memory allocation and loading logic
 
   const int token_idx = blockIdx.x;
   if (token_idx >= gridDim.x) return;
@@ -316,26 +312,8 @@ __global__ void rotary_embedding_kernel_1d(
 
   constexpr int kVecBytes = 16;
   const int scalar_size = sizeof(scalar_t);
-  const int vec_size = kVecBytes / scalar_size;
 
-  if constexpr (vectorized) {
-    using vec_t = float4;
-    const vec_t* cos_vec_ptr = reinterpret_cast<const vec_t*>(current_token_cos_ptr);
-    const vec_t* sin_vec_ptr = reinterpret_cast<const vec_t*>(current_token_sin_ptr);
-    vec_t* s_cos_vec = reinterpret_cast<vec_t*>(s_cos);
-    vec_t* s_sin_vec = reinterpret_cast<vec_t*>(s_sin);
-
-    for (int i = threadIdx.x; i < rot_dim_arg / vec_size; i += blockDim.x) {
-      s_cos_vec[i] = SGLANG_LDG(cos_vec_ptr + i);
-      s_sin_vec[i] = SGLANG_LDG(sin_vec_ptr + i);
-    }
-  } else {
-    for (int i = threadIdx.x; i < rot_dim_arg; i += blockDim.x) {
-      s_cos[i] = SGLANG_LDG(current_token_cos_ptr + i);
-      s_sin[i] = SGLANG_LDG(current_token_sin_ptr + i);
-    }
-  }
-  __syncthreads();
+  // Removed SMEM loading and __syncthreads()
 
   scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
@@ -355,7 +333,7 @@ __global__ void rotary_embedding_kernel_1d(
       scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
 
       apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-          query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+          query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
     }
 
     if (key_for_token != nullptr) {
@@ -366,7 +344,7 @@ __global__ void rotary_embedding_kernel_1d(
 
         scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
         apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-            key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+            key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
       }
     }
   } else {
@@ -378,7 +356,7 @@ __global__ void rotary_embedding_kernel_1d(
       scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
 
       apply_token_rotary_embedding<scalar_t, interleaved>(
-          query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+          query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
     }
 
     if (key_for_token != nullptr) {
@@ -389,7 +367,7 @@ __global__ void rotary_embedding_kernel_1d(
 
         scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
         apply_token_rotary_embedding<scalar_t, interleaved>(
-            key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
+            key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
       }
     }
   }
@@ -620,8 +598,8 @@ void rotary_embedding_cos_sin(
         dim3 grid_2d((int)num_tokens, std::max(1, blocks_per_token));
         dim3 grid_1d((int)num_tokens);
 
-        // We need 2 arrays (cos, sin) of size 'rot_dim_from_cache', each element is 'sizeof(torch_scalar_t)'
-        size_t smem_size = rot_dim_from_cache * sizeof(torch_scalar_t) * 2;
+        // No shared memory needed
+        size_t smem_size = 0;
 
         DISPATCH_ROT_DIM(
             embed_dim_for_rotation,
