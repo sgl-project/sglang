@@ -151,10 +151,12 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
         ]
+        # This test runs first (alphabetically) and needs longer timeout for
+        # DeepGEMM JIT compilation which is required for DeepSeek-V3's FP8 MoE layers
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
             other_args=other_args,
         )
 
