@@ -2153,15 +2153,15 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob or self.spec_algorithm.is_eagle():
-                batch.extend_input_len_per_req = [
+                batch_result.extend_input_len_per_req = [
                     req.extend_input_len for req in batch.reqs
                 ]
-                batch.extend_logprob_start_len_per_req = [
+                batch_result.extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs
                 ]
             else:
-                batch.extend_input_len_per_req = None
-                batch.extend_logprob_start_len_per_req = None
+                batch_result.extend_input_len_per_req = None
+                batch_result.extend_logprob_start_len_per_req = None
 
             ret = batch_result
         else:  # embedding or reward model
