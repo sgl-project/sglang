@@ -1,8 +1,8 @@
-# Benchmarks SGLang fused layernorm scale shift kernels versus PyTorch naive implementations
+# Benchmarks SGLang fused layernorm/rmsnorm scale shift kernels versus PyTorch naive implementations
 # Tests three kernel variants:
-# 1. fused_layernorm_scale_shift - with affine parameters (gamma/beta)
-# 2. fused_layernorm_scale_shift_no_affine - without affine parameters
-# 3. fused_scale_residual_layernorm_scale_shift - with residual and gate
+# 1. fused_norm_scale_shift - with affine parameters (gamma/beta)
+# 2. fused_norm_scale_shift_no_affine - without affine parameters
+# 3. fused_scale_residual_norm_scale_shift - with residual and gate
 import argparse
 import os
 from dataclasses import dataclass
@@ -18,13 +18,14 @@ IS_CI = (
 )
 
 
-# ========== fused_layernorm_scale_shift ==========
-def fused_layernorm_scale_shift_naive(
+# ========== fused_norm_scale_shift ==========
+def fused_norm_scale_shift_naive(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    norm_type: str,
     eps: float = 1e-5,
 ):
     dtype = x.dtype
@@ -34,32 +35,41 @@ def fused_layernorm_scale_shift_naive(
     s32 = scale.float()
     sh32 = shift.float()
 
-    mean = x32.mean(dim=1, keepdim=True)
-    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-
-    y_ln32 = (x32 - mean) * inv_std
-    y_ln32 = y_ln32 * w32 + b32
+    if norm_type == "layer":
+        mean = x32.mean(dim=1, keepdim=True)
+        var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
+        inv_std = (var + eps).sqrt().reciprocal()
+        y_ln32 = (x32 - mean) * inv_std
+        y_ln32 = y_ln32 * w32 + b32
+    elif norm_type == "rms":
+        mean_sq = (x32 * x32).mean(dim=1, keepdim=True)
+        inv_std = (mean_sq + eps).sqrt().reciprocal()
+        y_ln32 = x32 * inv_std
+        y_ln32 = y_ln32 * w32
     y_out = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
     return y_out
 
 
-def fused_layernorm_scale_shift_sglang(
+def fused_norm_scale_shift_sglang(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    norm_type: str,
     eps: float = 1e-5,
 ):
-    return sgl_kernel.fused_layernorm_scale_shift(x, weight, bias, scale, shift)
+    return sgl_kernel.fused_norm_scale_shift(
+        x, weight, bias, scale, shift, norm_type, eps
+    )
 
 
-# ========== fused_layernorm_scale_shift_no_affine ==========
-def fused_layernorm_scale_shift_no_affine_naive(
+# ========== fused_norm_scale_shift_no_affine ==========
+def fused_norm_scale_shift_no_affine_naive(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    norm_type: str,
     eps: float = 1e-5,
 ):
     dtype = x.dtype
@@ -67,33 +77,41 @@ def fused_layernorm_scale_shift_no_affine_naive(
     s32 = scale.float()
     sh32 = shift.float()
 
-    mean = x32.mean(dim=1, keepdim=True)
-    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-
-    y_ln32 = (x32 - mean) * inv_std
+    if norm_type == "layer":
+        mean = x32.mean(dim=1, keepdim=True)
+        var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
+        inv_std = (var + eps).sqrt().reciprocal()
+        y_ln32 = (x32 - mean) * inv_std
+    else:
+        mean_sq = (x32 * x32).mean(dim=1, keepdim=True)
+        inv_std = (mean_sq + eps).sqrt().reciprocal()
+        y_ln32 = x32 * inv_std
     y_out = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
     return y_out
 
 
-def fused_layernorm_scale_shift_no_affine_sglang(
+def fused_norm_scale_shift_no_affine_sglang(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    norm_type: str,
     eps: float = 1e-5,
 ):
-    return sgl_kernel.fused_layernorm_scale_shift_no_affine(x, scale, shift)
+    return sgl_kernel.fused_norm_scale_shift(
+        x, None, None, scale, shift, norm_type, eps
+    )
 
 
-# ========== fused_scale_residual_layernorm_scale_shift ==========
-def fused_scale_residual_layernorm_scale_shift_naive(
+# ========== fused_scale_residual_norm_scale_shift ==========
+def fused_scale_residual_norm_scale_shift_naive(
     residual: torch.Tensor,
     x: torch.Tensor,
+    gate: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
-    gate: torch.Tensor,
+    norm_type: str,
     eps: float = 1e-5,
 ):
     dtype = x.dtype
@@ -101,40 +119,47 @@ def fused_scale_residual_layernorm_scale_shift_naive(
     res32 = residual.float() + x.float() * gate.float()
     residual_out = res32.to(dtype)
 
-    # LayerNorm
+    # LayerNorm / RMSNorm
     w32 = weight.float()
     b32 = bias.float()
     s32 = scale.float()
     sh32 = shift.float()
 
-    mean = res32.mean(dim=1, keepdim=True)
-    var = (res32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-
-    y_ln32 = (res32 - mean) * inv_std
-    y_ln32 = y_ln32 * w32 + b32
+    if norm_type == "layer":
+        mean = res32.mean(dim=1, keepdim=True)
+        var = (res32 - mean).pow(2).mean(dim=1, keepdim=True)
+        inv_std = (var + eps).sqrt().reciprocal()
+        y_ln32 = (res32 - mean) * inv_std
+        y_ln32 = y_ln32 * w32 + b32
+    else:
+        mean_sq = (res32 * res32).mean(dim=1, keepdim=True)
+        inv_std = (mean_sq + eps).sqrt().reciprocal()
+        y_ln32 = res32 * inv_std
+        y_ln32 = y_ln32 * w32
     y_out = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
     return y_out, residual_out
 
 
-def fused_scale_residual_layernorm_scale_shift_sglang(
+def fused_scale_residual_norm_scale_shift_sglang(
     residual: torch.Tensor,
     x: torch.Tensor,
+    gate: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
-    gate: torch.Tensor,
+    norm_type: str,
     eps: float = 1e-5,
 ):
-    return sgl_kernel.fused_scale_residual_layernorm_scale_shift(
-        residual, x, weight, bias, scale, shift, gate
+    return sgl_kernel.fused_scale_residual_norm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, norm_type, eps
     )
 
 
-def bench_fused_layernorm_scale_shift(
+def bench_fused_norm_scale_shift(
     M: int,
     N: int,
+    norm_type: str,
     num_warmup: int,
     num_run: int,
 ) -> Tuple[float, float]:
@@ -149,10 +174,10 @@ def bench_fused_layernorm_scale_shift(
     shift = torch.randn(M, N, dtype=dtype, device=device)
 
     def run_naive():
-        fused_layernorm_scale_shift_naive(x, weight, bias, scale, shift, eps)
+        fused_norm_scale_shift_naive(x, weight, bias, scale, shift, norm_type, eps)
 
     def run_sglang():
-        fused_layernorm_scale_shift_sglang(x, weight, bias, scale, shift, eps)
+        fused_norm_scale_shift_sglang(x, weight, bias, scale, shift, norm_type, eps)
 
     # warmup
     for _ in range(num_warmup):
@@ -189,9 +214,10 @@ def bench_fused_layernorm_scale_shift(
     return naive_time, sglang_time
 
 
-def bench_fused_layernorm_scale_shift_no_affine(
+def bench_fused_norm_scale_shift_no_affine(
     M: int,
     N: int,
+    norm_type: str,
     num_warmup: int,
     num_run: int,
 ) -> Tuple[float, float]:
@@ -204,10 +230,10 @@ def bench_fused_layernorm_scale_shift_no_affine(
     shift = torch.randn(M, N, dtype=dtype, device=device)
 
     def run_naive():
-        fused_layernorm_scale_shift_no_affine_naive(x, scale, shift, eps)
+        fused_norm_scale_shift_no_affine_naive(x, scale, shift, norm_type, eps)
 
     def run_sglang():
-        fused_layernorm_scale_shift_no_affine_sglang(x, scale, shift, eps)
+        fused_norm_scale_shift_no_affine_sglang(x, scale, shift, norm_type, eps)
 
     # warmup
     for _ in range(num_warmup):
@@ -244,9 +270,10 @@ def bench_fused_layernorm_scale_shift_no_affine(
     return naive_time, sglang_time
 
 
-def bench_fused_scale_residual_layernorm_scale_shift(
+def bench_fused_scale_residual_norm_scale_shift(
     M: int,
     N: int,
+    norm_type: str,
     num_warmup: int,
     num_run: int,
 ) -> Tuple[float, float]:
@@ -263,13 +290,13 @@ def bench_fused_scale_residual_layernorm_scale_shift(
     gate = torch.randn(M, N, dtype=dtype, device=device)
 
     def run_naive():
-        fused_scale_residual_layernorm_scale_shift_naive(
-            residual, x, weight, bias, scale, shift, gate, eps
+        fused_scale_residual_norm_scale_shift_naive(
+            residual, x, gate, weight, bias, scale, shift, norm_type, eps
         )
 
     def run_sglang():
-        fused_scale_residual_layernorm_scale_shift_sglang(
-            residual, x, weight, bias, scale, shift, gate, eps
+        fused_scale_residual_norm_scale_shift_sglang(
+            residual, x, gate, weight, bias, scale, shift, norm_type, eps
         )
 
     # warmup
@@ -308,9 +335,9 @@ def bench_fused_scale_residual_layernorm_scale_shift(
 
 
 benchmark_kernels = {
-    "fused_layernorm_scale_shift": bench_fused_layernorm_scale_shift,
-    "fused_layernorm_scale_shift_no_affine": bench_fused_layernorm_scale_shift_no_affine,
-    "fused_scale_residual_layernorm_scale_shift": bench_fused_scale_residual_layernorm_scale_shift,
+    "fused_norm_scale_shift": bench_fused_norm_scale_shift,
+    "fused_norm_scale_shift_no_affine": bench_fused_norm_scale_shift_no_affine,
+    "fused_scale_residual_norm_scale_shift": bench_fused_scale_residual_norm_scale_shift,
 }
 
 
@@ -323,6 +350,7 @@ class ShapeArg:
 def benchmark_one_shape(
     kernel_name: str,
     shape_args: List[ShapeArg],
+    norm_type_args: List[str],
     num_warmup: int,
     num_run: int,
 ):
@@ -332,20 +360,22 @@ def benchmark_one_shape(
 
     kernel_func = benchmark_kernels[kernel_name]
 
-    for shape in shape_args:
-        naive_time, sglang_time = kernel_func(
-            shape.M,
-            shape.N,
-            num_warmup,
-            num_run,
-        )
-        speedup = naive_time / sglang_time if sglang_time > 0 else 0.0
-        print(
-            f"M={shape.M:5d}, N={shape.N:5d} | "
-            f"Naive: {naive_time:8.2f} us | "
-            f"SGLang: {sglang_time:8.2f} us | "
-            f"Speedup: {speedup:5.2f}x"
-        )
+    for norm_type in norm_type_args:
+        for shape in shape_args:
+            naive_time, sglang_time = kernel_func(
+                shape.M,
+                shape.N,
+                norm_type,
+                num_warmup,
+                num_run,
+            )
+            speedup = naive_time / sglang_time if sglang_time > 0 else 0.0
+            print(
+                f"M={shape.M:5d}, N={shape.N:5d} norm={norm_type} | "
+                f"Naive: {naive_time:8.2f} us | "
+                f"SGLang: {sglang_time:8.2f} us | "
+                f"Speedup: {speedup:5.2f}x"
+            )
 
 
 def main():
@@ -375,10 +405,14 @@ def main():
             ShapeArg(M=4096, N=4096),
         ]
 
+    norm_type_args = ["layer", "rms"]
+
     args = parser.parse_args()
 
     for kernel_name in benchmark_kernels.keys():
-        benchmark_one_shape(kernel_name, shape_args, args.num_warmup, args.num_run)
+        benchmark_one_shape(
+            kernel_name, shape_args, norm_type_args, args.num_warmup, args.num_run
+        )
 
 
 if __name__ == "__main__":
