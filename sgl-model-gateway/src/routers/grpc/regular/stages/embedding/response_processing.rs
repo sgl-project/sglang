@@ -87,7 +87,7 @@ impl EmbeddingResponseProcessingStage {
         let model = dispatch.model.clone();
 
         // Convert flat embedding vector to response
-        // sigle input -> single embedding object
+        // single input -> single embedding object
 
         let embedding_data = EmbeddingObject {
             object: "embedding".to_string(),

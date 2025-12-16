@@ -454,7 +454,6 @@ impl RequestPipeline {
             model_id
         );
         let start = Instant::now();
-        let _request_for_metrics = Arc::clone(&request);
 
         // Record request start
         SmgMetrics::record_router_request(
