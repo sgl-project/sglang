@@ -446,9 +446,6 @@ def save_gt_to_staging(
     The staging directory can be uploaded as a CI artifact for developers
     to download and upload to the sgl-test-files repository.
 
-    Note: Only frame files are saved, not metadata. Users should manually
-    upload frame files to sgl-test-files repository.
-
     Args:
         frames: List of frames as numpy arrays
         case: Test case configuration
@@ -464,7 +461,6 @@ def save_gt_to_staging(
     num_gpus = case.server_args.num_gpus
     case_id = case.id
 
-    # Save frames to staging directory (no metadata)
     gt_path = save_frames_as_gt(
         frames=frames,
         case_id=case_id,
@@ -473,29 +469,5 @@ def save_gt_to_staging(
         output_dir=staging_dir,
     )
 
-    # Print detailed instructions for uploading to sgl-test-files
     logger.info(f"[Staging] Saved GT frames for {case_id} to {gt_path}")
-    logger.info("=" * 60)
-    logger.info("GT FILES READY FOR UPLOAD")
-    logger.info("=" * 60)
-    logger.info(f"Staging directory: {gt_path}")
-    logger.info("")
-    logger.info("To add these GT files to the repository:")
-    logger.info("1. Clone sgl-test-files repo (if not already):")
-    logger.info("   git clone https://github.com/sgl-project/sgl-test-files.git")
-    logger.info("")
-    logger.info("2. Copy the generated files:")
-    logger.info(
-        f"   cp -r {gt_path}/* sgl-test-files/images/consistency_gt/{num_gpus}-gpu/{case_id}/"
-    )
-    logger.info("")
-    logger.info("3. Commit and push:")
-    logger.info("   cd sgl-test-files")
-    logger.info("   git add images/consistency_gt/")
-    logger.info(f'   git commit -m "Add consistency GT for {case_id}"')
-    logger.info("   git push")
-    logger.info("")
-    logger.info("4. After the PR is merged, re-run the tests.")
-    logger.info("=" * 60)
-
     return gt_path
