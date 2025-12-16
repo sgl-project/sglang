@@ -158,6 +158,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    get_int_env_var,
     init_custom_process_group,
     is_cuda,
     is_float4_e2m1fn_x2,
@@ -316,6 +317,8 @@ class ModelRunner:
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        self.gemm_ar_attn_op = None
+        self.gemm_ar_mlp_op = None
         self.forward_pass_id = 0
         self.init_new_workspace = False
 
@@ -432,6 +435,10 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        if self.device == "cuda" and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+            logger.info(f"Initialize Gemm-AllReduce Overlap Operator...")
+            self.init_overlap_gemm_allreduce_operator()
 
         # Check if the model is using hybrid SWA
         if (
@@ -2066,6 +2073,111 @@ class ModelRunner:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+
+    def init_overlap_gemm_allreduce_operator(self):
+        if get_int_env_var("SGL_USE_TP_OVERLAP", 0) != 1:
+            return
+
+        _TP_OVERLAP_GROUP = torch.distributed.new_group(
+            ranks=self.tp_group.ranks, backend="gloo"
+        )
+        torch.distributed.barrier(_TP_OVERLAP_GROUP)
+
+        # Init symm memory, init mc tensor
+        import cutlass
+        import cutlass.torch as cutlass_torch
+        import torch.distributed._symmetric_memory as symm_mem
+        from cutlass.cute.runtime import from_dlpack
+
+        def create_c_tensor_mc(torch_tensor_cpu):
+            # Try NVSHMEM first, fallback to torch symm_mem
+            from sglang.srt.distributed.device_communicators.nvshmem_communicator import (
+                get_nvshmem_comm,
+            )
+
+            nvshmem_comm = get_nvshmem_comm()
+
+            if nvshmem_comm:
+                # Use NVSHMEM_SYMM_MEM
+                symm_tensor = nvshmem_comm.create_symmetric_tensor(
+                    torch_tensor_cpu.shape, dtype=torch_tensor_cpu.dtype
+                )
+                mc_ptr = nvshmem_comm.create_multicast_pointer(symm_tensor)
+            else:
+                # Use TORCH_SYMM_MEM
+                symm_tensor = symm_mem.empty(
+                    torch_tensor_cpu.shape, device="cuda", dtype=torch_tensor_cpu.dtype
+                )
+                symm_tensor.copy_(torch_tensor_cpu)
+                symm = symm_mem.rendezvous(
+                    symm_tensor, group=dist.group.WORLD.group_name
+                )
+                mc_ptr = symm.multicast_ptr
+
+            cute_tensor_mc = from_dlpack(
+                cutlass_torch.as_tensor(
+                    mc_ptr, torch_tensor_cpu.shape, torch_tensor_cpu.dtype
+                ),
+                assumed_align=16,
+            )
+            cute_tensor_mc = cute_tensor_mc.mark_layout_dynamic(
+                leading_dim=1
+            )  # is_dynamic_layout=True
+            return symm_tensor, cute_tensor_mc
+
+        dtype_map = {
+            torch.float16: cutlass.Float16,
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float32: cutlass.Float32,
+        }
+        max_M = self.model_config.hf_config.max_position_embeddings
+        N = self.model_config.hf_config.hidden_size
+        _c_torch_cpu = cutlass_torch.matrix(
+            1, max_M, N, False, dtype_map.get(self.model_config.dtype, cutlass.BFloat16)
+        )  # l = 1, c_major == "m"
+        torch_symm_tensor, c_tensor_mc = create_c_tensor_mc(_c_torch_cpu)
+
+        from sglang.srt.layers.gemm_allreduce import GemmARLayer
+
+        self.gemm_ar_attn_op = GemmARLayer(
+            tp_group=_TP_OVERLAP_GROUP,
+            max_M=max_M,
+            N=self.model_config.hf_config.hidden_size,
+            K=(self.model_config.hf_config.hidden_size // self.tp_size),
+            input_dtype=self.model_config.dtype,
+            output_dtype=self.model_config.dtype,
+            local_world_size=self.tp_size,
+            c_tensor_mc=c_tensor_mc,
+            torch_symm_tensor=torch_symm_tensor,
+            mma_tiler_mn=(256, 256),  # Larger tiler for better performance
+            cluster_shape_mn=(2, 1),  # Better cluster shape for TP
+            use_2cta_instrs=True,  # Enable for better performance
+            use_tma_store=True,
+            all_reduce="LDMCxSTMC",
+        )
+
+        self.gemm_ar_mlp_op = GemmARLayer(
+            tp_group=_TP_OVERLAP_GROUP,
+            max_M=max_M,
+            N=self.model_config.hf_config.hidden_size,
+            K=(self.model_config.hf_config.intermediate_size // self.tp_size),
+            input_dtype=self.model_config.dtype,
+            output_dtype=self.model_config.dtype,
+            local_world_size=self.tp_size,
+            c_tensor_mc=c_tensor_mc,
+            torch_symm_tensor=torch_symm_tensor,
+            mma_tiler_mn=(256, 256),
+            cluster_shape_mn=(2, 2),
+            use_2cta_instrs=True,
+            use_tma_store=True,
+            all_reduce="LDMCxSTMC",
+        )
+
+        for each in self.model.model.layers:
+            if each.self_attn.o_proj:
+                each.self_attn.o_proj.gemm_ar_attn_op = self.gemm_ar_attn_op
+            if each.mlp.down_proj:
+                each.mlp.down_proj.gemm_ar_mlp_op = self.gemm_ar_mlp_op
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
