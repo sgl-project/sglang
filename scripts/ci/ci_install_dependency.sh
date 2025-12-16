@@ -5,6 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
+FLASHINFER_VERSION=0.5.3
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -153,6 +154,60 @@ $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFI
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
 $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 $PIP_CMD uninstall xformers || true
+
+# Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
+# Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
+FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
+mkdir -p "${FLASHINFER_CACHE_DIR}"
+
+# Clean up old versions to avoid cache bloat
+find "${FLASHINFER_CACHE_DIR}" -name "flashinfer_jit_cache-*.whl" ! -name "flashinfer_jit_cache-${FLASHINFER_VERSION}*" -type f -delete 2>/dev/null || true
+
+FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl"
+CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+
+FLASHINFER_INSTALLED=false
+
+# Try to install from cache first
+if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+    echo "Found cached flashinfer wheel: $CACHED_WHEEL"
+    if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+        FLASHINFER_INSTALLED=true
+        echo "Successfully installed flashinfer-jit-cache from cache"
+    else
+        echo "Failed to install from cache, will try downloading..."
+        rm -f "$CACHED_WHEEL"
+    fi
+fi
+
+# If not installed from cache, download with retry logic
+if [ "$FLASHINFER_INSTALLED" = false ]; then
+    for i in {1..5}; do
+        # Download wheel to cache directory (use pip directly as uv pip doesn't support download)
+        if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
+            --index-url https://flashinfer.ai/whl/${CU_VERSION} \
+            -d "${FLASHINFER_CACHE_DIR}"; then
+
+            CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
+            if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
+                if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+                    FLASHINFER_INSTALLED=true
+                    echo "Successfully downloaded and installed flashinfer-jit-cache"
+                    break
+                fi
+            else
+                echo "Warning: Download succeeded but wheel file not found"
+            fi
+        fi
+        echo "Attempt $i to download flashinfer-jit-cache failed, retrying in 10 seconds..."
+        sleep 10
+    done
+fi
+
+if [ "$FLASHINFER_INSTALLED" = false ]; then
+    echo "ERROR: Failed to install flashinfer-jit-cache after 5 attempts"
+    exit 1
+fi
 
 # Show current packages
 $PIP_CMD list
