@@ -49,6 +49,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         prefix: str = "",
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
+
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
             2 * self.hidden_size,
@@ -70,6 +71,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -78,6 +80,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -89,6 +92,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected

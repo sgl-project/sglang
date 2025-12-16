@@ -293,7 +293,6 @@ class LlamaModel(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
-                enable_tp=not is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -752,4 +751,3 @@ class InternLM3ForCausalLM(LlamaForCausalLM):
 
 
 EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM]
-
