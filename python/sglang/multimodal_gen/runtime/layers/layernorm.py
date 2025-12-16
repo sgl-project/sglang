@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
@@ -22,8 +21,8 @@ _is_cuda = is_cuda()
 
 from sgl_kernel import (
     fused_add_rmsnorm,
-    fused_layernorm_scale_shift,
-    fused_scale_residual_layernorm_scale_shift,
+    fused_norm_scale_shift,
+    fused_scale_residual_norm_scale_shift,
     rmsnorm,
 )
 
@@ -268,7 +267,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
     """
     Fused operation that combines:
     1. Gated residual connection
-    2. LayerNorm
+    2. LayerNorm or RMSNorm
     3. Scale and shift operations
 
     This reduces memory bandwidth by combining memory-bound operations.
@@ -285,6 +284,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.norm_type = norm_type
         self.eps = eps
         if norm_type == "rms":
             self.norm = RMSNorm(
@@ -323,9 +323,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
-        can_use_cuda = (
-            _is_cuda and (x.shape[-1] % 4 == 0) and not isinstance(self.norm, RMSNorm)
-        )
+        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)
         if can_use_cuda:
             B, L, C = x.shape
             M = B * L
@@ -393,7 +391,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             else:
                 raise ValueError(f"Gate type {type(gate)} not supported")
 
-            y_2d, residual_output = fused_scale_residual_layernorm_scale_shift(
+            y_2d, residual_output = fused_scale_residual_norm_scale_shift(
                 residual_2d,
                 x_2d,
                 gate_opt,
@@ -401,6 +399,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 beta_opt,
                 scale_arg,
                 shift_arg,
+                self.norm_type,
                 self.eps,
             )
             return y_2d.view(B, L, C), residual_output.view(B, L, C)
@@ -499,11 +498,7 @@ class LayerNormScaleShift(nn.Module):
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-        can_use_cuda = (
-            _is_cuda
-            and self.norm_type == "layer"
-            and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
-        )
+        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
         if can_use_cuda:
             B, L, C = x.shape
             M = B * L
@@ -522,8 +517,8 @@ class LayerNormScaleShift(nn.Module):
                 scale_arg = self._get_arg(scale, x, B, L, C, M)
                 shift_arg = self._get_arg(shift, x, B, L, C, M)
 
-                y_2d = fused_layernorm_scale_shift(
-                    x_2d, None, None, scale_arg, shift_arg, self.eps
+                y_2d = fused_norm_scale_shift(
+                    x_2d, None, None, scale_arg, shift_arg, self.norm_type, self.eps
                 )
                 return y_2d.view(B, L, C)
 
@@ -538,8 +533,14 @@ class LayerNormScaleShift(nn.Module):
             scale_arg = self._get_arg(scale, x, B, L, C, M)
             shift_arg = self._get_arg(shift, x, B, L, C, M)
 
-            y_2d = fused_layernorm_scale_shift(
-                x_2d, gamma_opt, beta_opt, scale_arg, shift_arg, self.eps
+            y_2d = fused_norm_scale_shift(
+                x_2d,
+                gamma_opt,
+                beta_opt,
+                scale_arg,
+                shift_arg,
+                self.norm_type,
+                self.eps,
             )
             return y_2d.view(B, L, C)
 
