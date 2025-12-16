@@ -3,15 +3,15 @@ import collections.abc
 import logging
 from collections.abc import Callable, Sequence
 from typing import Iterable, List, Optional, Tuple, TypeAlias, cast
-import numpy as np
+
 import torch
 import torch.nn as nn
 import torchaudio.functional as F
 from transformers import PretrainedConfig
+
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
