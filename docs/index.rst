@@ -23,6 +23,7 @@ Its core features include:
 
    basic_usage/send_request.ipynb
    basic_usage/openai_api.rst
+   basic_usage/ollama_api.md
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
