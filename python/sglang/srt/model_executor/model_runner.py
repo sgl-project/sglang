@@ -79,9 +79,6 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.hardware_backend.npu.graph_runner.npu_compile_model_runner import (
-    NPUCompileModelRunner,
-)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.npu.graph_runner.piecewise_npu_graph_runner_decode import (
     PiecewiseNPUGraphRunnerDecode,
@@ -2488,11 +2485,7 @@ class ModelRunner:
                 "npu": (
                     PiecewiseNPUGraphRunnerDecode
                     if self.server_args.enable_piecewise_npu_graph_decode
-                    else (
-                        NPUCompileModelRunner
-                        if self.server_args.enable_torchair_compile
-                        else NPUGraphRunner
-                    )
+                    else NPUGraphRunner
                 ),
             },
         )

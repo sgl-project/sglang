@@ -77,7 +77,11 @@ def patch_model_npu(
     tp_group: GroupCoordinator,
 ):
     compilation_config = get_global_server_args().compilation_config
-    if enable_compile and compilation_config.compiler == "npugraph_ex":
+    if (
+        enable_compile
+        and (compilation_config is not None)
+        and (compilation_config.compiler == "npugraph_ex")
+    ):
         backend = get_compiler_backend(compilation_config=compilation_config)
         yield torch.compile(
             torch.no_grad()(model.forward),
@@ -100,6 +104,7 @@ class NPUGraphRunner(CudaGraphRunner):
         model_runner.attn_backend.enable_torch_compile = (
             model_runner.server_args.enable_torch_compile
         )
+        self.enable_torchair_compile = model_runner.server_args.enable_torchair_compile
 
         super().__init__(model_runner)
         self.update_attr_name = None
@@ -138,10 +143,9 @@ class NPUGraphRunner(CudaGraphRunner):
         compilation_config = get_global_server_args().compilation_config
         if (
             self.enable_torch_compile
+            and (not self.enable_torchair_compile)
             and (not self.compile_bs or bs in self.compile_bs)
-            and (compilation_config.compiler != "npugraph_ex")
         ):
-            self.model_runner.attn_backend.enable_torch_compile = True
             compiler = NpuGraphCompiler(
                 model_runner=self.model_runner,
                 model=run_once_fn,
@@ -178,9 +182,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 compiled_function(*args)
 
         else:
-            self.model_runner.attn_backend.enable_torch_compile = False
-
-            if self.enable_torch_compile:
+            if self.enable_torchair_compile:
                 skip_guard_context = torch.compiler.set_stance(
                     skip_guard_eval_unsafe=True
                 )

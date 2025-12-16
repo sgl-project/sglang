@@ -251,7 +251,6 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
@@ -1292,7 +1291,7 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices,
             )
 
-        if self.graph_mode and (not self.enable_torch_compile):
+        if self.graph_mode and (not self.enable_torchair_compile):
             return self.forward_decode_graph(
                 q,
                 k,

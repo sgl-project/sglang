@@ -64,6 +64,25 @@ def set_default_server_args(args: "ServerArgs"):
             "Cannot enable both --enable-piecewise-npu-graph-decode and --enable-torchair-compile"
         )
 
+    if args.enable_piecewise_npu_graph_decode and args.enable_torch_compile:
+        raise ValueError(
+            "Cannot enable both --enable-piecewise-npu-graph-decode and --enable-torch-compile"
+        )
+
+    if args.enable_torchair_compile and args.enable_torch_compile:
+        raise ValueError(
+            "Cannot enable both --enable-torchair-compile and --enable-torch-compile"
+        )
+
+    if args.disable_cuda_graph and (
+        args.enable_piecewise_npu_graph_decode
+        or args.enable_torch_compile
+        or args.enable_torchair_compile
+    ):
+        raise ValueError(
+            f"--enable-piecewise-npu-graph-decode or --enable-torch-compile or --enable-torchair-compile is not appropriate for --disable-cuda-graph"
+        )
+
     if args.compilation_config:
         if args.compilation_config.compiler == "npugraph":
             args.enable_torch_compile = True
@@ -86,6 +105,11 @@ def set_default_server_args(args: "ServerArgs"):
         if args.compilation_config.compiler == "piecewise":
             args.enable_piecewise_npu_graph_decode = True
 
+            if args.disable_cuda_graph:
+                raise ValueError(
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --disable-cuda-graph"
+                )
+
             if args.enable_torchair_compile:
                 raise ValueError(
                     f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torchair-compile"
@@ -93,6 +117,11 @@ def set_default_server_args(args: "ServerArgs"):
 
         if args.compilation_config.compiler == "npugraph_ex":
             args.enable_torchair_compile = True
+
+            if args.disable_cuda_graph:
+                raise ValueError(
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --disable-cuda-graph"
+                )
 
             if args.enable_piecewise_npu_graph_decode:
                 raise ValueError(
