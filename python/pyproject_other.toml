@@ -68,6 +68,22 @@ runtime_common = [
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
 ]
 
+diffusion = [
+  "PyYAML==6.0.1",
+  "cloudpickle",
+  "diffusers==0.36.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python==4.10.0.84",
+  "remote-pdb",
+  "st_attn ==0.0.7",
+  "vsa==0.0.4",
+  "yunchang@git+https://github.com/feifeibear/long-context-attention.git@b192e97", # fix torch_cpp_ext._get_cuda_arch_flags() https://github.com/feifeibear/long-context-attention/pull/148,
+  "runai_model_streamer==0.15.3",
+  "cache-dit==1.1.8"
+]
+
 tracing = [
   "opentelemetry-sdk",
   "opentelemetry-api",
@@ -114,6 +130,9 @@ dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [

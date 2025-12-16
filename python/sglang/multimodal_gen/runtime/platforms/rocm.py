@@ -68,10 +68,8 @@ class RocmPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        logger.info(
-            "Trying SGLANG_DIFFUSION_ATTENTION_BACKEND=%s",
-            envs.SGLANG_DIFFUSION_ATTENTION_BACKEND,
-        )
+        torch.backends.cudnn.enabled = False  # Seems to improve things a lot on AMD
+        logger.info("Set: torch.backends.cudnn.enabled = False for better AMD performance.")
 
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")

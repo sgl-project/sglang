@@ -7,15 +7,26 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.srt.utils import is_hip
 
-try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+_is_hip = is_hip()
 
-    # flash_attn 3 no longer have a different API, see following commit:
-    # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
-    flash_attn_func = flash_attn_varlen_func
-except ImportError as e:
-    raise e
+if _is_hip:
+    try:
+        from flash_attn import flash_attn_func  # Use the flash attention v2 function
+    except ImportError:
+        def _unsupported(*args, **kwargs):
+            raise ImportError("flash-attn is not installed. Please install it, e.g., `pip install flash-attn`.")
+        flash_attn_func = _unsupported
+else:
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        # flash_attn 3 no longer have a different API, see following commit:
+        # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
+        flash_attn_func = flash_attn_varlen_func
+    except ImportError as e:
+        raise e
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -123,17 +134,27 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
-        output = flash_attn_func(
-            q=query,  # type: ignore[no-untyped-call]
-            k=key,
-            v=value,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.softmax_scale,
-            causal=self.causal,
-            return_softmax_lse=return_softmax_lse,
-            ver=fa_ver,
-        )
+
+        if _is_hip:
+            output = flash_attn_func(
+                q=query,  # type: ignore[no-untyped-call]
+                k=key,
+                v=value,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+            )
+        else:
+            output = flash_attn_func(
+                q=query,  # type: ignore[no-untyped-call]
+                k=key,
+                v=value,
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                return_softmax_lse=return_softmax_lse,
+                ver=fa_ver,
+            )
         return output
