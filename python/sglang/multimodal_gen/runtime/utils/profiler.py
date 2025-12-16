@@ -2,7 +2,7 @@ import os
 
 import torch
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
 logger = init_logger(__name__)
 
@@ -56,14 +56,14 @@ class SGLDiffusionProfiler:
             # profile denoising stage only
             warmup = 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
-            num_active_steps = num_actual_steps + warmup
+            self.num_active_steps = num_actual_steps + warmup
             self.profiler = torch.profiler.profile(
                 **common_torch_profiler_args,
                 schedule=torch.profiler.schedule(
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
-                    active=num_active_steps,
+                    active=self.num_active_steps,
                     repeat=1,
                 ),
             )
@@ -89,7 +89,12 @@ class SGLDiffusionProfiler:
 
     def step_denoising_step(self):
         if not self.full_profile:
-            self._step()
+            if self.num_active_steps >= 0:
+                self._step()
+                self.num_active_steps -= 1
+            else:
+                # early exit when enough steps are captured, to reduce the trace file size
+                self.stop(dump_rank=0)
 
     @classmethod
     def get_instance(cls) -> "SGLDiffusionProfiler":
@@ -122,7 +127,7 @@ class SGLDiffusionProfiler:
                     f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
                 )
             )
-            logger.info(f"Saving profiler traces to: {trace_path}")
             self.profiler.export_chrome_trace(trace_path)
+            logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
         except Exception as e:
-            logger.error(f"Failed to export trace: {e}")
+            logger.error(f"Failed to save trace: {e}")
