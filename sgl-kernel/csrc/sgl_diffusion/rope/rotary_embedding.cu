@@ -73,12 +73,11 @@ inline __device__ void apply_token_rotary_embedding_vec(
     const scalar_t* __restrict__ sin_ptr,  // [rot_dim]
     int rot_offset,
     int embed_dim) {
-  
   using vec_t = float4;
   constexpr int kVecBytes = sizeof(vec_t);
   constexpr int kScalarBytes = sizeof(scalar_t);
   constexpr int kElePerVec = kVecBytes / kScalarBytes;
-  
+
   // Union for type punning to avoid strict aliasing issues with reinterpret_cast
   union VecUnion {
     vec_t vec;
@@ -90,59 +89,59 @@ inline __device__ void apply_token_rotary_embedding_vec(
     // A single vector load contains 'kElePerVec' elements, which is 'kElePerVec / 2' pairs.
     // rot_offset is the index of the PAIR.
     // Address in arr is rot_offset * 2.
-    
+
     VecUnion data;
     data.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset * 2);
-    
-    #pragma unroll
+
+#pragma unroll
     for (int i = 0; i < kElePerVec; i += 2) {
       // data.elems[i] is x, data.elems[i+1] is y
       // They correspond to pair index: rot_offset + (i / 2)
       int curr_rot_offset = rot_offset + i / 2;
-      
+
       float cos_val = static_cast<float>(cos_ptr[curr_rot_offset]);
       float sin_val = static_cast<float>(sin_ptr[curr_rot_offset]);
-      
+
       float x = static_cast<float>(data.elems[i]);
-      float y = static_cast<float>(data.elems[i+1]);
-      
+      float y = static_cast<float>(data.elems[i + 1]);
+
       data.elems[i] = static_cast<scalar_t>(x * cos_val - y * sin_val);
-      data.elems[i+1] = static_cast<scalar_t>(y * cos_val + x * sin_val);
+      data.elems[i + 1] = static_cast<scalar_t>(y * cos_val + x * sin_val);
     }
-    
+
     *reinterpret_cast<vec_t*>(arr + rot_offset * 2) = data.vec;
 
   } else {
     // Non-interleaved: X and Y are separated by embed_dim.
     // We process 'kElePerVec' PAIRS at once.
     // Load X vector and Y vector.
-    
+
     VecUnion data_x, data_y;
     data_x.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset);
     data_y.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset + embed_dim);
-    
-    #pragma unroll
+
+#pragma unroll
     for (int i = 0; i < kElePerVec; ++i) {
       int curr_rot_offset = rot_offset + i;
-      
+
       // In non-interleaved, we might need different cos/sin for X and Y depending on implementation,
       // but standard RoPE uses the same angle for the pair.
       // Based on original scalar code:
       // cos_val_x = cos_ptr[rot_offset]
       // cos_val_y = cos_ptr[rot_offset + embed_dim]
-      
+
       float cos_val_x = static_cast<float>(cos_ptr[curr_rot_offset]);
       float sin_val_x = static_cast<float>(sin_ptr[curr_rot_offset]);
       float cos_val_y = static_cast<float>(cos_ptr[curr_rot_offset + embed_dim]);
       float sin_val_y = static_cast<float>(sin_ptr[curr_rot_offset + embed_dim]);
-      
+
       float x = static_cast<float>(data_x.elems[i]);
       float y = static_cast<float>(data_y.elems[i]);
-      
+
       data_x.elems[i] = static_cast<scalar_t>(x * cos_val_x - y * sin_val_x);
       data_y.elems[i] = static_cast<scalar_t>(y * cos_val_y + x * sin_val_y);
     }
-    
+
     *reinterpret_cast<vec_t*>(arr + rot_offset) = data_x.vec;
     *reinterpret_cast<vec_t*>(arr + rot_offset + embed_dim) = data_y.vec;
   }
@@ -227,31 +226,31 @@ __global__ void rotary_embedding_kernel_2d(
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
 
   const int local_block_idx = blockIdx.y;
-  
+
   if constexpr (vectorized) {
     using vec_t = float4;
     constexpr int kElePerVec = kVecBytes / sizeof(scalar_t);
     constexpr int pairs_per_step = interleaved ? (kElePerVec / 2) : kElePerVec;
-    
+
     const int pair_stride = blockDim.x * blocks_per_token * pairs_per_step;
     const int thread_pair_offset = (local_block_idx * blockDim.x + threadIdx.x) * pairs_per_step;
     const int nq_pairs = num_heads * embed_dim_for_rotation;
-    
+
     for (int i = thread_pair_offset; i < nq_pairs; i += pair_stride) {
       const int head_idx = i / embed_dim_for_rotation;
       const int rot_offset = i % embed_dim_for_rotation;
-      
+
       scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
       apply_token_rotary_embedding_vec<scalar_t, interleaved>(
           query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
     }
-    
+
     if (key_for_token != nullptr) {
       const int nk_pairs = num_kv_heads * embed_dim_for_rotation;
       for (int i = thread_pair_offset; i < nk_pairs; i += pair_stride) {
         const int head_idx = i / embed_dim_for_rotation;
         const int rot_offset = i % embed_dim_for_rotation;
-        
+
         scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
         apply_token_rotary_embedding_vec<scalar_t, interleaved>(
             key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
@@ -261,7 +260,7 @@ __global__ void rotary_embedding_kernel_2d(
     // Fallback to scalar implementation
     const int pair_stride = blockDim.x * blocks_per_token;
     const int thread_pair_offset = local_block_idx * blockDim.x + threadIdx.x;
-    
+
     const int nq_pairs = num_heads * embed_dim_for_rotation;
     for (int i = thread_pair_offset; i < nq_pairs; i += pair_stride) {
       const int head_idx = i / embed_dim_for_rotation;
@@ -342,23 +341,23 @@ __global__ void rotary_embedding_kernel_1d(
     using vec_t = float4;
     constexpr int kElePerVec = kVecBytes / sizeof(scalar_t);
     constexpr int pairs_per_step = interleaved ? (kElePerVec / 2) : kElePerVec;
-    
+
     const int nq_pairs = num_heads * embed_dim_for_rotation;
     for (int i = threadIdx.x * pairs_per_step; i < nq_pairs; i += blockDim.x * pairs_per_step) {
       const int head_idx = i / embed_dim_for_rotation;
       const int rot_offset = i % embed_dim_for_rotation;
       scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
-      
+
       apply_token_rotary_embedding_vec<scalar_t, interleaved>(
           query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
     }
-    
+
     if (key_for_token != nullptr) {
       const int nk_pairs = num_kv_heads * embed_dim_for_rotation;
       for (int i = threadIdx.x * pairs_per_step; i < nk_pairs; i += blockDim.x * pairs_per_step) {
         const int head_idx = i / embed_dim_for_rotation;
         const int rot_offset = i % embed_dim_for_rotation;
-        
+
         scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
         apply_token_rotary_embedding_vec<scalar_t, interleaved>(
             key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
@@ -371,7 +370,7 @@ __global__ void rotary_embedding_kernel_1d(
       const int head_idx = i / embed_dim_for_rotation;
       const int rot_offset = i % embed_dim_for_rotation;
       scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
-       
+
       apply_token_rotary_embedding<scalar_t, interleaved>(
           query_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
     }
@@ -381,7 +380,7 @@ __global__ void rotary_embedding_kernel_1d(
       for (int i = threadIdx.x; i < nk_pairs; i += blockDim.x) {
         const int head_idx = i / embed_dim_for_rotation;
         const int rot_offset = i % embed_dim_for_rotation;
-        
+
         scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
         apply_token_rotary_embedding<scalar_t, interleaved>(
             key_for_token_head, s_cos, s_sin, rot_offset, embed_dim_for_rotation);
@@ -500,7 +499,7 @@ void rotary_embedding_cos_sin(
         // Constants for vectorization
         constexpr int kVecBytes = 16;
         constexpr int kElePerVec = kVecBytes / sizeof(torch_scalar_t);
-        
+
         // Determine how many pairs one thread handles in one vector step
         // Interleaved: 1 vector load (16B) contains 'kElePerVec' elements -> 'kElePerVec / 2' pairs.
         // Non-interleaved: 2 vector loads (32B) contains 'kElePerVec' pairs (X vec + Y vec).
@@ -509,10 +508,10 @@ void rotary_embedding_cos_sin(
         // Check if we can guarantee vectorization for ALL tokens
         // We need Base Pointers, Strides, and Dimension to be aligned.
         bool can_vectorize_all = true;
-        
+
         // 1. Check Dimensions
         if (embed_dim_for_rotation % pairs_per_step != 0) can_vectorize_all = false;
-        
+
         // 2. Check Base Pointers
         if (reinterpret_cast<uintptr_t>(query.data_ptr()) % kVecBytes != 0) can_vectorize_all = false;
         if (reinterpret_cast<uintptr_t>(cos.data_ptr()) % kVecBytes != 0) can_vectorize_all = false;
@@ -522,14 +521,14 @@ void rotary_embedding_cos_sin(
         }
 
         // 3. Check Strides
-        // We need the stride between tokens to be a multiple of vector size 
+        // We need the stride between tokens to be a multiple of vector size
         // to ensure that if token 0 is aligned, token 1 is also aligned.
         if (query_token_stride * sizeof(torch_scalar_t) % kVecBytes != 0) can_vectorize_all = false;
         if (head_stride_query * sizeof(torch_scalar_t) % kVecBytes != 0) can_vectorize_all = false;
-        
+
         if (key.has_value()) {
-           if (key_token_stride * sizeof(torch_scalar_t) % kVecBytes != 0) can_vectorize_all = false;
-           if (head_stride_key * sizeof(torch_scalar_t) % kVecBytes != 0) can_vectorize_all = false;
+          if (key_token_stride * sizeof(torch_scalar_t) % kVecBytes != 0) can_vectorize_all = false;
+          if (head_stride_key * sizeof(torch_scalar_t) % kVecBytes != 0) can_vectorize_all = false;
         }
 
         // Determine launch configuration
@@ -537,13 +536,14 @@ void rotary_embedding_cos_sin(
         // Otherwise, fallback to conservative estimate (1 pair per thread) to ensure enough blocks.
         const int launch_pairs_per_thread = can_vectorize_all ? pairs_per_step : 1;
 
-        const int total_threads_needed = (max_pairs_to_rotate_per_token + launch_pairs_per_thread - 1) / launch_pairs_per_thread;
-        
+        const int total_threads_needed =
+            (max_pairs_to_rotate_per_token + launch_pairs_per_thread - 1) / launch_pairs_per_thread;
+
         // Case 1: 2D Grid (Split one token across multiple blocks)
         // Keep block size moderate (128-256) aligned with head size
         const int threads_per_block_2d = std::min<int>(256, std::max(128, embed_dim_for_rotation));
         const int blocks_per_token_2d = (total_threads_needed + threads_per_block_2d - 1) / threads_per_block_2d;
-        
+
         // Decide grid strategy
         const bool use_grid_2d = (num_tokens <= 4) && (blocks_per_token_2d > 1);
 
@@ -568,80 +568,139 @@ void rotary_embedding_cos_sin(
             if (use_grid_2d) {
               if (vectorized) {
                 rotary_embedding_kernel_2d<cuda_scalar_t, true, true><<<grid_2d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size, blocks_per_token);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size,
+                    blocks_per_token);
               } else {
                 rotary_embedding_kernel_2d<cuda_scalar_t, true, false><<<grid_2d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size, blocks_per_token);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size,
+                    blocks_per_token);
               }
             } else {
               if (vectorized) {
                 rotary_embedding_kernel_1d<cuda_scalar_t, true, true><<<grid_1d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size);
               } else {
                 rotary_embedding_kernel_1d<cuda_scalar_t, true, false><<<grid_1d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size);
               }
             }
-          } else { // non-interleaved
+          } else {  // non-interleaved
             if (use_grid_2d) {
               if (vectorized) {
                 rotary_embedding_kernel_2d<cuda_scalar_t, false, true><<<grid_2d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size, blocks_per_token);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size,
+                    blocks_per_token);
               } else {
                 rotary_embedding_kernel_2d<cuda_scalar_t, false, false><<<grid_2d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size, blocks_per_token);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size,
+                    blocks_per_token);
               }
             } else {
               if (vectorized) {
                 rotary_embedding_kernel_1d<cuda_scalar_t, false, true><<<grid_1d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size);
               } else {
                 rotary_embedding_kernel_1d<cuda_scalar_t, false, false><<<grid_1d, block, smem_size, stream>>>(
-                  reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                  reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                  key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                  rot_dim_from_cache, embed_dim_for_rotation, query_token_stride, key_token_stride,
-                  head_stride_query, head_stride_key, num_heads, num_kv_heads, (int)head_size);
+                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                    rot_dim_from_cache,
+                    embed_dim_for_rotation,
+                    query_token_stride,
+                    key_token_stride,
+                    head_stride_query,
+                    head_stride_key,
+                    num_heads,
+                    num_kv_heads,
+                    (int)head_size);
               }
             }
           }
-          
         };
 
         // Close the log file after all launches
@@ -650,7 +709,6 @@ void rotary_embedding_cos_sin(
         } else {
           launch_kernel(false);
         }
-
       });
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
