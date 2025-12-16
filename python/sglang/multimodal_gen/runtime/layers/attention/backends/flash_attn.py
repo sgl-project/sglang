@@ -15,8 +15,12 @@ if _is_hip:
     try:
         from flash_attn import flash_attn_func  # Use the flash attention v2 function
     except ImportError:
+
         def _unsupported(*args, **kwargs):
-            raise ImportError("flash-attn is not installed. Please install it, e.g., `pip install flash-attn`.")
+            raise ImportError(
+                "flash-attn is not installed. Please install it, e.g., `pip install flash-attn`."
+            )
+
         flash_attn_func = _unsupported
 else:
     try:

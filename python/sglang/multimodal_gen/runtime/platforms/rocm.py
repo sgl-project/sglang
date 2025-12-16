@@ -9,7 +9,6 @@ adjusted to match the structure and interface of `cuda.py`.
 
 import torch
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -69,7 +68,9 @@ class RocmPlatform(Platform):
         dtype: torch.dtype,
     ) -> str:
         torch.backends.cudnn.enabled = False  # Seems to improve things a lot on AMD
-        logger.info("Set: torch.backends.cudnn.enabled = False for better AMD performance.")
+        logger.info(
+            "Set: torch.backends.cudnn.enabled = False for better AMD performance."
+        )
 
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
