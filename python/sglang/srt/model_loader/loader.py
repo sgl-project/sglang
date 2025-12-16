@@ -841,6 +841,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         from sglang.srt.layers.quantization.blockwise_fp8_utils import (
             scaled_fp8_blockwise,
         )
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         from sglang.srt.layers.parameter import BlockQuantScaleParameter
         from torch.nn.parameter import Parameter
@@ -848,11 +849,21 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         # Default block size for blockwise quantization
         default_block_size = [128, 128]
 
-        for name, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is None:
-                continue
+        # Create FP8 config for setting quant_method after quantization
+        # Note: is_checkpoint_fp8_serialized=False because we're doing online quantization
+        # weight_block_size is not set here because Fp8Config requires is_checkpoint_fp8_serialized=True
+        # for weight_block_size, but we handle blockwise quantization manually
+        fp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=None,
+            weight_block_size=default_block_size,
+        )
 
+        # Track which modules were successfully quantized
+        quantized_modules = []
+
+        for name, module in model.named_modules():
             with device_loading_context(module, target_device):
                 # 1) Skip modules that should not be quantized (lm_head, embeddings, layer norms, etc.)
                 if any(
@@ -877,7 +888,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     torch.float32,
                 ]:
                     logger.info(
-                        f"[QuantizedRL] module: {name} not BF16/FP16/FP32 weights"
+                        f"[QuantizedRL] module: {name} dtype is {weight.dtype} not BF16/FP16/FP32 weights"
                     )
                     continue
 
@@ -891,10 +902,16 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     ):
                         try:
                             qweight, scale = scaled_fp8_blockwise(
-                                weight.data, default_block_size
+                                weight, default_block_size
                             )
                             # Scale shape is (blk_m, blk_n, 1); squeeze the last dim
                             scale = scale.squeeze(-1)
+                            
+                            # Transpose scale to match transposed weight layout
+                            # If weight is (M, K) and gets transposed to (K, M),
+                            # scale should be (blk_m, blk_n) = (M//128, K//128)
+                            # and needs to be transposed to (blk_n, blk_m) = (K//128, M//128)
+                            scale = scale.t()
 
                             # Remove existing weight_scale
                             if hasattr(module, "weight_scale"):
@@ -925,12 +942,20 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             module.weight = Parameter(
                                 qweight.t(), requires_grad=False
                             )
-                            use_blockwise = False
+                            use_blockwise = True
+                            
                             logger.info(
                                 f"[QuantizedRL] Quantize (blockwise, initial load): {name} "
                                 f"{weight.dtype}→FP8 "
                                 f"(shape={weight.shape}, block_size={default_block_size})"
                             )
+                            quant_method = fp8_config.get_quant_method(module, prefix=name)
+                            if quant_method is not None:
+                                module.quant_method = quant_method
+                                module.weight_block_size = default_block_size
+                                logger.debug(
+                                    f"[QuantizedRL] Set quant_method weight_block_size={default_block_size} for module: {name}"
+                                )
                         except Exception as e:
                             logger.warning(
                                 f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
@@ -941,11 +966,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 #    weights for this module and do not attempt per-channel FP8 here. FP8
                 #    conversion for reload will be handled by rebinding_and_load_weights.
                 if not use_blockwise:
+
                     logger.info(
                         f"[QuantizedRL] Disabled or failed blockwise fp8 for module: {name}; "
                         f"keeping original weight dtype {weight.dtype} on initial load"
                     )
-                    quant_method.process_weights_after_loading(module)
+                    # quant_method = getattr(module, "quant_method", None)
+                    # quant_method.process_weights_after_loading(module)
+                    
 
 
 
@@ -1176,7 +1204,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                                 )
                                 # scale shape is (blk_m, blk_n, 1), need to squeeze
                                 scale = scale.squeeze(-1)
-                                use_blockwise = False
+                                use_blockwise = True
                                 logger.info(
                                     f"[QuantizedRL] Quantize (blockwise): {name} {weight.dtype}→FP8 "
                                     f"(shape={weight.shape}, block_size={default_block_size})"
@@ -2833,19 +2861,10 @@ def get_model_loader(
         if model_config and not model_config.quantization:
             logger.info(
                 "QuantizedRL: Setting quantization to fp8 (native SGLang support). "
-                "Model will be loaded with FP8 infrastructure"
+                "Model will be loaded with FP8 infrastructure. "
+                "Quantization config will be set after weights are loaded."
             )
-            use_blockwise = False
             model_config.quantization = "fp8"
-            if use_blockwise:
-                model_config.hf_config.quantization_config = {
-                    "activation_scheme": "dynamic",
-                    "fmt": "e4m3",
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                }
-            else:
-                pass
 
 
         return QuantizedRLModelLoader(load_config)
