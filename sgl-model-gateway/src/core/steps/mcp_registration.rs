@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     app_context::AppContext,
     mcp::{config::McpServerConfig, manager::McpManager},
-    observability::metrics::SmgMetrics,
+    observability::metrics::Metrics,
     workflow::*,
 };
 
@@ -153,7 +153,7 @@ impl StepExecutor for RegisterMcpServerStep {
         mcp_manager.register_static_server(config_request.name.clone(), mcp_client);
 
         // Update active MCP servers metric
-        SmgMetrics::set_mcp_servers_active(mcp_manager.list_servers().len());
+        Metrics::set_mcp_servers_active(mcp_manager.list_servers().len());
 
         info!("Registered MCP server: {}", config_request.name);
 

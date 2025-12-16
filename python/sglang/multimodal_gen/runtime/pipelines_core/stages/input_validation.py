@@ -293,12 +293,16 @@ class InputValidationStage(PipelineStage):
         result = VerificationResult()
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
-        # Validate height and width
 
-        if batch.height % 8 != 0 or batch.width % 8 != 0:
-            raise ValueError(
-                f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
-            )
+        # Validate height and width
+        def check_size(value: int, name: str):
+            if value % (8 * server_args.num_gpus) != 0:
+                raise ValueError(
+                    f"{name} must be divisible by (8 x num_gpus) but {value} % (8 * {server_args.num_gpus}) != 0."
+                )
+
+        check_size(batch.height, "Height")
+        check_size(batch.width, "Width")
         result.add_check("seeds", batch.seeds, V.list_not_empty)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         return result
