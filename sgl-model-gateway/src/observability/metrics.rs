@@ -24,197 +24,6 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
-    describe_counter!(
-        "sgl_router_requests_total",
-        "Total number of requests by route and method"
-    );
-    describe_histogram!(
-        "sgl_router_request_duration_seconds",
-        "Request duration in seconds"
-    );
-    describe_counter!(
-        "sgl_router_request_errors_total",
-        "Total number of request errors by route and error type"
-    );
-    describe_counter!(
-        "sgl_router_attempt_http_responses_total",
-        "Total number of upstream engine HTTP responses by status code"
-    );
-    describe_counter!(
-        "sgl_router_retries_total",
-        "Total number of request retries by route"
-    );
-    describe_histogram!(
-        "sgl_router_retry_backoff_duration_seconds",
-        "Backoff duration in seconds by attempt index"
-    );
-    describe_counter!(
-        "sgl_router_retries_exhausted_total",
-        "Total number of requests that exhausted retries by route"
-    );
-
-    describe_gauge!(
-        "sgl_router_cb_state",
-        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
-    );
-    describe_counter!(
-        "sgl_router_cb_state_transitions_total",
-        "Total number of circuit breaker state transitions by worker"
-    );
-    describe_counter!(
-        "sgl_router_cb_outcomes_total",
-        "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
-    );
-    describe_gauge!(
-        "sgl_router_cb_consecutive_failures",
-        "Current consecutive failure count per worker circuit breaker"
-    );
-    describe_gauge!(
-        "sgl_router_cb_consecutive_successes",
-        "Current consecutive success count per worker circuit breaker"
-    );
-
-    describe_counter!(
-        "sgl_router_discovery_watcher_errors_total",
-        "Total number of Kubernetes watcher errors"
-    );
-    describe_counter!(
-        "sgl_router_discovery_watcher_restarts_total",
-        "Total number of Kubernetes watcher restarts"
-    );
-
-    describe_gauge!(
-        "sgl_router_active_workers",
-        "Number of currently active workers"
-    );
-    describe_gauge!(
-        "sgl_router_worker_health",
-        "Worker health status (1=healthy, 0=unhealthy)"
-    );
-    describe_counter!(
-        "sgl_router_processed_requests_total",
-        "Total requests processed by each worker"
-    );
-
-    describe_gauge!(
-        "sgl_router_job_queue_depth",
-        "Current number of pending jobs in the queue"
-    );
-    describe_histogram!(
-        "sgl_router_job_duration_seconds",
-        "Job processing duration in seconds by job type"
-    );
-    describe_counter!(
-        "sgl_router_job_success_total",
-        "Total successful job completions by job type"
-    );
-    describe_counter!(
-        "sgl_router_job_failure_total",
-        "Total failed job completions by job type"
-    );
-    describe_counter!(
-        "sgl_router_job_queue_full_total",
-        "Total number of jobs rejected due to queue full"
-    );
-    describe_counter!(
-        "sgl_router_job_shutdown_rejected_total",
-        "Total number of jobs rejected due to shutdown"
-    );
-
-    describe_counter!(
-        "sgl_router_policy_decisions_total",
-        "Total routing policy decisions by policy and worker"
-    );
-    describe_counter!("sgl_router_cache_hits_total", "Total cache hits");
-    describe_counter!("sgl_router_cache_misses_total", "Total cache misses");
-    describe_gauge!(
-        "sgl_router_tree_size",
-        "Current tree size for cache-aware routing"
-    );
-    describe_counter!(
-        "sgl_router_load_balancing_events_total",
-        "Total load balancing trigger events"
-    );
-    describe_gauge!("sgl_router_max_load", "Maximum worker load");
-    describe_gauge!("sgl_router_min_load", "Minimum worker load");
-
-    describe_counter!("sgl_router_pd_requests_total", "Total PD requests by route");
-    describe_counter!(
-        "sgl_router_pd_prefill_requests_total",
-        "Total prefill requests per worker"
-    );
-    describe_counter!(
-        "sgl_router_pd_decode_requests_total",
-        "Total decode requests per worker"
-    );
-    describe_counter!(
-        "sgl_router_pd_errors_total",
-        "Total PD errors by error type"
-    );
-    describe_counter!(
-        "sgl_router_pd_prefill_errors_total",
-        "Total prefill server errors"
-    );
-    describe_counter!(
-        "sgl_router_pd_decode_errors_total",
-        "Total decode server errors"
-    );
-    describe_counter!(
-        "sgl_router_pd_stream_errors_total",
-        "Total streaming errors per worker"
-    );
-    describe_histogram!(
-        "sgl_router_pd_request_duration_seconds",
-        "PD request duration by route"
-    );
-
-    describe_counter!(
-        "sgl_router_discovery_updates_total",
-        "Total service discovery update events"
-    );
-    describe_gauge!(
-        "sgl_router_discovery_workers_added",
-        "Number of workers added in last discovery update"
-    );
-    describe_gauge!(
-        "sgl_router_discovery_workers_removed",
-        "Number of workers removed in last discovery update"
-    );
-
-    describe_histogram!(
-        "sgl_router_generate_duration_seconds",
-        "Generate request duration"
-    );
-
-    describe_counter!("sgl_router_embeddings_total", "Total embedding requests");
-    describe_histogram!(
-        "sgl_router_embeddings_duration_seconds",
-        "Embedding request duration"
-    );
-    describe_counter!(
-        "sgl_router_embeddings_errors_total",
-        "Embedding request errors"
-    );
-    describe_gauge!("sgl_router_embeddings_queue_size", "Embedding queue size");
-
-    describe_gauge!(
-        "sgl_router_running_requests",
-        "Number of running requests per worker"
-    );
-
-    describe_counter!(
-        "sgl_router_http_requests_total",
-        "Total number of HTTP requests"
-    );
-    describe_counter!(
-        "sgl_router_http_responses_total",
-        "Total number of HTTP responses by status code and error code"
-    );
-
-    // ========================================================================
-    // SMG Metrics (new layered architecture)
-    // ========================================================================
-
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
@@ -414,339 +223,8 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to install Prometheus metrics exporter");
 }
 
-pub struct RouterMetrics;
-
-impl RouterMetrics {
-    pub fn record_request(route: &'static str) {
-        counter!("sgl_router_requests_total",
-            "route" => route
-        )
-        .increment(1);
-    }
-
-    pub fn record_request_duration(duration: Duration) {
-        histogram!("sgl_router_request_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_request_error(route: &'static str, error_type: &'static str) {
-        counter!("sgl_router_request_errors_total",
-            "route" => route,
-            "error_type" => error_type
-        )
-        .increment(1);
-    }
-
-    // TODO unify metric names
-    pub fn record_attempt_http_response(route: &'static str, status_code: u16, error_code: &str) {
-        counter!("sgl_router_attempt_http_responses_total",
-            "route" => route,
-            "status_code" => status_code.to_string(),
-            "error_code" => error_code.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_retry(route: &'static str) {
-        counter!("sgl_router_retries_total",
-            "route" => route
-        )
-        .increment(1);
-    }
-
-    pub fn record_retry_backoff_duration(duration: Duration, attempt: u32) {
-        histogram!("sgl_router_retry_backoff_duration_seconds",
-            "attempt" => attempt.to_string()
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    pub fn record_retries_exhausted(route: &'static str) {
-        counter!("sgl_router_retries_exhausted_total",
-            "route" => route
-        )
-        .increment(1);
-    }
-
-    pub fn set_worker_health(worker_url: &str, healthy: bool) {
-        gauge!("sgl_router_worker_health",
-            "worker" => worker_url.to_string()
-        )
-        .set(if healthy { 1.0 } else { 0.0 });
-    }
-
-    pub fn set_active_workers(count: usize) {
-        gauge!("sgl_router_active_workers").set(count as f64);
-    }
-
-    pub fn record_processed_request(worker_url: &str) {
-        counter!("sgl_router_processed_requests_total",
-            "worker" => worker_url.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_policy_decision(policy: &'static str, worker: &str) {
-        counter!("sgl_router_policy_decisions_total",
-            "policy" => policy,
-            "worker" => worker.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_cache_hit() {
-        counter!("sgl_router_cache_hits_total").increment(1);
-    }
-
-    pub fn record_cache_miss() {
-        counter!("sgl_router_cache_misses_total").increment(1);
-    }
-
-    pub fn set_tree_size(worker: &str, size: usize) {
-        gauge!("sgl_router_tree_size",
-            "worker" => worker.to_string()
-        )
-        .set(size as f64);
-    }
-
-    pub fn record_load_balancing_event() {
-        counter!("sgl_router_load_balancing_events_total").increment(1);
-    }
-
-    pub fn set_load_range(max_load: usize, min_load: usize) {
-        gauge!("sgl_router_max_load").set(max_load as f64);
-        gauge!("sgl_router_min_load").set(min_load as f64);
-    }
-
-    pub fn record_pd_request(route: &'static str) {
-        counter!("sgl_router_pd_requests_total",
-            "route" => route
-        )
-        .increment(1);
-    }
-
-    pub fn record_pd_request_duration(route: &'static str, duration: Duration) {
-        histogram!("sgl_router_pd_request_duration_seconds",
-            "route" => route
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    pub fn record_pd_prefill_request(worker: &str) {
-        counter!("sgl_router_pd_prefill_requests_total",
-            "worker" => worker.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_pd_decode_request(worker: &str) {
-        counter!("sgl_router_pd_decode_requests_total",
-            "worker" => worker.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_pd_error(error_type: &'static str) {
-        counter!("sgl_router_pd_errors_total",
-            "error_type" => error_type
-        )
-        .increment(1);
-    }
-
-    pub fn record_pd_prefill_error(worker: &str) {
-        counter!("sgl_router_pd_prefill_errors_total",
-            "worker" => worker.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_pd_decode_error(worker: &str) {
-        counter!("sgl_router_pd_decode_errors_total",
-            "worker" => worker.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_pd_stream_error(worker: &str) {
-        counter!("sgl_router_pd_stream_errors_total",
-            "worker" => worker.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn record_discovery_update(added: usize, removed: usize) {
-        counter!("sgl_router_discovery_updates_total").increment(1);
-        gauge!("sgl_router_discovery_workers_added").set(added as f64);
-        gauge!("sgl_router_discovery_workers_removed").set(removed as f64);
-    }
-
-    pub fn record_generate_duration(duration: Duration) {
-        histogram!("sgl_router_generate_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_embeddings_request() {
-        counter!("sgl_router_embeddings_total").increment(1);
-    }
-
-    pub fn record_embeddings_duration(duration: Duration) {
-        histogram!("sgl_router_embeddings_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_embeddings_error(error_type: &str) {
-        counter!(
-            "sgl_router_embeddings_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn set_embeddings_queue_size(size: usize) {
-        gauge!("sgl_router_embeddings_queue_size").set(size as f64);
-    }
-
-    pub fn record_classify_request() {
-        counter!("sgl_router_classify_total").increment(1);
-    }
-
-    pub fn record_classify_duration(duration: Duration) {
-        histogram!("sgl_router_classify_duration_seconds").record(duration.as_secs_f64());
-    }
-
-    pub fn record_classify_error(error_type: &str) {
-        counter!(
-            "sgl_router_classify_errors_total",
-            "error_type" => error_type.to_string()
-        )
-        .increment(1);
-    }
-
-    pub fn set_classify_queue_size(size: usize) {
-        gauge!("sgl_router_classify_queue_size").set(size as f64);
-    }
-
-    pub fn set_running_requests(worker: &str, count: usize) {
-        gauge!("sgl_router_running_requests",
-            "worker" => worker.to_string()
-        )
-        .set(count as f64);
-    }
-
-    pub fn set_cb_state(worker: &str, state_code: u8) {
-        gauge!("sgl_router_cb_state",
-            "worker" => worker.to_string()
-        )
-        .set(state_code as f64);
-    }
-
-    pub fn record_cb_state_transition(worker: &str, from: &'static str, to: &'static str) {
-        counter!("sgl_router_cb_state_transitions_total",
-            "worker" => worker.to_string(),
-            "from" => from,
-            "to" => to
-        )
-        .increment(1);
-    }
-
-    pub fn record_cb_outcome(worker: &str, outcome: &'static str) {
-        counter!("sgl_router_cb_outcomes_total",
-            "worker" => worker.to_string(),
-            "outcome" => outcome
-        )
-        .increment(1);
-    }
-
-    pub fn set_cb_consecutive_failures(worker: &str, count: u32) {
-        gauge!("sgl_router_cb_consecutive_failures",
-            "worker" => worker.to_string()
-        )
-        .set(count as f64);
-    }
-
-    pub fn set_cb_consecutive_successes(worker: &str, count: u32) {
-        gauge!("sgl_router_cb_consecutive_successes",
-            "worker" => worker.to_string()
-        )
-        .set(count as f64);
-    }
-
-    pub fn record_discovery_watcher_error() {
-        counter!("sgl_router_discovery_watcher_errors_total").increment(1);
-    }
-
-    pub fn record_discovery_watcher_restart() {
-        counter!("sgl_router_discovery_watcher_restarts_total").increment(1);
-    }
-
-    // TODO delete the metrics (instead of setting them to zero)
-    pub fn remove_worker_metrics(worker_url: &str) {
-        gauge!("sgl_router_cb_consecutive_failures","worker" => worker_url.to_string()).set(0.0);
-        gauge!("sgl_router_cb_consecutive_successes","worker" => worker_url.to_string()).set(0.0);
-        gauge!("sgl_router_running_requests","worker" => worker_url.to_string()).set(0.0);
-        gauge!("sgl_router_tree_size","worker" => worker_url.to_string()).set(0.0);
-
-        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
-        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
-        gauge!("sgl_router_cb_state","worker" => worker_url.to_string()).set(-1.0);
-        gauge!("sgl_router_worker_health","worker" => worker_url.to_string()).set(-1.0);
-    }
-
-    pub fn set_job_queue_depth(depth: usize) {
-        gauge!("sgl_router_job_queue_depth").set(depth as f64);
-    }
-
-    pub fn record_job_duration(job_type: &'static str, duration: Duration) {
-        histogram!("sgl_router_job_duration_seconds",
-            "job_type" => job_type
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    pub fn record_job_success(job_type: &'static str) {
-        counter!("sgl_router_job_success_total",
-            "job_type" => job_type
-        )
-        .increment(1);
-    }
-
-    pub fn record_job_failure(job_type: &'static str) {
-        counter!("sgl_router_job_failure_total",
-            "job_type" => job_type
-        )
-        .increment(1);
-    }
-
-    pub fn record_job_queue_full() {
-        counter!("sgl_router_job_queue_full_total").increment(1);
-    }
-
-    pub fn record_job_shutdown_rejected() {
-        counter!("sgl_router_job_shutdown_rejected_total").increment(1);
-    }
-
-    // This is different from the following:
-    // * sgl_router_requests_total: bump when a request is handled and response is to be returned, thus very different from this.
-    // * sgl_router_processed_requests_total: bump when routing decision is made.
-    // Here we want a metric to directly reflect user's experience ("I am sending a request")
-    // when viewing the router as a blackbox, and is bumped immediately when the request arrives.
-    // TODO: add route name
-    pub fn record_http_request() {
-        counter!("sgl_router_http_requests_total").increment(1);
-    }
-
-    pub fn record_http_status_code(status_code: u16, error_code: &str) {
-        counter!("sgl_router_http_responses_total",
-            "status_code" => status_code.to_string(),
-            "error_code" => error_code.to_string()
-        )
-        .increment(1);
-    }
-}
-
-// ============================================================================
-// SMG Metrics - New layered architecture
-// ============================================================================
-
 /// Label constants for consistent metric labeling
-pub mod smg_labels {
+pub mod metrics_labels {
     // Router types
     pub const ROUTER_OPENAI: &str = "openai";
     pub const ROUTER_HTTP: &str = "http";
@@ -808,12 +286,6 @@ pub mod smg_labels {
     pub const REGISTRATION_SUCCESS: &str = "success";
     pub const REGISTRATION_FAILED: &str = "failed";
     pub const REGISTRATION_DUPLICATE: &str = "duplicate";
-
-    // Deregistration reasons
-    pub const DEREGISTRATION_HEALTH_CHECK_FAILED: &str = "health_check_failed";
-    pub const DEREGISTRATION_TIMEOUT: &str = "timeout";
-    pub const DEREGISTRATION_MANUAL: &str = "manual";
-    pub const DEREGISTRATION_SHUTDOWN: &str = "shutdown";
     pub const DEREGISTRATION_POD_DELETED: &str = "pod_deleted";
 
     // Rate limit results
@@ -835,19 +307,10 @@ pub mod smg_labels {
     pub const ERROR_BACKEND: &str = "backend_error";
     pub const ERROR_VALIDATION: &str = "validation_error";
     pub const ERROR_INTERNAL: &str = "internal_error";
-
-    // Pipeline stages (gRPC router)
-    pub const STAGE_PREPARATION: &str = "preparation";
-    pub const STAGE_WORKER_SELECTION: &str = "worker_selection";
-    pub const STAGE_CLIENT_ACQUISITION: &str = "client_acquisition";
-    pub const STAGE_REQUEST_BUILDING: &str = "request_building";
-    pub const STAGE_DISPATCH_METADATA: &str = "dispatch_metadata";
-    pub const STAGE_REQUEST_EXECUTION: &str = "request_execution";
-    pub const STAGE_RESPONSE_PROCESSING: &str = "response_processing";
 }
 
 /// SMG Metrics helper struct for the new layered metrics architecture
-pub struct SmgMetrics;
+pub struct Metrics;
 
 /// Parameters for recording streaming metrics.
 pub struct StreamingMetricsParams<'a> {
@@ -869,7 +332,7 @@ pub struct StreamingMetricsParams<'a> {
     pub output_tokens: u64,
 }
 
-impl SmgMetrics {
+impl Metrics {
     /// Record an HTTP request
     pub fn record_http_request(method: &str, path: &str, status_class: &str) {
         counter!(
@@ -1151,7 +614,7 @@ impl SmgMetrics {
                 "backend_type" => backend_type,
                 "model" => model.clone(),
                 "endpoint" => endpoint,
-                "token_type" => smg_labels::TOKEN_INPUT
+                "token_type" => metrics_labels::TOKEN_INPUT
             )
             .increment(input);
         }
@@ -1163,7 +626,7 @@ impl SmgMetrics {
             "backend_type" => backend_type,
             "model" => model,
             "endpoint" => endpoint,
-            "token_type" => smg_labels::TOKEN_OUTPUT
+            "token_type" => metrics_labels::TOKEN_OUTPUT
         )
         .increment(output_tokens);
     }
@@ -1628,7 +1091,7 @@ mod tests {
         let _matching_metrics = [
             "request_duration_seconds",
             "response_duration_seconds",
-            "sgl_router_request_duration_seconds",
+            "smg_request_duration_seconds",
         ];
 
         let _non_matching_metrics = ["duration_total", "duration_seconds_total", "other_metric"];
@@ -1681,37 +1144,6 @@ mod tests {
     }
 
     #[test]
-    fn test_metrics_static_methods() {
-        RouterMetrics::record_request("/generate");
-        RouterMetrics::record_request_duration(Duration::from_millis(100));
-        RouterMetrics::record_request_error("/generate", "timeout");
-        RouterMetrics::record_retry("/generate");
-
-        RouterMetrics::set_worker_health("http://worker1", true);
-        RouterMetrics::record_processed_request("http://worker1");
-
-        RouterMetrics::record_policy_decision("random", "http://worker1");
-        RouterMetrics::record_cache_hit();
-        RouterMetrics::record_cache_miss();
-        RouterMetrics::set_tree_size("http://worker1", 1000);
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(20, 5);
-
-        RouterMetrics::record_pd_request("/v1/chat/completions");
-        RouterMetrics::record_pd_request_duration("/v1/chat/completions", Duration::from_secs(1));
-        RouterMetrics::record_pd_prefill_request("http://prefill1");
-        RouterMetrics::record_pd_decode_request("http://decode1");
-        RouterMetrics::record_pd_error("invalid_request");
-        RouterMetrics::record_pd_prefill_error("http://prefill1");
-        RouterMetrics::record_pd_decode_error("http://decode1");
-        RouterMetrics::record_pd_stream_error("http://decode1");
-
-        RouterMetrics::record_discovery_update(3, 1);
-        RouterMetrics::record_generate_duration(Duration::from_secs(2));
-        RouterMetrics::set_running_requests("http://worker1", 15);
-    }
-
-    #[test]
     fn test_port_already_in_use() {
         let port = 29123;
 
@@ -1738,75 +1170,5 @@ mod tests {
         let socket_addr = SocketAddr::new(ip_addr, config.port);
 
         assert_eq!(socket_addr.to_string(), "127.0.0.1:29000");
-    }
-
-    #[test]
-    fn test_concurrent_metric_updates() {
-        use std::{
-            sync::{
-                atomic::{AtomicBool, Ordering},
-                Arc,
-            },
-            thread,
-        };
-
-        let done = Arc::new(AtomicBool::new(false));
-        let mut handles = vec![];
-
-        for i in 0..3 {
-            let done_clone = done.clone();
-            let handle = thread::spawn(move || {
-                let worker = format!("http://worker{}", i);
-                while !done_clone.load(Ordering::Relaxed) {
-                    RouterMetrics::record_processed_request(&worker);
-                    thread::sleep(Duration::from_millis(1));
-                }
-            });
-            handles.push(handle);
-        }
-
-        thread::sleep(Duration::from_millis(10));
-        done.store(true, Ordering::Relaxed);
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_empty_string_metrics() {
-        RouterMetrics::record_request("");
-        RouterMetrics::set_worker_health("", true);
-        RouterMetrics::record_policy_decision("", "");
-    }
-
-    #[test]
-    fn test_very_long_metric_labels() {
-        let long_label = "a".repeat(1000);
-
-        RouterMetrics::record_request("/very_long_test_route");
-        RouterMetrics::set_worker_health(&long_label, false);
-    }
-
-    #[test]
-    fn test_special_characters_in_labels() {
-        let special_labels = [
-            "test/with/slashes",
-            "test-with-dashes",
-            "test_with_underscores",
-            "test.with.dots",
-            "test:with:colons",
-        ];
-
-        for label in special_labels {
-            RouterMetrics::record_request(label);
-            RouterMetrics::set_worker_health(label, true);
-        }
-    }
-
-    #[test]
-    fn test_extreme_metric_values() {
-        RouterMetrics::record_request_duration(Duration::from_nanos(1));
-        RouterMetrics::record_request_duration(Duration::from_secs(86400));
     }
 }
