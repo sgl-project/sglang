@@ -1225,6 +1225,7 @@ def create_fp8_scale_parameter(
             output_dim=0,
             weight_loader=weight_loader,
         )
+        scale.format_ue8m0 = False
     elif parameter_type == PerTensorScaleParameter:
         scale = parameter_type(
             data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
@@ -1287,6 +1288,8 @@ def process_fp8_weight_channel_strategy(
         weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale, input_scale=input_scale
         )
+    else:
+        weight_scale = weight_scale.data
 
     return weight, weight_scale, input_scale
 

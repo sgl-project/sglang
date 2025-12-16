@@ -146,7 +146,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         return None
 
     @property
-    def weight_block_size(self) -> Optional[List[int]]:
+    def weight_block_size(self) -> Optional[list[int]]:
         """Get the weight block size from the quantization config."""
         if "Linear" in self.target_scheme_map:
             weights_config = self.target_scheme_map["Linear"].get("weights")

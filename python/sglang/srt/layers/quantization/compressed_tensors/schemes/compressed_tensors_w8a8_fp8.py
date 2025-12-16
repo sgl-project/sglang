@@ -28,8 +28,15 @@ from sglang.srt.layers.quantization.fp8_utils import (
     process_fp8_weight_tensor_strategy,
     validate_fp8_block_shape,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter.ops.shuffle import shuffle_weight
+
 
 strategy_to_parameter_type = {
     QuantizationStrategy.BLOCK: BlockQuantScaleParameter,
@@ -119,7 +126,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             weight, weight_scale, input_scale = process_fp8_weight_channel_strategy(
                 layer.weight, layer.weight_scale, getattr(layer, "input_scale", None)
             )
-            weight = weight.t()
+
+            if _use_aiter:
+                # keep the weight as (N, K)
+                weight = shuffle_weight(weight, (16, 16))
+            else:
+                weight = weight.t()
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
