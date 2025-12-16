@@ -27,7 +27,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 logger = init_logger(__name__)
 
 # Remote GT base URL (sgl-test-files repository)
-GT_REMOTE_BASE_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/consistency_gt"
+GT_REMOTE_BASE_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/diffusion-ci/consistency_gt"
 
 # Path to the GT metadata file (kept in sglang repo)
 GT_METADATA_PATH = Path(__file__).parent.parent / "consistency_gt" / "gt_metadata.json"
