@@ -133,7 +133,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
-from sglang.srt.managers.scheduler_enhancer import SchedulerEnhancer
+from sglang.srt.managers.scheduler_group_prefill import SchedulerPrefillGroup
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -510,9 +510,9 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
-        self.schedule_enhancer = None
+        self.scheduler_prefill_group = None
         if SCHEDULER_DECREASE_PREFILL_IDLE:
-            self.schedule_enhancer = SchedulerEnhancer(
+            self.scheduler_prefill_group = SchedulerPrefillGroup(
                 self.dp_size,
                 self.attn_tp_size,
                 self.tp_worker,
@@ -1777,10 +1777,10 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
+        # Handle the case where prefill is not allowed
+        if self.scheduler_prefill_group and not self.scheduler_prefill_group.get_schedule_decision(
             self.running_batch
         ):
-            # Decrease prefill idle as much as possible during high dp load.
             return None
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:

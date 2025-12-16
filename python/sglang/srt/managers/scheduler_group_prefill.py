@@ -1,7 +1,7 @@
 import torch
 
 
-class SchedulerEnhancer:
+class SchedulerPrefillGroup:
     def __init__(
         self, dp_size, attn_tp_size, tp_worker, max_running_requests, server_args
     ):
