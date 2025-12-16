@@ -816,7 +816,11 @@ void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Te
 // weight  : {hidden_size}
 // bias    : {hidden_size}
 at::Tensor fused_add_layernorm_cpu(
-    const at::Tensor& input, at::Tensor& residual, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps) {
+    const at::Tensor& input,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_add_layernorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
