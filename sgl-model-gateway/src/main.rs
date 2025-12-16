@@ -360,6 +360,12 @@ struct CliArgs {
 
     #[arg(long, default_value = "localhost:4317")]
     otlp_traces_endpoint: String,
+
+    #[arg(long)]
+    tls_cert_path: Option<String>,
+
+    #[arg(long)]
+    tls_key_path: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -659,7 +665,8 @@ impl CliArgs {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
-            .igw(self.enable_igw);
+            .igw(self.enable_igw)
+            .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()
     }

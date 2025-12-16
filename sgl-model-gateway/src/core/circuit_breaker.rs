@@ -8,6 +8,8 @@ use std::{
 
 use tracing::info;
 
+use crate::observability::metrics::Metrics;
+
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
@@ -53,6 +55,24 @@ impl std::fmt::Display for CircuitState {
     }
 }
 
+impl CircuitState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+
+    pub fn to_int(&self) -> u8 {
+        match self {
+            CircuitState::Closed => 0u8,
+            CircuitState::Open => 1u8,
+            CircuitState::HalfOpen => 2u8,
+        }
+    }
+}
+
 /// Circuit breaker implementation
 #[derive(Debug)]
 pub struct CircuitBreaker {
@@ -64,18 +84,21 @@ pub struct CircuitBreaker {
     last_failure_time: Arc<RwLock<Option<Instant>>>,
     last_state_change: Arc<RwLock<Instant>>,
     config: CircuitBreakerConfig,
+    metric_label: String,
 }
 
 impl CircuitBreaker {
     /// Create a new circuit breaker with default configuration
     pub fn new() -> Self {
-        Self::with_config(CircuitBreakerConfig::default())
+        Self::with_config_and_label(CircuitBreakerConfig::default(), String::new())
     }
 
-    /// Create a new circuit breaker with custom configuration
-    pub fn with_config(config: CircuitBreakerConfig) -> Self {
+    /// Create a new circuit breaker with custom configuration and metric label
+    pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
+        let init_state = CircuitState::Closed;
+        Metrics::set_worker_cb_state(&metric_label, init_state.to_int());
         Self {
-            state: Arc::new(RwLock::new(CircuitState::Closed)),
+            state: Arc::new(RwLock::new(init_state)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
             consecutive_successes: Arc::new(AtomicU32::new(0)),
             total_failures: Arc::new(AtomicU64::new(0)),
@@ -83,7 +106,13 @@ impl CircuitBreaker {
             last_failure_time: Arc::new(RwLock::new(None)),
             last_state_change: Arc::new(RwLock::new(Instant::now())),
             config,
+            metric_label,
         }
+    }
+
+    /// Get the metric label
+    pub fn metric_label(&self) -> &str {
+        &self.metric_label
     }
 
     /// Check if a request can be executed
@@ -122,6 +151,10 @@ impl CircuitBreaker {
         } else {
             self.record_failure();
         }
+
+        let outcome_str = if success { "success" } else { "failure" };
+        Metrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
+        self.publish_gauge_metrics();
     }
 
     /// Record a successful request
@@ -196,17 +229,12 @@ impl CircuitBreaker {
                 }
             }
 
-            let from = match old_state {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            let to = match new_state {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
+            let from = old_state.as_str();
+            let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
+            Metrics::record_worker_cb_transition(&self.metric_label, from, to);
+            Metrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
+            self.publish_gauge_metrics();
         }
     }
 
@@ -264,6 +292,7 @@ impl CircuitBreaker {
         self.transition_to(CircuitState::Closed);
         self.consecutive_failures.store(0, Ordering::Release);
         self.consecutive_successes.store(0, Ordering::Release);
+        self.publish_gauge_metrics();
     }
 
     /// Force the circuit to open (for manual intervention)
@@ -283,6 +312,11 @@ impl CircuitBreaker {
             time_since_last_state_change: self.time_since_last_state_change(),
         }
     }
+
+    fn publish_gauge_metrics(&self) {
+        Metrics::set_worker_cb_consecutive_failures(&self.metric_label, self.failure_count());
+        Metrics::set_worker_cb_consecutive_successes(&self.metric_label, self.success_count());
+    }
 }
 
 impl Clone for CircuitBreaker {
@@ -296,6 +330,7 @@ impl Clone for CircuitBreaker {
             last_failure_time: Arc::clone(&self.last_failure_time),
             last_state_change: Arc::clone(&self.last_state_change),
             config: self.config.clone(),
+            metric_label: self.metric_label.clone(),
         }
     }
 }
@@ -339,7 +374,7 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         assert_eq!(cb.state(), CircuitState::Closed);
         cb.record_failure();
@@ -360,7 +395,7 @@ mod tests {
             timeout_duration: Duration::from_millis(100),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -379,7 +414,7 @@ mod tests {
             timeout_duration: Duration::from_millis(50),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -402,7 +437,7 @@ mod tests {
             timeout_duration: Duration::from_millis(50),
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -422,7 +457,7 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         cb.record_failure();
@@ -443,7 +478,7 @@ mod tests {
             failure_threshold: 1,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
@@ -470,7 +505,7 @@ mod tests {
             failure_threshold: 2,
             ..Default::default()
         };
-        let cb = CircuitBreaker::with_config(config);
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_success();
         cb.record_failure();

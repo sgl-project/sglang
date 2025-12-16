@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use crate::core::Worker;
 
 /// Round-robin selection policy
 ///
@@ -39,10 +39,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
         // Get and increment counter atomically
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
         let selected_idx = count % healthy_indices.len();
-        let worker = workers[healthy_indices[selected_idx]].url();
 
-        RouterMetrics::record_processed_request(worker);
-        RouterMetrics::record_policy_decision(self.name(), worker);
         Some(healthy_indices[selected_idx])
     }
 

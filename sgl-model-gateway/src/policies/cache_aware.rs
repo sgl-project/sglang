@@ -73,7 +73,7 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use crate::core::Worker;
 
 /// Cache-aware routing policy
 ///
@@ -134,6 +134,7 @@ impl CacheAwarePolicy {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
                         debug!(
                             "Cache eviction completed for model {}, max_size: {}",
                             model_id, max_tree_size
@@ -268,9 +269,6 @@ impl CacheAwarePolicy {
             max_load, min_load, worker_loads
         );
 
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(max_load, min_load);
-
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
@@ -296,8 +294,6 @@ impl CacheAwarePolicy {
 
         // Increment processed counter
         workers[min_load_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[min_load_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
         Some(min_load_idx)
     }
@@ -363,10 +359,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             let selected_url = if match_rate > self.config.cache_threshold {
-                RouterMetrics::record_cache_hit();
                 matched_worker.to_string()
             } else {
-                RouterMetrics::record_cache_miss();
                 let min_load_idx = *healthy_indices
                     .iter()
                     .min_by_key(|&&idx| workers[idx].load())?;
@@ -382,8 +376,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
-                    RouterMetrics::record_processed_request(&selected_url);
-                    RouterMetrics::record_policy_decision(self.name(), &selected_url);
 
                     return Some(selected_idx);
                 }

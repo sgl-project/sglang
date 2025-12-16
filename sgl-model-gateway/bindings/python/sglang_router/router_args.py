@@ -118,6 +118,9 @@ class RouterArgs:
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
     ca_cert_paths: List[str] = dataclasses.field(default_factory=list)
+    # Server TLS configuration
+    server_cert_path: Optional[str] = None
+    server_key_path: Optional[str] = None
     # Trace
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -644,6 +647,19 @@ class RouterArgs:
             default=[],
             help="Path(s) to CA certificate(s) for verifying worker TLS certificates. Can specify multiple CAs.",
         )
+        # Server TLS configuration
+        parser.add_argument(
+            f"--{prefix}tls-cert-path",
+            type=str,
+            default=None,
+            help="Path to server TLS certificate (PEM format)",
+        )
+        parser.add_argument(
+            f"--{prefix}tls-key-path",
+            type=str,
+            default=None,
+            help="Path to server TLS private key (PEM format)",
+        )
         parser.add_argument(
             f"--{prefix}enable-trace",
             action="store_true",
@@ -677,6 +693,18 @@ class RouterArgs:
                 args_dict[attr.name] = cli_args_dict[f"{prefix}{attr.name}"]
             elif attr.name in cli_args_dict:
                 args_dict[attr.name] = cli_args_dict[attr.name]
+
+            # Special handling for CLI args with dashes vs dataclass fields with underscores
+            # e.g. --tls-cert-path maps to tls_cert_path in args namespace, but we might want server_cert_path in dataclass
+            # Wait, dataclass fields are server_cert_path/server_key_path
+            # CLI args are tls_cert_path/tls_key_path
+            # We need to manually map them if names don't match
+
+        # Map tls args to server cert/key path
+        if f"{prefix}tls_cert_path" in cli_args_dict:
+            args_dict["server_cert_path"] = cli_args_dict[f"{prefix}tls_cert_path"]
+        if f"{prefix}tls_key_path" in cli_args_dict:
+            args_dict["server_key_path"] = cli_args_dict[f"{prefix}tls_key_path"]
 
         # parse special arguments and remove "--prefill" and "--decode" from cli_args_dict
         args_dict["prefill_urls"] = cls._parse_prefill_urls(

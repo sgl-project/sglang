@@ -69,6 +69,7 @@ jobs:
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -86,6 +87,7 @@ jobs:
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -102,6 +104,7 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg GRACE_BLACKWELL=0 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
@@ -146,6 +149,7 @@ jobs:
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -163,6 +167,7 @@ jobs:
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .

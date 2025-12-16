@@ -6,7 +6,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::response::{IntoResponse, Response};
-use futures::future;
+use futures::{
+    future,
+    stream::{self, StreamExt},
+};
 use http::{Method, StatusCode};
 use serde_json::Value;
 use tokio::{
@@ -20,6 +23,9 @@ use crate::{
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT: usize = 32;
 
 /// Unified worker management
 pub struct WorkerManager;
@@ -66,7 +72,7 @@ impl WorkerManager {
             workers.len()
         );
 
-        let mut tasks = Vec::new();
+        let mut tasks = Vec::with_capacity(http_workers.len());
         for worker in &http_workers {
             let url = worker.url().to_string();
             let flush_url = format!("{}/flush_cache", url);
@@ -131,6 +137,7 @@ impl WorkerManager {
             message,
         })
     }
+
     pub async fn get_worker_load(
         url: &str,
         api_key: Option<&str>,
@@ -195,7 +202,7 @@ impl WorkerManager {
         let total_workers = workers.len();
 
         // Prepare tasks for parallel execution
-        let mut tasks = Vec::new();
+        let mut tasks = Vec::with_capacity(workers.len());
         for worker in &workers {
             let url = worker.url().to_string();
             let api_key = worker.api_key().clone();
@@ -272,50 +279,57 @@ impl WorkerManager {
         method: Method,
     ) -> Result<Vec<(String, String)>, Response> {
         let workers = worker_registry.get_all();
+        let worker_count = workers.len();
+
         if workers.is_empty() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
         }
 
-        let mut responses = vec![];
-        // May do parallel requests later
-        for worker in workers {
-            let worker_url = worker.url().to_string();
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                let client = client.clone();
+                let worker_url = worker.url().to_string();
+                let url = format!("{worker_url}/{endpoint}");
+                let api_key = worker.api_key().clone();
+                let method = method.clone();
 
-            let url = format!("{}/{}", worker_url, endpoint);
-            let mut request_builder = match method {
-                Method::GET => client.get(url),
-                Method::POST => client.post(url),
-                _ => {
-                    return Err((
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Unsupported method for simple routing",
-                    )
-                        .into_response())
-                }
-            };
+                async move {
+                    let mut req = client.request(method, &url).timeout(REQUEST_TIMEOUT);
 
-            if let Some(api_key) = worker.api_key() {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
-            }
+                    if let Some(key) = api_key {
+                        req = req.bearer_auth(key);
+                    }
 
-            match request_builder.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match res.text().await {
-                        Ok(body_text) => {
-                            if status.is_success() {
-                                responses.push((worker_url, body_text));
+                    match req.send().await {
+                        Ok(res) if res.status().is_success() => match res.text().await {
+                            Ok(body) => Some((worker_url, body)),
+                            Err(e) => {
+                                warn!("Failed reading response from {url}: {e}");
+                                None
                             }
+                        },
+                        Ok(res) => {
+                            warn!("Request to {url} failed: {}", res.status());
+                            None
                         }
                         Err(e) => {
-                            warn!("fan_out_simple_request failed when reading text: {}", e)
+                            warn!("Request to {url} failed: {e}");
+                            None
                         }
                     }
                 }
-                Err(e) => warn!("fan_out_simple_request failed when sending: {}", e),
-            }
+            })
+            .collect();
+
+        let responses: Vec<_> = stream::iter(futures)
+            .buffer_unordered(MAX_CONCURRENT)
+            .filter_map(|r| async { r })
+            .collect()
+            .await;
+
+        if responses.is_empty() && worker_count > 0 {
+            return Err((StatusCode::BAD_GATEWAY, "All backend requests failed").into_response());
         }
 
         Ok(responses)
