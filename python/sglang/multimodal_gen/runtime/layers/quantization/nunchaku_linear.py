@@ -347,7 +347,8 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
         """
         Apply AWQ W4A16 quantized linear transformation.
 
-        Uses Nunchaku's optimized kernels for W4A16 computation.
+        Uses Nunchaku's AWQ W4A16 GEMV kernel, mirroring
+        :class:`nunchaku.models.linear.AWQW4A16Linear`.
         """
         if not _check_nunchaku_available():
             raise ImportError(
@@ -355,18 +356,35 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
                 "Install with: pip install nunchaku"
             )
 
-        from nunchaku.kernels import gemm_w4a16
+        from nunchaku.ops.gemv import awq_gemv_w4a16_cuda  # type: ignore[import]
 
-        qweight = layer.qweight
-        wscales = layer.wscales
-        wzeros = layer.wzeros
+        # Expect input in (..., in_features) shape; flatten to 2D for AWQ GEMV.
+        orig_shape = x.shape
+        print(f"orig_shape: {orig_shape}")
+        x_2d = x.reshape(-1, orig_shape[-1])
+        print(f"x_2d: {x_2d.shape}")
 
-        # Apply AWQ W4A16 computation
-        out = gemm_w4a16(x, qweight, wscales, wzeros)
+        in_features = layer.input_size_per_partition
+        out_features = layer.output_size_per_partition
 
+        # Apply AWQ W4A16 computation, following AWQW4A16Linear.forward.
+        out_2d = awq_gemv_w4a16_cuda(
+            in_feats=x_2d,
+            kernel=layer.qweight,
+            scaling_factors=layer.wscales,
+            zeros=layer.wzeros,
+            m=x_2d.shape[0],
+            n=out_features,
+            k=in_features,
+            group_size=layer.group_size,
+        )
+        print(f"out_2d: {out_2d.shape}")
         if bias is not None:
-            out = out + bias
+            view_shape = [1] * (out_2d.ndim - 1) + [-1]
+            out_2d.add_(bias.view(view_shape))
 
+        out = out_2d.reshape(*orig_shape[:-1], out_features)
+        print(f"out: {out[0].shape}")
         return out
 
 

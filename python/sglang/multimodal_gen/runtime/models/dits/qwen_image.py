@@ -415,6 +415,21 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
+class _ReplicatedLinearForMod(ReplicatedLinear):
+    """ReplicatedLinear wrapper for modulation MLPs that returns only the
+    tensor output (drops the auxiliary bias output).
+
+    This keeps the module hierarchy (and hence state_dict parameter names)
+    identical to using ``ReplicatedLinear`` directly, but matches the
+    expected ``nn.Sequential`` semantics used for ``img_mod`` / ``txt_mod``
+    (which assume the last module returns a plain tensor).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        out, _ = super().forward(x)
+        return out
+
+
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -435,7 +450,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            _ReplicatedLinearForMod(
                 dim,
                 6 * dim,
                 bias=True,
@@ -462,7 +477,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            _ReplicatedLinearForMod(
                 dim,
                 6 * dim,
                 bias=True,
@@ -528,7 +543,8 @@ class QwenImageTransformerBlock(nn.Module):
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
-
+        print(f"img_mod1: {img_mod1.shape}")
+        print(f"txt_mod1: {txt_mod1.shape}")
         # Process image stream - norm1 + modulation
 
         img_normed = self.img_norm1(hidden_states)
@@ -546,6 +562,8 @@ class QwenImageTransformerBlock(nn.Module):
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
+        print(f"img_modulated: {img_modulated.shape}")
+        print(f"txt_modulated: {txt_modulated.shape}")
         attn_output = self.attn(
             hidden_states=img_modulated,  # Image stream (will be processed as "sample")
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")

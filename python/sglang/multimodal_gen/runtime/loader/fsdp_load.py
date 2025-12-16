@@ -257,12 +257,20 @@ def load_model_from_full_model_state_dict(
             raise ValueError(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
+        # Preserve original dtypes for parameters where it matters (e.g.,
+        # quantized weights and metadata such as int8/FP8). Only cast to
+        # ``param_dtype`` when the checkpoint tensor already uses that dtype.
+        if full_tensor.dtype == param_dtype:
+            target_dtype = param_dtype
+        else:
+            target_dtype = full_tensor.dtype
+
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             # In cases where parts of the model aren't sharded, some parameters will be plain tensors
             sharded_tensor = full_tensor
         else:
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,
@@ -270,7 +278,13 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
-        sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
+        # Preserve requires_grad flag from meta parameter. Quantized weights
+        # (e.g., int8/FP8) must have requires_grad=False to avoid PyTorch
+        # complaining about non-floating Parameters requiring gradients.
+        requires_grad = getattr(meta_sharded_param, "requires_grad", False)
+        sharded_sd[target_param_name] = nn.Parameter(
+            sharded_tensor, requires_grad=requires_grad
+        )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
