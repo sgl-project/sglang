@@ -10,10 +10,7 @@ import torchaudio.functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
