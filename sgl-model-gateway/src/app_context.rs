@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::{
     config::RouterConfig,
-    core::{workflow::WorkflowEngine, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
+    core::{ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
@@ -24,6 +24,7 @@ use crate::{
     },
     tool_parser::ParserFactory as ToolParserFactory,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
+    workflow::WorkflowEngine,
 };
 
 /// Error type for AppContext builder

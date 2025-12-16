@@ -11,7 +11,7 @@
 package ffi
 
 /*
-#cgo LDFLAGS: -lsglang_router_rs -ldl
+#cgo LDFLAGS: -lsgl_model_gateway_go -ldl
 #include <stdlib.h>
 #include <stdint.h>
 

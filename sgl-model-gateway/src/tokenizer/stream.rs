@@ -44,6 +44,7 @@ impl DecodeStream {
 
     /// Step appends a token_id to the internal state and tries to produce a text chunk.
     /// Returning `None` means the given id is not enough to produce a chunk.
+    #[inline]
     pub fn step(&mut self, id: TokenIdType) -> Result<Option<String>> {
         self.all_token_ids.push(id);
 
@@ -71,7 +72,8 @@ impl DecodeStream {
 
     /// Process multiple tokens at once
     pub fn step_batch(&mut self, token_ids: &[u32]) -> Result<Vec<String>> {
-        let mut chunks = Vec::new();
+        // Pre-allocate with capacity - most tokens produce output
+        let mut chunks = Vec::with_capacity(token_ids.len());
 
         for &token_id in token_ids {
             if let Some(text) = self.step(token_id)? {
