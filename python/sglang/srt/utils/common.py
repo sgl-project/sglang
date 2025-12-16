@@ -1655,15 +1655,6 @@ def get_hpu_memory_capacity():
         )
 
 
-def get_npu_memory_capacity():
-    try:
-        import torch_npu  # noqa: F401
-
-        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-    except ImportError as e:
-        raise ImportError("torch_npu is required when run on npu device.")
-
-
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
@@ -1712,6 +1703,8 @@ def get_device_memory_capacity(device: str = None):
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
+        from sglang.srt.hardware_backend.npu.utils import get_npu_memory_capacity
+
         gpu_mem = get_npu_memory_capacity()
     elif device == "cpu":
         gpu_mem = get_cpu_memory_capacity()

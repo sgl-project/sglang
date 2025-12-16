@@ -650,16 +650,16 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
+        # Handle device-specific backends.
+        self._handle_hpu_backends()
+        self._handle_cpu_backends()
+        self._handle_npu_backends()
+
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
-
-        # Handle device-specific backends.
-        self._handle_hpu_backends()
-        self._handle_cpu_backends()
-        self._handle_npu_backends()
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -800,16 +800,6 @@ class ServerArgs:
                     self.chunked_prefill_size = 2048
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 8
-            elif is_npu() and gpu_mem < 32 * 1024:
-                # Atlas A2B4
-                # (chunked_prefill_size 32k, cuda_graph_max_bs 16 if tp < 4 else 64)
-                if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 32768
-                if self.cuda_graph_max_bs is None:
-                    if self.tp_size < 4:
-                        self.cuda_graph_max_bs = 16
-                    else:
-                        self.cuda_graph_max_bs = 64
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, cuda_graph_max_bs 24 if tp < 4 else 80)
@@ -833,16 +823,6 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 32
                     else:
                         self.cuda_graph_max_bs = 160
-            elif is_npu() and gpu_mem < 64 * 1024:
-                # Atlas A2 and Atlas A3
-                # (chunked_prefill_size 32k, cuda_graph_max_bs 64 if tp < 4 else 128)
-                if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 32768
-                if self.cuda_graph_max_bs is None:
-                    if self.tp_size < 4:
-                        self.cuda_graph_max_bs = 64
-                    else:
-                        self.cuda_graph_max_bs = 128
             elif gpu_mem < 90 * 1024:
                 # H100, A100
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)

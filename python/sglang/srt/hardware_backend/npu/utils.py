@@ -48,6 +48,29 @@ def set_default_server_args(args: "ServerArgs"):
     if args.page_size is None:
         args.page_size = 128
 
+    # NPU memory settings
+    npu_mem = get_npu_memory_capacity()
+    if npu_mem < 32 * 1024:
+        # Ascend 910B4,910B4_1
+        # (chunked_prefill_size 4k, cuda_graph_max_bs 16 if tp < 4 else 64)
+        if args.chunked_prefill_size is None:
+            args.chunked_prefill_size = 4 * 1024
+        if args.cuda_graph_max_bs is None:
+            if args.tp_size < 4:
+                args.cuda_graph_max_bs = 16
+            else:
+                args.cuda_graph_max_bs = 64
+    elif npu_mem < 64 * 1024:
+        # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
+        # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 64)
+        if args.chunked_prefill_size is None:
+            args.chunked_prefill_size = 8 * 1024
+        if args.cuda_graph_max_bs is None:
+            if args.tp_size < 4:
+                args.cuda_graph_max_bs = 64
+            else:
+                args.cuda_graph_max_bs = 256
+
     # NPU does not support CustomAllReduce
     args.disable_custom_all_reduce = True
 
@@ -85,6 +108,16 @@ def init_npu_backend():
 
     torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
+
+
+@functools.lru_cache(maxsize=1)
+def get_npu_memory_capacity() -> int:
+    """
+    Return the total NPU memory capacity in MB.
+    """
+    import torch
+
+    return torch.npu.mem_get_info()[1] // (1024 * 1024)
 
 
 def npu_format_cast(
