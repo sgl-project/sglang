@@ -164,7 +164,6 @@ class SGLDiffusionGenerateImage:
         if not positve_prompt:
             raise ValueError("Prompt cannot be empty")
 
-        client = sgld_client
         size = f"{width}x{height}"
 
         # Prepare request parameters
@@ -196,7 +195,7 @@ class SGLDiffusionGenerateImage:
 
         # Call API
         try:
-            response = client.generate_image(**request_params)
+            response = sgld_client.generate_image(**request_params)
         except Exception as e:
             raise RuntimeError(f"Failed to generate image: {str(e)}")
 
@@ -346,7 +345,6 @@ class SGLDiffusionGenerateVideo:
         if not positve_prompt:
             raise ValueError("Prompt cannot be empty")
 
-        client = sgld_client
         size = f"{width}x{height}"
 
         # Prepare request parameters
@@ -381,7 +379,7 @@ class SGLDiffusionGenerateVideo:
 
         # Call API
         try:
-            response = client.generate_video(**request_params)
+            response = sgld_client.generate_video(**request_params)
             video_id = response.get("id", "")
             video_path = response.get("file_path", "")
         except Exception as e:
@@ -392,6 +390,14 @@ class SGLDiffusionGenerateVideo:
 
 class SGLDiffusionSetLora:
     """Node to set LoRA adapter for SGLang Diffusion server."""
+    def __init__(self):
+        self.target = "all"
+        self.sgld_client = None
+
+    def __del__(self):
+        if self.sgld_client:
+            self.sgld_client.unset_lora(target=self.target)
+            self.sgld_client = None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -446,7 +452,8 @@ class SGLDiffusionSetLora:
         if lora_nickname == "":
             lora_nickname = lora_name[:-4]
 
-        client = sgld_client
+        self.sgld_client = sgld_client
+        self.target = target
 
         # Prepare request parameters
         request_params = {
@@ -457,8 +464,8 @@ class SGLDiffusionSetLora:
 
         # Call API
         try:
-            response = client.set_lora(**request_params)
-            return (client,)
+            response = self.sgld_client.set_lora(**request_params)
+            return (self.sgld_client,)
         except Exception as e:
             raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
 

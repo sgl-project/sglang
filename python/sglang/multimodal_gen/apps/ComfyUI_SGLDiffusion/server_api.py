@@ -466,6 +466,36 @@ class SGLDiffusionServerAPI:
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
 
+    def unset_lora(
+        self,
+        target: str = "all",
+    ) -> Dict[str, Any]:
+        """
+        Unset (unmerge) LoRA weights from the base model.
+
+        Args:
+            target: same as set_lora
+
+        Returns:
+            Dictionary containing the API response with status and message
+        """
+        # Prepare request payload
+        payload: Dict[str, Any] = {
+            "target": target,
+        }
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/unmerge_lora_weights",
+                json=payload,
+                headers=self.headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
+
 
 if __name__ == "__main__":
     api = SGLDiffusionServerAPI(
