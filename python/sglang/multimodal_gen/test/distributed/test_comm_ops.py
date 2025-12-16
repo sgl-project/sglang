@@ -1,7 +1,9 @@
 import os
 import unittest
+
 import torch
 import torch.distributed as dist
+
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 
 # Configuration
@@ -10,6 +12,7 @@ SIZES_TO_TEST = [
     (1024 * 1024 * 16, "64MB"),  # 64MB
     (1024 * 1024 * 64, "256MB"),  # 256MB
 ]
+
 
 def benchmark_op(func, args, iterations=20):
     # Warmup
@@ -27,6 +30,7 @@ def benchmark_op(func, args, iterations=20):
 
     torch.cuda.synchronize()
     return start_event.elapsed_time(end_event) / iterations
+
 
 def run_all_reduce_test(coord_custom, coord_torch, device, num_elements, label):
     rank = dist.get_rank()
@@ -57,6 +61,7 @@ def run_all_reduce_test(coord_custom, coord_torch, device, num_elements, label):
         print(
             f"[All-Reduce | {label:<6}] Custom: {time_custom:.4f} ms | Torch: {time_torch:.4f} ms | Speedup: {time_torch/time_custom:.2f}x"
         )
+
 
 def run_all_gather_test(
     coord_custom, coord_torch, device, num_elements, label, separate, dim_to_test=0
@@ -101,6 +106,7 @@ def run_all_gather_test(
         print(
             f"[All-Gather {mode_str} dim={dim_to_test} | {label:<6}] Custom: {time_custom:.4f} ms | Torch: {time_torch:.4f} ms | Speedup: {time_torch/time_custom:.2f}x"
         )
+
 
 def run_gather_test(
     coord_custom, coord_torch, device, num_elements, label, dim_to_test=0
@@ -168,7 +174,9 @@ class TestCommOps(unittest.TestCase):
 
         # 3. Skip if World Size < 2 (Cannot test distributed ops properly)
         if cls.world_size < 2:
-            print(f"Skipping distributed tests: World Size is {cls.world_size} (Need >= 2)")
+            print(
+                f"Skipping distributed tests: World Size is {cls.world_size} (Need >= 2)"
+            )
             raise unittest.SkipTest("World size < 2, skipping distributed tests")
 
     @classmethod
@@ -233,11 +241,17 @@ class TestCommOps(unittest.TestCase):
                     dim_to_test=dim,
                 )
                 run_gather_test(
-                    coord_custom, coord_torch, device, num_elements, label, dim_to_test=dim
+                    coord_custom,
+                    coord_torch,
+                    device,
+                    num_elements,
+                    label,
+                    dim_to_test=dim,
                 )
 
             if rank == 0:
                 print("-" * 120)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -330,7 +330,11 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        if self.device_communicator is not None and self.use_device_communicator and not async_op:
+        if (
+            self.device_communicator is not None
+            and self.use_device_communicator
+            and not async_op
+        ):
             return self.device_communicator.all_reduce(input_, op=op)
 
         # Fallback to PyTorch implementation
