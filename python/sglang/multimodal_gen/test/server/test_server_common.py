@@ -493,12 +493,12 @@ To add GT files to pass consistency tests:
 
 2. Clone sgl-test-files repo and copy the frame files:
    git clone https://github.com/sgl-project/sgl-test-files.git
-   mkdir -p sgl-test-files/images/consistency_gt/{gpu_dir}/{case.id}/
-   cp -r {staging_path}/* sgl-test-files/images/consistency_gt/{gpu_dir}/{case.id}/
+   mkdir -p sgl-test-files/images/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
+   cp -r {staging_path}/* sgl-test-files/images/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
 
 3. Commit and push to sgl-test-files:
    cd sgl-test-files
-   git add images/consistency_gt/
+   git add images/diffusion-ci/consistency_gt/
    git commit -m "Add consistency GT for {case.id}"
    git push
 
@@ -509,7 +509,7 @@ To add GT files to pass consistency tests:
 1. Set environment variable: SGLANG_GT_STAGING_DIR=/path/to/staging
 2. Re-run this test to generate GT frames
 3. Upload the generated frames to sgl-test-files repository:
-   https://github.com/sgl-project/sgl-test-files/tree/main/images/consistency_gt/{gpu_dir}/{case.id}/
+   https://github.com/sgl-project/sgl-test-files/tree/main/images/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
 """
             error_msg += f"""
 (Optional) Add custom SSIM threshold to gt_metadata.json if needed:
