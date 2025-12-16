@@ -8,7 +8,7 @@ use std::{
 
 use tracing::info;
 
-use crate::observability::metrics::RouterMetrics;
+use crate::observability::metrics::Metrics;
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
@@ -96,7 +96,7 @@ impl CircuitBreaker {
     /// Create a new circuit breaker with custom configuration and metric label
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         let init_state = CircuitState::Closed;
-        RouterMetrics::set_cb_state(&metric_label, init_state.to_int());
+        Metrics::set_worker_cb_state(&metric_label, init_state.to_int());
         Self {
             state: Arc::new(RwLock::new(init_state)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
@@ -153,7 +153,7 @@ impl CircuitBreaker {
         }
 
         let outcome_str = if success { "success" } else { "failure" };
-        RouterMetrics::record_cb_outcome(&self.metric_label, outcome_str);
+        Metrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
         self.publish_gauge_metrics();
     }
 
@@ -232,8 +232,8 @@ impl CircuitBreaker {
             let from = old_state.as_str();
             let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
-            RouterMetrics::record_cb_state_transition(&self.metric_label, from, to);
-            RouterMetrics::set_cb_state(&self.metric_label, new_state.to_int());
+            Metrics::record_worker_cb_transition(&self.metric_label, from, to);
+            Metrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
             self.publish_gauge_metrics();
         }
     }
@@ -313,10 +313,9 @@ impl CircuitBreaker {
         }
     }
 
-    // TODO maybe publish whenever the variable is changed
     fn publish_gauge_metrics(&self) {
-        RouterMetrics::set_cb_consecutive_failures(&self.metric_label, self.failure_count());
-        RouterMetrics::set_cb_consecutive_successes(&self.metric_label, self.success_count());
+        Metrics::set_worker_cb_consecutive_failures(&self.metric_label, self.failure_count());
+        Metrics::set_worker_cb_consecutive_successes(&self.metric_label, self.success_count());
     }
 }
 
