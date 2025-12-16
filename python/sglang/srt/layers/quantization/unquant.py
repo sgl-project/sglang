@@ -7,10 +7,10 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     _mlaprolog_process_weight_after_loading,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -132,7 +132,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-        dynamic_scale: torch.Tensor = None,
+        **kwargs,
     ) -> torch.Tensor:
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
