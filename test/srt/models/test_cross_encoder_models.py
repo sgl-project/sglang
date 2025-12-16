@@ -3,7 +3,6 @@ import random
 import unittest
 
 import torch
-from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, is_in_ci

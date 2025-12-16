@@ -24,7 +24,8 @@ class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[torch.Tensor] = None
-    num_accepted_tokens: Optional[int] = None
+    num_accepted_tokens: int = 0
+    accept_length_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
     # For output processing
@@ -39,20 +40,19 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
-    allocate_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
-    def copy_to_cpu(self, return_logprob: bool = False):
+    def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
         if return_logprob:
-            if self.logits_output.next_token_logits is not None:
-                self.logits_output.next_token_logits = (
-                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
+            if self.logits_output.next_token_logprobs is not None:
+                self.logits_output.next_token_logprobs = (
+                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
                 )
             if self.logits_output.input_token_logprobs is not None:
                 self.logits_output.input_token_logprobs = (
@@ -66,9 +66,6 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
-
-        if self.allocate_lens is not None:
-            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
 

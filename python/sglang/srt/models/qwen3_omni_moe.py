@@ -31,7 +31,6 @@ from sglang.srt.configs.qwen3_omni import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -61,10 +60,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             num_heads=config.encoder_attention_heads,
             projection_size=embed_dim,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend="fa3",
-            softmax_in_single_precision=False,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -321,7 +317,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = RMSNorm(
+        self.ln_q = nn.LayerNorm(
             self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
         )
         self.mlp = nn.ModuleList(

@@ -14,6 +14,8 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import math
+import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
@@ -27,6 +29,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -45,7 +51,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.models.utils import RotaryPosMixin, compute_cu_seqlens_from_grid_numpy
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, get_int_env_var
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -64,14 +73,21 @@ class Qwen3_VisionMLP(nn.Module):
         hidden_act="silu",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
@@ -79,6 +95,8 @@ class Qwen3_VisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.act = ACT2FN[hidden_act]
 
@@ -129,9 +147,9 @@ class Qwen3_VisionBlock(nn.Module):
         intermediate_dim: int,
         hidden_act="silu",
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
-        attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -139,35 +157,16 @@ class Qwen3_VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
 
-        if attn_implementation == "sdpa":
-            softmax_in_single_precision = False
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_2":
-            softmax_in_single_precision = False
-            qkv_backend = "triton_attn"
-            flatten_batch = True
-        elif attn_implementation == "eager":
-            softmax_in_single_precision = True
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_3":
-            softmax_in_single_precision = False
-            qkv_backend = "fa3"
-            flatten_batch = True
-
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
-            flatten_batch=flatten_batch,
+            flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            use_data_parallel=use_data_parallel,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -176,6 +175,7 @@ class Qwen3_VisionBlock(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -210,6 +210,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         use_postshuffle_norm: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -221,12 +222,18 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
@@ -235,6 +242,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -249,7 +258,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen3VLMoeVisionModel(nn.Module):
+class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
     def __init__(
         self,
@@ -257,6 +266,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = vision_config.hidden_size
@@ -266,8 +276,12 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
+        self.use_data_parallel = use_data_parallel
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
+        self.out_hidden_size = vision_config.out_hidden_size * (
+            1 + len(self.deepstack_visual_indexes)
+        )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
@@ -282,9 +296,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -296,6 +310,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
             spatial_merge_size=self.spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
         self.deepstack_merger_list = nn.ModuleList(
@@ -308,6 +323,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix),
+                    use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
@@ -324,26 +340,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
         for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-            hpos_ids = hpos_ids.flatten()
+            base = self.rot_pos_ids(h, w, self.spatial_merge_size)
+            pos_ids.append(base if t == 1 else base.repeat(t, 1))
 
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-            wpos_ids = wpos_ids.flatten()
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
         max_grid_size = grid_thw[:, 1:].max()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
@@ -455,15 +454,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         position_embeddings = (emb.cos(), emb.sin())
 
         # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0)
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
-                cu_seqlens.to(torch.int32),
-            ]
-        )
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
 
         x = x.unsqueeze(1)
 
@@ -610,6 +601,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -617,6 +610,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
 
         # TODO: make it more elegant
@@ -624,22 +618,28 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
+            self.config.encoder_only = getattr(config, "encoder_only", False)
+            self.config.language_only = getattr(config, "language_only", False)
 
-        self.model = language_model_cls(
-            config=self.config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
+        if not hasattr(config, "encoder_only") or not config.encoder_only:
+            self.model = language_model_cls(
+                config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
+                prefix=add_prefix("model", prefix),
             )
+
+            if self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+        else:
+            # encoder_only mode: no language model, so no lm_head needed
+            self.lm_head = None
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(self.config)
@@ -648,7 +648,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
@@ -674,8 +674,101 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+
+        max_patches_per_call = get_int_env_var("SGLANG_VLM_MAX_PATCHES_PER_VIT", 0)
+        max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
+
+        if max_patches_per_call == 0 and max_images_per_call == 0:
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_values,
+                    image_grid_thw.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                return self.visual(pixel_values, grid_thw=image_grid_thw)
+
+        # compute the number of patches per image and the slice positions in pixel_values
+        grid_thw_list = (
+            image_grid_thw.tolist()
+        )  # List[List[int]], each is [T, H, W] or similar
+        patches_per_image = [int(math.prod(g)) for g in grid_thw_list]
+        num_images = len(patches_per_image)
+
+        # cumulative sum used to slice pixel_values along the image dimension
+        cum_patches = [0]
+        for p in patches_per_image:
+            cum_patches.append(cum_patches[-1] + p)
+        total_patches = cum_patches[-1]
+
+        assert pixel_values.size(0) == total_patches, (
+            f"pixel_values rows ({pixel_values.size(0)}) "
+            f"!= total patches ({total_patches})"
+        )
+
+        # split into chunks in image order, each chunk obeys the patch/image limits
+        all_chunk_embeds: List[torch.Tensor] = []
+        img_start = 0
+
+        while img_start < num_images:
+            img_end = img_start
+            patches_in_chunk = 0
+            images_in_chunk = 0
+
+            # try to pack more images into the current chunk until some limit would be exceeded
+            while img_end < num_images:
+                next_patches = patches_per_image[img_end]
+
+                # if adding this image would exceed the patch limit, stop
+                if (
+                    max_patches_per_call > 0
+                    and patches_in_chunk + next_patches > max_patches_per_call
+                ):
+                    break
+
+                # if adding this image would exceed the image-count limit, also stop
+                if (
+                    max_images_per_call > 0
+                    and images_in_chunk + 1 > max_images_per_call
+                ):
+                    break
+
+                patches_in_chunk += next_patches
+                images_in_chunk += 1
+                img_end += 1
+
+            # extreme case: the first image alone exceeds the patch limit -> at least ensure img_end > img_start
+            if img_end == img_start:
+                img_end = img_start + 1
+                patches_in_chunk = patches_per_image[img_start]
+                images_in_chunk = 1
+
+            # slice pixel_values and grid_thw according to [img_start:img_end]
+            patch_start = cum_patches[img_start]
+            patch_end = cum_patches[img_end]
+            pixel_chunk = pixel_values[patch_start:patch_end]
+            grid_chunk = image_grid_thw[img_start:img_end]
+
+            # run ViT once on this chunk without extra padding
+            if self.use_data_parallel:
+                chunk_embeds = run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_chunk,
+                    grid_chunk.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
+
+            # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
+            all_chunk_embeds.append(chunk_embeds)
+
+            # next batch
+            img_start = img_end
+
+        # concatenate back the full image embedding sequence
+        return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
@@ -685,11 +778,23 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        else:
+            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    _lora_pattern = re.compile(
+        r"^model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
 
     def forward(
         self,
@@ -765,6 +870,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.encoder_only or self.config.language_only
+                ) and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -778,6 +888,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 try:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading visual/language model weights
+                    if (
+                        self.config.encoder_only or self.config.language_only
+                    ) and name not in params_dict:
                         continue
                     param = params_dict[name]
                 except KeyError:

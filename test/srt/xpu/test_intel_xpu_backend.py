@@ -3,7 +3,6 @@ Usage:
 python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen_model
 """
 
-import os
 import unittest
 from functools import wraps
 
