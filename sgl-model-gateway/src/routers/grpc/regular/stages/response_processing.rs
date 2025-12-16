@@ -49,6 +49,7 @@ impl PipelineStage for ResponseProcessingStage {
                     "RequestType::Responses reached regular response processing stage"
                 );
                 Err(error::internal_error(
+                    "responses_in_wrong_pipeline",
                     "RequestType::Responses reached regular response processing stage",
                 ))
             }
