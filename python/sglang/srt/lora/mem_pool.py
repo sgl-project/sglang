@@ -163,7 +163,12 @@ class LoRAMemoryPool:
                 "num_local_experts",
                 getattr(self.base_hf_config, "num_experts", 0),
             )
-            return (self.max_loras_per_batch, num_experts, max_lora_dim, input_dim)
+            return (
+                self.max_loras_per_batch,
+                num_experts,
+                max_lora_dim * c,
+                input_dim,
+            )
         else:
             return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
@@ -588,7 +593,9 @@ class LoRAMemoryPool:
                     # MoE: multiple tensors per module (one per expert)
                     for expert_id, expert_weight in weights.items():
                         # Buffer shape: [num_loras, num_experts, max_rank, hidden_dim]
-                        buffer_view = target_buffer[buffer_id, expert_id, :lora_rank, :]
+                        buffer_view = target_buffer[
+                            buffer_id, expert_id, : lora_rank * c, :
+                        ]
                         load_lora_weight_tensor(buffer_view, expert_weight)
                 else:
                     # Standard: single tensor per module
@@ -745,7 +752,7 @@ class LoRAMemoryPool:
             - 4D tensor [num_loras, num_experts, rank, hidden] for MoE modules
         """
         buffer_dict = self.A_buffer if lora_type == LoRAType.LORA_A else self.B_buffer
-        
+
         return buffer_dict[target_module][layer_id]
 
     def get_buffer_id(self, lora_uid: str):
