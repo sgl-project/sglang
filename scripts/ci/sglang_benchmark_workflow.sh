@@ -24,20 +24,22 @@ if [[ "${TYPE}" == "launch" ]]; then
     echo "========== LAUNCHING SERVER ========"
     if [[ "${model_name}" == "Qwen3-VL-235B" ]]; then
         export SGLANG_USE_AITER=1
-        export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=1
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
             --port 9000 \
             --tp-size "${TP}" \
-            --ep-size "${EP}" \
             --trust-remote-code \
             --chunked-prefill-size 32768 \
-            --mem-fraction-static 0.6 \
+            --mem-fraction-static 0.90 \
             --disable-radix-cache \
             --max-prefill-tokens 32768 \
             --cuda-graph-max-bs 128 \
             --page-size 16 \
+            --mm-attention-backend aiter_attn \
+            --mm-enable-dp-encoder \
+            --enable-aiter-allreduce-fusion \
+            --mm-processor-kwargs '{"max_pixels": 1638400, "min_pixels": 740}' \
             --watchdog-timeout 1200 &
         sglang_pid=$!
     elif [[ "${model_name}" == "Qwen3-next" ]]; then
@@ -62,22 +64,26 @@ if [[ "${TYPE}" == "launch" ]]; then
         sglang_pid=$!
     elif [[ "${model_name}" == "Qwen3-Omni" ]]; then
         echo "Qwen3-Omni-Server Launch"
+        export SGLANG_USE_CUDA_IPC_TRANSPORT=1
+        export SGLANG_VLM_CACHE_SIZE_MB=0
         export SGLANG_USE_AITER=1
+        export USE_PA=1
         export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=0
+        export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
             --port 9000 \
             --tp-size ${TP} \
-            --ep-size ${EP} \
             --trust-remote-code \
             --mm-attention-backend "aiter_attn"\
-            --chunked-prefill-size 16384 \
+            --chunked-prefill-size 32768 \
             --mem-fraction-static 0.85 \
             --disable-radix-cache \
-            --max-prefill-tokens 16384 \
-            --cuda-graph-max-bs 64 \
+            --max-prefill-tokens 32768 \
+            --cuda-graph-max-bs 8 \
             --page-size 64  \
+            --mm-enable-dp-encoder \
             --watchdog-timeout 1200 &
         sglang_pid=$!
     else

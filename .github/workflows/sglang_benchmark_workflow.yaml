@@ -11,15 +11,16 @@ on:
         required: false
         default: '["Qwen3-VL-235B","Qwen3-next","Qwen3-Omni"]'
       image:
-        description: 'Image to use for the benchmark (default: "rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125")'
+        description: 'Image to use for the benchmark (default: "rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_f25820a_aiter_5fad56f_20251212")'
         required: true
-        default: "rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125"
+        default: "rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_f25820a_aiter_5fad56f_20251212"
   
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
+  IMAGE: ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_f25820a_aiter_5fad56f_20251212' }}
   SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/zejunchen-zejun/sglang.git' }}
   SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -39,7 +40,7 @@ jobs:
         run: |
           docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
           for i in {1..3}; do
-            docker pull ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125' }} && break || {
+            docker pull ${{ env.IMAGE }} && break || {
               echo "docker pull failed, retrying ($i/3)..."
               sleep 5
             }
@@ -48,7 +49,7 @@ jobs:
       - name: Generate Dockerfile
         run: |
           cat <<'EOF' > Dockerfile.mod
-          FROM ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125' }}
+          FROM ${{ env.IMAGE }}
           ENV GPU_ARCHS="gfx942"
           ENV PYTORCH_ROCM_ARCH="gfx942"
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
@@ -61,7 +62,7 @@ jobs:
 
           RUN git clone https://github.com/ZLkanyo009/aiter.git /aiter && \
             cd /aiter && \
-            git checkout caa3a9b404b757f15effb7acfafb1bfa7573ecac && \
+            git checkout qwen3vl-project && \
             git submodule sync && git submodule update --init --recursive && \
             python3 setup.py develop
 
