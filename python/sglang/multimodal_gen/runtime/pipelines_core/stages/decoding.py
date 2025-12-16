@@ -184,7 +184,12 @@ class DecodingStage(PipelineStage):
         pipeline = self.pipeline() if self.pipeline else None
         if not server_args.model_loaded["vae"]:
             loader = VAELoader()
-            self.vae = loader.load(server_args.model_paths["vae"], server_args)
+            self.vae = loader.load(
+                server_args.model_paths["vae"],
+                server_args,
+                "vae",
+                "diffusers",
+            )
             if pipeline:
                 pipeline.add_module("vae", self.vae)
             server_args.model_loaded["vae"] = True
