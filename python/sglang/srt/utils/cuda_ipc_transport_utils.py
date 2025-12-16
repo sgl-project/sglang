@@ -1,5 +1,7 @@
 import fcntl
 import logging
+import threading
+import time
 from multiprocessing import shared_memory
 from typing import Tuple
 
@@ -7,14 +9,20 @@ import numpy as np
 import torch
 
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_float_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
 MM_FEATURE_CACHE_SIZE = (
-    2 * 1024 * 1024 * 1024
+    4 * 1024 * 1024 * 1024
     if not get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB")
     else get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB") * 1024 * 1024
+)
+
+MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
+    0.05
+    if not get_float_env_var("SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC")
+    else get_float_env_var("SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC")
 )
 
 SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
@@ -57,20 +65,24 @@ class MmItemMemoryChunk:
     def try_to_recycle(self) -> bool:
         try:
             tp_num = get_global_server_args().tp_size
-        except:
+        except Exception:
             logger.info(
                 "get_global_server_args has not been inited , skip this turn 's recycle"
             )
-            tp_num = -1
-        if self.sync_flag.buffer_wrapper.item() == float(tp_num):
-            self.sync_flag.buffer_wrapper *= 0
+            return False
+
+        val = float(self.sync_flag.buffer_wrapper.item())
+        logger.debug(f"[try_to_recycle] area={self.area}, flag={val}, tp_size={tp_num}")
+
+        if val == float(tp_num):
+            self.sync_flag.buffer_wrapper *= 0.0
             return True
 
         return False
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size):
+    def __init__(self, memory_size, recycle_interval):
         self.memory_pool = torch.empty(
             memory_size, dtype=torch.int8, device="cuda"
         ).contiguous()
@@ -80,6 +92,38 @@ class MmItemMemoryPool:
         init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer())
         self.available_chunks = [init_chunk]
         self.occupied_chunks = []
+
+        self._lock = threading.Lock()
+
+        self._recycle_interval = recycle_interval
+        self._stop_recycler = False
+        self._recycle_thread = threading.Thread(
+            target=self._recycle_loop, name="MmItemMemoryPoolRecycler", daemon=True
+        )
+        self._recycle_thread.start()
+
+        logger.debug(
+            f"[MmItemMemoryPool] init: memory_size={memory_size}, "
+            f"recycle_interval={recycle_interval}s"
+        )
+
+    def shutdown(self):
+        self._stop_recycler = True
+        if self._recycle_thread.is_alive():
+            self._recycle_thread.join(timeout=1.0)
+
+    def _recycle_loop(self):
+        while not self._stop_recycler:
+            try:
+                with self._lock:
+                    self.recycle_chunks()
+                    self.merge_chunks()
+            except Exception as e:
+                logger.warning(
+                    f"[MmItemMemoryPool] recycle loop error: {e}", exc_info=True
+                )
+
+            time.sleep(self._recycle_interval)
 
     def clear_sync_flag_list(self):
         # call each chunk's __del__
@@ -137,15 +181,13 @@ class MmItemMemoryPool:
         return None
 
     def return_a_slice_tensor_with_flag(self, src_tensor: torch.Tensor):
-        self.recycle_chunks()
-        self.merge_chunks()
-
-        available_chunk = self.get_available_chunk(src_tensor)
-        if available_chunk is not None:
-            return (
-                available_chunk.sync_flag.meta_data,
-                self.memory_pool[available_chunk.start : available_chunk.end],
-            )
+        with self._lock:
+            available_chunk = self.get_available_chunk(src_tensor)
+            if available_chunk is not None:
+                return (
+                    available_chunk.sync_flag.meta_data,
+                    self.memory_pool[available_chunk.start : available_chunk.end],
+                )
         return None, None
 
     def recycle_chunks(self):

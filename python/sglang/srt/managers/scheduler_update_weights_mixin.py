@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -12,6 +13,8 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.managers.io_struct import (
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
@@ -44,8 +47,9 @@ class SchedulerUpdateWeightsMixin:
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
-            flush_cache_success = self.flush_cache()
-            assert flush_cache_success, "Cache flush failed after updating weights"
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
@@ -76,7 +80,8 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
+        worker = self.draft_worker or self.tp_worker
+        success, message = worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
@@ -132,7 +137,7 @@ class SchedulerUpdateWeightsMixin:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        torch.cuda.synchronize()
+        torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
 
@@ -163,6 +168,15 @@ class SchedulerUpdateWeightsMixin:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
 
         return ResumeMemoryOccupationReqOutput()
+
+    def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
+        try:
+            self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            return CheckWeightsReqOutput(success=True, message="Success.")
+        except Exception as e:
+            logger.warning(f"check_weights see error: {e}")
+            traceback.print_exc()
+            return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self: Scheduler, params):
         url = params["url"]

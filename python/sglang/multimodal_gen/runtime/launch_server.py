@@ -66,7 +66,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_w,
                     result_pipes_from_slaves_r,
                 ),
-                name=f"sgl-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{i}",
                 daemon=True,
             )
         else:  # Slave workers
@@ -83,7 +83,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_r[i - 1],
                     result_pipes_from_slaves_w[i - 1],
                 ),
-                name=f"sgl-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{i}",
                 daemon=True,
             )
         scheduler_pipe_readers.append(reader)
@@ -127,16 +127,28 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     if launch_http_server:
         logger.info("Starting FastAPI server.")
+        if server_args.webui:
+            logger.info("Launch FastAPI server in another process because of webui.")
+            http_server_process = mp.Process(
+                target=launch_http_server_only,
+                args=(server_args,),
+                name=f"sglang-diffusion-webui",
+                daemon=True,
+            )
+            http_server_process.start()
+        else:
+            launch_http_server_only(server_args)
 
-        # set for endpoints to access global_server_args
-        set_global_server_args(server_args)
 
-        app = create_app(server_args)
-        uvicorn.run(
-            app,
-            log_config=None,
-            log_level=server_args.log_level,
-            host=server_args.host,
-            port=server_args.port,
-            reload=False,
-        )
+def launch_http_server_only(server_args):
+    # set for endpoints to access global_server_args
+    set_global_server_args(server_args)
+    app = create_app(server_args)
+    uvicorn.run(
+        app,
+        log_config=None,
+        log_level=server_args.log_level,
+        host=server_args.host,
+        port=server_args.port,
+        reload=False,
+    )

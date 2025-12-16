@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -71,8 +72,8 @@ class BaseTpWorker(ABC):
         return self.model_runner.sliding_window_size
 
     @property
-    def is_hybrid(self) -> bool:
-        return self.model_runner.is_hybrid is not None
+    def is_hybrid_swa(self) -> bool:
+        return self.model_runner.is_hybrid_swa is not None
 
     def get_tokens_per_layer_info(self):
         return (
@@ -152,7 +153,11 @@ class BaseTpWorker(ABC):
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
         success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
         )
         return success, message
 
@@ -233,6 +238,12 @@ class TpModelWorker(BaseTpWorker):
             ),
             is_draft_model=is_draft_worker,
         )
+
+        # Init DLLM algorithm
+        if server_args.dllm_algorithm is not None:
+            self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
+        else:
+            self.dllm_algorithm = None
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -340,10 +351,26 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
+    def is_dllm(self):
+        return self.dllm_algorithm is not None
+
+    def _forward_batch_generation_dllm(
+        self, forward_batch: ForwardBatch
+    ) -> GenerationBatchResult:
+        logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
+            self.model_runner, forward_batch
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
         forward_batch: Optional[ForwardBatch] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
@@ -359,15 +386,10 @@ class TpModelWorker(BaseTpWorker):
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
 
-        pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
-                    all_gather_group=self.get_attention_tp_group()
-                )
-            )
-
         if self.pp_group.is_last_rank:
+            if self.is_dllm():
+                return self._forward_batch_generation_dllm(forward_batch)
+
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,

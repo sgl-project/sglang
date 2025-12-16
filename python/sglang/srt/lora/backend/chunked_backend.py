@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
@@ -52,7 +50,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         # For simple lora B, we use slice offsets [0, output_dim]
         output_dim = weights.shape[-2]
@@ -75,7 +73,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -107,7 +105,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -160,13 +158,36 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             chunk_size = 16
         return min(self.max_chunk_size, chunk_size)
 
+    def init_cuda_graph_batch_info(
+        self,
+        max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
+    ):
+        max_num_segments = (
+            (num_tokens_per_bs + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
+        ) * max_bs_in_cuda_graph
+        max_num_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        with torch.device("cuda"):
+            self.cuda_graph_batch_info = LoRABatchInfo(
+                bs=max_bs_in_cuda_graph,
+                use_cuda_graph=True,
+                seg_lens=torch.zeros(max_num_segments, dtype=torch.int32),
+                seg_indptr=torch.zeros(max_num_segments + 1, dtype=torch.int32),
+                weight_indices=torch.zeros(max_num_segments, dtype=torch.int32),
+                permutation=torch.zeros(max_num_tokens, dtype=torch.int32),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                num_segments=None,  # Set per batch
+                max_len=None,  # Not used in CSGMV backend
+            )
+
     def prepare_lora_batch(
         self,
         forward_batch: ForwardBatch,
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        batch_info: Optional[LoRABatchInfo] = None,
+        use_cuda_graph: bool,
     ):
         chunk_size = self._determine_chunk_size(forward_batch)
 
@@ -188,7 +209,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             scalings, dtype=torch.float, pin_memory=True, device="cpu"
         )
 
-        if batch_info is None:
+        if not use_cuda_graph:
             batch_info = LoRABatchInfo(
                 bs=forward_batch.batch_size,
                 num_segments=num_segments,
@@ -213,6 +234,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 seg_lens=None,
             )
         else:
+            batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = num_segments
             batch_info.max_len = chunk_size
@@ -262,14 +284,23 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         with torch.device("cpu"):
             seq_weight_indices = torch.tensor(seq_weight_indices, dtype=torch.int32)
 
-            seg_lens_cpu = (
-                torch.tensor(
+            if forward_batch.forward_mode.is_decode():
+                seg_lens_cpu = torch.ones(forward_batch.batch_size, dtype=torch.int32)
+            elif forward_batch.forward_mode.is_target_verify():
+                seg_lens_cpu = torch.full(
+                    size=(forward_batch.batch_size,),
+                    fill_value=forward_batch.spec_info.draft_token_num,
+                    dtype=torch.int32,
+                )
+            elif forward_batch.forward_mode.is_extend():
+                seg_lens_cpu = torch.tensor(
                     forward_batch.extend_seq_lens_cpu,
                     dtype=torch.int32,
                 )
-                if forward_batch.forward_mode.is_extend()
-                else torch.ones(forward_batch.batch_size, dtype=torch.int32)
-            )
+            else:
+                raise ValueError(
+                    f"Unsupported forward mode: {forward_batch.forward_mode}"
+                )
 
             row_weight_indices = torch.repeat_interleave(
                 seq_weight_indices, seg_lens_cpu

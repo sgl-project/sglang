@@ -31,10 +31,14 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+
 try:
     from vllm import _custom_ops as ops
 except ImportError:
     ops = None
+
+from sglang.srt.utils import direct_register_custom_op
 
 _is_cuda = is_cuda()
 
@@ -483,25 +487,44 @@ def apply_gptq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = gptq_marlin_gemm(
-        reshaped_x,
-        None,
-        weight,
-        weight_scale,
-        None,
-        weight_zp,
-        g_idx,
-        g_idx_sort_indices,
-        workspace,
-        wtype,
-        size_m=reshaped_x.shape[0],
-        size_n=output_size_per_partition,
-        size_k=input_size_per_partition,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=use_fp32_reduce,
-        is_zp_float=False,
-    )
+    forward_context = get_forward_context()
+    if forward_context is None:
+        output = gptq_marlin_gemm(
+            reshaped_x,
+            None,
+            weight,
+            weight_scale,
+            None,
+            weight_zp,
+            g_idx,
+            g_idx_sort_indices,
+            workspace,
+            wtype,
+            size_m=reshaped_x.shape[0],
+            size_n=output_size_per_partition,
+            size_k=input_size_per_partition,
+            is_k_full=is_k_full,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=use_fp32_reduce,
+            is_zp_float=False,
+        )
+    else:
+        output = torch.ops.sglang.unified_apply_gptq_marlin_gemm_with_wtype(
+            input=reshaped_x,
+            weight=weight,
+            weight_scale=weight_scale,
+            weight_zp=weight_zp,
+            g_idx=g_idx,
+            g_idx_sort_indices=g_idx_sort_indices,
+            workspace=workspace,
+            wtype_id=wtype.id,
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            is_k_full=is_k_full,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=use_fp32_reduce,
+            is_zp_float=False,
+        )
 
     if bias is not None:
         output.add_(bias)  # In-place add
@@ -534,24 +557,41 @@ def apply_awq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = gptq_marlin_gemm(
-        reshaped_x,
-        None,
-        weight,
-        weight_scale,
-        None,
-        weight_zp,
-        g_idx,
-        g_idx_sort_indices,
-        workspace,
-        quant_type,
-        size_m=reshaped_x.shape[0],
-        size_n=output_size_per_partition,
-        size_k=input_size_per_partition,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=use_fp32_reduce,
-        is_zp_float=False,
-    )
+    forward_context = get_forward_context()
+    if forward_context is None:
+        output = gptq_marlin_gemm(
+            reshaped_x,
+            None,
+            weight,
+            weight_scale,
+            None,
+            weight_zp,
+            g_idx,
+            g_idx_sort_indices,
+            workspace,
+            quant_type,
+            size_m=reshaped_x.shape[0],
+            size_n=output_size_per_partition,
+            size_k=input_size_per_partition,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=use_fp32_reduce,
+            is_zp_float=False,
+        )
+    else:
+        output = torch.ops.sglang.unified_apply_gptq_marlin_gemm(
+            input=reshaped_x,
+            weight=weight,
+            weight_scale=weight_scale,
+            weight_zp=weight_zp,
+            g_idx=g_idx,
+            g_idx_sort_indices=g_idx_sort_indices,
+            workspace=workspace,
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=use_fp32_reduce,
+            is_zp_float=False,
+        )
 
     if bias is not None:
         output.add_(bias)  # In-place add
@@ -818,3 +858,140 @@ class MarlinLinearMethod(LinearMethodBase):
             output.add_(bias)  # In-place add
 
         return output
+
+
+def unified_apply_gptq_marlin_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_zp: torch.Tensor,
+    g_idx: torch.Tensor,
+    g_idx_sort_indices: torch.Tensor,
+    workspace: torch.Tensor,
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    is_zp_float: bool,
+) -> torch.Tensor:
+    quant_config = get_forward_context().quant_config
+    quant_type = quant_config.quant_type
+    return gptq_marlin_gemm(
+        input,
+        None,
+        weight,
+        weight_scale,
+        None,
+        weight_zp,
+        g_idx,
+        g_idx_sort_indices,
+        workspace,
+        quant_type,
+        size_m=input.shape[0],
+        size_n=output_size_per_partition,
+        size_k=input_size_per_partition,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
+        is_zp_float=is_zp_float,
+    )
+
+
+def fake_unified_apply_gptq_marlin_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_zp: torch.Tensor,
+    g_idx: torch.Tensor,
+    g_idx_sort_indices: torch.Tensor,
+    workspace: torch.Tensor,
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    is_zp_float: bool,
+) -> torch.Tensor:
+    return input.new_empty(
+        (input.shape[0], output_size_per_partition), dtype=input.dtype
+    )
+
+
+direct_register_custom_op(
+    op_name="unified_apply_gptq_marlin_gemm",
+    op_func=unified_apply_gptq_marlin_gemm,
+    mutates_args=[],
+    fake_impl=fake_unified_apply_gptq_marlin_gemm,
+)
+
+
+def unified_apply_gptq_marlin_gemm_with_wtype(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_zp: torch.Tensor,
+    g_idx: torch.Tensor,
+    g_idx_sort_indices: torch.Tensor,
+    workspace: torch.Tensor,
+    wtype_id: int,
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+    is_k_full: bool,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    is_zp_float: bool,
+) -> torch.Tensor:
+    # Reconstruct ScalarType from id
+    wtype = None
+    for attr_name in dir(scalar_types):
+        if not attr_name.startswith("_"):
+            st = getattr(scalar_types, attr_name)
+            if hasattr(st, "id") and st.id == wtype_id:
+                wtype = st
+                break
+    return gptq_marlin_gemm(
+        input,
+        None,
+        weight,
+        weight_scale,
+        None,
+        weight_zp,
+        g_idx,
+        g_idx_sort_indices,
+        workspace,
+        wtype,
+        size_m=input.shape[0],
+        size_n=output_size_per_partition,
+        size_k=input_size_per_partition,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
+        is_zp_float=is_zp_float,
+    )
+
+
+def fake_unified_apply_gptq_marlin_gemm_with_wtype(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_zp: torch.Tensor,
+    g_idx: torch.Tensor,
+    g_idx_sort_indices: torch.Tensor,
+    workspace: torch.Tensor,
+    wtype_id: int,
+    output_size_per_partition: int,
+    input_size_per_partition: int,
+    is_k_full: bool,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    is_zp_float: bool,
+) -> torch.Tensor:
+    return input.new_empty(
+        (input.shape[0], output_size_per_partition), dtype=input.dtype
+    )
+
+
+direct_register_custom_op(
+    op_name="unified_apply_gptq_marlin_gemm_with_wtype",
+    op_func=unified_apply_gptq_marlin_gemm_with_wtype,
+    mutates_args=[],
+    fake_impl=fake_unified_apply_gptq_marlin_gemm_with_wtype,
+)

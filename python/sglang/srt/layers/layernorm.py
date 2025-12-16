@@ -19,7 +19,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from packaging.version import Version
 
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
@@ -70,10 +69,7 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
-    import vllm
     from vllm._custom_ops import fused_add_rms_norm, rms_norm
-
-    _vllm_version = Version(vllm.__version__)
 
 logger = logging.getLogger(__name__)
 
@@ -169,21 +165,12 @@ class RMSNorm(CustomOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            if _vllm_version < Version("0.9"):
-                fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
-                return x, residual
-            else:
-                residual_out = torch.empty_like(x)
-                output = torch.empty_like(x)
-                fused_add_rms_norm(
-                    output,
-                    x,
-                    residual_out,
-                    residual,
-                    self.weight.data,
-                    self.variance_epsilon,
-                )
-                return output, residual_out
+            out = torch.empty_like(x)
+            residual_out = torch.empty_like(x)
+            fused_add_rms_norm(
+                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
+            )
+            return out, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -356,25 +343,18 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.to(self.dtype)
-
-        mean = x.mean(dim=-1, keepdim=True)
-        variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-        x = (x - mean) * torch.rsqrt(variance + self.variance_epsilon)
-
-        if self.elementwise_affine:
-            x = x * self.weight.to(self.dtype)
-            if self.use_bias:
-                x = x + self.bias.to(self.dtype)
-
-        return x.to(orig_dtype)
+        return self.forward_native(x)
 
     def forward_cpu(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.layernorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        else:
+            return self.forward_native(x)
 
 
 class GemmaRMSNorm(CustomOp):
@@ -428,6 +408,22 @@ class GemmaRMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual)
 
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_cpu_amx_available:
+            if residual is not None:
+                torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+                return x, residual
+            return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        return self.forward_native(x, residual)
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -464,6 +460,11 @@ class Gemma3RMSNorm(CustomOp):
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
+
+    def forward_cpu(self, x):
+        if _is_cpu_amx_available and x.stride(-1) == 1:
+            return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
+        return self.forward_native(x)
 
     def forward_cuda(self, x):
         return self.forward_native(x)

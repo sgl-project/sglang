@@ -245,6 +245,11 @@ class ReplicatedLinear(LinearBase):
                 else:
                     raise ValueError(f"{loaded_weight} are not all equal")
 
+            if param.dtype == torch.int8 or loaded_weight.dtype == torch.int8:
+                assert (
+                    param.dtype == loaded_weight.dtype
+                ), "init para dtype and loaded weight dtype should be the same"
+
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
@@ -419,7 +424,16 @@ class ColumnParallelLinear(LinearBase):
         else:
             # FIXME: This branch is needed to load deepseek v3 awq.
             # However, we should fix this and avoid the branching here.
-            param.load_column_parallel_weight(loaded_weight)
+            # After QuantizedRL reload, params might still need tp_rank
+            try:
+                param.load_column_parallel_weight(
+                    loaded_weight,
+                    tp_rank=self.tp_rank,
+                    use_presharded_weights=self.use_presharded_weights,
+                )
+            except TypeError:
+                # Fallback for parameters that don't accept additional args
+                param.load_column_parallel_weight(loaded_weight)
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
@@ -736,7 +750,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = self.quant_method.quant_config.weight_block_size
-            block_n, _ = weight_block_size[0], weight_block_size[1]
+            raw_block_n, _ = weight_block_size[0], weight_block_size[1]
+            block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (
                 (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
             ) // self.tp_size
@@ -966,7 +981,8 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = self.quant_method.quant_config.weight_block_size
-            block_n, _ = weight_block_size[0], weight_block_size[1]
+            raw_block_n, _ = weight_block_size[0], weight_block_size[1]
+            block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (shard_offset + block_n - 1) // block_n
             shard_size = (shard_size + block_n - 1) // block_n
 
@@ -1358,7 +1374,16 @@ class RowParallelLinear(LinearBase):
         else:
             # `params` is defined in `vllm/model_executor/parameter.py`,
             # It does not support additional parameters.
-            param.load_row_parallel_weight(loaded_weight)
+            # However, after QuantizedRL reload, params might still need tp_rank
+            try:
+                param.load_row_parallel_weight(
+                    loaded_weight,
+                    tp_rank=self.tp_rank,
+                    use_presharded_weights=self.use_presharded_weights,
+                )
+            except TypeError:
+                # Fallback for parameters that don't accept additional args
+                param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_, skip_all_reduce=False):
         if self.input_is_parallel:

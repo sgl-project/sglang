@@ -13,10 +13,11 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 @dataclass
 class EncoderArchConfig(ArchConfig):
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [])
     architectures: list[str] = field(default_factory=lambda: [])
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
         }
     )

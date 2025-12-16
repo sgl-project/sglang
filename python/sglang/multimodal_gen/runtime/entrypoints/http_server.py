@@ -3,11 +3,10 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, prepare_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 @asynccontextmanager
@@ -32,27 +31,34 @@ async def lifespan(app: FastAPI):
     scheduler_client.close()
 
 
+# Health router
+health_router = APIRouter()
+
+
+@health_router.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@health_router.get("/health_generate")
+async def health_generate():
+    # TODO : health generate endpoint
+    return {"status": "ok"}
+
+
 def create_app(server_args: ServerArgs):
     """
     Create and configure the FastAPI application instance.
     """
     app = FastAPI(lifespan=lifespan)
+
+    app.include_router(health_router)
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
+
+    app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+
     app.state.server_args = server_args
     return app
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    server_args = prepare_server_args([])
-    configure_logger(server_args)
-    app = create_app(server_args)
-    uvicorn.run(
-        app,
-        host=server_args.host,
-        port=server_args.port,
-        log_config=None,
-        reload=False,  # Set to True during development for auto-reloading
-    )

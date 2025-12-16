@@ -4,7 +4,7 @@ import dataclasses
 import functools
 import math
 from functools import lru_cache, partial
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,8 @@ if _is_cuda:
 if _is_npu:
     import torch_npu
 
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -49,15 +51,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
-    from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
 
 
 @dataclasses.dataclass
@@ -89,6 +87,27 @@ def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Ten
         device=device,
     )
     return cu_seqlens
+
+
+def resolve_seqlens(
+    cu_seqlens: torch.Tensor | SingletonCache | None,
+    bsz: int,
+    seq_len: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    if cu_seqlens is None:
+        resolved_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=device)
+    elif isinstance(cu_seqlens, SingletonCache):
+        if cu_seqlens.empty():
+            cu_seqlens.set_data(_get_cu_seqlens_for_shape(bsz, seq_len, device=device))
+        resolved_seqlens = cu_seqlens.get_data()
+    else:
+        resolved_seqlens = cu_seqlens
+    assert isinstance(
+        resolved_seqlens, torch.Tensor
+    ), "cu_seqlens must be a torch.Tensor"
+    return resolved_seqlens
 
 
 class VisionSdpaAttention(nn.Module):
@@ -254,13 +273,17 @@ class VisionTritonAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
 
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
@@ -271,23 +294,42 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+            if "output_ws" not in kwargs:
+                raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
-        # [b * s, head, head_size]
-        output = torch.empty_like(q)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
-        context_attention_fwd(
-            q,
-            k,
-            v,
-            output,
-            cu_seqlens.cuda(),
-            seq_lens.cuda(),
-            max_seqlen,
-            is_causal=False,
-        )
+            if not isinstance(cu_seqlens, list):
+                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
+
+            output = kwargs["output_ws"]
+            context_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                cu_seqlens[0],
+                cu_seqlens[1],
+                cu_seqlens[2],
+                is_causal=False,
+            )
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+
+            # [b * s, head, head_size]
+            output = torch.empty_like(q)
+
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
+            context_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                cu_seqlens.cuda(),
+                seq_lens.cuda(),
+                max_seqlen,
+                is_causal=False,
+            )
 
         return output
 
@@ -300,13 +342,17 @@ class VisionFlash3Attention(nn.Module):
         if not _is_cuda:
             raise Exception("VisionFlash3Attention is only available for cuda")
         super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
 
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
@@ -317,28 +363,32 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-        elif isinstance(cu_seqlens, SingletonCache):
-            if cu_seqlens.empty():
-                cu_seqlens.set_data(
-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-                )
-            cu_seqlens = cu_seqlens.get_data()
+        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+            max_seqlen = cu_seqlens[1]
+            output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens[0],
+                cu_seqlens_k=cu_seqlens[0],
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+            )
+        else:
+            cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
 
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
-
-        output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-        )
+            output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+            )
 
         return output
 
@@ -348,8 +398,16 @@ class VisionAiterAttention(nn.Module):
         self,
         **kwargs,
     ):
-        if not _use_aiter:
+        if not _is_hip:
             raise Exception("aiter_attn is only available for AMD")
+        try:
+            from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
+        except ImportError as e:
+            raise ImportError(
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+            ) from e
+
+        self.flash_attn_varlen_func = aiter_flash_attn_varlen_func
         super().__init__()
 
     def forward(
@@ -357,25 +415,18 @@ class VisionAiterAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-        elif isinstance(cu_seqlens, SingletonCache):
-            if cu_seqlens.empty():
-                cu_seqlens.set_data(
-                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
-                )
-            cu_seqlens = cu_seqlens.get_data()
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-        return aiter_flash_attn_varlen_func(
+        return self.flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -401,7 +452,7 @@ class VisionAscendAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
         **kwargs,
@@ -412,8 +463,7 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if cu_seqlens is None:
-            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
 
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         if seq_lens.is_npu:
@@ -480,13 +530,12 @@ class VisionAttention(nn.Module):
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
+        use_data_parallel: bool = False,
         **kwargs,
     ):
         super().__init__()
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-        self.tp_size = attn_tp_size
-        self.tp_rank = attn_tp_rank
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
@@ -535,6 +584,7 @@ class VisionAttention(nn.Module):
             dropout=dropout,
             flatten_batch=flatten_batch,
             softmax_in_single_precision=softmax_in_single_precision,
+            use_data_parallel=use_data_parallel,
         )
 
         self.use_qkv_parallel = use_qkv_parallel
@@ -590,11 +640,11 @@ class VisionAttention(nn.Module):
                 backend = "fa3"
             else:
                 backend = "triton_attn"
-        elif _use_aiter:
-            if get_device_capability() < (9, 4):
-                backend = "triton_attn"
-            else:
+        elif _is_hip:
+            if get_device_capability() >= (9, 4) and _use_aiter:
                 backend = "aiter_attn"
+            else:
+                backend = "triton_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell():
@@ -642,6 +692,8 @@ class VisionAttention(nn.Module):
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
         kv_head = self.num_attention_kv_heads_per_partition
+
+        attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
@@ -719,6 +771,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            output_ws=attn_output_ws,
         )
 
         assert output.dim() == 3, output.shape

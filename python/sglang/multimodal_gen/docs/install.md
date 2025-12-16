@@ -1,6 +1,6 @@
-# Install sgl-diffusion
+# Install SGLang-diffusion
 
-You can install sgl-diffusion using one of the methods below.
+You can install sglang-diffusion using one of the methods below.
 
 This page primarily applies to common NVIDIA GPU platforms.
 
@@ -11,7 +11,7 @@ It is recommended to use uv for a faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install 'sglang[diffusion]' --prerelease=allow
+uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
 ## Method 2: From source
@@ -23,15 +23,15 @@ cd sglang
 
 # Install the Python packages
 pip install --upgrade pip
-pip install -e "python/.[diffusion]"
+pip install -e "python[diffusion]"
 
 # With uv
-uv pip install --prerelease=allow  -e "python/.[diffusion]"
+uv pip install -e "python[diffusion]" --prerelease=allow
 ```
 
 ## Method 3: Using Docker
 
-The Docker images are available on Docker Hub at [lmsysorg/sglang](), built from the [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
+The Docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang), built from the [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile).
 Replace `<secret>` below with your HuggingFace Hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash
