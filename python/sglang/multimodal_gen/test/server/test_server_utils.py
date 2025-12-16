@@ -792,7 +792,7 @@ def get_generate_fn(
                     f"{case_id}: video job {video_id} timed out during baseline generation. "
                     "Attempting to collect performance data anyway."
                 )
-                return video_id
+                return (video_id, b"")
 
             if is_amd:
                 logger.warning(
@@ -830,11 +830,11 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return video_id
+        return (video_id, content)
 
     video_seconds = sampling_params.seconds or 4
 
-    def generate_image(case_id, client) -> str:
+    def generate_image(case_id, client) -> tuple[str, bytes]:
         """T2I: Text to Image generation."""
         if not sampling_params.prompt:
             pytest.skip(f"{id}: no text prompt configured")
@@ -884,8 +884,8 @@ def get_generate_fn(
 
         return rid
 
-    def generate_image_edit(case_id, client) -> str:
-        """TI2I: Text + Image ? Image edit."""
+    def generate_image_edit(case_id, client) -> tuple[str, bytes]:
+        """TI2I: Text + Image -> Image edit."""
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
@@ -960,7 +960,7 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
     def generate_image_edit_url(case_id, client) -> str:
         """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
@@ -1045,8 +1045,8 @@ def get_generate_fn(
             seconds=video_seconds,
         )
 
-    def generate_image_to_video(case_id, client) -> str:
-        """I2V: Image ? Video (optional prompt)."""
+    def generate_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """I2V: Image -> Video (optional prompt)."""
         if not sampling_params.image_path:
             pytest.skip(f"{id}: no input image configured")
 
@@ -1085,8 +1085,8 @@ def get_generate_fn(
             },
         )
 
-    def generate_text_image_to_video(case_id, client) -> str:
-        """TI2V: Text + Image ? Video."""
+    def generate_text_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """TI2V: Text + Image -> Video."""
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
