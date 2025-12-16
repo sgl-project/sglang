@@ -43,6 +43,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -74,7 +75,11 @@ from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_regi
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    set_global_server_args_for_tokenizer,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     trace_get_proc_propagate_context,
@@ -102,6 +107,20 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
+
+
+def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+    is_cross_node = server_args.dist_init_addr
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        logger.info(
+            "[CUDA IPC] Cross-node detected, using default CPU transport mode"
+        )
+        return "default"
+    else:
+        logger.info("[CUDA IPC] Single-node detected, using CUDA IPC transport mode")
+        return "cuda_ipc"
 
 
 @dataclasses.dataclass
@@ -181,6 +200,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
 
         # Initialize tokenizer and processor
+        set_global_server_args_for_tokenizer(server_args)
+
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
 
@@ -236,6 +257,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.model_config.hf_config, server_args, _processor, transport_mode
             )
 
+            self.mm_data_processor = AsyncMMDataProcessor(
+                self.mm_processor,
+                max_concurrent_calls=getattr(server_args, "mm_max_concurrent_calls", None),
+                timeout_s=getattr(server_args, "mm_per_request_timeout", None),
+            )
+
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
             else:
@@ -245,6 +272,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self._initialize_multi_item_delimiter_text()
         else:
             self.mm_processor = self.processor = None
+            self.mm_data_processor = None
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = None
@@ -614,18 +642,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
+            mm_inputs: Dict = await self.mm_data_processor.process(
                 image_data=obj.image_data,
                 audio_data=obj.audio_data,
-                input_text=input_text or input_ids,
+                input_text_or_ids=(input_text or input_ids),
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
-                for item in mm_inputs["mm_items"]:
-                    if isinstance(item, MultimodalDataItem):
-                        item.set_pad_value()
         else:
             mm_inputs = None
 
@@ -898,7 +923,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self.send_to_scheduler.send_pyobj(batch_req)
-
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
@@ -2132,16 +2156,6 @@ class ServerStatus(Enum):
     Up = "Up"
     Starting = "Starting"
     UnHealthy = "UnHealthy"
-
-
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
-    is_cross_node = server_args.dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
 
 
 async def print_exception_wrapper(func):

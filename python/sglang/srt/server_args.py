@@ -3857,6 +3857,11 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
     _global_server_args = server_args
 
 
+def set_global_server_args_for_tokenizer(server_args: ServerArgs):
+    global _global_server_args
+    _global_server_args = server_args
+
+
 def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
         raise ValueError("Global server args is not set yet!")
