@@ -25,8 +25,8 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import numpy as np
 import torch
 
-import sglang.srt.model_executor.cuda_graph_runner
 import sglang
+import sglang.srt.model_executor.cuda_graph_runner
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -136,7 +136,11 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def _capture_graph(self, graph, pool, stream, run_once_fn, bs: int):
         compilation_config = get_global_server_args().compilation_config
-        if self.enable_torch_compile and (not self.compile_bs or bs in self.compile_bs) and (compilation_config.compiler != "npugraph_ex"):
+        if (
+            self.enable_torch_compile
+            and (not self.compile_bs or bs in self.compile_bs)
+            and (compilation_config.compiler != "npugraph_ex")
+        ):
             self.model_runner.attn_backend.enable_torch_compile = True
             compiler = NpuGraphCompiler(
                 model_runner=self.model_runner,
@@ -177,7 +181,9 @@ class NPUGraphRunner(CudaGraphRunner):
             self.model_runner.attn_backend.enable_torch_compile = False
 
             if self.enable_torch_compile:
-                skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+                skip_guard_context = torch.compiler.set_stance(
+                    skip_guard_eval_unsafe=True
+                )
             else:
                 skip_guard_context = empty_context()
 

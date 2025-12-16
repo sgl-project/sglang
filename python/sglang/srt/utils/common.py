@@ -1944,6 +1944,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
     return major, minor
 
+
 @lru_cache(maxsize=1)
 def get_compiler_backend(
     mode: str = None,
@@ -1965,7 +1966,7 @@ def get_compiler_backend(
             compiler_config.mode = "max-autotune" if mode is None else mode
             npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
             return npu_backend
-        
+
         if compilation_config.compiler == "npugraph_ex":
             if not torchair_package_installed:
                 raise ImportError(

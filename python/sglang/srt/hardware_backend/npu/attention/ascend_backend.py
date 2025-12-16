@@ -267,9 +267,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
-        self.enable_torchair_compile = (
-            model_runner.server_args.enable_torchair_compile
-        )
+        self.enable_torchair_compile = model_runner.server_args.enable_torchair_compile
         if self.enable_torchair_compile:
             max_total_tokens = model_runner.max_total_num_tokens
             self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size

@@ -37,7 +37,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
-from sglang.srt.server_args import get_global_server_args
 
 
 class NPUCompileModelRunner(CudaGraphRunner):
