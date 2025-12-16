@@ -297,7 +297,7 @@ class SGLDiffusionServerAPI:
             # Wait for completion with fixed polling
             poll_interval = 5  # 5 seconds
             max_wait_time = 3600  # 1 hour
-            max_consecutive_errors = 5  # Maximum consecutive network errors before giving up
+            max_consecutive_errors = 5
             consecutive_errors = 0
             start_time = time.time()
 
@@ -450,7 +450,7 @@ class SGLDiffusionServerAPI:
 
         Args:
             lora_nickname: The nickname of the adapter (required).
-            lora_path: Path to the LoRA adapter (local path or HF repo id). 
+            lora_path: Path to the LoRA adapter (local path or HF repo id).
                       Required for the first load; optional if re-activating a cached nickname.
             target: Which transformer(s) to apply the LoRA to. One of:
                 - "all": Apply to all transformers (default)

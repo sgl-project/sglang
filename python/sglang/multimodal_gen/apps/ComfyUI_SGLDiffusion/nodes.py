@@ -3,15 +3,16 @@ ComfyUI nodes for SGLang Diffusion integration.
 Provides nodes for connecting to SGLang Diffusion server and generating images/videos.
 """
 
-import base64
-import io
-import os
-import time
+import folder_paths
 import torch
 
 from .server_api import SGLDiffusionServerAPI
-from .utils import get_image_path, is_empty_image, convert_b64_to_tensor_image, convert_video_to_comfy_video
-import folder_paths
+from .utils import (
+    convert_b64_to_tensor_image,
+    convert_video_to_comfy_video,
+    get_image_path,
+    is_empty_image,
+)
 
 
 class SGLDiffusionServerModel:
@@ -201,9 +202,9 @@ class SGLDiffusionGenerateImage:
             raise RuntimeError(f"Failed to generate image: {str(e)}")
 
         # Decode base64 image
-        if not response['data'] or not response['data'][0]['b64_json']:
+        if not response["data"] or not response["data"][0]["b64_json"]:
             raise RuntimeError("No image data in response")
-        image_data = response['data'][0]['b64_json']
+        image_data = response["data"][0]["b64_json"]
         image = convert_b64_to_tensor_image(image_data)
 
         return (image,)
@@ -393,6 +394,7 @@ class SGLDiffusionGenerateVideo:
 
 class SGLDiffusionSetLora:
     """Node to set LoRA adapter for SGLang Diffusion server."""
+
     def __init__(self):
         self.target = "all"
         self.sgld_client = None
@@ -487,4 +489,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
     "SGLDiffusionSetLora": "SGLDiffusion Set LoRA",
 }
-
