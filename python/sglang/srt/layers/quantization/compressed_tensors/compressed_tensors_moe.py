@@ -13,9 +13,9 @@ from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
@@ -429,6 +429,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype = torch.float8_e4m3fn
 
         from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             assert self.weight_block_size is not None

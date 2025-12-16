@@ -982,7 +982,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         if isinstance(param, BlockQuantScaleParameter):
             if hasattr(self.quant_method, "quant_config"):
                 weight_block_size = self.quant_method.quant_config.weight_block_size
-            elif hasattr(self, "weight_block_size"): # llm-compressor quant model
+            elif hasattr(self, "weight_block_size"):  # llm-compressor quant model
                 weight_block_size = self.weight_block_size
             else:
                 raise ValueError(
