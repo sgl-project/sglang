@@ -660,24 +660,16 @@ def get_generate_fn(
                     f"{id}: image_path must be a URL for URL direct test: {url}"
                 )
 
-        logger.info(f"URL direct test: processing {len(image_urls)} URLs")
-        logger.info(f"URLs: {image_urls}")
-
         upload_images = []  # For file upload (first image)
         processed_urls = []  # For URL/base64 (middle and last images)
 
         if len(image_urls) >= 3:
-            logger.info(
-                f"Processing {len(image_urls)} images: first upload, last base64"
-            )
-
             # First image: use upload method
             first_url = image_urls[0]
             try:
                 # Use existing download function
                 temp_file = download_image_from_url(first_url)
                 upload_images.append(temp_file)
-                logger.info(f"First image saved for upload: {temp_file}")
 
             except Exception as e:
                 logger.error(f"Failed to download first image for upload: {e}")
@@ -687,7 +679,6 @@ def get_generate_fn(
             for i in range(1, len(image_urls) - 1):
                 middle_url = image_urls[i]
                 processed_urls.append(middle_url)
-                logger.info(f"Middle image {i} using URL method: {middle_url}")
 
             # Last image: convert to base64
             last_url = image_urls[-1]
@@ -703,21 +694,11 @@ def get_generate_fn(
                 content_type = response.headers.get("content-type", "image/jpeg")
                 base64_data = base64.b64encode(response.content).decode("utf-8")
                 base64_url = f"data:{content_type};base64,{base64_data}"
-
                 processed_urls.append(base64_url)
-                logger.info(
-                    f"Last image converted to base64: " f"{len(base64_data)} chars"
-                )
 
             except Exception as e:
                 logger.error(f"Failed to convert last image to base64: {e}")
                 pytest.skip(f"{id}: failed to convert last image " f"to base64: {e}")
-
-        logger.info(f"Upload images: {len(upload_images)} files")
-        logger.info(f"Processed URLs: {len(processed_urls)} items")
-        for i, url in enumerate(processed_urls):
-            url_type = "base64" if url.startswith("data:") else "http"
-            logger.info(f"  URL {i+1}: {url_type} format")
 
         # Open upload files
         upload_files = []
@@ -728,11 +709,11 @@ def get_generate_fn(
             response = client.images.with_raw_response.edit(
                 model=model_path,
                 image=upload_files,
-                image_urls=processed_urls,
                 prompt=sampling_params.prompt,
                 n=1,
                 size=sampling_params.output_size,
                 response_format="b64_json",
+                extra_body={"url": processed_urls},
             )
         finally:
             # Close upload files
