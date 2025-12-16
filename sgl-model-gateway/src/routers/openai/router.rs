@@ -2,6 +2,7 @@ use std::{
     any::Any,
     collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
+    time::Instant,
 };
 
 use axum::{
@@ -35,6 +36,7 @@ use crate::{
     app_context::AppContext,
     core::{model_type::Endpoint, ModelCard, ProviderType, RuntimeType, Worker, WorkerRegistry},
     data_connector::{ConversationId, ListParams, ResponseId, SortOrder},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
         responses::{
@@ -576,6 +578,20 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+        let streaming = body.stream;
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            metrics_labels::ENDPOINT_CHAT,
+            streaming,
+        );
+
         let auth_header = extract_auth_header(headers, &None);
 
         let worker = match self
@@ -583,18 +599,44 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             .await
         {
             Ok(w) => w,
-            Err(response) => return response,
+            Err(response) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
         };
 
         let mut payload = match to_value(body) {
             Ok(v) => v,
             Err(e) => {
-                return error_responses::bad_request(format!("Failed to serialize request: {}", e))
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_CHAT,
+                metrics_labels::ERROR_VALIDATION,
+            );
             return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
 
@@ -630,6 +672,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             Ok(r) => r,
             Err(e) => {
                 worker.circuit_breaker().record_failure();
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_BACKEND,
+                );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("Failed to contact upstream: {}", e),
@@ -646,6 +696,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             match resp.bytes().await {
                 Ok(body) => {
                     worker.circuit_breaker().record_success();
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_OPENAI,
+                        metrics_labels::BACKEND_EXTERNAL,
+                        metrics_labels::CONNECTION_HTTP,
+                        model,
+                        metrics_labels::ENDPOINT_CHAT,
+                        start.elapsed(),
+                    );
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     if let Some(ct) = content_type {
@@ -655,6 +713,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
                 Err(e) => {
                     worker.circuit_breaker().record_failure();
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_OPENAI,
+                        metrics_labels::BACKEND_EXTERNAL,
+                        metrics_labels::CONNECTION_HTTP,
+                        model,
+                        metrics_labels::ENDPOINT_CHAT,
+                        metrics_labels::ERROR_BACKEND,
+                    );
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to read response: {}", e),
@@ -663,6 +729,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
             }
         } else {
+            // For streaming, record duration at start since we can't track completion
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_CHAT,
+                start.elapsed(),
+            );
             let stream = resp.bytes_stream();
             let (tx, rx) = mpsc::unbounded_channel();
             tokio::spawn(async move {
@@ -696,15 +771,38 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+        let streaming = body.stream.unwrap_or(false);
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            metrics_labels::ENDPOINT_RESPONSES,
+            streaming,
+        );
+
         let auth_header = extract_auth_header(headers, &None);
 
-        let model = model_id.unwrap_or(body.model.as_str());
         let worker = match self
             .select_worker_for_model(model, auth_header.as_ref())
             .await
         {
             Ok(w) => w,
-            Err(response) => return response,
+            Err(response) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
         };
 
         let mut request_body = body.clone();
@@ -755,6 +853,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .get_conversation(&conv_id)
                 .await
             {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_VALIDATION,
+                );
                 return error_responses::not_found("conversation", &conv_id.0);
             }
 
@@ -864,12 +970,28 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut payload = match to_value(&request_body) {
             Ok(v) => v,
             Err(e) => {
-                return error_responses::bad_request(format!("Failed to serialize request: {}", e))
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ERROR_VALIDATION,
+            );
             return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
 
@@ -891,11 +1013,25 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             previous_response_id: original_previous_response_id,
         });
 
-        if ctx.is_streaming() {
+        let response = if ctx.is_streaming() {
             handle_streaming_response(ctx).await
         } else {
             self.handle_non_streaming_response(ctx).await
+        };
+
+        // Record duration only for successful requests (errors tracked inside handlers)
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_RESPONSES,
+                start.elapsed(),
+            );
         }
+
+        response
     }
 
     async fn get_response(
