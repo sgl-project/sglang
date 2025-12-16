@@ -512,13 +512,15 @@ class Scheduler(
         )
         # prefill batch interval, only for null disaggregation mode
         self.prefill_interval = -1
-        self.__consecutive_decode_steps = 0
+        self.consecutive_decode_steps = 0
         if self.server_args.disaggregation_mode == "null":
             self.prefill_interval = envs.SGLANG_PREFILL_INTERVAL.get()
             if self.prefill_interval > 10000:
-                self.prefill_interval = -1
                 logger.warning(f"{self.prefill_interval=} is too large, setting to -1")
-            if self.prefill_interval > 0:
+                self.prefill_interval = -1
+            elif self.prefill_interval <= 0:
+                logger.info("Prefill interval control is disabled")
+            else:
                 logger.info(f"Prefill interval: {self.prefill_interval}")
 
         self.schedule_enhancer = None
@@ -1753,7 +1755,7 @@ class Scheduler(
         if (
             self.prefill_interval > 0
             and not self.running_batch.is_empty()
-            and self.__consecutive_decode_steps < self.prefill_interval
+            and self.consecutive_decode_steps < self.prefill_interval
         ):
             self.running_batch.batch_is_full = True
         else:
@@ -1772,7 +1774,7 @@ class Scheduler(
 
         if new_batch is not None:
             # Prefill batch scheduled: reset the decode iteration counter
-            self.__consecutive_decode_steps = 0
+            self.consecutive_decode_steps = 0
             # Run prefill first if possible
             ret = new_batch
         else:
@@ -1780,7 +1782,7 @@ class Scheduler(
             if not self.running_batch.is_empty():
                 # Increment decode iteration counter for prefill interval tracking
                 if self.prefill_interval > 0:
-                    self.__consecutive_decode_steps += 1
+                    self.consecutive_decode_steps += 1
 
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
