@@ -113,6 +113,7 @@ void compute_expert_offsets_w4a8(
   } else {
     compute_expert_offsets_w4a8_call(1024);
   }
+#undef compute_expert_offsets_w4a8_call
 }
 
 void get_cutlass_w4a8_moe_mm_data_caller(
