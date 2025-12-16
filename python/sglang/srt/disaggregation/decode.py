@@ -67,6 +67,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
+SYNC_PREFILL_DP_RANK = envs.SGLANG_SYNC_PREFILL_DP_RANK.get()
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -457,7 +459,7 @@ class DecodePreallocQueue:
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
-            if envs.SGLANG_SYNC_PREFILL_DP_RANK.get():
+            if SYNC_PREFILL_DP_RANK:
                 if hasattr(decode_req.kv_receiver, "_get_prefill_dp_rank_from_server"):
                     if bootstrap_table is None:
                         bootstrap_table = (

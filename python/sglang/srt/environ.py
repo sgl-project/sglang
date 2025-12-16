@@ -199,6 +199,7 @@ class Envs:
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_SYNC_PREFILL_DP_RANK = EnvBool(False)
+    SGLANG_PREFILL_ENTRY_CLEANUP_INTERVAL = EnvInt(30)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
