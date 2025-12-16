@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -108,16 +108,6 @@ def init_npu_backend():
 
     torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
-
-
-@functools.lru_cache(maxsize=1)
-def get_npu_memory_capacity() -> int:
-    """
-    Return the total NPU memory capacity in MB.
-    """
-    import torch
-
-    return torch.npu.mem_get_info()[1] // (1024 * 1024)
 
 
 def npu_format_cast(
