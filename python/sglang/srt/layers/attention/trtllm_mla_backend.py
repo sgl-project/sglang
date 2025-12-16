@@ -1005,8 +1005,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             # FP4 KV cache is stored as FP4 but accessed as dequantized (bfloat16),
             # so don't convert q to FP4
-            float4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-            if not (float4_dtype is not None and self.data_type == float4_dtype):
+            is_fp4_kv_cache = float4_dtype is not None and self.data_type == float4_dtype
+            if not is_fp4_kv_cache:
                 q = q.to(self.data_type)
 
             bmm1_scale = q_scale * k_scale * layer.scaling
