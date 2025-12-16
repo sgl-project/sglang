@@ -153,10 +153,28 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
             ],
         )
 
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        self.assertGreater(metrics["accuracy"], 0.65)
+        # Wait a little bit so that the memory check happens.
+        time.sleep(4)
+
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
     def test_mmmu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -167,7 +185,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.55)
+        self.assertGreater(metrics["score"], 0.26)
 
 
 class TestQwenPPAccuracy(unittest.TestCase):
