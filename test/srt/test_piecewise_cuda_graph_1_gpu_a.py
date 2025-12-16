@@ -1,14 +1,9 @@
 import unittest
 
-import torch
-
-from sglang import Engine
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_IMAGE_URL,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
