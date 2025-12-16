@@ -172,7 +172,10 @@ class NemotronHMoE(nn.Module):
             activation=config.mlp_hidden_act,
             layer_id=layer_idx,
             is_gated=False,
-            routed_scaling_factor=self.routed_scaling_factor,
+            # NemotronH has a special FP16 overflow workaround for routed scaling,
+            # implemented in `forward()` below. Keep MoE-layer routed scaling off
+            # here to avoid double-scaling and to preserve the historical behavior.
+            routed_scaling_factor=1.0,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -234,6 +237,18 @@ class NemotronHMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         final_hidden_states, shared_output = self._forward_core(hidden_states)
+
+        # Fix FP16 overflow (NemotronH-specific workaround)
+        # - For non-FP16, apply routed scaling on the routed experts output.
+        # - For FP16, avoid scaling the routed output directly; if shared experts
+        #   exist, downscale the shared output instead to preserve the relative
+        #   weighting between routed/shared paths.
+        routed_scaling_factor = self.routed_scaling_factor
+        if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states * routed_scaling_factor
+            elif shared_output is not None:
+                shared_output = shared_output * (1.0 / routed_scaling_factor)
 
         if shared_output is not None:
             final_hidden_states += shared_output
