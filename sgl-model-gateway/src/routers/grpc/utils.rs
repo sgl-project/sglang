@@ -3,6 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
+use http::StatusCode;
 use serde_json::{json, Map, Value};
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -15,6 +16,7 @@ use super::{
 use crate::{
     core::Worker,
     grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
+    observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{
@@ -52,14 +54,20 @@ pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<Grp
                 error = %e,
                 "Failed to get gRPC client from worker"
             );
-            error::internal_error(format!("Failed to get gRPC client: {}", e))
+            error::internal_error(
+                "get_grpc_client_failed",
+                format!("Failed to get gRPC client: {}", e),
+            )
         })?
         .ok_or_else(|| {
             error!(
                 function = "get_grpc_client_from_worker",
                 "Selected worker not configured for gRPC"
             );
-            error::internal_error("Selected worker is not configured for gRPC")
+            error::internal_error(
+                "worker_not_configured_for_grpc",
+                "Selected worker is not configured for gRPC",
+            )
         })?;
 
     Ok((*client_arc).clone())
@@ -612,11 +620,10 @@ pub async fn collect_stream_responses(
                     ProtoResponseVariant::Error(err) => {
                         error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message(), "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
-                        return Err(error::internal_error(format!(
-                            "{} generation failed: {}",
-                            worker_name,
-                            err.message()
-                        )));
+                        return Err(error::internal_error(
+                            "worker_generation_failed",
+                            format!("{} generation failed: {}", worker_name, err.message()),
+                        ));
                     }
                     ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
@@ -629,10 +636,10 @@ pub async fn collect_stream_responses(
             Err(e) => {
                 error!(function = "collect_stream_responses", worker = %worker_name, error = ?e, "Worker stream error");
                 // Don't mark as completed - let Drop send abort for error cases
-                return Err(error::internal_error(format!(
-                    "{} stream failed: {}",
-                    worker_name, e
-                )));
+                return Err(error::internal_error(
+                    "worker_stream_failed",
+                    format!("{} stream failed: {}", worker_name, e),
+                ));
             }
         }
     }
@@ -949,6 +956,33 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
             Ok(json_value) => GenerateFinishReason::Other(json_value),
             Err(_) => GenerateFinishReason::Other(Value::String(reason_str.to_string())),
         },
+    }
+}
+
+// ============================================================================
+// Metrics helper functions (shared by HTTP routers and gRPC pipeline)
+// ============================================================================
+
+/// Map route path to endpoint label for metrics
+pub fn route_to_endpoint(route: &str) -> &'static str {
+    match route {
+        "/v1/chat/completions" => metrics_labels::ENDPOINT_CHAT,
+        "/generate" => metrics_labels::ENDPOINT_GENERATE,
+        "/v1/completions" => metrics_labels::ENDPOINT_COMPLETIONS,
+        "/v1/rerank" => metrics_labels::ENDPOINT_RERANK,
+        "/v1/responses" => metrics_labels::ENDPOINT_RESPONSES,
+        _ => "other",
+    }
+}
+
+/// Map HTTP status code to error type label for metrics
+pub fn error_type_from_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => metrics_labels::ERROR_VALIDATION,
+        404 => metrics_labels::ERROR_NO_WORKERS,
+        408 | 504 => metrics_labels::ERROR_TIMEOUT,
+        500..=599 => metrics_labels::ERROR_BACKEND,
+        _ => metrics_labels::ERROR_INTERNAL,
     }
 }
 

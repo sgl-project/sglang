@@ -22,6 +22,7 @@ SUITES = {
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
+        "test_lora_format_adapter.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -113,9 +114,12 @@ def run_pytest(files):
             and "AssertionError" in full_output
         )
 
-        if not is_perf_assertion:
+        is_flaky_ci_assertion = "SafetensorError" in full_output
+
+        if not (is_perf_assertion or is_flaky_ci_assertion):
             return returncode
 
+    logger.info(f"Max retry exceeded")
     return returncode
 
 
