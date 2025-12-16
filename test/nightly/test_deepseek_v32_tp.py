@@ -197,8 +197,8 @@ class TestDeepseekV32_TP_MTP(CustomTestCase):
             TEST_RESULTS.append(
                 {
                     "variant": "tp_mtp",
-                    "prefill_backend": "default",
-                    "decode_backend": "EAGLE",
+                    "prefill_backend": "flashmla_sparse",
+                    "decode_backend": "flashmla_kv",
                     "kv_cache": "fp16",
                     "accuracy": metrics["accuracy"],
                     "avg_spec_accept_length": avg_spec_accept_length,
