@@ -585,9 +585,9 @@ class QwenImageTransformer2DModel(CachableDiT):
         hf_config: dict[str, Any],
     ):
         super().__init__(config=config, hf_config=hf_config)
-        patch_size = config.arch_config.patch_size
-        in_channels = config.arch_config.in_channels
-        out_channels = config.arch_config.out_channels
+        patch_size = config.patch_size
+        in_channels = config.in_channels
+        out_channels = config.out_channels
         num_layers = config.arch_config.num_layers
         attention_head_dim = config.arch_config.attention_head_dim
         num_attention_heads = config.arch_config.num_attention_heads

@@ -1,0 +1,1733 @@
+Suite: 1-gpu | Partition: 0/2
+Selected 2 files:
+  - test_server_a.py
+  - test_lora_format_adapter.py
+============================= test session starts ==============================
+platform linux -- Python 3.12.12, pytest-9.0.1, pluggy-1.6.0 -- /root/.python/sglang/bin/python3
+cachedir: .pytest_cache
+rootdir: /sgl-workspace/sglang/python
+configfile: pyproject.toml
+plugins: anyio-4.11.0
+collecting ...
+----------------------------- live log collection ------------------------------
+INFO     sglang.multimodal_gen.envs:envs.py:106 Using AITER as the attention library
+INFO     sglang.multimodal_gen.runtime.platforms:__init__.py:97 ROCm platform is unavailable: No module named 'amdsmi'
+INFO     sglang.multimodal_gen.runtime.platforms:__init__.py:54 CUDA is available
+INFO     numexpr.utils:utils.py:148 Note: detected 128 virtual cores but NumExpr set to maximum of 64, check "NUMEXPR_MAX_THREADS" environment variable.
+INFO     numexpr.utils:utils.py:151 Note: NumExpr detected 128 cores but "NUMEXPR_MAX_THREADS" not set, so enforcing safe limit of 16.
+INFO     numexpr.utils:utils.py:164 NumExpr defaulting to 16 threads.
+collected 2 items
+
+sglang/multimodal_gen/test/server/test_server_a.py::TestDiffusionServerOneGpu::test_diffusion_perf[qwen_image_edit_ti2i] INFO:sglang.multimodal_gen.test.test_utils:[server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+
+-------------------------------- live log setup --------------------------------
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:144 [server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+INFO:sglang.multimodal_gen.test.server.test_server_utils:Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:144 Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Starting server pid=1590345, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:179 [server-test] Starting server pid=1590345, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=0s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=0s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=5s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=5s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=10s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=10s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=15s
+[12-14 03:49:51] server_args: {"model_path": "Qwen/Qwen-Image-Edit", "attention_backend": null, "mode": "inference", "workload_type": "t2v", "cache_strategy": "none", "distributed_executor_backend": "mp", "nccl_port": null, "trust_remote_code": false, "revision": null, "num_gpus": 1, "tp_size": 1, "sp_degree": 1, "ulysses_degree": 1, "ring_degree": 1, "dp_size": 1, "dp_degree": 1, "enable_cfg_parallel": false, "hsdp_replicate_dim": 1, "hsdp_shard_dim": 1, "dist_timeout": null, "lora_path": null, "lora_nickname": "default", "vae_path": null, "lora_target_modules": null, "output_type": "pil", "dit_cpu_offload": true, "use_fsdp_inference": false, "text_encoder_cpu_offload": true, "image_encoder_cpu_offload": true, "vae_cpu_offload": true, "pin_cpu_memory": true, "mask_strategy_file_path": null, "STA_mode": "STA_inference", "skip_time_steps": 15, "enable_torch_compile": false, "disable_autocast": true, "VSA_sparsity": 0.0, "moba_config_path": null, "moba_config": {}, "master_port": 30098, "host": null, "port": 28000, "scheduler_port": 5571, "enable_stage_verification": true, "prompt_file_path": null, "model_paths": {}, "model_loaded": {"transformer": true, "vae": true}, "override_transformer_cls_name": null, "boundary_ratio": null, "log_level": "debug"}
+[12-14 03:49:51] Starting server...
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=15s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=20s
+[12-14 03:50:00] Scheduler bind at endpoint: tcp://localhost:5571
+[12-14 03:50:00] Initializing distributed environment with world_size=1, device=cuda:0
+[12-14 03:50:00] world_size=1 rank=0 local_rank=0 distributed_init_method=env:// backend=nccl
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=20s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=25s
+Set TORCH_CUDA_ARCH_LIST to 9.0
+[12-14 03:50:02] Registering pipelines complete, 12 pipelines registered
+[12-14 03:50:02] Attempting to acquire lock 139809309050688 on /tmp/tmp353q2ttz/.cache/huggingface/.gitignore.lock
+[12-14 03:50:02] Lock 139809309050688 acquired on /tmp/tmp353q2ttz/.cache/huggingface/.gitignore.lock
+[12-14 03:50:02] Attempting to release lock 139809309050688 on /tmp/tmp353q2ttz/.cache/huggingface/.gitignore.lock
+[12-14 03:50:02] Lock 139809309050688 released on /tmp/tmp353q2ttz/.cache/huggingface/.gitignore.lock
+[12-14 03:50:02] Attempting to acquire lock 139809309051600 on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:02] Lock 139809309051600 acquired on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:02] Attempting to release lock 139809309051600 on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:02] Lock 139809309051600 released on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:02] Starting new HTTPS connection (1): huggingface.co:443
+[12-14 03:50:03] https://huggingface.co:443 "HEAD /Qwen/Qwen-Image-Edit/resolve/main/model_index.json HTTP/1.1" 307 0
+[12-14 03:50:03] https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen-Image-Edit/ac7f9318f633fc4b5778c59367c8128225f1e3de/model_index.json HTTP/1.1" 200 0
+[12-14 03:50:03] Attempting to acquire lock 139809442072480 on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Lock 139809442072480 acquired on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Attempting to release lock 139809442072480 on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Lock 139809442072480 released on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Attempting to acquire lock 139809443712752 on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Lock 139809443712752 acquired on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Attempting to release lock 139809443712752 on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Lock 139809443712752 released on /tmp/tmp353q2ttz/.cache/huggingface/download/model_index.json.lock
+[12-14 03:50:03] Downloaded model_index.json for Qwen/Qwen-Image-Edit, pipeline: QwenImageEditPipeline
+[12-14 03:50:03] Resolved model path 'Qwen/Qwen-Image-Edit' from exact path match.
+[12-14 03:50:03] Found model info: ModelInfo(pipeline_cls=<class 'sglang.multimodal_gen.runtime.pipelines.qwen_image.QwenImageEditPipeline'>, sampling_param_cls=<class 'sglang.multimodal_gen.configs.sample.qwenimage.QwenImageSamplingParams'>, pipeline_config_cls=<class 'sglang.multimodal_gen.configs.pipeline_configs.qwen_image.QwenImageEditPipelineConfig'>)
+[12-14 03:50:03] Loading pipeline modules...
+[12-14 03:50:03] Downloading model snapshot from HF Hub for Qwen/Qwen-Image-Edit...
+[12-14 03:50:03] Downloaded model to /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de
+[12-14 03:50:03] Model path: /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de
+[12-14 03:50:03] Diffusers version: 0.35.0.dev0
+[12-14 03:50:03] Loading pipeline modules from config: {'_class_name': 'QwenImageEditPipeline', '_diffusers_version': '0.35.0.dev0', 'processor': ['transformers', 'Qwen2VLProcessor'], 'scheduler': ['diffusers', 'FlowMatchEulerDiscreteScheduler'], 'text_encoder': ['transformers', 'Qwen2_5_VLForConditionalGeneration'], 'tokenizer': ['transformers', 'Qwen2Tokenizer'], 'transformer': ['diffusers', 'QwenImageTransformer2DModel'], 'vae': ['diffusers', 'AutoencoderKLQwenImage']}
+[12-14 03:50:03] Loading required components: ['processor', 'scheduler', 'text_encoder', 'tokenizer', 'transformer', 'vae']
+
+Loading required modules:   0%|          | 0/6 [00:00<?, ?it/s][12-14 03:50:03] Loading processor from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/processor
+[12-14 03:50:04] Loaded processor: Qwen2VLProcessor from: customized
+
+Loading required modules:  17%|█▋        | 1/6 [00:01<00:05,  1.01s/it][12-14 03:50:04] Loading scheduler from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/scheduler
+[12-14 03:50:04] Loaded scheduler: FlowMatchEulerDiscreteScheduler from: customized
+[12-14 03:50:04] Loading text_encoder from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/text_encoder
+[12-14 03:50:04] HF model config: {'bos_token_id': 151643, 'do_sample': True, 'eos_token_id': 151645, 'pad_token_id': 151643, 'repetition_penalty': 1.05, 'temperature': 0.1, 'top_k': 1, 'top_p': 0.001, 'architectures': ['Qwen2_5_VLForConditionalGeneration'], 'attention_dropout': 0.0, 'hidden_act': 'silu', 'hidden_size': 3584, 'image_token_id': 151655, 'initializer_range': 0.02, 'intermediate_size': 18944, 'max_position_embeddings': 128000, 'max_window_layers': 28, 'num_attention_heads': 28, 'num_hidden_layers': 28, 'num_key_value_heads': 4, 'rms_norm_eps': 1e-06, 'rope_scaling': {'mrope_section': [16, 24, 24], 'rope_type': 'default', 'type': 'default'}, 'rope_theta': 1000000.0, 'sliding_window': 32768, 'text_config': {'architectures': ['Qwen2_5_VLForConditionalGeneration'], 'attention_dropout': 0.0, 'bos_token_id': 151643, 'eos_token_id': 151645, 'hidden_act': 'silu', 'hidden_size': 3584, 'image_token_id': None, 'initializer_range': 0.02, 'intermediate_size': 18944, 'layer_types': ['full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention'], 'max_position_embeddings': 128000, 'max_window_layers': 28, 'model_type': 'qwen2_5_vl_text', 'num_attention_heads': 28, 'num_hidden_layers': 28, 'num_key_value_heads': 4, 'rms_norm_eps': 1e-06, 'rope_scaling': {'mrope_section': [16, 24, 24], 'rope_type': 'default', 'type': 'default'}, 'rope_theta': 1000000.0, 'sliding_window': None, 'torch_dtype': 'float32', 'use_cache': True, 'use_sliding_window': False, 'video_token_id': None, 'vision_end_token_id': 151653, 'vision_start_token_id': 151652, 'vision_token_id': 151654, 'vocab_size': 152064}, 'tie_word_embeddings': False, 'use_cache': True, 'use_sliding_window': False, 'video_token_id': 151656, 'vision_config': {'depth': 32, 'fullatt_block_indexes': [7, 15, 23, 31], 'hidden_act': 'silu', 'hidden_size': 1280, 'in_channels': 3, 'in_chans': 3, 'initializer_range': 0.02, 'intermediate_size': 3420, 'model_type': 'qwen2_5_vl', 'num_heads': 16, 'out_hidden_size': 3584, 'patch_size': 14, 'spatial_merge_size': 2, 'spatial_patch_size': 14, 'temporal_patch_size': 2, 'tokens_per_second': 2, 'torch_dtype': 'float32', 'window_size': 112}, 'vision_end_token_id': 151653, 'vision_start_token_id': 151652, 'vision_token_id': 151654, 'vocab_size': 152064}
+[12-14 03:50:04] Attention backend not specified
+[12-14 03:50:04] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=25s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=30s
+[12-14 03:50:09] [RunAI Streamer] Overall time to stream 15.4 GiB of all files to cpu: 4.53s, 3.4 GiB/s
+[12-14 03:50:09] Loading weights took 4.58 seconds
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=30s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=35s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=35s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=40s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=40s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=45s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=45s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=50s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=50s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=55s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=55s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=60s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=60s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=65s
+[12-14 03:50:44] Loaded text_encoder: FSDPQwen2_5_VLForConditionalGeneration from: customized
+
+Loading required modules:  50%|█████     | 3/6 [00:41<00:45, 15.19s/it][12-14 03:50:44] Loading tokenizer from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/tokenizer
+[12-14 03:50:45] Loaded tokenizer: Qwen2TokenizerFast from: customized
+
+Loading required modules:  67%|██████▋   | 4/6 [00:41<00:20, 10.11s/it][12-14 03:50:45] Loading transformer from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer
+[12-14 03:50:45] Loading QwenImageTransformer2DModel from 9 safetensors files, default_dtype: torch.bfloat16
+[12-14 03:50:45] Attention backend not specified
+[12-14 03:50:45] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=65s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=70s
+[12-14 03:50:48] [RunAI Streamer] Overall time to stream 38.1 GiB of all files to cpu: 3.54s, 10.8 GiB/s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=70s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=75s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=75s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=80s
+[12-14 03:51:00] Loaded model with 20.43B parameters
+[12-14 03:51:00] Fusing QKV projections for better performance
+[12-14 03:51:00] Loaded transformer: QwenImageTransformer2DModel from: customized
+
+Loading required modules:  83%|████████▎ | 5/6 [00:57<00:11, 11.94s/it][12-14 03:51:00] Loading vae from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/vae
+[12-14 03:51:00] HF model config: {'attn_scales': [], 'base_dim': 96, 'dim_mult': [1, 2, 4, 4], 'dropout': 0.0, 'latents_mean': [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921], 'latents_std': [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916], 'num_res_blocks': 2, 'temperal_downsample': [False, True, True], 'z_dim': 16}
+[12-14 03:51:00] Loaded vae: AutoencoderKLQwenImage from: customized
+
+Loading required modules: 100%|██████████| 6/6 [00:57<00:00,  9.59s/it]
+[12-14 03:51:00] Pipelines instantiated
+[12-14 03:51:00] Worker 0: Initialized device, model, and distributed environment.
+[12-14 03:51:00] Worker 0: Scheduler loop started.
+[12-14 03:51:00] Rank 0 scheduler listening on tcp://*:5571
+[12-14 03:51:00] All workers are ready
+[12-14 03:51:00] Starting FastAPI server.
+[2025-12-14 03:51:00] [32mINFO[0m:     Started server process [[36m1590345[0m]
+[2025-12-14 03:51:00] [32mINFO[0m:     Waiting for application startup.
+[12-14 03:51:00] Scheduler client connected to backend scheduler at tcp://localhost:5571
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=80s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Server ready
+[12-14 03:51:00] ZMQ Broker is listening for offline jobs on tcp://*:28001
+[2025-12-14 03:51:00] [32mINFO[0m:     Application startup complete.
+[2025-12-14 03:51:00] [32mINFO[0m:     Uvicorn running on [1mhttp://localhost:28000[0m (Press CTRL+C to quit)
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:215 [server-test] Server ready
+INFO:sglang.multimodal_gen.test.server.test_server_utils:Downloading image from URL: https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg
+-------------------------------- live log call ---------------------------------
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:53 Downloading image from URL: https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg
+INFO:sglang.multimodal_gen.test.server.test_server_utils:Downloaded image to: /tmp/diffusion_test_image_1765684266.jpg
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:68 Downloaded image to: /tmp/diffusion_test_image_1765684266.jpg
+[12-14 03:51:06] Calling on_part_begin with no data
+[12-14 03:51:06] Calling on_header_field with data[36:55]
+[12-14 03:51:06] Calling on_header_value with data[57:81]
+[12-14 03:51:06] Calling on_header_end with no data
+[12-14 03:51:06] Calling on_headers_finished with no data
+[12-14 03:51:06] Calling on_part_data with data[85:113]
+[12-14 03:51:06] Calling on_part_end with no data
+[12-14 03:51:06] Calling on_part_begin with no data
+[12-14 03:51:06] Calling on_header_field with data[151:170]
+[12-14 03:51:06] Calling on_header_value with data[172:195]
+[12-14 03:51:06] Calling on_header_end with no data
+[12-14 03:51:06] Calling on_headers_finished with no data
+[12-14 03:51:06] Calling on_part_data with data[199:219]
+[12-14 03:51:06] Calling on_part_end with no data
+[12-14 03:51:06] Calling on_part_begin with no data
+[12-14 03:51:06] Calling on_header_field with data[257:276]
+[12-14 03:51:06] Calling on_header_value with data[278:297]
+[12-14 03:51:06] Calling on_header_end with no data
+[12-14 03:51:06] Calling on_headers_finished with no data
+[12-14 03:51:06] Calling on_part_data with data[301:302]
+[12-14 03:51:06] Calling on_part_end with no data
+[12-14 03:51:06] Calling on_part_begin with no data
+[12-14 03:51:06] Calling on_header_field with data[340:359]
+[12-14 03:51:06] Calling on_header_value with data[361:394]
+[12-14 03:51:06] Calling on_header_end with no data
+[12-14 03:51:06] Calling on_headers_finished with no data
+[12-14 03:51:06] Calling on_part_data with data[398:406]
+[12-14 03:51:06] Calling on_part_end with no data
+[12-14 03:51:06] Calling on_part_begin with no data
+[12-14 03:51:06] Calling on_header_field with data[444:463]
+[12-14 03:51:06] Calling on_header_value with data[465:536]
+[12-14 03:51:06] Calling on_header_end with no data
+[12-14 03:51:06] Calling on_header_field with data[538:550]
+[12-14 03:51:06] Calling on_header_value with data[552:562]
+[12-14 03:51:06] Calling on_header_end with no data
+[12-14 03:51:06] Calling on_headers_finished with no data
+[12-14 03:51:06] Calling on_part_data with data[0:65536]
+[12-14 03:51:06] Calling on_part_data with data[0:65536]
+[12-14 03:51:06] Calling on_part_data with data[0:85601]
+[12-14 03:51:06] Calling on_part_end with no data
+[12-14 03:51:06] Calling on_end with no data
+[12-14 03:51:06] Setting num_frames to 1 because this is an image-gen model
+[12-14 03:51:06] Sampling params:
+                       width: -1
+                      height: -1
+                  num_frames: 1
+                      prompt: Convert 2D style to 3D style
+                  neg_prompt:
+                        seed: 1024
+                 infer_steps: 50
+      num_outputs_per_prompt: 1
+              guidance_scale: 4.0
+     embedded_guidance_scale: 6.0
+                    n_tokens: -1
+                  flow_shift: None
+                  image_path: outputs/uploads/7b65ce94-251e-4f13-b016-d93568b023c2_diffusion_test_image_1765684266.jpg
+                 save_output: True
+            output_file_path: outputs/7b65ce94-251e-4f13-b016-d93568b023c2.jpg
+
+[12-14 03:51:06] Processing prompt: Convert 2D style to 3D style
+[12-14 03:51:06] Creating pipeline stages...
+[12-14 03:51:06] Attention backend not specified
+[12-14 03:51:06] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+[12-14 03:51:06] Running pipeline stages: ['input_validation_stage', 'prompt_encoding_stage_primary', 'image_encoding_stage_primary', 'timestep_preparation_stage', 'latent_preparation_stage', 'conditioning_stage', 'denoising_stage', 'decoding_stage']
+[12-14 03:51:06] [InputValidationStage] started...
+[12-14 03:51:06] [InputValidationStage] finished in 0.0603 seconds
+[12-14 03:51:06] [ImageEncodingStage] started...
+[12-14 03:51:08] [ImageEncodingStage] finished in 1.8839 seconds
+[12-14 03:51:08] [ImageVAEEncodingStage] started...
+[12-14 03:51:09] [ImageVAEEncodingStage] finished in 0.9073 seconds
+[12-14 03:51:09] [TimestepPreparationStage] started...
+[12-14 03:51:09] [TimestepPreparationStage] timesteps: tensor([1000.0000,  998.7800,  997.5114,  996.1909,  994.8157,  993.3821,
+         991.8862,  990.3242,  988.6912,  986.9825,  985.1928,  983.3159,
+         981.3455,  979.2744,  977.0946,  974.7973,  972.3727,  969.8102,
+         967.0975,  964.2208,  961.1652,  957.9130,  954.4449,  950.7386,
+         946.7688,  942.5062,  937.9170,  932.9625,  927.5972,  921.7677,
+         915.4111,  908.4525,  900.8019,  892.3512,  882.9677,  872.4878,
+         860.7076,  847.3689,  832.1406,  814.5907,  794.1443,  770.0200,
+         741.1271,  705.8969,  661.9875,  605.7410,  531.1080,  427.3116,
+         273.1076,   20.0000], device='cuda:0')
+[12-14 03:51:09] [TimestepPreparationStage] finished in 0.0371 seconds
+[12-14 03:51:09] [LatentPreparationStage] started...
+[12-14 03:51:09] [LatentPreparationStage] finished in 0.0006 seconds
+[12-14 03:51:09] [ConditioningStage] started...
+[12-14 03:51:09] [ConditioningStage] finished in 0.0001 seconds
+[12-14 03:51:09] [DenoisingStage] started...
+
+  0%|          | 0/50 [00:00<?, ?it/s]
+  2%|▏         | 1/50 [00:01<01:11,  1.45s/it]
+  4%|▍         | 2/50 [00:01<00:36,  1.31it/s]
+  6%|▌         | 3/50 [00:02<00:28,  1.64it/s]
+  8%|▊         | 4/50 [00:02<00:24,  1.87it/s]
+ 10%|█         | 5/50 [00:02<00:22,  2.03it/s]
+ 12%|█▏        | 6/50 [00:03<00:20,  2.14it/s]
+ 14%|█▍        | 7/50 [00:03<00:19,  2.21it/s]
+ 16%|█▌        | 8/50 [00:04<00:18,  2.26it/s]
+ 18%|█▊        | 9/50 [00:04<00:17,  2.30it/s]
+ 20%|██        | 10/50 [00:05<00:17,  2.32it/s]
+ 22%|██▏       | 11/50 [00:05<00:16,  2.34it/s]
+ 24%|██▍       | 12/50 [00:05<00:16,  2.35it/s]
+ 26%|██▌       | 13/50 [00:06<00:15,  2.36it/s]
+ 28%|██▊       | 14/50 [00:06<00:15,  2.37it/s]
+ 30%|███       | 15/50 [00:07<00:14,  2.37it/s]
+ 32%|███▏      | 16/50 [00:07<00:14,  2.37it/s]
+ 34%|███▍      | 17/50 [00:08<00:13,  2.37it/s]
+ 36%|███▌      | 18/50 [00:08<00:13,  2.37it/s]
+ 38%|███▊      | 19/50 [00:08<00:13,  2.38it/s]
+ 40%|████      | 20/50 [00:09<00:12,  2.38it/s]
+ 42%|████▏     | 21/50 [00:09<00:12,  2.37it/s]
+ 44%|████▍     | 22/50 [00:10<00:11,  2.37it/s]
+ 46%|████▌     | 23/50 [00:10<00:11,  2.37it/s]
+ 48%|████▊     | 24/50 [00:10<00:10,  2.37it/s]
+ 50%|█████     | 25/50 [00:11<00:10,  2.37it/s]
+ 52%|█████▏    | 26/50 [00:11<00:10,  2.37it/s]
+ 54%|█████▍    | 27/50 [00:12<00:09,  2.37it/s]
+ 56%|█████▌    | 28/50 [00:12<00:09,  2.37it/s]
+ 58%|█████▊    | 29/50 [00:13<00:08,  2.37it/s]
+ 60%|██████    | 30/50 [00:13<00:08,  2.37it/s]
+ 62%|██████▏   | 31/50 [00:13<00:08,  2.37it/s]
+ 64%|██████▍   | 32/50 [00:14<00:07,  2.37it/s]
+ 66%|██████▌   | 33/50 [00:14<00:07,  2.37it/s]
+ 68%|██████▊   | 34/50 [00:15<00:06,  2.37it/s]
+ 70%|███████   | 35/50 [00:15<00:06,  2.37it/s]
+ 72%|███████▏  | 36/50 [00:16<00:05,  2.37it/s]
+ 74%|███████▍  | 37/50 [00:16<00:05,  2.37it/s]
+ 76%|███████▌  | 38/50 [00:16<00:05,  2.37it/s]
+ 78%|███████▊  | 39/50 [00:17<00:04,  2.37it/s]
+ 80%|████████  | 40/50 [00:17<00:04,  2.37it/s]
+ 82%|████████▏ | 41/50 [00:18<00:03,  2.37it/s]
+ 84%|████████▍ | 42/50 [00:18<00:03,  2.37it/s]
+ 86%|████████▌ | 43/50 [00:19<00:02,  2.37it/s]
+ 88%|████████▊ | 44/50 [00:19<00:02,  2.37it/s]
+ 90%|█████████ | 45/50 [00:19<00:02,  2.37it/s]
+ 92%|█████████▏| 46/50 [00:20<00:01,  2.37it/s]
+ 94%|█████████▍| 47/50 [00:20<00:01,  2.37it/s]
+ 96%|█████████▌| 48/50 [00:21<00:00,  2.37it/s]
+ 98%|█████████▊| 49/50 [00:21<00:00,  2.36it/s]
+100%|██████████| 50/50 [00:21<00:00,  2.37it/s]
+100%|██████████| 50/50 [00:21<00:00,  2.27it/s]
+[12-14 03:51:31] [DenoisingStage] average time per step: 0.4396 seconds
+[12-14 03:51:31] [DenoisingStage] finished in 21.9859 seconds
+[12-14 03:51:31] [DecodingStage] started...
+INFO:httpx:HTTP Request: POST http://localhost:28000/v1/images/edits "HTTP/1.1 200 OK"
+[12-14 03:51:32] [DecodingStage] finished in 1.1955 seconds
+[12-14 03:51:32] Saved output to outputs/7b65ce94-251e-4f13-b016-d93568b023c2.jpg
+[12-14 03:51:32] Pixel data generated successfully in 26.25 seconds
+[12-14 03:51:32] Completed batch processing. Generated 1 outputs in 26.25 seconds.
+[2025-12-14 03:51:32] [32mINFO[0m:     127.0.0.1:58010 - "[1mPOST /v1/images/edits HTTP/1.1[0m" [32m200 OK[0m
+INFO     httpx:_client.py:1025 HTTP Request: POST http://localhost:28000/v1/images/edits "HTTP/1.1 200 OK"
+INFO:sglang.multimodal_gen.test.slack_utils:Found thread_ts: 1765599450.861079
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:148 Found thread_ts: 1765599450.861079
+INFO:sglang.multimodal_gen.test.slack_utils:File uploaded successfully: .png
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:185 File uploaded successfully: .png
+INFO:sglang.multimodal_gen.test.test_utils:Waiting for req perf record with request id:
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:181 Waiting for req perf record with request id:
+ERROR:sglang.multimodal_gen.test.server.test_server_common:Performance validation failed for qwen_image_edit_ti2i:
+Validation failed for 'Denoise Step 0'.
+    Actual:   1452.1602ms
+    Expected: 720.0000ms
+    Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+assert 1452.1601861342788 <= 1007.9999999999999
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:222 Performance validation failed for qwen_image_edit_ti2i:
+Validation failed for 'Denoise Step 0'.
+    Actual:   1452.1602ms
+    Expected: 720.0000ms
+    Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+assert 1452.1601861342788 <= 1007.9999999999999
+ERROR:sglang.multimodal_gen.test.server.test_server_common:
+update this baseline in the "scenarios" section of perf_baselines.json:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "InputValidationStage": 60.1,
+        "ImageEncodingStage": 1883.83,
+        "ImageVAEEncodingStage": 907.28,
+        "TimestepPreparationStage": 26.41,
+        "LatentPreparationStage": 0.38,
+        "ConditioningStage": 0.02,
+        "DenoisingStage": 21985.7,
+        "DecodingStage": 1195.47
+    },
+    "denoise_step_ms": {
+        "0": 1452.16,
+        "1": 281.39,
+        "2": 423.27,
+        "3": 419.09,
+        "4": 418.85,
+        "5": 421.11,
+        "6": 419.45,
+        "7": 421.25,
+        "8": 420.59,
+        "9": 420.73,
+        "10": 420.23,
+        "11": 420.42,
+        "12": 420.56,
+        "13": 419.76,
+        "14": 421.82,
+        "15": 421.22,
+        "16": 420.37,
+        "17": 420.94,
+        "18": 419.81,
+        "19": 420.79,
+        "20": 421.38,
+        "21": 422.98,
+        "22": 420.79,
+        "23": 423.34,
+        "24": 422.87,
+        "25": 421.87,
+        "26": 422.32,
+        "27": 422.95,
+        "28": 422.43,
+        "29": 422.42,
+        "30": 423.26,
+        "31": 421.49,
+        "32": 422.63,
+        "33": 421.33,
+        "34": 422.41,
+        "35": 421.93,
+        "36": 422.72,
+        "37": 422.54,
+        "38": 422.39,
+        "39": 422.03,
+        "40": 422.8,
+        "41": 423.49,
+        "42": 421.86,
+        "43": 421.67,
+        "44": 423.08,
+        "45": 422.75,
+        "46": 422.69,
+        "47": 423.14,
+        "48": 423.97,
+        "49": 421.14
+    },
+    "expected_e2e_ms": 26072.89,
+    "expected_avg_denoise_ms": 439.53,
+    "expected_median_denoise_ms": 421.86
+}
+
+
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:363
+update this baseline in the "scenarios" section of perf_baselines.json:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "InputValidationStage": 60.1,
+        "ImageEncodingStage": 1883.83,
+        "ImageVAEEncodingStage": 907.28,
+        "TimestepPreparationStage": 26.41,
+        "LatentPreparationStage": 0.38,
+        "ConditioningStage": 0.02,
+        "DenoisingStage": 21985.7,
+        "DecodingStage": 1195.47
+    },
+    "denoise_step_ms": {
+        "0": 1452.16,
+        "1": 281.39,
+        "2": 423.27,
+        "3": 419.09,
+        "4": 418.85,
+        "5": 421.11,
+        "6": 419.45,
+        "7": 421.25,
+        "8": 420.59,
+        "9": 420.73,
+        "10": 420.23,
+        "11": 420.42,
+        "12": 420.56,
+        "13": 419.76,
+        "14": 421.82,
+        "15": 421.22,
+        "16": 420.37,
+        "17": 420.94,
+        "18": 419.81,
+        "19": 420.79,
+        "20": 421.38,
+        "21": 422.98,
+        "22": 420.79,
+        "23": 423.34,
+        "24": 422.87,
+        "25": 421.87,
+        "26": 422.32,
+        "27": 422.95,
+        "28": 422.43,
+        "29": 422.42,
+        "30": 423.26,
+        "31": 421.49,
+        "32": 422.63,
+        "33": 421.33,
+        "34": 422.41,
+        "35": 421.93,
+        "36": 422.72,
+        "37": 422.54,
+        "38": 422.39,
+        "39": 422.03,
+        "40": 422.8,
+        "41": 423.49,
+        "42": 421.86,
+        "43": 421.67,
+        "44": 423.08,
+        "45": 422.75,
+        "46": 422.69,
+        "47": 423.14,
+        "48": 423.97,
+        "49": 421.14
+    },
+    "expected_e2e_ms": 26072.89,
+    "expected_avg_denoise_ms": 439.53,
+    "expected_median_denoise_ms": 421.86
+}
+
+
+FAILED
+--- POTENTIAL BASELINE IMPROVEMENTS DETECTED ---
+The following test cases performed significantly better than their baselines.
+Consider updating perf_baselines.json with the snippets below:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "LatentPreparationStage": 0.38,
+        "ImageVAEEncodingStage": 400.0,
+        "TimestepPreparationStage": 13.78,
+        "ConditioningStage": 0.02,
+        "DenoisingStage": 21985.7,
+        "DecodingStage": 850.0,
+        "ImageEncodingStage": 1485.0,
+        "InputValidationStage": 23
+    },
+    "denoise_step_ms": {
+        "0": 720.0,
+        "1": 281.39,
+        "2": 423.27,
+        "3": 419.09,
+        "4": 418.85,
+        "5": 421.11,
+        "6": 419.45,
+        "7": 421.25,
+        "8": 420.59,
+        "9": 420.73,
+        "10": 420.23,
+        "11": 420.42,
+        "12": 420.56,
+        "13": 419.76,
+        "14": 421.82,
+        "15": 421.22,
+        "16": 420.37,
+        "17": 420.94,
+        "18": 419.81,
+        "19": 420.79,
+        "20": 421.38,
+        "21": 422.98,
+        "22": 420.79,
+        "23": 423.34,
+        "24": 422.87,
+        "25": 421.87,
+        "26": 422.32,
+        "27": 422.95,
+        "28": 422.43,
+        "29": 422.42,
+        "30": 423.26,
+        "31": 421.49,
+        "32": 422.63,
+        "33": 421.33,
+        "34": 422.41,
+        "35": 421.93,
+        "36": 422.72,
+        "37": 422.54,
+        "38": 422.39,
+        "39": 422.03,
+        "40": 422.8,
+        "41": 423.49,
+        "42": 421.86,
+        "43": 421.67,
+        "44": 423.08,
+        "45": 422.75,
+        "46": 422.69,
+        "47": 423.14,
+        "48": 423.97,
+        "49": 421.14
+    },
+    "expected_e2e_ms": 26072.89,
+    "expected_avg_denoise_ms": 439.53,
+    "expected_median_denoise_ms": 421.86
+},
+
+
+sglang/multimodal_gen/test/server/test_lora_format_adapter.py::TestLoRAFormatAdapter::test_lora_format_adapter_all_formats INFO:lora_test:=== Running test: HF standard SDXL LoRA ===
+
+-------------------------------- live log call ---------------------------------
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: HF standard SDXL LoRA ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=1120
+=== Downloading LoRA from jbilcke-hf/sdxl-cinematic-1 (pytorch_lora_weights.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/sdxl_cinematic1_pytorch_lora_weights.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=1120
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.up.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.up.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.STANDARD
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.STANDARD
+INFO:lora_test:[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.up.weight
+INFO     lora_test:lora_format_adapter.py:229 [LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.up.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.up.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_out_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_q_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.0.attn2.processor.to_v_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_k_lora.up.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.down.weight, unet.down_blocks.1.attentions.0.transformer_blocks.1.attn1.processor.to_out_lora.up.weight
+INFO:lora_test:=== Running test: XLabs FLUX Realism LoRA ===
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: XLabs FLUX Realism LoRA ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=152
+=== Downloading LoRA from XLabs-AI/flux-RealismLora (lora.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/flux_realism_lora.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=152
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): double_blocks.0.processor.proj_lora1.down.weight, double_blocks.0.processor.proj_lora1.up.weight, double_blocks.0.processor.proj_lora2.down.weight, double_blocks.0.processor.proj_lora2.up.weight, double_blocks.0.processor.qkv_lora1.down.weight, double_blocks.0.processor.qkv_lora1.up.weight, double_blocks.0.processor.qkv_lora2.down.weight, double_blocks.0.processor.qkv_lora2.up.weight, double_blocks.1.processor.proj_lora1.down.weight, double_blocks.1.processor.proj_lora1.up.weight, double_blocks.1.processor.proj_lora2.down.weight, double_blocks.1.processor.proj_lora2.up.weight, double_blocks.1.processor.qkv_lora1.down.weight, double_blocks.1.processor.qkv_lora1.up.weight, double_blocks.1.processor.qkv_lora2.down.weight, double_blocks.1.processor.qkv_lora2.up.weight, double_blocks.10.processor.proj_lora1.down.weight, double_blocks.10.processor.proj_lora1.up.weight, double_blocks.10.processor.proj_lora2.down.weight, double_blocks.10.processor.proj_lora2.up.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): double_blocks.0.processor.proj_lora1.down.weight, double_blocks.0.processor.proj_lora1.up.weight, double_blocks.0.processor.proj_lora2.down.weight, double_blocks.0.processor.proj_lora2.up.weight, double_blocks.0.processor.qkv_lora1.down.weight, double_blocks.0.processor.qkv_lora1.up.weight, double_blocks.0.processor.qkv_lora2.down.weight, double_blocks.0.processor.qkv_lora2.up.weight, double_blocks.1.processor.proj_lora1.down.weight, double_blocks.1.processor.proj_lora1.up.weight, double_blocks.1.processor.proj_lora2.down.weight, double_blocks.1.processor.proj_lora2.up.weight, double_blocks.1.processor.qkv_lora1.down.weight, double_blocks.1.processor.qkv_lora1.up.weight, double_blocks.1.processor.qkv_lora2.down.weight, double_blocks.1.processor.qkv_lora2.up.weight, double_blocks.10.processor.proj_lora1.down.weight, double_blocks.10.processor.proj_lora1.up.weight, double_blocks.10.processor.proj_lora2.down.weight, double_blocks.10.processor.proj_lora2.up.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.XLABS_FLUX
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.XLABS_FLUX
+INFO:lora_test:[LoRAFormatAdapter] Converted XLabs FLUX LoRA using _convert_xlabs_flux_lora_to_diffusers
+INFO     lora_test:lora_format_adapter.py:271 [LoRAFormatAdapter] Converted XLabs FLUX LoRA using _convert_xlabs_flux_lora_to_diffusers
+INFO:lora_test:[LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:204 [LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_B.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.1.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.1.attn.to_add_out.lora_B.weight
+INFO:lora_test:=== Running test: Kohya-style Flux LoRA ===
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: Kohya-style Flux LoRA ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=912
+=== Downloading LoRA from kohya-ss/misc-models (flux-hasui-lora-d4-sigmoid-raw-gs1.0.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/flux_hasui_lora_d4_sigmoid_raw_gs1_0.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=912
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): lora_unet_double_blocks_0_img_attn_proj.alpha, lora_unet_double_blocks_0_img_attn_proj.lora_down.weight, lora_unet_double_blocks_0_img_attn_proj.lora_up.weight, lora_unet_double_blocks_0_img_attn_qkv.alpha, lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight, lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight, lora_unet_double_blocks_0_img_mlp_0.alpha, lora_unet_double_blocks_0_img_mlp_0.lora_down.weight, lora_unet_double_blocks_0_img_mlp_0.lora_up.weight, lora_unet_double_blocks_0_img_mlp_2.alpha, lora_unet_double_blocks_0_img_mlp_2.lora_down.weight, lora_unet_double_blocks_0_img_mlp_2.lora_up.weight, lora_unet_double_blocks_0_img_mod_lin.alpha, lora_unet_double_blocks_0_img_mod_lin.lora_down.weight, lora_unet_double_blocks_0_img_mod_lin.lora_up.weight, lora_unet_double_blocks_0_txt_attn_proj.alpha, lora_unet_double_blocks_0_txt_attn_proj.lora_down.weight, lora_unet_double_blocks_0_txt_attn_proj.lora_up.weight, lora_unet_double_blocks_0_txt_attn_qkv.alpha, lora_unet_double_blocks_0_txt_attn_qkv.lora_down.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): lora_unet_double_blocks_0_img_attn_proj.alpha, lora_unet_double_blocks_0_img_attn_proj.lora_down.weight, lora_unet_double_blocks_0_img_attn_proj.lora_up.weight, lora_unet_double_blocks_0_img_attn_qkv.alpha, lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight, lora_unet_double_blocks_0_img_attn_qkv.lora_up.weight, lora_unet_double_blocks_0_img_mlp_0.alpha, lora_unet_double_blocks_0_img_mlp_0.lora_down.weight, lora_unet_double_blocks_0_img_mlp_0.lora_up.weight, lora_unet_double_blocks_0_img_mlp_2.alpha, lora_unet_double_blocks_0_img_mlp_2.lora_down.weight, lora_unet_double_blocks_0_img_mlp_2.lora_up.weight, lora_unet_double_blocks_0_img_mod_lin.alpha, lora_unet_double_blocks_0_img_mod_lin.lora_down.weight, lora_unet_double_blocks_0_img_mod_lin.lora_up.weight, lora_unet_double_blocks_0_txt_attn_proj.alpha, lora_unet_double_blocks_0_txt_attn_proj.lora_down.weight, lora_unet_double_blocks_0_txt_attn_proj.lora_up.weight, lora_unet_double_blocks_0_txt_attn_qkv.alpha, lora_unet_double_blocks_0_txt_attn_qkv.lora_down.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.KOHYA_FLUX
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.KOHYA_FLUX
+INFO:lora_test:[LoRAFormatAdapter] Converted Kohya FLUX LoRA using _convert_kohya_flux_lora_to_diffusers
+INFO     lora_test:lora_format_adapter.py:271 [LoRAFormatAdapter] Converted Kohya FLUX LoRA using _convert_kohya_flux_lora_to_diffusers
+INFO:lora_test:[LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_A.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_B.weight, transformer.transformer_blocks.0.ff.net.2.lora_A.weight, transformer.transformer_blocks.0.ff.net.2.lora_B.weight, transformer.transformer_blocks.0.norm1.linear.lora_A.weight, transformer.transformer_blocks.0.norm1.linear.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:204 [LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_A.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_B.weight, transformer.transformer_blocks.0.ff.net.2.lora_A.weight, transformer.transformer_blocks.0.ff.net.2.lora_B.weight, transformer.transformer_blocks.0.norm1.linear.lora_A.weight, transformer.transformer_blocks.0.norm1.linear.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_A.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_B.weight, transformer.transformer_blocks.0.ff.net.2.lora_A.weight, transformer.transformer_blocks.0.ff.net.2.lora_B.weight, transformer.transformer_blocks.0.norm1.linear.lora_A.weight, transformer.transformer_blocks.0.norm1.linear.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): transformer.transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer.transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer.transformer_blocks.0.attn.to_q.lora_A.weight, transformer.transformer_blocks.0.attn.to_k.lora_A.weight, transformer.transformer_blocks.0.attn.to_v.lora_A.weight, transformer.transformer_blocks.0.attn.to_q.lora_B.weight, transformer.transformer_blocks.0.attn.to_k.lora_B.weight, transformer.transformer_blocks.0.attn.to_v.lora_B.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_A.weight, transformer.transformer_blocks.0.ff.net.0.proj.lora_B.weight, transformer.transformer_blocks.0.ff.net.2.lora_A.weight, transformer.transformer_blocks.0.ff.net.2.lora_B.weight, transformer.transformer_blocks.0.norm1.linear.lora_A.weight, transformer.transformer_blocks.0.norm1.linear.lora_B.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer.transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer.transformer_blocks.0.attn.add_q_proj.lora_B.weight
+INFO:lora_test:=== Running test: Kohya-style SD LoRA ===
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: Kohya-style SD LoRA ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=1320
+=== Downloading LoRA from kohya-ss/misc-models (fp-1f-chibi-1024.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/fp_1f_chibi_1024.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=1320
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_down.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_down.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.NON_DIFFUSERS_SD
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.NON_DIFFUSERS_SD
+INFO:lora_test:[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_down.weight
+INFO     lora_test:lora_format_adapter.py:229 [LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_up.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_down.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_up.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_down.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_down.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_up.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_down.weight
+INFO:lora_test:[LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_A.weight
+INFO     lora_test:lora_format_adapter.py:204 [LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_A.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_A.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): lora_unet_single_transformer_blocks_0_attn_to_k.alpha, lora_unet_single_transformer_blocks_0_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_q.alpha, lora_unet_single_transformer_blocks_0_attn_to_q.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_q.lora_B.weight, lora_unet_single_transformer_blocks_0_attn_to_v.alpha, lora_unet_single_transformer_blocks_0_attn_to_v.lora_A.weight, lora_unet_single_transformer_blocks_0_attn_to_v.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_mlp.alpha, lora_unet_single_transformer_blocks_0_proj_mlp.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_mlp.lora_B.weight, lora_unet_single_transformer_blocks_0_proj_out.alpha, lora_unet_single_transformer_blocks_0_proj_out.lora_A.weight, lora_unet_single_transformer_blocks_0_proj_out.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_k.alpha, lora_unet_single_transformer_blocks_10_attn_to_k.lora_A.weight, lora_unet_single_transformer_blocks_10_attn_to_k.lora_B.weight, lora_unet_single_transformer_blocks_10_attn_to_q.alpha, lora_unet_single_transformer_blocks_10_attn_to_q.lora_A.weight
+INFO:lora_test:=== Running test: Wan2.1 Fun Reward LoRA (Comfy) ===
+[Kohya-style SD LoRA] diffusers-style check FAILED (relaxed):
+  total keys = 1320
+  cond1(no banned prefixes)  = False, bad_prefix_keys=1320
+    example bad prefix key: lora_unet_single_transformer_blocks_0_attn_to_k.alpha
+  cond2(no banned suffixes)  = False, bad_suffix_keys=440
+    example bad suffix key: lora_unet_single_transformer_blocks_0_attn_to_k.alpha
+  cond3(allowed roots>=60%)  = False, root_ok_count=0
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: Wan2.1 Fun Reward LoRA (Comfy) ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=1104
+=== Downloading LoRA from alibaba-pai/Wan2.1-Fun-Reward-LoRAs (Wan2.1-Fun-1.3B-InP-MPS.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/wan21_fun_1_3b_inp_mps.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=1104
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_down.weight, lora_unet__blocks_0_cross_attn_k.lora_up.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_down.weight, lora_unet__blocks_0_cross_attn_k_img.lora_up.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_down.weight, lora_unet__blocks_0_cross_attn_o.lora_up.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_down.weight, lora_unet__blocks_0_cross_attn_q.lora_up.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_down.weight, lora_unet__blocks_0_cross_attn_v.lora_up.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_down.weight, lora_unet__blocks_0_cross_attn_v_img.lora_up.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_down.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_down.weight, lora_unet__blocks_0_cross_attn_k.lora_up.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_down.weight, lora_unet__blocks_0_cross_attn_k_img.lora_up.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_down.weight, lora_unet__blocks_0_cross_attn_o.lora_up.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_down.weight, lora_unet__blocks_0_cross_attn_q.lora_up.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_down.weight, lora_unet__blocks_0_cross_attn_v.lora_up.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_down.weight, lora_unet__blocks_0_cross_attn_v_img.lora_up.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_down.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.NON_DIFFUSERS_SD
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.NON_DIFFUSERS_SD
+INFO:lora_test:[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_down.weight, lora_unet__blocks_0_cross_attn_k.lora_up.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_down.weight, lora_unet__blocks_0_cross_attn_k_img.lora_up.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_down.weight, lora_unet__blocks_0_cross_attn_o.lora_up.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_down.weight, lora_unet__blocks_0_cross_attn_q.lora_up.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_down.weight, lora_unet__blocks_0_cross_attn_v.lora_up.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_down.weight, lora_unet__blocks_0_cross_attn_v_img.lora_up.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_down.weight
+INFO     lora_test:lora_format_adapter.py:229 [LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_down.weight, lora_unet__blocks_0_cross_attn_k.lora_up.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_down.weight, lora_unet__blocks_0_cross_attn_k_img.lora_up.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_down.weight, lora_unet__blocks_0_cross_attn_o.lora_up.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_down.weight, lora_unet__blocks_0_cross_attn_q.lora_up.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_down.weight, lora_unet__blocks_0_cross_attn_v.lora_up.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_down.weight, lora_unet__blocks_0_cross_attn_v_img.lora_up.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_down.weight
+INFO:lora_test:[LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_A.weight, lora_unet__blocks_0_cross_attn_k.lora_B.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_A.weight, lora_unet__blocks_0_cross_attn_k_img.lora_B.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_A.weight, lora_unet__blocks_0_cross_attn_o.lora_B.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_A.weight, lora_unet__blocks_0_cross_attn_q.lora_B.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_A.weight, lora_unet__blocks_0_cross_attn_v.lora_B.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_A.weight, lora_unet__blocks_0_cross_attn_v_img.lora_B.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_A.weight
+INFO     lora_test:lora_format_adapter.py:204 [LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_A.weight, lora_unet__blocks_0_cross_attn_k.lora_B.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_A.weight, lora_unet__blocks_0_cross_attn_k_img.lora_B.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_A.weight, lora_unet__blocks_0_cross_attn_o.lora_B.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_A.weight, lora_unet__blocks_0_cross_attn_q.lora_B.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_A.weight, lora_unet__blocks_0_cross_attn_v.lora_B.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_A.weight, lora_unet__blocks_0_cross_attn_v_img.lora_B.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_A.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_A.weight, lora_unet__blocks_0_cross_attn_k.lora_B.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_A.weight, lora_unet__blocks_0_cross_attn_k_img.lora_B.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_A.weight, lora_unet__blocks_0_cross_attn_o.lora_B.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_A.weight, lora_unet__blocks_0_cross_attn_q.lora_B.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_A.weight, lora_unet__blocks_0_cross_attn_v.lora_B.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_A.weight, lora_unet__blocks_0_cross_attn_v_img.lora_B.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_A.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): lora_unet__blocks_0_cross_attn_k.alpha, lora_unet__blocks_0_cross_attn_k.lora_A.weight, lora_unet__blocks_0_cross_attn_k.lora_B.weight, lora_unet__blocks_0_cross_attn_k_img.alpha, lora_unet__blocks_0_cross_attn_k_img.lora_A.weight, lora_unet__blocks_0_cross_attn_k_img.lora_B.weight, lora_unet__blocks_0_cross_attn_o.alpha, lora_unet__blocks_0_cross_attn_o.lora_A.weight, lora_unet__blocks_0_cross_attn_o.lora_B.weight, lora_unet__blocks_0_cross_attn_q.alpha, lora_unet__blocks_0_cross_attn_q.lora_A.weight, lora_unet__blocks_0_cross_attn_q.lora_B.weight, lora_unet__blocks_0_cross_attn_v.alpha, lora_unet__blocks_0_cross_attn_v.lora_A.weight, lora_unet__blocks_0_cross_attn_v.lora_B.weight, lora_unet__blocks_0_cross_attn_v_img.alpha, lora_unet__blocks_0_cross_attn_v_img.lora_A.weight, lora_unet__blocks_0_cross_attn_v_img.lora_B.weight, lora_unet__blocks_0_ffn_0.alpha, lora_unet__blocks_0_ffn_0.lora_A.weight
+INFO:lora_test:=== Running test: Qwen-Image EVA LoRA ===
+[Wan2.1 Fun Reward LoRA (Comfy)] diffusers-style check FAILED (relaxed):
+  total keys = 1104
+  cond1(no banned prefixes)  = False, bad_prefix_keys=1104
+    example bad prefix key: lora_unet__blocks_0_cross_attn_k.alpha
+  cond2(no banned suffixes)  = False, bad_suffix_keys=368
+    example bad suffix key: lora_unet__blocks_0_cross_attn_k.alpha
+  cond3(allowed roots>=60%)  = False, root_ok_count=0
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: Qwen-Image EVA LoRA ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=480
+=== Downloading LoRA from starsfriday/Qwen-Image-EVA-LoRA (qwen_image_eva.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/qwen_image_eva.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=480
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): transformer.transformer_blocks.0.attn.to_k.lora.down.weight, transformer.transformer_blocks.0.attn.to_k.lora.up.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.0.attn.to_q.lora.down.weight, transformer.transformer_blocks.0.attn.to_q.lora.up.weight, transformer.transformer_blocks.0.attn.to_v.lora.down.weight, transformer.transformer_blocks.0.attn.to_v.lora.up.weight, transformer.transformer_blocks.1.attn.to_k.lora.down.weight, transformer.transformer_blocks.1.attn.to_k.lora.up.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.1.attn.to_q.lora.down.weight, transformer.transformer_blocks.1.attn.to_q.lora.up.weight, transformer.transformer_blocks.1.attn.to_v.lora.down.weight, transformer.transformer_blocks.1.attn.to_v.lora.up.weight, transformer.transformer_blocks.10.attn.to_k.lora.down.weight, transformer.transformer_blocks.10.attn.to_k.lora.up.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.up.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): transformer.transformer_blocks.0.attn.to_k.lora.down.weight, transformer.transformer_blocks.0.attn.to_k.lora.up.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.0.attn.to_q.lora.down.weight, transformer.transformer_blocks.0.attn.to_q.lora.up.weight, transformer.transformer_blocks.0.attn.to_v.lora.down.weight, transformer.transformer_blocks.0.attn.to_v.lora.up.weight, transformer.transformer_blocks.1.attn.to_k.lora.down.weight, transformer.transformer_blocks.1.attn.to_k.lora.up.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.1.attn.to_q.lora.down.weight, transformer.transformer_blocks.1.attn.to_q.lora.up.weight, transformer.transformer_blocks.1.attn.to_v.lora.down.weight, transformer.transformer_blocks.1.attn.to_v.lora.up.weight, transformer.transformer_blocks.10.attn.to_k.lora.down.weight, transformer.transformer_blocks.10.attn.to_k.lora.up.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.up.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.STANDARD
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.STANDARD
+INFO:lora_test:[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): transformer.transformer_blocks.0.attn.to_k.lora.down.weight, transformer.transformer_blocks.0.attn.to_k.lora.up.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.0.attn.to_q.lora.down.weight, transformer.transformer_blocks.0.attn.to_q.lora.up.weight, transformer.transformer_blocks.0.attn.to_v.lora.down.weight, transformer.transformer_blocks.0.attn.to_v.lora.up.weight, transformer.transformer_blocks.1.attn.to_k.lora.down.weight, transformer.transformer_blocks.1.attn.to_k.lora.up.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.1.attn.to_q.lora.down.weight, transformer.transformer_blocks.1.attn.to_q.lora.up.weight, transformer.transformer_blocks.1.attn.to_v.lora.down.weight, transformer.transformer_blocks.1.attn.to_v.lora.up.weight, transformer.transformer_blocks.10.attn.to_k.lora.down.weight, transformer.transformer_blocks.10.attn.to_k.lora.up.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.up.weight
+INFO     lora_test:lora_format_adapter.py:229 [LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): transformer.transformer_blocks.0.attn.to_k.lora.down.weight, transformer.transformer_blocks.0.attn.to_k.lora.up.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.0.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.0.attn.to_q.lora.down.weight, transformer.transformer_blocks.0.attn.to_q.lora.up.weight, transformer.transformer_blocks.0.attn.to_v.lora.down.weight, transformer.transformer_blocks.0.attn.to_v.lora.up.weight, transformer.transformer_blocks.1.attn.to_k.lora.down.weight, transformer.transformer_blocks.1.attn.to_k.lora.up.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.1.attn.to_out.0.lora.up.weight, transformer.transformer_blocks.1.attn.to_q.lora.down.weight, transformer.transformer_blocks.1.attn.to_q.lora.up.weight, transformer.transformer_blocks.1.attn.to_v.lora.down.weight, transformer.transformer_blocks.1.attn.to_v.lora.up.weight, transformer.transformer_blocks.10.attn.to_k.lora.down.weight, transformer.transformer_blocks.10.attn.to_k.lora.up.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.down.weight, transformer.transformer_blocks.10.attn.to_out.0.lora.up.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): transformer_blocks.0.attn.to_k.lora_A.weight, transformer_blocks.0.attn.to_k.lora_B.weight, transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer_blocks.0.attn.to_q.lora_A.weight, transformer_blocks.0.attn.to_q.lora_B.weight, transformer_blocks.0.attn.to_v.lora_A.weight, transformer_blocks.0.attn.to_v.lora_B.weight, transformer_blocks.1.attn.to_k.lora_A.weight, transformer_blocks.1.attn.to_k.lora_B.weight, transformer_blocks.1.attn.to_out.0.lora_A.weight, transformer_blocks.1.attn.to_out.0.lora_B.weight, transformer_blocks.1.attn.to_q.lora_A.weight, transformer_blocks.1.attn.to_q.lora_B.weight, transformer_blocks.1.attn.to_v.lora_A.weight, transformer_blocks.1.attn.to_v.lora_B.weight, transformer_blocks.10.attn.to_k.lora_A.weight, transformer_blocks.10.attn.to_k.lora_B.weight, transformer_blocks.10.attn.to_out.0.lora_A.weight, transformer_blocks.10.attn.to_out.0.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): transformer_blocks.0.attn.to_k.lora_A.weight, transformer_blocks.0.attn.to_k.lora_B.weight, transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer_blocks.0.attn.to_q.lora_A.weight, transformer_blocks.0.attn.to_q.lora_B.weight, transformer_blocks.0.attn.to_v.lora_A.weight, transformer_blocks.0.attn.to_v.lora_B.weight, transformer_blocks.1.attn.to_k.lora_A.weight, transformer_blocks.1.attn.to_k.lora_B.weight, transformer_blocks.1.attn.to_out.0.lora_A.weight, transformer_blocks.1.attn.to_out.0.lora_B.weight, transformer_blocks.1.attn.to_q.lora_A.weight, transformer_blocks.1.attn.to_q.lora_B.weight, transformer_blocks.1.attn.to_v.lora_A.weight, transformer_blocks.1.attn.to_v.lora_B.weight, transformer_blocks.10.attn.to_k.lora_A.weight, transformer_blocks.10.attn.to_k.lora_B.weight, transformer_blocks.10.attn.to_out.0.lora_A.weight, transformer_blocks.10.attn.to_out.0.lora_B.weight
+INFO:lora_test:=== Running test: Qwen-Image Lightning LoRA ===
+[Qwen-Image EVA LoRA] diffusers-style check FAILED (relaxed):
+  total keys = 480
+  cond1(no banned prefixes)  = True, bad_prefix_keys=0
+  cond2(no banned suffixes)  = True, bad_suffix_keys=0
+  cond3(allowed roots>=60%)  = False, root_ok_count=0
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: Qwen-Image Lightning LoRA ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=2160
+=== Downloading LoRA from lightx2v/Qwen-Image-Lightning (Qwen-Image-Lightning-4steps-V1.0-bf16.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/qwen_image_lightning_4steps_v1_bf16.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=2160
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_down.weight, transformer_blocks.0.attn.add_k_proj.lora_up.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_down.weight, transformer_blocks.0.attn.add_q_proj.lora_up.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_down.weight, transformer_blocks.0.attn.add_v_proj.lora_up.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_down.weight, transformer_blocks.0.attn.to_add_out.lora_up.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_down.weight, transformer_blocks.0.attn.to_k.lora_up.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_down.weight, transformer_blocks.0.attn.to_out.0.lora_up.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_down.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_down.weight, transformer_blocks.0.attn.add_k_proj.lora_up.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_down.weight, transformer_blocks.0.attn.add_q_proj.lora_up.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_down.weight, transformer_blocks.0.attn.add_v_proj.lora_up.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_down.weight, transformer_blocks.0.attn.to_add_out.lora_up.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_down.weight, transformer_blocks.0.attn.to_k.lora_up.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_down.weight, transformer_blocks.0.attn.to_out.0.lora_up.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_down.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.NON_DIFFUSERS_SD
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.NON_DIFFUSERS_SD
+INFO:lora_test:[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_down.weight, transformer_blocks.0.attn.add_k_proj.lora_up.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_down.weight, transformer_blocks.0.attn.add_q_proj.lora_up.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_down.weight, transformer_blocks.0.attn.add_v_proj.lora_up.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_down.weight, transformer_blocks.0.attn.to_add_out.lora_up.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_down.weight, transformer_blocks.0.attn.to_k.lora_up.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_down.weight, transformer_blocks.0.attn.to_out.0.lora_up.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_down.weight
+INFO     lora_test:lora_format_adapter.py:229 [LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_down.weight, transformer_blocks.0.attn.add_k_proj.lora_up.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_down.weight, transformer_blocks.0.attn.add_q_proj.lora_up.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_down.weight, transformer_blocks.0.attn.add_v_proj.lora_up.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_down.weight, transformer_blocks.0.attn.to_add_out.lora_up.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_down.weight, transformer_blocks.0.attn.to_k.lora_up.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_down.weight, transformer_blocks.0.attn.to_out.0.lora_up.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_down.weight
+INFO:lora_test:[LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_A.weight, transformer_blocks.0.attn.to_k.lora_B.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_A.weight
+INFO     lora_test:lora_format_adapter.py:204 [LoRAFormatAdapter] after NON_DIFFUSERS_SD simple conversion, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_A.weight, transformer_blocks.0.attn.to_k.lora_B.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_A.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_A.weight, transformer_blocks.0.attn.to_k.lora_B.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_A.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): transformer_blocks.0.attn.add_k_proj.alpha, transformer_blocks.0.attn.add_k_proj.lora_A.weight, transformer_blocks.0.attn.add_k_proj.lora_B.weight, transformer_blocks.0.attn.add_q_proj.alpha, transformer_blocks.0.attn.add_q_proj.lora_A.weight, transformer_blocks.0.attn.add_q_proj.lora_B.weight, transformer_blocks.0.attn.add_v_proj.alpha, transformer_blocks.0.attn.add_v_proj.lora_A.weight, transformer_blocks.0.attn.add_v_proj.lora_B.weight, transformer_blocks.0.attn.to_add_out.alpha, transformer_blocks.0.attn.to_add_out.lora_A.weight, transformer_blocks.0.attn.to_add_out.lora_B.weight, transformer_blocks.0.attn.to_k.alpha, transformer_blocks.0.attn.to_k.lora_A.weight, transformer_blocks.0.attn.to_k.lora_B.weight, transformer_blocks.0.attn.to_out.0.alpha, transformer_blocks.0.attn.to_out.0.lora_A.weight, transformer_blocks.0.attn.to_out.0.lora_B.weight, transformer_blocks.0.attn.to_q.alpha, transformer_blocks.0.attn.to_q.lora_A.weight
+INFO:lora_test:=== Running test: Classic Painting Z-Image LoRA ===
+[Qwen-Image Lightning LoRA] diffusers-style check FAILED (relaxed):
+  total keys = 2160
+  cond1(no banned prefixes)  = True, bad_prefix_keys=0
+  cond2(no banned suffixes)  = False, bad_suffix_keys=720
+    example bad suffix key: transformer_blocks.0.attn.add_k_proj.alpha
+  cond3(allowed roots>=60%)  = False, root_ok_count=0
+INFO     lora_test:test_lora_format_adapter.py:148 === Running test: Classic Painting Z-Image LoRA ===
+INFO:lora_test:[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=480
+=== Downloading LoRA from renderartist/Classic-Painting-Z-Image-Turbo-LoRA (Classic_Painting_Z_Image_Turbo_v1_renderartist_1750.safetensors) ===
+Saved to: /tmp/sglang_lora_tests/classic_painting_z_image_turbo_v1_renderartist_1750.safetensors
+INFO     lora_test:lora_format_adapter.py:396 [LoRAFormatAdapter] normalize_lora_state_dict called, #keys=480
+INFO:lora_test:[LoRAFormatAdapter] before convert, sample keys (<=20): diffusion_model.layers.0.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.0.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.0.attention.to_k.lora_A.weight, diffusion_model.layers.0.attention.to_k.lora_B.weight, diffusion_model.layers.0.attention.to_out.0.lora_A.weight, diffusion_model.layers.0.attention.to_out.0.lora_B.weight, diffusion_model.layers.0.attention.to_q.lora_A.weight, diffusion_model.layers.0.attention.to_q.lora_B.weight, diffusion_model.layers.0.attention.to_v.lora_A.weight, diffusion_model.layers.0.attention.to_v.lora_B.weight, diffusion_model.layers.0.feed_forward.w1.lora_A.weight, diffusion_model.layers.0.feed_forward.w1.lora_B.weight, diffusion_model.layers.0.feed_forward.w2.lora_A.weight, diffusion_model.layers.0.feed_forward.w2.lora_B.weight, diffusion_model.layers.0.feed_forward.w3.lora_A.weight, diffusion_model.layers.0.feed_forward.w3.lora_B.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.1.attention.to_k.lora_A.weight, diffusion_model.layers.1.attention.to_k.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:401 [LoRAFormatAdapter] before convert, sample keys (<=20): diffusion_model.layers.0.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.0.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.0.attention.to_k.lora_A.weight, diffusion_model.layers.0.attention.to_k.lora_B.weight, diffusion_model.layers.0.attention.to_out.0.lora_A.weight, diffusion_model.layers.0.attention.to_out.0.lora_B.weight, diffusion_model.layers.0.attention.to_q.lora_A.weight, diffusion_model.layers.0.attention.to_q.lora_B.weight, diffusion_model.layers.0.attention.to_v.lora_A.weight, diffusion_model.layers.0.attention.to_v.lora_B.weight, diffusion_model.layers.0.feed_forward.w1.lora_A.weight, diffusion_model.layers.0.feed_forward.w1.lora_B.weight, diffusion_model.layers.0.feed_forward.w2.lora_A.weight, diffusion_model.layers.0.feed_forward.w2.lora_B.weight, diffusion_model.layers.0.feed_forward.w3.lora_A.weight, diffusion_model.layers.0.feed_forward.w3.lora_B.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.1.attention.to_k.lora_A.weight, diffusion_model.layers.1.attention.to_k.lora_B.weight
+INFO:lora_test:[LoRAFormatAdapter] detected format: LoRAFormat.STANDARD
+INFO     lora_test:lora_format_adapter.py:407 [LoRAFormatAdapter] detected format: LoRAFormat.STANDARD
+INFO:lora_test:[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): diffusion_model.layers.0.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.0.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.0.attention.to_k.lora_A.weight, diffusion_model.layers.0.attention.to_k.lora_B.weight, diffusion_model.layers.0.attention.to_out.0.lora_A.weight, diffusion_model.layers.0.attention.to_out.0.lora_B.weight, diffusion_model.layers.0.attention.to_q.lora_A.weight, diffusion_model.layers.0.attention.to_q.lora_B.weight, diffusion_model.layers.0.attention.to_v.lora_A.weight, diffusion_model.layers.0.attention.to_v.lora_B.weight, diffusion_model.layers.0.feed_forward.w1.lora_A.weight, diffusion_model.layers.0.feed_forward.w1.lora_B.weight, diffusion_model.layers.0.feed_forward.w2.lora_A.weight, diffusion_model.layers.0.feed_forward.w2.lora_B.weight, diffusion_model.layers.0.feed_forward.w3.lora_A.weight, diffusion_model.layers.0.feed_forward.w3.lora_B.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.1.attention.to_k.lora_A.weight, diffusion_model.layers.1.attention.to_k.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:229 [LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, sample keys (<=20): diffusion_model.layers.0.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.0.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.0.attention.to_k.lora_A.weight, diffusion_model.layers.0.attention.to_k.lora_B.weight, diffusion_model.layers.0.attention.to_out.0.lora_A.weight, diffusion_model.layers.0.attention.to_out.0.lora_B.weight, diffusion_model.layers.0.attention.to_q.lora_A.weight, diffusion_model.layers.0.attention.to_q.lora_B.weight, diffusion_model.layers.0.attention.to_v.lora_A.weight, diffusion_model.layers.0.attention.to_v.lora_B.weight, diffusion_model.layers.0.feed_forward.w1.lora_A.weight, diffusion_model.layers.0.feed_forward.w1.lora_B.weight, diffusion_model.layers.0.feed_forward.w2.lora_A.weight, diffusion_model.layers.0.feed_forward.w2.lora_B.weight, diffusion_model.layers.0.feed_forward.w3.lora_A.weight, diffusion_model.layers.0.feed_forward.w3.lora_B.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.1.attention.to_k.lora_A.weight, diffusion_model.layers.1.attention.to_k.lora_B.weight
+INFO:lora_test:[LoRAFormatAdapter] after convert, sample keys (<=20): diffusion_model.layers.0.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.0.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.0.attention.to_k.lora_A.weight, diffusion_model.layers.0.attention.to_k.lora_B.weight, diffusion_model.layers.0.attention.to_out.0.lora_A.weight, diffusion_model.layers.0.attention.to_out.0.lora_B.weight, diffusion_model.layers.0.attention.to_q.lora_A.weight, diffusion_model.layers.0.attention.to_q.lora_B.weight, diffusion_model.layers.0.attention.to_v.lora_A.weight, diffusion_model.layers.0.attention.to_v.lora_B.weight, diffusion_model.layers.0.feed_forward.w1.lora_A.weight, diffusion_model.layers.0.feed_forward.w1.lora_B.weight, diffusion_model.layers.0.feed_forward.w2.lora_A.weight, diffusion_model.layers.0.feed_forward.w2.lora_B.weight, diffusion_model.layers.0.feed_forward.w3.lora_A.weight, diffusion_model.layers.0.feed_forward.w3.lora_B.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.1.attention.to_k.lora_A.weight, diffusion_model.layers.1.attention.to_k.lora_B.weight
+INFO     lora_test:lora_format_adapter.py:413 [LoRAFormatAdapter] after convert, sample keys (<=20): diffusion_model.layers.0.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.0.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.0.attention.to_k.lora_A.weight, diffusion_model.layers.0.attention.to_k.lora_B.weight, diffusion_model.layers.0.attention.to_out.0.lora_A.weight, diffusion_model.layers.0.attention.to_out.0.lora_B.weight, diffusion_model.layers.0.attention.to_q.lora_A.weight, diffusion_model.layers.0.attention.to_q.lora_B.weight, diffusion_model.layers.0.attention.to_v.lora_A.weight, diffusion_model.layers.0.attention.to_v.lora_B.weight, diffusion_model.layers.0.feed_forward.w1.lora_A.weight, diffusion_model.layers.0.feed_forward.w1.lora_B.weight, diffusion_model.layers.0.feed_forward.w2.lora_A.weight, diffusion_model.layers.0.feed_forward.w2.lora_B.weight, diffusion_model.layers.0.feed_forward.w3.lora_A.weight, diffusion_model.layers.0.feed_forward.w3.lora_B.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_A.weight, diffusion_model.layers.1.adaLN_modulation.0.lora_B.weight, diffusion_model.layers.1.attention.to_k.lora_A.weight, diffusion_model.layers.1.attention.to_k.lora_B.weight
+PASSED
+
+=================================== FAILURES ===================================
+_____ TestDiffusionServerOneGpu.test_diffusion_perf[qwen_image_edit_ti2i] ______
+
+self = <test_server_a.TestDiffusionServerOneGpu object at 0x7f9089114dd0>
+case = DiffusionTestCase(id='qwen_image_edit_ti2i', server_args=DiffusionServerArgs(model_path='Qwen/Qwen-Image-Edit', modali.../lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg', seconds=1, num_frames=None, fps=None))
+diffusion_server = ServerContext(port=28000, process=<Popen: returncode: None args: ['sglang', 'serve', '--model-path', 'Qwen/Qwe...>, mo...PosixPath('/sgl-workspace/sglang/.cache/logs/performance.log'), log_dir=PosixPath('/sgl-workspace/sglang/.cache/logs'))
+
+    def test_diffusion_perf(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ):
+        """Single parametrized test that runs for all cases.
+
+        Pytest will execute this test once per case in ONE_GPU_CASES,
+        with test IDs like:
+        - test_diffusion_perf[qwen_image_text]
+        - test_diffusion_perf[qwen_image_edit]
+        - etc.
+        """
+        generate_fn = get_generate_fn(
+            model_path=case.server_args.model_path,
+            modality=case.server_args.modality,
+            sampling_params=case.sampling_params,
+        )
+        perf_record = self.run_and_collect(
+            diffusion_server,
+            case.id,
+            generate_fn,
+        )
+>       self._validate_and_record(case, perf_record)
+
+sglang/multimodal_gen/test/server/test_server_common.py:494:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+sglang/multimodal_gen/test/server/test_server_common.py:220: in _validate_and_record
+    validator.validate(perf_record, case.sampling_params.num_frames)
+sglang/multimodal_gen/test/server/test_server_utils.py:351: in validate
+    self._validate_denoise_steps(summary)
+sglang/multimodal_gen/test/server/test_server_utils.py:398: in _validate_denoise_steps
+    self._assert_le(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <sglang.multimodal_gen.test.server.test_server_utils.PerformanceValidator object at 0x7f9088255fa0>
+name = 'Denoise Step 0', actual = 1452.1601861342788, expected = 720.0
+tolerance = 0.4, min_abs_tolerance_ms = 20.0
+
+    def _assert_le(
+        self,
+        name: str,
+        actual: float,
+        expected: float,
+        tolerance: float,
+        min_abs_tolerance_ms: float = 20.0,
+    ):
+        """Assert that actual is less than or equal to expected within a tolerance.
+
+        Uses the larger of relative tolerance or absolute tolerance to prevent
+        flaky failures on very fast operations.
+        """
+        upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance_ms)
+>       assert actual <= upper_bound, (
+            f"Validation failed for '{name}'.\n"
+            f"  Actual:   {actual:.4f}ms\n"
+            f"  Expected: {expected:.4f}ms\n"
+            f"  Limit:    {upper_bound:.4f}ms "
+            f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
+        )
+E       AssertionError: Validation failed for 'Denoise Step 0'.
+E           Actual:   1452.1602ms
+E           Expected: 720.0000ms
+E           Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+E       assert 1452.1601861342788 <= 1007.9999999999999
+
+sglang/multimodal_gen/test/server/test_server_utils.py:333: AssertionError
+------------------------------ Captured log setup ------------------------------
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:144 [server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:144 Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:179 [server-test] Starting server pid=1590345, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=0s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=5s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=10s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=15s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=20s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=25s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=30s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=35s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=40s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=45s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=50s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=55s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=60s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=65s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=70s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=75s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=80s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:215 [server-test] Server ready
+------------------------------ Captured log call -------------------------------
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:53 Downloading image from URL: https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:68 Downloaded image to: /tmp/diffusion_test_image_1765684266.jpg
+INFO     httpx:_client.py:1025 HTTP Request: POST http://localhost:28000/v1/images/edits "HTTP/1.1 200 OK"
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:148 Found thread_ts: 1765599450.861079
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:185 File uploaded successfully: .png
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:181 Waiting for req perf record with request id:
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:222 Performance validation failed for qwen_image_edit_ti2i:
+Validation failed for 'Denoise Step 0'.
+    Actual:   1452.1602ms
+    Expected: 720.0000ms
+    Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+assert 1452.1601861342788 <= 1007.9999999999999
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:363
+update this baseline in the "scenarios" section of perf_baselines.json:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "InputValidationStage": 60.1,
+        "ImageEncodingStage": 1883.83,
+        "ImageVAEEncodingStage": 907.28,
+        "TimestepPreparationStage": 26.41,
+        "LatentPreparationStage": 0.38,
+        "ConditioningStage": 0.02,
+        "DenoisingStage": 21985.7,
+        "DecodingStage": 1195.47
+    },
+    "denoise_step_ms": {
+        "0": 1452.16,
+        "1": 281.39,
+        "2": 423.27,
+        "3": 419.09,
+        "4": 418.85,
+        "5": 421.11,
+        "6": 419.45,
+        "7": 421.25,
+        "8": 420.59,
+        "9": 420.73,
+        "10": 420.23,
+        "11": 420.42,
+        "12": 420.56,
+        "13": 419.76,
+        "14": 421.82,
+        "15": 421.22,
+        "16": 420.37,
+        "17": 420.94,
+        "18": 419.81,
+        "19": 420.79,
+        "20": 421.38,
+        "21": 422.98,
+        "22": 420.79,
+        "23": 423.34,
+        "24": 422.87,
+        "25": 421.87,
+        "26": 422.32,
+        "27": 422.95,
+        "28": 422.43,
+        "29": 422.42,
+        "30": 423.26,
+        "31": 421.49,
+        "32": 422.63,
+        "33": 421.33,
+        "34": 422.41,
+        "35": 421.93,
+        "36": 422.72,
+        "37": 422.54,
+        "38": 422.39,
+        "39": 422.03,
+        "40": 422.8,
+        "41": 423.49,
+        "42": 421.86,
+        "43": 421.67,
+        "44": 423.08,
+        "45": 422.75,
+        "46": 422.69,
+        "47": 423.14,
+        "48": 423.97,
+        "49": 421.14
+    },
+    "expected_e2e_ms": 26072.89,
+    "expected_avg_denoise_ms": 439.53,
+    "expected_median_denoise_ms": 421.86
+}
+=============================== warnings summary ===============================
+<frozen importlib._bootstrap>:488
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+
+<frozen importlib._bootstrap>:488
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+
+../../../root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:22
+  /root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:22: DeprecationWarning: SMEM_CAPACITY is deprecated: Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead
+    from .blackwell_helpers import (
+
+../../../root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:34
+  /root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:34: DeprecationWarning: SMEM_CAPACITY is deprecated: Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead
+    from .hopper_helpers import (
+
+sglang/multimodal_gen/test/server/test_lora_format_adapter.py::TestLoRAFormatAdapter::test_lora_format_adapter_all_formats
+  /root/.python/sglang/lib/python3.12/site-packages/huggingface_hub/file_download.py:979: UserWarning: `local_dir_use_symlinks` parameter is deprecated and will be ignored. The process to download files to a local folder has been updated and do not rely on symlinks anymore. You only need to pass a destination folder as`local_dir`.
+  For more details, check out https://huggingface.co/docs/huggingface_hub/main/en/guides/download#download-files-to-local-folder.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED sglang/multimodal_gen/test/server/test_server_a.py::TestDiffusionServerOneGpu::test_diffusion_perf[qwen_image_edit_ti2i]
+============= 1 failed, 1 passed, 5 warnings in 128.11s (0:02:08) ==============
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
+============================= test session starts ==============================
+platform linux -- Python 3.12.12, pytest-9.0.1, pluggy-1.6.0 -- /root/.python/sglang/bin/python3
+cachedir: .pytest_cache
+rootdir: /sgl-workspace/sglang/python
+configfile: pyproject.toml
+plugins: anyio-4.11.0
+collecting ...
+----------------------------- live log collection ------------------------------
+INFO     sglang.multimodal_gen.envs:envs.py:106 Using AITER as the attention library
+INFO     sglang.multimodal_gen.runtime.platforms:__init__.py:97 ROCm platform is unavailable: No module named 'amdsmi'
+INFO     sglang.multimodal_gen.runtime.platforms:__init__.py:54 CUDA is available
+INFO     numexpr.utils:utils.py:148 Note: detected 128 virtual cores but NumExpr set to maximum of 64, check "NUMEXPR_MAX_THREADS" environment variable.
+INFO     numexpr.utils:utils.py:151 Note: NumExpr detected 128 cores but "NUMEXPR_MAX_THREADS" not set, so enforcing safe limit of 16.
+INFO     numexpr.utils:utils.py:164 NumExpr defaulting to 16 threads.
+collected 2 items / 1 deselected / 1 selected
+run-last-failure: rerun previous 1 failure
+
+sglang/multimodal_gen/test/server/test_server_a.py::TestDiffusionServerOneGpu::test_diffusion_perf[qwen_image_edit_ti2i] INFO:sglang.multimodal_gen.test.test_utils:[server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+
+-------------------------------- live log setup --------------------------------
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:144 [server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+INFO:sglang.multimodal_gen.test.server.test_server_utils:Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:144 Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Starting server pid=1599572, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:179 [server-test] Starting server pid=1599572, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=0s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=0s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=5s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=5s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=10s
+[12-14 03:52:01] server_args: {"model_path": "Qwen/Qwen-Image-Edit", "attention_backend": null, "mode": "inference", "workload_type": "t2v", "cache_strategy": "none", "distributed_executor_backend": "mp", "nccl_port": null, "trust_remote_code": false, "revision": null, "num_gpus": 1, "tp_size": 1, "sp_degree": 1, "ulysses_degree": 1, "ring_degree": 1, "dp_size": 1, "dp_degree": 1, "enable_cfg_parallel": false, "hsdp_replicate_dim": 1, "hsdp_shard_dim": 1, "dist_timeout": null, "lora_path": null, "lora_nickname": "default", "vae_path": null, "lora_target_modules": null, "output_type": "pil", "dit_cpu_offload": true, "use_fsdp_inference": false, "text_encoder_cpu_offload": true, "image_encoder_cpu_offload": true, "vae_cpu_offload": true, "pin_cpu_memory": true, "mask_strategy_file_path": null, "STA_mode": "STA_inference", "skip_time_steps": 15, "enable_torch_compile": false, "disable_autocast": true, "VSA_sparsity": 0.0, "moba_config_path": null, "moba_config": {}, "master_port": 30067, "host": null, "port": 28000, "scheduler_port": 5639, "enable_stage_verification": true, "prompt_file_path": null, "model_paths": {}, "model_loaded": {"transformer": true, "vae": true}, "override_transformer_cls_name": null, "boundary_ratio": null, "log_level": "debug"}
+[12-14 03:52:01] Starting server...
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=10s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=15s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=15s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=20s
+[12-14 03:52:11] Scheduler bind at endpoint: tcp://localhost:5639
+[12-14 03:52:11] Initializing distributed environment with world_size=1, device=cuda:0
+[12-14 03:52:11] world_size=1 rank=0 local_rank=0 distributed_init_method=env:// backend=nccl
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=20s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=25s
+Set TORCH_CUDA_ARCH_LIST to 9.0
+[12-14 03:52:14] Registering pipelines complete, 12 pipelines registered
+[12-14 03:52:14] Attempting to acquire lock 140117270526144 on /tmp/tmpp6xhhmy0/.cache/huggingface/.gitignore.lock
+[12-14 03:52:14] Lock 140117270526144 acquired on /tmp/tmpp6xhhmy0/.cache/huggingface/.gitignore.lock
+[12-14 03:52:14] Attempting to release lock 140117270526144 on /tmp/tmpp6xhhmy0/.cache/huggingface/.gitignore.lock
+[12-14 03:52:14] Lock 140117270526144 released on /tmp/tmpp6xhhmy0/.cache/huggingface/.gitignore.lock
+[12-14 03:52:14] Attempting to acquire lock 140117271154416 on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Lock 140117271154416 acquired on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Attempting to release lock 140117271154416 on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Lock 140117271154416 released on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Starting new HTTPS connection (1): huggingface.co:443
+[12-14 03:52:14] https://huggingface.co:443 "HEAD /Qwen/Qwen-Image-Edit/resolve/main/model_index.json HTTP/1.1" 307 0
+[12-14 03:52:14] https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen-Image-Edit/ac7f9318f633fc4b5778c59367c8128225f1e3de/model_index.json HTTP/1.1" 200 0
+[12-14 03:52:14] Attempting to acquire lock 140117270513424 on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Lock 140117270513424 acquired on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Attempting to release lock 140117270513424 on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Lock 140117270513424 released on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Attempting to acquire lock 140117269677648 on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Lock 140117269677648 acquired on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Attempting to release lock 140117269677648 on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Lock 140117269677648 released on /tmp/tmpp6xhhmy0/.cache/huggingface/download/model_index.json.lock
+[12-14 03:52:14] Downloaded model_index.json for Qwen/Qwen-Image-Edit, pipeline: QwenImageEditPipeline
+[12-14 03:52:14] Resolved model path 'Qwen/Qwen-Image-Edit' from exact path match.
+[12-14 03:52:14] Found model info: ModelInfo(pipeline_cls=<class 'sglang.multimodal_gen.runtime.pipelines.qwen_image.QwenImageEditPipeline'>, sampling_param_cls=<class 'sglang.multimodal_gen.configs.sample.qwenimage.QwenImageSamplingParams'>, pipeline_config_cls=<class 'sglang.multimodal_gen.configs.pipeline_configs.qwen_image.QwenImageEditPipelineConfig'>)
+[12-14 03:52:14] Loading pipeline modules...
+[12-14 03:52:14] Downloading model snapshot from HF Hub for Qwen/Qwen-Image-Edit...
+[12-14 03:52:14] Downloaded model to /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de
+[12-14 03:52:14] Model path: /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de
+[12-14 03:52:14] Diffusers version: 0.35.0.dev0
+[12-14 03:52:14] Loading pipeline modules from config: {'_class_name': 'QwenImageEditPipeline', '_diffusers_version': '0.35.0.dev0', 'processor': ['transformers', 'Qwen2VLProcessor'], 'scheduler': ['diffusers', 'FlowMatchEulerDiscreteScheduler'], 'text_encoder': ['transformers', 'Qwen2_5_VLForConditionalGeneration'], 'tokenizer': ['transformers', 'Qwen2Tokenizer'], 'transformer': ['diffusers', 'QwenImageTransformer2DModel'], 'vae': ['diffusers', 'AutoencoderKLQwenImage']}
+[12-14 03:52:14] Loading required components: ['processor', 'scheduler', 'text_encoder', 'tokenizer', 'transformer', 'vae']
+
+Loading required modules:   0%|          | 0/6 [00:00<?, ?it/s][12-14 03:52:14] Loading processor from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/processor
+[12-14 03:52:15] Loaded processor: Qwen2VLProcessor from: customized
+
+Loading required modules:  17%|█▋        | 1/6 [00:00<00:04,  1.01it/s][12-14 03:52:15] Loading scheduler from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/scheduler
+[12-14 03:52:15] Loaded scheduler: FlowMatchEulerDiscreteScheduler from: customized
+[12-14 03:52:15] Loading text_encoder from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/text_encoder
+[12-14 03:52:15] HF model config: {'bos_token_id': 151643, 'do_sample': True, 'eos_token_id': 151645, 'pad_token_id': 151643, 'repetition_penalty': 1.05, 'temperature': 0.1, 'top_k': 1, 'top_p': 0.001, 'architectures': ['Qwen2_5_VLForConditionalGeneration'], 'attention_dropout': 0.0, 'hidden_act': 'silu', 'hidden_size': 3584, 'image_token_id': 151655, 'initializer_range': 0.02, 'intermediate_size': 18944, 'max_position_embeddings': 128000, 'max_window_layers': 28, 'num_attention_heads': 28, 'num_hidden_layers': 28, 'num_key_value_heads': 4, 'rms_norm_eps': 1e-06, 'rope_scaling': {'mrope_section': [16, 24, 24], 'rope_type': 'default', 'type': 'default'}, 'rope_theta': 1000000.0, 'sliding_window': 32768, 'text_config': {'architectures': ['Qwen2_5_VLForConditionalGeneration'], 'attention_dropout': 0.0, 'bos_token_id': 151643, 'eos_token_id': 151645, 'hidden_act': 'silu', 'hidden_size': 3584, 'image_token_id': None, 'initializer_range': 0.02, 'intermediate_size': 18944, 'layer_types': ['full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention'], 'max_position_embeddings': 128000, 'max_window_layers': 28, 'model_type': 'qwen2_5_vl_text', 'num_attention_heads': 28, 'num_hidden_layers': 28, 'num_key_value_heads': 4, 'rms_norm_eps': 1e-06, 'rope_scaling': {'mrope_section': [16, 24, 24], 'rope_type': 'default', 'type': 'default'}, 'rope_theta': 1000000.0, 'sliding_window': None, 'torch_dtype': 'float32', 'use_cache': True, 'use_sliding_window': False, 'video_token_id': None, 'vision_end_token_id': 151653, 'vision_start_token_id': 151652, 'vision_token_id': 151654, 'vocab_size': 152064}, 'tie_word_embeddings': False, 'use_cache': True, 'use_sliding_window': False, 'video_token_id': 151656, 'vision_config': {'depth': 32, 'fullatt_block_indexes': [7, 15, 23, 31], 'hidden_act': 'silu', 'hidden_size': 1280, 'in_channels': 3, 'in_chans': 3, 'initializer_range': 0.02, 'intermediate_size': 3420, 'model_type': 'qwen2_5_vl', 'num_heads': 16, 'out_hidden_size': 3584, 'patch_size': 14, 'spatial_merge_size': 2, 'spatial_patch_size': 14, 'temporal_patch_size': 2, 'tokens_per_second': 2, 'torch_dtype': 'float32', 'window_size': 112}, 'vision_end_token_id': 151653, 'vision_start_token_id': 151652, 'vision_token_id': 151654, 'vocab_size': 152064}
+[12-14 03:52:16] Attention backend not specified
+[12-14 03:52:16] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=25s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=30s
+[12-14 03:52:20] [RunAI Streamer] Overall time to stream 15.4 GiB of all files to cpu: 4.16s, 3.7 GiB/s
+[12-14 03:52:20] Loading weights took 4.21 seconds
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=30s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=35s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=35s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=40s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=40s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=45s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=45s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=50s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=50s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=55s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=55s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=60s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=60s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=65s
+[12-14 03:52:55] Loaded text_encoder: FSDPQwen2_5_VLForConditionalGeneration from: customized
+
+Loading required modules:  50%|█████     | 3/6 [00:41<00:45, 15.16s/it][12-14 03:52:55] Loading tokenizer from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/tokenizer
+[12-14 03:52:56] Loaded tokenizer: Qwen2TokenizerFast from: customized
+
+Loading required modules:  67%|██████▋   | 4/6 [00:41<00:20, 10.08s/it][12-14 03:52:56] Loading transformer from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer
+[12-14 03:52:56] Loading QwenImageTransformer2DModel from 9 safetensors files, default_dtype: torch.bfloat16
+[12-14 03:52:56] Attention backend not specified
+[12-14 03:52:56] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=65s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=70s
+[12-14 03:52:59] [RunAI Streamer] Overall time to stream 38.1 GiB of all files to cpu: 3.57s, 10.7 GiB/s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=70s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=75s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=75s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=80s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=80s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Server ready
+[12-14 03:53:16] Loaded model with 20.43B parameters
+[12-14 03:53:16] Fusing QKV projections for better performance
+[12-14 03:53:16] Loaded transformer: QwenImageTransformer2DModel from: customized
+
+Loading required modules:  83%|████████▎ | 5/6 [01:01<00:13, 13.37s/it][12-14 03:53:16] Loading vae from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/vae
+[12-14 03:53:16] HF model config: {'attn_scales': [], 'base_dim': 96, 'dim_mult': [1, 2, 4, 4], 'dropout': 0.0, 'latents_mean': [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921], 'latents_std': [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916], 'num_res_blocks': 2, 'temperal_downsample': [False, True, True], 'z_dim': 16}
+[12-14 03:53:16] Loaded vae: AutoencoderKLQwenImage from: customized
+
+Loading required modules: 100%|██████████| 6/6 [01:01<00:00, 10.30s/it]
+[12-14 03:53:16] Pipelines instantiated
+[12-14 03:53:16] Worker 0: Initialized device, model, and distributed environment.
+[12-14 03:53:16] Worker 0: Scheduler loop started.
+[12-14 03:53:16] Rank 0 scheduler listening on tcp://*:5639
+[12-14 03:53:16] All workers are ready
+[12-14 03:53:16] Starting FastAPI server.
+[2025-12-14 03:53:16] [32mINFO[0m:     Started server process [[36m1599572[0m]
+[2025-12-14 03:53:16] [32mINFO[0m:     Waiting for application startup.
+[12-14 03:53:16] Scheduler client connected to backend scheduler at tcp://localhost:5639
+[12-14 03:53:16] ZMQ Broker is listening for offline jobs on tcp://*:28001
+[2025-12-14 03:53:16] [32mINFO[0m:     Application startup complete.
+[2025-12-14 03:53:16] [32mINFO[0m:     Uvicorn running on [1mhttp://localhost:28000[0m (Press CTRL+C to quit)
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:215 [server-test] Server ready
+INFO:sglang.multimodal_gen.test.server.test_server_utils:Downloading image from URL: https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg
+-------------------------------- live log call ---------------------------------
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:53 Downloading image from URL: https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg
+INFO:sglang.multimodal_gen.test.server.test_server_utils:Downloaded image to: /tmp/diffusion_test_image_1765684396.jpg
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:68 Downloaded image to: /tmp/diffusion_test_image_1765684396.jpg
+[12-14 03:53:17] Calling on_part_begin with no data
+[12-14 03:53:17] Calling on_header_field with data[0:19]
+[12-14 03:53:17] Calling on_header_value with data[21:45]
+[12-14 03:53:17] Calling on_header_end with no data
+[12-14 03:53:17] Calling on_headers_finished with no data
+[12-14 03:53:17] Calling on_part_data with data[49:77]
+[12-14 03:53:17] Calling on_part_end with no data
+[12-14 03:53:17] Calling on_part_begin with no data
+[12-14 03:53:17] Calling on_header_field with data[115:134]
+[12-14 03:53:17] Calling on_header_value with data[136:159]
+[12-14 03:53:17] Calling on_header_end with no data
+[12-14 03:53:17] Calling on_headers_finished with no data
+[12-14 03:53:17] Calling on_part_data with data[163:183]
+[12-14 03:53:17] Calling on_part_end with no data
+[12-14 03:53:17] Calling on_part_begin with no data
+[12-14 03:53:17] Calling on_header_field with data[221:240]
+[12-14 03:53:17] Calling on_header_value with data[242:261]
+[12-14 03:53:17] Calling on_header_end with no data
+[12-14 03:53:17] Calling on_headers_finished with no data
+[12-14 03:53:17] Calling on_part_data with data[265:266]
+[12-14 03:53:17] Calling on_part_end with no data
+[12-14 03:53:17] Calling on_part_begin with no data
+[12-14 03:53:17] Calling on_header_field with data[304:323]
+[12-14 03:53:17] Calling on_header_value with data[325:358]
+[12-14 03:53:17] Calling on_header_end with no data
+[12-14 03:53:17] Calling on_headers_finished with no data
+[12-14 03:53:17] Calling on_part_data with data[362:370]
+[12-14 03:53:17] Calling on_part_end with no data
+[12-14 03:53:17] Calling on_part_begin with no data
+[12-14 03:53:17] Calling on_header_field with data[408:427]
+[12-14 03:53:17] Calling on_header_value with data[429:500]
+[12-14 03:53:17] Calling on_header_end with no data
+[12-14 03:53:17] Calling on_header_field with data[502:514]
+[12-14 03:53:17] Calling on_header_value with data[516:526]
+[12-14 03:53:17] Calling on_header_end with no data
+[12-14 03:53:17] Calling on_headers_finished with no data
+[12-14 03:53:17] Calling on_part_data with data[530:33271]
+[12-14 03:53:17] Calling on_part_data with data[0:65482]
+[12-14 03:53:17] Calling on_part_data with data[0:65482]
+[12-14 03:53:17] Calling on_part_data with data[0:52968]
+[12-14 03:53:17] Calling on_part_end with no data
+[12-14 03:53:17] Calling on_end with no data
+[12-14 03:53:17] Setting num_frames to 1 because this is an image-gen model
+[12-14 03:53:17] Sampling params:
+                       width: -1
+                      height: -1
+                  num_frames: 1
+                      prompt: Convert 2D style to 3D style
+                  neg_prompt:
+                        seed: 1024
+                 infer_steps: 50
+      num_outputs_per_prompt: 1
+              guidance_scale: 4.0
+     embedded_guidance_scale: 6.0
+                    n_tokens: -1
+                  flow_shift: None
+                  image_path: outputs/uploads/5e6994bb-6dbe-4f32-aa3f-9918c6cde812_diffusion_test_image_1765684396.jpg
+                 save_output: True
+            output_file_path: outputs/5e6994bb-6dbe-4f32-aa3f-9918c6cde812.jpg
+
+[12-14 03:53:17] Processing prompt: Convert 2D style to 3D style
+[12-14 03:53:17] Creating pipeline stages...
+[12-14 03:53:17] Attention backend not specified
+[12-14 03:53:17] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+[12-14 03:53:17] Running pipeline stages: ['input_validation_stage', 'prompt_encoding_stage_primary', 'image_encoding_stage_primary', 'timestep_preparation_stage', 'latent_preparation_stage', 'conditioning_stage', 'denoising_stage', 'decoding_stage']
+[12-14 03:53:17] [InputValidationStage] started...
+[12-14 03:53:17] [InputValidationStage] finished in 0.0654 seconds
+[12-14 03:53:17] [ImageEncodingStage] started...
+[12-14 03:53:19] [ImageEncodingStage] finished in 2.3276 seconds
+[12-14 03:53:19] [ImageVAEEncodingStage] started...
+[12-14 03:53:20] [ImageVAEEncodingStage] finished in 1.2701 seconds
+[12-14 03:53:20] [TimestepPreparationStage] started...
+[12-14 03:53:20] [TimestepPreparationStage] timesteps: tensor([1000.0000,  998.7800,  997.5114,  996.1909,  994.8157,  993.3821,
+         991.8862,  990.3242,  988.6912,  986.9825,  985.1928,  983.3159,
+         981.3455,  979.2744,  977.0946,  974.7973,  972.3727,  969.8102,
+         967.0975,  964.2208,  961.1652,  957.9130,  954.4449,  950.7386,
+         946.7688,  942.5062,  937.9170,  932.9625,  927.5972,  921.7677,
+         915.4111,  908.4525,  900.8019,  892.3512,  882.9677,  872.4878,
+         860.7076,  847.3689,  832.1406,  814.5907,  794.1443,  770.0200,
+         741.1271,  705.8969,  661.9875,  605.7410,  531.1080,  427.3116,
+         273.1076,   20.0000], device='cuda:0')
+[12-14 03:53:20] [TimestepPreparationStage] finished in 0.0423 seconds
+[12-14 03:53:20] [LatentPreparationStage] started...
+[12-14 03:53:20] [LatentPreparationStage] finished in 0.0006 seconds
+[12-14 03:53:20] [ConditioningStage] started...
+[12-14 03:53:20] [ConditioningStage] finished in 0.0001 seconds
+[12-14 03:53:20] [DenoisingStage] started...
+
+  0%|          | 0/50 [00:00<?, ?it/s]
+  2%|▏         | 1/50 [00:01<01:09,  1.43s/it]
+  4%|▍         | 2/50 [00:01<00:36,  1.33it/s]
+  6%|▌         | 3/50 [00:02<00:28,  1.66it/s]
+  8%|▊         | 4/50 [00:02<00:24,  1.89it/s]
+ 10%|█         | 5/50 [00:02<00:22,  2.04it/s]
+ 12%|█▏        | 6/50 [00:03<00:20,  2.14it/s]
+ 14%|█▍        | 7/50 [00:03<00:19,  2.21it/s]
+ 16%|█▌        | 8/50 [00:04<00:18,  2.26it/s]
+ 18%|█▊        | 9/50 [00:04<00:17,  2.30it/s]
+ 20%|██        | 10/50 [00:05<00:17,  2.32it/s]
+ 22%|██▏       | 11/50 [00:05<00:16,  2.33it/s]
+ 24%|██▍       | 12/50 [00:05<00:16,  2.35it/s]
+ 26%|██▌       | 13/50 [00:06<00:15,  2.35it/s]
+ 28%|██▊       | 14/50 [00:06<00:15,  2.36it/s]
+ 30%|███       | 15/50 [00:07<00:14,  2.36it/s]
+ 32%|███▏      | 16/50 [00:07<00:14,  2.37it/s]
+ 34%|███▍      | 17/50 [00:08<00:13,  2.37it/s]
+ 36%|███▌      | 18/50 [00:08<00:13,  2.37it/s]
+ 38%|███▊      | 19/50 [00:08<00:13,  2.37it/s]
+ 40%|████      | 20/50 [00:09<00:12,  2.37it/s]
+ 42%|████▏     | 21/50 [00:09<00:12,  2.37it/s]
+ 44%|████▍     | 22/50 [00:10<00:11,  2.37it/s]
+ 46%|████▌     | 23/50 [00:10<00:11,  2.37it/s]
+ 48%|████▊     | 24/50 [00:10<00:10,  2.37it/s]
+ 50%|█████     | 25/50 [00:11<00:10,  2.37it/s]
+ 52%|█████▏    | 26/50 [00:11<00:10,  2.37it/s]
+ 54%|█████▍    | 27/50 [00:12<00:09,  2.37it/s]
+ 56%|█████▌    | 28/50 [00:12<00:09,  2.37it/s]
+ 58%|█████▊    | 29/50 [00:13<00:08,  2.37it/s]
+ 60%|██████    | 30/50 [00:13<00:08,  2.37it/s]
+ 62%|██████▏   | 31/50 [00:13<00:08,  2.37it/s]
+ 64%|██████▍   | 32/50 [00:14<00:07,  2.37it/s]
+ 66%|██████▌   | 33/50 [00:14<00:07,  2.37it/s]
+ 68%|██████▊   | 34/50 [00:15<00:06,  2.37it/s]
+ 70%|███████   | 35/50 [00:15<00:06,  2.37it/s]
+ 72%|███████▏  | 36/50 [00:16<00:05,  2.37it/s]
+ 74%|███████▍  | 37/50 [00:16<00:05,  2.37it/s]
+ 76%|███████▌  | 38/50 [00:16<00:05,  2.37it/s]
+ 78%|███████▊  | 39/50 [00:17<00:04,  2.36it/s]
+ 80%|████████  | 40/50 [00:17<00:04,  2.37it/s]
+ 82%|████████▏ | 41/50 [00:18<00:03,  2.36it/s]
+ 84%|████████▍ | 42/50 [00:18<00:03,  2.36it/s]
+ 86%|████████▌ | 43/50 [00:19<00:02,  2.36it/s]
+ 88%|████████▊ | 44/50 [00:19<00:02,  2.36it/s]
+ 90%|█████████ | 45/50 [00:19<00:02,  2.36it/s]
+ 92%|█████████▏| 46/50 [00:20<00:01,  2.36it/s]
+ 94%|█████████▍| 47/50 [00:20<00:01,  2.36it/s]
+ 96%|█████████▌| 48/50 [00:21<00:00,  2.36it/s]
+ 98%|█████████▊| 49/50 [00:21<00:00,  2.36it/s]
+100%|██████████| 50/50 [00:21<00:00,  2.36it/s]
+100%|██████████| 50/50 [00:21<00:00,  2.28it/s]
+[12-14 03:53:42] [DenoisingStage] average time per step: 0.4395 seconds
+[12-14 03:53:42] [DenoisingStage] finished in 21.9818 seconds
+INFO:httpx:HTTP Request: POST http://localhost:28000/v1/images/edits "HTTP/1.1 200 OK"
+[12-14 03:53:42] [DecodingStage] started...
+[12-14 03:53:43] [DecodingStage] finished in 0.5844 seconds
+[12-14 03:53:43] Saved output to outputs/5e6994bb-6dbe-4f32-aa3f-9918c6cde812.jpg
+[12-14 03:53:43] Pixel data generated successfully in 26.44 seconds
+[12-14 03:53:43] Completed batch processing. Generated 1 outputs in 26.44 seconds.
+[2025-12-14 03:53:43] [32mINFO[0m:     127.0.0.1:37756 - "[1mPOST /v1/images/edits HTTP/1.1[0m" [32m200 OK[0m
+INFO     httpx:_client.py:1025 HTTP Request: POST http://localhost:28000/v1/images/edits "HTTP/1.1 200 OK"
+INFO:sglang.multimodal_gen.test.slack_utils:Found thread_ts: 1765599450.861079
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:148 Found thread_ts: 1765599450.861079
+INFO:sglang.multimodal_gen.test.slack_utils:File uploaded successfully: .png
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:185 File uploaded successfully: .png
+INFO:sglang.multimodal_gen.test.test_utils:Waiting for req perf record with request id:
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:181 Waiting for req perf record with request id:
+ERROR:sglang.multimodal_gen.test.server.test_server_common:Performance validation failed for qwen_image_edit_ti2i:
+Validation failed for 'Denoise Step 0'.
+    Actual:   1425.6475ms
+    Expected: 720.0000ms
+    Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+assert 1425.6474650464952 <= 1007.9999999999999
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:222 Performance validation failed for qwen_image_edit_ti2i:
+Validation failed for 'Denoise Step 0'.
+    Actual:   1425.6475ms
+    Expected: 720.0000ms
+    Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+assert 1425.6474650464952 <= 1007.9999999999999
+ERROR:sglang.multimodal_gen.test.server.test_server_common:
+update this baseline in the "scenarios" section of perf_baselines.json:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "InputValidationStage": 65.27,
+        "ImageEncodingStage": 2327.51,
+        "ImageVAEEncodingStage": 1269.99,
+        "TimestepPreparationStage": 31.61,
+        "LatentPreparationStage": 0.4,
+        "ConditioningStage": 0.02,
+        "DenoisingStage": 21981.61,
+        "DecodingStage": 584.35
+    },
+    "denoise_step_ms": {
+        "0": 1425.65,
+        "1": 282.22,
+        "2": 425.18,
+        "3": 418.1,
+        "4": 421.56,
+        "5": 421.34,
+        "6": 419.71,
+        "7": 422.2,
+        "8": 419.64,
+        "9": 422.48,
+        "10": 421.29,
+        "11": 420.47,
+        "12": 422.0,
+        "13": 419.35,
+        "14": 422.55,
+        "15": 421.12,
+        "16": 423.63,
+        "17": 420.57,
+        "18": 420.55,
+        "19": 421.96,
+        "20": 420.32,
+        "21": 423.72,
+        "22": 422.27,
+        "23": 422.33,
+        "24": 422.83,
+        "25": 422.05,
+        "26": 422.0,
+        "27": 421.59,
+        "28": 422.91,
+        "29": 420.22,
+        "30": 422.0,
+        "31": 422.09,
+        "32": 421.82,
+        "33": 423.06,
+        "34": 421.59,
+        "35": 422.2,
+        "36": 423.85,
+        "37": 422.97,
+        "38": 423.0,
+        "39": 422.06,
+        "40": 423.63,
+        "41": 423.25,
+        "42": 422.84,
+        "43": 423.54,
+        "44": 423.72,
+        "45": 423.58,
+        "46": 423.57,
+        "47": 425.88,
+        "48": 422.05,
+        "49": 422.64
+    },
+    "expected_e2e_ms": 26274.39,
+    "expected_avg_denoise_ms": 439.42,
+    "expected_median_denoise_ms": 422.14
+}
+
+
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:363
+update this baseline in the "scenarios" section of perf_baselines.json:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "InputValidationStage": 65.27,
+        "ImageEncodingStage": 2327.51,
+        "ImageVAEEncodingStage": 1269.99,
+        "TimestepPreparationStage": 31.61,
+        "LatentPreparationStage": 0.4,
+        "ConditioningStage": 0.02,
+        "DenoisingStage": 21981.61,
+        "DecodingStage": 584.35
+    },
+    "denoise_step_ms": {
+        "0": 1425.65,
+        "1": 282.22,
+        "2": 425.18,
+        "3": 418.1,
+        "4": 421.56,
+        "5": 421.34,
+        "6": 419.71,
+        "7": 422.2,
+        "8": 419.64,
+        "9": 422.48,
+        "10": 421.29,
+        "11": 420.47,
+        "12": 422.0,
+        "13": 419.35,
+        "14": 422.55,
+        "15": 421.12,
+        "16": 423.63,
+        "17": 420.57,
+        "18": 420.55,
+        "19": 421.96,
+        "20": 420.32,
+        "21": 423.72,
+        "22": 422.27,
+        "23": 422.33,
+        "24": 422.83,
+        "25": 422.05,
+        "26": 422.0,
+        "27": 421.59,
+        "28": 422.91,
+        "29": 420.22,
+        "30": 422.0,
+        "31": 422.09,
+        "32": 421.82,
+        "33": 423.06,
+        "34": 421.59,
+        "35": 422.2,
+        "36": 423.85,
+        "37": 422.97,
+        "38": 423.0,
+        "39": 422.06,
+        "40": 423.63,
+        "41": 423.25,
+        "42": 422.84,
+        "43": 423.54,
+        "44": 423.72,
+        "45": 423.58,
+        "46": 423.57,
+        "47": 425.88,
+        "48": 422.05,
+        "49": 422.64
+    },
+    "expected_e2e_ms": 26274.39,
+    "expected_avg_denoise_ms": 439.42,
+    "expected_median_denoise_ms": 422.14
+}
+
+
+FAILED
+--- POTENTIAL BASELINE IMPROVEMENTS DETECTED ---
+The following test cases performed significantly better than their baselines.
+Consider updating perf_baselines.json with the snippets below:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "DenoisingStage": 21981.61,
+        "ImageEncodingStage": 1485.0,
+        "ConditioningStage": 0.02,
+        "LatentPreparationStage": 0.4,
+        "TimestepPreparationStage": 13.78,
+        "DecodingStage": 584.35,
+        "InputValidationStage": 23,
+        "ImageVAEEncodingStage": 400.0
+    },
+    "denoise_step_ms": {
+        "0": 720.0,
+        "1": 282.22,
+        "2": 425.18,
+        "3": 418.1,
+        "4": 421.56,
+        "5": 421.34,
+        "6": 419.71,
+        "7": 422.2,
+        "8": 419.64,
+        "9": 422.48,
+        "10": 421.29,
+        "11": 420.47,
+        "12": 422.0,
+        "13": 419.35,
+        "14": 422.55,
+        "15": 421.12,
+        "16": 423.63,
+        "17": 420.57,
+        "18": 420.55,
+        "19": 421.96,
+        "20": 420.32,
+        "21": 423.72,
+        "22": 422.27,
+        "23": 422.33,
+        "24": 422.83,
+        "25": 422.05,
+        "26": 422.0,
+        "27": 421.59,
+        "28": 422.91,
+        "29": 420.22,
+        "30": 422.0,
+        "31": 422.09,
+        "32": 421.82,
+        "33": 423.06,
+        "34": 421.59,
+        "35": 422.2,
+        "36": 423.85,
+        "37": 422.97,
+        "38": 423.0,
+        "39": 422.06,
+        "40": 423.63,
+        "41": 423.25,
+        "42": 422.84,
+        "43": 423.54,
+        "44": 423.72,
+        "45": 423.58,
+        "46": 423.57,
+        "47": 425.88,
+        "48": 422.05,
+        "49": 422.64
+    },
+    "expected_e2e_ms": 26274.39,
+    "expected_avg_denoise_ms": 439.42,
+    "expected_median_denoise_ms": 422.14
+},
+
+
+
+=================================== FAILURES ===================================
+_____ TestDiffusionServerOneGpu.test_diffusion_perf[qwen_image_edit_ti2i] ______
+
+self = <test_server_a.TestDiffusionServerOneGpu object at 0x7f4854c9f380>
+case = DiffusionTestCase(id='qwen_image_edit_ti2i', server_args=DiffusionServerArgs(model_path='Qwen/Qwen-Image-Edit', modali.../lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg', seconds=1, num_frames=None, fps=None))
+diffusion_server = ServerContext(port=28000, process=<Popen: returncode: None args: ['sglang', 'serve', '--model-path', 'Qwen/Qwe...>, mo...PosixPath('/sgl-workspace/sglang/.cache/logs/performance.log'), log_dir=PosixPath('/sgl-workspace/sglang/.cache/logs'))
+
+    def test_diffusion_perf(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ):
+        """Single parametrized test that runs for all cases.
+
+        Pytest will execute this test once per case in ONE_GPU_CASES,
+        with test IDs like:
+        - test_diffusion_perf[qwen_image_text]
+        - test_diffusion_perf[qwen_image_edit]
+        - etc.
+        """
+        generate_fn = get_generate_fn(
+            model_path=case.server_args.model_path,
+            modality=case.server_args.modality,
+            sampling_params=case.sampling_params,
+        )
+        perf_record = self.run_and_collect(
+            diffusion_server,
+            case.id,
+            generate_fn,
+        )
+>       self._validate_and_record(case, perf_record)
+
+sglang/multimodal_gen/test/server/test_server_common.py:494:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+sglang/multimodal_gen/test/server/test_server_common.py:220: in _validate_and_record
+    validator.validate(perf_record, case.sampling_params.num_frames)
+sglang/multimodal_gen/test/server/test_server_utils.py:351: in validate
+    self._validate_denoise_steps(summary)
+sglang/multimodal_gen/test/server/test_server_utils.py:398: in _validate_denoise_steps
+    self._assert_le(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <sglang.multimodal_gen.test.server.test_server_utils.PerformanceValidator object at 0x7f484f972540>
+name = 'Denoise Step 0', actual = 1425.6474650464952, expected = 720.0
+tolerance = 0.4, min_abs_tolerance_ms = 20.0
+
+    def _assert_le(
+        self,
+        name: str,
+        actual: float,
+        expected: float,
+        tolerance: float,
+        min_abs_tolerance_ms: float = 20.0,
+    ):
+        """Assert that actual is less than or equal to expected within a tolerance.
+
+        Uses the larger of relative tolerance or absolute tolerance to prevent
+        flaky failures on very fast operations.
+        """
+        upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance_ms)
+>       assert actual <= upper_bound, (
+            f"Validation failed for '{name}'.\n"
+            f"  Actual:   {actual:.4f}ms\n"
+            f"  Expected: {expected:.4f}ms\n"
+            f"  Limit:    {upper_bound:.4f}ms "
+            f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
+        )
+E       AssertionError: Validation failed for 'Denoise Step 0'.
+E           Actual:   1425.6475ms
+E           Expected: 720.0000ms
+E           Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+E       assert 1425.6474650464952 <= 1007.9999999999999
+
+sglang/multimodal_gen/test/server/test_server_utils.py:333: AssertionError
+------------------------------ Captured log setup ------------------------------
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:144 [server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:144 Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:179 [server-test] Starting server pid=1599572, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=0s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=5s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=10s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=15s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=20s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=25s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=30s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=35s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=40s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=45s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=50s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=55s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=60s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=65s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=70s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=75s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=80s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:215 [server-test] Server ready
+------------------------------ Captured log call -------------------------------
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:53 Downloading image from URL: https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:68 Downloaded image to: /tmp/diffusion_test_image_1765684396.jpg
+INFO     httpx:_client.py:1025 HTTP Request: POST http://localhost:28000/v1/images/edits "HTTP/1.1 200 OK"
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:148 Found thread_ts: 1765599450.861079
+INFO     sglang.multimodal_gen.test.slack_utils:slack_utils.py:185 File uploaded successfully: .png
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:181 Waiting for req perf record with request id:
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:222 Performance validation failed for qwen_image_edit_ti2i:
+Validation failed for 'Denoise Step 0'.
+    Actual:   1425.6475ms
+    Expected: 720.0000ms
+    Limit:    1008.0000ms (rel_tol: 40.0%, abs_pad: 20.0ms)
+assert 1425.6474650464952 <= 1007.9999999999999
+ERROR    sglang.multimodal_gen.test.server.test_server_common:test_server_common.py:363
+update this baseline in the "scenarios" section of perf_baselines.json:
+
+"qwen_image_edit_ti2i": {
+    "stages_ms": {
+        "InputValidationStage": 65.27,
+        "ImageEncodingStage": 2327.51,
+        "ImageVAEEncodingStage": 1269.99,
+        "TimestepPreparationStage": 31.61,
+        "LatentPreparationStage": 0.4,
+        "ConditioningStage": 0.02,
+        "DenoisingStage": 21981.61,
+        "DecodingStage": 584.35
+    },
+    "denoise_step_ms": {
+        "0": 1425.65,
+        "1": 282.22,
+        "2": 425.18,
+        "3": 418.1,
+        "4": 421.56,
+        "5": 421.34,
+        "6": 419.71,
+        "7": 422.2,
+        "8": 419.64,
+        "9": 422.48,
+        "10": 421.29,
+        "11": 420.47,
+        "12": 422.0,
+        "13": 419.35,
+        "14": 422.55,
+        "15": 421.12,
+        "16": 423.63,
+        "17": 420.57,
+        "18": 420.55,
+        "19": 421.96,
+        "20": 420.32,
+        "21": 423.72,
+        "22": 422.27,
+        "23": 422.33,
+        "24": 422.83,
+        "25": 422.05,
+        "26": 422.0,
+        "27": 421.59,
+        "28": 422.91,
+        "29": 420.22,
+        "30": 422.0,
+        "31": 422.09,
+        "32": 421.82,
+        "33": 423.06,
+        "34": 421.59,
+        "35": 422.2,
+        "36": 423.85,
+        "37": 422.97,
+        "38": 423.0,
+        "39": 422.06,
+        "40": 423.63,
+        "41": 423.25,
+        "42": 422.84,
+        "43": 423.54,
+        "44": 423.72,
+        "45": 423.58,
+        "46": 423.57,
+        "47": 425.88,
+        "48": 422.05,
+        "49": 422.64
+    },
+    "expected_e2e_ms": 26274.39,
+    "expected_avg_denoise_ms": 439.42,
+    "expected_median_denoise_ms": 422.14
+}
+=============================== warnings summary ===============================
+<frozen importlib._bootstrap>:488
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+
+<frozen importlib._bootstrap>:488
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+
+../../../root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:22
+  /root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:22: DeprecationWarning: SMEM_CAPACITY is deprecated: Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead
+    from .blackwell_helpers import (
+
+../../../root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:34
+  /root/.python/sglang/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py:34: DeprecationWarning: SMEM_CAPACITY is deprecated: Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead
+    from .hopper_helpers import (
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED sglang/multimodal_gen/test/server/test_server_a.py::TestDiffusionServerOneGpu::test_diffusion_perf[qwen_image_edit_ti2i]
+=========== 1 failed, 1 deselected, 4 warnings in 124.92s (0:02:04) ============
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
+============================= test session starts ==============================
+platform linux -- Python 3.12.12, pytest-9.0.1, pluggy-1.6.0 -- /root/.python/sglang/bin/python3
+cachedir: .pytest_cache
+rootdir: /sgl-workspace/sglang/python
+configfile: pyproject.toml
+plugins: anyio-4.11.0
+collecting ...
+----------------------------- live log collection ------------------------------
+INFO     sglang.multimodal_gen.envs:envs.py:106 Using AITER as the attention library
+INFO     sglang.multimodal_gen.runtime.platforms:__init__.py:97 ROCm platform is unavailable: No module named 'amdsmi'
+INFO     sglang.multimodal_gen.runtime.platforms:__init__.py:54 CUDA is available
+INFO     numexpr.utils:utils.py:148 Note: detected 128 virtual cores but NumExpr set to maximum of 64, check "NUMEXPR_MAX_THREADS" environment variable.
+INFO     numexpr.utils:utils.py:151 Note: NumExpr detected 128 cores but "NUMEXPR_MAX_THREADS" not set, so enforcing safe limit of 16.
+INFO     numexpr.utils:utils.py:164 NumExpr defaulting to 16 threads.
+collected 2 items / 1 deselected / 1 selected
+run-last-failure: rerun previous 1 failure
+
+sglang/multimodal_gen/test/server/test_server_a.py::TestDiffusionServerOneGpu::test_diffusion_perf[qwen_image_edit_ti2i] INFO:sglang.multimodal_gen.test.test_utils:[server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+
+-------------------------------- live log setup --------------------------------
+INFO     sglang.multimodal_gen.test.test_utils:test_utils.py:144 [server-test] Monitoring perf log at /sgl-workspace/sglang/.cache/logs/performance.log
+INFO:sglang.multimodal_gen.test.server.test_server_utils:Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:144 Running command: sglang serve --model-path Qwen/Qwen-Image-Edit --port 28000 --log-level=debug --num-gpus 1 --ulysses-degree 1
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Starting server pid=1604054, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:179 [server-test] Starting server pid=1604054, model=Qwen/Qwen-Image-Edit, log=/tmp/sgl_server_28000_Qwen_Qwen-Image-Edit.log
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=0s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=0s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=5s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=5s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=10s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=10s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=15s
+[12-14 03:54:11] server_args: {"model_path": "Qwen/Qwen-Image-Edit", "attention_backend": null, "mode": "inference", "workload_type": "t2v", "cache_strategy": "none", "distributed_executor_backend": "mp", "nccl_port": null, "trust_remote_code": false, "revision": null, "num_gpus": 1, "tp_size": 1, "sp_degree": 1, "ulysses_degree": 1, "ring_degree": 1, "dp_size": 1, "dp_degree": 1, "enable_cfg_parallel": false, "hsdp_replicate_dim": 1, "hsdp_shard_dim": 1, "dist_timeout": null, "lora_path": null, "lora_nickname": "default", "vae_path": null, "lora_target_modules": null, "output_type": "pil", "dit_cpu_offload": true, "use_fsdp_inference": false, "text_encoder_cpu_offload": true, "image_encoder_cpu_offload": true, "vae_cpu_offload": true, "pin_cpu_memory": true, "mask_strategy_file_path": null, "STA_mode": "STA_inference", "skip_time_steps": 15, "enable_torch_compile": false, "disable_autocast": true, "VSA_sparsity": 0.0, "moba_config_path": null, "moba_config": {}, "master_port": 30013, "host": null, "port": 28000, "scheduler_port": 5636, "enable_stage_verification": true, "prompt_file_path": null, "model_paths": {}, "model_loaded": {"transformer": true, "vae": true}, "override_transformer_cls_name": null, "boundary_ratio": null, "log_level": "debug"}
+[12-14 03:54:11] Starting server...
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=15s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=20s
+[12-14 03:54:21] Scheduler bind at endpoint: tcp://localhost:5636
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=20s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=25s
+[12-14 03:54:21] Initializing distributed environment with world_size=1, device=cuda:0
+[12-14 03:54:21] world_size=1 rank=0 local_rank=0 distributed_init_method=env:// backend=nccl
+Set TORCH_CUDA_ARCH_LIST to 9.0
+[12-14 03:54:23] Registering pipelines complete, 12 pipelines registered
+[12-14 03:54:23] Attempting to acquire lock 139926082571104 on /tmp/tmpvuydugwv/.cache/huggingface/.gitignore.lock
+[12-14 03:54:23] Lock 139926082571104 acquired on /tmp/tmpvuydugwv/.cache/huggingface/.gitignore.lock
+[12-14 03:54:23] Attempting to release lock 139926082571104 on /tmp/tmpvuydugwv/.cache/huggingface/.gitignore.lock
+[12-14 03:54:23] Lock 139926082571104 released on /tmp/tmpvuydugwv/.cache/huggingface/.gitignore.lock
+[12-14 03:54:23] Attempting to acquire lock 139927015688672 on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Lock 139927015688672 acquired on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Attempting to release lock 139927015688672 on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Lock 139927015688672 released on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Starting new HTTPS connection (1): huggingface.co:443
+[12-14 03:54:23] https://huggingface.co:443 "HEAD /Qwen/Qwen-Image-Edit/resolve/main/model_index.json HTTP/1.1" 307 0
+[12-14 03:54:23] https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen-Image-Edit/ac7f9318f633fc4b5778c59367c8128225f1e3de/model_index.json HTTP/1.1" 200 0
+[12-14 03:54:23] Attempting to acquire lock 139927200404912 on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Lock 139927200404912 acquired on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Attempting to release lock 139927200404912 on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Lock 139927200404912 released on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Attempting to acquire lock 139927200404912 on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Lock 139927200404912 acquired on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Attempting to release lock 139927200404912 on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Lock 139927200404912 released on /tmp/tmpvuydugwv/.cache/huggingface/download/model_index.json.lock
+[12-14 03:54:23] Downloaded model_index.json for Qwen/Qwen-Image-Edit, pipeline: QwenImageEditPipeline
+[12-14 03:54:23] Resolved model path 'Qwen/Qwen-Image-Edit' from exact path match.
+[12-14 03:54:23] Found model info: ModelInfo(pipeline_cls=<class 'sglang.multimodal_gen.runtime.pipelines.qwen_image.QwenImageEditPipeline'>, sampling_param_cls=<class 'sglang.multimodal_gen.configs.sample.qwenimage.QwenImageSamplingParams'>, pipeline_config_cls=<class 'sglang.multimodal_gen.configs.pipeline_configs.qwen_image.QwenImageEditPipelineConfig'>)
+[12-14 03:54:23] Loading pipeline modules...
+[12-14 03:54:23] Downloading model snapshot from HF Hub for Qwen/Qwen-Image-Edit...
+[12-14 03:54:23] Downloaded model to /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de
+[12-14 03:54:23] Model path: /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de
+[12-14 03:54:23] Diffusers version: 0.35.0.dev0
+[12-14 03:54:23] Loading pipeline modules from config: {'_class_name': 'QwenImageEditPipeline', '_diffusers_version': '0.35.0.dev0', 'processor': ['transformers', 'Qwen2VLProcessor'], 'scheduler': ['diffusers', 'FlowMatchEulerDiscreteScheduler'], 'text_encoder': ['transformers', 'Qwen2_5_VLForConditionalGeneration'], 'tokenizer': ['transformers', 'Qwen2Tokenizer'], 'transformer': ['diffusers', 'QwenImageTransformer2DModel'], 'vae': ['diffusers', 'AutoencoderKLQwenImage']}
+[12-14 03:54:23] Loading required components: ['processor', 'scheduler', 'text_encoder', 'tokenizer', 'transformer', 'vae']
+
+Loading required modules:   0%|          | 0/6 [00:00<?, ?it/s][12-14 03:54:23] Loading processor from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/processor
+[12-14 03:54:24] Loaded processor: Qwen2VLProcessor from: customized
+
+Loading required modules:  17%|█▋        | 1/6 [00:00<00:04,  1.01it/s][12-14 03:54:24] Loading scheduler from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/scheduler
+[12-14 03:54:24] Loaded scheduler: FlowMatchEulerDiscreteScheduler from: customized
+[12-14 03:54:24] Loading text_encoder from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/text_encoder
+[12-14 03:54:24] HF model config: {'bos_token_id': 151643, 'do_sample': True, 'eos_token_id': 151645, 'pad_token_id': 151643, 'repetition_penalty': 1.05, 'temperature': 0.1, 'top_k': 1, 'top_p': 0.001, 'architectures': ['Qwen2_5_VLForConditionalGeneration'], 'attention_dropout': 0.0, 'hidden_act': 'silu', 'hidden_size': 3584, 'image_token_id': 151655, 'initializer_range': 0.02, 'intermediate_size': 18944, 'max_position_embeddings': 128000, 'max_window_layers': 28, 'num_attention_heads': 28, 'num_hidden_layers': 28, 'num_key_value_heads': 4, 'rms_norm_eps': 1e-06, 'rope_scaling': {'mrope_section': [16, 24, 24], 'rope_type': 'default', 'type': 'default'}, 'rope_theta': 1000000.0, 'sliding_window': 32768, 'text_config': {'architectures': ['Qwen2_5_VLForConditionalGeneration'], 'attention_dropout': 0.0, 'bos_token_id': 151643, 'eos_token_id': 151645, 'hidden_act': 'silu', 'hidden_size': 3584, 'image_token_id': None, 'initializer_range': 0.02, 'intermediate_size': 18944, 'layer_types': ['full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention', 'full_attention'], 'max_position_embeddings': 128000, 'max_window_layers': 28, 'model_type': 'qwen2_5_vl_text', 'num_attention_heads': 28, 'num_hidden_layers': 28, 'num_key_value_heads': 4, 'rms_norm_eps': 1e-06, 'rope_scaling': {'mrope_section': [16, 24, 24], 'rope_type': 'default', 'type': 'default'}, 'rope_theta': 1000000.0, 'sliding_window': None, 'torch_dtype': 'float32', 'use_cache': True, 'use_sliding_window': False, 'video_token_id': None, 'vision_end_token_id': 151653, 'vision_start_token_id': 151652, 'vision_token_id': 151654, 'vocab_size': 152064}, 'tie_word_embeddings': False, 'use_cache': True, 'use_sliding_window': False, 'video_token_id': 151656, 'vision_config': {'depth': 32, 'fullatt_block_indexes': [7, 15, 23, 31], 'hidden_act': 'silu', 'hidden_size': 1280, 'in_channels': 3, 'in_chans': 3, 'initializer_range': 0.02, 'intermediate_size': 3420, 'model_type': 'qwen2_5_vl', 'num_heads': 16, 'out_hidden_size': 3584, 'patch_size': 14, 'spatial_merge_size': 2, 'spatial_patch_size': 14, 'temporal_patch_size': 2, 'tokens_per_second': 2, 'torch_dtype': 'float32', 'window_size': 112}, 'vision_end_token_id': 151653, 'vision_start_token_id': 151652, 'vision_token_id': 151654, 'vocab_size': 152064}
+[12-14 03:54:25] Attention backend not specified
+[12-14 03:54:25] Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=25s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=30s
+[12-14 03:54:30] [RunAI Streamer] Overall time to stream 15.4 GiB of all files to cpu: 4.77s, 3.2 GiB/s
+[12-14 03:54:30] Loading weights took 4.82 seconds
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=30s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=35s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=35s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=40s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=40s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=45s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=45s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=50s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=50s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=55s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=55s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=60s
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=60s
+INFO:sglang.multimodal_gen.test.server.test_server_utils:[server-test] Waiting for server... elapsed=65s
+[12-14 03:55:05] Loaded text_encoder: FSDPQwen2_5_VLForConditionalGeneration from: customized
+
+Loading required modules:  50%|█████     | 3/6 [00:41<00:46, 15.38s/it][12-14 03:55:05] Loading tokenizer from /root/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/tokenizer
+INFO     sglang.multimodal_gen.test.server.test_server_utils:test_server_utils.py:221 [server-test] Waiting for server... elapsed=65s
+Traceback (most recent call last):
+  File "/sgl-workspace/sglang/python/sglang/multimodal_gen/test/run_suite.py", line 174, in <module>
+    main()
+  File "/sgl-workspace/sglang/python/sglang/multimodal_gen/test/run_suite.py", line 169, in main
+    exit_code = run_pytest(my_files)
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/multimodal_gen/test/run_suite.py", line 98, in run_pytest
+    line = process.stdout.readline()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

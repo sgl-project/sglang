@@ -87,7 +87,7 @@ class SamplingParams:
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
 
     # Text inputs
     prompt: str | list[str] | None = None
@@ -557,6 +557,15 @@ class SamplingParams:
         elif hasattr(args, "resolution_720p") and args.resolution_720p:
             args.width = 1280
             args.height = 720
+
+        if (
+            hasattr(args, "image_path")
+            and isinstance(args.image_path, str)
+            and args.image_path
+        ):
+            paths = args.image_path.split()
+            if len(paths) > 1:
+                args.image_path = paths
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         args.height_not_provided = False

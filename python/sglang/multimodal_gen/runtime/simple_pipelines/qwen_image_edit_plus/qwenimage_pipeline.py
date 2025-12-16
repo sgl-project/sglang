@@ -8,10 +8,14 @@ from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLProcessor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.simple_pipelines.qwen_image_edit_plus.qwenimage_transformers import (
     QwenImageTransformer2DModel,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class Config:
+    prefix = "qwenimage"
 
 
 class QwenImageEditPlusPipeline(nn.Module):
@@ -19,6 +23,8 @@ class QwenImageEditPlusPipeline(nn.Module):
 
     def __init__(self, model_path: str, server_args: ServerArgs):
         super().__init__()
+        self.config = Config()
+        self.hf_config = {}
         self.device = get_local_torch_device()
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model_path, subfolder="scheduler"
@@ -32,9 +38,7 @@ class QwenImageEditPlusPipeline(nn.Module):
         self.processor = Qwen2VLProcessor.from_pretrained(
             model_path, subfolder="processor"
         )
-        config = {}
-        hf_config = {}
-        self.transformer = QwenImageTransformer2DModel(config, hf_config)
+        self.transformer = QwenImageTransformer2DModel(self.config, self.hf_config)
         self.negtive_prompt = " "
         self.true_cfg_scale = 4.0
         self.num_inference_steps = 40
