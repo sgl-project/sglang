@@ -3,7 +3,6 @@ import logging
 import re
 from typing import List
 
-
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -76,7 +75,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
         self.invoke_end_token = "</｜DSML｜invoke>"
         self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
-        self._last_arguments = ""
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
@@ -338,7 +336,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Move to next tool call
                     self.current_tool_id += 1
                     self.current_tool_name_sent = False
-                    self._last_arguments = ""
 
                     # Continue loop to check for more invoke blocks
                     continue
