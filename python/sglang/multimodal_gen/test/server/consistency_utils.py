@@ -26,9 +26,11 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 
-# Path to the consistency GT directory
-GT_DIR = Path(__file__).parent.parent / "consistency_gt"
-GT_METADATA_PATH = GT_DIR / "gt_metadata.json"
+# Remote GT base URL (sgl-test-files repository)
+GT_REMOTE_BASE_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/consistency_gt"
+
+# Path to the GT metadata file (kept in sglang repo)
+GT_METADATA_PATH = Path(__file__).parent.parent / "consistency_gt" / "gt_metadata.json"
 
 # Default thresholds
 DEFAULT_SSIM_THRESHOLD_IMAGE = 0.98
@@ -85,12 +87,6 @@ def save_gt_metadata(metadata: dict[str, Any]) -> None:
         json.dump(metadata, f, indent=4)
 
 
-def get_case_gt_dir(case_id: str, num_gpus: int) -> Path:
-    """Get the GT directory for a specific case."""
-    gpu_dir = f"{num_gpus}-gpu"
-    return GT_DIR / gpu_dir / case_id
-
-
 def get_staging_dir() -> Path | None:
     """Get the staging directory from environment variable.
 
@@ -103,42 +99,50 @@ def get_staging_dir() -> Path | None:
     return None
 
 
-def get_case_staging_dir(case_id: str, num_gpus: int) -> Path | None:
-    """Get the staging directory for a specific case.
-
-    Returns:
-        Path to case staging directory, or None if staging is not enabled.
-    """
-    staging_dir = get_staging_dir()
-    if staging_dir is None:
-        return None
-    gpu_dir = f"{num_gpus}-gpu"
-    return staging_dir / gpu_dir / case_id
-
-
 def load_gt_frames(case_id: str, num_gpus: int) -> list[np.ndarray]:
     """
-    Load ground truth frames for a specific case.
+    Load ground truth frames for a specific case from remote repository.
+
+    Downloads frames from sgl-test-files repository and caches locally.
 
     Returns:
         List of numpy arrays (RGB images) for each key frame.
+
+    Raises:
+        FileNotFoundError: If GT frames are not available remotely.
     """
-    case_dir = get_case_gt_dir(case_id, num_gpus)
-    if not case_dir.exists():
-        raise FileNotFoundError(f"GT directory not found: {case_dir}")
+    from sglang.utils import download_and_cache_file
+
+    # Determine frame names from metadata
+    metadata = load_gt_metadata()
+    case_meta = metadata.get("cases", {}).get(case_id, {})
+
+    if case_meta.get("num_frames", 1) == 3:
+        # Video with 3 key frames
+        frame_names = ["frame_0.png", "frame_mid.png", "frame_last.png"]
+    else:
+        # Single image
+        frame_names = ["frame_0.png"]
 
     frames = []
-    # Sort to ensure consistent ordering: frame_0.png, frame_mid.png, frame_last.png
-    frame_files = sorted(case_dir.glob("frame_*.png"))
+    for frame_name in frame_names:
+        # Construct URL and cache path
+        url = f"{GT_REMOTE_BASE_URL}/{num_gpus}-gpu/{case_id}/{frame_name}"
+        cache_filename = f"/tmp/sglang_gt_{num_gpus}gpu_{case_id}_{frame_name}"
 
-    if not frame_files:
-        raise FileNotFoundError(f"No GT frames found in {case_dir}")
+        try:
+            # Download and cache
+            local_path = download_and_cache_file(url, cache_filename)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"GT frame not found at {url}. "
+                f"Please upload GT files to sgl-test-files repository. Error: {e}"
+            )
 
-    for frame_file in frame_files:
-        img = Image.open(frame_file).convert("RGB")
+        img = Image.open(local_path).convert("RGB")
         frames.append(np.array(img))
 
-    logger.info(f"Loaded {len(frames)} GT frames for {case_id}")
+    logger.info(f"Loaded {len(frames)} GT frames for {case_id} from remote repository")
     return frames
 
 
@@ -375,22 +379,23 @@ def save_frames_as_gt(
     output_dir: Path | None = None,
 ) -> Path:
     """
-    Save frames as ground truth PNG files.
+    Save frames as ground truth PNG files to staging directory.
 
     Args:
         frames: List of frames as numpy arrays
         case_id: Test case identifier
         num_gpus: Number of GPUs used
         is_video: Whether this is a video (affects naming)
-        output_dir: Optional output directory (defaults to GT_DIR)
+        output_dir: Output directory (required, GT files are no longer stored locally)
 
     Returns:
         Path to the GT directory
     """
-    if output_dir is not None:
-        case_dir = output_dir / f"{num_gpus}-gpu" / case_id
-    else:
-        case_dir = get_case_gt_dir(case_id, num_gpus)
+    if output_dir is None:
+        raise ValueError(
+            "output_dir is required. GT files are now stored in sgl-test-files repository."
+        )
+    case_dir = output_dir / f"{num_gpus}-gpu" / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
 
     # Clear existing frames
@@ -412,11 +417,21 @@ def save_frames_as_gt(
 
 
 def gt_exists(case_id: str, num_gpus: int) -> bool:
-    """Check if GT exists for a specific case."""
-    case_dir = get_case_gt_dir(case_id, num_gpus)
-    if not case_dir.exists():
+    """Check if GT exists (cached locally or available remotely)."""
+    import requests
+
+    # Check local cache first
+    cache_filename = f"/tmp/sglang_gt_{num_gpus}gpu_{case_id}_frame_0.png"
+    if os.path.exists(cache_filename):
+        return True
+
+    # Check remote
+    url = f"{GT_REMOTE_BASE_URL}/{num_gpus}-gpu/{case_id}/frame_0.png"
+    try:
+        response = requests.head(url, timeout=10)
+        return response.status_code == 200
+    except Exception:
         return False
-    return len(list(case_dir.glob("frame_*.png"))) > 0
 
 
 def save_gt_to_staging(
@@ -425,15 +440,14 @@ def save_gt_to_staging(
     is_video: bool,
 ) -> Path | None:
     """
-    Save GT frames to staging directory for later upload as artifact.
+    Save GT frames to staging directory for later upload to sgl-test-files.
 
     This function is called when GT doesn't exist during test execution.
     The staging directory can be uploaded as a CI artifact for developers
-    to download and add to their PR.
+    to download and upload to the sgl-test-files repository.
 
     Note: Only frame files are saved, not metadata. Users should manually
-    copy frame files to the GT directory. Metadata update is optional
-    (only needed for custom thresholds).
+    upload frame files to sgl-test-files repository.
 
     Args:
         frames: List of frames as numpy arrays
@@ -459,5 +473,29 @@ def save_gt_to_staging(
         output_dir=staging_dir,
     )
 
+    # Print detailed instructions for uploading to sgl-test-files
     logger.info(f"[Staging] Saved GT frames for {case_id} to {gt_path}")
+    logger.info("=" * 60)
+    logger.info("GT FILES READY FOR UPLOAD")
+    logger.info("=" * 60)
+    logger.info(f"Staging directory: {gt_path}")
+    logger.info("")
+    logger.info("To add these GT files to the repository:")
+    logger.info("1. Clone sgl-test-files repo (if not already):")
+    logger.info("   git clone https://github.com/sgl-project/sgl-test-files.git")
+    logger.info("")
+    logger.info("2. Copy the generated files:")
+    logger.info(
+        f"   cp -r {gt_path}/* sgl-test-files/images/consistency_gt/{num_gpus}-gpu/{case_id}/"
+    )
+    logger.info("")
+    logger.info("3. Commit and push:")
+    logger.info("   cd sgl-test-files")
+    logger.info("   git add images/consistency_gt/")
+    logger.info(f'   git commit -m "Add consistency GT for {case_id}"')
+    logger.info("   git push")
+    logger.info("")
+    logger.info("4. After the PR is merged, re-run the tests.")
+    logger.info("=" * 60)
+
     return gt_path

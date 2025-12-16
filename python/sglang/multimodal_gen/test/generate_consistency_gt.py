@@ -3,8 +3,8 @@
 Ground Truth Generation Script for Consistency Testing.
 
 This script generates ground truth (GT) outputs for consistency tests.
-GT files are stored in the consistency_gt/ directory and used as reference
-for regression testing.
+GT files are saved to a staging directory (./gt_staging/) and must be
+manually uploaded to the sgl-test-files repository.
 
 IMPORTANT: GT correctness is controlled by Reviewer during PR review.
 This script uses the exact same generation code path as the tests to ensure
@@ -25,6 +25,9 @@ Usage:
 
     # List available cases without generating
     python generate_consistency_gt.py --list
+
+After generation, upload the files to:
+    https://github.com/sgl-project/sgl-test-files/tree/main/images/consistency_gt/
 """
 
 from __future__ import annotations
@@ -47,7 +50,6 @@ from sglang.multimodal_gen.test.server.consistency_utils import (
     DEFAULT_SSIM_THRESHOLD_VIDEO,
     GT_METADATA_PATH,
     extract_key_frames_from_video,
-    gt_exists,
     image_bytes_to_numpy,
     load_gt_metadata,
     save_frames_as_gt,
@@ -67,6 +69,9 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port
 
 logger = init_logger(__name__)
+
+# Staging directory for generated GT files (to be uploaded to sgl-test-files)
+GT_STAGING_DIR = Path("./gt_staging")
 
 # All test cases organized by GPU configuration
 ALL_CASES = {
@@ -174,9 +179,11 @@ def generate_gt_for_case(
 
         logger.info(f"Extracted {len(frames)} frame(s)")
 
-        # Save frames as GT
-        gt_dir = save_frames_as_gt(frames, case_id, num_gpus, is_video=is_video)
-        logger.info(f"GT saved to: {gt_dir}")
+        # Save frames to staging directory (for upload to sgl-test-files)
+        gt_dir = save_frames_as_gt(
+            frames, case_id, num_gpus, is_video=is_video, output_dir=GT_STAGING_DIR
+        )
+        logger.info(f"GT saved to staging: {gt_dir}")
 
         # Update metadata
         threshold = (
@@ -255,11 +262,6 @@ def main():
         default=None,
         help="Override number of GPUs (only with --case)",
     )
-    parser.add_argument(
-        "--missing-only",
-        action="store_true",
-        help="Only generate GT for cases that don't have GT yet",
-    )
 
     args = parser.parse_args()
 
@@ -302,23 +304,6 @@ def main():
         for suite_cases in ALL_CASES.values():
             cases_to_generate.extend(suite_cases)
 
-    # Filter to only missing GT cases if --missing-only is set
-    if args.missing_only:
-        original_count = len(cases_to_generate)
-        cases_to_generate = [
-            case
-            for case in cases_to_generate
-            if not gt_exists(case.id, case.server_args.num_gpus)
-        ]
-        logger.info(
-            f"[--missing-only] Filtered from {original_count} to "
-            f"{len(cases_to_generate)} cases without GT"
-        )
-
-        if not cases_to_generate:
-            print("\nNo missing GT cases found. Nothing to generate.")
-            return
-
     # Generate GT for each case
     print(f"\n{'='*60}")
     print(f"Generating GT for {len(cases_to_generate)} case(s)")
@@ -345,7 +330,34 @@ def main():
     print(f"  Successful:   {success_count}")
     print(f"  Failed:       {fail_count}")
     print(f"\nMetadata saved to: {GT_METADATA_PATH}")
-    print(f"{'='*60}\n")
+    print(f"GT files saved to: {GT_STAGING_DIR.absolute()}")
+    print(f"{'='*60}")
+
+    # Print upload instructions
+    if success_count > 0:
+        print(f"\n{'='*60}")
+        print("UPLOAD INSTRUCTIONS")
+        print(f"{'='*60}")
+        print(f"\nGenerated GT files are in: {GT_STAGING_DIR.absolute()}")
+        print("\nTo upload to sgl-test-files repository:")
+        print("1. Clone sgl-test-files repo (if not already):")
+        print("   git clone https://github.com/sgl-project/sgl-test-files.git")
+        print("")
+        print("2. Copy the generated files:")
+        print(
+            f"   cp -r {GT_STAGING_DIR.absolute()}/* sgl-test-files/images/consistency_gt/"
+        )
+        print("")
+        print("3. Commit and push:")
+        print("   cd sgl-test-files")
+        print("   git add images/consistency_gt/")
+        print('   git commit -m "Add consistency GT files"')
+        print("   git push")
+        print("")
+        print(
+            "4. After the PR is merged, the tests will automatically use the new GT files."
+        )
+        print(f"{'='*60}\n")
 
     if fail_count > 0:
         sys.exit(1)
