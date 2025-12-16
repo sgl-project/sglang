@@ -178,7 +178,7 @@ class BaseTpWorker(ABC):
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
 
-    def process_weights_after_loading(self, recv_req: PostProcessWeightsReqInput):
+    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
         """Perform optional post-processing on the updated model weights (e.g., Marlin conversion)."""
         success, message = self.model_runner.post_process_weights(recv_req)
         return success, message
