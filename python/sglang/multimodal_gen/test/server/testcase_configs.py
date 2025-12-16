@@ -242,6 +242,7 @@ MULTI_URL_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
     image_path=[
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
     ],
     direct_url_test=True,
 )

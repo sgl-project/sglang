@@ -663,19 +663,40 @@ def get_generate_fn(
         logger.info(f"URL direct test: processing {len(image_urls)} URLs")
         logger.info(f"URLs: {image_urls}")
 
-        # Special logic: if 2 or more URLs, convert the first one to base64
-        processed_urls = []
-        if len(image_urls) >= 2:
-            logger.info(f"Converting first URL to base64 (special test logic)")
+        upload_images = []  # For file upload (first image)
+        processed_urls = []  # For URL/base64 (middle and last images)
 
-            # Download and convert first URL to base64
+        if len(image_urls) >= 3:
+            logger.info(
+                f"Processing {len(image_urls)} images: first upload, last base64"
+            )
+
+            # First image: use upload method
             first_url = image_urls[0]
+            try:
+                # Use existing download function
+                temp_file = download_image_from_url(first_url)
+                upload_images.append(temp_file)
+                logger.info(f"First image saved for upload: {temp_file}")
+
+            except Exception as e:
+                logger.error(f"Failed to download first image for upload: {e}")
+                pytest.skip(f"{id}: failed to download first image " f"for upload: {e}")
+
+            # Middle images: use URL method
+            for i in range(1, len(image_urls) - 1):
+                middle_url = image_urls[i]
+                processed_urls.append(middle_url)
+                logger.info(f"Middle image {i} using URL method: {middle_url}")
+
+            # Last image: convert to base64
+            last_url = image_urls[-1]
             try:
                 import base64
 
                 import requests
 
-                response = requests.get(first_url, timeout=30)
+                response = requests.get(last_url, timeout=30)
                 response.raise_for_status()
 
                 # Convert to base64 data URL
@@ -684,33 +705,45 @@ def get_generate_fn(
                 base64_url = f"data:{content_type};base64,{base64_data}"
 
                 processed_urls.append(base64_url)
-                logger.info(f"First URL converted to base64: {len(base64_data)} chars")
-
-                # Add remaining URLs as-is
-                processed_urls.extend(image_urls[1:])
+                logger.info(
+                    f"Last image converted to base64: " f"{len(base64_data)} chars"
+                )
 
             except Exception as e:
-                logger.error(f"Failed to convert first URL to base64: {e}")
-                pytest.skip(f"{id}: failed to convert first URL to base64: {e}")
-        else:
-            # Less than 2 URLs, use all
-            processed_urls = image_urls
+                logger.error(f"Failed to convert last image to base64: {e}")
+                pytest.skip(f"{id}: failed to convert last image " f"to base64: {e}")
 
-        logger.info(f"Final processed URLs: {len(processed_urls)} items")
+        logger.info(f"Upload images: {len(upload_images)} files")
+        logger.info(f"Processed URLs: {len(processed_urls)} items")
         for i, url in enumerate(processed_urls):
             url_type = "base64" if url.startswith("data:") else "http"
             logger.info(f"  URL {i+1}: {url_type} format")
 
-        # Direct URL test - pass processed URLs to API
-        response = client.images.with_raw_response.edit(
-            model=model_path,
-            image=[],
-            image_urls=processed_urls,
-            prompt=sampling_params.prompt,
-            n=1,
-            size=sampling_params.output_size,
-            response_format="b64_json",
-        )
+        # Open upload files
+        upload_files = []
+        try:
+            for upload_path in upload_images:
+                upload_files.append(open(upload_path, "rb"))
+
+            response = client.images.with_raw_response.edit(
+                model=model_path,
+                image=upload_files,
+                image_urls=processed_urls,
+                prompt=sampling_params.prompt,
+                n=1,
+                size=sampling_params.output_size,
+                response_format="b64_json",
+            )
+        finally:
+            # Close upload files
+            for f in upload_files:
+                f.close()
+            # Clean up temporary files
+            for upload_path in upload_images:
+                try:
+                    upload_path.unlink()
+                except Exception:
+                    pass
 
         rid = response.headers.get("x-request-id", "")
         result = response.parse()
