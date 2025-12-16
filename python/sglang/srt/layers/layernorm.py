@@ -121,9 +121,9 @@ class RMSNorm(CustomOp):
                 self.variance_epsilon,
             )
         if residual is not None:
-            # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition. 
+            # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
-            # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition), 
+            # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
             # we probably need to add another parameter to fused_add_rmsnorm
             post_residual_addition = kwargs.get("post_residual_addition")
             if post_residual_addition is not None:
