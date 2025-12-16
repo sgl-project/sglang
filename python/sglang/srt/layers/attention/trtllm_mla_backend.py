@@ -1018,7 +1018,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len = metadata.max_seq_len_k + metadata.max_seq_len_q
             q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             # FP4 KV cache is dequantized, so skip dtype assertion for FP4
-            if not (float4_dtype is not None and self.data_type == float4_dtype):
+            if not is_fp4_kv_cache:
                 assert kv_cache.dtype == self.data_type
 
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
