@@ -316,6 +316,12 @@ class TestEAGLEServerPageSize(TestEAGLEServerBasic):
         "--attention-backend=flashinfer",
     ]
 
+    @classmethod
+    def setUpClass(cls):
+        # Runtime check only supported for topk=1, and can help to find a leak.
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
+            super().setUpClass()
+
 
 class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
     # default topk=8 and tokens=64

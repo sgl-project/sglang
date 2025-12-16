@@ -430,8 +430,8 @@ class SamplingParams:
             "--generator-device",
             type=str,
             default=SamplingParams.generator_device,
-            choices=["cuda", "cpu"],
-            help="Device for random generator (cuda or cpu). Default: cuda",
+            choices=["cuda", "musa", "cpu"],
+            help="Device for random generator (cuda, musa or cpu). Default: cuda",
         )
         parser.add_argument(
             "--num-frames",

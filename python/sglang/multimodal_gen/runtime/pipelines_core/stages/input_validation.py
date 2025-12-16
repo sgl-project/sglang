@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators,
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import best_output_size
@@ -61,7 +62,7 @@ class InputValidationStage(PipelineStage):
         if generator_device == "cpu":
             device_str = "cpu"
         else:
-            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+            device_str = current_platform.device_type
 
         batch.generator = [
             torch.Generator(device_str).manual_seed(seed) for seed in seeds
