@@ -1418,7 +1418,7 @@ class ModelRunner:
                         self.model_config.get_num_kv_heads(get_attention_tp_size())
                         * math.ceil(
                             self.model_config.head_dim / 2
-                        )  # two neightbour dims are packed into one byte
+                        )  # two neighbour dims are packed into one byte
                         * num_layers
                         * 2  # key and value
                         * 1  # two int4 pack to one byte
