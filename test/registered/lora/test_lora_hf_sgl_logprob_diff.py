@@ -39,10 +39,7 @@ from sglang.test.runners import HFRunner, SRTRunner
 
 register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
 
-from sglang.test.test_utils import (
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-    CustomTestCase,
-)
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 # Test configuration constants
 LORA_BACKEND = "triton"
