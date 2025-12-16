@@ -159,7 +159,8 @@ async def generations(
 async def edits(
     image: Optional[List[UploadFile]] = File(None),
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
-    url: Optional[List[str]] = Form(None, alias="url[]"),
+    url: Optional[List[str]] = Form(None),
+    url_array: Optional[List[str]] = Form(None, alias="url[]"),
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
@@ -175,10 +176,11 @@ async def edits(
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
+    urls = url or url_array
 
-    if (not images or len(images) == 0) and (not url or len(url) == 0):
+    if (not images or len(images) == 0) and (not urls or len(urls) == 0):
         raise HTTPException(
-            status_code=422, detail="Field 'image' or 'image_urls' is required"
+            status_code=422, detail="Field 'image' or 'url' is required"
         )
 
     # Save all input images; additional images beyond the first are saved for potential future use
@@ -186,13 +188,13 @@ async def edits(
     os.makedirs(uploads_dir, exist_ok=True)
     if images is not None and not isinstance(images, list):
         images = [images]
-    if url is not None and not isinstance(url, list):
-        url = [url]
-    if url is not None:
+    if urls is not None and not isinstance(urls, list):
+        urls = [urls]
+    if urls is not None:
         if images is None:
-            images = url
+            images = urls
         else:
-            images.extend(url)
+            images.extend(urls)
 
     input_paths = []
     for idx, img in enumerate(images):
