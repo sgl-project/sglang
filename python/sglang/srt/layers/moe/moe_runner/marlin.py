@@ -80,7 +80,9 @@ def fused_experts_none_to_marlin(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     global MARLIN_MOE_WORKSPACE
-    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (  # noqa
+        fused_marlin_moe,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
@@ -97,7 +99,7 @@ def fused_experts_none_to_marlin(
             hidden_states.device, max_blocks_per_sm=4
         )
 
-    output = fused_marlin_moe(
+    output = torch.ops.sglang.fused_marlin_moe(
         hidden_states=hidden_states,
         w1=quant_info.w13_qweight,
         w2=quant_info.w2_qweight,

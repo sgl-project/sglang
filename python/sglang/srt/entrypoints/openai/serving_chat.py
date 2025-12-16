@@ -1069,8 +1069,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3"]:
-            # qwen3, glm45, and nano_v3 are reasoning by default
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
+            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking", True) is True
