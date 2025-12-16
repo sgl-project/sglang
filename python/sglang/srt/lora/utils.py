@@ -83,7 +83,7 @@ def get_hidden_dim(
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
         elif module_name == "gate_up_proj_moe":
-            return config.hidden_size, config.moe_intermediate_size
+            return config.hidden_size, config.moe_intermediate_size * 2
         elif module_name == "down_proj_moe":
             return config.moe_intermediate_size, config.hidden_size
         elif module_name == "embed_tokens":
