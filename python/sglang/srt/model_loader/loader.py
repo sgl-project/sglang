@@ -734,20 +734,27 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
     # Parameters to skip during FP8 quantization (matches FlashRL's exclude_list)
     SKIP_QUANTIZATION_PARAMS = [
+        # Quantization scales
         "weight_scale",
         "input_scale",
         "output_scale",
+        # Bias parameters
         ".bias",
+        # Output layer
         "lm_head",
-        "lm_head.weight",
-        "model.norm.weight",
+        # Embedding layers
         "embed_tokens",  # BF16 params
+        "embeddings",  # Generic embeddings (adapted from verl PR #4415)
+        # Rotary position encoding
         "rotary_emb.inv_freq",
         "rotary_emb.cos_cached",
         "rotary_emb.sin_cached",
+        # Projector layer
         "projector",
-        "input_layernorm.weight",
-        "post_attention_layernorm.weight",  # LayerNorms
+        # Normalization layers (generic patterns cover all variants)
+        "layernorm",  # LayerNorm
+        "norm",  # Various Norm layers
+        "ln_",  # LayerNorm variants
     ]
 
     # Stacked parameters (Qwen2): shards loaded separately, then combined
@@ -877,6 +884,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
                 # 2) Modules without a weight tensor 
                 if not hasattr(module, "weight") or module.weight is None:
+                    logger.info(
+                        f"[QuantizedRL] Skip quantization for module: {name} because it does not have a weight tensor"
+                    )
                     continue
 
                 weight = module.weight
@@ -894,73 +904,80 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
                 use_blockwise = False
 
-                if weight.ndim == 2:
-                    # Check whether both dimensions are divisible by the block size
-                    if (
-                        weight.shape[0] % default_block_size[0] == 0
-                        and weight.shape[1] % default_block_size[1] == 0
-                    ):
-                        try:
-                            qweight, scale = scaled_fp8_blockwise(
-                                weight, default_block_size
-                            )
-                            # Scale shape is (blk_m, blk_n, 1); squeeze the last dim
-                            scale = scale.squeeze(-1)
-                            
-                            # Transpose scale to match transposed weight layout
-                            # If weight is (M, K) and gets transposed to (K, M),
-                            # scale should be (blk_m, blk_n) = (M//128, K//128)
-                            # and needs to be transposed to (blk_n, blk_m) = (K//128, M//128)
-                            scale = scale.t()
+                assert(weight.ndim == 2), f"Module {name} weight shape {weight.shape} is not 2D"
+                # Check whether both dimensions are divisible by the block size
+                assert (
+                    weight.shape[0] % default_block_size[0] == 0
+                    and weight.shape[1] % default_block_size[1] == 0
+                ), f"Module {name} weight shape {weight.shape} is not divisible by block size {default_block_size}"
 
-                            # Remove existing weight_scale
-                            if hasattr(module, "weight_scale"):
-                                delattr(module, "weight_scale")
 
-                            # Update or create weight_scale_inv using a plain Parameter
-                            if hasattr(module, "weight_scale_inv"):
-                                # Keep the existing Parameter type; just update data if shape matches
-                                if module.weight_scale_inv.data.shape == scale.shape:
-                                    module.weight_scale_inv.data.copy_(scale)
-                                else:
-                                    logger.warning(
-                                        f"[QuantizedRL] Scale shape mismatch for {name}: "
-                                        f"expected {module.weight_scale_inv.data.shape}, "
-                                        f"got {scale.shape}. Recreating scale parameter as plain Parameter."
-                                    )
-                                    module.weight_scale_inv = Parameter(
-                                        scale, requires_grad=False
-                                    )
-                            else:
-                                # No existing weight_scale_inv; create a new plain Parameter
-                                module.register_parameter(
-                                    "weight_scale_inv",
-                                    Parameter(scale, requires_grad=False),
-                                )
+                try:
+                    qweight, scale = scaled_fp8_blockwise(
+                        weight, default_block_size
+                    )
+                    # Scale shape is (blk_m, blk_n, 1); squeeze the last dim
+                    scale = scale.squeeze(-1)
+                    
+                    # Note: scaled_fp8_blockwise returns weight in original shape (M, K)
+                    # and scale in shape (blk_m, blk_n) = (M//128, K//128)
+                    # The w8a8_block_fp8_matmul_deepgemm expects:
+                    # - weight shape (M, K) where M is output dim, K is input dim
+                    # - input shape (batch*seq, K)
+                    # - assert A.shape[-1] == B.shape[-1] requires weight.shape[-1] == K
+                    # So we should NOT transpose the weight or scale
 
-                            # Update the weight; keep the same transposed layout as native FP8 path
-                            module.weight = Parameter(
-                                qweight.t(), requires_grad=False
-                            )
-                            use_blockwise = True
-                            
-                            logger.info(
-                                f"[QuantizedRL] Quantize (blockwise, initial load): {name} "
-                                f"{weight.dtype}→FP8 "
-                                f"(shape={weight.shape}, block_size={default_block_size})"
-                            )
-                            quant_method = fp8_config.get_quant_method(module, prefix=name)
-                            if quant_method is not None:
-                                module.quant_method = quant_method
-                                module.weight_block_size = default_block_size
-                                logger.debug(
-                                    f"[QuantizedRL] Set quant_method weight_block_size={default_block_size} for module: {name}"
-                                )
-                        except Exception as e:
+                    # Remove existing weight_scale
+                    if hasattr(module, "weight_scale"):
+                        delattr(module, "weight_scale")
+
+                    # Update or create weight_scale_inv using a plain Parameter
+                    if hasattr(module, "weight_scale_inv"):
+                        # Keep the existing Parameter type; just update data if shape matches
+                        if module.weight_scale_inv.data.shape == scale.shape:
+                            module.weight_scale_inv.data.copy_(scale)
+                        else:
                             logger.warning(
-                                f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
-                                "skipping blockwise quantization for this module"
+                                f"[QuantizedRL] Scale shape mismatch for {name}: "
+                                f"expected {module.weight_scale_inv.data.shape}, "
+                                f"got {scale.shape}. Recreating scale parameter as plain Parameter."
                             )
+                            module.weight_scale_inv = Parameter(
+                                scale, requires_grad=False
+                            )
+                    else:
+                        # No existing weight_scale_inv; create a new plain Parameter
+                        module.register_parameter(
+                            "weight_scale_inv",
+                            Parameter(scale, requires_grad=False),
+                        )
+
+                    # Update the weight; keep original shape (M, K) without transposition
+                    # This matches the expected format for w8a8_block_fp8_matmul_deepgemm
+                    module.weight = Parameter(
+                        qweight, requires_grad=False
+                    )
+                    use_blockwise = True
+                    
+                    logger.info(
+                        f"[QuantizedRL] Quantize (blockwise, initial load): {name} "
+                        f"{weight.dtype}→FP8 "
+                        f"(shape={weight.shape}, block_size={default_block_size})"
+                    )
+                    quant_method = fp8_config.get_quant_method(module, prefix=name)
+                    if quant_method is not None:
+                        module.quant_method = quant_method
+                        module.weight_block_size = default_block_size
+                        logger.debug(
+                            f"[QuantizedRL] Set quant_method weight_block_size={default_block_size} for module: {name}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
+                        "skipping blockwise quantization for this module"
+                    )
+
+                    
 
                 # 4) If blockwise is not applicable or fails, we keep the original BF16/FP16/FP32
                 #    weights for this module and do not attempt per-channel FP8 here. FP8
