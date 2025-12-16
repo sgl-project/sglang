@@ -215,8 +215,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
-    # For reasoning
-    reasoning: bool = False
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -244,6 +244,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: Optional[bool] = None
+    num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -700,8 +704,8 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
 
-    # For reasoning
-    reasoning: bool = False
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -723,6 +727,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: bool = False
+    num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
 
 
 @dataclass
