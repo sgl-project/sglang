@@ -18,6 +18,7 @@ from typing import Any, Callable, Sequence
 from urllib.request import urlopen
 
 import pytest
+import requests
 from openai import Client, OpenAI
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
@@ -683,10 +684,6 @@ def get_generate_fn(
             # Last image: convert to base64
             last_url = image_urls[-1]
             try:
-                import base64
-
-                import requests
-
                 response = requests.get(last_url, timeout=30)
                 response.raise_for_status()
 
@@ -699,7 +696,10 @@ def get_generate_fn(
             except Exception as e:
                 logger.error(f"Failed to convert last image to base64: {e}")
                 pytest.skip(f"{id}: failed to convert last image " f"to base64: {e}")
-
+        else:
+            pytest.skip(
+                f"Invalid image input: expected a file path, URL, or base64-encoded string, but the provided value is too short (less than 3)."
+            )
         # Open upload files
         upload_files = []
         try:
@@ -731,8 +731,6 @@ def get_generate_fn(
         validate_image(result.data[0].b64_json)
 
         # Save and upload result for verification
-        import base64
-
         img_data = base64.b64decode(result.data[0].b64_json)
         tmp_path = f"{rid}.png"
         with open(tmp_path, "wb") as f:

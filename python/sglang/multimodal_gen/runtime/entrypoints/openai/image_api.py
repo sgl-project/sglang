@@ -186,25 +186,21 @@ async def edits(
     # Save all input images; additional images beyond the first are saved for potential future use
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    if images is not None and not isinstance(images, list):
-        images = [images]
-    if urls is not None and not isinstance(urls, list):
-        urls = [urls]
-    if urls is not None:
-        if images is None:
-            images = urls
-        else:
-            images.extend(urls)
+    image_list = []
+    if images:
+        image_list.extend(images if isinstance(images, list) else [images])
+    if urls:
+        image_list.extend(urls if isinstance(urls, list) else [urls])
 
     input_paths = []
-    for idx, img in enumerate(images):
+    for idx, img in enumerate(image_list):
         try:
             input_path = await maybe_url_image(
                 img, os.path.join(uploads_dir, f"{request_id}_{idx}_image_{idx}")
             )
         except Exception as e:
             raise HTTPException(
-                status_code=400, detail=f"fail to deal image_urls: {str(e)}"
+                status_code=400, detail=f"Failed to process image source: {str(e)}"
             )
         if input_path is None:
             filename = img.filename or f"image_{idx}"

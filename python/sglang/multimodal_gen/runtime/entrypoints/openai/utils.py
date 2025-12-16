@@ -124,7 +124,7 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
             f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
         )
     data = match.group(3)
-    if data is None:
+    if not data:
         raise ValueError(
             f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
         )
