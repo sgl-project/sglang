@@ -131,6 +131,28 @@ impl GrpcClient {
             _ => panic!("Mismatched client and request types"),
         }
     }
+
+    /// Submit an embedding request
+    pub async fn embed(
+        &mut self,
+        req: crate::routers::grpc::proto_wrapper::ProtoEmbedRequest,
+    ) -> Result<
+        crate::routers::grpc::proto_wrapper::ProtoEmbedResponse,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        use crate::routers::grpc::proto_wrapper::{ProtoEmbedRequest, ProtoEmbedResponse};
+        match (self, req) {
+            (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
+                let resp = client.embed(*boxed_req).await?;
+                Ok(ProtoEmbedResponse::Sglang(resp))
+            }
+            (Self::Vllm(client), ProtoEmbedRequest::Vllm(boxed_req)) => {
+                let resp = client.embed(*boxed_req).await?;
+                Ok(ProtoEmbedResponse::Vllm(resp))
+            }
+            _ => panic!("Mismatched client and request types"),
+        }
+    }
 }
 
 /// Unified ModelInfo wrapper

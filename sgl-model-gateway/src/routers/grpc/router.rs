@@ -25,6 +25,7 @@ use crate::{
     core::WorkerRegistry,
     protocols::{
         chat::ChatCompletionRequest,
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
@@ -38,6 +39,7 @@ pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
     harmony_pipeline: RequestPipeline,
+    embedding_pipeline: RequestPipeline, // New field for embedding pipeline
     shared_components: Arc<SharedComponents>,
     responses_context: responses::ResponsesContext,
     harmony_responses_context: responses::ResponsesContext,
@@ -95,6 +97,13 @@ impl GrpcRouter {
             ctx.configured_reasoning_parser.clone(),
         );
 
+        // Create Embedding pipeline
+        let embedding_pipeline = RequestPipeline::new_embeddings(
+            worker_registry.clone(),
+            _policy_registry.clone(),
+            tokenizer.clone(),
+        );
+
         // Extract shared dependencies for responses contexts
         let mcp_manager = ctx
             .mcp_manager
@@ -123,6 +132,7 @@ impl GrpcRouter {
             worker_registry,
             pipeline,
             harmony_pipeline,
+            embedding_pipeline,
             shared_components,
             responses_context,
             harmony_responses_context,
@@ -236,6 +246,25 @@ impl GrpcRouter {
             .await
         }
     }
+
+    /// Main route_embeddings implementation
+    async fn route_embeddings_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!("Processing embedding request for model: {:?}", model_id);
+
+        self.embedding_pipeline
+            .execute_embeddings(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
+    }
 }
 
 impl std::fmt::Debug for GrpcRouter {
@@ -291,6 +320,15 @@ impl RouterTrait for GrpcRouter {
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
         cancel_response_impl(&self.responses_context, response_id).await
+    }
+
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_embeddings_impl(headers, body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {

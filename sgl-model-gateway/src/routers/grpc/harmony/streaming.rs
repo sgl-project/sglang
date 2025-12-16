@@ -172,6 +172,19 @@ impl HarmonyStreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
+            context::ExecutionResult::Embedding { .. } => {
+                error!("Harmony streaming not supported for embeddings");
+                let error_chunk = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "error": {
+                            "message": "Embeddings not supported in Harmony streaming",
+                            "type": "invalid_request_error"
+                        }
+                    })
+                );
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
+            }
         }
 
         // Return SSE response
@@ -640,6 +653,9 @@ impl HarmonyStreamingProcessor {
                     mcp_tool_names,
                 )
                 .await
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                Err("Embeddings not supported in Responses API streaming".to_string())
             }
         }
     }

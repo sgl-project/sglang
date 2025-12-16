@@ -180,6 +180,22 @@ impl VllmEngineClient {
         ))
     }
 
+    /// Submit an embedding request
+    pub async fn embed(
+        &self,
+        req: proto::EmbedRequest,
+    ) -> Result<proto::EmbedResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.client.clone();
+        let mut request = Request::new(req);
+
+        // Inject W3C trace context into gRPC metadata for distributed tracing
+        inject_trace_context_grpc(request.metadata_mut());
+
+        let response = client.embed(request).await?;
+
+        Ok(response.into_inner())
+    }
+
     /// Perform health check
     pub async fn health_check(
         &self,
