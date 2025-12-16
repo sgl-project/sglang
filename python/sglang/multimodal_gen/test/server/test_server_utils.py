@@ -704,7 +704,8 @@ def get_generate_fn(
         # Direct URL test - pass processed URLs to API
         response = client.images.with_raw_response.edit(
             model=model_path,
-            image=processed_urls,
+            image=[],
+            image_urls=processed_urls,
             prompt=sampling_params.prompt,
             n=1,
             size=sampling_params.output_size,
