@@ -185,7 +185,10 @@ impl BasicWorkerBuilder {
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            circuit_breaker: CircuitBreaker::with_config_and_label(
+                self.circuit_breaker_config,
+                self.url.clone(),
+            ),
             grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
         }
@@ -352,8 +355,8 @@ mod tests {
         let worker = BasicWorkerBuilder::new("http://localhost:8080").build();
 
         assert_eq!(worker.url(), "http://localhost:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
-        assert_eq!(worker.connection_mode(), ConnectionMode::Http);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert!(worker.is_healthy());
     }
 
@@ -364,8 +367,8 @@ mod tests {
             .build();
 
         assert_eq!(worker.url(), "http://localhost:8080");
-        assert_eq!(worker.worker_type(), WorkerType::Decode);
-        assert_eq!(worker.connection_mode(), ConnectionMode::Http);
+        assert_eq!(worker.worker_type(), &WorkerType::Decode);
+        assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert!(worker.is_healthy());
     }
 
@@ -403,13 +406,13 @@ mod tests {
         assert_eq!(worker.url(), "http://localhost:8080");
         assert_eq!(
             worker.worker_type(),
-            WorkerType::Prefill {
+            &WorkerType::Prefill {
                 bootstrap_port: None
             }
         );
         assert_eq!(
             worker.connection_mode(),
-            ConnectionMode::Grpc { port: Some(50051) }
+            &ConnectionMode::Grpc { port: Some(50051) }
         );
         assert_eq!(worker.metadata().labels, labels);
         assert_eq!(
@@ -459,7 +462,7 @@ mod tests {
         assert_eq!(worker.url(), "http://localhost:8080@2");
         assert_eq!(worker.dp_rank(), Some(2));
         assert_eq!(worker.dp_size(), Some(8));
-        assert_eq!(worker.worker_type(), WorkerType::Regular);
+        assert_eq!(worker.worker_type(), &WorkerType::Regular);
     }
 
     #[test]
@@ -522,10 +525,10 @@ mod tests {
         assert_eq!(worker.url(), "grpc://cluster.local@1");
         assert_eq!(worker.dp_rank(), Some(1));
         assert_eq!(worker.dp_size(), Some(4));
-        assert_eq!(worker.worker_type(), WorkerType::Decode);
+        assert_eq!(worker.worker_type(), &WorkerType::Decode);
         assert_eq!(
             worker.connection_mode(),
-            ConnectionMode::Grpc { port: Some(50051) }
+            &ConnectionMode::Grpc { port: Some(50051) }
         );
         assert_eq!(
             worker.metadata().labels.get("transport"),
