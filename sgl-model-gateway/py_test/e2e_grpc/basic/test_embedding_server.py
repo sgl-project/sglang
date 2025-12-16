@@ -7,7 +7,6 @@ Test the embedding functionality of the gRPC router.
 import sys
 import unittest
 from pathlib import Path
-import numpy as np
 
 import openai
 
@@ -57,7 +56,7 @@ class TestEmbeddingServer(CustomTestCase):
 
     def test_embedding(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        
+
         input_text = "Hello world"
         response = client.embeddings.create(
             model=self.model,
@@ -71,45 +70,40 @@ class TestEmbeddingServer(CustomTestCase):
         assert embedding.index == 0
         assert len(embedding.embedding) > 0
         assert isinstance(embedding.embedding[0], float)
-        
+
         # Verify usage statistics
         assert response.usage.prompt_tokens > 0
         assert response.usage.total_tokens == response.usage.prompt_tokens
 
     def test_embedding_batch(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        
+
         input_texts = ["Hello world", "SGLang is fast"]
         response = client.embeddings.create(
             model=self.model,
             input=input_texts,
         )
 
-        # Current implementation concatenates batch inputs into a single string
-        # See sgl-model-gateway/src/protocols/embedding.rs:extract_text_for_routing
         assert len(response.data) == 1
         assert response.data[0].index == 0
         assert len(response.data[0].embedding) > 0
 
     def test_embedding_dimensions(self):
-        # Qwen2-1.5B-instruct embedding dimension should be 1536
-        # But let's just check it's consistent
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        
+
         response1 = client.embeddings.create(
             model=self.model,
             input="A short text",
         )
         dim1 = len(response1.data[0].embedding)
-        
+
         response2 = client.embeddings.create(
             model=self.model,
             input="A much longer text to ensure dimensions match",
         )
         dim2 = len(response2.data[0].embedding)
-        
+
         assert dim1 == dim2
-        # print(f"Embedding dimension: {dim1}")
 
 
 if __name__ == "__main__":

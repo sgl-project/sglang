@@ -48,7 +48,7 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
             error::internal_error("preparation_missing", "Preparation output missing")
         })?;
 
-        // Extract client to use specific builder (SGLang vs vLLM)
+        // Extract client
         let client = ctx
             .state
             .clients
@@ -74,50 +74,21 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
         let original_text = prep_output.original_text.clone();
 
         // Use backend-specific builder to create ProtoEmbedRequest
-        let proto_request_result: Result<ProtoEmbedRequest, Response> = if client.is_sglang() {
-            let sglang_client = client.as_sglang();
-            let embedding_request = ctx.embedding_request();
+        // Currently only SGLang supports embedding via gRPC
+        let sglang_client = client.as_sglang();
+        let embedding_request = ctx.embedding_request();
 
-            let sglang_req = sglang_client.build_embed_request(
-                request_id.clone(),
-                original_text,
-                prep_output.token_ids.clone(),
-                embedding_request.log_metrics,
-            );
+        let sglang_req = sglang_client.build_embed_request(
+            request_id.clone(),
+            original_text,
+            prep_output.token_ids.clone(),
+            embedding_request.log_metrics,
+        );
 
-            Ok(ProtoEmbedRequest::Sglang(Box::new(sglang_req)))
-        } else {
-            let _vllm_client = client.as_vllm();
-            // Construct vLLM proto request manually
-            let vllm_req = crate::grpc_client::vllm_proto::EmbedRequest {
-                request_id: request_id.clone(),
-                tokenized: Some(crate::grpc_client::vllm_proto::TokenizedInput {
-                    original_text: original_text.unwrap_or_default(),
-                    input_ids: prep_output.token_ids.clone(),
-                }),
-            };
+        let proto_req = ProtoEmbedRequest::Sglang(Box::new(sglang_req));
 
-            Ok(ProtoEmbedRequest::Vllm(Box::new(vllm_req)))
-        };
-
-        match proto_request_result {
-            Ok(proto_req) => {
-                ctx.state.proto_request = Some(ProtoRequest::Embed(proto_req));
-
-                Ok(None)
-            }
-            Err(e) => {
-                error!(
-                    function = "EmbeddingRequestBuildingStage::execute",
-                    error = ?e,
-                    "Failed to build proto request"
-                );
-                Err(error::internal_error(
-                    "request_build_failed",
-                    format!("Failed to build proto request: {:?}", e),
-                ))
-            }
-        }
+        ctx.state.proto_request = Some(ProtoRequest::Embed(proto_req));
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {

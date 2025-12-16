@@ -414,50 +414,26 @@ impl ProtoStream {
 #[derive(Clone)]
 pub enum ProtoEmbedRequest {
     Sglang(Box<sglang::EmbedRequest>),
-    Vllm(Box<vllm::EmbedRequest>),
 }
 
 impl ProtoEmbedRequest {
-    /// Get SGLang variant (panics if vLLM)
+    /// Get SGLang variant
     pub fn as_sglang(&self) -> &sglang::EmbedRequest {
         match self {
             Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang EmbedRequest, got vLLM"),
         }
     }
 
-    /// Get mutable SGLang variant (panics if vLLM)
+    /// Get mutable SGLang variant
     pub fn as_sglang_mut(&mut self) -> &mut sglang::EmbedRequest {
         match self {
             Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang EmbedRequest, got vLLM"),
-        }
-    }
-
-    /// Get vLLM variant (panics if SGLang)
-    pub fn as_vllm(&self) -> &vllm::EmbedRequest {
-        match self {
-            Self::Vllm(req) => req,
-            Self::Sglang(_) => panic!("Expected vLLM EmbedRequest, got SGLang"),
-        }
-    }
-
-    /// Get mutable vLLM variant (panics if SGLang)
-    pub fn as_vllm_mut(&mut self) -> &mut vllm::EmbedRequest {
-        match self {
-            Self::Vllm(req) => req,
-            Self::Sglang(_) => panic!("Expected vLLM EmbedRequest, got SGLang"),
         }
     }
 
     /// Check if this is SGLang
     pub fn is_sglang(&self) -> bool {
         matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
     }
 
     /// Clone the inner request (for passing to embed())
@@ -469,7 +445,6 @@ impl ProtoEmbedRequest {
     pub fn request_id(&self) -> &str {
         match self {
             Self::Sglang(req) => &req.request_id,
-            Self::Vllm(req) => &req.request_id,
         }
     }
 }
@@ -477,7 +452,6 @@ impl ProtoEmbedRequest {
 /// Unified EmbedResponse
 pub enum ProtoEmbedResponse {
     Sglang(sglang::EmbedResponse),
-    Vllm(vllm::EmbedResponse),
 }
 
 impl ProtoEmbedResponse {
@@ -490,15 +464,6 @@ impl ProtoEmbedResponse {
                 }
                 Some(sglang::embed_response::Response::Error(error)) => {
                     ProtoEmbedResponseVariant::Error(ProtoEmbedError::Sglang(error))
-                }
-                None => ProtoEmbedResponseVariant::None,
-            },
-            Self::Vllm(resp) => match resp.response {
-                Some(vllm::embed_response::Response::Complete(complete)) => {
-                    ProtoEmbedResponseVariant::Complete(ProtoEmbedComplete::Vllm(complete))
-                }
-                Some(vllm::embed_response::Response::Error(error)) => {
-                    ProtoEmbedResponseVariant::Error(ProtoEmbedError::Vllm(error))
                 }
                 None => ProtoEmbedResponseVariant::None,
             },
@@ -517,7 +482,6 @@ pub enum ProtoEmbedResponseVariant {
 #[derive(Clone)]
 pub enum ProtoEmbedComplete {
     Sglang(sglang::EmbedComplete),
-    Vllm(vllm::EmbedComplete),
 }
 
 impl ProtoEmbedComplete {
@@ -525,7 +489,6 @@ impl ProtoEmbedComplete {
     pub fn embedding(&self) -> &[f32] {
         match self {
             Self::Sglang(c) => &c.embedding,
-            Self::Vllm(c) => &c.embedding,
         }
     }
 
@@ -533,16 +496,13 @@ impl ProtoEmbedComplete {
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
         }
     }
 
-    /// Get cached tokens (vLLM currently always 0 as field is missing in proto?)
-    /// Checking vllm_engine.proto... it doesn't have cached_tokens in EmbedComplete.
+    /// Get cached tokens
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(_) => 0,
         }
     }
 
@@ -550,7 +510,6 @@ impl ProtoEmbedComplete {
     pub fn embedding_dim(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.embedding_dim,
-            Self::Vllm(c) => c.embedding_dim,
         }
     }
 }
@@ -559,7 +518,6 @@ impl ProtoEmbedComplete {
 #[derive(Clone)]
 pub enum ProtoEmbedError {
     Sglang(sglang::EmbedError),
-    Vllm(vllm::EmbedError),
 }
 
 impl ProtoEmbedError {
@@ -567,7 +525,6 @@ impl ProtoEmbedError {
     pub fn message(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.message,
-            Self::Vllm(e) => &e.message,
         }
     }
 
@@ -575,7 +532,6 @@ impl ProtoEmbedError {
     pub fn code(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.code,
-            Self::Vllm(e) => &e.code,
         }
     }
 }

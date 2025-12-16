@@ -146,11 +146,7 @@ impl GrpcClient {
                 let resp = client.embed(*boxed_req).await?;
                 Ok(ProtoEmbedResponse::Sglang(resp))
             }
-            (Self::Vllm(client), ProtoEmbedRequest::Vllm(boxed_req)) => {
-                let resp = client.embed(*boxed_req).await?;
-                Ok(ProtoEmbedResponse::Vllm(resp))
-            }
-            _ => panic!("Mismatched client and request types"),
+            _ => panic!("Mismatched client and request types or unsupported embedding backend"),
         }
     }
 }
