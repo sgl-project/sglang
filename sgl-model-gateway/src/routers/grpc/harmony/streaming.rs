@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
-    observability::metrics::{smg_labels, SmgMetrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
@@ -315,11 +315,11 @@ impl HarmonyStreamingProcessor {
         grpc_stream.mark_completed();
 
         // Record streaming metrics
-        SmgMetrics::record_streaming_metrics(StreamingMetricsParams {
-            router_type: smg_labels::ROUTER_GRPC,
-            backend_type: smg_labels::BACKEND_HARMONY,
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,
-            endpoint: smg_labels::ENDPOINT_CHAT,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
             input_tokens: Some(total_prompt as u64),
@@ -474,11 +474,11 @@ impl HarmonyStreamingProcessor {
         }
 
         // Record streaming metrics
-        SmgMetrics::record_streaming_metrics(StreamingMetricsParams {
-            router_type: smg_labels::ROUTER_GRPC,
-            backend_type: smg_labels::BACKEND_HARMONY,
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,
-            endpoint: smg_labels::ENDPOINT_CHAT,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
             input_tokens: Some(total_prompt as u64),
