@@ -111,6 +111,8 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
 ]
 
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
+
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
@@ -431,6 +433,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
+    speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -747,8 +750,15 @@ class ServerArgs:
             # TODO: when extra_buffer is more verified, we can set the default path based on
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
+        # In speculative scenario:
+        # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
+        # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self.speculative_draft_model_quantization is None:
+            self.speculative_draft_model_quantization = self.quantization
+        elif self.speculative_draft_model_quantization == "unquant":
+            self.speculative_draft_model_quantization = None
 
-        # Handle ModelScope model downloads
+            # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             if not os.path.exists(self.model_path):
                 from modelscope import snapshot_download
@@ -3398,6 +3408,13 @@ class ServerArgs:
             choices=MOE_A2A_BACKEND_CHOICES,
             default=ServerArgs.speculative_moe_a2a_backend,
             help="Choose the backend for MoE A2A in speculative decoding",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-quantization",
+            type=str,
+            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+            default=ServerArgs.speculative_draft_model_quantization,
+            help="The quantization method for speculative model.",
         )
 
         # Speculative decoding (ngram)
