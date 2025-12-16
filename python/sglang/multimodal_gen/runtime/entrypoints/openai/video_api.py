@@ -82,6 +82,8 @@ def _build_sampling_params_from_request(
         sampling_kwargs["guidance_scale_2"] = request.guidance_scale_2
     if request.negative_prompt is not None:
         sampling_kwargs["negative_prompt"] = request.negative_prompt
+    if request.enable_teacache is not None:
+        sampling_kwargs["enable_teacache"] = request.enable_teacache
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
@@ -139,6 +141,12 @@ async def create_video(
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
+    seed: Optional[int] = Form(1024),
+    generator_device: Optional[str] = Form("cuda"),
+    negative_prompt: Optional[str] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    enable_teacache: Optional[bool] = Form(False),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -180,6 +188,12 @@ async def create_video(
             size=size,
             fps=fps_val,
             num_frames=num_frames_val,
+            seed=seed,
+            generator_device=generator_device,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            enable_teacache=enable_teacache,
         )
     else:
         try:
