@@ -1,3 +1,4 @@
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -5,7 +6,6 @@ import torch_npu
 
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
-    NPUMLAProlog,
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
@@ -275,11 +275,7 @@ def forward_dsa_prepare_npu(
     zero_allocator: "BumpAllocator",
 ):
     dynamic_scale = None
-    if is_mla_preprocess_enabled() and (
-        forward_batch.forward_mode.is_decode()
-        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-        or forward_batch.forward_mode.is_target_verify()
-    ):
+    if is_mla_preprocess_enabled():
         (
             q_pe,
             k_pe,
@@ -291,7 +287,11 @@ def forward_dsa_prepare_npu(
             positions,
             dynamic_scale,
         ) = npu_mla_preprocess(
-            hidden_states, positions, forward_batch, zero_allocator, m.alt_stream
+            m,
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
@@ -402,66 +402,33 @@ def forward_dsa_core_npu(
 
 
 def npu_mla_preprocess(
-    self, hidden_states, positions, forward_batch, zero_allocator, alt_stream
+    m: "DeepseekV2AttentionMLA",
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    zero_allocator: "BumpAllocator",
 ):
     dynamic_scale = None
-    if not self.is_mla_prolog_enabled:
-        if self.mla_preprocess is None:
-            self.mla_preprocess = NPUFusedMLAPreprocess(
-                self.fused_qkv_a_proj_with_mqa,
-                self.q_a_layernorm,
-                self.kv_a_layernorm,
-                self.q_b_proj,
-                self.w_kc,
-                self.rotary_emb,
-                self.layer_id,
-                self.num_local_heads,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-            )
-        mla_event = torch.npu.Event()
-        mla_event.record()
-        with torch.npu.stream(alt_stream):
-            torch.npu.current_stream().wait_event(mla_event)
-            (
-                q_pe,
-                k_pe,
-                q_nope_out,
-                k_nope,
-                forward_batch,
-                zero_allocator,
-                positions,
-            ) = self.mla_preprocess.forward(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
-            q_pe.record_stream(alt_stream)
-            k_pe.record_stream(alt_stream)
-            q_nope_out.record_stream(alt_stream)
-            k_nope.record_stream(alt_stream)
-            mlapo_event = alt_stream.record_event()
-
-        fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        q, _ = fused_qkv_a_proj_out.split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
-        )  # 1536 / 512+64
-        q_lora = self.q_a_layernorm(q)
-        torch.npu.current_stream().wait_event(mlapo_event)
-    else:
-        if self.mla_preprocess is None:
-            self.mla_preprocess = NPUMLAProlog(
-                self.fused_qkv_a_proj_with_mqa,
-                self.q_a_layernorm,
-                self.kv_a_layernorm,
-                self.q_b_proj,
-                self.w_kc,
-                self.rotary_emb,
-                self.layer_id,
-                self.num_local_heads,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.v_head_dim,
-            )
-        # mla_prolog_v3
+    if not hasattr(m, "mla_preprocess"):
+        m.mla_preprocess = NPUFusedMLAPreprocess(
+            m.fused_qkv_a_proj_with_mqa,
+            m.q_a_layernorm,
+            m.kv_a_layernorm,
+            m.q_b_proj,
+            m.w_kc,
+            m.rotary_emb,
+            m.layer_id,
+            m.num_local_heads,
+            m.qk_nope_head_dim,
+            m.qk_rope_head_dim,
+            m.v_head_dim,
+            m.quant_config,
+        )
+    # mlaprolog does not require additional calculation of q_lora
+    _is_mlaprolog = hasattr(m.quant_config, "ignore") and any(
+        re.fullmatch(r".*kv_b_proj", l) for l in m.quant_config.ignore
+    )
+    if _is_mlaprolog:
         (
             q_pe,
             k_pe,
@@ -471,7 +438,37 @@ def npu_mla_preprocess(
             forward_batch,
             positions,
             dynamic_scale,
-        ) = self.mla_preprocess.forward(positions, hidden_states, forward_batch)
+        ) = m.mla_preprocess.forward(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+    else:
+        mla_event = torch.npu.Event()
+        mla_event.record()
+        with torch.npu.stream(m.alt_stream):
+            torch.npu.current_stream().wait_event(mla_event)
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+            q_pe.record_stream(m.alt_stream)
+            k_pe.record_stream(m.alt_stream)
+            q_nope_out.record_stream(m.alt_stream)
+            k_nope.record_stream(m.alt_stream)
+            mlapo_event = m.alt_stream.record_event()
+
+        fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        q, _ = fused_qkv_a_proj_out.split(
+            [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+        )  # 1536 / 512+64
+        q_lora = m.q_a_layernorm(q)
+        torch.npu.current_stream().wait_event(mlapo_event)
     return (
         q_pe,
         k_pe,

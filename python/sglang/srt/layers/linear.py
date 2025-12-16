@@ -21,7 +21,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_prolog_enabled
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -197,19 +196,15 @@ class ReplicatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        q_lora_rank: Optional[int] = None,
     ):
         super().__init__(
             input_size,
             output_size,
-            bias,
             skip_bias_add,
             params_dtype,
             quant_config,
             prefix=prefix,
         )
-        if is_mla_prolog_enabled() and "fused_qkv_a_proj_with_mqa" in prefix:
-            self.q_lora_rank = q_lora_rank
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
@@ -260,11 +255,14 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(
-        self, x: torch.Tensor, dynamic_scale: torch.Tensor = None
+        self, x: torch.Tensor, **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias, dynamic_scale)
+        dynamic_scale = kwargs.get("dynamic_scale", None)
+        if dynamic_scale is not None:
+            x = x, dynamic_scale
+        output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 

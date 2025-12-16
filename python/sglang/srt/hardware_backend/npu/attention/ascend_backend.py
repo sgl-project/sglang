@@ -578,7 +578,7 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
-            # MLAPO and MLAPROLOG does saving kv_cache
+            # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
         if topk_indices is not None:
             return self.forward_sparse(
