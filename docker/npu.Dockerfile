@@ -71,9 +71,14 @@ RUN (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION
 RUN (${PIP_INSTALL} pybind11) \
     && (${PIP_INSTALL} ${TRITON_ASCEND_URL})
 
+RUN git clone https://github.com/feifeibear/long-context-attention.git long-context-attention \
+    && cd long-context-attention \
+    && git checkout 7a52abd669efb35e550680a239e1745b620b2bae \
+    && pip install -e .
+
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && ${PIP_INSTALL} -v .[srt_npu]) && \
+    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && ${PIP_INSTALL} -v .[srt_npu, diffusion]) && \
     rm -rf sglang
 
 # Install Deep-ep
