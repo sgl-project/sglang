@@ -49,6 +49,8 @@ from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
+import torch.nn.functional as F  # wili
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,18 +108,33 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             bias=True,
         )
 
+        # wili, Conv3dToGemm
+        self.k = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+        # self.ww = self.proj.weight.view(self.embed_dim, self.k).transpose(1,0)  # wili, do not use this since it will generate 2 kernels
+        self.linear = nn.Linear(in_features=self.k, out_features=self.embed_dim, bias=True, dtype=self.proj.weight.dtype)
+        self.is_first_call = True
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
-        )
+        if False:  # wili, disable original Conv3d
+            target_dtype = self.proj.weight.dtype
+            hidden_states = hidden_states.view(
+                -1,
+                self.in_channels,
+                self.temporal_patch_size,
+                self.patch_size,
+                self.patch_size,
+            )
+            hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
+                -1, self.embed_dim
+            )
+        else:
+            # hidden_states = hidden_states @ self.ww + self.proj.bias  # wili
+            if self.is_first_call:  # wili, steal weight from Conv3d during warming up
+                with torch.no_grad():
+                    self.linear.weight.copy_(self.proj.weight.view(self.embed_dim, self.k))
+                    self.linear.bias.copy_(self.proj.bias)
+                    self.is_first_call = False
+            hidden_states = self.linear(hidden_states)
         return hidden_states
 
 
@@ -329,6 +346,47 @@ class Qwen3VLMoeVisionModel(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
+    def rot_pos_emb_v2(self, grid_thw):  # wili
+        """
+        grid_thw: LongTensor on CPU / GPU, shape [N, 3], value (t,h,w) per row
+        return  : bfloat16 tensor on GPU, shape [Σ(t*h*w), 2 * 18]
+        """
+        device = grid_thw.device
+        m = self.spatial_merge_size
+        N = grid_thw.shape[0]
+        t, h, w = grid_thw.unbind(1)
+        hw = h * w
+        thw = t * hw
+        num_elements = thw.sum().item()
+
+        cumsum_no_t = torch.cat([torch.zeros(1, dtype=torch.long, device=device), hw.cumsum(0)])
+        cumsum = torch.cat([torch.zeros(1, dtype=torch.long, device=device), thw.cumsum(0)])
+
+        pos_ids = torch.empty((num_elements, 2), dtype=torch.long, device=device)
+
+        max_h, max_w = h.max().item(), w.max().item()
+        ar_h = torch.arange(max_h, device=device).view(-1, 1)
+        ar_w = torch.arange(max_w, device=device).view(1, -1)
+
+        hpos_full = ar_h.expand(max_h, max_w).reshape(max_h // m, m, max_w // m, m).permute(0, 2, 1, 3).reshape(-1)
+        wpos_full = ar_w.expand(max_h, max_w).reshape(max_h // m, m, max_w // m, m).permute(0, 2, 1, 3).reshape(-1)
+
+        sample_hpos = hpos_full[None, :max_h * max_w].expand(N, -1)
+        sample_wpos = wpos_full[None, :max_h * max_w].expand(N, -1)
+
+        mask = torch.arange(max_h * max_w, device=device).unsqueeze(0) < hw.unsqueeze(1)
+        sample_hpos = sample_hpos[mask]
+        sample_wpos = sample_wpos[mask]
+
+        for st, ed, st_no_t, ed_no_t, tt in zip(cumsum[:-1], cumsum[1:], cumsum_no_t[:-1], cumsum_no_t[1:], t):
+            pos_ids[st:ed, 0] = sample_hpos[st_no_t:ed_no_t].repeat(tt)
+            pos_ids[st:ed, 1] = sample_wpos[st_no_t:ed_no_t].repeat(tt)
+
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        return rotary_pos_emb
+    
     def fast_pos_embed_interpolate(self, grid_thw):
         num_grid_per_side = int(self.num_position_embeddings**0.5)
 
@@ -414,17 +472,76 @@ class Qwen3VLMoeVisionModel(nn.Module):
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
 
+    def fast_pos_embed_interpolate_v2(self, grid_thw: torch.Tensor):
+        """
+        grid_thw: LongTensor on CPU / GPU, shape [N, 3], value (t,h,w) per row
+        return  : bfloat16 tensor on GPU, shape [Σ(t*h*w), self.pos_embed.embedding_dim]
+        """
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+        grid_thw = grid_thw.to(device, non_blocking=True)
+        num_grid = int(self.num_position_embeddings ** 0.5)
+        m_size = self.spatial_merge_size
+        embedding_dim = self.pos_embed.embedding_dim
+
+        num_patch_per_clip = grid_thw.prod(dim=1)  # [t_i * h_i * w_i for i in range len(grid_thw)]
+        num_patch_quad = num_patch_per_clip * 4  # 4 indice / weights per patch
+        num_elements = int(num_patch_per_clip.sum())  # number of total patches, on CPU
+
+        offset = torch.cat([torch.tensor([0], dtype=torch.long, device=device), num_patch_per_clip.cumsum(0)])
+        offset_quad = offset * 4
+
+        idx_all = torch.empty(num_patch_quad.sum(), dtype=torch.long, device=device)
+        wgt_all = torch.empty(num_patch_quad.sum(), dtype=dtype, device=device)
+
+        for st, ed, (t, h, w) in zip(offset_quad[:-1], offset_quad[1:], grid_thw):
+            h_idx = torch.linspace(0, num_grid - 1, h, device=device)
+            w_idx = torch.linspace(0, num_grid - 1, w, device=device)
+
+            h_floor = h_idx.floor().long()
+            w_floor = w_idx.floor().long()
+            h_ceil = (h_floor + 1).clamp_max(num_grid - 1)
+            w_ceil = (w_floor + 1).clamp_max(num_grid - 1)
+
+            hf, wf = torch.meshgrid(h_floor, w_floor, indexing='ij')
+            hc, wf = torch.meshgrid(h_ceil, w_floor, indexing='ij')
+            hf, wc = torch.meshgrid(h_floor, w_ceil, indexing='ij')
+            hc, wc = torch.meshgrid(h_ceil, w_ceil, indexing='ij')
+            idx4 = torch.stack([hf * num_grid + wf, hf * num_grid + wc, hc * num_grid + wf, hc * num_grid + wc], dim=-1)
+
+            dh = (h_idx - h_floor.float()).view(-1, 1)
+            dw = (w_idx - w_floor.float()).view(1, -1)
+            w4 = torch.stack([(1 - dh) * (1 - dw), (1 - dh) * dw, dh * (1 - dw), dh * dw], dim=-1)
+
+            idx_all[st:ed] = idx4.flatten().repeat_interleave(t)
+            wgt_all[st:ed] = w4.flatten().repeat_interleave(t)
+
+        patch_pos_embed = self.pos_embed(idx_all) * wgt_all.unsqueeze(1)
+        patch_pos_embed = patch_pos_embed.view(-1, 4, embedding_dim).sum(dim=1)
+
+        out = torch.empty([num_elements, embedding_dim], dtype=dtype, device=device)
+        for st, ed, (t, h, w) in zip(offset[:-1], offset[1:], grid_thw):
+            emb = patch_pos_embed[st:ed]
+            emb = emb.view(t, h // m_size, m_size, w // m_size, m_size, embedding_dim)
+            emb = emb.permute(0, 1, 3, 2, 4, 5).contiguous().flatten(0, 4)
+            out[st:ed] = emb
+
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
         x = x.to(device=self.device, dtype=self.dtype)
+        grid_thw = grid_thw.to(device=self.device)  # wili
         x = self.patch_embed(x)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        # pos_embeds = self.fast_pos_embed_interpolate(grid_thw)  # wili
+        pos_embeds = self.fast_pos_embed_interpolate_v2(grid_thw)  # wili
         x += pos_embeds
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # rotary_pos_emb = self.rot_pos_emb_v2(grid_thw)  # wili, do not use this since sometimes it is worse than the original one
 
         seq_len, _ = x.size()
         rotary_pos_emb = rotary_pos_emb.to(x.device)

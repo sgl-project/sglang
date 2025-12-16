@@ -94,6 +94,10 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
+from torchvision.io import decode_jpeg  # wili
+import cupy as cp  # wili
+from nvidia import nvimgcodec  # wili
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -885,8 +889,16 @@ def load_image(
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image_metadata, image_file = image_file.split(",")  # wili
+        if ("jpg" in image_metadata) or ("jpeg" in image_metadata):  # wili, specified for jpeg base64
+            image_bytes = pybase64.b64decode(image_file, validate=True)
+            #image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            #image = decode_jpeg(image, device="cuda")
+            code_stream = nvimgcodec.CodeStream(image_bytes)
+            img_cupy = nvimgcodec.Decoder().decode(code_stream)
+            image = torch.from_dlpack(img_cupy.to_dlpack()).clone()
+        else:
+            image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
