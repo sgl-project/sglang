@@ -296,6 +296,9 @@ class Scheduler(
         # Init diffusion LLM config
         self.dllm_config = DllmConfig.from_server_args(server_args)
 
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
+
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
 
@@ -429,9 +432,6 @@ class Scheduler(
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
-
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         # Init cache using the existing memory pool
         self.init_cache_with_memory_pool()
@@ -689,7 +689,7 @@ class Scheduler(
             self.send_to_tokenizer = SenderWrapper(None)
             self.send_to_detokenizer = SenderWrapper(None)
 
-        if self.current_scheduler_metrics_enabled():
+        if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
@@ -1786,6 +1786,7 @@ class Scheduler(
         ):
             # Decrease prefill idle as much as possible during high dp load.
             return None
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1886,9 +1887,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if not self.try_preemption:
-                    break
-                if not adder.preempt_to_schedule(req, self.server_args):
+                if not self.try_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
+                ):
                     break
 
             if self.enable_hicache_storage:
@@ -1932,6 +1933,7 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
+        # Update chunked prefill
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
@@ -1940,12 +1942,12 @@ class Scheduler(
             self.chunked_req.is_chunked += 1
 
         # Print stats
-        if self.current_scheduler_metrics_enabled():
+        if self.current_scheduler_metrics_enabled:
             self.log_prefill_stats(adder, can_run_list, running_bs, 0)
 
+        # Record metrics
         for req in can_run_list:
             if req.time_stats.forward_entry_time == 0:
-                # Avoid update chunked request many times
                 req.time_stats.forward_entry_time = time.perf_counter()
                 if self.enable_metrics:
                     self.metrics_collector.observe_queue_time(

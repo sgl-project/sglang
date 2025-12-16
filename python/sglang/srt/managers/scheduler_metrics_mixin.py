@@ -39,6 +39,7 @@ class SchedulerMetricsMixin:
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
+        # Basic stats
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
@@ -61,6 +62,11 @@ class SchedulerMetricsMixin:
         self.kv_transfer_alloc_ms: float = 0.0
 
         self.stats = SchedulerStats()
+
+        # Metrics
+        self.current_scheduler_metrics_enabled = (
+            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
 
         if self.enable_metrics:
             engine_type = "unified"
@@ -436,6 +442,3 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
-
-    def current_scheduler_metrics_enabled(self):
-        return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
