@@ -59,7 +59,7 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
-# Normalise / collapse architectures we don’t yet build specifically for
+# Normalise / collapse architectures we don't yet build specifically for
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
@@ -140,13 +140,163 @@ IMAGE=$(find_latest_image "${GPU_ARCH}")
 echo "Pulling Docker image: ${IMAGE}"
 docker pull "${IMAGE}"
 
+# Check for NFS cache directory on host
 CACHE_HOST=/home/runner/sgl-data
+echo "=== Shared Storage Detection ==="
+echo "Checking for shared storage: $CACHE_HOST"
+
 if [[ -d "$CACHE_HOST" ]]; then
+    # Check if it's a mountpoint (separate filesystem, not local)
+    if mountpoint -q "$CACHE_HOST" 2>/dev/null; then
+        echo "✓ $CACHE_HOST is a mountpoint (shared storage)"
+        IS_SHARED_STORAGE="1"
+    else
+        # Check if it's on a different device than root
+        root_dev=$(df / | tail -1 | awk '{print $1}')
+        cache_dev=$(df "$CACHE_HOST" | tail -1 | awk '{print $1}')
+        if [[ "$root_dev" != "$cache_dev" ]]; then
+            echo "✓ $CACHE_HOST is on different device than root (shared storage)"
+            IS_SHARED_STORAGE="1"
+        else
+            echo "⚠ $CACHE_HOST is on same device as root (local storage)"
+            IS_SHARED_STORAGE="0"
+        fi
+    fi
+    
+    echo ""
+    echo "=== Storage Info ==="
+    df -h "$CACHE_HOST"
+    ls -la "$CACHE_HOST" 2>/dev/null | head -5 || true
+    
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+    HAS_NFS_CACHE="1"
 else
+    echo "✗ Shared storage NOT found: $CACHE_HOST"
+    echo "Available directories in /home/runner:"
+    ls -la /home/runner 2>/dev/null || echo "Cannot list /home/runner"
     CACHE_VOLUME=""
+    HAS_NFS_CACHE="0"
+    IS_SHARED_STORAGE="0"
+fi
+echo "==============================="
+
+# Measure NFS bandwidth using a safetensor file read test
+# If bandwidth > 10GB/s, use NFS for HF cache; otherwise use local storage
+# This handles NFS performance "cliff" where busy NFS is slower than direct download
+measure_nfs_bandwidth() {
+    local test_dir="${CACHE_HOST}/hf-cache/hub"
+    local safetensor_file=""
+
+    echo "Looking for safetensor test file in: $test_dir"
+
+    # Find a safetensor file to test bandwidth (look for any .safetensors file)
+    if [[ -d "$test_dir" ]]; then
+        safetensor_file=$(find "$test_dir" -name "*.safetensors" -type f -size +10M 2>/dev/null | head -1)
+        if [[ -n "$safetensor_file" ]]; then
+            echo "Found test file: $safetensor_file"
+        else
+            echo "No suitable .safetensors files found (need >10MB)"
+            # List what's in the cache for debugging
+            echo "HF cache contents:"
+            ls -la "$test_dir" 2>/dev/null | head -5 || echo "  (empty or not accessible)"
+        fi
+    else
+        echo "HF cache directory does not exist yet: $test_dir"
+    fi
+
+    if [[ -z "$safetensor_file" ]]; then
+        echo "No safetensor file for bandwidth test - defaulting to NFS"
+        echo "10.1"  # Default to "good" bandwidth if no test file exists
+        return
+    fi
+
+    # Get file size in bytes
+    local file_size=$(stat -c %s "$safetensor_file" 2>/dev/null || echo "0")
+    local file_size_mb=$((file_size / 1048576))
+    echo "Test file size: ${file_size_mb} MB"
+
+    if [[ "$file_size" -lt 1048576 ]]; then  # Less than 1MB
+        echo "Test file too small (<1MB) - defaulting to NFS"
+        echo "10.1"
+        return
+    fi
+
+    # Clear page cache to get real disk/NFS read speed (requires root)
+    echo "Clearing page cache for accurate measurement..."
+    sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo "  (skipped - not root)"
+
+    # Time how long it takes to read the file
+    echo "Reading file to measure bandwidth..."
+    local start_time=$(date +%s.%N)
+    dd if="$safetensor_file" of=/dev/null bs=4M 2>/dev/null
+    local end_time=$(date +%s.%N)
+
+    # Calculate bandwidth in GB/s
+    local elapsed=$(echo "$end_time - $start_time" | bc)
+    echo "Read time: ${elapsed} seconds"
+
+    if [[ $(echo "$elapsed > 0" | bc) -eq 1 ]]; then
+        local bandwidth=$(echo "scale=2; $file_size / $elapsed / 1073741824" | bc)
+        echo "Calculated bandwidth: ${bandwidth} GB/s"
+        echo "$bandwidth"
+    else
+        echo "Timing error - defaulting to NFS"
+        echo "10.1"  # Default if timing failed
+    fi
+}
+
+# Check NFS bandwidth and decide HF cache strategy
+USE_NFS_HF_CACHE="0"  # Default to local if no NFS available
+if [[ "$HAS_NFS_CACHE" == "1" ]]; then
+    echo ""
+    echo "=== NFS Bandwidth Test ==="
+    NFS_BANDWIDTH=$(measure_nfs_bandwidth)
+    echo ""
+    echo "Result: NFS bandwidth = ${NFS_BANDWIDTH} GB/s (threshold: 10 GB/s)"
+
+    if (( $(echo "$NFS_BANDWIDTH < 10" | bc -l) )); then
+        echo "DECISION: Bandwidth BELOW threshold"
+        echo "ACTION: Using LOCAL storage (/tmp/hf-cache) for HF cache"
+        USE_NFS_HF_CACHE="0"
+    else
+        echo "DECISION: Bandwidth ABOVE threshold"
+        echo "ACTION: Using NFS (/sgl-data/hf-cache) for HF cache"
+        USE_NFS_HF_CACHE="1"
+    fi
+    echo "=========================="
+else
+    echo ""
+    echo "=== NFS Not Available ==="
+    echo "No NFS cache directory - using local storage for all caches"
+    echo "=========================="
 fi
 
+# AITER and MIOpen caches should ALWAYS use NFS if available
+# These are kernel caches that are expensive to rebuild and benefit from persistence
+if [[ "$HAS_NFS_CACHE" == "1" ]]; then
+    AITER_CACHE_DIR="/sgl-data/aiter-kernels"
+    MIOPEN_CACHE_DIR="/sgl-data/miopen-cache"
+else
+    AITER_CACHE_DIR="/tmp/aiter-kernels"
+    MIOPEN_CACHE_DIR="/tmp/miopen-cache"
+fi
+
+# HF cache location depends on bandwidth check
+if [[ "$USE_NFS_HF_CACHE" == "1" ]]; then
+    HF_CACHE_DIR="/sgl-data/hf-cache"
+else
+    HF_CACHE_DIR="/tmp/hf-cache"
+fi
+
+echo ""
+echo "=== Final Cache Configuration ==="
+echo "  AITER cache:  ${AITER_CACHE_DIR}"
+echo "  MIOpen cache: ${MIOPEN_CACHE_DIR}"
+echo "  HF cache:     ${HF_CACHE_DIR}"
+echo "  NFS HF cache: ${USE_NFS_HF_CACHE} (1=NFS, 0=local)"
+echo "================================="
+
+echo ""
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
@@ -155,8 +305,15 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
-  -e HF_HOME=/sgl-data/hf-cache \
+  -e HF_HOME="${HF_CACHE_DIR}" \
+  -e AITER_JIT_DIR="${AITER_CACHE_DIR}" \
+  -e MIOPEN_USER_DB_PATH="${MIOPEN_CACHE_DIR}" \
+  -e MIOPEN_CUSTOM_CACHE_DIR="${MIOPEN_CACHE_DIR}" \
+  -e SGLANG_NFS_HF_CACHE="${USE_NFS_HF_CACHE}" \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+echo ""
+echo "Container started successfully"

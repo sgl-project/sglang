@@ -24,6 +24,11 @@ from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.amd_ci_utils import (
+    cleanup_hf_cache_if_not_persistent,
+    cleanup_rocm_gpu_memory,
+    wait_for_rocm_gpu_memory_clear,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     PerformanceSummary,
@@ -97,6 +102,11 @@ class ServerContext:
         except Exception:
             pass
 
+        # ROCm/AMD: Extra cleanup to ensure GPU memory is released between tests
+        cleanup_rocm_gpu_memory(self.process)
+        # Clean up downloaded models if HF cache is not persistent
+        cleanup_hf_cache_if_not_persistent()
+
 
 class ServerManager:
     """Manages diffusion server lifecycle."""
@@ -115,6 +125,9 @@ class ServerManager:
 
     def start(self) -> ServerContext:
         """Start the diffusion server and wait for readiness."""
+        # ROCm/AMD: Wait for GPU memory to be clear before starting
+        wait_for_rocm_gpu_memory_clear()
+
         log_dir, perf_log_path = prepare_perf_log()
 
         safe_model_name = self.model.replace("/", "_")
