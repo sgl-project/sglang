@@ -237,9 +237,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if not has_tool_call and not potentially_dsml and not ends_with_prefix:
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                if e_token in current_text:
+                    current_text = current_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=current_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
