@@ -167,21 +167,21 @@ inline __device__ void apply_token_rotary_embedding<float, true>(
 }
 
 // 2D grid kernel: parallel over tokens (grid.x) and pair-tiles (grid.y)
-template <typename scalar_t, bool interleaved, bool vectorized>
+template <typename scalar_t, bool interleaved, bool vectorized, int ROT_EMBED_DIM>
 __global__ void rotary_embedding_kernel_2d(
     const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim_arg]
     const scalar_t* __restrict__ sin_data,  // [num_tokens, rot_dim_arg]
     scalar_t* __restrict__ query_total,
     scalar_t* __restrict__ key_total,
     const int rot_dim_arg,
-    const int embed_dim_for_rotation,
+    const int embed_dim_for_rotation_arg,
     const int64_t query_token_stride,
     const int64_t key_token_stride,
     const int64_t head_stride_query,
     const int64_t head_stride_key,
     const int num_heads,
     const int num_kv_heads,
-    const int head_size,
+    const int head_size_arg,
     const int blocks_per_token) {
   extern __shared__ char smem_[];
   scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
@@ -226,6 +226,9 @@ __global__ void rotary_embedding_kernel_2d(
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
 
   const int local_block_idx = blockIdx.y;
+
+  // Use compile-time constant if ROT_EMBED_DIM > 0, otherwise fallback to runtime argument
+  const int embed_dim_for_rotation = (ROT_EMBED_DIM > 0) ? ROT_EMBED_DIM : embed_dim_for_rotation_arg;
 
   if constexpr (vectorized) {
     using vec_t = float4;
@@ -286,21 +289,21 @@ __global__ void rotary_embedding_kernel_2d(
 }
 
 // 1D grid kernel: each block handles one token
-template <typename scalar_t, bool interleaved, bool vectorized>
+template <typename scalar_t, bool interleaved, bool vectorized, int ROT_EMBED_DIM>
 __global__ void rotary_embedding_kernel_1d(
     const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim_arg]
     const scalar_t* __restrict__ sin_data,  // [num_tokens, rot_dim_arg]
     scalar_t* __restrict__ query_total,
     scalar_t* __restrict__ key_total,
     const int rot_dim_arg,
-    const int embed_dim_for_rotation,
+    const int embed_dim_for_rotation_arg,
     const int64_t query_token_stride,
     const int64_t key_token_stride,
     const int64_t head_stride_query,
     const int64_t head_stride_key,
     const int num_heads,
     const int num_kv_heads,
-    const int head_size) {
+    const int head_size_arg) {
   extern __shared__ char smem_[];
   scalar_t* s_cos = reinterpret_cast<scalar_t*>(smem_);
   scalar_t* s_sin = s_cos + rot_dim_arg;
@@ -336,6 +339,9 @@ __global__ void rotary_embedding_kernel_1d(
 
   scalar_t* query_for_token = query_total + token_idx * (int)query_token_stride;
   scalar_t* key_for_token = (key_total != nullptr) ? (key_total + token_idx * (int)key_token_stride) : nullptr;
+
+  // Use compile-time constant if ROT_EMBED_DIM > 0, otherwise fallback to runtime argument
+  const int embed_dim_for_rotation = (ROT_EMBED_DIM > 0) ? ROT_EMBED_DIM : embed_dim_for_rotation_arg;
 
   if constexpr (vectorized) {
     using vec_t = float4;
@@ -388,6 +394,25 @@ __global__ void rotary_embedding_kernel_1d(
     }
   }
 }
+
+// Define dispatch macro for Rotation Dimension (Pair Count)
+// Note: This is usually HEAD_SIZE / 2 for LLaMA-like models.
+// Case 32 -> head_size 64
+// Case 64 -> head_size 128
+// Case 128 -> head_size 256
+#define DISPATCH_ROT_DIM(embed_dim, ...) \
+    switch (embed_dim) { \
+        case 16: { constexpr int ROT_EMBED_DIM = 16; __VA_ARGS__; break; } \
+        case 32: { constexpr int ROT_EMBED_DIM = 32; __VA_ARGS__; break; } \
+        case 64: { constexpr int ROT_EMBED_DIM = 64; __VA_ARGS__; break; } \
+        case 96: { constexpr int ROT_EMBED_DIM = 96; __VA_ARGS__; break; } \
+        case 128: { constexpr int ROT_EMBED_DIM = 128; __VA_ARGS__; break; } \
+        case 256: { constexpr int ROT_EMBED_DIM = 256; __VA_ARGS__; break; } \
+        case 512: { constexpr int ROT_EMBED_DIM = 512; __VA_ARGS__; break; } \
+        case 1024: { constexpr int ROT_EMBED_DIM = 1024; __VA_ARGS__; break; } \
+        default: { constexpr int ROT_EMBED_DIM = 0; __VA_ARGS__; break; } \
+    }
+
 
 void rotary_embedding_cos_sin(
     at::Tensor& cos,
@@ -563,152 +588,154 @@ void rotary_embedding_cos_sin(
         // We need 2 arrays (cos, sin) of size 'rot_dim_from_cache', each element is 'sizeof(torch_scalar_t)'
         size_t smem_size = rot_dim_from_cache * sizeof(torch_scalar_t) * 2;
 
-        auto launch_kernel = [&](bool vectorized) {
-          if (interleaved) {
-            if (use_grid_2d) {
-              if (vectorized) {
-                rotary_embedding_kernel_2d<cuda_scalar_t, true, true><<<grid_2d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size,
-                    blocks_per_token);
+        DISPATCH_ROT_DIM(embed_dim_for_rotation,
+          auto launch_kernel = [&](bool vectorized) {
+            if (interleaved) {
+              if (use_grid_2d) {
+                if (vectorized) {
+                  rotary_embedding_kernel_2d<cuda_scalar_t, true, true, ROT_EMBED_DIM><<<grid_2d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size,
+                      blocks_per_token);
+                } else {
+                  rotary_embedding_kernel_2d<cuda_scalar_t, true, false, ROT_EMBED_DIM><<<grid_2d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size,
+                      blocks_per_token);
+                }
               } else {
-                rotary_embedding_kernel_2d<cuda_scalar_t, true, false><<<grid_2d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size,
-                    blocks_per_token);
+                if (vectorized) {
+                  rotary_embedding_kernel_1d<cuda_scalar_t, true, true, ROT_EMBED_DIM><<<grid_1d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size);
+                } else {
+                  rotary_embedding_kernel_1d<cuda_scalar_t, true, false, ROT_EMBED_DIM><<<grid_1d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size);
+                }
               }
-            } else {
-              if (vectorized) {
-                rotary_embedding_kernel_1d<cuda_scalar_t, true, true><<<grid_1d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size);
+            } else {  // non-interleaved
+              if (use_grid_2d) {
+                if (vectorized) {
+                  rotary_embedding_kernel_2d<cuda_scalar_t, false, true, ROT_EMBED_DIM><<<grid_2d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size,
+                      blocks_per_token);
+                } else {
+                  rotary_embedding_kernel_2d<cuda_scalar_t, false, false, ROT_EMBED_DIM><<<grid_2d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size,
+                      blocks_per_token);
+                }
               } else {
-                rotary_embedding_kernel_1d<cuda_scalar_t, true, false><<<grid_1d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size);
+                if (vectorized) {
+                  rotary_embedding_kernel_1d<cuda_scalar_t, false, true, ROT_EMBED_DIM><<<grid_1d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size);
+                } else {
+                  rotary_embedding_kernel_1d<cuda_scalar_t, false, false, ROT_EMBED_DIM><<<grid_1d, block, smem_size, stream>>>(
+                      reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
+                      reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
+                      key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
+                      rot_dim_from_cache,
+                      embed_dim_for_rotation,
+                      query_token_stride,
+                      key_token_stride,
+                      head_stride_query,
+                      head_stride_key,
+                      num_heads,
+                      num_kv_heads,
+                      (int)head_size);
+                }
               }
             }
-          } else {  // non-interleaved
-            if (use_grid_2d) {
-              if (vectorized) {
-                rotary_embedding_kernel_2d<cuda_scalar_t, false, true><<<grid_2d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size,
-                    blocks_per_token);
-              } else {
-                rotary_embedding_kernel_2d<cuda_scalar_t, false, false><<<grid_2d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size,
-                    blocks_per_token);
-              }
-            } else {
-              if (vectorized) {
-                rotary_embedding_kernel_1d<cuda_scalar_t, false, true><<<grid_1d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size);
-              } else {
-                rotary_embedding_kernel_1d<cuda_scalar_t, false, false><<<grid_1d, block, smem_size, stream>>>(
-                    reinterpret_cast<const cuda_scalar_t*>(cos.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<const cuda_scalar_t*>(sin.data_ptr<torch_scalar_t>()),
-                    reinterpret_cast<cuda_scalar_t*>(query.data_ptr<torch_scalar_t>()),
-                    key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<torch_scalar_t>()) : nullptr,
-                    rot_dim_from_cache,
-                    embed_dim_for_rotation,
-                    query_token_stride,
-                    key_token_stride,
-                    head_stride_query,
-                    head_stride_key,
-                    num_heads,
-                    num_kv_heads,
-                    (int)head_size);
-              }
-            }
-          }
-        };
+          };
 
-        // Close the log file after all launches
-        if (can_vectorize_all) {
-          launch_kernel(true);
-        } else {
-          launch_kernel(false);
-        }
+          // Close the log file after all launches
+          if (can_vectorize_all) {
+            launch_kernel(true);
+          } else {
+            launch_kernel(false);
+          }
+        );
       });
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
