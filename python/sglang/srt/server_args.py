@@ -336,6 +336,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    enable_confidential_compute_optimize: bool = False
     custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
@@ -2897,6 +2898,12 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
+        )
+        parser.add_argument(
+            "--enable-cc-optimize",
+            action="store_true",
+            dest="enable_confidential_compute_optimize",
+            help="Enable confidential compute optimization. Uses blocking D2H copy in worker thread for enhanced performance in confidential computing environments.",
         )
         parser.add_argument(
             "--custom-sigquit-handler",

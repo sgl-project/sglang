@@ -70,7 +70,11 @@ class SchedulerOutputProcessorMixin:
         skip_stream_req = None
 
         if self.is_generation:
-            if result.copy_done is not None:
+            # Handle synchronization for overlap scheduling
+            if result.use_confidential_compute:
+                # Confidential compute mode: resolve Future objects from worker thread
+                result.resolve_confidential_futures()
+            elif result.copy_done is not None:
                 result.copy_done.synchronize()
 
             (
@@ -288,7 +292,10 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
+        # Handle synchronization for overlap scheduling
+        if result.use_confidential_compute:
+            result.resolve_confidential_futures()
+        elif result.copy_done is not None:
             result.copy_done.synchronize()
 
         next_token_ids = result.next_token_ids.tolist()
@@ -318,7 +325,10 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
+        # Handle synchronization for overlap scheduling
+        if result.use_confidential_compute:
+            result.resolve_confidential_futures()
+        elif result.copy_done is not None:
             result.copy_done.synchronize()
 
         logits_output, next_token_ids, can_run_cuda_graph = (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -44,6 +45,14 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # For confidential compute mode - stores Future objects for async D2H copy
+    use_confidential_compute: bool = False
+    next_token_ids_future: Optional[Future] = None
+    next_token_logprobs_future: Optional[Future] = None
+    input_token_logprobs_future: Optional[Future] = None
+    hidden_states_future: Optional[Future] = None
+    accept_lens_future: Optional[Future] = None
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
@@ -68,6 +77,86 @@ class GenerationBatchResult:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
+
+    def copy_to_cpu_confidential(
+        self,
+        host_copy_executor: ThreadPoolExecutor,
+        return_logprob: bool,
+    ):
+        """Copy tensors to CPU using worker thread for confidential compute mode.
+
+        In confidential compute environments, blocking D2H copies in a worker thread
+        can provide better performance by avoiding CUDA synchronization on the main thread.
+        """
+        self.use_confidential_compute = True
+
+        # Record an event on the current stream for synchronization
+        copy_ready = torch.cuda.Event()
+        copy_ready.record()
+
+        def _to_host_tensor(
+            tensor: torch.Tensor, event: torch.cuda.Event
+        ) -> torch.Tensor:
+            # Synchronize with the CUDA event before blocking copy
+            # synchronize() is intentionally chosen instead of wait();
+            # otherwise, the blocking copy will stall subsequent CUDA API
+            # calls on the main thread
+            event.synchronize()
+            return tensor.to("cpu", non_blocking=False)
+
+        # Submit async copy tasks to worker thread
+        self.next_token_ids_future = host_copy_executor.submit(
+            _to_host_tensor, self.next_token_ids, copy_ready
+        )
+
+        if return_logprob:
+            if self.logits_output.next_token_logprobs is not None:
+                self.next_token_logprobs_future = host_copy_executor.submit(
+                    _to_host_tensor, self.logits_output.next_token_logprobs, copy_ready
+                )
+            if self.logits_output.input_token_logprobs is not None:
+                self.input_token_logprobs_future = host_copy_executor.submit(
+                    _to_host_tensor, self.logits_output.input_token_logprobs, copy_ready
+                )
+
+        if self.logits_output.hidden_states is not None:
+            self.hidden_states_future = host_copy_executor.submit(
+                _to_host_tensor, self.logits_output.hidden_states, copy_ready
+            )
+
+        if self.accept_lens is not None:
+            self.accept_lens_future = host_copy_executor.submit(
+                _to_host_tensor, self.accept_lens, copy_ready
+            )
+
+    def resolve_confidential_futures(self):
+        """Resolve all Future objects from confidential compute mode D2H copies."""
+        if not self.use_confidential_compute:
+            return
+
+        if self.next_token_ids_future is not None:
+            self.next_token_ids = self.next_token_ids_future.result()
+            self.next_token_ids_future = None
+
+        if self.next_token_logprobs_future is not None:
+            self.logits_output.next_token_logprobs = (
+                self.next_token_logprobs_future.result()
+            )
+            self.next_token_logprobs_future = None
+
+        if self.input_token_logprobs_future is not None:
+            self.logits_output.input_token_logprobs = (
+                self.input_token_logprobs_future.result()
+            )
+            self.input_token_logprobs_future = None
+
+        if self.hidden_states_future is not None:
+            self.logits_output.hidden_states = self.hidden_states_future.result()
+            self.hidden_states_future = None
+
+        if self.accept_lens_future is not None:
+            self.accept_lens = self.accept_lens_future.result()
+            self.accept_lens_future = None
 
     @classmethod
     def from_pp_proxy(
