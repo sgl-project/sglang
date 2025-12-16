@@ -18,7 +18,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.sample.base import (
+from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
@@ -31,10 +31,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     _save_upload_to_path,
-    post_process_sample,
+    process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -42,10 +42,15 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
+# NOTE(mick): the sampling params needs to be further adjusted
+# FIXME: duplicated with the one in `image_api.py`
 def _build_sampling_params_from_request(
     request_id: str, request: VideoGenerationsRequest
 ) -> SamplingParams:
-    width, height = _parse_size(request.size or "720x1280")
+    if request.size is None:
+        width, height = None, None
+    else:
+        width, height = _parse_size(request.size)
     seconds = request.seconds if request.seconds is not None else 4
     # Prefer user-provided fps/num_frames from request; fallback to defaults
     fps_default = 24
@@ -56,21 +61,33 @@ def _build_sampling_params_from_request(
         request.num_frames if request.num_frames is not None else derived_num_frames
     )
     server_args = get_global_server_args()
-    # TODO: should we cache this sampling_params?
-    sampling_params = SamplingParams.from_pretrained(server_args.model_path)
-    user_params = SamplingParams(
-        request_id=request_id,
-        prompt=request.prompt,
-        num_frames=num_frames,
-        fps=fps,
-        width=width,
-        height=height,
-        image_path=request.input_reference,
-        save_output=True,
+    sampling_kwargs = {
+        "request_id": request_id,
+        "prompt": request.prompt,
+        "num_frames": num_frames,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "image_path": request.input_reference,
+        "save_output": True,
+        "output_file_name": request_id,
+        "seed": request.seed,
+        "generator_device": request.generator_device,
+    }
+    if request.num_inference_steps is not None:
+        sampling_kwargs["num_inference_steps"] = request.num_inference_steps
+    if request.guidance_scale is not None:
+        sampling_kwargs["guidance_scale"] = request.guidance_scale
+    if request.guidance_scale_2 is not None:
+        sampling_kwargs["guidance_scale_2"] = request.guidance_scale_2
+    if request.negative_prompt is not None:
+        sampling_kwargs["negative_prompt"] = request.negative_prompt
+    sampling_params = SamplingParams.from_user_sampling_params_args(
+        model_path=server_args.model_path,
+        server_args=server_args,
+        **sampling_kwargs,
     )
-    sampling_params = sampling_params.from_user_sampling_params(user_params)
-    sampling_params.set_output_file_name()
-    sampling_params.log(server_args)
+
     return sampling_params
 
 
@@ -98,14 +115,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 
     try:
-        result = await scheduler_client.forward([batch])
-        post_process_sample(
-            result.output[0],
-            batch.data_type,
-            batch.fps,
-            batch.save_output,
-            os.path.join(batch.output_path, batch.output_file_name),
-        )
+        await process_generation_batch(scheduler_client, batch)
         await VIDEO_STORE.update_fields(
             job_id,
             {"status": "completed", "progress": 100, "completed_at": int(time.time())},
@@ -167,7 +177,7 @@ async def create_video(
             input_reference=input_path,
             model=model,
             seconds=seconds if seconds is not None else 4,
-            size=size or "720x1280",
+            size=size,
             fps=fps_val,
             num_frames=num_frames_val,
         )
@@ -195,7 +205,6 @@ async def create_video(
 
     # Build Req for scheduler
     batch = prepare_request(
-        prompt=req.prompt,
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )

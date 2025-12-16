@@ -4,7 +4,7 @@
 
 # Adapted from torchtune
 # Copyright 2024 The TorchTune Authors.
-# Copyright 2025 The sgl-diffusion Authors.
+# Copyright 2025 The sglang-diffusion Authors.
 
 import contextlib
 from collections.abc import Callable, Generator
@@ -269,7 +269,7 @@ def load_model_from_full_model_state_dict(
                 meta_sharded_param.placements,
             )
             if cpu_offload:
-                sharded_tensor = sharded_tensor.cpu()
+                sharded_tensor = sharded_tensor.to("cpu")
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping

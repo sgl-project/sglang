@@ -14,7 +14,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
@@ -26,6 +26,20 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _get_qkv_projections(
+    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
+):
+    img_qkv, _ = attn.to_qkv(hidden_states)
+    img_query, img_key, img_value = img_qkv.chunk(3, dim=-1)
+
+    txt_query = txt_key = txt_value = None
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+        txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        txt_query, txt_key, txt_value = txt_qkv.chunk(3, dim=-1)
+
+    return img_query, img_key, img_value, txt_query, txt_key, txt_value
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -218,7 +232,6 @@ class QwenEmbedRope(nn.Module):
 
 
 class QwenImageCrossAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,  # query_dim
@@ -243,27 +256,22 @@ class QwenImageCrossAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
+        self.added_kv_proj_dim = added_kv_proj_dim
 
-        # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
+        # Use ReplicatedLinear for fused QKV projections
+        qkv_dim = num_heads * head_dim * 3
+        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=True)
+
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
+
         if added_kv_proj_dim is not None:
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            if context_pre_only is not None:
-                self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
-                )
+            # Use ReplicatedLinear for added (encoder) QKV projections
+            self.to_added_qkv = ReplicatedLinear(added_kv_proj_dim, qkv_dim, bias=True)
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
@@ -282,15 +290,16 @@ class QwenImageCrossAttention(nn.Module):
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
         # Scaled dot product attention
-        self.attn = LocalAttention(
+        self.attn = USPAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
             supported_attention_backends={
-                AttentionBackendEnum.FA3,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
             },
         )
 
@@ -301,17 +310,11 @@ class QwenImageCrossAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         **cross_attention_kwargs,
     ):
-        seq_txt = encoder_hidden_states.shape[1]
+        seq_len_txt = encoder_hidden_states.shape[1]
 
-        # Compute QKV for image stream (sample projections)
-        img_query, _ = self.to_q(hidden_states)
-        img_key, _ = self.to_k(hidden_states)
-        img_value, _ = self.to_v(hidden_states)
-
-        # Compute QKV for text stream (context projections)
-        txt_query, _ = self.add_q_proj(encoder_hidden_states)
-        txt_key, _ = self.add_k_proj(encoder_hidden_states)
-        txt_value, _ = self.add_v_proj(encoder_hidden_states)
+        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
+            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        )
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -366,8 +369,8 @@ class QwenImageCrossAttention(nn.Module):
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
         # Split attention outputs back
-        txt_attn_output = joint_hidden_states[:, :seq_txt, :]  # Text part
-        img_attn_output = joint_hidden_states[:, seq_txt:, :]  # Image part
+        txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]  # Text part
+        img_attn_output = joint_hidden_states[:, seq_len_txt:, :]  # Image part
 
         # Apply output projections
         img_attn_output, _ = self.to_out[0](img_attn_output)
@@ -516,6 +519,8 @@ class QwenImageTransformer2DModel(CachableDiT):
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
+    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+
     def __init__(
         self,
         config: QwenImageDitConfig,
@@ -568,7 +573,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
-        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed

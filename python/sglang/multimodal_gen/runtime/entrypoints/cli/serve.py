@@ -6,6 +6,7 @@ import argparse
 import os
 from typing import cast
 
+from sglang.multimodal_gen.apps.webui import run_sgl_diffusion_webui
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -33,9 +34,12 @@ def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None =
     server_args.post_init_serve()
     launch_server(server_args)
 
+    if server_args.webui:
+        run_sgl_diffusion_webui(server_args)
+
 
 class ServeSubcommand(CLISubcommand):
-    """The `serve` subcommand for the sgl-diffusion CLI"""
+    """The `serve` subcommand for the sglang-diffusion CLI"""
 
     def __init__(self) -> None:
         self.name = "serve"

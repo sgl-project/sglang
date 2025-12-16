@@ -24,7 +24,10 @@ class TestJSONConstrainedMixin:
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": (
+                    "Introduce the capital of France. Return in a JSON format. The JSON Schema is: "
+                    + json.dumps(json_schema)
+                ),
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": 128,
@@ -69,7 +72,8 @@ class TestJSONConstrainedMixin:
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {
                     "role": "user",
-                    "content": "Introduce the capital of France. Return in a JSON format.",
+                    "content": "Introduce the capital of France. Return in a JSON format. "
+                    "The JSON Schema is: " + json.dumps(self.json_schema),
                 },
             ],
             temperature=0,

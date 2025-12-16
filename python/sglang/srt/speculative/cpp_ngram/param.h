@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <regex>

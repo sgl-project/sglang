@@ -327,7 +327,7 @@ class GroupCoordinator:
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
+            dispatch_custom_allreduce,
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -366,12 +366,13 @@ class GroupCoordinator:
                 device=self.device,
             )
 
-        self.ca_comm: Optional[CustomAllreduce] = None
+        self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                self.ca_comm = CustomAllreduce(
+                CAClass = dispatch_custom_allreduce()
+                self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
                 )
@@ -746,6 +747,24 @@ class GroupCoordinator:
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
             )
+
+    def cp_all_gather_into_tensor_async(
+        self, output: torch.Tensor, input: torch.Tensor, stream=None
+    ):
+        """
+        Implement an asynchronous `allgather` operation on a specified stream.
+        (the default `torch.distributed.all_gather_into_tensor` will trigger event synchronization),
+        eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
+        The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
+        """
+        assert (
+            stream is not None
+        ), f"Invalid params stream ({stream}, Please specify the stream to use when calling cp_all_gather_into_tensor_async.)"
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            self.all_gather_into_tensor(output, input)
+        else:
+            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
 
     def all_gather(
         self,

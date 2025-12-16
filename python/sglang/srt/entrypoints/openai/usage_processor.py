@@ -30,7 +30,8 @@ class UsageProcessor:
         cached_details = None
         if enable_cache_report:
             cached_total = sum(
-                r["meta_info"].get("cached_tokens", 0) for r in responses
+                responses[i]["meta_info"].get("cached_tokens", 0)
+                for i in range(0, len(responses), n_choices)
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
@@ -55,7 +56,9 @@ class UsageProcessor:
         total_completion_tokens = sum(completion_tokens.values())
 
         cached_details = (
-            UsageProcessor._details_if_cached(sum(cached_tokens.values()))
+            UsageProcessor._details_if_cached(
+                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
+            )
             if enable_cache_report
             else None
         )

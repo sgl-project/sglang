@@ -31,9 +31,14 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import load_image
+from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+    init_npu_backend()
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -72,6 +77,8 @@ def get_dtype_str(torch_dtype):
         return "float16"
     if torch_dtype is torch.float32:
         return "float32"
+    if torch_dtype is torch.bfloat16:
+        return "bfloat16"
     else:
         raise NotImplementedError()
 
@@ -353,7 +360,7 @@ class HFRunner:
                     scores = []
                     for conv in prompts:
                         conv_formatted = self.tokenizer.apply_chat_template(
-                            conv, tokenize=False
+                            conv, tokenize=False, return_dict=False
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
@@ -429,6 +436,7 @@ class HFRunner:
                 )
             else:
                 model = base_model
+
             if patch_model_do_sample_false:
                 model.generation_config.do_sample = False
             outputs = model.generate(
@@ -448,6 +456,7 @@ class HFRunner:
             text = tokenizer.decode(
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
+
             # Check if the text is empty or only whitespace.
             if not text.strip():
                 raise ValueError(
@@ -528,6 +537,8 @@ class SRTRunner:
         speculative_num_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_ngram_min_match_window_size: Optional[int] = None,
+        speculative_ngram_max_match_window_size: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
         torchao_config: Optional[str] = None,
@@ -539,6 +550,7 @@ class SRTRunner:
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
+        enable_deterministic_inference: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -554,6 +566,14 @@ class SRTRunner:
             spec_kwargs["speculative_num_steps"] = speculative_num_steps
             spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
             spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
+        elif speculative_algorithm == "NGRAM":
+            spec_kwargs["speculative_algorithm"] = speculative_algorithm
+            spec_kwargs["speculative_ngram_min_match_window_size"] = (
+                speculative_ngram_min_match_window_size
+            )
+            spec_kwargs["speculative_ngram_max_match_window_size"] = (
+                speculative_ngram_max_match_window_size
+            )
 
         self.engine = Engine(
             model_path=model_path,
@@ -594,6 +614,7 @@ class SRTRunner:
                 else "{}"
             ),
             lora_eviction_policy=lora_eviction_policy,
+            enable_deterministic_inference=enable_deterministic_inference,
             **spec_kwargs,
         )
 

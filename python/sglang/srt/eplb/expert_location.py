@@ -284,9 +284,19 @@ class ExpertLocationMetadata:
     # -------------------------------- usage ------------------------------------
 
     def logical_to_all_physical(
-        self, layer_id: int, logical_expert_id: int
+        self,
+        layer_id: int,
+        logical_expert_id: int,
+        require_global_experts: bool = False,
     ) -> List[int]:
         # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
+        if require_global_experts:
+            num_physical_experts = self.logical_to_all_physical_map_cpu[layer_id].shape[
+                -1
+            ]
+            return list(
+                range(logical_expert_id, num_physical_experts, self.num_logical_experts)
+            )
         return [
             physical_expert_id
             for physical_expert_id in self.logical_to_all_physical_map_cpu[
