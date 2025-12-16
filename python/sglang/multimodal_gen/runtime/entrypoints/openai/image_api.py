@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     _save_upload_to_path,
+    maybe_url_image,
     process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -158,6 +159,7 @@ async def generations(
 async def edits(
     image: Optional[List[UploadFile]] = File(None),
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
+    image_urls: Optional[List[str]] = Form(None),
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
@@ -181,11 +183,27 @@ async def edits(
     os.makedirs(uploads_dir, exist_ok=True)
     if images is not None and not isinstance(images, list):
         images = [images]
+
+    if image_urls is not None:
+        if images is None:
+            images = image_urls
+        else:
+            images.extend(image_urls)
+
     input_paths = []
     for idx, img in enumerate(images):
-        filename = img.filename or f"image_{idx}"
-        input_path = os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
-        await _save_upload_to_path(img, input_path)
+        try:
+            input_path = maybe_url_image(
+                img, os.path.join(uploads_dir, f"{request_id}_{idx}_image_{idx}")
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"fail to deal image_urls: {str(e)}"
+            )
+        if input_path is None:
+            filename = img.filename or f"image_{idx}"
+            input_path = os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
+            await _save_upload_to_path(img, input_path)
         input_paths.append(input_path)
 
     sampling = _build_sampling_params_from_request(
