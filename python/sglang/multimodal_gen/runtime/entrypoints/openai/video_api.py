@@ -84,6 +84,8 @@ def _build_sampling_params_from_request(
         sampling_kwargs["negative_prompt"] = request.negative_prompt
     if request.enable_teacache is not None:
         sampling_kwargs["enable_teacache"] = request.enable_teacache
+    if request.output_path is not None:
+        sampling_kwargs["output_path"] = request.output_path
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,

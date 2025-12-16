@@ -69,6 +69,7 @@ class VideoGenerationsRequest(BaseModel):
     guidance_scale_2: Optional[float] = None
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    output_path: Optional[str] = None
 
 
 class VideoListResponse(BaseModel):
