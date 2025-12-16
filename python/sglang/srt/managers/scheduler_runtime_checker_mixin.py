@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import time
+import warnings
 from typing import TYPE_CHECKING
 
 import psutil
@@ -173,6 +174,13 @@ class SchedulerRuntimeCheckerMixin:
         current_batch: ScheduleBatch = self.last_batch
 
         if current_batch is None:
+            return
+
+        spec_topk = self.server_args.speculative_eagle_topk or 1
+        if spec_topk > 1:
+            warnings.warn(
+                "Runtime memory check (busy) is not supported when speculation topk > 1."
+            )
             return
 
         _, _, available_size, evictable_size = self._get_token_info()
