@@ -9,7 +9,6 @@ The American Invitational Mathematics Examination (AIME) is a challenging
 competition math exam. All answers are integers from 000 to 999.
 """
 
-import random
 import re
 from typing import Optional
 
@@ -69,16 +68,20 @@ class AIME25Eval(Eval):
             )
 
         # Load AIME 2025 dataset from HuggingFace
-        dataset = load_dataset("opencompass/AIME2025", split="test")
-        examples = [
+        dataset1 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
+        dataset2 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
+        examples1 = [
             {"question": row["question"], "answer": str(row["answer"])}
-            for row in dataset
+            for row in dataset1
         ]
+        examples2 = [
+            {"question": row["question"], "answer": str(row["answer"])}
+            for row in dataset2
+        ]
+        examples = examples1 + examples2
 
         if num_examples:
-            examples = random.Random(0).sample(
-                examples, min(num_examples, len(examples))
-            )
+            examples = examples[: min(num_examples, len(examples))]
 
         self.examples = examples
         self.num_threads = num_threads
