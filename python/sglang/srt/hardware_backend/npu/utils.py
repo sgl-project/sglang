@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+indexer_weight_stream = None
 
 
 class NPUACLFormat(IntEnum):
@@ -58,9 +59,9 @@ def set_default_server_args(args: "ServerArgs"):
         else:
             args.hicache_mem_layout = "page_first_direct"
 
-    if args.enable_piecewise_npu_graph_decode and args.enable_torch_npugraph_ex_compile:
+    if args.enable_piecewise_npu_graph_decode and args.enable_torchair_compile:
         raise ValueError(
-            "Cannot enable both --enable-piecewise-npu-graph-decode and --enable-torch-npugraph-ex-compile"
+            "Cannot enable both --enable-piecewise-npu-graph-decode and --enable-torchair-compile"
         )
 
     if args.compilation_config:
@@ -77,28 +78,28 @@ def set_default_server_args(args: "ServerArgs"):
                     f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-piecewise-npu-graph-decode"
                 )
 
-            if args.enable_torch_npugraph_ex_compile:
+            if args.enable_torchair_compile:
                 raise ValueError(
-                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torch-npugraph-ex-compile"
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torchair-compile"
                 )
 
         if args.compilation_config.compiler == "piecewise":
             args.enable_piecewise_npu_graph_decode = True
 
-            if args.enable_torch_npugraph_ex_compile:
+            if args.enable_torchair_compile:
                 raise ValueError(
-                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torch-npugraph-ex-compile"
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torchair-compile"
                 )
 
         if args.compilation_config.compiler == "npugraph_ex":
-            args.enable_torch_npugraph_ex_compile = True
+            args.enable_torchair_compile = True
 
             if args.enable_piecewise_npu_graph_decode:
                 raise ValueError(
                     f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-piecewise-npu-graph-decode"
                 )
 
-        if args.enable_torch_npugraph_ex_compile:
+        if args.enable_torchair_compile:
             args.enable_torch_compile = True
 
 
@@ -153,3 +154,10 @@ def npu_format_cast(
     import torch_npu
 
     return torch_npu.npu_format_cast(tensor, acl_format.value)
+
+
+def get_indexer_weight_stream():
+    global indexer_weight_stream
+    if indexer_weight_stream is None:
+        indexer_weight_stream = torch.npu.Stream()
+    return indexer_weight_stream

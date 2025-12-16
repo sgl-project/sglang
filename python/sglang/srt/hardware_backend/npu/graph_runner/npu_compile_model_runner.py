@@ -63,7 +63,6 @@ class NPUCompileModelRunner(CudaGraphRunner):
 
         backend = get_compiler_backend(
             mode="reduce-overhead",
-            compilation_config=get_global_server_args().compilation_config,
         )
 
         compile_forward = torch.compile(
