@@ -27,6 +27,7 @@ MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model from sanity_check.py - TP2 verified on MI300X
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.83,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
@@ -39,6 +40,8 @@ MODEL_SCORE_THRESHOLDS = {
 
 failing_models = {
     "neuralmagic/gemma-2-2b-it-FP8",
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",  # RuntimeError: This GEMM is not supported!
+    "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
 }
 
 
@@ -61,6 +64,11 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
 )
 
+# AMD-specific models verified on MI300X with tp=2
+AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
+    "Qwen/Qwen3-30B-A3B-Thinking-2507"
+)
+
 NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
 DISABLE_HF_XET_MODELS = {
     "Qwen/Qwen2-57B-A14B-Instruct",
@@ -72,12 +80,27 @@ TRITON_MOE_MODELS = {
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mistral-7B-Instruct-v0.3",
 }
+# AMD-specific models that need special launch config (matching in-house CI sanity_check.py)
+# AMD_SPECIAL_CONFIG_MODELS = {
+#     "Qwen/Qwen3-30B-A3B-Thinking-2507", # default config works
+# }
 
 
 def popen_launch_server_wrapper(base_url, model, is_tp2):
     other_args = ["--log-level-http", "warning", "--trust-remote-code"]
     if is_tp2:
         other_args.extend(["--tp", "2"])
+
+    # Use same config as sanity_check.py for AMD-specific models (scaled for tp=2)
+    # Original tp=8: chunked-prefill-size=130172, max-running-requests=128
+    # Scaled tp=2:   chunked-prefill-size=32543,  max-running-requests=32
+    # if model in AMD_SPECIAL_CONFIG_MODELS:
+    #     other_args.extend([
+    #         "--chunked-prefill-size", "32543",
+    #         "--max-running-requests", "32",
+    #         "--mem-fraction-static", "0.85",
+    #         "--attention-backend", "aiter",
+    #     ])
 
     process = popen_launch_server(
         model,
@@ -126,6 +149,8 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            # AMD-specific models verified on MI300X
+            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 

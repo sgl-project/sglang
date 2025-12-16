@@ -70,7 +70,9 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
-    from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+    from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+        AscendAttnBackend,
+    )
 
     return AscendAttnBackend(runner)
 

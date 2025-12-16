@@ -65,6 +65,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -78,11 +79,13 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -94,6 +97,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -104,10 +108,7 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
-    AscendMLAPagedTokenToKVPool,
-    AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -132,7 +133,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
-from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
@@ -187,6 +187,17 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_xpu_xmx_available = xpu_has_xmx_support()
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+    init_npu_backend()
+
 MLA_ATTENTION_BACKENDS = [
     "aiter",
     "flashinfer",
@@ -224,28 +235,15 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_xpu_xmx_available = xpu_has_xmx_support()
-
-# Use a small KV cache pool size for tests in CI
-SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
-
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
-# the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
+# the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
-
-if _is_npu:
-    import torch_npu
-
-    torch.npu.config.allow_internal_format = True
-    torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -327,7 +325,6 @@ class ModelRunner:
 
         # Model-specific adjustment
         self.model_specific_adjustment()
-        self.check_quantized_moe_compatibility()
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -359,6 +356,7 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
+        self.check_quantized_moe_compatibility()
 
         # Temporary cached values
         self.support_pp = (
@@ -444,11 +442,6 @@ class ModelRunner:
             architectures = self.model_config.hf_config.architectures
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid_swa = self.model_config.is_hybrid_swa = True
-
-        if config := self.mamba2_config:
-            class_name = config.__class__.__name__
-            logger.warning(f"{class_name} model detected, disable radix cache")
-            self.server_args.disable_radix_cache = True
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -587,8 +580,10 @@ class ModelRunner:
             quantization_config := getattr(
                 self.model_config.hf_config, "quantization_config", None
             )
-        ) is not None and "weight_block_size" in quantization_config:
-            weight_block_size_n = quantization_config["weight_block_size"][0]
+        ) is not None and (
+            weight_block_size := quantization_config.get("weight_block_size", None)
+        ) is not None:
+            weight_block_size_n = weight_block_size[0]
 
             if self.tp_size % self.moe_ep_size != 0:
                 raise ValueError(
@@ -770,6 +765,7 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             modelopt_config=modelopt_config,
+            rl_quant_profile=self.server_args.rl_quant_profile,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -957,7 +953,7 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
+            loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -1452,14 +1448,9 @@ class ModelRunner:
         server_args = self.server_args
         assert config is not None
 
-        speculativa_ratio = (
-            0
-            if server_args.speculative_num_draft_tokens is None
-            else server_args.speculative_num_draft_tokens
-        )
         if (
             server_args.disable_radix_cache
-            or config.mamba2_cache_params.mamba_cache_per_req == 0
+            or server_args.max_mamba_cache_size is not None
         ):
             # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
             if server_args.max_mamba_cache_size is None:
@@ -1467,7 +1458,25 @@ class ModelRunner:
                     server_args.max_mamba_cache_size = server_args.max_running_requests
                 else:
                     server_args.max_mamba_cache_size = 512
+            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
         else:
+            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            # reserve the memory for the intermediate mamba states used for spec dec
+            if not self.spec_algorithm.is_none():
+                assert server_args.speculative_num_draft_tokens is not None
+                assert server_args.max_running_requests is not None
+
+                mamba_state_intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * server_args.max_running_requests
+                    * server_args.speculative_num_draft_tokens
+                )
+                total_rest_memory = total_rest_memory - (
+                    mamba_state_intermediate_size / (1 << 30)
+                )
+
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
             # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
@@ -1481,20 +1490,21 @@ class ModelRunner:
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
                 // config.mamba2_cache_params.mamba_cache_per_req
-                // (1 + speculativa_ratio)
             )
 
-        if self.hybrid_gdn_config is not None:
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
-            )
         mamba_state_memory = (
             server_args.max_mamba_cache_size
             * config.mamba2_cache_params.mamba_cache_per_req
-            * (1 + speculativa_ratio)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    @property
+    def qwen3_next_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, Qwen3NextConfig):
+            return config
+        return None
 
     @property
     def hybrid_gdn_config(self):
@@ -1636,19 +1646,19 @@ class ModelRunner:
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
                 if _is_hip:
-                    self.kv_cache_dtype = torch.float8_e4m3fnuz
+                    self.kv_cache_dtype = fp8_dtype
                 else:
                     self.kv_cache_dtype = torch.float8_e4m3fn
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e5m2fnuz
+                self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
             if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e4m3fnuz
+                self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
@@ -1670,8 +1680,12 @@ class ModelRunner:
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        if SGLANG_CI_SMALL_KV_SIZE:
-            self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
+
+        if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
+            logger.info(
+                f"Use a small KV cache pool size ({small_kv_size}) for local tests"
+            )
+            self.max_total_num_tokens = small_kv_size
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -1685,11 +1699,18 @@ class ModelRunner:
             )
 
         if self.mambaish_config is not None:
-            ratio = (
-                MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
-                if not self.server_args.disable_radix_cache
-                else 1
-            )
+            additional_ratio = 0
+            if (
+                self.server_args.enable_mamba_extra_buffer()
+                and not self.spec_algorithm.is_none()
+            ):
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+            else:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            if self.server_args.disable_radix_cache:
+                ratio = 1
+            else:
+                ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
@@ -1776,6 +1797,7 @@ class ModelRunner:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         cache_params=config.mamba2_cache_params,
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                     )
                 else:
@@ -1791,11 +1813,13 @@ class ModelRunner:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
+                    mamba_spec_state_size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
+                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
@@ -1814,7 +1838,11 @@ class ModelRunner:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
-                self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMLATokenToKVPool,
+                )
+
+                self.token_to_kv_pool = NPUMLATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -1828,7 +1856,11 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = AscendTokenToKVPool(
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMHATokenToKVPool,
+                )
+
+                self.token_to_kv_pool = NPUMHATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -1986,7 +2018,11 @@ class ModelRunner:
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
             ):
-                self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
+                from sglang.srt.hardware_backend.npu.allocator_npu import (
+                    NPUPagedTokenToKVPoolAllocator,
+                )
+
+                self.token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -2689,6 +2725,17 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+
+        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        if (
+            forward_batch.num_token_non_padded is not None
+            and forward_batch.global_num_tokens_gpu is not None
+            and require_gathered_buffer
+            and not is_nsa_enable_prefill_cp()
+        ):
+            forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                server_args=self.server_args,
+            )
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

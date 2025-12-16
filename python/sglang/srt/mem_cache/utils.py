@@ -43,7 +43,7 @@ def set_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -168,7 +168,7 @@ def get_mla_kv_buffer_kernel(
     rope_dim: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
 
     nope_offs = tl.arange(0, nope_dim)

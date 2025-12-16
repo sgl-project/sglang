@@ -79,6 +79,50 @@ class TestGemm(CustomTestCase):
             ):
                 self._bf16_gemm(*params)
 
+    def _bf16_gemm_with_small_oc(self, M, N, K, has_bias, use_post_sigmul):
+        use_post_sigmul = use_post_sigmul and N == 1
+        mat_mul = (
+            None if not use_post_sigmul else torch.randn(M, 2 * K, dtype=torch.bfloat16)
+        )
+        mat1 = torch.randn(M, K, dtype=torch.bfloat16)
+        mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+
+        ref = torch.nn.functional.linear(mat1, mat2)
+        if has_bias:
+            bias = torch.randn(N, dtype=torch.float32)
+            ref.add_(bias)
+        if use_post_sigmul:
+            ref = torch.nn.functional.sigmoid(ref) * mat_mul
+            out = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
+                mat1,
+                torch.ops.sgl_kernel.convert_weight_packed(mat2),
+                bias if has_bias else None,
+                True,
+                mat_mul if use_post_sigmul else None,
+            )
+        else:
+            out = torch.ops.sgl_kernel.weight_packed_linear(
+                mat1,
+                torch.ops.sgl_kernel.convert_weight_packed(mat2),
+                bias if has_bias else None,
+                True,
+            )
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    def test_bf16_gemm_with_small_oc(self):
+        for params in itertools.product(
+            [1, 8, 32, 1024], [12, 1], self.K, self.has_bias, [False, True]
+        ):
+            with self.subTest(
+                M=params[0],
+                N=params[1],
+                K=params[2],
+                has_bias=params[3],
+                use_post_sigmul=params[4],
+            ):
+                self._bf16_gemm_with_small_oc(*params)
+
     def _int8_gemm(self, M, N, K, has_bias):
         dtype = torch.bfloat16
         A = torch.randn((M, K), dtype=dtype) / 10

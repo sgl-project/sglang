@@ -365,7 +365,8 @@ class CommonKVReceiver(BaseKVReceiver):
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
             for target_tp_rank in self.target_tp_ranks:
-                for target_pp_rank in self.target_pp_ranks:
+                # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
+                for target_pp_rank in reversed(self.target_pp_ranks):
                     bootstrap_info = self._get_bootstrap_info_from_server(
                         target_tp_rank, self.target_dp_group, target_pp_rank
                     )

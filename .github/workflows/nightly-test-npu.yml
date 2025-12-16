@@ -1,0 +1,198 @@
+name: Nightly Test (NPU)
+
+on:
+  schedule:
+    - cron: '0 17 * * *'  # Execute at 1:00 a.m. Beijing Time every day
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-test-npu.yml"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
+
+concurrency:
+  group: nightly-test-npu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nightly-1-npu-a3:
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    runs-on: linux-aarch64-a3-2
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Print Log Information
+        run: |
+          bash scripts/ci/npu_log_print.sh
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
+          pip install sentence_transformers accelerate
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-1-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+
+  nightly-2-npu-a3:
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    runs-on: linux-aarch64-a3-2
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0]
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Print Log Information
+        run: |
+          bash scripts/ci/npu_log_print.sh
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
+          pip install sentence_transformers accelerate
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-2-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+
+  nightly-4-npu-a3:
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    runs-on: linux-aarch64-a3-4
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0]
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
+      - name: Print Log Information
+        run: |
+          bash scripts/ci/npu_log_print.sh
+
+      - name: Run test
+        timeout-minutes: 240
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
+          hf download lmms-lab/MMMU --repo-type dataset
+          pip install sentence_transformers torchaudio==2.8.0 torch_npu==2.8.0
+          pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
+          pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter peft==0.2.0 black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
+          pip install jsonlines httpx==0.25.0 evaluate>=0.4.0 datasets==2.16.1 numexpr xgrammar==0.1.25 numpy==1.26.4 dotenv
+          git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+          cd ./lmms-eval
+          nohup pip install . > lmmslog.txt 2>&1 &
+          sleep 120
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          cd ../
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-4-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+
+  check-all-jobs:
+    if: github.repository == 'sgl-project/sglang' && always()
+    needs:
+      - nightly-1-npu-a3
+      - nightly-4-npu-a3
+    runs-on: ubuntu-latest
+    container:
+      image: docker.m.daocloud.io/ubuntu:22.04
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"

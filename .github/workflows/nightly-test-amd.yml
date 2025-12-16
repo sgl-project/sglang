@@ -9,6 +9,18 @@ on:
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
 
 concurrency:
   group: nightly-test-amd-${{ github.ref }}
@@ -19,7 +31,7 @@ jobs:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2-nightly]
+        runner: [linux-mi325-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code

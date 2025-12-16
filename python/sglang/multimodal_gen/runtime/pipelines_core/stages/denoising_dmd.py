@@ -91,8 +91,6 @@ class DmdDenoisingStage(DenoisingStage):
         prompt_embeds = prepared_vars["prompt_embeds"]
 
         denoising_loop_start_time = time.time()
-        self.start_profile(batch=batch)
-
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted
@@ -166,7 +164,8 @@ class DmdDenoisingStage(DenoisingStage):
                                 video_raw_latent_shape,
                                 dtype=pred_video.dtype,
                                 generator=batch.generator[0],
-                            ).to(self.device)
+                                device=self.device,
+                            )
                             latents = self.scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),
@@ -185,7 +184,6 @@ class DmdDenoisingStage(DenoisingStage):
 
                     self.step_profile()
 
-        self.stop_profile(batch)
         denoising_loop_end_time = time.time()
         if len(timesteps) > 0:
             self.log_info(

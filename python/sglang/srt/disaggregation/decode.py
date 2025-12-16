@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
@@ -144,6 +144,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         enable_memory_saver: bool,
         cache_params: "Mamba2CacheParams",
         speculative_num_draft_tokens: int,
+        enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
     ):
         DecodeReqToTokenPool.__init__(
@@ -154,9 +155,18 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
+        self.mamba_ping_pong_track_buffer_size = (
+            2 if speculative_num_draft_tokens is None else 1
+        )
+        self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
-            size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
+            size=size + pre_alloc_size,
+            mamba_spec_state_size=size + pre_alloc_size,
+            cache_params=cache_params,
+            device=device,
+            enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
 
     def clear(self):
@@ -199,6 +209,7 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         prefill_pp_size: int,
+        pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
@@ -220,6 +231,7 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.prefill_pp_size = prefill_pp_size
+        self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -236,8 +248,7 @@ class DecodePreallocQueue:
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.decode_tp_size = attn_tp_size
-        # Note(shangming): pp is not supported on the decode side yet, so its rank is fixed to 0
-        kv_args.pp_rank = 0
+        kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_pp_size = self.prefill_pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -302,6 +313,7 @@ class DecodePreallocQueue:
             return
 
         if is_retracted:
+            req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
@@ -340,7 +352,9 @@ class DecodePreallocQueue:
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
 
-    def resume_retracted_reqs(self) -> List[Req]:
+    def resume_retracted_reqs(
+        self, rids_to_check: Optional[List[str]] = None
+    ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
 
         # allocate memory
@@ -349,6 +363,9 @@ class DecodePreallocQueue:
         allocatable_tokens = self._allocatable_tokens(count_retracted=False)
 
         for i, req in enumerate(self.retracted_queue):
+            if rids_to_check is not None and req.rid not in rids_to_check:
+                continue
+
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
@@ -377,7 +394,9 @@ class DecodePreallocQueue:
 
         return resumed_reqs
 
-    def _update_handshake_waiters(self) -> None:
+    def _update_handshake_waiters(
+        self, rids_to_check: Optional[List[str]] = None
+    ) -> None:
         if not self.queue:
             return
 
@@ -389,6 +408,9 @@ class DecodePreallocQueue:
         )
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+
             if poll == KVPoll.Bootstrapping:
                 pass
             elif poll == KVPoll.WaitingForInput:
@@ -410,10 +432,13 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
-    def pop_preallocated(self) -> List[DecodeRequest]:
+    def pop_preallocated(
+        self, rids_to_check: Optional[List[str]] = None
+    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
-        self._update_handshake_waiters()
+        self._update_handshake_waiters(rids_to_check)
 
+        failed_reqs = []
         preallocated_reqs = []
         indices_to_remove = set()
 
@@ -428,14 +453,20 @@ class DecodePreallocQueue:
         )
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+
             if i in indices_to_remove:
                 continue
 
@@ -544,7 +575,7 @@ class DecodePreallocQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        return preallocated_reqs
+        return preallocated_reqs, failed_reqs
 
     @property
     def num_tokens_pre_allocated(self):
@@ -726,7 +757,7 @@ class DecodeTransferQueue:
         )
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
 
-    def pop_transferred(self) -> List[Req]:
+    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
         polls = poll_and_all_reduce(
@@ -736,6 +767,8 @@ class DecodeTransferQueue:
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -958,7 +991,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()

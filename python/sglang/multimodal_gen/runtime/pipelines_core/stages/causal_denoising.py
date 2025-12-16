@@ -344,7 +344,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
                                 if isinstance(batch.generator, list)
                                 else batch.generator
                             ),
-                        ).to(self.device)
+                            device=self.device,
+                        )
                         noise_btchw = noise
                         noise_latents_btchw = self.scheduler.add_noise(
                             pred_video_btchw.flatten(0, 1),

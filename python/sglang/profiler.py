@@ -116,7 +116,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="Whether to memory usage (https://pytorch.org/memory_viz)",
+        help="Whether to profile memory usage (https://pytorch.org/memory_viz)",
     )
     parser.add_argument(
         "--rpd",

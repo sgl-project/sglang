@@ -32,14 +32,18 @@ jobs:
 
           for workflow_file in "${WORKFLOW_FILES[@]}"; do
             echo "--- Checking workflow: $workflow_file ---"
+
+            # Fetch list and pipe to while loop
             gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
               --json databaseId,status \
               --limit 1000 \
-              | jq -r '.[] | select(.status=="queued" or .status=="in_progress") | .databaseId' \
+              | jq -r '.[] | select(.status=="queued" or .status=="in_progress" or .status=="waiting") | .databaseId' \
               | while read run_id; do
-                  echo "Cancelling run ID: $run_id for workflow: $workflow_file"
-                  gh run cancel "$run_id" --repo "$REPO"
+                  echo "Attempting to cancel run ID: $run_id for workflow: $workflow_file"
+
+                  # The "|| echo ..." part prevents the script from crashing if cancellation fails
+                  gh run cancel "$run_id" --repo "$REPO" || echo "⚠️ Could not cancel run $run_id (it may have already completed). Continuing..."
                 done
           done

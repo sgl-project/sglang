@@ -22,6 +22,7 @@ from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 import sglang
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
@@ -321,7 +322,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             max_context_length=self.model_info["max_context_length"],
             vocab_size=self.model_info["vocab_size"],
             supports_vision=self.model_info["supports_vision"],
-            model_type=self.model_info["model_type"],
+            model_type=self.model_info.get("model_type") or "",
+            architectures=self.model_info.get("architectures") or [],
             eos_token_ids=self.model_info["eos_token_ids"],
             pad_token_id=self.model_info["pad_token_id"],
             bos_token_id=self.model_info["bos_token_id"],
@@ -718,7 +720,10 @@ async def serve_grpc(
         server_args=server_args,
     )
 
-    # Update model info from scheduler info
+    # Load model config to get HF config info (same as TokenizerManager does)
+    model_config = ModelConfig.from_server_args(server_args)
+
+    # Update model info from scheduler info and model config
     if model_info is None:
         model_info = {
             "model_name": server_args.model_path,
@@ -727,7 +732,8 @@ async def serve_grpc(
             ),
             "vocab_size": scheduler_info.get("vocab_size", 128256),
             "supports_vision": scheduler_info.get("supports_vision", False),
-            "model_type": scheduler_info.get("model_type", "transformer"),
+            "model_type": getattr(model_config.hf_config, "model_type", None),
+            "architectures": getattr(model_config.hf_config, "architectures", None),
             "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
             "eos_token_ids": scheduler_info.get("eos_token_ids", []),
             "pad_token_id": scheduler_info.get("pad_token_id", 0),
