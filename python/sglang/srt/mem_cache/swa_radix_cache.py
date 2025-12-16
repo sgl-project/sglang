@@ -31,6 +31,7 @@ from numpy import float64
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import use_elasticmem
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -691,6 +692,7 @@ class SWARadixCache(BasePrefixCache):
             ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
             if node.full_lock_ref == 0:
                 self.full_evictable_size_ -= len(node.value)
+                self._rm_unused(full_indices=node.value)
                 self.full_protected_size_ += len(node.value)
             node.full_lock_ref += 1
 
@@ -703,6 +705,7 @@ class SWARadixCache(BasePrefixCache):
                 ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
                 if node.swa_lock_ref == 0:
                     self.swa_evictable_size_ -= len(node.value)
+                    self._rm_unused(swa_indices=node.value)
                     self.swa_protected_size_ += len(node.value)
                 node.swa_lock_ref += 1
                 swa_lock_size += len(node.value)
@@ -730,6 +733,7 @@ class SWARadixCache(BasePrefixCache):
             ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
             if node.full_lock_ref == 1:
                 self.full_evictable_size_ += len(node.value)
+                self._add_unused(full_indices=node.value)
                 self.full_protected_size_ -= len(node.value)
             node.full_lock_ref -= 1
 
@@ -743,6 +747,7 @@ class SWARadixCache(BasePrefixCache):
 
                 if node.swa_lock_ref == 1:
                     self.swa_evictable_size_ += len(node.value)
+                    self._add_unused(swa_indices=node.value)
                     self.swa_protected_size_ -= len(node.value)
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
@@ -939,13 +944,20 @@ class SWARadixCache(BasePrefixCache):
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
                     self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
+                    if node.full_lock_ref == 0:
+                        self.full_evictable_size_ -= len(node.value[first_diff_idx:])
+                        self._add_unused(node.value[first_diff_idx:])
                     node.value = value[:prefix_len]
+                    if node.full_lock_ref == 0:
+                        self.full_evictable_size_ += len(node.value[first_diff_idx:])
+                        self._add_unused(node.value[first_diff_idx:])
                     node.swa_tombstone = False
 
                     # insert the node into the lru lists
                     self.swa_lru_list.insert_mru(node)
 
                     self.swa_evictable_size_ += len(node.value)
+                    self._add_unused(swa_indices=node.value)
                 else:
                     self.token_to_kv_pool_allocator.free(
                         value[first_diff_idx:prefix_len]
@@ -968,6 +980,7 @@ class SWARadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.swa_evictable_size_ += len(value)
+            self._add_unused(full_indices=value, swa_indices=value)
         return total_prefix_length
 
     def _iteratively_delete_tombstone_leaf(
@@ -986,6 +999,7 @@ class SWARadixCache(BasePrefixCache):
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             self.token_to_kv_pool_allocator.free(node.parent.value)
+
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
@@ -1004,11 +1018,13 @@ class SWARadixCache(BasePrefixCache):
         del node.parent.children[k]
         self.full_evictable_size_ -= len(node.key)
         self.swa_evictable_size_ -= len(node.key)
+        self._add_unused(full_indices=node.value, swa_indices=node.value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         node.swa_tombstone = True
         self.swa_evictable_size_ -= len(node.key)
+        self._add_unused(swa_indices=node.value)
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (
@@ -1020,6 +1036,7 @@ class SWARadixCache(BasePrefixCache):
                 break
         del node.parent.children[k]
         self.full_evictable_size_ -= len(node.key)
+        self._add_unused(full_indices=node.value)
 
     def _collect_leaves(self) -> List[TreeNode]:
         ret_list = []
@@ -1091,3 +1108,31 @@ class SWARadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size, total_swa_size
+
+    def _add_unused(
+        self,
+        full_indices: Optional[torch.Tensor] = None,
+        swa_indices: Optional[torch.Tensor] = None,
+    ):
+        if not use_elasticmem:
+            return
+
+        if full_indices is not None:
+            self.token_to_kv_pool_allocator.add_unused(full_indices)
+
+        if swa_indices is not None:
+            self.token_to_kv_pool_allocator.add_unused_swa(swa_indices)
+
+    def _rm_unused(
+        self,
+        full_indices: Optional[torch.Tensor] = None,
+        swa_indices: Optional[torch.Tensor] = None,
+    ):
+        if not use_elasticmem:
+            return
+
+        if full_indices is not None:
+            self.token_to_kv_pool_allocator.rm_unused(full_indices)
+
+        if swa_indices is not None:
+            self.token_to_kv_pool_allocator.rm_unused_swa(swa_indices)

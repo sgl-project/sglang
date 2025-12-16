@@ -679,6 +679,9 @@ class ServerArgs:
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
 
+        # Handle elastic memory.
+        self._handle_emem()
+
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -2040,6 +2043,14 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
+
+    def _handle_emem(self):
+        if self.enable_memory_saver:
+            if get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "false"):
+                logger.warning(
+                    "Currently, elasticmem is not compatible with memory_saver"
+                )
+                os.environ["SGLANG_ELASTIC_MEM_POOL"] = "false"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

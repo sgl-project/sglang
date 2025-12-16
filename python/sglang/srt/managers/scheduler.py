@@ -154,7 +154,6 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
-    ElasticAllocator,
     use_elasticmem,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -817,8 +816,8 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-        if isinstance(self.token_to_kv_pool_allocator, ElasticAllocator):
-            self.token_to_kv_pool_allocator.register_scheduler(self)
+        if use_elasticmem:
+            self.emem_orch.register_scheduler(self)
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -1704,15 +1703,15 @@ class Scheduler(
             else:
                 ret = None
 
-        if use_elasticmem and ret:
-            self.emem_orch.try_resize()
-
         # Handle DP attention
         if need_mlp_sync:
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
+
+        if use_elasticmem and ret:
+            self.emem_orch.try_resize()
 
         return ret
 
