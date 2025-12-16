@@ -105,7 +105,7 @@ class DeepEPMoE(FusedMoE):
             and isinstance(quant_config, CompressedTensorsConfig)
             and quant_config._is_wfp8afp8_moe
             and getattr(self.quant_method, "block_quant", False)
-        ):
+        ):  # support W8A8-FP8_BLOCK with llm-compressed-tensors: https://github.com/vllm-project/llm-compressor/blob/main/examples/quantization_w8a8_fp8/fp8_block_example.py
             self.deprecate_flag = True
         else:
             self.deprecate_flag = False
