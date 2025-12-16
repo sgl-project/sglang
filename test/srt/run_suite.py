@@ -146,7 +146,7 @@ suites = {
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 472),
+        TestFile("models/test_qwen3_next_models.py", 590),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -368,6 +368,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
