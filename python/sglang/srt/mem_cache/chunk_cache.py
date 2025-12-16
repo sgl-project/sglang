@@ -51,14 +51,11 @@ class ChunkCache(BasePrefixCache):
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
-        self.protected_size_ -= len(req.prefix_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
-        self.protected_size_ += len(kv_indices) - len(req.prefix_indices)
-
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
@@ -72,7 +69,8 @@ class ChunkCache(BasePrefixCache):
         return 0
 
     def protected_size(self):
-        return self.protected_size_
+        # NOTE: no protected size in chunk cache. Chunk cache's eviction is the same with request's lifecycle.
+        return 0
 
     def pretty_print(self):
         return ""

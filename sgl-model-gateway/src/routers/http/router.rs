@@ -19,11 +19,12 @@ use tracing::{debug, error};
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuardV2,
+        WorkerRegistry, WorkerType,
     },
     observability::{
         events::{self, Event},
-        metrics::RouterMetrics,
+        metrics::{metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
     policies::PolicyRegistry,
@@ -37,7 +38,11 @@ use crate::{
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{error, header_utils, RouterTrait},
+    routers::{
+        error,
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 /// Regular router that uses injected load balancing policies
@@ -152,6 +157,15 @@ impl Router {
         };
 
         let idx = policy.select_worker(&available, text)?;
+
+        // Record worker selection metric (Layer 3)
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id.unwrap_or("default"),
+            policy.name(),
+        );
+
         Some(available[idx].clone())
     }
 
@@ -159,48 +173,66 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let model = model_id.unwrap_or("default");
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            is_stream,
+        );
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
-                    .await;
-
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                RouterMetrics::record_attempt_http_response(
-                    route,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
-
-                res
+                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .await
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
-                RouterMetrics::record_retry(route);
-                RouterMetrics::record_retry_backoff_duration(delay, attempt);
+                // Layer 3 worker metrics
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
             },
             // on_exhausted hook
-            || RouterMetrics::record_retries_exhausted(route),
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
         )
         .await;
 
         if response.status().is_success() {
             let duration = start.elapsed();
-            RouterMetrics::record_request(route);
-            RouterMetrics::record_generate_duration(duration);
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
         } else if !is_retryable_status(response.status()) {
-            RouterMetrics::record_request_error(route, "non_retryable_error");
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
         }
 
         response
@@ -210,7 +242,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
@@ -218,7 +250,6 @@ impl Router {
         let worker = match self.select_worker_for_model(model_id, Some(text)) {
             Some(w) => w,
             None => {
-                RouterMetrics::record_request_error(route, "no_available_workers");
                 return error::service_unavailable(
                     "no_available_workers",
                     "No available workers (all circuits open or unhealthy)",
@@ -233,19 +264,8 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_incremented = if policy.name() == "cache_aware" {
-            increment_load(&worker);
-            true
-        } else {
-            false
-        };
-
-        // Keep a clone for potential cleanup on retry
-        let worker_for_cleanup = if load_incremented {
-            Some(worker.clone())
-        } else {
-            None
-        };
+        let load_guard =
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuardV2::new(worker.clone()));
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
@@ -262,20 +282,22 @@ impl Router {
                 route,
                 worker.url(),
                 is_stream,
-                load_incremented,
+                load_guard,
             )
             .await;
 
         events::RequestReceivedEvent {}.emit();
 
-        worker.record_outcome(response.status().is_success());
+        let status = response.status();
+        worker.record_outcome(status.is_success());
 
-        // For retryable failures, we need to decrement load since send_typed_request
-        // won't have done it (it only decrements on success or non-retryable failures)
-        if is_retryable_status(response.status()) && load_incremented {
-            if let Some(cleanup_worker) = worker_for_cleanup {
-                decrement_load(&cleanup_worker);
-            }
+        // Record worker errors for server errors (5xx)
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
         }
 
         response
@@ -418,10 +440,10 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        mut load_guard: Option<WorkerLoadGuardV2>,
     ) -> Response {
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
@@ -504,13 +526,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(ref w) = worker {
-                        decrement_load(w);
-                    }
-                }
-
                 return convert_reqwest_error(e);
             }
         };
@@ -530,31 +545,14 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(ref w) = worker {
-                            decrement_load(w);
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     error::internal_error("read_response_body_failed", error_msg)
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(ref w) = worker {
-                    decrement_load(w);
-                }
-            }
-
+            drop(load_guard);
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            // Clone the worker Arc for the async block instead of looking it up again
-            let stream_worker = worker.clone();
-
+        } else {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -566,16 +564,14 @@ impl Router {
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut decremented = false;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
                             // Check for stream end marker using memmem for efficiency
-                            if memmem::find(&bytes, b"data: [DONE]").is_some() {
-                                if let Some(ref w) = stream_worker {
-                                    decrement_load(w);
-                                    decremented = true;
-                                }
+                            if load_guard.is_some()
+                                && memmem::find(&bytes, b"data: [DONE]").is_some()
+                            {
+                                load_guard = None;
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
@@ -587,46 +583,7 @@ impl Router {
                         }
                     }
                 }
-                if !decremented {
-                    if let Some(ref w) = stream_worker {
-                        decrement_load(w);
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        } else {
-            // For requests without load tracking, just stream
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
+                drop(load_guard);
             });
 
             let stream = UnboundedReceiverStream::new(rx);
@@ -657,16 +614,6 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
-}
-
-fn increment_load(w: &Arc<dyn Worker>) {
-    w.increment_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
-}
-
-fn decrement_load(w: &Arc<dyn Worker>) {
-    w.decrement_load();
-    RouterMetrics::set_running_requests(w.url(), w.load());
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
@@ -722,8 +669,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
-
-use crate::routers::error::extract_error_code_from_response;
 
 #[async_trait]
 impl RouterTrait for Router {
@@ -808,22 +753,8 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Record embeddings-specific metrics in addition to general request metrics
-        let start = Instant::now();
-        let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
-            .await;
-
-        // Embedding specific metrics
-        if res.status().is_success() {
-            RouterMetrics::record_embeddings_request();
-            RouterMetrics::record_embeddings_duration(start.elapsed());
-        } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_embeddings_error(&error_type);
-        }
-
-        res
+        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .await
     }
 
     async fn route_classify(
@@ -832,22 +763,8 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Record classification-specific metrics in addition to general request metrics
-        let start = Instant::now();
-        let res = self
-            .route_typed_request(headers, body, "/v1/classify", model_id)
-            .await;
-
-        // Classification specific metrics
-        if res.status().is_success() {
-            RouterMetrics::record_classify_request();
-            RouterMetrics::record_classify_duration(start.elapsed());
-        } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_classify_error(&error_type);
-        }
-
-        res
+        self.route_typed_request(headers, body, "/v1/classify", model_id)
+            .await
     }
 
     async fn route_rerank(

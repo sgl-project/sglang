@@ -2,7 +2,13 @@ mod create_worker;
 mod detect_connection;
 mod discover_dp;
 mod discover_metadata;
-mod removal;
+mod find_worker_to_update;
+mod find_workers_to_remove;
+mod remove_from_policy_registry;
+mod remove_from_worker_registry;
+mod update_policies_for_worker;
+mod update_remaining_policies;
+mod update_worker_properties;
 
 use std::{sync::Arc, time::Duration};
 
@@ -10,16 +16,45 @@ pub use create_worker::CreateLocalWorkerStep;
 pub use detect_connection::DetectConnectionModeStep;
 pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
-pub use removal::{
-    FindWorkersToRemoveStep, RemoveFromPolicyRegistryStep, RemoveFromWorkerRegistryStep,
-    UpdateRemainingPoliciesStep, WorkerRemovalRequest,
-};
+pub use find_worker_to_update::FindWorkerToUpdateStep;
+pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
+pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
+pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
+pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
+pub use update_remaining_policies::UpdateRemainingPoliciesStep;
+pub use update_worker_properties::UpdateWorkerPropertiesStep;
 
 use super::shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep};
 use crate::{
     config::RouterConfig,
+    core::{Worker, WorkerRegistry},
     workflow::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition},
 };
+
+/// Find workers by URL, supporting both DP-aware (prefix match) and regular (exact match) modes.
+///
+/// For DP-aware workers, finds all workers with URL prefix `{url}@`.
+/// For regular workers, finds the single worker with exact URL match.
+pub(crate) fn find_workers_by_url(
+    registry: &WorkerRegistry,
+    url: &str,
+    dp_aware: bool,
+) -> Vec<Arc<dyn Worker>> {
+    if dp_aware {
+        let worker_url_prefix = format!("{}@", url);
+        registry
+            .get_all()
+            .iter()
+            .filter(|worker| worker.url().starts_with(&worker_url_prefix))
+            .cloned()
+            .collect()
+    } else {
+        match registry.get_by_url(url) {
+            Some(worker) => vec![worker],
+            None => Vec::new(),
+        }
+    }
+}
 
 pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDefinition {
     let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
@@ -191,5 +226,57 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition {
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
             })
             .depends_on(&["remove_from_worker_registry"]),
+        )
+}
+
+/// Create a worker update workflow definition.
+///
+/// DAG structure:
+/// ```text
+///     find_worker_to_update
+///              │
+///     update_worker_properties
+///              │
+///     update_policies_for_worker
+/// ```
+pub fn create_worker_update_workflow() -> WorkflowDefinition {
+    WorkflowDefinition::new("worker_update", "Update worker properties")
+        .add_step(
+            StepDefinition::new(
+                "find_worker_to_update",
+                "Find worker to update",
+                Arc::new(FindWorkerToUpdateStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
+            }),
+        )
+        .add_step(
+            StepDefinition::new(
+                "update_worker_properties",
+                "Update worker properties",
+                Arc::new(UpdateWorkerPropertiesStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
+            })
+            .depends_on(&["find_worker_to_update"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "update_policies_for_worker",
+                "Update policies for updated worker",
+                Arc::new(UpdatePoliciesForWorkerStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
+            })
+            .depends_on(&["update_worker_properties"]),
         )
 }

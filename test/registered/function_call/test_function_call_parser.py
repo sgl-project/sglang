@@ -2034,12 +2034,12 @@ class TestGlm4MoeDetector(unittest.TestCase):
                     and tool_call_chunk.tool_index is not None
                 ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
+                        tool_calls.append({"name": "", "parameters": ""})
                     tc = tool_calls[tool_call_chunk.tool_index]
                     if tool_call_chunk.name:
                         tc["name"] = tool_call_chunk.name
                     if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
+                        tc["parameters"] += tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
@@ -2066,12 +2066,12 @@ class TestGlm4MoeDetector(unittest.TestCase):
                     and tool_call_chunk.tool_index is not None
                 ):
                     while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": {}})
+                        tool_calls.append({"name": "", "parameters": ""})
                     tc = tool_calls[tool_call_chunk.tool_index]
                     if tool_call_chunk.name:
                         tc["name"] = tool_call_chunk.name
                     if tool_call_chunk.parameters:
-                        tc["parameters"] = tool_call_chunk.parameters
+                        tc["parameters"] += tool_call_chunk.parameters
         self.assertEqual(len(tool_calls), 2)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
@@ -2102,19 +2102,33 @@ class TestGlm4MoeDetector(unittest.TestCase):
 
     def test_partial_tool_call(self):
         """Test parsing a partial tool call that spans multiple chunks."""
-        text1 = "<tool_call>get_weather\n<arg_key>city</arg_key>\n"
-        result1 = self.detector.parse_streaming_increment(text1, self.tools)
-        self.assertEqual(result1.normal_text, "")
-        self.assertEqual(result1.calls, [])
-        self.assertEqual(self.detector._buffer, text1)
-        text2 = "<arg_value>Beijing</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
-        result2 = self.detector.parse_streaming_increment(text2, self.tools)
-        self.assertEqual(len(result2.calls), 1)
-        self.assertEqual(result2.calls[0].name, "get_weather")
+        chunks = [
+            "<tool_call>get_weather\n",
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(
-            result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
         )
-        self.assertEqual(self.detector._buffer, "")
 
     def test_array_argument_with_escaped_json(self):
         """Test that array arguments with escaped JSON are properly handled without double-escaping."""
