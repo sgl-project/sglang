@@ -411,13 +411,7 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 def handle_attention_aiter(attn, forward_batch):
     if forward_batch.forward_mode.is_extend_without_speculative():
-        if is_dp_attention_enabled():
-            if sum(forward_batch.extend_prefix_lens_cpu) == 0:
-                return AttnForwardMethod.MHA
-            else:
-                return AttnForwardMethod.MLA
-        else:
-            return AttnForwardMethod.MHA
+        return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
 
