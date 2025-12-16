@@ -489,7 +489,7 @@ class TestPrioritySchedulingPreemption(unittest.TestCase):
             "preempt_to_schedule was not called",
         )
         count = adder._calls.get(id(dummy_req), 0)
-        self.assertGreaterEqual(
+        self.assertEqual(
             count, 2, f"expected add_one_req to be called twice; got {count}"
         )
         self.assertIsInstance(result_batch, ScheduleBatch)
@@ -511,7 +511,6 @@ def _verify_genereate_responses(
         expected_status, expected_err_msg = expected
 
         # Check status code is as expected
-        print(f"Got status: {got_status}, expected: {expected_status}")
         assert got_status == expected_status
 
         # Check error message content or fields' existence based on status code
