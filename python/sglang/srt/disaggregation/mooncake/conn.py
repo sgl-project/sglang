@@ -113,7 +113,6 @@ class KVArgsRegisterInfo:
     dst_tp_rank: int
     dst_attn_tp_size: int
     dst_kv_item_len: int
-    page_size: int
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -128,7 +127,6 @@ class KVArgsRegisterInfo:
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
-            page_size=int(msg[10].decode("ascii")),
         )
 
 
@@ -858,12 +856,6 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     register_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    if register_info.page_size != self.kv_args.page_size:
-                        raise ValueError(
-                            f"Page size mismatch: decode server has page_size={register_info.page_size}, "
-                            f"but prefill server has page_size={self.kv_args.page_size}. "
-                            f"Both servers must use the same --page-size value."
-                        )
                     self.decode_kv_args_table[mooncake_session_id] = register_info
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
@@ -1212,7 +1204,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
-            dst_page_size = str(self.kv_mgr.kv_args.page_size).encode("ascii")
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(
@@ -1227,7 +1218,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_tp_rank,
                         dst_attn_tp_size,
                         dst_kv_item_len,
-                        dst_page_size,
                     ]
                 )
 
