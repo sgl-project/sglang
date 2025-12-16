@@ -36,7 +36,7 @@ __global__ void count_and_sort_expert_tokens_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
-    if(expert_id >= 0 && expert_id < num_experts) {
+    if (expert_id >= 0 && expert_id < num_experts) {
       int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
       sorted_token_ids[rank_post_pad] = i;
     }
@@ -281,7 +281,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
-    if(expert_id >= 0 && expert_id < num_experts) {
+    if (expert_id >= 0 && expert_id < num_experts) {
       ++tokens_cnts[(tid + 1) * num_experts + expert_id];
     }
   }
