@@ -1,7 +1,6 @@
 import json
 import logging
 import re
-from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -72,9 +71,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
-        self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
         self.invoke_end_token = "</｜DSML｜invoke>"
         self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        self.partial_parameter_regex = (
+            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
+        )
+        self.function_calls_regex = (
+            r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>"
+        )
+        self.invoke_regex = (
+            r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)'
+        )
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
@@ -134,32 +141,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
             remaining_content = invoke_content[last_match_end:]
             # Match start of a parameter tag + value (potentially incomplete)
             # Regex: <tag name="..." string="...">VALUE... (no end tag)
-            partial_regex = (
-                r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*)$'
+            partial_match = re.search(
+                self.partial_parameter_regex, remaining_content, re.DOTALL
             )
-            partial_match = re.search(partial_regex, remaining_content, re.DOTALL)
 
             if partial_match:
                 param_name = partial_match.group(1)
-                param_type = partial_match.group(2)
                 param_value = partial_match.group(3)
-
-                # For partial values, we just take what we have so far
-                # We don't try JSON parsing for partial values unless they look complete,
-                # but simplistic approach is to just treat as string/partial value
-                if param_type == "true":
-                    # For strings, the value is just the content so far
-                    # We might need to be careful if the value itself contains partial closing tag
-                    # But greedy match .* at end should capture everything
-                    parameters[param_name] = param_value
-                else:
-                    # For non-strings (JSON), partial parsing is tricky without a dedicated parser
-                    # But we can try to return the raw string or try partial json
-                    parameters[param_name] = param_value
+                parameters[param_name] = param_value
 
         return parameters
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -176,7 +169,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         try:
             # Extract content between function_calls tags
             function_calls_match = re.search(
-                r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>",
+                self.function_calls_regex,
                 text,
                 re.DOTALL,
             )
@@ -186,14 +179,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            invoke_pattern = (
-                r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
-            )
             invoke_matches = re.findall(
-                invoke_pattern, function_calls_content, re.DOTALL
+                self.invoke_regex, function_calls_content, re.DOTALL
             )
 
-            for func_name, invoke_content in invoke_matches:
+            for func_name, invoke_content, _ in invoke_matches:
                 # Parse parameters from XML format
                 func_args = self._parse_parameters_from_xml(invoke_content)
                 # construct match_result for parse_base_json
@@ -207,7 +197,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
+        self, new_text: str, tools: list[Tool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing tool calls for DeepSeekV32 format.
@@ -241,16 +231,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
 
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
         all_calls: list[ToolCallItem] = []
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
-                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                    pattern=self.invoke_regex,
                     string=current_text,
                     flags=re.DOTALL,
                 )
