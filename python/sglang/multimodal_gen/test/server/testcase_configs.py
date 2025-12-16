@@ -321,7 +321,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "qwen_image_edit_2509_ti2i_url",
         DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit-2509",  # 假设的模型路径
+            model_path="Qwen/Qwen-Image-Edit-2509",
             modality="image",
             warmup_text=0,
             warmup_edit=1,

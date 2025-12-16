@@ -801,9 +801,7 @@ def get_generate_fn(
         else:
             fn = generate_video
     elif sampling_params.prompt and sampling_params.image_path:
-        if getattr(sampling_params, "direct_url_test", False) and is_image_url(
-            sampling_params.image_path
-        ):
+        if getattr(sampling_params, "direct_url_test", False):
             fn = generate_image_edit_url
         else:
             fn = generate_image_edit
