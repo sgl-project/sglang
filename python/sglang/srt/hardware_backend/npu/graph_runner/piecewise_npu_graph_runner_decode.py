@@ -40,14 +40,11 @@ from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_grap
     PiecewiseNpuGraphCompiler,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_runner import (
-    CudaGraphRunner,
-)
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     PPProxyTensors,
-    enable_num_token_non_padded,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_available_gpu_memory
@@ -109,7 +106,6 @@ class PiecewiseNPUGraphRunnerDecode(CudaGraphRunner):
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
-        self.enable_dp_attention = model_runner.server_args.enable_dp_attention
 
         # Graph inputs
         with torch.device(self.model_runner.device):
@@ -117,6 +113,14 @@ class PiecewiseNPUGraphRunnerDecode(CudaGraphRunner):
             self.block_tables = torch.full((160, 160), 0, dtype=torch.int32)
 
         super().__init__(model_runner)
+
+    def can_run(self, forward_batch: ForwardBatch):
+        return (
+            (self.pp_size <= 1)
+            and (not self.is_encoder_decoder)
+            and (not self.enable_two_batch_overlap)
+            and super().can_run(forward_batch)
+        )
 
     def capture(self, forward_batch_: ForwardBatch = None, bs_: int = None) -> None:
         with graph_capture() as graph_capture_context:
@@ -179,15 +183,6 @@ class PiecewiseNPUGraphRunnerDecode(CudaGraphRunner):
             input_ids = torch.zeros((bs,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-        assert self.is_encoder_decoder == False
-        encoder_lens = None
-        num_token_non_padded = None
-
-        assert self.pp_size <= 1
-        assert self.enable_dp_attention == False
-        global_num_tokens = None
-        gathered_buffer = None
-
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
@@ -205,10 +200,10 @@ class PiecewiseNPUGraphRunnerDecode(CudaGraphRunner):
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum(),
-            encoder_lens=encoder_lens,
+            encoder_lens=None,
             return_logprob=False,
             positions=positions,
-            global_num_tokens_gpu=global_num_tokens,
+            global_num_tokens_gpu=None,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -234,13 +229,6 @@ class PiecewiseNPUGraphRunnerDecode(CudaGraphRunner):
             forward_batch.seq_lens_cpu_int[i] = 7
             forward_batch.req_pool_indices[i] = 1
         forward_batch.seq_lens_sum = sum(forward_batch.seq_lens)
-
-        if self.enable_dp_attention:  # or self.enable_sp_layernorm:
-            assert False
-        assert self.pp_size <= 1
-        assert self.enable_dp_attention == False
-        assert enable_num_token_non_padded(self.model_runner.server_args) == False
-        assert self.enable_two_batch_overlap == False
 
         attn_backend.init_forward_metadata(forward_batch)
 
@@ -372,22 +360,10 @@ class PiecewiseNPUGraphRunnerDecode(CudaGraphRunner):
                 dim = pp_proxy_tensors[key].shape[0]
                 self.pp_proxy_tensors[key][:dim].copy_(pp_proxy_tensors[key])
 
-        if self.is_encoder_decoder:
-            assert False
-
         if forward_batch.mrope_positions is not None:
             compiled_graph.forward_batch.mrope_positions[:, :raw_num_token].copy_(
                 forward_batch.mrope_positions
             )
-
-        if self.enable_dp_attention:
-            assert False
-
-        if enable_num_token_non_padded(self.model_runner.server_args):
-            assert False
-
-        if self.enable_two_batch_overlap:
-            assert False
 
         # Store fields
         self.raw_bs = raw_bs
