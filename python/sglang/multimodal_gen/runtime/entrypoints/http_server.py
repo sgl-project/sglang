@@ -51,24 +51,22 @@ async def get_models(request: Request):
     response = {
         "model_path": server_args.model_path,
         "num_gpus": server_args.num_gpus,
+        "task_type": server_args.pipeline_config.task_type.name,
+        "dit_precision": server_args.pipeline_config.dit_precision,
+        "vae_precision": server_args.pipeline_config.vae_precision,
+        "workload_type": server_args.workload_type.value,
     }
 
-    if task_type_enum := getattr(server_args.pipeline_config, "task_type", None):
-        response["task_type"] = task_type_enum.name
-
-    if workload_type_enum := getattr(server_args, "workload_type", None):
-        response["workload_type"] = workload_type_enum.value
-
     if model_info:
-        if pipeline_name := getattr(model_info.pipeline_cls, "pipeline_name", None):
-            response["pipeline_name"] = pipeline_name
-        response["pipeline_class"] = model_info.pipeline_cls.__name__
-
-    if dit_precision := getattr(server_args.pipeline_config, "dit_precision", None):
-        response["dit_precision"] = dit_precision
-
-    if vae_precision := getattr(server_args.pipeline_config, "vae_precision", None):
-        response["vae_precision"] = vae_precision
+        if (
+            hasattr(model_info.pipeline_cls, "pipeline_name")
+            and model_info.pipeline_cls.pipeline_name
+        ):
+            response["pipeline_name"] = model_info.pipeline_cls.pipeline_name
+        else:
+            response["pipeline_name"] = model_info.pipeline_cls.__name__
+        if hasattr(model_info.pipeline_cls, "__name__"):
+            response["pipeline_class"] = model_info.pipeline_cls.__name__
 
     return response
 
