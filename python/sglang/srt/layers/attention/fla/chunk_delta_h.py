@@ -16,18 +16,9 @@ from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
+CHUNK_SIZE = 64
 
 
-@triton.heuristics(
-    {
-        "USE_G": lambda args: args["g"] is not None,
-        "USE_GK": lambda args: args["gk"] is not None,
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-        "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 # @triton.autotune(
 #     configs=[
 #         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
@@ -284,16 +275,15 @@ def chunk_gated_delta_rule_fwd_h(
     gk: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
-    chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
-    BT = chunk_size
+    BT = CHUNK_SIZE
 
     chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
+        prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
         if cu_seqlens is not None
         else None
     )
@@ -337,6 +327,12 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         BV=32,
+        USE_G=g is not None,
+        USE_GK=gk is not None,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=final_state is not None,
+        SAVE_NEW_VALUE=v_new is not None,
+        IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=2,
     )
