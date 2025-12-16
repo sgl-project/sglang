@@ -830,10 +830,16 @@ class Scheduler(
             and server_args.disaggregation_decode_enable_offload_kvcache
         ):
             if server_args.enable_lmcache:
-                from sglang.srt.mem_cache.storage.lmcache.lmc_decode_offload_manager import LMCCacheDecodeKVCacheOffloadManager
+                from sglang.srt.mem_cache.storage.lmcache.lmc_decode_offload_manager import (
+                    LMCCacheDecodeKVCacheOffloadManager,
+                )
+
                 offload_cls = LMCCacheDecodeKVCacheOffloadManager
             else:
-                from sglang.srt.mem_cache.hicache_decode_offload_manager import HiCacheDecodeKVCacheOffloadManager
+                from sglang.srt.mem_cache.hicache_decode_offload_manager import (
+                    HiCacheDecodeKVCacheOffloadManager,
+                )
+
                 offload_cls = HiCacheDecodeKVCacheOffloadManager
             self.decode_offload_manager = offload_cls(
                 model_config=self.model_config,

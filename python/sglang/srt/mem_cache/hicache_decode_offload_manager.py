@@ -7,12 +7,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.disaggregation.base.decode_kvcache_offload_manager import DecodeKVCacheOffloadManager
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
+from sglang.srt.disaggregation.base.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
 )
+from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
@@ -211,7 +210,7 @@ class HiCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
         page_hashes = []
         last_hash = prior_hash
         for offset in range(0, len(tokens), self.page_size):
-            page_tokens = tokens[offset: offset + self.page_size]
+            page_tokens = tokens[offset : offset + self.page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes

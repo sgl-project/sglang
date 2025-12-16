@@ -1,22 +1,13 @@
 from __future__ import annotations
 
 import logging
-import threading
-import time
 from typing import TYPE_CHECKING
 
-import torch
+from sglang.srt.disaggregation.base.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
-from sglang.srt.disaggregation.base.decode_kvcache_offload_manager import DecodeKVCacheOffloadManager
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-)
 try:
     from lmcache.integration.sglang.sglang_adapter import (
         LMCacheConnector,
@@ -28,7 +19,7 @@ except ImportError as e:
     ) from e
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +34,9 @@ class LMCCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
         if isinstance(kv_cache, MHATokenToKVPool):
             pass
         elif isinstance(kv_cache, MLATokenToKVPool):
-            raise ValueError("MLA is not supported yet in LMCache decode offload manager")
+            raise ValueError(
+                "MLA is not supported yet in LMCache decode offload manager"
+            )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")
 
@@ -65,7 +58,6 @@ class LMCCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
         token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
         if token_indices.dim() == 0 or token_indices.numel() == 0:
             return False
-
 
         all_tokens = req.origin_input_ids + req.output_ids[:-1]
         prefill_offloaded_len = (

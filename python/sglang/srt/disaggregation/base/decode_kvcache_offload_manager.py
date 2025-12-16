@@ -1,15 +1,15 @@
 from __future__ import annotations
-from abc import ABC, abstractmethod
-import logging
-from typing import TYPE_CHECKING
-import torch
-from sglang.srt.configs.model_config import ModelConfig
 
+import logging
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    ReqToTokenPool,
-)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
