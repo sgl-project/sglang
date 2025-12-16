@@ -49,6 +49,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    PostProcessWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -632,6 +633,22 @@ class Engine(EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
+        )
+
+    def post_process_weights(
+        self,
+        enable_quant_post_process: bool = True,
+    ):
+        """
+        Optional post-processing for updated weights (e.g., Marlin conversion).
+        Should be called after weight update is finished.
+        """
+        obj = PostProcessWeightsReqInput(
+            enable_quant_post_process=enable_quant_post_process,
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.post_process_weights(obj, None)
         )
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):

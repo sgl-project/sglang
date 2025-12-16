@@ -1253,6 +1253,18 @@ class UpdateWeightsFromIPCReqOutput(BaseReq):
 
 
 @dataclass
+class PostProcessWeightsReqInput(BaseReq):
+    # Whether to enable quantization post-processing
+    enable_quant_post_process: bool = True
+
+
+@dataclass
+class PostProcessWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str
