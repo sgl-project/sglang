@@ -1,14 +1,15 @@
 import asyncio
 import os
 import re
-import unittest
-from unittest import mock
-from typing import Any, List, Optional, Tuple
 import types
+import unittest
+from typing import Any, List, Optional, Tuple
+from unittest import mock
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.grpc.sglang_scheduler_pb2 import SamplingParams
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers import scheduler as scheduler_mod
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -21,9 +22,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     send_concurrent_generate_requests_with_custom_params,
 )
-from sglang.srt.managers import scheduler as scheduler_mod
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
 class TestPriorityScheduling(CustomTestCase):
@@ -513,6 +511,7 @@ def _verify_genereate_responses(
         expected_status, expected_err_msg = expected
 
         # Check status code is as expected
+        print(f"Got status: {got_status}, expected: {expected_status}")
         assert got_status == expected_status
 
         # Check error message content or fields' existence based on status code
