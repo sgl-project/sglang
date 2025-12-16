@@ -1,3 +1,4 @@
+import importlib.util
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -7,7 +8,6 @@ import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-import nvshmem.core
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -25,8 +25,9 @@ from cutlass.cute.typing import (
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
-    import nvshmem.core
-except ImportError as exc:
+    if importlib.util.find_spec("nvshmem") is None:
+        raise ImportError
+except ImportError:
     raise ImportError(
         "nvshmem4py is required but not installed. Please install it using:\n"
         "  For CUDA 12: pip install nvshmem4py-cu12\n"
@@ -268,7 +269,7 @@ class PersistentDenseGemmKernel:
         - Computing MMA/cluster/tile shapes
         - Computing cluster layout
         - Computing multicast CTAs for A/B
-        - Computing epilogue subtile
+        - Computing epilogue sub-tile
         - Setting up A/B/C stage counts in shared memory
         - Computing A/B/C shared memory layout
         - Computing tensor memory allocation columns
@@ -309,7 +310,7 @@ class PersistentDenseGemmKernel:
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        # Compute epilogue subtile
+        # Compute epilogue sub-tile
         if cutlass.const_expr(self.use_tma_store):
             self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
                 self.cta_tile_shape_mnk,
@@ -972,6 +973,7 @@ class PersistentDenseGemmKernel:
             else:
                 self.epilogue_release_flag(
                     tidx,
+                    warp_idx,
                     acc_pipeline,
                     tiled_mma,
                     tCtAcc_base,
@@ -1142,7 +1144,7 @@ class PersistentDenseGemmKernel:
                 #
                 # This ensure
                 # 1. no rank early exit while other ranks are still issuing multimem.ld_reduce
-                # 2. each rank's prior multimem.st have become visiable to all other ranks in the system (w/ .SYS scope)
+                # 2. each rank's prior multimem.st have become visible to all other ranks in the system (w/ .SYS scope)
                 if warp_idx == self.all_reduce_warp_id[0]:
                     with cute.arch.elect_one():
                         # Offset to last tile flag idx
@@ -1267,15 +1269,15 @@ class PersistentDenseGemmKernel:
             bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
             #
-            # Store accumulator to global memory in subtiles
+            # Store accumulator to global memory in sub-tiles
             #
-            subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-            num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
-            for subtile_idx in cutlass.range(subtile_cnt):
+            sub_tile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+            num_prev_sub_tiles = tile_sched.num_tiles_executed * sub_tile_cnt
+            for sub_tile_idx in cutlass.range(sub_tile_cnt):
                 #
                 # Load accumulator from tensor memory buffer to register
                 #
-                tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                tTR_tAcc_mn = tTR_tAcc[(None, None, None, sub_tile_idx)]
                 cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                 #
@@ -1288,7 +1290,7 @@ class PersistentDenseGemmKernel:
                 #
                 # Store C to shared memory
                 #
-                c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
+                c_buffer = (num_prev_sub_tiles + sub_tile_idx) % self.num_c_stage
                 cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
                 # Fence and barrier to make sure shared memory store is visible to TMA store
                 cute.arch.fence_proxy(
@@ -1304,7 +1306,7 @@ class PersistentDenseGemmKernel:
                     cute.copy(
                         tma_atom_c,
                         bSG_sC[(None, c_buffer)],
-                        bSG_gC[(None, subtile_idx)],
+                        bSG_gC[(None, sub_tile_idx)],
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     c_pipeline.producer_commit()
@@ -1352,6 +1354,7 @@ class PersistentDenseGemmKernel:
     def epilogue_release_flag(
         self,
         epi_tidx: cutlass.Int32,
+        warp_idx: cutlass.Int32,
         acc_pipeline: pipeline.PipelineAsync,
         tiled_mma: cute.TiledMma,
         tCtAcc_base: cute.Tensor,
@@ -1416,14 +1419,14 @@ class PersistentDenseGemmKernel:
             acc_pipeline.consumer_wait(acc_consumer_state)
 
             #
-            # Store accumulator to global memory in subtiles
+            # Store accumulator to global memory in sub-tiles
             #
-            subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-            for subtile_idx in cutlass.range(subtile_cnt):
+            sub_tile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+            for sub_tile_idx in cutlass.range(sub_tile_cnt):
                 #
                 # Load accumulator from tensor memory buffer to register
                 #
-                tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                tTR_tAcc_mn = tTR_tAcc[(None, None, None, sub_tile_idx)]
                 cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                 #
@@ -1436,7 +1439,7 @@ class PersistentDenseGemmKernel:
                 #
                 # Store C to global memory
                 #
-                cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
+                cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, sub_tile_idx)])
 
             #
             # Async arrive accumulator buffer empty
@@ -1456,7 +1459,6 @@ class PersistentDenseGemmKernel:
             # Wait for C store complete
             # Unlike regular epilogue where we only wait C store complete once at end of each kernel.
             # Here we need to wait for C store complete for each output tile before we set the release flag.
-            c_pipeline.producer_tail()
             # Update flag with release semantic with GPU scope
             if warp_idx == self.epilogue_warp_id[0]:
                 with cute.arch.elect_one():
