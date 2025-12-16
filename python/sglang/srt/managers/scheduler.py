@@ -153,7 +153,9 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -732,8 +734,8 @@ class Scheduler(
             ),
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
-            enable_kv_cache_events=self.enable_kv_cache_events,
             gpu_id=self.gpu_id,
+            enable_kv_cache_events=self.enable_kv_cache_events,
         )
 
         if (
@@ -798,6 +800,32 @@ class Scheduler(
                 )
             else:
                 self.tree_cache = RadixCache(params)
+
+        # For L3 storage scenarios in disaggregation mode, decode instance can be used to expand storage capacity
+        if (
+            server_args.disaggregation_mode == "decode"
+            and not self.enable_hierarchical_cache_direct
+            and not self.enable_hierarchical_cache
+            and envs.SGLANG_ENABLE_DECODE_DISTRIBUTED_KV_POOL.get()
+            and server_args.hicache_storage_backend is not None
+        ):
+            storage_config = HiCacheStorageConfig(
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                is_mla_model=False,
+                is_page_first_layout=False,
+                model_name=None,
+                extra_config={"device_id": self.gpu_id},
+            )
+            try:
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    server_args.hicache_storage_backend, storage_config, None
+                )
+            except ValueError as e:
+                logger.error(
+                    f"Failed to init distributed kv pool {server_args.hicache_storage_backend} "
+                    f"for disaggregation_mode=decode: {e}"
+                )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -1782,7 +1810,6 @@ class Scheduler(
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            self.enable_hierarchical_cache_direct,
         )
 
         if self.chunked_req is not None:

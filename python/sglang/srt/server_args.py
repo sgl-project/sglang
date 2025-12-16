@@ -1867,6 +1867,8 @@ class ServerArgs:
             ), "Cannot set --disaggregation-decode-dp for the decode engine."
 
             self.disable_radix_cache = True
+            self.enable_hierarchical_cache = False
+            self.enable_hierarchical_cache_direct = False
             logger.warning("KV cache is forced as chunk cache for decode server")
 
             if self.dp_size > 1 and not is_in_ci():

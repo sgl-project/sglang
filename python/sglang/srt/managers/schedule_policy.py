@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -329,11 +329,10 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
-        enable_hierarchical_cache_direct: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
-        self.enable_hierarchical_cache_direct = enable_hierarchical_cache_direct
+        self.enable_hierarchical_cache_direct = get_global_server_args().enable_hierarchical_cache_direct
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio

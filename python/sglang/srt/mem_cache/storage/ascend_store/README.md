@@ -24,7 +24,7 @@ bash script/build_and_pack_run.sh
 cd output
 bash memcache_hybrid-1.0.0_linux_aarch64.run
 
-# install LocalService
+# install LocalService in sglang nodes
 pip3 install memcache/wheel/memcache_hybrid-1.0.0-cp311-cp311-linux_aarch64.whl
 ```
 
@@ -37,7 +37,7 @@ git clone https://gitcode.com/Ascend/memfabric_hybrid.git
 cd memfabric_hybrid
 bash script/build_and_pack_run.sh
 
-# install MemFabric
+# install MemFabric in sglang nodes
 cd output
 bash memfabric_hybrid-1.0.0_linux_aarch64.run
 pip3 install memfabric_hybrid/wheel/memfabric_hybrid-1.0.0-cp311-cp311-linux_aarch64.whl
@@ -67,25 +67,23 @@ You need modify the configuration file content.<br>
 For more detailed introduction of configuration items, please refer to [MemCache Configs](https://gitcode.com/Ascend/memcache/blob/master/doc/memcached_config.md).<br>
 2). MetaService supports certificate-based secure communication.
 However, you can disable certificate verification by setting xxx.xxx.tls.enable to false to achieve better performance, which may be accompanied by security risks.<br>
-3). MetaService can also be launched via python method, For details, refer to
-https://gitcode.com/Ascend/memcache/blob/develop/README.md
-
 
 ### 2. Start the SGLang server with memcache(local-service).
+Support Normal and Disaggregation modes.
 
+#### 2.1 Normal Mode
 ```
 # 1. set local service config
 export MMC_LOCAL_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-local.conf
 
-# 2. launch sglang with --enable-hierarchical-cache and --hicache-storage-backend=memcache
+# 2. launch sglang with --enable-hierarchical-cache-direct and --hicache-storage-backend=memcache
 python3 -m sglang.launch_server \
     --model-path /data/Qwen3-32B \
     --host 127.0.0.1 \
-    --port 28002 \
+    --port 18001 \
     --trust-remote-code \
-    --tp-size 2 \
-    --mem-fraction-static 0.85 \
-    --base-gpu-id 14 \
+    --tp-size 4 \
+    --mem-fraction-static 0.8 \
     --attention-backend ascend \
     --device npu \
     --log-level info \
@@ -96,10 +94,61 @@ python3 -m sglang.launch_server \
     --enable-hierarchical-cache-direct \
     --hicache-storage-backend memcache &
 ```
+
+#### 2.2 Disaggregation Mode.
+```
+# 1. launch prefill sglang with --enable-hierarchical-cache-direct and --hicache-storage-backend=memcache
+# set local service config
+export MMC_LOCAL_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-local.conf
+python3 -m sglang.launch_server \
+    --model-path /data/Qwen3-32B \
+    --host 127.0.0.1 \
+    --port 18001 \
+    --disaggregation-mode prefill \
+    --disaggregation-bootstrap-port 8998 \
+    --disaggregation-transfer-backend ascend \
+    --trust-remote-code \
+    --tp-size 4 \
+    --base-gpu-id 0 \
+    --mem-fraction-static 0.8 \
+    --attention-backend ascend \
+    --device npu \
+    --log-level info \
+    --max-running-requests 8 \
+    --context-length 3800 \
+    --chunked-prefill-size 57344 \
+    --max-prefill-tokens 30400 \
+    --enable-hierarchical-cache-direct \
+    --hicache-storage-backend memcache &
+
+# 3. launch decode sglang with --hicache-storage-backend=memcache# set local service config
+export MMC_LOCAL_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-local.conf
+export SGLANG_ENABLE_DECODE_DISTRIBUTED_KV_POOL=1
+python3 -m sglang.launch_server \
+    --model-path /data/Qwen3-32B \
+    --host 127.0.0.1 \
+    --port 28002 \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --trust-remote-code \
+    --tp-size 4 \
+    --base-gpu-id 4 \
+    --mem-fraction-static 0.8 \
+    --attention-backend ascend \
+    --device npu \
+    --log-level info \
+    --max-running-requests 8 \
+    --context-length 3800 \
+    --chunked-prefill-size 57344 \
+    --max-prefill-tokens 30400 \
+    --hicache-storage-backend memcache &
+```
+
 1). The MMC_LOCAL_CONFIG_PATH environment variable specifies the configuration file of LocaService.
 You need modify the configuration file content.<br>
 For more detailed introduction of configuration items, please refer to [MemCache Configs](https://gitcode.com/Ascend/memcache/blob/master/doc/memcached_config.md).<br>
 <br>
 2). LocalService is integrated into the tp worker process.
 LocalService communication supports certificate-based secure authentication.
-However, you can disable certificate verification by setting xxx.xxx.tls.enable to false to achieve better performance, which may be accompanied by security risks.
+However, you can disable certificate verification by setting xxx.xxx.tls.enable to false to achieve better performance, which may be accompanied by security risks.<br>
+3). In disaggregation mode, the decode sglang instance can also be launched without memcache by removing `--hicache-storage-backend` and `unset SGLANG_ENABLE_DECODE_DISTRIBUTED_KV_POOL`
