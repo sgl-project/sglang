@@ -180,6 +180,15 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
 
+        # For Nunchaku models, rotary_emb is None because they compute RoPE internally.
+        # In this case, we just pass img_shapes and txt_seq_lens directly.
+        if rotary_emb is None:
+            return {
+                "img_shapes": img_shapes,
+                "txt_seq_lens": txt_seq_lens,
+            }
+
+        # For SGLang native models, compute freqs_cis externally and pass it in.
         (img_cos, img_sin), (txt_cos, txt_sin) = self.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
@@ -248,6 +257,16 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             ],
         ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
+
+        # For Nunchaku models, rotary_emb is None because they compute RoPE internally.
+        # In this case, we just pass img_shapes and txt_seq_lens directly.
+        if rotary_emb is None:
+            return {
+                "img_shapes": img_shapes,
+                "txt_seq_lens": txt_seq_lens,
+            }
+
+        # For SGLang native models, compute freqs_cis externally and pass it in.
         (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )

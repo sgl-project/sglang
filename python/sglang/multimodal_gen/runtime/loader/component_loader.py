@@ -730,10 +730,15 @@ class TransformerLoader(ComponentLoader):
             logger.info(
                 "Using quantized model weights from: %s", weights_path
             )
+            # quantized_model_path can be a single .safetensors file or a directory
+            if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
+                safetensors_list = [weights_path]
+            else:
+                safetensors_list = _list_safetensors_files(weights_path)
         else:
             weights_path = component_model_path
+            safetensors_list = _list_safetensors_files(weights_path)
 
-        safetensors_list = _list_safetensors_files(weights_path)
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {weights_path}")
 

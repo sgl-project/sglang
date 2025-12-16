@@ -35,13 +35,16 @@ class QwenImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
-            # QKV fusion mappings
+            # QKV fusion mappings (for original diffusers checkpoints with separate Q/K/V)
             r"(.*)\.to_q\.(weight|bias)$": (r"\1.to_qkv.\2", 0, 3),
             r"(.*)\.to_k\.(weight|bias)$": (r"\1.to_qkv.\2", 1, 3),
             r"(.*)\.to_v\.(weight|bias)$": (r"\1.to_qkv.\2", 2, 3),
             r"(.*)\.add_q_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 0, 3),
             r"(.*)\.add_k_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 1, 3),
             r"(.*)\.add_v_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 2, 3),
+            # Nunchaku quantized checkpoint mappings (fused QKV already, different param names)
+            # add_qkv_proj -> to_added_qkv (Nunchaku uses add_qkv_proj, sglang uses to_added_qkv)
+            r"(.*)\.add_qkv_proj\.(.+)$": r"\1.to_added_qkv.\2",
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
         }
