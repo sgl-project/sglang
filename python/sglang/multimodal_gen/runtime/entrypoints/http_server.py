@@ -58,15 +58,8 @@ async def get_models(request: Request):
     }
 
     if model_info:
-        if (
-            hasattr(model_info.pipeline_cls, "pipeline_name")
-            and model_info.pipeline_cls.pipeline_name
-        ):
-            response["pipeline_name"] = model_info.pipeline_cls.pipeline_name
-        else:
-            response["pipeline_name"] = model_info.pipeline_cls.__name__
-        if hasattr(model_info.pipeline_cls, "__name__"):
-            response["pipeline_class"] = model_info.pipeline_cls.__name__
+        response["pipeline_name"] = model_info.pipeline_cls.pipeline_name
+        response["pipeline_class"] = model_info.pipeline_cls.__name__
 
     return response
 
