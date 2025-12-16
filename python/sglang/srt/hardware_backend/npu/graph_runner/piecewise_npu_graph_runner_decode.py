@@ -40,16 +40,17 @@ from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_grap
     PiecewiseNpuGraphCompiler,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.cuda_graph_runner import get_batch_sizes_to_capture
+from sglang.srt.model_executor.cuda_graph_runner import (
+    CudaGraphRunner,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     PPProxyTensors,
     enable_num_token_non_padded,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_available_gpu_memory, rank0_log
+from sglang.srt.utils import get_available_gpu_memory
 
 torch._dynamo.config.skip_nnmodule_hook_guards = True
 torch._dynamo.config.automatic_dynamic_shapes = False
@@ -63,7 +64,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 
 torch.cuda.CUDAGraph = torch.npu.NPUGraph
 torch.cuda.synchronize = torch.npu.synchronize
@@ -88,13 +88,12 @@ class CompiledGraph:
         self.callable = callable
 
 
-class PiecewiseNPUGraphRunnerDecode:
+class PiecewiseNPUGraphRunnerDecode(CudaGraphRunner):
     """A PiecewiseNPUGraphRunnerDecode runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         model_runner.attn_backend.enable_piecewise_npu_graph_decode = True
         patch_dynamo_context()
-        self.inference_counter = 1
         self.init_forward_metadata_was_done = True
 
         # Parse args
@@ -110,143 +109,16 @@ class PiecewiseNPUGraphRunnerDecode:
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
-        # self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
-        self.enable_two_batch_overlap = (
-            model_runner.server_args.enable_two_batch_overlap
-        )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
-        self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
-        self.pp_size = model_runner.server_args.pp_size
-
-        # Batch sizes to capture
-        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture npu graph bs {self.capture_bs}")
-        self.capture_forward_mode: int = ForwardMode.DECODE
-        self.capture_hidden_mode: int = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_eagle():
-            if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen")
-            else:
-                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
-                )
-
-        # Attention backend
-        self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.model_runner.attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
-        self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
-        )
-        # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
-        self.encoder_len_fill_value = 0
-        self.seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
 
         # Graph inputs
         with torch.device(self.model_runner.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-            )
-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-
             self.block_tables = torch.full((160, 160), 0, dtype=torch.int32)
 
-            # pipeline parallelism
-            if self.pp_size > 1:
-                self.pp_proxy_tensors = {
-                    "hidden_states": torch.zeros(
-                        (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
-                    ),
-                    "residual": torch.zeros(
-                        (self.max_bs, self.model_runner.model_config.hidden_size),
-                        dtype=torch.bfloat16,
-                    ),
-                }
+        super().__init__(model_runner)
 
-            # Speculative_inference
-            if model_runner.spec_algorithm.is_eagle3():
-                self.model_runner.model.set_eagle3_layers_to_capture()
-
-            if self.is_encoder_decoder:
-                # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
-                self.encoder_lens = torch.full(
-                    (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int32
-                )
-            else:
-                self.encoder_lens = None
-
-            if self.enable_dp_attention:  # or self.enable_sp_layernorm:
-                # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
-                self.gathered_buffer = torch.zeros(
-                    (
-                        self.max_bs * self.dp_size * self.num_tokens_per_bs,
-                        self.model_runner.model_config.hidden_size,
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
-                self.global_num_tokens_gpu = torch.zeros(
-                    (self.dp_size,), dtype=torch.int32
-                )
-
-        try:
-            with model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Graph compilation failed: {e}\n{NPU_GRAPH_CAPTURE_FAILED_MSG}"
-            )
-
-    def can_run(self, forward_batch: ForwardBatch):
-        if self.enable_dp_attention:  # or self.enable_sp_layernorm:
-            total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
-
-            is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                total_global_tokens in self.graphs
-                if self.disable_padding
-                else total_global_tokens <= self.max_bs
-            )
-        else:
-            is_bs_supported = (
-                forward_batch.batch_size in self.graphs
-                if self.disable_padding
-                else forward_batch.batch_size <= self.max_bs
-            )
-
-        # NOTE: npu graph cannot handle mixed batch (encoder_len = 0)
-        # If mixed batch cannot be supported, then encoder_lens can be removed in npu graph
-        # because the full_text_row_masked_out_mask tensor will always be ones
-        is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
-            if self.is_encoder_decoder
-            else True
-        )
-
-        is_tbo_supported = (
-            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
-        )
-
-        can_run_value = (
-            is_bs_supported and is_encoder_lens_supported and is_tbo_supported
-        )
-        return can_run_value
-
-    def capture(self, forward_batch_: ForwardBatch = None, bs_: int = None):
+    def capture(self, forward_batch_: ForwardBatch = None, bs_: int = None) -> None:
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
 
@@ -450,10 +322,14 @@ class PiecewiseNPUGraphRunnerDecode:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.enable_dp_attention:
-            index = bisect.bisect_left(
-                self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens / self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else max_num_tokens
             )
+            index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
@@ -575,43 +451,3 @@ class PiecewiseNPUGraphRunnerDecode:
             )
 
         return result
-
-    def get_spec_info(self, num_tokens: int):
-        spec_info = None
-        if self.model_runner.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
-
-            if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen.")
-            else:
-                spec_info = EagleVerifyInput(
-                    draft_token=None,
-                    custom_mask=torch.ones(
-                        (num_tokens * self.model_runner.model_config.context_len),
-                        dtype=torch.bool,
-                        device=self.model_runner.device,
-                    ),
-                    positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
-                    spec_steps=self.model_runner.server_args.speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    seq_lens_sum=None,
-                    seq_lens_cpu=None,
-                )
-
-        return spec_info
-
-
-NPU_GRAPH_CAPTURE_FAILED_MSG = (
-    "Possible solutions:\n"
-    "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-    "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
-    "3. disable torch compile by not using --enable-torch-compile\n"
-    "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
-    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
-)
