@@ -139,9 +139,6 @@ class TestLoraOps(CustomTestCase):
         lora_indices_tensor = torch.randint(
             num_loras, (batch_size,), dtype=torch.int32, device="cpu"
         )
-        seq_len_tensor = torch.randint(
-            num_loras, (batch_size,), dtype=torch.int32, device="cpu"
-        )
         lora_ranks_tensor = torch.tensor(lora_ranks, dtype=torch.int32, device="cpu")
         lora_scaling_tensor = torch.tensor(
             lora_scaling, dtype=torch.float16, device="cpu"
