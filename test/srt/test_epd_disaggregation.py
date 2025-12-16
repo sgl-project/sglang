@@ -177,6 +177,7 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
         subprocess.run(cmd, check=True, timeout=3600)
 
+    @unittest.skip("Skipping because multi-encoder test already covers functionality.")
     def test_mmmu(self):
         """Test MMMU evaluation with EPD disaggregation"""
         import glob
