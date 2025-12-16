@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
@@ -249,6 +252,8 @@ class QwenImageCrossAttention(nn.Module):
         context_pre_only: bool = False,
         parallel_attention=False,
         out_dim: int = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -267,6 +272,8 @@ class QwenImageCrossAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=num_heads,
             bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
 
         if self.qk_norm:
@@ -283,17 +290,31 @@ class QwenImageCrossAttention(nn.Module):
                 head_size=head_dim,
                 total_num_heads=num_heads,
                 bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_added_qkv",
             )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = ReplicatedLinear(
+                self.inner_dim,
+                self.dim,
+                bias=out_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
+            )
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                ReplicatedLinear(
+                    self.inner_dim,
+                    self.dim,
+                    bias=out_bias,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
             )
         else:
             self.to_out = None
@@ -402,6 +423,8 @@ class QwenImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -412,8 +435,12 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -424,6 +451,8 @@ class QwenImageTransformerBlock(nn.Module):
             added_kv_proj_dim=dim,
             context_pre_only=False,
             head_dim=attention_head_dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
         self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.img_mlp = FeedForward(
@@ -433,8 +462,12 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -443,6 +476,36 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
+
+        # Optionally replace FeedForward with NunchakuFeedForward when using NunchakuConfig.
+        # This mirrors Nunchaku's own transformer_qwenimage implementation where the MLP
+        # is quantized with SVDQ W4A4.
+        if (
+            quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "svdquant"
+        ):
+            try:
+                # Nunchaku is an optional dependency.
+                from nunchaku.models.attention import (  # type: ignore[import]
+                    NunchakuFeedForward,
+                )
+            except Exception:  # ImportError and others
+                logger.warning(
+                    "NunchakuConfig provided but `nunchaku` package is not available; "
+                    "keeping standard FeedForward layers."
+                )
+            else:
+                # Use parameters directly from NunchakuConfig so that precision/rank
+                # and activation quantization behavior are consistent with the
+                # quantized linear layers.
+                nunchaku_kwargs = {
+                    "precision": quant_config.precision,
+                    "rank": quant_config.rank,
+                    "act_unsigned": quant_config.act_unsigned,
+                }
+                self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
+                self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
     def _modulate(self, x, mod_params):
         """Apply modulation to input tensor"""
@@ -537,6 +600,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         self,
         config: QwenImageDitConfig,
         hf_config: dict[str, Any],
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
         patch_size = config.arch_config.patch_size
@@ -567,8 +631,10 @@ class QwenImageTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{layer_idx}",
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 

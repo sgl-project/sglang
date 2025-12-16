@@ -131,9 +131,14 @@ def load_nunchaku_model(
     # Get the appropriate model class
     model_class = _get_nunchaku_model_class(model_type)
     
-    # Get Nunchaku-specific kwargs
-    nunchaku_kwargs = quantization_config.get_nunchaku_kwargs()
-    nunchaku_kwargs["torch_dtype"] = torch_dtype
+    # Get Nunchaku-specific kwargs for model initialization.
+    # We only rely on quantization parameters here; attention processor
+    # selection is handled separately at the model level.
+    nunchaku_kwargs = {
+        "precision": quantization_config.precision,
+        "rank": quantization_config.rank,
+        "torch_dtype": torch_dtype,
+    }
     
     logger.info(f"Loading {model_class.__name__} with kwargs: {nunchaku_kwargs}")
     
@@ -254,7 +259,6 @@ def create_nunchaku_config_from_server_args(server_args) -> NunchakuConfig:
         rank=getattr(server_args, "quantization_rank", 32),
         act_unsigned=getattr(server_args, "quantization_act_unsigned", False),
         quantized_model_path=getattr(server_args, "quantized_model_path", None),
-        processor=getattr(server_args, "quantization_processor", "flashattn2"),
         enable_offloading=getattr(server_args, "quantization_enable_offloading", False),
     )
 

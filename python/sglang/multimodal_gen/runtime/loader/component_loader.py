@@ -9,6 +9,7 @@ import json
 import os
 import time
 import traceback
+import inspect
 from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
@@ -604,6 +605,86 @@ class VAELoader(ComponentLoader):
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
+    def _get_quant_config(self, server_args: ServerArgs):
+        """
+        Get quantization configuration from server_args if enabled.
+
+        Returns:
+            NunchakuConfig if quantization is enabled, None otherwise.
+        """
+        if not getattr(server_args, "enable_quantization", False):
+            return None
+
+        quantized_path = getattr(server_args, "quantized_model_path", None)
+        if not quantized_path:
+            return None
+
+        # Import and create NunchakuConfig
+        from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
+            create_nunchaku_config_from_server_args,
+        )
+        return create_nunchaku_config_from_server_args(server_args)
+
+    def _load_nunchaku_transformer(
+        self,
+        server_args: ServerArgs,
+        quant_config,
+        model_type: str,
+        default_dtype: torch.dtype,
+    ):
+        """
+        Load a Nunchaku quantized transformer using full model replacement.
+
+        This follows the AWQ pattern but uses Nunchaku's pre-quantized models
+        for complex architectures like Qwen-Image where layer-by-layer
+        quantization is not practical.
+
+        Args:
+            server_args: Server configuration arguments.
+            quant_config: NunchakuConfig instance.
+            model_type: Type of model (e.g., "qwen_image", "flux").
+            default_dtype: Default dtype for non-quantized parameters.
+
+        Returns:
+            Loaded quantized transformer model.
+        """
+        from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
+            load_nunchaku_model,
+        )
+
+        logger.info(
+            "Loading Nunchaku quantized transformer: %s with config: %s",
+            model_type,
+            quant_config,
+        )
+
+        model = load_nunchaku_model(
+            model_type=model_type,
+            quantization_config=quant_config,
+            torch_dtype=default_dtype,
+            device=get_local_torch_device(),
+        )
+
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(
+            "Loaded Nunchaku quantized model with %.2fB parameters",
+            total_params / 1e9,
+        )
+
+        return model.eval()
+
+    def _infer_model_type(self, cls_name: str) -> str:
+        """Infer model type from class name for Nunchaku loading."""
+        cls_name_lower = cls_name.lower()
+        if "qwen" in cls_name_lower and "image" in cls_name_lower:
+            return "qwen_image"
+        elif "flux" in cls_name_lower:
+            return "flux"
+        elif "sana" in cls_name_lower:
+            return "sana"
+        else:
+            return cls_name_lower
+
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
@@ -627,12 +708,34 @@ class TransformerLoader(ComponentLoader):
         dit_config = server_args.pipeline_config.dit_config
         dit_config.update_model_arch(config)
 
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
+        # Check for quantization configuration (AWQ-style pattern / Nunchaku).
+        # For multimodal_gen we currently only support layer-wise quantization
+        # and do not use full-transformer replacement in this loader.
+        quant_config = self._get_quant_config(server_args)
+        if quant_config is not None:
+            logger.info(
+                "Loading transformer with layer-by-layer quantization (quant_config=%s)",
+                quant_config,
+            )
+
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         # Find all safetensors files
-        safetensors_list = _list_safetensors_files(component_model_path)
+        # If quantization is enabled and quantized_model_path is set, use that path
+        # for loading weights (Nunchaku quantized weights have different parameter names)
+        if quant_config is not None and quant_config.quantized_model_path:
+            weights_path = quant_config.quantized_model_path
+            logger.info(
+                "Using quantized model weights from: %s", weights_path
+            )
+        else:
+            weights_path = component_model_path
+
+        safetensors_list = _list_safetensors_files(weights_path)
         if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {component_model_path}")
+            raise ValueError(f"No safetensors files found in {weights_path}")
 
         # Check if we should use custom initialization weights
         custom_weights_path = getattr(
@@ -655,8 +758,6 @@ class TransformerLoader(ComponentLoader):
                 ), "Custom initialization weights must be a safetensors file"
                 safetensors_list = [custom_weights_path]
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-
         logger.info(
             "Loading %s from %s safetensors files, default_dtype: %s",
             cls_name,
@@ -666,9 +767,21 @@ class TransformerLoader(ComponentLoader):
 
         # Load the model using FSDP loader
         assert server_args.hsdp_shard_dim is not None
+
+        # Prepare init params for model construction. Some models (e.g.
+        # QwenImageTransformer2DModel) accept an optional `quant_config`
+        # argument to enable per-layer quantization (Nunchaku, etc.).
+        init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
+        if (
+            quant_config is not None
+            and "quant_config"
+            in inspect.signature(model_cls.__init__).parameters
+        ):
+            init_params["quant_config"] = quant_config
+
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
-            init_params={"config": dit_config, "hf_config": hf_config},
+            init_params=init_params,
             weight_dir_list=safetensors_list,
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,

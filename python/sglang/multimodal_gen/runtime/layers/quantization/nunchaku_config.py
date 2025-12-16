@@ -1,14 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 """
 Nunchaku quantization configuration for SVDQuant integration.
+
+This module provides AWQ-style quantization config that integrates with
+the LinearMethodBase pattern used in SGLang.
 """
 
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
 import torch
 
 from .base_config import QuantizationConfig, QuantizeMethodBase
+
+
+# Layer prefixes that use different quantization methods
+# These patterns are based on Nunchaku's transformer implementation
+SVDQ_W4A4_LAYER_PATTERNS = [
+    "attn.to_qkv",
+    "attn.to_out",
+    "attn.add_qkv_proj",
+    "attn.to_add_out",
+    "img_mlp",
+    "txt_mlp",
+]
+
+AWQ_W4A16_LAYER_PATTERNS = [
+    "img_mod",
+    "txt_mod",
+]
+
+# Layers to skip quantization
+SKIP_QUANTIZATION_PATTERNS = [
+    "norm",
+    "embed",
+    "rotary",
+    "pos_embed",
+]
 
 
 @dataclass
@@ -27,7 +55,6 @@ class NunchakuConfig(QuantizationConfig):
         group_size: Quantization group size (automatically set based on precision)
         act_unsigned: Use unsigned activation quantization (int4 only)
         quantized_model_path: Path to pre-quantized model weights (.safetensors)
-        processor: Attention processor type ("flashattn2" or "nunchaku-fp16")
         enable_offloading: Enable CPU offloading for low memory
     """
 
@@ -36,7 +63,6 @@ class NunchakuConfig(QuantizationConfig):
     group_size: Optional[int] = None
     act_unsigned: bool = False
     quantized_model_path: Optional[str] = None
-    processor: str = "flashattn2"  # "flashattn2" or "nunchaku-fp16"
     enable_offloading: bool = False
 
     # ---- QuantizationConfig interface -------------------------------------------------
@@ -75,7 +101,6 @@ class NunchakuConfig(QuantizationConfig):
             group_size=config.get("group_size"),
             act_unsigned=bool(config.get("act_unsigned", False)),
             quantized_model_path=config.get("quantized_model_path"),
-            processor=config.get("processor", "flashattn2"),
             enable_offloading=bool(config.get("enable_offloading", False)),
         )
 
@@ -83,13 +108,56 @@ class NunchakuConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         """
-        Return the per-layer quantization method.
+        Return the per-layer quantization method based on layer type and prefix.
 
-        For Nunchaku SVDQuant we delegate quantization to the Nunchaku models
-        themselves (via `nunchaku.*` Transformer2DModel classes), so we do not
-        apply any additional vLLM-style per-layer quantization here.
+        This follows the SGLang AWQ pattern where different layers can use
+        different quantization methods.
+
+        Args:
+            layer: The layer to get quantization method for.
+            prefix: The full name of the layer in the state dict.
+
+        Returns:
+            - NunchakuSVDQLinearMethod for attention and MLP layers (W4A4)
+            - NunchakuAWQLinearMethod for modulation layers (W4A16)
+            - None for layers that should not be quantized
         """
-        return None
+        from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+
+        # Only quantize linear layers
+        if not isinstance(layer, LinearBase):
+            return None
+
+        # Skip layers that shouldn't be quantized
+        for pattern in SKIP_QUANTIZATION_PATTERNS:
+            if pattern in prefix.lower():
+                return None
+
+        # Check if this layer should use SVDQ W4A4
+        for pattern in SVDQ_W4A4_LAYER_PATTERNS:
+            if pattern in prefix:
+                from .nunchaku_linear import NunchakuSVDQLinearMethod
+                return NunchakuSVDQLinearMethod(
+                    precision=self.precision,
+                    rank=self.rank,
+                    act_unsigned=self.act_unsigned,
+                )
+
+        # Check if this layer should use AWQ W4A16
+        for pattern in AWQ_W4A16_LAYER_PATTERNS:
+            if pattern in prefix:
+                from .nunchaku_linear import NunchakuAWQLinearMethod
+                return NunchakuAWQLinearMethod(
+                    group_size=self.group_size or 64,
+                )
+
+        # Default: use SVDQ W4A4 for other linear layers in the transformer
+        from .nunchaku_linear import NunchakuSVDQLinearMethod
+        return NunchakuSVDQLinearMethod(
+            precision=self.precision,
+            rank=self.rank,
+            act_unsigned=self.act_unsigned,
+        )
 
     # ---- Nunchaku-specific helpers ---------------------------------------------------
     def __post_init__(self):
@@ -110,13 +178,6 @@ class NunchakuConfig(QuantizationConfig):
                 f"Invalid precision: {self.precision}. Must be 'int4' or 'nvfp4'"
             )
 
-        # Validate processor
-        if self.processor not in ["flashattn2", "nunchaku-fp16"]:
-            raise ValueError(
-                f"Invalid processor: {self.processor}. "
-                "Must be 'flashattn2' or 'nunchaku-fp16'"
-            )
-
         # Validate rank
         if self.rank <= 0:
             raise ValueError(f"Rank must be positive, got {self.rank}")
@@ -134,16 +195,7 @@ class NunchakuConfig(QuantizationConfig):
             "group_size": self.group_size,
             "act_unsigned": self.act_unsigned,
             "quantized_model_path": self.quantized_model_path,
-            "processor": self.processor,
             "enable_offloading": self.enable_offloading,
-        }
-
-    def get_nunchaku_kwargs(self) -> dict:
-        """Get keyword arguments for Nunchaku model initialization."""
-        return {
-            "precision": self.precision,
-            "rank": self.rank,
-            "processor": self.processor,
         }
 
     @classmethod

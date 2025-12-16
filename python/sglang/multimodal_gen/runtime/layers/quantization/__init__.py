@@ -69,6 +69,11 @@ try:
     from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
         NunchakuConfig,
     )
+    from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
+        NunchakuAWQLinearMethod,
+        NunchakuSVDQLinearMethod,
+        NunchakuTransformerMethod,
+    )
 
     @register_quantization_config("svdquant")
     class _RegisteredNunchakuConfig(NunchakuConfig):
@@ -80,11 +85,20 @@ except Exception:
     # Nunchaku is an optional dependency; if it's not available we simply
     # don't register the config and leave QUANTIZATION_METHODS unchanged.
     _RegisteredNunchakuConfig = None  # type: ignore[assignment]
+    NunchakuConfig = None  # type: ignore[assignment]
+    NunchakuSVDQLinearMethod = None  # type: ignore[assignment]
+    NunchakuAWQLinearMethod = None  # type: ignore[assignment]
+    NunchakuTransformerMethod = None  # type: ignore[assignment]
 
 
-all = [
+__all__ = [
     "QuantizationMethods",
     "QuantizationConfig",
     "get_quantization_config",
     "QUANTIZATION_METHODS",
+    # Nunchaku exports
+    "NunchakuConfig",
+    "NunchakuSVDQLinearMethod",
+    "NunchakuAWQLinearMethod",
+    "NunchakuTransformerMethod",
 ]
