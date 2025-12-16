@@ -195,7 +195,7 @@ async def edits(
     input_paths = []
     for idx, img in enumerate(images):
         try:
-            input_path = maybe_url_image(
+            input_path = await maybe_url_image(
                 img, os.path.join(uploads_dir, f"{request_id}_{idx}_image_{idx}")
             )
         except Exception as e:
