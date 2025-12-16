@@ -165,10 +165,11 @@ class LoRAPipeline(ComposedPipelineBase):
         name_list = []
         for name, _ in module.named_modules():
             name_list.append(name)
-        test = set(whitelist) - set(name_list)
-        if test:
+        excluded_modules = set(whitelist) - set(name_list)
+        if excluded_modules:
             logger.warning(
-                "Whitelist contains modules that do not exist in the module: %s", test
+                "Lora contains modules that do not exist in the original model: %s",
+                excluded_modules,
             )
         for name, layer in module.named_modules():
             if whitelist is not None:
