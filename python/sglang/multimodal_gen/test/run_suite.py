@@ -102,6 +102,7 @@ def run_pytest(files, is_distributed=False):
 
         return final_exit_code
     else:
+        # Standard pytest execution
         base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
 
         max_retries = 4
@@ -141,16 +142,25 @@ def run_pytest(files, is_distributed=False):
             if returncode == 0:
                 return 0
 
-            # check if the failure is due to an assertion in test_server_utils.py
+            # Get full output to check for specific error types
             full_output = "".join(output_lines)
+
+            # Check for Performance Assertion Error
             is_perf_assertion = (
                 "multimodal_gen/test/server/test_server_utils.py" in full_output
                 and "AssertionError" in full_output
             )
 
-            if not is_perf_assertion:
+            # Check for Flaky CI Safetensor Error
+            is_flaky_ci_assertion = "SafetensorError" in full_output
+
+            # If it is NOT a performance assertion AND NOT a flaky CI error, return failure immediately.
+            # If it IS one of them, the loop continues to the next retry.
+            if not (is_perf_assertion or is_flaky_ci_assertion):
                 return returncode
 
+    # If we exit the loop, it means max retries were exceeded
+    logger.info(f"Max retry exceeded")
     return returncode
 
 

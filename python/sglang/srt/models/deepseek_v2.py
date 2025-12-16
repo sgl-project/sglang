@@ -2698,6 +2698,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_dtype = k_nope.dtype
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        elif _is_hip and self.current_attention_backend == "aiter":
+            k = k_nope.new_empty(*k_shape)
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         else:
             k = k_nope.new_empty(*k_shape)
             k[..., : self.qk_nope_head_dim] = k_nope
@@ -3020,7 +3023,11 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_npu else None
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
