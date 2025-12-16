@@ -340,7 +340,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return lambda name: StructureInfo(
             begin=f'<｜DSML｜invoke name="{name}">',
             end="</｜DSML｜invoke>",
-            trigger=f"<｜DSML｜",
+            trigger=f"<｜DSML｜invoke",
         )
 
     def update_state(self):
