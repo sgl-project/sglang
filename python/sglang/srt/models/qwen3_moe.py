@@ -420,25 +420,22 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if (
             _use_aiter
-            or (self.rope_scaling is not None and "aiter_rope_fused_qknorm" in self.rope_scaling)
-            or _use_aiter_rope_fused_qknorm
+            and ((self.rope_scaling is not None and "aiter_rope_fused_qknorm" in self.rope_scaling)
+            or _use_aiter_rope_fused_qknorm)
         ):
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
             layer_id = self.attn.layer_id
             assert not USING_PRESHUFFLE_LAYOUT, "AITER_PA_ASM_PRESHUFFLE_LAYOUT should disabled"
-            if _use_aiter_rope_fused_qknorm:
-                aiter_fused_set_kv_buffer_arg = None
-            else:
-                aiter_fused_set_kv_buffer_arg = AiterFusedSetKVBufferArg(
-                    kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id),
-                    cache_loc = forward_batch.out_cache_loc,
-                    k_scale = self.attn.k_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
-                    v_scale = self.attn.v_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
-                )
-                if aiter_fused_set_kv_buffer_arg.k_scale is None:
-                    aiter_fused_set_kv_buffer_arg.k_scale = 1.0
-                if aiter_fused_set_kv_buffer_arg.v_scale is None:
-                    aiter_fused_set_kv_buffer_arg.v_scale = 1.0
+            aiter_fused_set_kv_buffer_arg = AiterFusedSetKVBufferArg(
+                kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id),
+                cache_loc = forward_batch.out_cache_loc,
+                k_scale = self.attn.k_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
+                v_scale = self.attn.v_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
+            )
+            if aiter_fused_set_kv_buffer_arg.k_scale is None:
+                aiter_fused_set_kv_buffer_arg.k_scale = 1.0
+            if aiter_fused_set_kv_buffer_arg.v_scale is None:
+                aiter_fused_set_kv_buffer_arg.v_scale = 1.0
             q, k, v = self.rotary_emb(
                 qkv,
                 self.q_norm.weight,
@@ -449,8 +446,7 @@ class Qwen3MoeAttention(nn.Module):
                 self.k_norm.variance_epsilon,
                 fused_set_kv_buffer_arg=aiter_fused_set_kv_buffer_arg,
             )
-            if not _use_aiter_rope_fused_qknorm:
-                self.aiter_enable_fused_set_kv_buffer = True
+            self.aiter_enable_fused_set_kv_buffer = True
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._apply_qk_norm(q, k)
