@@ -42,7 +42,6 @@ register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     CustomTestCase,
-    is_in_ci,
 )
 
 # Test configuration constants
@@ -505,10 +504,6 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Basic test comparing HF and SGLang LoRA logprobs with small model.
         """
-        # Use a smaller model and shorter prompts for CI
-        if is_in_ci():
-            self.skipTest("Skipping in CI environment - requires large models")
-
         model_path = "meta-llama/Llama-2-7b-hf"
         lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
@@ -524,9 +519,6 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Full test comparing HF and SGLang LoRA logprobs with all prompts.
         """
-        if is_in_ci():
-            self.skipTest("Skipping in CI environment - requires large models")
-
         model_path = "meta-llama/Llama-2-7b-hf"
         lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
         prompts = DEFAULT_TEST_PROMPTS
