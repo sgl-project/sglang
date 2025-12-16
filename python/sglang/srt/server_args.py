@@ -1382,9 +1382,6 @@ class ServerArgs:
                 assert (
                     is_cuda()
                 ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
-                assert (
-                    self.disaggregation_mode == "null"
-                ), "Mamba extra_buffer is not compatible with disaggregation mode yet."
                 if self.speculative_num_draft_tokens is not None:
                     assert (
                         self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -1443,7 +1440,9 @@ class ServerArgs:
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
-        is_h20_device = "H20" in device_name and "H200" not in device_name
+        is_h20_device = (
+            device_name and "H20" in device_name and "H200" not in device_name
+        )
         if (
             not self.enable_flashinfer_allreduce_fusion
             and model_arch
