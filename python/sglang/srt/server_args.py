@@ -1961,6 +1961,7 @@ class ServerArgs:
                 self.disable_overlap_schedule = True
                 logger.warning(
                     "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
+                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
                 )
 
             if self.enable_mixed_chunk:
