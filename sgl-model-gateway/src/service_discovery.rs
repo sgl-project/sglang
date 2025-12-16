@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     app_context::AppContext,
     core::Job,
-    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerConfigRequest,
 };
 
@@ -302,7 +302,6 @@ pub async fn start_service_discovery(
                 }
                 Err(err) => {
                     error!("Error in Kubernetes watcher: {}", err);
-                    RouterMetrics::record_discovery_watcher_error();
                     warn!(
                         "Retrying in {} seconds with exponential backoff",
                         retry_delay.as_secs()
@@ -317,7 +316,6 @@ pub async fn start_service_discovery(
                 "Kubernetes watcher exited, restarting in {} seconds",
                 config_arc.check_interval.as_secs()
             );
-            RouterMetrics::record_discovery_watcher_restart();
             time::sleep(config_arc.check_interval).await;
         }
     });
@@ -412,17 +410,16 @@ async fn handle_pod_event(
                 match job_queue.submit(job).await {
                     Ok(_) => {
                         debug!("Worker addition job submitted for: {}", worker_url);
-                        RouterMetrics::record_discovery_update(1, 0);
 
                         // Layer 4: Record successful registration from K8s discovery
-                        SmgMetrics::record_discovery_registration(
-                            smg_labels::DISCOVERY_KUBERNETES,
-                            smg_labels::REGISTRATION_SUCCESS,
+                        Metrics::record_discovery_registration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::REGISTRATION_SUCCESS,
                         );
 
                         // Update workers discovered gauge (using count from initial lock)
-                        SmgMetrics::set_discovery_workers_discovered(
-                            smg_labels::DISCOVERY_KUBERNETES,
+                        Metrics::set_discovery_workers_discovered(
+                            metrics_labels::DISCOVERY_KUBERNETES,
                             tracked_count,
                         );
                     }
@@ -433,9 +430,9 @@ async fn handle_pod_event(
                         );
 
                         // Layer 4: Record failed registration
-                        SmgMetrics::record_discovery_registration(
-                            smg_labels::DISCOVERY_KUBERNETES,
-                            smg_labels::REGISTRATION_FAILED,
+                        Metrics::record_discovery_registration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::REGISTRATION_FAILED,
                         );
 
                         if let Ok(mut tracker) = tracked_pods.lock() {
@@ -451,9 +448,9 @@ async fn handle_pod_event(
             }
         } else {
             // Pod already tracked - this is a duplicate event
-            SmgMetrics::record_discovery_registration(
-                smg_labels::DISCOVERY_KUBERNETES,
-                smg_labels::REGISTRATION_DUPLICATE,
+            Metrics::record_discovery_registration(
+                metrics_labels::DISCOVERY_KUBERNETES,
+                metrics_labels::REGISTRATION_DUPLICATE,
             );
         }
     }
@@ -498,17 +495,16 @@ async fn handle_pod_deletion(
                 );
             } else {
                 debug!("Submitted worker removal job for {}", worker_url);
-                RouterMetrics::record_discovery_update(0, 1);
 
                 // Layer 4: Record deregistration from K8s pod deletion
-                SmgMetrics::record_discovery_deregistration(
-                    smg_labels::DISCOVERY_KUBERNETES,
-                    smg_labels::DEREGISTRATION_POD_DELETED,
+                Metrics::record_discovery_deregistration(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::DEREGISTRATION_POD_DELETED,
                 );
 
                 // Update workers discovered gauge (using count from initial lock)
-                SmgMetrics::set_discovery_workers_discovered(
-                    smg_labels::DISCOVERY_KUBERNETES,
+                Metrics::set_discovery_workers_discovered(
+                    metrics_labels::DISCOVERY_KUBERNETES,
                     remaining_count,
                 );
             }

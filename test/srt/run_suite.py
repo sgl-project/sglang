@@ -157,7 +157,7 @@ suites = {
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 200),
+        TestFile("test_disaggregation_hybrid_attention.py", 600),
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
@@ -368,6 +368,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
