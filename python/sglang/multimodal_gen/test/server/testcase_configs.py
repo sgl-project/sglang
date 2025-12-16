@@ -119,7 +119,7 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
-    tp_size: int | None = None  # tensor parallelism size
+    tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     # LoRA
