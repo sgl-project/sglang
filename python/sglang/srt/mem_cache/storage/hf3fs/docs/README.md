@@ -21,16 +21,16 @@ case "$VERSION_ID" in \
   "22.04") \ 
     CLANG_VERSION="14"; \
     GIT_BRANCH=main; \
-    GIT_COMMIT_ID=6f029c439d0d22995900ca357d51b37975c6ffb5 \
+    GIT_COMMIT_ID=6f029c439d0d22995900ca357d51b37975c6ffb5; \
     ;; \
   "24.04") \
     CLANG_VERSION="18"; \
     GIT_BRANCH="ubuntu24.04"; \
-    GIT_COMMIT_ID=d0cf83a42395cdb2a66d3ce83cb0a11a46bee9f3 \
+    GIT_COMMIT_ID=d0cf83a42395cdb2a66d3ce83cb0a11a46bee9f3; \
   ;; \
   *) \
     echo "Unsupported Ubuntu version: $VERSION_ID"; \
-    exit 1 \
+    exit 1; \
   ;; \
 esac; \
 apt-get update && apt-get install -y --no-install-recommends \
