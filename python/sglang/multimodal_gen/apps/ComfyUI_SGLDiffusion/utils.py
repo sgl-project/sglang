@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import shutil
 import time
 import uuid
 from typing import Optional
@@ -140,4 +141,47 @@ def convert_b64_to_tensor_image(b64_image: str) -> torch.Tensor:
     
     return tensor_image
 
+
+class SGLDVideoInput(VideoInput):
+    def __init__(self, video_path: str, height: int, width: int):
+        super().__init__()
+        
+        self.video_path = video_path
+        self.height = height
+        self.width = width
+
+    def get_dimensions(self) -> tuple[int, int]:
+        """
+        Returns the dimensions of the video input.
+
+        Returns:
+            Tuple of (width, height)
+        """
+        return self.width, self.height
+
+    def get_components(self):
+        """
+        Returns the components of the video input.
+        This is required by the VideoInput abstract base class.
+        """
+        return [self.video_path]
+
+    def save_to(self, path: str, format=None, codec=None, metadata=None):
+        """
+        Abstract method to save the video input to a file.
+        """
+        save_path = path
+        # Copy video file from video_path to save_path
+        if os.path.exists(self.video_path):
+            # Ensure destination directory exists
+            save_dir = os.path.dirname(save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            shutil.copy2(self.video_path, save_path)
+
 def convert_video_to_comfy_video(video_path: str, height: int, width: int) -> VideoInput:
+    """
+    Convert video to ComfyUI VIDEO format (VideoInput).
+    """     
+    video_input = SGLDVideoInput(video_path, height, width)
+    return video_input

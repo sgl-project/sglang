@@ -10,7 +10,8 @@ import time
 import torch
 
 from .server_api import SGLDiffusionServerAPI
-from .utils import get_image_path, is_empty_image, convert_b64_to_tensor_image
+from .utils import get_image_path, is_empty_image, convert_b64_to_tensor_image, convert_video_to_comfy_video
+import folder_paths
 
 
 class SGLDiffusionServerModel:
@@ -271,7 +272,7 @@ class SGLDiffusionGenerateVideo:
                         "default": 1280,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 1,
                     },
                 ),
                 "height": (
@@ -280,7 +281,7 @@ class SGLDiffusionGenerateVideo:
                         "default": 720,
                         "min": 256,
                         "max": 4096,
-                        "step": 64,
+                        "step": 1,
                     },
                 ),
                 "num_frames": (
@@ -319,8 +320,8 @@ class SGLDiffusionGenerateVideo:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("video_id", "video_path")
+    RETURN_TYPES = ("VIDEO", "STRING")
+    RETURN_NAMES = ("video", "video_path")
     FUNCTION = "generate_video"
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
@@ -346,6 +347,7 @@ class SGLDiffusionGenerateVideo:
             raise ValueError("Prompt cannot be empty")
 
         size = f"{width}x{height}"
+        output_dir = folder_paths.get_temp_directory()
 
         # Prepare request parameters
         request_params = {
@@ -353,6 +355,7 @@ class SGLDiffusionGenerateVideo:
             "size": size,
             "seconds": seconds,
             "fps": fps,
+            "output_path": output_dir,
         }
 
         # Add optional parameters if provided
@@ -380,12 +383,12 @@ class SGLDiffusionGenerateVideo:
         # Call API
         try:
             response = sgld_client.generate_video(**request_params)
-            video_id = response.get("id", "")
             video_path = response.get("file_path", "")
+            video = convert_video_to_comfy_video(video_path, height, width)
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
 
-        return (video_id, video_path)
+        return (video, video_path)
 
 
 class SGLDiffusionSetLora:

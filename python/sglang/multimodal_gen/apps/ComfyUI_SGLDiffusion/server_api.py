@@ -218,6 +218,7 @@ class SGLDiffusionServerAPI:
         enable_teacache: bool = False,
         generator_device: Optional[str] = "cuda",
         input_reference: Optional[str] = None,
+        output_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate a video using SGLang Diffusion API and wait for completion.
@@ -278,6 +279,8 @@ class SGLDiffusionServerAPI:
             payload["generator_device"] = generator_device
         if input_reference:
             payload["input_reference"] = input_reference
+        if output_path:
+            payload["output_path"] = output_path
 
         try:
             # Create video generation job
@@ -294,6 +297,8 @@ class SGLDiffusionServerAPI:
             # Wait for completion with fixed polling
             poll_interval = 5  # 5 seconds
             max_wait_time = 3600  # 1 hour
+            max_consecutive_errors = 5  # Maximum consecutive network errors before giving up
+            consecutive_errors = 0
             start_time = time.time()
 
             while time.time() - start_time < max_wait_time:
@@ -306,6 +311,9 @@ class SGLDiffusionServerAPI:
                     status_response.raise_for_status()
                     status = status_response.json()
 
+                    # Reset error counter on successful request
+                    consecutive_errors = 0
+
                     if status.get("status") == "completed":
                         return status
                     elif status.get("status") == "failed":
@@ -316,9 +324,21 @@ class SGLDiffusionServerAPI:
                             else "Unknown error"
                         )
                         raise RuntimeError(f"Video generation failed: {error_msg}")
-                except requests.exceptions.RequestException:
-                    # Continue polling on network errors
-                    pass
+                except requests.exceptions.ConnectionError as e:
+                    # Connection errors - likely server is down
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        raise RuntimeError(
+                            f"Lost connection to server after {consecutive_errors} consecutive errors. "
+                            f"Server may be unavailable: {str(e)}"
+                        )
+                except requests.exceptions.RequestException as e:
+                    # Other network errors - continue polling but track errors
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        raise RuntimeError(
+                            f"Network error after {consecutive_errors} consecutive failures: {str(e)}"
+                        )
 
                 time.sleep(poll_interval)
 
