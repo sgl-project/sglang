@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use sgl_model_gateway::core::workflow::*;
+use sgl_model_gateway::workflow::*;
 use tokio::time::sleep;
 
 // Test step that counts invocations
@@ -70,7 +70,7 @@ async fn test_simple_workflow_execution() {
         ));
 
     let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow);
+    engine.register_workflow(workflow).unwrap();
 
     // Start workflow
     let instance_id = engine
@@ -115,7 +115,7 @@ async fn test_workflow_with_retry() {
     );
 
     let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow);
+    engine.register_workflow(workflow).unwrap();
 
     // Start workflow
     let instance_id = engine
@@ -166,7 +166,7 @@ async fn test_workflow_failure_after_max_retries() {
     );
 
     let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow);
+    engine.register_workflow(workflow).unwrap();
 
     // Start workflow
     let instance_id = engine
@@ -223,7 +223,7 @@ async fn test_workflow_continue_on_failure() {
         ));
 
     let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow);
+    engine.register_workflow(workflow).unwrap();
 
     // Start workflow
     let instance_id = engine
@@ -306,7 +306,7 @@ async fn test_workflow_context_sharing() {
         ));
 
     let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow);
+    engine.register_workflow(workflow).unwrap();
 
     let instance_id = engine
         .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
@@ -317,4 +317,348 @@ async fn test_workflow_context_sharing() {
 
     let state = engine.get_status(instance_id).unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
+}
+
+// ============================================================================
+// DAG / Parallel Execution Tests
+// ============================================================================
+
+// Step that records when it starts and ends (for testing parallel execution)
+struct TimingStep {
+    step_name: String,
+    duration_ms: u64,
+    start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>>,
+    end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor for TimingStep {
+    async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let start = std::time::Instant::now();
+        self.start_times
+            .write()
+            .push((self.step_name.clone(), start));
+
+        sleep(Duration::from_millis(self.duration_ms)).await;
+
+        let end = std::time::Instant::now();
+        self.end_times.write().push((self.step_name.clone(), end));
+
+        Ok(StepResult::Success)
+    }
+}
+
+#[tokio::test]
+async fn test_parallel_execution_no_dependencies() {
+    // Steps without dependencies should run in parallel
+    let engine = WorkflowEngine::new();
+
+    let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
+        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
+        Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    // Three steps, each taking 100ms, no dependencies
+    // If parallel: ~100ms total
+    // If sequential: ~300ms total
+    let workflow = WorkflowDefinition::new("parallel_workflow", "Parallel Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(TimingStep {
+                step_name: "step_a".to_string(),
+                duration_ms: 100,
+                start_times: Arc::clone(&start_times),
+                end_times: Arc::clone(&end_times),
+            }),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            Arc::new(TimingStep {
+                step_name: "step_b".to_string(),
+                duration_ms: 100,
+                start_times: Arc::clone(&start_times),
+                end_times: Arc::clone(&end_times),
+            }),
+        ))
+        .add_step(StepDefinition::new(
+            "step_c",
+            "Step C",
+            Arc::new(TimingStep {
+                step_name: "step_c".to_string(),
+                duration_ms: 100,
+                start_times: Arc::clone(&start_times),
+                end_times: Arc::clone(&end_times),
+            }),
+        ));
+
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+
+    let overall_start = std::time::Instant::now();
+    let instance_id = engine
+        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .await
+        .unwrap();
+
+    // Wait for completion - give enough time for async scheduling
+    for _ in 0..50 {
+        sleep(Duration::from_millis(50)).await;
+        let state = engine.get_status(instance_id).unwrap();
+        if state.status != WorkflowStatus::Running {
+            break;
+        }
+    }
+
+    let overall_duration = overall_start.elapsed();
+
+    let state = engine.get_status(instance_id).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // Check that all steps completed
+    assert_eq!(end_times.read().len(), 3);
+
+    // Verify parallel execution: all steps should start around the same time
+    let starts = start_times.read();
+    let first_start = starts.iter().map(|(_, t)| t).min().unwrap();
+    let last_start = starts.iter().map(|(_, t)| t).max().unwrap();
+
+    // All starts should be within 100ms of each other (allowing for scheduling variance)
+    let start_spread = last_start.duration_since(*first_start);
+    assert!(
+        start_spread < Duration::from_millis(100),
+        "Steps did not start in parallel, spread: {:?}",
+        start_spread
+    );
+
+    // Total duration should be less than sequential (300ms) - use generous threshold
+    assert!(
+        overall_duration < Duration::from_millis(500),
+        "Parallel execution took too long: {:?}",
+        overall_duration
+    );
+}
+
+#[tokio::test]
+async fn test_dag_with_dependencies() {
+    // DAG: A and B run in parallel, C waits for both
+    //   A ──┐
+    //       ├──> C
+    //   B ──┘
+    let engine = WorkflowEngine::new();
+
+    let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
+        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
+        Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    let workflow = WorkflowDefinition::new("dag_workflow", "DAG Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(TimingStep {
+                step_name: "step_a".to_string(),
+                duration_ms: 50,
+                start_times: Arc::clone(&start_times),
+                end_times: Arc::clone(&end_times),
+            }),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            Arc::new(TimingStep {
+                step_name: "step_b".to_string(),
+                duration_ms: 100,
+                start_times: Arc::clone(&start_times),
+                end_times: Arc::clone(&end_times),
+            }),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                Arc::new(TimingStep {
+                    step_name: "step_c".to_string(),
+                    duration_ms: 50,
+                    start_times: Arc::clone(&start_times),
+                    end_times: Arc::clone(&end_times),
+                }),
+            )
+            .depends_on(&["step_a", "step_b"]),
+        );
+
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+
+    let instance_id = engine
+        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .await
+        .unwrap();
+
+    // Poll until workflow completes (or timeout)
+    for _ in 0..50 {
+        sleep(Duration::from_millis(50)).await;
+        let state = engine.get_status(instance_id).unwrap();
+        if state.status != WorkflowStatus::Running {
+            break;
+        }
+    }
+
+    let state = engine.get_status(instance_id).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // Verify step C started after both A and B finished
+    let starts = start_times.read();
+    let ends = end_times.read();
+
+    let c_start = starts.iter().find(|(n, _)| n == "step_c").unwrap().1;
+    let a_end = ends.iter().find(|(n, _)| n == "step_a").unwrap().1;
+    let b_end = ends.iter().find(|(n, _)| n == "step_b").unwrap().1;
+
+    assert!(c_start >= a_end, "Step C started before Step A finished");
+    assert!(c_start >= b_end, "Step C started before Step B finished");
+}
+
+#[tokio::test]
+async fn test_dag_dependency_failure_blocks_dependents() {
+    // If step A fails with FailWorkflow, step B (depends on A) should not run
+    let engine = WorkflowEngine::new();
+
+    let b_executed = Arc::new(AtomicU32::new(0));
+
+    struct FailingStep;
+
+    #[async_trait::async_trait]
+    impl StepExecutor for FailingStep {
+        async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("failing"),
+                message: "Intentional failure".to_string(),
+            })
+        }
+
+        fn is_retryable(&self, _error: &WorkflowError) -> bool {
+            false // Disable retries for this test
+        }
+    }
+
+    struct TrackingStep {
+        counter: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl StepExecutor for TrackingStep {
+        async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(StepResult::Success)
+        }
+    }
+
+    let workflow = WorkflowDefinition::new("blocked_workflow", "Blocked Test")
+        .add_step(
+            StepDefinition::new("step_a", "Step A", Arc::new(FailingStep))
+                .with_failure_action(FailureAction::FailWorkflow),
+        )
+        .add_step(
+            StepDefinition::new(
+                "step_b",
+                "Step B",
+                Arc::new(TrackingStep {
+                    counter: Arc::clone(&b_executed),
+                }),
+            )
+            .depends_on(&["step_a"]),
+        );
+
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+
+    let instance_id = engine
+        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .await
+        .unwrap();
+
+    // Poll until workflow completes (or timeout)
+    for _ in 0..50 {
+        sleep(Duration::from_millis(50)).await;
+        let state = engine.get_status(instance_id).unwrap();
+        if state.status != WorkflowStatus::Running {
+            break;
+        }
+    }
+
+    let state = engine.get_status(instance_id).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+
+    // Step B should not have executed
+    assert_eq!(b_executed.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_dag_validation_cycle_detection() {
+    // Create a workflow with a cycle: A -> B -> C -> A
+    let workflow = WorkflowDefinition::new("cyclic_workflow", "Cyclic Test")
+        .add_step(
+            StepDefinition::new("step_a", "Step A", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_c"]),
+        )
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_a"]),
+        )
+        .add_step(
+            StepDefinition::new("step_c", "Step C", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_b"]),
+        );
+
+    let result = workflow.validate();
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("Cycle detected"));
+}
+
+#[test]
+fn test_dag_validation_missing_dependency() {
+    // Create a workflow with a missing dependency
+    let workflow = WorkflowDefinition::new("missing_dep_workflow", "Missing Dep Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["nonexistent_step"]),
+        );
+
+    let result = workflow.validate();
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("non-existent step"));
+}
+
+#[test]
+fn test_dag_validation_valid_workflow() {
+    // Create a valid DAG workflow
+    let workflow = WorkflowDefinition::new("valid_workflow", "Valid Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_c", "Step C", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_a", "step_b"]),
+        )
+        .add_step(
+            StepDefinition::new("step_d", "Step D", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_c"]),
+        );
+
+    let result = workflow.validate();
+    assert!(result.is_ok());
 }

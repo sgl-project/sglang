@@ -59,14 +59,21 @@
     during the next eviction cycle.
 */
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use crate::core::Worker;
 
 /// Cache-aware routing policy
 ///
@@ -77,7 +84,10 @@ use crate::{core::Worker, observability::metrics::RouterMetrics};
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    /// Handle to the background eviction thread
     eviction_handle: Option<thread::JoinHandle<()>>,
+    /// Flag to signal the eviction thread to stop
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl CacheAwarePolicy {
@@ -87,25 +97,49 @@ impl CacheAwarePolicy {
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // Start background eviction thread if configured
         let eviction_handle = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
+            let shutdown_clone = Arc::clone(&shutdown_flag);
             let max_tree_size = config.max_tree_size;
             let interval = config.eviction_interval_secs;
 
-            Some(thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(interval));
+            Some(thread::spawn(move || {
+                // Use smaller sleep intervals to check shutdown flag more frequently
+                let check_interval_ms = 100; // Check every 100ms
+                let total_sleep_ms = interval * 1000;
 
-                // Evict for all model trees
-                for tree_ref in trees_clone.iter() {
-                    let model_id = tree_ref.key();
-                    let tree = tree_ref.value();
-                    tree.evict_tenant_by_size(max_tree_size);
-                    debug!(
-                        "Cache eviction completed for model {}, max_size: {}",
-                        model_id, max_tree_size
-                    );
+                loop {
+                    // Sleep in small increments, checking shutdown flag periodically
+                    let mut slept_ms = 0u64;
+                    while slept_ms < total_sleep_ms {
+                        if shutdown_clone.load(Ordering::Relaxed) {
+                            debug!("Eviction thread received shutdown signal");
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(check_interval_ms));
+                        slept_ms += check_interval_ms;
+                    }
+
+                    // Check shutdown before starting eviction
+                    if shutdown_clone.load(Ordering::Relaxed) {
+                        debug!("Eviction thread received shutdown signal");
+                        return;
+                    }
+
+                    // Evict for all model trees
+                    for tree_ref in trees_clone.iter() {
+                        let model_id = tree_ref.key();
+                        let tree = tree_ref.value();
+                        tree.evict_tenant_by_size(max_tree_size);
+
+                        debug!(
+                            "Cache eviction completed for model {}, max_size: {}",
+                            model_id, max_tree_size
+                        );
+                    }
                 }
             }))
         } else {
@@ -116,6 +150,7 @@ impl CacheAwarePolicy {
             config,
             trees,
             eviction_handle,
+            shutdown_flag,
         }
     }
 
@@ -234,9 +269,6 @@ impl CacheAwarePolicy {
             max_load, min_load, worker_loads
         );
 
-        RouterMetrics::record_load_balancing_event();
-        RouterMetrics::set_load_range(max_load, min_load);
-
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
@@ -262,8 +294,6 @@ impl CacheAwarePolicy {
 
         // Increment processed counter
         workers[min_load_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[min_load_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
         Some(min_load_idx)
     }
@@ -329,10 +359,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             let selected_url = if match_rate > self.config.cache_threshold {
-                RouterMetrics::record_cache_hit();
                 matched_worker.to_string()
             } else {
-                RouterMetrics::record_cache_miss();
                 let min_load_idx = *healthy_indices
                     .iter()
                     .min_by_key(|&&idx| workers[idx].load())?;
@@ -348,8 +376,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
-                    RouterMetrics::record_processed_request(&selected_url);
-                    RouterMetrics::record_policy_decision(self.name(), &selected_url);
 
                     return Some(selected_idx);
                 }
@@ -407,12 +433,16 @@ impl Default for CacheAwarePolicy {
 
 impl Drop for CacheAwarePolicy {
     fn drop(&mut self) {
-        // Note: We can't properly stop the eviction thread since it's in an infinite loop
-        // In a production system, we'd use a channel or atomic flag to signal shutdown
+        // Signal the eviction thread to stop
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+
+        // Wait for the thread to finish (with timeout)
         if let Some(handle) = self.eviction_handle.take() {
-            // The thread will continue running until the program exits
-            // This is acceptable for now since the router typically runs for the lifetime of the program
-            drop(handle);
+            // The thread checks the shutdown flag every 100ms, so it should exit quickly
+            match handle.join() {
+                Ok(()) => debug!("Eviction thread shut down cleanly"),
+                Err(_) => debug!("Eviction thread panicked during shutdown"),
+            }
         }
     }
 }
