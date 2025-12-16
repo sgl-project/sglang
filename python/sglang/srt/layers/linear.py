@@ -841,7 +841,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
         self.q_proj_shard_size = self.num_heads * self.head_size
-        self.k_proj_shard_size = self.num_kv_heads * self.head_size
+        self.kv_proj_shard_size = self.num_kv_heads * self.head_size
         self.v_proj_shard_size = self.num_kv_heads * self.v_head_size
         input_size = self.hidden_size
         output_size = (
