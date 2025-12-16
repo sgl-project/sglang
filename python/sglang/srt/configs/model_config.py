@@ -589,12 +589,11 @@ class ModelConfig:
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
-        quant_config_file = Path(self.model_path, "quant_model_description.json")
-        if quant_config_file.is_file():
-            with open(quant_config_file) as f:
+        quant_config_file = Path(self.model_path, "quant_model_description.json")   
+        quant_cfg = None 
+        if quant_config_file.is_file(): 
+            with open(quant_config_file) as f: 
                 quant_cfg = json.load(f)
-        else:
-            quant_cfg = None
                             
         return quant_cfg
 
