@@ -215,6 +215,7 @@ class TestLayerNorm(CustomTestCase):
         weight: torch.Tensor,
         variance_epsilon: float,
         residual: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         orig_dtype = x.dtype
         x = x.to(torch.float32)
@@ -225,6 +226,8 @@ class TestLayerNorm(CustomTestCase):
         (variance, mean) = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
         x = (x - mean) * torch.rsqrt(variance + variance_epsilon)
         x = x.to(orig_dtype) * weight
+        if bias is not None:
+            x = x + bias
         if residual is None:
             return x
         else:
@@ -240,12 +243,17 @@ class TestLayerNorm(CustomTestCase):
         x = make_non_contiguous(x)
         hidden_size = x.size(-1)
         weight = torch.randn(hidden_size, dtype=dtype)
+        bias = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
 
         ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, variance_epsilon)
         ref_ln_out = self._forward_native(x, weight, variance_epsilon)
 
         atol = rtol = precision[ref_ln_out.dtype]
+        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
+
+        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, variance_epsilon)
+        ref_ln_out = self._forward_native(x, weight, variance_epsilon, residual=None, bias=bias)
         torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
 
         residual = torch.randn([m, hidden_size], dtype=dtype)
@@ -255,11 +263,25 @@ class TestLayerNorm(CustomTestCase):
             x, residual, weight, variance_epsilon
         )
         ref_add_ln_out, ref_residual = self._forward_native(
-            x, weight, variance_epsilon, ref_residual
+            x, weight, variance_epsilon, residual=ref_residual
         )
 
         torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+        residual = torch.randn([m, hidden_size], dtype=dtype)
+        ref_residual = residual.clone()
+
+        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+            x, residual, weight, bias, variance_epsilon
+        )
+        ref_add_ln_out, ref_residual = self._forward_native(
+            x, weight, variance_epsilon, residual=ref_residual, bias=bias
+        )
+
+        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
 
     @parametrize(
         l=[1024, 256],
@@ -272,12 +294,17 @@ class TestLayerNorm(CustomTestCase):
         x = make_non_contiguous(x)
         hidden_size = x.size(-1)
         weight = torch.randn(hidden_size, dtype=dtype)
+        bias = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
 
         ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, variance_epsilon)
         ref_ln_out = self._forward_native(x, weight, variance_epsilon)
 
         atol = rtol = precision[ref_ln_out.dtype]
+        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
+
+        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, variance_epsilon)
+        ref_ln_out = self._forward_native(x, weight, variance_epsilon, residual=None, bias=bias)
         torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
 
         residual = torch.randn([l, m, hidden_size], dtype=dtype)
@@ -293,6 +320,18 @@ class TestLayerNorm(CustomTestCase):
         torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
+        residual = torch.randn([m, hidden_size], dtype=dtype)
+        ref_residual = residual.clone()
+
+        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+            x, residual, weight, bias, variance_epsilon
+        )
+        ref_add_ln_out, ref_residual = self._forward_native(
+            x, weight, variance_epsilon, residual=ref_residual, bias=bias
+        )
+
+        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
 if __name__ == "__main__":
     unittest.main()

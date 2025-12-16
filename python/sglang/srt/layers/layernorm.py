@@ -350,9 +350,14 @@ class LayerNorm(CustomOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.layernorm_cpu(
-                x, self.weight.data, self.variance_epsilon
-            )
+            if self.use_bias:
+                return torch.ops.sgl_kernel.layernorm_cpu(
+                    x, self.weight.data, self.bias, self.variance_epsilon
+                )
+            else:
+                return torch.ops.sgl_kernel.layernorm_cpu(
+                    x, self.weight.data, self.variance_epsilon
+                )
         else:
             return self.forward_native(x)
 
