@@ -160,6 +160,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
 
+    assert input_tensor.shape[0] <= max_token_num
+
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
@@ -205,7 +207,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    max_token_num: int = 2048,
+    max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,

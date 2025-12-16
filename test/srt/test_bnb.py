@@ -4,19 +4,12 @@ python3 -m unittest test_bnb.TestVisionModel.test_vlm
 python3 -m unittest test_bnb.TestLanguageModel.test_mmlu
 """
 
-import io
-import json
 import multiprocessing as mp
-import os
-import unittest
+import random
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-import numpy as np
 import openai
-import pybase64
-import requests
-from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
