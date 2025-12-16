@@ -47,18 +47,18 @@ nohup python3 -m sglang.launch_server \
 
 python3 -m sglang.bench_serving --backend sglang \
   --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 2048 --random-input 8192 --random-output 1024 --random-range-ratio 0.5 \
+  --num-prompts 512 --random-input 8192 --random-output 1024 --random-range-ratio 0.5 \
   --max-concurrency 128
 
 python3 -m sglang.bench_serving --backend sglang \
   --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 8192 --random-input 2048 --random-output 1024 --random-range-ratio 0.5 \
+  --num-prompts 1024 --random-input 2048 --random-output 1024 --random-range-ratio 0.5 \
   --max-concurrency 256
 
 python3 -m sglang.bench_serving --backend sglang \
   --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 8192 --random-input 8192 --random-output 8192 --random-range-ratio 0.5 \
-  --max-concurrency 24
+  --num-prompts 512 --random-input 8192 --random-output 1024 --random-range-ratio 0.5 \
+  --max-concurrency 128
 
 ##############################
 # tiny-random-llama-4-8E
@@ -107,6 +107,7 @@ nohup python3 -m sglang.launch_server \
   --cuda-graph-max-bs 1024 \
   --mem-fraction-static 0.3 \
   --hybrid-kvcache-ratio 1.0 \
+  --chunked-prefill-size 8192 \
   --context-length 65536 &
 
 sleep 3
@@ -115,18 +116,13 @@ tail -f nohup.out
 
 python3 -m sglang.bench_serving --backend sglang \
   --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 2048 --random-input 24576 --random-output 1024 --random-range-ratio 0.5 \
-  --max-concurrency 800
+  --num-prompts 1024 --random-input 24576 --random-output 1024 --random-range-ratio 0.5 \
+  --max-concurrency 384
 
 python3 -m sglang.bench_serving --backend sglang \
   --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 8192 --random-input 8192 --random-output 8192 --random-range-ratio 0.5 \
+  --num-prompts 2048 --random-input 8192 --random-output 8192 --random-range-ratio 0.5 \
   --max-concurrency 1024
-
-nohup python3 -m sglang.bench_serving --backend sglang \
-  --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 8192 --random-input 8192 --random-output 8192 --random-range-ratio 0.5 \
-  --max-concurrency 24 > bench.out &
 
 curl -L -X POST 'http://127.0.0.1:30000/v1/chat/completions' \
 -H 'Content-Type: application/json' \

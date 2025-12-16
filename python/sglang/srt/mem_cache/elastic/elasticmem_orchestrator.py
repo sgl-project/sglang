@@ -16,18 +16,28 @@ limitations under the License.
 import atexit
 import logging
 import signal
+import time
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Set, Tuple
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import get_bool_env_var, get_float_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
 use_elasticmem = get_bool_env_var("SGLANG_ELASTIC_MEM_POOL", "false")
 # page size of device memory, default 2MB
 cu_page_size = get_int_env_var("SGLANG_CU_PAGE_SIZE", 2 << 20)
+
+can_map_threshold = get_float_env_var("SGLANG_CAN_MAP", 0.9)
+can_unmap_threshold = get_float_env_var("SGLANG_CAN_UNMAP", 0.9)
+defragmentation_threshold = get_float_env_var(
+    "SGLANG_DEFRAGMENTATION_THRESHOLD", can_unmap_threshold - 0.1
+)
+assert (
+    defragmentation_threshold <= can_unmap_threshold
+), f"{defragmentation_threshold=} <= {can_unmap_threshold=}"
 
 if use_elasticmem:
     import kvcached.vmm_ops as vmm_ops
@@ -110,7 +120,9 @@ class ElasticAllocator(ABC):
         pass
 
     @abstractmethod
-    def register_evict_func(self, func_evictable_size, func_evict) -> None:
+    def register_evict_func(
+        self, func_evictable_size, func_evict, func_evict_indices
+    ) -> None:
         pass
 
     @abstractmethod
@@ -126,12 +138,17 @@ class ElasticAllocator(ABC):
         pass
 
     @abstractmethod
+    def evict_indices(self, indices: Set[int]) -> None:
+        pass
+
+    @abstractmethod
     def update_size(self) -> None:
         """Update the internal size tracking."""
         pass
 
-    def free_all(self) -> None:
-        self.evict(self.evictable_size())
+    @abstractmethod
+    def defragmentation(self) -> bool:
+        pass
 
 
 class ElasticMempoolOrchestrator:
@@ -151,8 +168,6 @@ class ElasticMempoolOrchestrator:
         vmm_ops.init_emem(current_device_id, cu_page_size)
 
         self.allocators = []
-        self.free_all = False
-        self.free_all_allocator = None
 
         self.remaining_page = 0
 
@@ -171,10 +186,6 @@ class ElasticMempoolOrchestrator:
                 map_candidate = allocator
 
         if map_candidate is None:
-            if self.free_all and self.free_all_allocator.token_usage() < 0.1:
-                self.free_all_allocator.free_all()
-                self.free_all = False
-                self.free_all_allocator = None
             return
 
         min_token_usage = 1
@@ -190,9 +201,12 @@ class ElasticMempoolOrchestrator:
             ):
                 unmap_candidate = allocator
 
-        if unmap_candidate is None and min_token_usage < 0.9:
-            self.free_all = True
-            self.free_all_allocator = min_token_usage_allocator
+        if unmap_candidate is None and min_token_usage < defragmentation_threshold:
+            start_time = time.perf_counter()
+            if min_token_usage_allocator.defragmentation():
+                logger.info(
+                    f"defragmentation took: {(time.perf_counter()-start_time) * 1000} ms"
+                )
 
         if (
             map_candidate is not None
@@ -204,15 +218,15 @@ class ElasticMempoolOrchestrator:
                 f"{map_candidate.token_usage()=}, "
                 f"{unmap_candidate.token_usage()=}"
             )
-            self.do_resize(map_candidate, unmap_candidate)
+            self._do_resize(map_candidate, unmap_candidate)
 
-    def do_resize(
+    def _do_resize(
         self, map_allocator: ElasticAllocator, unmap_allocator: ElasticAllocator
     ) -> None:
-        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
         logger.info("ElasticMempoolOrchestrator do_resize")
         unmap_page = 0
-        unmap_allocator.evict(unmap_allocator.evictable_size())
         unmap_page = unmap_allocator.reduce()
         logger.info(
             f"{unmap_allocator._kvcache.pool_name} unmap {unmap_page}, remain {self.remaining_page} cu_page"
@@ -231,3 +245,5 @@ class ElasticMempoolOrchestrator:
 
         for _allocator in self.allocators:
             _allocator.update_size()
+
+        logger.debug(f"do_resize took {(time.perf_counter() - start_time) * 1000} ms")

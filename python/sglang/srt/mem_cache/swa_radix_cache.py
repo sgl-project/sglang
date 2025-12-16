@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 import torch
 from numpy import float64
@@ -31,6 +31,7 @@ from numpy import float64
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import use_elasticmem
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -598,34 +599,9 @@ class SWARadixCache(BasePrefixCache):
             x = self.full_lru_list.get_leaf_lru_no_lock()
 
             while full_num_evicted < full_num_tokens and self.full_lru_list.in_list(x):
-                assert (
-                    x != self.root_node
-                ), f"root node should not exist in full lru list, {x.id=}"
-                assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
-
-                # 1. free node kv indices, evict full and swa tokens
-                self.token_to_kv_pool_allocator.free(x.value)
-                full_num_evicted += len(x.value)
-                swa_num_evicted += len(x.value)
-
-                # 2. get the next leaf, update the lru lists
-                x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
-                self.full_lru_list.remove_node(x)
-                self.swa_lru_list.remove_node(x)
-
-                # 3. delete the leaf node
-                self._delete_leaf(x)
-
-                # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
-                x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
-                full_num_evicted += leaf_full_num_evicted
-
-                # 5. if parent has no more children, it is a leaf. It is possible that this node is lru, so
-                # we need to get the first leaf node in the lru list
-                if len(x.parent.children) == 0:
-                    x_next = self.full_lru_list.get_leaf_lru_no_lock()
-
-                x = x_next
+                x, full_num_evicted, swa_num_evicted = self._evict_full_node(
+                    x, full_num_evicted, swa_num_evicted
+                )
 
         if swa_num_evicted < swa_num_tokens:
             # get the least recently used node that is not locked, doesn't have to be a leaf
@@ -633,42 +609,52 @@ class SWARadixCache(BasePrefixCache):
 
             # evict lru leaf nodes until swa_num_tokens is reached
             while swa_num_evicted < swa_num_tokens and (self.swa_lru_list.in_list(x)):
-                assert not x.swa_tombstone, f"duplicate swa tombstone node, {x.id=}"
-                assert x != self.root_node, f"root node is not evictable, {x.id=}"
-                assert x.swa_lock_ref == 0, f"node is in use by swa kv indices, {x.id=}"
+                x, full_num_evicted, swa_num_evicted = self._evict_swa_node(
+                    x, full_num_evicted, swa_num_evicted
+                )
 
-                if len(x.children) > 0:
-                    # 1. an internal node, free swa tokens.
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
-                    swa_num_evicted += len(x.value)
+        self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
 
-                    # 2. get the next node, update the lru lists
-                    x_next = self.swa_lru_list.get_prev_no_lock(x)
-                    self.swa_lru_list.remove_node(x)
+    def evict_indices(self, full_indices: Set[int], swa_indices: Set[int]) -> None:
+        if self.disable:
+            return
+        if not use_elasticmem:
+            return
 
-                    # 3. tombstone the node
-                    self._tombstone_internal_node(x)
-                else:
-                    assert (
-                        x.full_lock_ref == 0
-                    ), f"leaf node with full lock must also have swa lock, {x.id=}"
-                    # 1. a leaf node, free full and swa tokens
-                    self.token_to_kv_pool_allocator.free(x.value)
-                    full_num_evicted += len(x.value)
-                    swa_num_evicted += len(x.value)
+        start_time = time.perf_counter()
 
-                    # 2. get the next node, update the lru lists
-                    x_next = self.swa_lru_list.get_prev_no_lock(x)
-                    self.full_lru_list.remove_node(x)
-                    self.swa_lru_list.remove_node(x)
+        full_num_evicted, swa_num_evicted = 0, 0
 
-                    # 3. delete the leaf node
-                    self._delete_leaf(x)
+        swa_nodes = set()
+        swa_x = self.swa_lru_list.get_lru_no_lock()
+        while swa_x is not None and swa_indices:
+            node_indices = (
+                self.token_to_kv_pool_allocator.full_indices_to_swa_indices(
+                    swa_x.value
+                ).tolist()
+                if swa_x.value is not None
+                else set()
+            )
+            swa_indices.difference_update(node_indices)
+            swa_nodes.add(swa_x)
+            swa_x = self.swa_lru_list.get_prev_no_lock(swa_x)
 
-                    # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
-                    self._iteratively_delete_tombstone_leaf(x)
+        if full_indices:
+            x = self.full_lru_list.get_leaf_lru_no_lock()
+            while full_indices and self.full_lru_list.in_list(x):
+                x, full_num_evicted, swa_num_evicted = self._evict_full_node(
+                    x, full_num_evicted, swa_num_evicted, full_indices=full_indices
+                )
 
-                x = x_next
+        if swa_nodes:
+            x = self.swa_lru_list.get_lru_no_lock()
+            while swa_nodes:
+                x, full_num_evicted, swa_num_evicted = self._evict_swa_node(
+                    x, full_num_evicted, swa_num_evicted
+                )
+                for swa_node in list(swa_nodes):
+                    if not self.swa_lru_list.in_list(swa_node):
+                        swa_nodes.remove(swa_node)
 
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
 
@@ -691,6 +677,7 @@ class SWARadixCache(BasePrefixCache):
             ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
             if node.full_lock_ref == 0:
                 self.full_evictable_size_ -= len(node.value)
+                self._rm_unused(full_indices=node.value)
                 self.full_protected_size_ += len(node.value)
             node.full_lock_ref += 1
 
@@ -703,6 +690,7 @@ class SWARadixCache(BasePrefixCache):
                 ), f"inc_lock_swa on swa_tombstone node, {node.id=}"
                 if node.swa_lock_ref == 0:
                     self.swa_evictable_size_ -= len(node.value)
+                    self._rm_unused(swa_indices=node.value)
                     self.swa_protected_size_ += len(node.value)
                 node.swa_lock_ref += 1
                 swa_lock_size += len(node.value)
@@ -730,6 +718,7 @@ class SWARadixCache(BasePrefixCache):
             ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
             if node.full_lock_ref == 1:
                 self.full_evictable_size_ += len(node.value)
+                self._add_unused(full_indices=node.value)
                 self.full_protected_size_ -= len(node.value)
             node.full_lock_ref -= 1
 
@@ -743,6 +732,7 @@ class SWARadixCache(BasePrefixCache):
 
                 if node.swa_lock_ref == 1:
                     self.swa_evictable_size_ += len(node.value)
+                    self._add_unused(swa_indices=node.value)
                     self.swa_protected_size_ -= len(node.value)
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
@@ -939,13 +929,20 @@ class SWARadixCache(BasePrefixCache):
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
                     self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
+                    if node.full_lock_ref == 0:
+                        self.full_evictable_size_ -= len(node.value[first_diff_idx:])
+                        self._add_unused(node.value[first_diff_idx:])
                     node.value = value[:prefix_len]
+                    if node.full_lock_ref == 0:
+                        self.full_evictable_size_ += len(node.value[first_diff_idx:])
+                        self._add_unused(node.value[first_diff_idx:])
                     node.swa_tombstone = False
 
                     # insert the node into the lru lists
                     self.swa_lru_list.insert_mru(node)
 
                     self.swa_evictable_size_ += len(node.value)
+                    self._add_unused(swa_indices=node.value)
                 else:
                     self.token_to_kv_pool_allocator.free(
                         value[first_diff_idx:prefix_len]
@@ -968,10 +965,92 @@ class SWARadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.swa_evictable_size_ += len(value)
+            self._add_unused(full_indices=value, swa_indices=value)
         return total_prefix_length
 
+    def _evict_full_node(
+        self,
+        x: TreeNode,
+        full_num_evicted: int,
+        swa_num_evicted: int,
+        full_indices: Optional[Set[int]] = None,
+    ):
+        assert (
+            x != self.root_node
+        ), f"root node should not exist in full lru list, {x.id=}"
+        assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
+
+        # 1. free node kv indices, evict full and swa tokens
+        self.token_to_kv_pool_allocator.free(x.value)
+        full_num_evicted += len(x.value)
+        swa_num_evicted += len(x.value)
+
+        if full_indices is not None:
+            full_indices.difference_update(x.value.tolist())
+
+        # 2. get the next leaf, update the lru lists
+        x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
+        self.full_lru_list.remove_node(x)
+        self.swa_lru_list.remove_node(x)
+
+        # 3. delete the leaf node
+        self._delete_leaf(x)
+
+        # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
+        x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(
+            x, full_indices=full_indices
+        )
+        full_num_evicted += leaf_full_num_evicted
+
+        # 5. if parent has no more children, it is a leaf. It is possible that this node is lru, so
+        # we need to get the first leaf node in the lru list
+        if len(x.parent.children) == 0:
+            x_next = self.full_lru_list.get_leaf_lru_no_lock()
+
+        x = x_next
+        return x, full_num_evicted, swa_num_evicted
+
+    def _evict_swa_node(self, x: TreeNode, full_num_evicted: int, swa_num_evicted: int):
+        assert not x.swa_tombstone, f"duplicate swa tombstone node, {x.id=}"
+        assert x != self.root_node, f"root node is not evictable, {x.id=}"
+        assert x.swa_lock_ref == 0, f"node is in use by swa kv indices, {x.id=}"
+
+        if len(x.children) > 0:
+            # 1. an internal node, free swa tokens.
+            self.token_to_kv_pool_allocator.free_swa(x.value)
+            swa_num_evicted += len(x.value)
+
+            # 2. get the next node, update the lru lists
+            x_next = self.swa_lru_list.get_prev_no_lock(x)
+            self.swa_lru_list.remove_node(x)
+
+            # 3. tombstone the node
+            self._tombstone_internal_node(x)
+        else:
+            assert (
+                x.full_lock_ref == 0
+            ), f"leaf node with full lock must also have swa lock, {x.id=}"
+            # 1. a leaf node, free full and swa tokens
+            self.token_to_kv_pool_allocator.free(x.value)
+            full_num_evicted += len(x.value)
+            swa_num_evicted += len(x.value)
+
+            # 2. get the next node, update the lru lists
+            x_next = self.swa_lru_list.get_prev_no_lock(x)
+            self.full_lru_list.remove_node(x)
+            self.swa_lru_list.remove_node(x)
+
+            # 3. delete the leaf node
+            self._delete_leaf(x)
+
+            # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
+            self._iteratively_delete_tombstone_leaf(x)
+
+        x = x_next
+        return x, full_num_evicted, swa_num_evicted
+
     def _iteratively_delete_tombstone_leaf(
-        self, node: TreeNode
+        self, node: TreeNode, full_indices: Optional[Set[int]] = None
     ) -> Tuple[TreeNode, int]:
         full_num_evicted = 0
         while node.parent.swa_tombstone and len(node.parent.children) == 0:
@@ -986,6 +1065,10 @@ class SWARadixCache(BasePrefixCache):
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             self.token_to_kv_pool_allocator.free(node.parent.value)
+
+            if full_indices is not None:
+                full_indices.difference_update(node.parent.value.tolist())
+
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
@@ -1004,11 +1087,13 @@ class SWARadixCache(BasePrefixCache):
         del node.parent.children[k]
         self.full_evictable_size_ -= len(node.key)
         self.swa_evictable_size_ -= len(node.key)
+        self._add_unused(full_indices=node.value, swa_indices=node.value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         node.swa_tombstone = True
         self.swa_evictable_size_ -= len(node.key)
+        self._add_unused(swa_indices=node.value)
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (
@@ -1020,6 +1105,7 @@ class SWARadixCache(BasePrefixCache):
                 break
         del node.parent.children[k]
         self.full_evictable_size_ -= len(node.key)
+        self._add_unused(full_indices=node.value)
 
     def _collect_leaves(self) -> List[TreeNode]:
         ret_list = []
@@ -1091,3 +1177,31 @@ class SWARadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size, total_swa_size
+
+    def _add_unused(
+        self,
+        full_indices: Optional[torch.Tensor] = None,
+        swa_indices: Optional[torch.Tensor] = None,
+    ):
+        if not use_elasticmem:
+            return
+
+        if full_indices is not None:
+            self.token_to_kv_pool_allocator.add_unused(full_indices)
+
+        if swa_indices is not None:
+            self.token_to_kv_pool_allocator.add_unused_swa(swa_indices)
+
+    def _rm_unused(
+        self,
+        full_indices: Optional[torch.Tensor] = None,
+        swa_indices: Optional[torch.Tensor] = None,
+    ):
+        if not use_elasticmem:
+            return
+
+        if full_indices is not None:
+            self.token_to_kv_pool_allocator.rm_unused(full_indices)
+
+        if swa_indices is not None:
+            self.token_to_kv_pool_allocator.rm_unused_swa(swa_indices)
