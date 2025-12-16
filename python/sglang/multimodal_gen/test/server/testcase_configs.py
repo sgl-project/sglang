@@ -140,6 +140,9 @@ class DiffusionSamplingParams:
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
 
+    # URL direct test flag - if True, don't pre-download URL images
+    direct_url_test: bool = False
+
 
 @dataclass(frozen=True)
 class DiffusionTestCase:
@@ -234,6 +237,15 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
     ],
 )
 
+MULTI_URL_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
+    direct_url_test=True,
+)
+
 T2V_PROMPT = "A curious raccoon"
 
 TI2V_sampling_params = DiffusionSamplingParams(
@@ -305,6 +317,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_edit=1,
         ),
         MULTI_IMAGE_TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_edit_2509_ti2i_url",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit-2509",  # 假设的模型路径
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        MULTI_URL_IMAGE_TI2I_sampling_params,
     ),
 ]
 

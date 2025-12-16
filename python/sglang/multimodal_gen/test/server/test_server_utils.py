@@ -643,6 +643,96 @@ def get_generate_fn(
 
         return rid
 
+    def generate_image_edit_url(case_id, client) -> str:
+        """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
+        if not sampling_params.prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
+
+        # Handle both single URL and list of URLs
+        image_urls = sampling_params.image_path
+        if not isinstance(image_urls, list):
+            image_urls = [image_urls]
+
+        # Validate all URLs
+        for url in image_urls:
+            if not is_image_url(url):
+                pytest.skip(
+                    f"{id}: image_path must be a URL for URL direct test: {url}"
+                )
+
+        logger.info(f"URL direct test: processing {len(image_urls)} URLs")
+        logger.info(f"URLs: {image_urls}")
+
+        # Special logic: if 2 or more URLs, convert the first one to base64
+        processed_urls = []
+        if len(image_urls) >= 2:
+            logger.info(f"Converting first URL to base64 (special test logic)")
+
+            # Download and convert first URL to base64
+            first_url = image_urls[0]
+            try:
+                import base64
+
+                import requests
+
+                response = requests.get(first_url, timeout=30)
+                response.raise_for_status()
+
+                # Convert to base64 data URL
+                content_type = response.headers.get("content-type", "image/jpeg")
+                base64_data = base64.b64encode(response.content).decode("utf-8")
+                base64_url = f"data:{content_type};base64,{base64_data}"
+
+                processed_urls.append(base64_url)
+                logger.info(f"First URL converted to base64: {len(base64_data)} chars")
+
+                # Add remaining URLs as-is
+                processed_urls.extend(image_urls[1:])
+
+            except Exception as e:
+                logger.error(f"Failed to convert first URL to base64: {e}")
+                pytest.skip(f"{id}: failed to convert first URL to base64: {e}")
+        else:
+            # Less than 2 URLs, use all
+            processed_urls = image_urls
+
+        logger.info(f"Final processed URLs: {len(processed_urls)} items")
+        for i, url in enumerate(processed_urls):
+            url_type = "base64" if url.startswith("data:") else "http"
+            logger.info(f"  URL {i+1}: {url_type} format")
+
+        # Direct URL test - pass processed URLs to API
+        response = client.images.with_raw_response.edit(
+            model=model_path,
+            image_urls=processed_urls,
+            prompt=sampling_params.prompt,
+            n=1,
+            size=sampling_params.output_size,
+            response_format="b64_json",
+        )
+
+        rid = response.headers.get("x-request-id", "")
+        result = response.parse()
+        validate_image(result.data[0].b64_json)
+
+        # Save and upload result for verification
+        import base64
+
+        img_data = base64.b64decode(result.data[0].b64_json)
+        tmp_path = f"{rid}.png"
+        with open(tmp_path, "wb") as f:
+            f.write(img_data)
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+            origin_file_path=str(sampling_params.image_path),
+        )
+        os.remove(tmp_path)
+
+        return rid
+
     def generate_video(case_id, client) -> str:
         """T2V: Text ? Video."""
         if not sampling_params.prompt:
@@ -711,7 +801,12 @@ def get_generate_fn(
         else:
             fn = generate_video
     elif sampling_params.prompt and sampling_params.image_path:
-        fn = generate_image_edit
+        if getattr(sampling_params, "direct_url_test", False) and is_image_url(
+            sampling_params.image_path
+        ):
+            fn = generate_image_edit_url
+        else:
+            fn = generate_image_edit
     else:
         fn = generate_image
 
