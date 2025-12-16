@@ -36,7 +36,8 @@ at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 
 // layernorm
-at::Tensor layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor
+layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps);
 
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
@@ -46,7 +47,12 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
 // fused_add_layernorm
-at::Tensor fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
+at::Tensor fused_add_layernorm_cpu(
+    const at::Tensor& input,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    double eps);
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
