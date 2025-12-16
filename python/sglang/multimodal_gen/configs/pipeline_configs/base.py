@@ -39,14 +39,19 @@ logger = init_logger(__name__)
 # NOTE: possible duplication with DataType, WorkloadType
 # this may focus on the model's original ability
 class ModelTaskType(Enum):
+    # TODO: check if I2V/TI2V models can work w/wo text
+
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
 
-    def is_image_gen(self):
+    def is_image_gen(self) -> bool:
         return self == ModelTaskType.T2I or self == ModelTaskType.I2I
+
+    def requires_image_input(self) -> bool:
+        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
 
 
 class STA_Mode(str, Enum):

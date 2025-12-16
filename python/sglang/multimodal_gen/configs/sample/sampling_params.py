@@ -201,9 +201,26 @@ class SamplingParams:
         if self.height is None:
             self.height_not_provided = True
 
-    def check_sampling_param(self):
+        self._validate()
+
+    def _validate(self):
+        """
+        check if the sampling params is correct by itself
+        """
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError("prompt_path must be a txt file")
+
+    def _validate_with_server_args(self, server_args: ServerArgs):
+        """
+        check if the sampling params is compatible and valid with server_args
+        """
+        pipeline_config = server_args.pipeline_config
+        if pipeline_config.task_type.requires_image_input():
+            # requires image input
+            if self.image_path is None:
+                raise ValueError(
+                    f"Served model with workload type: {pipeline_config.task_type.name} requires image_path input, while is provided none"
+                )
 
     def _adjust(
         self,
@@ -332,6 +349,8 @@ class SamplingParams:
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
+
+        sampling_params._validate_with_server_args(server_args)
 
         return sampling_params
 

@@ -215,9 +215,6 @@ class ServerArgs:
     # Running mode
     mode: ExecutionMode = ExecutionMode.INFERENCE
 
-    # Workload type
-    workload_type: WorkloadType = WorkloadType.T2V
-
     # Cache strategy
     cache_strategy: str = "none"
 
@@ -406,15 +403,6 @@ class ServerArgs:
             choices=ExecutionMode.choices(),
             default=ServerArgs.mode.value,
             help="The mode to run SGLang-diffusion",
-        )
-
-        # Workload type
-        parser.add_argument(
-            "--workload-type",
-            type=str,
-            choices=WorkloadType.choices(),
-            default=ServerArgs.workload_type.value,
-            help="The workload type",
         )
 
         # distributed_executor_backend
@@ -796,10 +784,6 @@ class ServerArgs:
         if "mode" in kwargs and isinstance(kwargs["mode"], str):
             kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
 
-        # Convert workload_type string to enum if necessary
-        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
-            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
-
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -911,14 +895,6 @@ class ServerArgs:
         assert (
             self.mode in ExecutionMode.choices()
         ), f"Invalid execution mode: {self.mode}"
-
-        # Validate workload type
-        assert isinstance(
-            self.workload_type, WorkloadType
-        ), f"Workload type must be a WorkloadType enum, got {type(self.workload_type)}"
-        assert (
-            self.workload_type in WorkloadType.choices()
-        ), f"Invalid workload type: {self.workload_type}"
 
         if self.tp_size == -1:
             self.tp_size = 1
