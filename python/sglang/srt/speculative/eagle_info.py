@@ -379,7 +379,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
-                    accept_index[i, j + 1:] = -1
+                    accept_index[i, j + 1 :] = -1
                     break
                 else:
                     if req.grammar is not None:
@@ -701,7 +701,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
-        
+
     def prepare_extend_after_decode_for_simple_eagle(
         self,
         batch: ScheduleBatch,
