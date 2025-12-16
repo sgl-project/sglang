@@ -6,9 +6,9 @@ from typing import List, Tuple
 import numpy as np
 import torch
 import triton
-
 from sgl_kernel.rotary_embedding import rotary_embedding_cos_sin as sgl_rotary_cos_sin
 from sgl_kernel.testing.rotary_embedding import RotaryEmbedding as NativeRotaryEmbedding
+
 
 def compute_cos_sin_cache(
     max_seq_len: int,
@@ -28,7 +28,10 @@ def compute_cos_sin_cache(
 
 def benchmark_mm_rotary_embedding() -> None:
     try:
-        from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding as vLLMRotaryEmbedding
+        from vllm.model_executor.layers.rotary_embedding import (
+            RotaryEmbedding as vLLMRotaryEmbedding,
+        )
+
         HAS_VLLM = True
     except ImportError:
         vLLMRotaryEmbedding = None
@@ -57,9 +60,9 @@ def benchmark_mm_rotary_embedding() -> None:
         (1, 32, 8, 64),
         (1, 32, 8, 256),
         (32, 32, 8, 64),
-        (1, 32, 1, 128), 
-        (32, 8, 8, 128), 
-        (1, 32, 8, 80),  
+        (1, 32, 1, 128),
+        (32, 8, 8, 128),
+        (1, 32, 8, 80),
     ]
 
     for batch_size, num_heads, num_kv_heads, head_size in configs:
@@ -90,10 +93,14 @@ def benchmark_mm_rotary_embedding() -> None:
                 dtype=dtype,
             ).to(device)
 
-            print(f"\nConfig: batch_size={batch_size}, heads={num_heads}/{num_kv_heads}, head_size={head_size}, dtype={dtype}")
+            print(
+                f"\nConfig: batch_size={batch_size}, heads={num_heads}/{num_kv_heads}, head_size={head_size}, dtype={dtype}"
+            )
             print("-" * 100)
         except Exception as e:
-            print(f"\nSkipping config (batch_size={batch_size}, heads={num_heads}/{num_kv_heads}, head_size={head_size}): {e}")
+            print(
+                f"\nSkipping config (batch_size={batch_size}, heads={num_heads}/{num_kv_heads}, head_size={head_size}): {e}"
+            )
             continue
 
         header = f"{'seq_len':>8}"
@@ -113,9 +120,15 @@ def benchmark_mm_rotary_embedding() -> None:
         for seq_len in seq_lens:
             try:
                 num_tokens = batch_size * seq_len
-                query = torch.randn(num_tokens, num_heads * head_size, dtype=dtype, device=device)  
-                key = torch.randn(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device)
-                positions = torch.arange(seq_len, device=device, dtype=torch.int64).repeat(batch_size)
+                query = torch.randn(
+                    num_tokens, num_heads * head_size, dtype=dtype, device=device
+                )
+                key = torch.randn(
+                    num_tokens, num_kv_heads * head_size, dtype=dtype, device=device
+                )
+                positions = torch.arange(
+                    seq_len, device=device, dtype=torch.int64
+                ).repeat(batch_size)
                 cos = cos_cache[positions]
                 sin = sin_cache[positions]
 
@@ -144,7 +157,9 @@ def benchmark_mm_rotary_embedding() -> None:
                 k = key.clone()
                 sgl_rotary_cos_sin(cos, sin, q, k, head_size, True)
 
-            ms, _, _ = triton.testing.do_bench(fn_sgl_cos_sin, quantiles=[0.5, 0.2, 0.8])
+            ms, _, _ = triton.testing.do_bench(
+                fn_sgl_cos_sin, quantiles=[0.5, 0.2, 0.8]
+            )
             sgl_cos_sin_time = 1000 * ms
             row_str += f" | {sgl_cos_sin_time:16.4f}"
 
@@ -237,7 +252,9 @@ def benchmark_mm_rotary_embedding() -> None:
         if native_vals:
             print(f"  Native: {np.mean(native_vals):.4f} ms")
 
-        sgl_cos_sin_vals = [r["sgl_cos_sin"] for r in results if r["sgl_cos_sin"] is not None]
+        sgl_cos_sin_vals = [
+            r["sgl_cos_sin"] for r in results if r["sgl_cos_sin"] is not None
+        ]
         if sgl_cos_sin_vals:
             print(f"  SGLang (cos/sin API): {np.mean(sgl_cos_sin_vals):.4f} ms")
 
@@ -252,7 +269,7 @@ def benchmark_mm_rotary_embedding() -> None:
             fa_vals = [r["flash_attn"] for r in results if r["flash_attn"] is not None]
             if fa_vals:
                 print(f"  flash_attn: {np.mean(fa_vals):.4f} ms")
-   
+
 
 if __name__ == "__main__":
     benchmark_mm_rotary_embedding()

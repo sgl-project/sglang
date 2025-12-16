@@ -23,7 +23,9 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
 )
 
 try:
-    from sgl_kernel.rotary_embedding import rotary_embedding_cos_sin as sgl_rotary_embedding  # type: ignore
+    from sgl_kernel.rotary_embedding import (
+        rotary_embedding_cos_sin as sgl_rotary_embedding,  # type: ignore
+    )
 except Exception:
     sgl_rotary_embedding = None
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
@@ -403,23 +405,42 @@ class QwenImageCrossAttention(nn.Module):
             (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
 
             if sgl_rotary_embedding is not None:
-                def _apply_sgl_rope(q: torch.Tensor, k: Optional[torch.Tensor], cos, sin):
+
+                def _apply_sgl_rope(
+                    q: torch.Tensor, k: Optional[torch.Tensor], cos, sin
+                ):
                     # sgl_kernel expects contiguous [num_tokens, num_heads, head_size]
                     q_shape = q.shape
                     q_view = q.contiguous().view(-1, q_shape[-2], q_shape[-1])
-                    k_view = k.contiguous().view(-1, k.shape[-2], k.shape[-1]) if k is not None else None
+                    k_view = (
+                        k.contiguous().view(-1, k.shape[-2], k.shape[-1])
+                        if k is not None
+                        else None
+                    )
                     sgl_rotary_embedding(cos, sin, q_view, k_view, q_shape[-1], True)
                     q_out = q_view.view(q_shape)
                     k_out = k_view.view(k.shape) if k_view is not None else None
                     return q_out, k_out
 
-                img_query, img_key = _apply_sgl_rope(img_query, img_key, img_cos, img_sin)
-                txt_query, txt_key = _apply_sgl_rope(txt_query, txt_key, txt_cos, txt_sin)
+                img_query, img_key = _apply_sgl_rope(
+                    img_query, img_key, img_cos, img_sin
+                )
+                txt_query, txt_key = _apply_sgl_rope(
+                    txt_query, txt_key, txt_cos, txt_sin
+                )
             else:
-                img_query = apply_rotary_embedding(img_query, img_cos, img_sin, interleaved=True)
-                img_key = apply_rotary_embedding(img_key, img_cos, img_sin, interleaved=True)
-                txt_query = apply_rotary_embedding(txt_query, txt_cos, txt_sin, interleaved=True)
-                txt_key = apply_rotary_embedding(txt_key, txt_cos, txt_sin, interleaved=True)
+                img_query = apply_rotary_embedding(
+                    img_query, img_cos, img_sin, interleaved=True
+                )
+                img_key = apply_rotary_embedding(
+                    img_key, img_cos, img_sin, interleaved=True
+                )
+                txt_query = apply_rotary_embedding(
+                    txt_query, txt_cos, txt_sin, interleaved=True
+                )
+                txt_key = apply_rotary_embedding(
+                    txt_key, txt_cos, txt_sin, interleaved=True
+                )
 
         # Concatenate for joint attention
         # Order: [text, image]

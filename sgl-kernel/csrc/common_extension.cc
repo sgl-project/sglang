@@ -91,15 +91,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   m.def(
-      "rotary_embedding(Tensor positions, Tensor! query,Tensor!? key, int head_size, Tensor cos_sin_cache, bool is_neox) -> ()");
+      "rotary_embedding(Tensor positions, Tensor! query,Tensor!? key, int head_size, Tensor cos_sin_cache, bool "
+      "is_neox) -> ()");
   m.impl(
       "rotary_embedding",
       torch::kCUDA,
-      static_cast<void (*)(torch::Tensor&, torch::Tensor&, std::optional<torch::Tensor>, int64_t, torch::Tensor&, bool)>(
+      static_cast<void (*)(
+          torch::Tensor&, torch::Tensor&, std::optional<torch::Tensor>, int64_t, torch::Tensor&, bool)>(
           &rotary_embedding));
 
   m.def(
-      "rotary_embedding_cos_sin(Tensor cos, Tensor sin, Tensor(a!) query, Tensor? key, int head_size, bool interleaved) -> ()");
+      "rotary_embedding_cos_sin(Tensor cos, Tensor sin, Tensor(a!) query, Tensor? key, int head_size, bool "
+      "interleaved) -> ()");
   m.impl(
       "rotary_embedding_cos_sin",
       torch::kCUDA,

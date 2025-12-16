@@ -4,19 +4,23 @@
 import os
 import sys
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import List, Tuple
 
 import torch
 
 try:
     import pytest
+
     HAS_PYTEST = True
 except ImportError:
     HAS_PYTEST = False
 
 try:
     # Cos/sin-based rotary kernel from sgl_diffusion
-    from sgl_kernel.rotary_embedding import rotary_embedding_cos_sin as rotary_emb_module
+    from sgl_kernel.rotary_embedding import (
+        rotary_embedding_cos_sin as rotary_emb_module,
+    )
+
     HAS_ROTARY_EMBEDDING = True
 except ImportError:
     rotary_emb_module = None
@@ -42,7 +46,9 @@ def compute_cos_sin_cache(
     """
     Compute separate cos and sin caches.
     """
-    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+    )
     t = torch.arange(max_seq_len, dtype=torch.float32)
     freqs = torch.einsum("i,j->ij", t, inv_freq)
     cos = freqs.cos().to(dtype)
@@ -58,7 +64,7 @@ def reference_rotary_neox(
     head_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Reference implementation of NeoX-style rotary embedding, 
+    Reference implementation of NeoX-style rotary embedding,
     using explicit cos/sin caches and Q/K in flattened (num_tokens, heads * dim) layout.
     """
     num_tokens = query.size(0)
@@ -124,7 +130,11 @@ def _check_rotary_correctness(
     device: str = "cuda",
 ) -> RotaryTestResult:
     if not HAS_ROTARY_EMBEDDING:
-        return RotaryTestResult("basic (skipped: rotary_embedding not built)", True, details="rotary_embedding extension not found")
+        return RotaryTestResult(
+            "basic (skipped: rotary_embedding not built)",
+            True,
+            details="rotary_embedding extension not found",
+        )
 
     rotary_dim = head_size
     max_seq_len = 8192
@@ -139,7 +149,9 @@ def _check_rotary_correctness(
     cos = cos_cache[positions]
     sin = sin_cache[positions]
 
-    q_ref, k_ref = reference_rotary_neox(query.clone(), key.clone(), cos, sin, head_size)
+    q_ref, k_ref = reference_rotary_neox(
+        query.clone(), key.clone(), cos, sin, head_size
+    )
 
     q_out = query.clone()
     k_out = key.clone()
@@ -168,7 +180,7 @@ def test_rotary_embedding_correctness(
 ) -> None:
     if not HAS_ROTARY_EMBEDDING:
         pytest.skip("sgl_kernel.rotary_embedding not available")
-    
+
     result = _check_rotary_correctness(
         batch_size=batch_size,
         seq_len=seq_len,
@@ -177,7 +189,9 @@ def test_rotary_embedding_correctness(
         head_size=head_size,
         dtype=dtype,
     )
-    assert result.passed, f"{result.name} failed: Q={result.q_diff:.2e}, K={result.k_diff:.2e}"
+    assert (
+        result.passed
+    ), f"{result.name} failed: Q={result.q_diff:.2e}, K={result.k_diff:.2e}"
 
 
 if __name__ == "__main__":

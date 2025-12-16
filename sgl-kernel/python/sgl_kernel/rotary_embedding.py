@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal, Optional
+
 import torch
 
 _HAS_COS_SIN = hasattr(torch.ops.sgl_kernel, "rotary_embedding_cos_sin")
@@ -74,14 +75,18 @@ def apply_rotary_embedding(
             )
             return
 
-        raise RuntimeError("No cos/sin rotary embedding kernel is available in torch.ops.sgl_kernel")
+        raise RuntimeError(
+            "No cos/sin rotary embedding kernel is available in torch.ops.sgl_kernel"
+        )
 
     if mode == "positions":
         if positions is None or cos_sin_cache is None:
             raise ValueError("mode='positions' requires positions and cos_sin_cache")
 
         if not _HAS_GENERIC:
-            raise RuntimeError("No positions rotary embedding kernel is available in torch.ops.sgl_kernel")
+            raise RuntimeError(
+                "No positions rotary embedding kernel is available in torch.ops.sgl_kernel"
+            )
 
         # Prefer keyword call if supported.
         try:
@@ -132,6 +137,7 @@ def rotary_embedding_cos_sin(
         interleaved=interleaved,
         is_neox=is_neox,
     )
+
 
 def rotary_embedding(
     positions: torch.Tensor,
