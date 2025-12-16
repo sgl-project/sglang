@@ -598,7 +598,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and _is_flashinfer_available
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and get_global_server_args().enable_flashinfer_allreduce_fusion
-                and hidden_states.shape[0] <= 4096
+                and hidden_states.shape[0] <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
@@ -607,6 +607,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 _use_aiter
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and get_global_server_args().enable_aiter_allreduce_fusion
+                and hidden_states.shape[0] <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states,
