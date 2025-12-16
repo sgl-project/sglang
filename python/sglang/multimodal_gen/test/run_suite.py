@@ -30,6 +30,11 @@ SUITES = {
         "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
     ],
+    "2-gpu-distributed": [
+        # Distributed communication tests (in distributed/ subdirectory)
+        "test_comm_ops.py",
+        # add new distributed test files here
+    ],
 }
 
 
@@ -57,65 +62,94 @@ def parse_args():
     parser.add_argument(
         "--base-dir",
         type=str,
-        default="server",
-        help="Base directory for tests relative to this script's parent",
+        default=None,
+        help="Base directory for tests relative to this script's parent (auto-detected if not specified)",
     )
     return parser.parse_args()
 
 
-def run_pytest(files):
+def run_pytest(files, is_distributed=False):
     if not files:
         print("No files to run.")
         return 0
 
-    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
+    # For distributed tests, use torchrun instead of pytest directly
+    if is_distributed:
+        # Use torchrun for distributed tests (requires 2 GPUs)
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node=2",
+            "--standalone",
+        ]
 
-    max_retries = 4
-    # retry if the perf assertion failed, for {max_retries} times
-    for i in range(max_retries + 1):
-        cmd = list(base_cmd)
-        if i > 0:
-            cmd.append("--last-failed")
-        cmd.extend(files)
+        final_exit_code = 0
+        for f in files:
+            cmd = list(base_cmd)
+            cmd.append(f)  # append one file at a time
 
-        if i > 0:
-            logger.info(
-                f"Performance assertion failed. Retrying ({i}/{max_retries}) with --last-failed..."
+            logger.info(f"Running distributed command: {' '.join(cmd)}")
+
+            # distributed tests usually do not retry, because the environment state may be dirty
+            # and the script does not support --last-failed parameter
+            ret = subprocess.call(cmd)
+            if ret != 0:
+                final_exit_code = ret
+                # if one fails, the subsequent ones may also be affected
+                # we can choose to break or continue
+                logger.error(f"Distributed test {f} failed with exit code {ret}")
+
+        return final_exit_code
+    else:
+        base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
+
+        max_retries = 4
+        # retry if the perf assertion failed, for {max_retries} times
+        for i in range(max_retries + 1):
+            cmd = list(base_cmd)
+            if i > 0:
+                cmd.append("--last-failed")
+            cmd.extend(files)
+
+            if i > 0:
+                logger.info(
+                    f"Performance assertion failed. Retrying ({i}/{max_retries}) with --last-failed..."
+                )
+
+            logger.info(f"Running command: {' '.join(cmd)}")
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
 
-        logger.info(f"Running command: {' '.join(cmd)}")
+            output_lines = []
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    sys.stdout.write(line)
+                    output_lines.append(line)
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+            returncode = process.poll()
 
-        output_lines = []
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            if line:
-                sys.stdout.write(line)
-                output_lines.append(line)
+            if returncode == 0:
+                return 0
 
-        returncode = process.poll()
+            # check if the failure is due to an assertion in test_server_utils.py
+            full_output = "".join(output_lines)
+            is_perf_assertion = (
+                "multimodal_gen/test/server/test_server_utils.py" in full_output
+                and "AssertionError" in full_output
+            )
 
-        if returncode == 0:
-            return 0
-
-        # check if the failure is due to an assertion in test_server_utils.py
-        full_output = "".join(output_lines)
-        is_perf_assertion = (
-            "multimodal_gen/test/server/test_server_utils.py" in full_output
-            and "AssertionError" in full_output
-        )
-
-        if not is_perf_assertion:
-            return returncode
+            if not is_perf_assertion:
+                return returncode
 
     return returncode
 
@@ -126,6 +160,14 @@ def main():
     # 1. resolve base path
     current_file_path = Path(__file__).resolve()
     test_root_dir = current_file_path.parent
+
+    # Auto-detect base directory based on suite name
+    if args.base_dir is None:
+        if "distributed" in args.suite:
+            args.base_dir = "distributed"
+        else:
+            args.base_dir = "server"
+
     target_dir = test_root_dir / args.base_dir
 
     if not target_dir.exists():
@@ -166,7 +208,8 @@ def main():
         sys.exit(0)
 
     # 4. execute
-    exit_code = run_pytest(my_files)
+    is_distributed = "distributed" in args.suite
+    exit_code = run_pytest(my_files, is_distributed=is_distributed)
     sys.exit(exit_code)
 
 
