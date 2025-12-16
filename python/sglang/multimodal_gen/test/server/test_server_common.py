@@ -476,25 +476,43 @@ Consider updating perf_baselines.json with the snippets below:
             # Save to staging directory if enabled
             staging_path = save_gt_to_staging(output_frames, case, is_video)
 
-            # Build helpful error message (similar to perf baseline)
+            # Build helpful error message
             gpu_dir = f"{num_gpus}-gpu"
-            gt_target_path = (
-                f"python/sglang/multimodal_gen/test/consistency_gt/{gpu_dir}/{case.id}/"
-            )
 
             error_msg = f"""
 --- MISSING GROUND TRUTH DETECTED ---
-GT not found for '{case.id}' ({num_gpus}-gpu). Add GT files to pass consistency tests.
+GT not found for '{case.id}' ({num_gpus}-gpu).
 
-1. Copy frame files to:
-   {gt_target_path}
 """
             if staging_path:
-                error_msg += """
-   Frame files have been saved to staging and are available in the 'missing-gt' artifact.
+                error_msg += f"""GT frames have been generated and saved to staging directory.
+These are available in the 'missing-gt' CI artifact.
+
+To add GT files to pass consistency tests:
+1. Download the 'missing-gt' artifact from this CI run
+
+2. Clone sgl-test-files repo and copy the frame files:
+   git clone https://github.com/sgl-project/sgl-test-files.git
+   mkdir -p sgl-test-files/images/consistency_gt/{gpu_dir}/{case.id}/
+   cp -r {staging_path}/* sgl-test-files/images/consistency_gt/{gpu_dir}/{case.id}/
+
+3. Commit and push to sgl-test-files:
+   cd sgl-test-files
+   git add images/consistency_gt/
+   git commit -m "Add consistency GT for {case.id}"
+   git push
+
+4. After the sgl-test-files PR is merged, re-run this CI.
+"""
+            else:
+                error_msg += f"""GT staging is not enabled. To generate GT files:
+1. Set environment variable: SGLANG_GT_STAGING_DIR=/path/to/staging
+2. Re-run this test to generate GT frames
+3. Upload the generated frames to sgl-test-files repository:
+   https://github.com/sgl-project/sgl-test-files/tree/main/images/consistency_gt/{gpu_dir}/{case.id}/
 """
             error_msg += f"""
-2. (Optional) Add custom threshold to gt_metadata.json if needed:
+(Optional) Add custom SSIM threshold to gt_metadata.json if needed:
    "{case.id}": {{
        "ssim_threshold": 0.98
    }}
