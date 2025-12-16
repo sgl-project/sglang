@@ -148,7 +148,12 @@ class NunchakuConfig(QuantizationConfig):
             if pattern in prefix:
                 from .nunchaku_linear import NunchakuAWQLinearMethod
                 return NunchakuAWQLinearMethod(
-                    group_size=self.group_size or 64,
+                    # AWQ W4A16 in Nunchaku uses group_size=64 regardless of the
+                    # SVDQ precision/group_size used for W4A4. The checkpoints for
+                    # Qwen-Image are produced with group_size=64, so we hardcode
+                    # this here to ensure shapes match (e.g. wzeros.shape[0] =
+                    # in_features // 64).
+                    group_size=64,
                 )
 
         # Default: use SVDQ W4A4 for other linear layers in the transformer

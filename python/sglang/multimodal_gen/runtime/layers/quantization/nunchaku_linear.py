@@ -107,6 +107,12 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             requires_grad=False,
         )
 
+        # Original smooth factor (kept for full compatibility with Nunchaku).
+        smooth_factor_orig = Parameter(
+            torch.empty(input_size_per_partition, dtype=params_dtype),
+            requires_grad=False,
+        )
+
         # Low-rank projections
         proj_down = Parameter(
             torch.empty(input_size_per_partition, self.rank, dtype=params_dtype),
@@ -117,11 +123,26 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             requires_grad=False,
         )
 
+        # Per-channel scales for NVFP4 (FP4) mode, mirroring SVDQW4A4Linear.
+        if self.precision == "nvfp4":
+            wcscales = Parameter(
+                torch.empty(
+                    output_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+        else:
+            wcscales = None
+
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("wscales", wscales)
         layer.register_parameter("smooth_factor", smooth_factor)
+        layer.register_parameter("smooth_factor_orig", smooth_factor_orig)
         layer.register_parameter("proj_down", proj_down)
         layer.register_parameter("proj_up", proj_up)
+        if wcscales is not None:
+            layer.register_parameter("wcscales", wcscales)
 
         # Store metadata
         layer.input_size_per_partition = input_size_per_partition
@@ -129,14 +150,21 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         layer.precision = self.precision
         layer.rank = self.rank
         layer.group_size = self.group_size
+        # Whether to use unsigned activations in INT4 mode.
+        layer.act_unsigned = self.act_unsigned
+        # Global weight scale (set later from checkpoint when available).
+        layer.wtscale = None
 
         weight_loader = extra_weight_attrs.get("weight_loader")
         if weight_loader is not None:
             set_weight_attrs(qweight, {"weight_loader": weight_loader})
             set_weight_attrs(wscales, {"weight_loader": weight_loader})
             set_weight_attrs(smooth_factor, {"weight_loader": weight_loader})
+            set_weight_attrs(smooth_factor_orig, {"weight_loader": weight_loader})
             set_weight_attrs(proj_down, {"weight_loader": weight_loader})
             set_weight_attrs(proj_up, {"weight_loader": weight_loader})
+            if wcscales is not None:
+                set_weight_attrs(wcscales, {"weight_loader": weight_loader})
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Process weights after loading from checkpoint."""
@@ -144,8 +172,14 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
         layer.wscales = Parameter(layer.wscales.data, requires_grad=False)
         layer.smooth_factor = Parameter(layer.smooth_factor.data, requires_grad=False)
+        if hasattr(layer, "smooth_factor_orig") and layer.smooth_factor_orig is not None:
+            layer.smooth_factor_orig = Parameter(
+                layer.smooth_factor_orig.data, requires_grad=False
+            )
         layer.proj_down = Parameter(layer.proj_down.data, requires_grad=False)
         layer.proj_up = Parameter(layer.proj_up.data, requires_grad=False)
+        if hasattr(layer, "wcscales") and layer.wcscales is not None:
+            layer.wcscales = Parameter(layer.wcscales.data, requires_grad=False)
 
     def apply(
         self,
@@ -156,7 +190,7 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         """
         Apply SVDQ W4A4 quantized linear transformation.
 
-        Uses Nunchaku's optimized kernels for W4A4 computation with SVD low-rank.
+        Uses Nunchaku's optimized SVDQ W4A4 kernels with low-rank decomposition.
         """
         if not _check_nunchaku_available():
             raise ImportError(
@@ -164,30 +198,61 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
                 "Install with: pip install nunchaku"
             )
 
-        from nunchaku.kernels import gemm_w4a4_svd
-
-        # Get quantized parameters
-        qweight = layer.qweight
-        wscales = layer.wscales
-        smooth_factor = layer.smooth_factor
-        proj_down = layer.proj_down
-        proj_up = layer.proj_up
-
-        # Apply SVDQ W4A4 computation
-        # The kernel handles: smooth -> quantize act -> gemm -> dequant + low-rank correction
-        out = gemm_w4a4_svd(
-            x,
-            qweight,
-            wscales,
-            smooth_factor,
-            proj_down,
-            proj_up,
-            precision=layer.precision,
+        from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda  # type: ignore[import]
+        from nunchaku.ops.quantize import (  # type: ignore[import]
+            svdq_quantize_w4a4_act_fuse_lora_cuda,
         )
 
-        if bias is not None:
-            out = out + bias
+        # Expect input in (..., in_features) shape; flatten to 2D for kernels.
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
 
+        # Quantize activations and compute low-rank hidden states, mirroring
+        # SVDQW4A4Linear.quantize.
+        quantized_x, ascales, lora_act_out = svdq_quantize_w4a4_act_fuse_lora_cuda(
+            x_2d,
+            lora_down=layer.proj_down,
+            smooth=layer.smooth_factor,
+            fp4=layer.precision == "nvfp4",
+        )
+
+        # Allocate output buffer.
+        out_2d = torch.empty(
+            quantized_x.shape[0],
+            layer.output_size_per_partition,
+            dtype=x_2d.dtype,
+            device=x_2d.device,
+        )
+
+        # Global scale (for FP4); may be a tensor or float.
+        alpha: float | None
+        wtscale = getattr(layer, "wtscale", None)
+        if isinstance(wtscale, torch.Tensor):
+            alpha = float(wtscale.item())
+        else:
+            alpha = wtscale
+
+        # Per-channel FP4 scales (optional in INT4 mode).
+        wcscales = getattr(layer, "wcscales", None)
+
+        # Apply SVDQ GEMM with low-rank correction, mirroring
+        # SVDQW4A4Linear.forward_quant.
+        svdq_gemm_w4a4_cuda(
+            act=quantized_x,
+            wgt=layer.qweight,
+            out=out_2d,
+            ascales=ascales,
+            wscales=layer.wscales,
+            lora_act_in=lora_act_out,
+            lora_up=layer.proj_up,
+            bias=bias,
+            fp4=layer.precision == "nvfp4",
+            alpha=alpha,
+            wcscales=wcscales,
+            act_unsigned=getattr(layer, "act_unsigned", False),
+        )
+
+        out = out_2d.reshape(*orig_shape[:-1], layer.output_size_per_partition)
         return out
 
 

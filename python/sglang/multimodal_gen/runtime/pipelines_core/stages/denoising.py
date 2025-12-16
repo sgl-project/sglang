@@ -1181,7 +1181,7 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
-        print(f"current_model: {current_model}")
+        # print(f"current_model: {current_model}")
         return current_model(
             hidden_states=latent_model_input,
             encoder_hidden_states=prompt_embeds,

@@ -605,6 +605,95 @@ class VAELoader(ComponentLoader):
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
+    def _patch_nunchaku_wtscale(
+        self,
+        model: nn.Module,
+        safetensors_list: list[str],
+        quant_config: Any,
+    ) -> None:
+        """Patch SVDQW4A4Linear.wtscale from Nunchaku safetensors checkpoints.
+
+        Nunchaku stores a scalar ``wtscale`` per quantized linear layer in the
+        checkpoint, but in its own loader it is applied manually (not via
+        ``load_state_dict``):
+
+        .. code-block:: python
+            for n, m in transformer.named_modules():
+                if isinstance(m, SVDQW4A4Linear) and m.wtscale is not None:
+                    m.wtscale = model_state_dict.pop(f\"{n}.wtscale\", 1.0)
+
+        Our FSDP path cannot treat ``wtscale`` as a normal parameter because it
+        is a Python attribute, not an ``nn.Parameter``. Instead, we mirror the
+        Nunchaku behavior here: load the scalar from the safetensors file and
+        assign it to the ``wtscale`` attribute after FSDP loading.
+        """
+
+        # Only patch for Nunchaku SVDQuant configs.
+        if not hasattr(quant_config, "get_name") or quant_config.get_name() != "svdquant":
+            return
+
+        if not safetensors_list:
+            return
+
+        # Current Nunchaku Qwen-Image checkpoints are single-file; if there are
+        # multiple files, we skip patching rather than guessing.
+        if len(safetensors_list) != 1:
+            logger.warning(
+                "Nunchaku wtscale patch expects a single safetensors file, "
+                "but got %d files. Skipping wtscale patch.",
+                len(safetensors_list),
+            )
+            return
+
+        try:
+            # Optional dependency: only patch if Nunchaku is installed.
+            from nunchaku.models.linear import (  # type: ignore[import]
+                SVDQW4A4Linear,
+            )
+            from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (  # type: ignore[import]
+                NunchakuSVDQLinearMethod,
+            )
+        except Exception:
+            logger.warning(
+                "Nunchaku is not available; skipping SVDQ wtscale patch."
+            )
+            return
+
+        weights_path = safetensors_list[0]
+        try:
+            state_dict = safetensors_load_file(weights_path)
+        except Exception as exc:  # pragma: no cover - best effort logging
+            logger.warning(
+                "Failed to load quantized weights from %s for wtscale patch: %s",
+                weights_path,
+                exc,
+            )
+            return
+
+        num_patched = 0
+        for name, module in model.named_modules():
+            key = f"{name}.wtscale"
+            tensor = state_dict.get(key)
+            if tensor is None:
+                continue
+
+            # Case 1: native Nunchaku SVDQW4A4Linear (used in NunchakuFeedForward).
+            if isinstance(module, SVDQW4A4Linear) and getattr(module, "wtscale", None) is not None:
+                module.wtscale = tensor
+                num_patched += 1
+                continue
+
+            # Case 2: SGLang LinearBase layers using NunchakuSVDQLinearMethod.
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, NunchakuSVDQLinearMethod):
+                # Store as a tensor attribute; the kernel wrapper will read it
+                # and pass it as ``alpha`` to svdq_gemm_w4a4_cuda.
+                module.wtscale = tensor
+                num_patched += 1
+
+        if num_patched > 0:
+            logger.info("Patched wtscale for %d SVDQW4A4Linear layers", num_patched)
+
     def _get_quant_config(self, server_args: ServerArgs):
         """
         Get quantization configuration from server_args if enabled.
@@ -800,6 +889,12 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
         )
+
+        # After FSDP loading, apply Nunchaku-specific post-processing to patch
+        # SVDQW4A4Linear.wtscale attributes from the quantized checkpoint, so we
+        # fully mirror Nunchaku's own loader behavior.
+        if quant_config is not None:
+            self._patch_nunchaku_wtscale(model, safetensors_list, quant_config)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
