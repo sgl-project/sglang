@@ -57,6 +57,7 @@ class Req:
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
+    vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 

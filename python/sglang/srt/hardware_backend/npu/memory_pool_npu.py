@@ -89,7 +89,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
-
+        loc = loc.to(torch.int32)
         torch_npu._npu_reshape_and_cache(
             key=cache_k,
             value=cache_v,
