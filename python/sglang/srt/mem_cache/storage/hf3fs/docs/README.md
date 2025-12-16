@@ -18,7 +18,7 @@ The Usrbio client is required for accessing 3FS. Install it in your SGLang Pod u
 set -e; \
 . /etc/os-release; \
 case "$VERSION_ID" in \
-  "22.04") \ 
+  "22.04") \
     CLANG_VERSION="14"; \
     GIT_BRANCH=main; \
     GIT_COMMIT_ID=6f029c439d0d22995900ca357d51b37975c6ffb5; \
