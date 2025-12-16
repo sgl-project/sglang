@@ -1,0 +1,180 @@
+name: Generate Consistency GT
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Test suite to generate GT for'
+        required: true
+        default: '1-gpu'
+        type: choice
+        options:
+          - '1-gpu'
+          - '2-gpu'
+          - 'all'
+      case:
+        description: 'Specific case ID (optional, overrides suite)'
+        required: false
+        type: string
+      missing_only:
+        description: 'Only generate GT for cases without existing GT'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  generate-gt-1-gpu:
+    if: ${{ github.event.inputs.suite == '1-gpu' || github.event.inputs.suite == 'all' || github.event.inputs.case != '' }}
+    runs-on: [self-hosted, 1-gpu]
+    outputs:
+      has_changes: ${{ steps.check_changes.outputs.has_changes }}
+      branch_name: ${{ steps.create_branch.outputs.branch_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pip install -e "python[diffusion]"
+
+      - name: Create branch for GT update
+        id: create_branch
+        run: |
+          BRANCH_NAME="auto/gt-update-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b $BRANCH_NAME
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Generate GT
+        run: |
+          cd python/sglang/multimodal_gen/test
+          MISSING_FLAG=""
+          if [ "${{ github.event.inputs.missing_only }}" == "true" ]; then
+            MISSING_FLAG="--missing-only"
+          fi
+
+          if [ -n "${{ github.event.inputs.case }}" ]; then
+            python generate_consistency_gt.py --case ${{ github.event.inputs.case }} $MISSING_FLAG
+          else
+            python generate_consistency_gt.py --suite 1-gpu $MISSING_FLAG
+          fi
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          git add python/sglang/multimodal_gen/test/consistency_gt/
+          if git diff --staged --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git commit -m "chore: auto-generate consistency GT for 1-gpu cases"
+          git push -u origin ${{ steps.create_branch.outputs.branch_name }}
+
+  generate-gt-2-gpu:
+    if: ${{ github.event.inputs.suite == '2-gpu' || github.event.inputs.suite == 'all' }}
+    runs-on: [self-hosted, 2-gpu]
+    needs: [generate-gt-1-gpu]
+    # Run after 1-gpu to avoid git conflicts
+    outputs:
+      has_changes: ${{ steps.check_changes.outputs.has_changes }}
+      branch_name: ${{ steps.ensure_branch.outputs.branch_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.generate-gt-1-gpu.outputs.branch_name || github.ref }}
+
+      - name: Pull latest if branch exists
+        if: needs.generate-gt-1-gpu.outputs.has_changes == 'true'
+        run: git pull origin ${{ needs.generate-gt-1-gpu.outputs.branch_name }} || true
+
+      - name: Ensure branch exists
+        id: ensure_branch
+        run: |
+          if [ "${{ needs.generate-gt-1-gpu.outputs.has_changes }}" != "true" ]; then
+            BRANCH_NAME="auto/gt-update-$(date +%Y%m%d-%H%M%S)"
+            git checkout -b $BRANCH_NAME
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "branch_name=${{ needs.generate-gt-1-gpu.outputs.branch_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        run: |
+          pip install -e "python[diffusion]"
+
+      - name: Generate GT
+        run: |
+          cd python/sglang/multimodal_gen/test
+          MISSING_FLAG=""
+          if [ "${{ github.event.inputs.missing_only }}" == "true" ]; then
+            MISSING_FLAG="--missing-only"
+          fi
+          python generate_consistency_gt.py --suite 2-gpu $MISSING_FLAG
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          git add python/sglang/multimodal_gen/test/consistency_gt/
+          if git diff --staged --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git commit -m "chore: auto-generate consistency GT for 2-gpu cases"
+          git push -u origin ${{ steps.ensure_branch.outputs.branch_name }}
+
+  create-pr:
+    needs: [generate-gt-1-gpu, generate-gt-2-gpu]
+    if: |
+      always() &&
+      (needs.generate-gt-1-gpu.outputs.has_changes == 'true' ||
+       needs.generate-gt-2-gpu.outputs.has_changes == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine branch name
+        id: get_branch
+        run: |
+          if [ -n "${{ needs.generate-gt-2-gpu.outputs.branch_name }}" ]; then
+            echo "branch_name=${{ needs.generate-gt-2-gpu.outputs.branch_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "branch_name=${{ needs.generate-gt-1-gpu.outputs.branch_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "chore: auto-generate consistency GT" \
+            --body "## Summary
+
+          Auto-generated ground truth (GT) files for consistency testing.
+
+          **Triggered by:** @${{ github.actor }}
+          **Suite:** ${{ github.event.inputs.suite }}
+          **Case:** ${{ github.event.inputs.case || 'all in suite' }}
+          **Missing only:** ${{ github.event.inputs.missing_only }}
+
+          ## Review Checklist
+
+          - [ ] Verify GT images are correct for the test cases
+          - [ ] Check that metadata in gt_metadata.json is accurate
+          " \
+            --base main \
+            --head ${{ steps.get_branch.outputs.branch_name }}

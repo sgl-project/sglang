@@ -479,8 +479,19 @@ def get_generate_fn(
     model_path: str,
     modality: str,
     sampling_params: DiffusionSamplingParams,
-) -> Callable[[str, Client], str]:
-    """Return appropriate generation function for the case."""
+    seed: int | None = None,
+) -> Callable[[str, Client], tuple[str, bytes]]:
+    """Return appropriate generation function for the case.
+
+    Args:
+        model_path: Path to the model
+        modality: "image" or "video"
+        sampling_params: Sampling parameters for generation
+        seed: Optional seed for reproducibility (used for consistency testing)
+
+    Returns:
+        A function that takes (case_id, client) and returns (request_id, content_bytes)
+    """
 
     def _create_and_download_video(
         client,
@@ -491,10 +502,13 @@ def get_generate_fn(
         prompt: str | None = None,
         seconds: int | None = None,
         input_reference: Any | None = None,
-    ) -> str:
+    ) -> tuple[str, bytes]:
         """
         Create a video job via /v1/videos, poll until completion,
         then download the binary content and validate it.
+
+        Returns:
+            Tuple of (video_id, video_content_bytes)
         """
 
         create_kwargs: dict[str, Any] = {
@@ -507,6 +521,9 @@ def get_generate_fn(
             create_kwargs["seconds"] = seconds
         if input_reference is not None:
             create_kwargs["input_reference"] = input_reference  # triggers multipart
+        # Use extra_body for sglang-specific parameters (seed is not in OpenAI SDK)
+        if seed is not None:
+            create_kwargs["extra_body"] = {"seed": seed}
 
         job = client.videos.create(**create_kwargs)  # type: ignore[attr-defined]
         video_id = job.id
@@ -534,7 +551,7 @@ def get_generate_fn(
                     f"{id}: video job {video_id} timed out during baseline generation. "
                     "Attempting to collect performance data anyway."
                 )
-                return video_id
+                return (video_id, b"")
 
             pytest.fail(f"{id}: video job {video_id} did not complete in time")
 
@@ -555,22 +572,27 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return video_id
+        return (video_id, content)
 
     video_seconds = sampling_params.seconds or 4
 
-    def generate_image(case_id, client) -> str:
+    def generate_image(case_id, client) -> tuple[str, bytes]:
         """T2I: Text to Image generation."""
         if not sampling_params.prompt:
             pytest.skip(f"{id}: no text prompt configured")
 
-        response = client.images.with_raw_response.generate(
-            model=model_path,
-            prompt=sampling_params.prompt,
-            n=1,
-            size=sampling_params.output_size,
-            response_format="b64_json",
-        )
+        generate_kwargs: dict[str, Any] = {
+            "model": model_path,
+            "prompt": sampling_params.prompt,
+            "n": 1,
+            "size": sampling_params.output_size,
+            "response_format": "b64_json",
+        }
+        # Use extra_body for sglang-specific parameters (seed is not in OpenAI SDK)
+        if seed is not None:
+            generate_kwargs["extra_body"] = {"seed": seed}
+
+        response = client.images.with_raw_response.generate(**generate_kwargs)
         result = response.parse()
         validate_image(result.data[0].b64_json)
 
@@ -586,10 +608,10 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return str(result.created)
+        return (str(result.created), img_data)
 
-    def generate_image_edit(case_id, client) -> str:
-        """TI2I: Text + Image ? Image edit."""
+    def generate_image_edit(case_id, client) -> tuple[str, bytes]:
+        """TI2I: Text + Image -> Image edit."""
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 
@@ -611,14 +633,19 @@ def get_generate_fn(
 
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
-            response = client.images.with_raw_response.edit(
-                model=model_path,
-                image=images,
-                prompt=sampling_params.prompt,
-                n=1,
-                size=sampling_params.output_size,
-                response_format="b64_json",
-            )
+            edit_kwargs: dict[str, Any] = {
+                "model": model_path,
+                "image": images,
+                "prompt": sampling_params.prompt,
+                "n": 1,
+                "size": sampling_params.output_size,
+                "response_format": "b64_json",
+            }
+            # Use extra_body for sglang-specific parameters (seed is not in OpenAI SDK)
+            if seed is not None:
+                edit_kwargs["extra_body"] = {"seed": seed}
+
+            response = client.images.with_raw_response.edit(**edit_kwargs)
         finally:
             for img in images:
                 img.close()
@@ -641,10 +668,10 @@ def get_generate_fn(
         )
         os.remove(tmp_path)
 
-        return rid
+        return (rid, img_data)
 
-    def generate_video(case_id, client) -> str:
-        """T2V: Text ? Video."""
+    def generate_video(case_id, client) -> tuple[str, bytes]:
+        """T2V: Text -> Video."""
         if not sampling_params.prompt:
             pytest.skip(f"{id}: no text prompt configured")
 
@@ -657,8 +684,8 @@ def get_generate_fn(
             seconds=video_seconds,
         )
 
-    def generate_image_to_video(case_id, client) -> str:
-        """I2V: Image ? Video (optional prompt)."""
+    def generate_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """I2V: Image -> Video (optional prompt)."""
         if not sampling_params.image_path:
             pytest.skip(f"{id}: no input image configured")
 
@@ -680,8 +707,8 @@ def get_generate_fn(
                 input_reference=fh,
             )
 
-    def generate_text_image_to_video(case_id, client) -> str:
-        """TI2V: Text + Image ? Video."""
+    def generate_text_image_to_video(case_id, client) -> tuple[str, bytes]:
+        """TI2V: Text + Image -> Video."""
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
 

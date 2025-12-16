@@ -91,6 +91,7 @@ diffusion = [
   "moviepy>=2.0.0",
   "opencv-python==4.10.0.84",
   "remote-pdb",
+  "scikit-image>=0.21.0",  # For SSIM computation in consistency tests
   "st_attn ==0.0.7",
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
