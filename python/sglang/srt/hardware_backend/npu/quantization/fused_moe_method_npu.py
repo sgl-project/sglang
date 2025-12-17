@@ -344,8 +344,7 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         layer.w13_weight.data = cls.pack_to_int32(layer.w13_weight.data)
         layer.w2_weight.data = cls.pack_to_int32(layer.w2_weight.data)
 
-    staticmethod
-
+    @staticmethod
     def apply(
         layer,
         dispatch_output: "StandardDispatchOutput",
