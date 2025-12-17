@@ -1,45 +1,47 @@
-"""Unified Qwen3-235B performance and accuracy tests using nightly_metrics.
+"""Unified GLM-4.6 performance and accuracy tests using nightly_metrics.
 
-This file replaces test_qwen3_235b_perf.py and adds accuracy testing.
+This file replaces test_glm_4_6_perf.py and adds accuracy testing.
 Simple configuration: TP=8 only.
+GLM-4.6 is a 357B MoE model.
 """
 
 import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add nightly directory to path for run_combined_tests import
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "nightly"))
 
-from nightly_metrics import run_metrics
+from run_combined_tests import run_metrics
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# Registered to nightly-8-gpu-temp suite for testing
-# This suite should be run with --timeout-per-file=12000 (200 minutes)
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
+# Registered to nightly-8-gpu-h200-basic suite
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-h200-basic", nightly=True)
 
-QWEN3_235B_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+GLM_4_6_MODEL_PATH = "zai-org/GLM-4.6"
 
 
-class TestQwen3235BUnified(unittest.TestCase):
-    """Unified test class for Qwen3-235B performance and accuracy.
+class TestGLM46Unified(unittest.TestCase):
+    """Unified test class for GLM-4.6 performance and accuracy.
 
     Single variant with simple TP=8 configuration.
+    GLM-4.6 is a 357B MoE model.
     Runs BOTH:
     - Performance test (using NightlyBenchmarkRunner)
     - Accuracy test (using run_eval with mgsm_en)
     """
 
-    def test_qwen3_235b(self):
-        """Run performance and accuracy for Qwen3-235B."""
+    def test_glm_46(self):
+        """Run performance and accuracy for GLM-4.6."""
         print("\n" + "=" * 80)
-        print("RUNNING: TestQwen3235BUnified.test_qwen3_235b")
+        print("RUNNING: TestGLM46Unified.test_glm_46")
         print("=" * 80)
 
         variants = [
             ModelLaunchSettings(
-                QWEN3_235B_MODEL_PATH,
+                GLM_4_6_MODEL_PATH,
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
@@ -56,8 +58,8 @@ class TestQwen3235BUnified(unittest.TestCase):
             run_accuracy=True,
             is_vlm=False,
             base_url=DEFAULT_URL_FOR_TEST,
-            profile_dir="performance_profiles_qwen3_235b",
-            test_name="Qwen3-235B Unified",
+            profile_dir="performance_profiles_glm_4_6",
+            test_name="GLM-4.6 Unified",
             batch_sizes=[1, 1, 8, 16, 64],
             eval_name="mgsm_en",
         )
