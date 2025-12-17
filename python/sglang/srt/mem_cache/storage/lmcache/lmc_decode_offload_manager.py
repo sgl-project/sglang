@@ -22,7 +22,7 @@ except ImportError as e:
     ) from e
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ class LMCCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
         self.ongoing_offload = {}
         logger.info("Enable offload kv cache for decode side")
 
-    def offload_kv_cache(self, req) -> bool:
+    def offload_kv_cache(self, req: "Req") -> bool:
         """Offload incremental KV cache for decode side."""
         if req.req_pool_idx == -1 or len(req.output_ids) == 0:
             return False
