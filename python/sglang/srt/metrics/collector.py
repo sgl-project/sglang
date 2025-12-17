@@ -651,6 +651,9 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
+    def increase_num_retracted_reqs(self, num: int) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
