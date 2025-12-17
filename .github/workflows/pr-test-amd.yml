@@ -184,6 +184,13 @@ jobs:
           # This directory persists across container restarts on the self-hosted runner
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
+          # Clear pre-built AITER kernels from Docker image to avoid segfaults
+          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
+          echo "Clearing pre-built AITER kernels from Docker image..."
+          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
+          docker exec ci_sglang rm -rf /sgl-data/aiter-kernels/*.so 2>/dev/null || true
+          echo "AITER kernels cleared - will be rebuilt on first use"
+
           # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
           # This tells the test cleanup code to NOT delete downloaded models
           if docker exec ci_sglang test -d /sgl-data && docker exec ci_sglang mountpoint -q /sgl-data 2>/dev/null; then
@@ -193,12 +200,6 @@ jobs:
             echo "WARNING: /sgl-data is not a mount point - models will be cleaned up after each test"
           fi
 
-          # Check AITER cache
-          if docker exec ci_sglang test -f /sgl-data/aiter-kernels/mha_fwd_bf16_nbias_nmask_nlse_ndropout.so; then
-            echo "Found cached AITER kernels in /sgl-data/aiter-kernels"
-          else
-            echo "No cached AITER kernels found - will be built on first use"
-          fi
           # Check MIOpen cache (VAE convolution kernels)
           miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
           echo "Found ${miopen_files} MIOpen cache files"
@@ -301,6 +302,13 @@ jobs:
           # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
+          # Clear pre-built AITER kernels from Docker image to avoid segfaults
+          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
+          echo "Clearing pre-built AITER kernels from Docker image..."
+          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
+          docker exec ci_sglang rm -rf /sgl-data/aiter-kernels/*.so 2>/dev/null || true
+          echo "AITER kernels cleared - will be rebuilt on first use"
+
           # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
           # This tells the test cleanup code to NOT delete downloaded models
           if docker exec ci_sglang test -d /sgl-data && docker exec ci_sglang mountpoint -q /sgl-data 2>/dev/null; then
@@ -310,11 +318,7 @@ jobs:
             echo "WARNING: /sgl-data is not a mount point - models will be cleaned up after each test"
           fi
 
-          if docker exec ci_sglang test -f /sgl-data/aiter-kernels/mha_fwd_bf16_nbias_nmask_nlse_ndropout.so; then
-            echo "Found cached AITER kernels in /sgl-data/aiter-kernels"
-          else
-            echo "No cached AITER kernels found - will be built on first use"
-          fi
+          # Check MIOpen cache (VAE convolution kernels)
           miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
           echo "Found ${miopen_files} MIOpen cache files"
 
