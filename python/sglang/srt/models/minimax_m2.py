@@ -802,6 +802,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
 
@@ -826,13 +829,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
+            # Skip loading weights that belong to MTP layers
+            if "rotary_emb.inv_freq" in name or "mtp_layers" in name:
                 continue
-
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
-
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -898,17 +897,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
             num_logical_experts=config.num_local_experts,
             num_groups=None,
         )
-
-
-def get_spec_layer_idx_from_weight_name(
-    config: PretrainedConfig, weight_name: str
-) -> Optional[int]:
-    if hasattr(config, "num_mtp_modules") and (config.num_mtp_modules > 0):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_mtp_modules):
-            if weight_name.startswith(f"model.layers.{layer_idx + i}."):
-                return layer_idx + i
-    return None
 
 
 # Entry class for model registration
