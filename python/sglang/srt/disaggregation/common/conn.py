@@ -268,10 +268,8 @@ class CommonKVReceiver(BaseKVReceiver):
                         f"but decode server has page_size={decode_page_size}. "
                         f"Both servers must use the same --page-size value."
                     )
-                    self.kv_mgr.record_failure(self.bootstrap_room, error_msg)
-                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                    self.bootstrap_infos = None
-                    return
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
 
             logger.debug(
                 f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size}"
