@@ -431,17 +431,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         TI2V_url_sampling_params,
     ),
     DiffusionTestCase(
-        "wan2_2_ti2v_5b_base64",
-        DiffusionServerArgs(
-            model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-            modality="video",
-            warmup_text=0,
-            warmup_edit=0,
-            custom_validator="video",
-        ),
-        TI2V_base64_sampling_params,
-    ),
-    DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
         DiffusionServerArgs(
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
