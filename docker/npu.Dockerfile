@@ -74,7 +74,7 @@ RUN (${PIP_INSTALL} pybind11) \
 RUN git clone https://github.com/feifeibear/long-context-attention.git long-context-attention \
     && cd long-context-attention \
     && git checkout 7a52abd669efb35e550680a239e1745b620b2bae \
-    && pip install -e .
+    && pip install .
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
