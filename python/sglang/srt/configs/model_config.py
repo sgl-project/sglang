@@ -236,8 +236,14 @@ class ModelConfig:
         server_args: ServerArgs,
         model_path: str = None,
         model_revision: str = None,
+        is_draft_model: bool = False,
         **kwargs,
     ):
+        quantization = (
+            server_args.speculative_draft_model_quantization
+            if is_draft_model
+            else server_args.quantization
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -247,7 +253,7 @@ class ModelConfig:
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
-            quantization=server_args.quantization,
+            quantization=quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
@@ -255,6 +261,7 @@ class ModelConfig:
             override_config_file=server_args.decrypted_config_file,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
+            is_draft_model=is_draft_model,
             **kwargs,
         )
 

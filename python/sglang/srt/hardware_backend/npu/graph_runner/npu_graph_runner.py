@@ -18,16 +18,24 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import numpy as np
 import torch
 
+import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import (
+    empty_context,
+    get_bool_env_var,
+    get_compiler_backend,
+    is_npu,
+)
 
 is_npu = is_npu()
 
@@ -44,15 +52,36 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
+@contextmanager
+def patch_model_npu(
+    model: torch.nn.Module,
+    enable_compile: bool,
+    num_tokens: int,
+    tp_group: GroupCoordinator,
+):
+    if enable_compile:
+        backend = get_compiler_backend("npugraph_ex")
+        yield torch.compile(
+            torch.no_grad()(model.forward),
+            fullgraph=True,
+            dynamic=False,
+            backend=backend,
+        )
+    else:
+        yield model.forward
+
+
 class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
+        sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
         super().__init__(model_runner)
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
         self._init_arch_map()
+        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
@@ -68,7 +97,12 @@ class NPUGraphRunner(CudaGraphRunner):
         return torch.npu.NPUGraph()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.npu.graph(
+        if self.enable_torch_compile:
+            skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+        else:
+            skip_guard_context = empty_context()
+
+        with skip_guard_context, torch.npu.graph(
             graph,
             pool=pool,
             stream=stream,
@@ -77,13 +111,21 @@ class NPUGraphRunner(CudaGraphRunner):
             out = run_once_fn()
         return out
 
-    def _get_update_attr_name(self, model_runner):
-        if self.bs < get_attention_tp_size():
+    def _get_update_attr_name(self, model_runner, forward_batch):
+        if (
+            self.bs < get_attention_tp_size()
+            or forward_batch.forward_mode.is_target_verify()
+            or self.use_fia
+        ):
             return self.attr_name[AttentionArch.MLA]
         return self.attr_name[model_runner.model_config.attention_arch]
 
-    def _get_update_attr_type(self, model_runner):
-        if self.bs < get_attention_tp_size():
+    def _get_update_attr_type(self, model_runner, forward_batch):
+        if (
+            self.bs < get_attention_tp_size()
+            or forward_batch.forward_mode.is_target_verify()
+            or self.use_fia
+        ):
             return self.attr_type[AttentionArch.MLA]
         return self.attr_type[model_runner.model_config.attention_arch]
 
@@ -139,8 +181,12 @@ class NPUGraphRunner(CudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        self.update_attr_name = self._get_update_attr_name(self.model_runner)
-        self.update_attr_type = self._get_update_attr_type(self.model_runner)
+        self.update_attr_name = self._get_update_attr_name(
+            self.model_runner, forward_batch
+        )
+        self.update_attr_type = self._get_update_attr_type(
+            self.model_runner, forward_batch
+        )
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():

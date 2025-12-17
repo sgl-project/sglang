@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -963,7 +964,7 @@ class DenoisingStage(PipelineStage):
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
-            device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+            device_type=current_platform.device_type,
             dtype=target_dtype,
             enabled=autocast_enabled,
         ):
@@ -1114,10 +1115,8 @@ class DenoisingStage(PipelineStage):
             A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
-        if local_rank == 0:
-            return tqdm(iterable=iterable, total=total)
-        else:
-            return tqdm(iterable=iterable, total=total, disable=True)
+        disable = local_rank != 0
+        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def rescale_noise_cfg(
         self, noise_cfg, noise_pred_text, guidance_rescale=0.0
