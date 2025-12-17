@@ -2,13 +2,12 @@ import unittest
 
 from nightly_utils import NightlyBenchmarkRunner
 
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 PROFILE_DIR = "performance_profiles_deepseek_v32"
 
-register_cuda_ci(est_time=6000, suite="nightly-8-gpu-h200", nightly=True)
+# register_cuda_ci(est_time=6000, suite="nightly-8-gpu-h200", nightly=True)
 
 
 class TestNightlyDeepseekV32Performance(unittest.TestCase):
