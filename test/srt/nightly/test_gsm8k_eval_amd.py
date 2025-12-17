@@ -36,9 +36,6 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.65,
     "google/gemma-2-27b-it": 0.91,
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
-    # AMD TP=8 models from in-house CI sanity_check.py (mi30x config)
-    "lmsys/gpt-oss-120b-bf16": 0.82,
-    "lmsys/gpt-oss-20b-bf16": 0.50,
 }
 
 failing_models = {
@@ -72,11 +69,6 @@ AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
     "Qwen/Qwen3-30B-A3B-Thinking-2507"
 )
 
-# AMD-specific models verified on MI300X with tp=8 (from in-house CI sanity_check.py)
-AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP8 = remove_failing_models(
-    "lmsys/gpt-oss-120b-bf16,lmsys/gpt-oss-20b-bf16"
-)
-
 NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
 DISABLE_HF_XET_MODELS = {
     "Qwen/Qwen2-57B-A14B-Instruct",
@@ -92,15 +84,16 @@ TRITON_MOE_MODELS = {
 # AMD_SPECIAL_CONFIG_MODELS = {
 #     "Qwen/Qwen3-30B-A3B-Thinking-2507", # default config works
 # }
+# AMD TP=8 base models - NOT compatible with mgsm_en eval (no chat template)
+# These models work with gsm8k completion API but not chat completions
+# AMD_TP8_MODELS = {
+#     "lmsys/gpt-oss-120b-bf16",  # base model, gsm8k accuracy ~85%
+#     "lmsys/gpt-oss-20b-bf16",   # base model, gsm8k accuracy ~54%
+#     "amd--grok-1-W4A8KV8",      # base model, gsm8k accuracy ~82%
+# }
 
-# AMD TP=8 models that need special launch config (from in-house CI sanity_check.py mi30x)
-AMD_TP8_MODELS = {
-    "lmsys/gpt-oss-120b-bf16",
-    "lmsys/gpt-oss-20b-bf16",
-}
 
-
-def popen_launch_server_wrapper(base_url, model, is_tp2, is_tp8=False):
+def popen_launch_server_wrapper(base_url, model, is_tp2):
     other_args = ["--log-level-http", "warning", "--trust-remote-code"]
     if is_tp2:
         other_args.extend(["--tp", "2"])
@@ -115,16 +108,6 @@ def popen_launch_server_wrapper(base_url, model, is_tp2, is_tp8=False):
     #         "--mem-fraction-static", "0.85",
     #         "--attention-backend", "aiter",
     #     ])
-
-    # AMD TP=8 models config (from in-house CI sanity_check.py mi30x)
-    if is_tp8 and model in AMD_TP8_MODELS:
-        other_args.extend([
-            "--tp", "8",
-            "--chunked-prefill-size", "130172",
-            "--max-running-requests", "128",
-            "--mem-fraction-static", "0.85",
-            "--attention-backend", "triton",
-        ])
 
     process = popen_launch_server(
         model,
@@ -168,16 +151,13 @@ def check_model_scores(results):
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # (models, is_fp8, is_tp2, is_tp8)
         cls.model_groups = [
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
             # AMD-specific models verified on MI300X
-            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True, False),
-            # AMD TP=8 models from in-house CI sanity_check.py
-            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP8), False, False, True),
+            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
@@ -188,7 +168,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         is_first = True
         all_results = []
 
-        for model_group, is_fp8, is_tp2, is_tp8 in self.model_groups:
+        for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
                     os.environ["SGLANG_MOE_PADDING"] = (
@@ -197,12 +177,11 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     os.environ["HF_HUB_DISABLE_XET"] = (
                         "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )
-                    # AMD TP=8 models use triton backend (SGLANG_USE_AITER=0)
                     os.environ["SGLANG_USE_AITER"] = (
-                        "0" if model in TRITON_MOE_MODELS or model in AMD_TP8_MODELS else "1"
+                        "0" if model in TRITON_MOE_MODELS else "1"
                     )
 
-                    process = popen_launch_server_wrapper(self.base_url, model, is_tp2, is_tp8)
+                    process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
 
                     args = SimpleNamespace(
                         base_url=self.base_url,
