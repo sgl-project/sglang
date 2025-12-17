@@ -10,7 +10,7 @@ use crate::routers::{
     grpc::{
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext, RequestType, WorkerSelection},
-        proto_wrapper::ProtoGenerateRequest,
+        proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
     },
 };
 
@@ -179,9 +179,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             }
         }
 
-        ctx.state.proto_request = Some(
-            crate::routers::grpc::proto_wrapper::ProtoRequest::Generate(proto_request),
-        );
+        ctx.state.proto_request = Some(ProtoRequest::Generate(proto_request));
         Ok(None)
     }
 

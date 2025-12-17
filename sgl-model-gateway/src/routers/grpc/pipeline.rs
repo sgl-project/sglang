@@ -33,6 +33,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -444,7 +445,7 @@ impl RequestPipeline {
     /// Execute the complete pipeline for an embedding request
     pub async fn execute_embeddings(
         &self,
-        request: Arc<crate::protocols::embedding::EmbeddingRequest>,
+        request: Arc<EmbeddingRequest>,
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,

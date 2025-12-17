@@ -2,7 +2,9 @@
 
 use crate::{
     grpc_client::{SglangSchedulerClient, VllmEngineClient},
-    routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+    routers::grpc::proto_wrapper::{
+        ProtoEmbedRequest, ProtoEmbedResponse, ProtoGenerateRequest, ProtoStream,
+    },
 };
 
 /// Health check response (common across backends)
@@ -135,12 +137,8 @@ impl GrpcClient {
     /// Submit an embedding request
     pub async fn embed(
         &mut self,
-        req: crate::routers::grpc::proto_wrapper::ProtoEmbedRequest,
-    ) -> Result<
-        crate::routers::grpc::proto_wrapper::ProtoEmbedResponse,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        use crate::routers::grpc::proto_wrapper::{ProtoEmbedRequest, ProtoEmbedResponse};
+        req: ProtoEmbedRequest,
+    ) -> Result<ProtoEmbedResponse, Box<dyn std::error::Error + Send + Sync>> {
         match (self, req) {
             (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
                 let resp = client.embed(*boxed_req).await?;

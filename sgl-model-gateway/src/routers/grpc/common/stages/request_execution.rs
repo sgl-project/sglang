@@ -9,7 +9,10 @@ use crate::routers::{
     error,
     grpc::{
         context::{ClientSelection, ExecutionResult, RequestContext},
-        proto_wrapper::{ProtoGenerateRequest, ProtoRequest, ProtoStream},
+        proto_wrapper::{
+            ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
+            ProtoStream,
+        },
     },
 };
 
@@ -135,7 +138,7 @@ impl RequestExecutionStage {
 
     async fn execute_single_embed(
         &self,
-        proto_request: crate::routers::grpc::proto_wrapper::ProtoEmbedRequest,
+        proto_request: ProtoEmbedRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
@@ -162,10 +165,10 @@ impl RequestExecutionStage {
         })?;
 
         match response.into_response() {
-            crate::routers::grpc::proto_wrapper::ProtoEmbedResponseVariant::Complete(complete) => {
+            ProtoEmbedResponseVariant::Complete(complete) => {
                 Ok(ExecutionResult::Embedding { response: complete })
             }
-            crate::routers::grpc::proto_wrapper::ProtoEmbedResponseVariant::Error(e) => {
+            ProtoEmbedResponseVariant::Error(e) => {
                 error!(
                     function = "execute_single_embed",
                     error = %e.message(),
@@ -176,7 +179,7 @@ impl RequestExecutionStage {
                     e.message().to_string(),
                 ))
             }
-            crate::routers::grpc::proto_wrapper::ProtoEmbedResponseVariant::None => {
+            ProtoEmbedResponseVariant::None => {
                 error!(
                     function = "execute_single_embed",
                     "Embedding execution returned no response"
