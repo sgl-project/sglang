@@ -337,6 +337,8 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+        if self.current_scheduler_metrics_enabled():
+            self.metrics_collector.observe_cuda_graph_pass(can_run_cuda_graph=can_run_cuda_graph)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 

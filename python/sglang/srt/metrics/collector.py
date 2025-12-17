@@ -618,9 +618,9 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.cuda_graph_forward_passes_total = Counter(
-            name="sglang:cuda_graph_forward_passes_total",
-            documentation="Total number of CUDA graph forward passes categorized by modes.",
+        self.cuda_graph_passes_total = Counter(
+            name="sglang:cuda_graph_passes_total",
+            documentation="Total number of forward passes categorized by CUDA graph.",
             labelnames=labels.keys(),
         )
 
