@@ -374,8 +374,14 @@ impl CircuitBreaker {
     }
 
     fn publish_gauge_metrics(&self) {
-        Metrics::set_worker_cb_consecutive_failures(&self.metric_label, self.failure_count());
-        Metrics::set_worker_cb_consecutive_successes(&self.metric_label, self.success_count());
+        Metrics::set_worker_cb_consecutive_failures(
+            &self.metric_label,
+            self.consecutive_failures(),
+        );
+        Metrics::set_worker_cb_consecutive_successes(
+            &self.metric_label,
+            self.consecutive_successes(),
+        );
     }
 }
 
