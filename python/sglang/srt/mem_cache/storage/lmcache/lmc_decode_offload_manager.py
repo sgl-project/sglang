@@ -34,13 +34,11 @@ class LMCCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
         super().__init__(*args, **kwargs)
         self.request_counter = 0
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(kv_cache, MHATokenToKVPool):
-            pass
-        elif isinstance(kv_cache, MLATokenToKVPool):
+        if isinstance(kv_cache, MLATokenToKVPool):
             raise ValueError(
                 "MLA is not supported yet in LMCache decode offload manager"
             )
-        else:
+        elif not isinstance(kv_cache, MHATokenToKVPool):
             raise ValueError("Unsupported KV cache type for decode offload")
 
         self.lmcache_connector = LMCacheConnector(
