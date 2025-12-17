@@ -16,8 +16,8 @@ import json
 import logging
 import math
 import os
-from pathlib import Path
 from enum import Enum, IntEnum, auto
+from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry, is_npu
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -38,6 +38,7 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+
 
 class AttentionArch(IntEnum):
     MLA = auto()
@@ -596,12 +597,12 @@ class ModelConfig:
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
-        quant_config_file = Path(self.model_path, "quant_model_description.json")   
-        quant_cfg = None 
-        if quant_config_file.is_file(): 
-            with open(quant_config_file) as f: 
+        quant_config_file = Path(self.model_path, "quant_model_description.json")
+        quant_cfg = None
+        if quant_config_file.is_file():
+            with open(quant_config_file) as f:
                 quant_cfg = json.load(f)
-                            
+
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
@@ -724,7 +725,7 @@ class ModelConfig:
         quant_cfg = self._parse_quant_hf_config()
         if _is_npu:
             quant_cfg = self._find_quant_modelslim_config()
-            self.quantization = 'modelslim'
+            self.quantization = "modelslim"
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(

@@ -199,7 +199,7 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
             top_k=topk_ids.shape[1],
         )
         return StandardCombineInput(hidden_states=output)
-    
+
     @staticmethod
     def apply_without_routing_weights(
         layer,
@@ -253,12 +253,11 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
     @classmethod
     def process_scale(cls, weight: torch.Tensor, scale, per_group_scale):
         scale = scale.transpose(1, 2).contiguous()
-        #if cls.is_per_channel_weight:
+        # if cls.is_per_channel_weight:
         if True:
             scale_np = scale.cpu().numpy()
             scale_np.dtype = np.uint32
-            scale_uint64_tensor = torch.from_numpy(scale_np.astype(
-                np.int64)).npu()
+            scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
             return scale_uint64_tensor, None
         per_group_scale = per_group_scale.transpose(1, 2).contiguous()
         group_num, k, n = weight.shape
@@ -341,6 +340,7 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         layer.w2_weight.data = cls.pack_to_int32(layer.w2_weight.data)
 
     staticmethod
+
     def apply(
         layer,
         dispatch_output: "StandardDispatchOutput",
@@ -351,11 +351,11 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, _ = topk_output
-        top_k=topk_ids.shape[1]
+        top_k = topk_ids.shape[1]
         group_list_type = 1
         original_shape = hidden_states.shape
         topk_weights = topk_weights
-        
+
         num_tokens = hidden_states.shape[:-1].numel()
 
         first_expert_idx = 0
@@ -372,7 +372,8 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
                 expert_tokens_num_flag=True,
                 active_expert_range=[first_expert_idx, last_expert_idx],
                 quant_mode=1,
-            ))
+            )
+        )
 
         expert_tokens = expert_tokens.to(torch.int64)
 
@@ -382,7 +383,7 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         w2_scale = [layer.w2_weight_scale]
         # TODO w4a8 scene: dynamic acquisition of dtype in the future
         _output_dtype = torch.bfloat16
-        
+
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[sorted_hidden_states],
             weight=[layer.w13_weight],
@@ -417,7 +418,8 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
             permuted_tokens=output,
             sorted_indices=torch.abs(expanded_row_idx),
-            probs=topk_weights)
+            probs=topk_weights,
+        )
         if len(original_shape) == 3:
             final_hidden_states = final_hidden_states.view(original_shape)
 
