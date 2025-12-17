@@ -64,6 +64,14 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
+    # torch compile support
+    if server_args.enable_torch_compile:
+        extra_args += " --enable-torch-compile"
+
+    # force lazy-loading for testing
+    if server_args.force_lazy_loading:
+        extra_args += " --force-lazy-loading"
+
     # start server
     manager = ServerManager(
         model=server_args.model_path,
