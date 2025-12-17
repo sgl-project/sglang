@@ -99,11 +99,19 @@ def get_staging_dir() -> Path | None:
     return None
 
 
-def load_gt_frames(case_id: str, num_gpus: int) -> list[np.ndarray]:
+def load_gt_frames(
+    case_id: str, num_gpus: int, is_video: bool = False
+) -> list[np.ndarray]:
     """
     Load ground truth frames for a specific case from remote repository.
 
     Downloads frames from sgl-test-files repository and caches locally.
+
+    Args:
+        case_id: Test case identifier.
+        num_gpus: Number of GPUs used.
+        is_video: Whether this is a video case (default: False).
+            Used to determine default frame count when metadata is not available.
 
     Returns:
         List of numpy arrays (RGB images) for each key frame.
@@ -117,7 +125,10 @@ def load_gt_frames(case_id: str, num_gpus: int) -> list[np.ndarray]:
     metadata = load_gt_metadata()
     case_meta = metadata.get("cases", {}).get(case_id, {})
 
-    if case_meta.get("num_frames", 1) == 3:
+    # Determine default frame count based on modality
+    default_num_frames = 3 if is_video else 1
+
+    if case_meta.get("num_frames", default_num_frames) == 3:
         # Video with 3 key frames
         frame_names = ["frame_0.png", "frame_mid.png", "frame_last.png"]
     else:

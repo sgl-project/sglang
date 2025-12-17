@@ -527,7 +527,7 @@ To add GT files to pass consistency tests:
             )
 
         # Load GT frames
-        gt_frames = load_gt_frames(case.id, num_gpus)
+        gt_frames = load_gt_frames(case.id, num_gpus, is_video=is_video)
 
         # Convert output to frames
         if is_video:
