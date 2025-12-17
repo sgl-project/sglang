@@ -330,6 +330,13 @@ def run_metrics(
     all_passed = True
 
     for model in models:
+        # Print configuration being tested
+        print("\n" + "=" * 80)
+        print(f"TESTING MODEL CONFIG: {model.model_path}")
+        print(f"  TP Size: {model.tp_size}")
+        print(f"  Extra Args: {model.extra_args}")
+        print("=" * 80)
+
         model_result = {
             "model": model.model_path,
             "perf_passed": None,
