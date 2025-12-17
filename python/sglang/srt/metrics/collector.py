@@ -325,9 +325,15 @@ class SchedulerMetricsCollector:
         )
 
         # Retract
+        # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
             name="sglang:num_retracted_reqs",
             documentation="The number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_reqs_total = Counter(
+            name="sglang:num_retracted_reqs_total",
+            documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -605,11 +611,17 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        # TODO maybe remove this old gauge in favor of the new counter
         self.is_cuda_graph = Gauge(
             name="sglang:is_cuda_graph",
             documentation="Whether the batch is using CUDA graph.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.cuda_graph_forward_passes_total = Counter(
+            name="sglang:cuda_graph_forward_passes_total",
+            documentation="Total number of CUDA graph forward passes categorized by modes.",
+            labelnames=labels.keys(),
         )
 
         self.new_token_ratio = Gauge(
