@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
-      multimodal_gen: $({ steps.filter.outputs.multimodal_gen })
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -249,4 +249,5 @@ jobs:
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python/sglang/multimodal_gen/test/
           python3 run_suite.py --suite 1-npu
+
 
