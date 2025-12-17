@@ -63,6 +63,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
@@ -76,7 +79,6 @@ from sglang.srt.utils import (
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
     numa_utils,
-    prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
@@ -104,11 +106,6 @@ def _launch_subprocesses(
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
-
-    # If using model from www.modelscope.cn, first download the model
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
 
     # Launch scheduler processes
     scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
@@ -179,10 +176,9 @@ def _launch_subprocesses(
         scheduler_infos.append(data)
 
     # Get back some info from scheduler to tokenizer_manager
-    scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
-    return tokenizer_manager, template_manager, scheduler_info, port_args
+    return tokenizer_manager, template_manager, scheduler_infos, port_args
 
 
 class Engine(EngineBase):
@@ -227,13 +223,18 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info, port_args = (
+        tokenizer_manager, template_manager, scheduler_infos, port_args = (
             self.launch_subprocesses_func(server_args=server_args)
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-        self.scheduler_info = scheduler_info
+        self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
+        self.remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -826,22 +827,23 @@ def _set_envs_and_config(server_args: ServerArgs):
     set_ulimit()
 
     # Check flashinfer version
-    if server_args.attention_backend == "flashinfer":
-        assert_pkg_version(
-            "flashinfer_python",
-            "0.5.3",
-            "Please uninstall the old version and "
-            "reinstall the latest version by following the instructions "
-            "at https://docs.flashinfer.ai/installation.html.",
-        )
-    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        assert_pkg_version(
-            "sgl-kernel",
-            "0.3.19",
-            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
-        )
+    if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+        if server_args.attention_backend == "flashinfer":
+            assert_pkg_version(
+                "flashinfer_python",
+                "0.5.3",
+                "Please uninstall the old version and "
+                "reinstall the latest version by following the instructions "
+                "at https://docs.flashinfer.ai/installation.html.",
+            )
+        if _is_cuda:
+            assert_pkg_version(
+                "sgl-kernel",
+                "0.3.19",
+                "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+            )
 
-    if True:  # Keep this check for internal code compatibility
+    if server_args.custom_sigquit_handler is None:
         # Register the signal handler.
         # The child processes will send SIGQUIT to this process when any error happens
         # This process then clean up the whole process tree
@@ -854,6 +856,12 @@ def _set_envs_and_config(server_args: ServerArgs):
             kill_process_tree(os.getpid())
 
         signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+    else:
+        # Allow users to register a custom SIGQUIT handler for things like crash dump
+        logger.error(
+            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+        )
+        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
