@@ -815,6 +815,11 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
+                params.is_local_attention = (
+                    "Llama4ForConditionalGeneration"
+                    in self.model_config.hf_config.architectures
+                )
+
                 self.tree_cache = SWAChunkCache(params)
         else:
 

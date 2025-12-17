@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 
@@ -83,7 +82,7 @@ class SWAChunkCache(ChunkCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
-        self.evict_chunk_len = envs.SGLANG_SWA_EVICT_CHUNK.get()
+        self.is_local_attention = params.is_local_attention
 
     def evict_swa(
         self,
@@ -91,11 +90,13 @@ class SWAChunkCache(ChunkCache):
         prelen: int,
         attention_chunk_size: int,
     ):
-        if (
-            prelen
-            >= req.evicted_seqlen_local + self.evict_chunk_len + attention_chunk_size
-        ):
-            new_evicted_seqlen_local = prelen - attention_chunk_size - 1
+        thresh = req.evicted_seqlen_local + attention_chunk_size * (
+            1 + self.is_local_attention
+        )
+        if prelen >= thresh:
+            new_evicted_seqlen_local = (
+                prelen // attention_chunk_size * attention_chunk_size
+            ) - attention_chunk_size * self.is_local_attention
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]

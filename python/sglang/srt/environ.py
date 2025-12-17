@@ -364,9 +364,6 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
 
-    # Sliding Window Attention (SWA)
-    SGLANG_SWA_EVICT_CHUNK = EnvInt(128)
-
     # fmt: on
 
 
