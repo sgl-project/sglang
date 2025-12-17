@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import inspect
 import json
+import os
 import random
 import sys
 import tempfile
@@ -294,6 +295,10 @@ class ServerArgs:
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
     port: int | None = None
+
+    # TODO: webui and their endpoint, check if webui_port is available.
+    webui: bool = False
+    webui_port: int | None = 12312
 
     scheduler_port: int = 5555
 
@@ -612,6 +617,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--webui",
+            action=StoreBoolean,
+            default=ServerArgs.webui,
+            help="Whether to use webui for better display",
+        )
+
+        parser.add_argument(
+            "--webui-port",
+            type=int,
+            default=ServerArgs.webui_port,
+            help="Whether to use webui for better display",
         )
 
         # Stage verification
@@ -937,6 +955,15 @@ class ServerArgs:
             if self.num_gpus == 1:
                 raise ValueError(
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
+                )
+
+        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            has_sp = self.sp_degree > 1
+            has_tp = self.tp_size > 1
+            if has_sp and has_tp:
+                raise ValueError(
+                    "cache-dit does not support hybrid parallelism (SP + TP). "
+                    "Please use either sequence parallelism or tensor parallelism, not both."
                 )
 
 
