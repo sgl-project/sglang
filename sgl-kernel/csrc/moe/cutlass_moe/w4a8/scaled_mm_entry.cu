@@ -23,7 +23,8 @@ void cutlass_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk);
+    int64_t topk,
+    int64_t num_experts);
 
 void get_cutlass_w4a8_moe_mm_data_caller(
     const torch::Tensor& topk_ids,
@@ -63,7 +64,8 @@ void cutlass_w4a8_moe_mm(
       d_strides,
       s_strides,
       chunk_size,
-      topk);
+      topk,
+      num_experts);
   return;
 }
 

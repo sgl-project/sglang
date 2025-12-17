@@ -170,6 +170,7 @@ def cutlass_w4a8_moe(
         s_strides13,
         128,
         topk,
+        num_local_experts,
     )
 
     intermediate_q = torch.empty(
@@ -193,6 +194,7 @@ def cutlass_w4a8_moe(
         s_strides2,
         128,
         topk,
+        num_local_experts,
     )
 
     output = torch.empty_like(a)
@@ -360,6 +362,7 @@ def cutlass_w4a8_moe_deepep_normal(
         s_strides13,
         128,
         topk,
+        num_experts,
     )
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
     silu_and_mul(c1, intermediate)
@@ -383,6 +386,7 @@ def cutlass_w4a8_moe_deepep_normal(
         s_strides2,
         128,
         topk,
+        num_experts,
     )
     num_tokens = src2dst.shape[0] // topk
     output = torch.empty(
@@ -513,6 +517,7 @@ def cutlass_w4a8_moe_deepep_ll(
         s_strides13,
         128,
         topk,
+        num_experts,
     )
 
     intermediate_q = torch.empty(
@@ -535,6 +540,7 @@ def cutlass_w4a8_moe_deepep_ll(
         s_strides2,
         128,
         topk,
+        num_experts,
     )
 
     return c2
