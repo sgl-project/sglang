@@ -632,6 +632,22 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.realtime_prefill_compute_tokens_total = Counter(
+            name="sglang:realtime_prefill_compute_tokens_total",
+            documentation="Total number of prefill compute tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_prefill_cache_tokens_total = Counter(
+            name="sglang:realtime_prefill_cache_tokens_total",
+            documentation="Total number of prefill cache tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_decode_tokens_total = Counter(
+            name="sglang:realtime_decode_tokens_total",
+            documentation="Total number of decode tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -659,6 +675,17 @@ class SchedulerMetricsCollector:
         # leave room for piecewise cuda graph, etc
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_realtime_tokens(
+        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+    ):
+        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(
+            prefill_compute_tokens
+        )
+        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(
+            prefill_cache_tokens
+        )
+        self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
