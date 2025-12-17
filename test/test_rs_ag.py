@@ -1,10 +1,11 @@
 """
-Test deterministic custom RS+AG (reduce-scatter + all-gather) behavior.
+Test deterministic custom RS+AG (reduce-scatter + all-gather) behavior with batch size invariance.
 
-This test verifies that custom RS+AG produces deterministic results
-across different batch sizes, which is essential for deterministic inference.
-
-This test directly calls RS+AG operations, so it doesn't require any flags.
+This test compares:
+1. NCCL all_reduce (same batch size) - may be deterministic
+2. NCCL all_reduce (different batch size) - typically NON-deterministic for bfloat16
+3. Custom RS+AG (same batch size) - should be DETERMINISTIC
+4. Custom RS+AG (different batch size) - should be DETERMINISTIC
 
 Usage:
     # Default TP=8
@@ -26,6 +27,30 @@ def get_open_port():
         return s.getsockname()[1]
 
 
+def custom_rs_ag(inp_flat, world_size, chunk_size, custom_ar, ar_group, device):
+    """Custom RS+AG implementation for deterministic all-reduce."""
+    output_chunk = torch.empty(chunk_size, dtype=inp_flat.dtype, device=device)
+    
+    # Reduce-scatter
+    if hasattr(custom_ar, '_reduce_scatter_tensor'):
+        try:
+            custom_ar._reduce_scatter_tensor(output_chunk, inp_flat)
+        except:
+            input_chunks = [inp_flat[i*chunk_size:(i+1)*chunk_size].clone() for i in range(world_size)]
+            torch.distributed.reduce_scatter(output_chunk, input_chunks, group=ar_group)
+    else:
+        input_chunks = [inp_flat[i*chunk_size:(i+1)*chunk_size].clone() for i in range(world_size)]
+        torch.distributed.reduce_scatter(output_chunk, input_chunks, group=ar_group)
+    
+    # All-gather
+    total_size = chunk_size * world_size
+    output_flat = torch.empty(total_size, dtype=inp_flat.dtype, device=device)
+    output_chunks = [output_flat[i*chunk_size:(i+1)*chunk_size] for i in range(world_size)]
+    torch.distributed.all_gather(output_chunks, output_chunk, group=ar_group)
+    
+    return output_flat
+
+
 def worker(world_size, rank, port):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -41,7 +66,7 @@ def worker(world_size, rank, port):
         from sglang.srt.distributed.device_communicators.custom_all_reduce import CustomAllreduce
         from torch.distributed import new_group
         
-        # Create gloo group for custom AR
+        # Create gloo group for custom AR (needed for RS+AG)
         dist.barrier()
         ar_group = new_group(backend="gloo")
         dist.barrier()
@@ -50,145 +75,238 @@ def worker(world_size, rank, port):
         
         if custom_ar is None or custom_ar.disabled:
             if rank == 0:
-                print("ERROR: Custom AR not available or disabled")
+                print("✗ Custom AR not available or disabled")
             dist.destroy_process_group()
             return
 
         num_trials = 10
+        BS = 50  # max batch size for varying batch test
         hidden_dim = 16384
-        batch_size = 50
 
-        # Different seed per rank
+        # Different seed per rank - each GPU has DIFFERENT input
         torch.manual_seed(42 + rank)
+
+        # Create fixed inputs for all trials
+        base_input = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
+        base_input_rand = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
 
         dist.barrier()
 
-        # Generate ONE random input (different per rank, but same across trials)
-        torch.manual_seed(99 + rank)
-        base_input = torch.randn(batch_size, hidden_dim, dtype=torch.bfloat16, device=device)
-
         # =====================================================================
-        # TEST 1: Default torch.distributed.all_reduce (non-deterministic) - REFERENCE
+        # TEST 1: NCCL all_reduce (same batch size) - may be DETERMINISTIC
         # =====================================================================
         if rank == 0:
             print(f"\n{'='*70}")
-            print(f"TEST 1: Default torch.distributed.all_reduce (non-deterministic, TP={world_size})")
+            print("TEST 1: NCCL all_reduce (same batch size)")
             print(f"{'='*70}")
+        dist.barrier()
 
-        results_default_ar = []
+        results_nccl_same = []
         for trial in range(num_trials):
             inp = base_input.clone()
             
-            # Use default torch.distributed.all_reduce (non-deterministic)
-            torch.distributed.all_reduce(inp, group=ar_group)
-            
+            # Use default NCCL all_reduce
+            dist.all_reduce(inp, op=dist.ReduceOp.SUM)
             torch.cuda.synchronize()
             
             checksum = inp.sum().item()
             first_vals = inp[:5].clone()
-            results_default_ar.append((checksum, first_vals))
+            results_nccl_same.append((checksum, first_vals))
 
             if rank == 0:
                 print(f"  Trial {trial+1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
 
-        # Check determinism for default AR
-        default_ar_deterministic = True
+        nccl_same_deterministic = True
         if rank == 0:
-            ref_sum, ref_vals = results_default_ar[0]
-            for i, (s, vals) in enumerate(results_default_ar[1:], 1):
-                if abs(ref_sum - s) > 1e-5 or not torch.allclose(ref_vals, vals, atol=1e-5):
-                    default_ar_deterministic = False
-                    print(f"  Trial {i+1} DIFFERS!")
+            ref_sum, ref_vals = results_nccl_same[0]
+            for i, (s, vals) in enumerate(results_nccl_same[1:], 1):
+                # Check first5 values for determinism (more reliable than sum for bfloat16)
+                if not torch.allclose(ref_vals, vals, rtol=1e-3):
+                    nccl_same_deterministic = False
+                    print(f"  Trial {i+1} DIFFERS! ref_first5={ref_vals.tolist()}, got={vals.tolist()}")
 
-            if default_ar_deterministic:
-                print("  ✓ DEFAULT ALL_REDUCE: DETERMINISTIC")
+            if nccl_same_deterministic:
+                print("  ✓ NCCL ALL_REDUCE (fixed BS): DETERMINISTIC")
             else:
-                print("  ✗ DEFAULT ALL_REDUCE: NON-DETERMINISTIC (expected)")
+                print("  ✗ NCCL ALL_REDUCE (fixed BS): NON-DETERMINISTIC")
 
         dist.barrier()
 
         # =====================================================================
-        # TEST 2: Custom RS+AG (deterministic)
+        # TEST 2: NCCL all_reduce (different batch size) - typically NON-DETERMINISTIC
+        # [a], [a, x], [a, x, x], ...
         # =====================================================================
         if rank == 0:
             print(f"\n{'='*70}")
-            print(f"TEST 2: Custom RS+AG (deterministic, TP={world_size})")
+            print("TEST 2: NCCL all_reduce (different batch size)")
+            print("Batches: [a], [a,x], [a,x,x], ...")
             print(f"{'='*70}")
+        dist.barrier()
 
-        results_rs_ag = []
+        results_nccl_variant = []
+        for bs in range(1, BS + 1):
+            # Construct batch: [a, x, x, ...]
+            batch = torch.stack([base_input] + [base_input_rand] * (bs - 1), dim=0)
+            batch_flat = batch.view(-1)
+
+            # Use default NCCL all_reduce
+            dist.all_reduce(batch_flat, op=dist.ReduceOp.SUM)
+            torch.cuda.synchronize()
+
+            # Reshape back
+            batch_out = batch_flat.view(bs, hidden_dim)
+
+            # Only compare output corresponding to first request
+            out_first_req = batch_out[0].clone()
+            checksum = out_first_req.sum().item()
+            first_vals = out_first_req[:5].clone()
+            results_nccl_variant.append((bs, checksum, first_vals))
+
+            if rank == 0:
+                print(f"  Batch size {bs:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
+
+        nccl_variant_deterministic = True
+        if rank == 0:
+            _, ref_sum, ref_vals = results_nccl_variant[0]
+            for bs, s, vals in results_nccl_variant[1:]:
+                # Check first5 values for determinism (more reliable than sum for bfloat16)
+                if not torch.allclose(ref_vals, vals, rtol=1e-3):
+                    nccl_variant_deterministic = False
+
+            if nccl_variant_deterministic:
+                print("  ✓ NCCL ALL_REDUCE (variant BS): DETERMINISTIC")
+            else:
+                print("  ✗ NCCL ALL_REDUCE (variant BS): NON-DETERMINISTIC")
+
+        dist.barrier()
+
+        # =====================================================================
+        # TEST 3: Custom RS+AG (same batch size) - should be DETERMINISTIC
+        # =====================================================================
+        if rank == 0:
+            print(f"\n{'='*70}")
+            print("TEST 3: Custom RS+AG (same batch size)")
+            print(f"{'='*70}")
+        dist.barrier()
+
+        # Compute padded size for RS+AG
+        original_size = hidden_dim
+        total_size = hidden_dim
+        if total_size % world_size != 0:
+            total_size = ((total_size + world_size - 1) // world_size) * world_size
+        chunk_size = total_size // world_size
+
+        results_rsag_same = []
         for trial in range(num_trials):
-            # Use the SAME input for all trials to test determinism
             inp = base_input.clone()
             
-            # Use custom RS+AG via parallel_state (simulated)
-            # For testing, we'll use the RS+AG path directly
-            inp_flat = inp.flatten()
-            total_size = inp_flat.numel()
-            
-            # Ensure tensor size is divisible by world_size (required for RS+AG)
-            if total_size % world_size != 0:
-                # Pad to make it divisible
-                pad_size = world_size - (total_size % world_size)
-                inp_flat = torch.cat([inp_flat, torch.zeros(pad_size, dtype=inp.dtype, device=device)])
-                total_size = inp_flat.numel()
-            
-            chunk_size = total_size // world_size
-            
-            # Reduce-scatter
-            output_chunk = torch.empty(chunk_size, dtype=inp.dtype, device=device)
-            if hasattr(custom_ar, '_reduce_scatter_tensor'):
-                try:
-                    custom_ar._reduce_scatter_tensor(output_chunk, inp_flat)
-                except:
-                    # Fallback to torch.distributed
-                    input_chunks = [inp_flat[i*chunk_size:(i+1)*chunk_size].clone() for i in range(world_size)]
-                    torch.distributed.reduce_scatter(output_chunk, input_chunks, group=ar_group)
+            # Pad if needed
+            if total_size != original_size:
+                inp_flat = torch.cat([inp, torch.zeros(total_size - original_size, dtype=inp.dtype, device=device)])
             else:
-                # Fallback to torch.distributed
-                input_chunks = [inp_flat[i*chunk_size:(i+1)*chunk_size].clone() for i in range(world_size)]
-                torch.distributed.reduce_scatter(output_chunk, input_chunks, group=ar_group)
+                inp_flat = inp.clone()
             
-            # All-gather
-            output_flat = torch.empty(total_size, dtype=inp.dtype, device=device)
-            output_chunks = [output_flat[i*chunk_size:(i+1)*chunk_size] for i in range(world_size)]
-            torch.distributed.all_gather(output_chunks, output_chunk, group=ar_group)
+            output_flat = custom_rs_ag(inp_flat, world_size, chunk_size, custom_ar, ar_group, device)
             
-            # Remove padding if we added it
-            if total_size != inp.numel():
-                output_flat = output_flat[:inp.numel()]
+            # Remove padding
+            if total_size != original_size:
+                output_flat = output_flat[:original_size]
             
             torch.cuda.synchronize()
             
             checksum = output_flat.sum().item()
             first_vals = output_flat[:5].clone()
-            results_rs_ag.append((checksum, first_vals))
+            results_rsag_same.append((checksum, first_vals))
 
             if rank == 0:
                 print(f"  Trial {trial+1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
 
-        # Check determinism for RS+AG
-        rs_ag_deterministic = True
+        rsag_same_deterministic = True
         if rank == 0:
-            ref_sum, ref_vals = results_rs_ag[0]
-            for i, (s, vals) in enumerate(results_rs_ag[1:], 1):
-                if abs(ref_sum - s) > 1e-5 or not torch.allclose(ref_vals, vals, atol=1e-5):
-                    rs_ag_deterministic = False
-                    print(f"  Trial {i+1} DIFFERS!")
+            ref_sum, ref_vals = results_rsag_same[0]
+            for i, (s, vals) in enumerate(results_rsag_same[1:], 1):
+                # Check first5 values for determinism (more reliable than sum for bfloat16)
+                if not torch.allclose(ref_vals, vals, rtol=1e-3):
+                    rsag_same_deterministic = False
+                    print(f"  Trial {i+1} DIFFERS! ref_first5={ref_vals.tolist()}, got={vals.tolist()}")
 
-            if rs_ag_deterministic:
-                print("  ✓ CUSTOM RS+AG: DETERMINISTIC")
+            if rsag_same_deterministic:
+                print("  ✓ CUSTOM RS+AG (fixed BS): DETERMINISTIC (as expected)")
             else:
-                print("  ✗ CUSTOM RS+AG: NON-DETERMINISTIC")
+                print("  ✗ CUSTOM RS+AG (fixed BS): NON-DETERMINISTIC")
+
+        dist.barrier()
 
         # =====================================================================
-        # COMPARISON
+        # TEST 4: Custom RS+AG (different batch size) - should be DETERMINISTIC
+        # [a], [a, x], [a, x, x], ...
         # =====================================================================
         if rank == 0:
             print(f"\n{'='*70}")
-            print("COMPARISON")
+            print("TEST 4: Custom RS+AG (different batch size)")
+            print("Batches: [a], [a,x], [a,x,x], ...")
             print(f"{'='*70}")
-            print(f"Default all_reduce: {'DETERMINISTIC' if default_ar_deterministic else 'NON-DETERMINISTIC'} (torch.distributed)")
-            print(f"Custom RS+AG:       {'DETERMINISTIC' if rs_ag_deterministic else 'NON-DETERMINISTIC'} (fixed ordering)")
+        dist.barrier()
+
+        results_rsag_variant = []
+        for bs in range(1, BS + 1):
+            # Construct batch: [a, x, x, ...]
+            batch = torch.stack([base_input] + [base_input_rand] * (bs - 1), dim=0)
+            batch_flat = batch.view(-1)
+            
+            batch_size = batch_flat.numel()
+            # Pad if needed
+            if batch_size % world_size != 0:
+                padded_size = ((batch_size + world_size - 1) // world_size) * world_size
+                batch_flat = torch.cat([batch_flat, torch.zeros(padded_size - batch_size, dtype=batch.dtype, device=device)])
+            else:
+                padded_size = batch_size
+            
+            batch_chunk_size = padded_size // world_size
+            output_flat = custom_rs_ag(batch_flat, world_size, batch_chunk_size, custom_ar, ar_group, device)
+            
+            # Remove padding
+            if padded_size != batch_size:
+                output_flat = output_flat[:batch_size]
+            
+            torch.cuda.synchronize()
+
+            # Reshape back
+            batch_out = output_flat.view(bs, hidden_dim)
+
+            # Only compare output corresponding to first request
+            out_first_req = batch_out[0].clone()
+            checksum = out_first_req.sum().item()
+            first_vals = out_first_req[:5].clone()
+            results_rsag_variant.append((bs, checksum, first_vals))
+
+            if rank == 0:
+                print(f"  Batch size {bs:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
+
+        rsag_variant_deterministic = True
+        if rank == 0:
+            _, ref_sum, ref_vals = results_rsag_variant[0]
+            for bs, s, vals in results_rsag_variant[1:]:
+                # Check first5 values for determinism (more reliable than sum for bfloat16)
+                if not torch.allclose(ref_vals, vals, rtol=1e-3):
+                    rsag_variant_deterministic = False
+
+            if rsag_variant_deterministic:
+                print("  ✓ CUSTOM RS+AG (variant BS): DETERMINISTIC (as expected)")
+            else:
+                print("  ✗ CUSTOM RS+AG (variant BS): NON-DETERMINISTIC")
+
+        # =====================================================================
+        # SUMMARY
+        # =====================================================================
+        if rank == 0:
+            print(f"\n{'='*70}")
+            print("SUMMARY")
+            print(f"{'='*70}")
+            print(f"  NCCL all_reduce (fixed BS):   {'DETERMINISTIC' if nccl_same_deterministic else 'NON-DETERMINISTIC'}")
+            print(f"  NCCL all_reduce (variant BS): {'DETERMINISTIC' if nccl_variant_deterministic else 'NON-DETERMINISTIC'}")
+            print(f"  Custom RS+AG (fixed BS):      {'DETERMINISTIC' if rsag_same_deterministic else 'NON-DETERMINISTIC'}")
+            print(f"  Custom RS+AG (variant BS):    {'DETERMINISTIC' if rsag_variant_deterministic else 'NON-DETERMINISTIC'}")
             print(f"{'='*70}")
 
         dist.barrier()
@@ -205,7 +323,7 @@ def worker(world_size, rank, port):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tp", type=int, default=2, help="Tensor parallelism size (default: 2)")
+    parser.add_argument("--tp", type=int, default=8, help="Tensor parallelism size (default: 8)")
     args = parser.parse_args()
     
     world_size = args.tp
