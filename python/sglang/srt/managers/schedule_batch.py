@@ -1574,6 +1574,42 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def prepare_for_lora_prefetch(self):
+        # Initialization logic is identical to prepare_for_extend() but we only set the
+        # fields needed for LoRA prefetching
+        self.forward_mode = ForwardMode.EXTEND
+
+        # Init tensors
+        reqs = self.reqs
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        seq_lens = [len(r.fill_ids) for r in reqs]
+        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        extend_lens = [r.extend_input_len for r in reqs]
+
+        input_ids_tensor = torch.tensor(
+            list(chain.from_iterable(input_ids)), dtype=torch.int64
+        ).to(self.device, non_blocking=True)
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        # Set batch fields needed by alloc_for_extend
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.seq_lens = seq_lens_tensor
+        self.seq_lens_cpu = seq_lens_cpu
+        self.extend_num_tokens = extend_num_tokens
+
+        self.input_ids = input_ids_tensor
+        self.orig_seq_lens = orig_seq_lens_tensor
+        self.seq_lens_sum = sum(seq_lens)
+
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,

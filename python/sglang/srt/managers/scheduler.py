@@ -347,6 +347,15 @@ class Scheduler(
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        self.load_stream = torch.get_device_module(self.device).Stream()
+        self.load_stream_ctx = torch.get_device_module(self.device).stream(
+            self.load_stream
+        )
+        self.lora_prefetch_executor = futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lora_prefetch"
+        )
+        self.lora_to_prefetch_future = {}
+
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
         self.dllm_config = (  # For diffusion LLM
@@ -1898,26 +1907,61 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            lora_set = set([req.lora_id for req in self.running_batch.reqs])
+            running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if (
+                self.enable_lora
+                and req.lora_id is not None
+                and req.lora_id not in running_loras
+            ):
 
-            if self.enable_lora:
-                new_lora_set = (
-                    lora_set
-                    | set([req.lora_id for req in adder.can_run_list])
-                    | set([req.lora_id])
-                )
-                if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
+                def _do_lora_prefetch_in_thread(model_worker_batch):
+                    with self.load_stream_ctx:
+                        self.tp_worker.fetch_lora_batch(model_worker_batch)
+                        load_done = torch.get_device_module(self.device).Event()
+                        load_done.record(self.load_stream)
+
+                    return load_done
+
+                if req.lora_id not in self.lora_to_prefetch_future:
+                    new_lora_set = (
+                        running_loras
+                        | set(self.lora_to_prefetch_future.keys())
+                        | set([req.lora_id])
+                    )
+                    if not self.tp_worker.can_run_lora_batch(new_lora_set):
                         continue
+
+                    fetch_lora_batch = ScheduleBatch.init_new(
+                        [req],
+                        self.req_to_token_pool,
+                        self.token_to_kv_pool_allocator,
+                        self.tree_cache,
+                        self.model_config,
+                        self.enable_overlap,
+                        self.spec_algorithm,
+                    )
+                    fetch_lora_batch.prepare_for_lora_prefetch()
+                    fetch_model_worker_batch = fetch_lora_batch.get_model_worker_batch()
+
+                    future = self.lora_prefetch_executor.submit(
+                        _do_lora_prefetch_in_thread,
+                        fetch_model_worker_batch,
+                    )
+                    self.lora_to_prefetch_future[req.lora_id] = future
+                    continue
+
+                future = self.lora_to_prefetch_future[req.lora_id]
+                if not future.done():
+                    continue
+
+                load_done = future.result()
+                if not load_done.query():
+                    continue
+
+                torch.cuda.current_stream().wait_event(load_done)
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -1946,6 +1990,9 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if self.enable_lora:
+                running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -2033,6 +2080,11 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
+
+        if self.enable_lora:
+            for lora_id in running_loras:
+                if lora_id in self.lora_to_prefetch_future:
+                    del self.lora_to_prefetch_future[lora_id]
 
         return new_batch
 

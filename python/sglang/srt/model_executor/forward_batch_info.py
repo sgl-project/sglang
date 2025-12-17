@@ -534,10 +534,6 @@ class ForwardBatch:
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Init lora information
-        if model_runner.server_args.enable_lora:
-            model_runner.lora_manager.prepare_lora_batch(ret)
-
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
