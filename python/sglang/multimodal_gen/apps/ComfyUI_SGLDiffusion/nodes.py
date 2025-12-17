@@ -5,6 +5,7 @@ Provides nodes for connecting to SGLang Diffusion server and generating images/v
 
 import folder_paths
 import torch
+import os
 
 from .server_api import SGLDiffusionServerAPI
 from .utils import (

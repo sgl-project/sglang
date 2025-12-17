@@ -4,14 +4,12 @@ import os
 import shutil
 import time
 import uuid
-from typing import Optional
 
+import folder_paths
 import numpy as np
 import torch
 from comfy_api.input import VideoInput
 from PIL import Image
-
-import folder_paths
 
 
 def _ensure_dir(path: str) -> None:
