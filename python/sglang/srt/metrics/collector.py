@@ -651,8 +651,13 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def increase_num_retracted_reqs(self, num: int) -> None:
+    def increment_num_retracted_reqs(self, num: int) -> None:
         self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+
+    def increment_cuda_graph_pass(self, value: bool) -> None:
+        # leave room for piecewise cuda graph, etc
+        mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
