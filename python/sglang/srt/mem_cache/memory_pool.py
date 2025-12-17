@@ -864,6 +864,7 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -883,17 +884,49 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
+        if dcp_kv_mask is not None:
+            N, H, D = cache_k.shape
+            grid = (N,)
+            masked_set_kv_buffer_kernel[grid](
+                cache_k,
+                loc,
+                dcp_kv_mask,
+                self.k_buffer[layer_id - self.start_layer],
+                N,
+                H,
+                D,
+                128,
+                cache_k.stride(0),
+                cache_k.stride(1),
+                self.k_buffer[layer_id - self.start_layer].stride(0),
+                self.k_buffer[layer_id - self.start_layer].stride(1),
+            )
+            masked_set_kv_buffer_kernel[grid](
+                cache_v,
+                loc,
+                dcp_kv_mask,
+                self.v_buffer[layer_id - self.start_layer],
+                N,
+                H,
+                D,
+                128,
+                cache_v.stride(0),
+                cache_v.stride(1),
+                self.v_buffer[layer_id - self.start_layer].stride(0),
+                self.v_buffer[layer_id - self.start_layer].stride(1),
+            )
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if get_is_capture_mode() and self.alt_stream is not None:
+                # Overlap the copy of K and V cache for small batch size
+                current_stream = self.device_module.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                with self.device_module.stream(self.alt_stream):
+                    self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
@@ -2111,3 +2144,45 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+
+@triton.jit
+def masked_set_kv_buffer_kernel(
+    src_ptr,
+    loc_ptr,
+    mask_ptr,
+    dst_ptr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    CHUNK: tl.constexpr,
+    src_stride_B: tl.constexpr,
+    src_stride_H: tl.constexpr,
+    dst_stride_B: tl.constexpr,
+    dst_stride_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= N:
+        return
+
+    do_write = tl.load(mask_ptr + pid) != 0
+    if not do_write:
+        return
+
+    loc = tl.load(loc_ptr + pid)
+
+    total = H * D
+    num_chunks = tl.cdiv(total, CHUNK)
+
+    for c in range(num_chunks):
+        offs = tl.arange(0, CHUNK)
+        idx = c * CHUNK + offs
+        mask = idx < total
+
+        row = idx // D
+        col = idx % D
+
+        src_addr = src_ptr + pid * src_stride_B + row * src_stride_H + col
+        data = tl.load(src_addr, mask=mask)
+        dst_addr = dst_ptr + loc * dst_stride_B + row * dst_stride_H + col
+        tl.store(dst_addr, data, mask=mask)
