@@ -548,12 +548,12 @@ def get_generate_fn(
         if not job_completed:
             if is_baseline_generation_mode:
                 logger.warning(
-                    f"{id}: video job {video_id} timed out during baseline generation. "
+                    f"{case_id}: video job {video_id} timed out during baseline generation. "
                     "Attempting to collect performance data anyway."
                 )
                 return (video_id, b"")
 
-            pytest.fail(f"{id}: video job {video_id} did not complete in time")
+            pytest.fail(f"{case_id}: video job {video_id} did not complete in time")
 
         # download video
         resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
@@ -579,7 +579,7 @@ def get_generate_fn(
     def generate_image(case_id, client) -> tuple[str, bytes]:
         """T2I: Text to Image generation."""
         if not sampling_params.prompt:
-            pytest.skip(f"{id}: no text prompt configured")
+            pytest.skip(f"{case_id}: no text prompt configured")
 
         generate_kwargs: dict[str, Any] = {
             "model": model_path,
@@ -613,7 +613,7 @@ def get_generate_fn(
     def generate_image_edit(case_id, client) -> tuple[str, bytes]:
         """TI2I: Text + Image -> Image edit."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
 
         image_paths = sampling_params.image_path
 
@@ -627,7 +627,7 @@ def get_generate_fn(
             else:
                 new_image_paths.append(Path(image_path))
                 if not image_path.exists():
-                    pytest.skip(f"{id}: file missing: {image_path}")
+                    pytest.skip(f"{case_id}: file missing: {image_path}")
 
         image_paths = new_image_paths
 
@@ -673,7 +673,7 @@ def get_generate_fn(
     def generate_video(case_id, client) -> tuple[str, bytes]:
         """T2V: Text -> Video."""
         if not sampling_params.prompt:
-            pytest.skip(f"{id}: no text prompt configured")
+            pytest.skip(f"{case_id}: no text prompt configured")
 
         return _create_and_download_video(
             client,
@@ -687,14 +687,14 @@ def get_generate_fn(
     def generate_image_to_video(case_id, client) -> tuple[str, bytes]:
         """I2V: Image -> Video (optional prompt)."""
         if not sampling_params.image_path:
-            pytest.skip(f"{id}: no input image configured")
+            pytest.skip(f"{case_id}: no input image configured")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{id}: file missing: {image_path}")
+                pytest.skip(f"{case_id}: file missing: {image_path}")
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -710,14 +710,14 @@ def get_generate_fn(
     def generate_text_image_to_video(case_id, client) -> tuple[str, bytes]:
         """TI2V: Text + Image -> Video."""
         if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{id}: no edit config")
+            pytest.skip(f"{case_id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{id}: file missing: {image_path}")
+                pytest.skip(f"{case_id}: file missing: {image_path}")
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
