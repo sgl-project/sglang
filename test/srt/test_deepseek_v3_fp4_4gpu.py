@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
-SERVER_LAUNCH_TIMEOUT = 1000
+SERVER_LAUNCH_TIMEOUT = 1200
 
 
 class TestDeepseekV3FP4(CustomTestCase):
@@ -172,7 +172,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
                 f"{speed=:.2f} token/s\n"
             )
 
-        self.assertGreater(acc_length, 2.04)
+        self.assertGreater(acc_length, 2.65)
         self.assertGreater(speed, 150)
 
 

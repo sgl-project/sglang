@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
+import importlib
+import importlib.util
 import logging
 import time
 from typing import List
 
 import requests
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,29 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
         return None, None
 
 
-# DEPRECATED. Use register_memory_region_v2 instead.
+def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos):
+    remote_instance_transfer_engine_info = {}
+    for data in scheduler_infos:
+        if (
+            "tp_rank" in data
+            and "remote_instance_transfer_engine_session_id" in data
+            and "remote_instance_transfer_engine_weights_info_dict" in data
+        ):
+            remote_instance_transfer_engine_info[data["tp_rank"]] = (
+                data["remote_instance_transfer_engine_session_id"],
+                data["remote_instance_transfer_engine_weights_info_dict"],
+            )
+    return remote_instance_transfer_engine_info
+
+
 def register_memory_region(model, transfer_engine):
+    if importlib.util.find_spec("torch") is None:
+        return register_memory_region_v1(model, transfer_engine)
+    else:
+        return register_memory_region_v2(model, transfer_engine)
+
+
+def register_memory_region_v1(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}
@@ -140,6 +162,8 @@ def register_memory_region_v2(model, transfer_engine):
             weight.element_size(),
         )
         weight_addr_set.add(weight.data_ptr())
+
+    import torch
 
     memory_snapshot = torch.cuda.memory.memory_snapshot()
     weight_blocks_for_reg_mr = []

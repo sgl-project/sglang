@@ -278,10 +278,10 @@ impl ResponseProcessor {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    return Err(error::internal_error(format!(
-                        "Failed to process choice {}: {}",
-                        index, e
-                    )));
+                    return Err(error::internal_error(
+                        "process_choice_failed",
+                        format!("Failed to process choice {}: {}", index, e),
+                    ));
                 }
             }
         }
@@ -380,10 +380,10 @@ impl ResponseProcessor {
             let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return Err(error::internal_error(format!(
-                        "Failed to process tokens: {}",
-                        e
-                    )))
+                    return Err(error::internal_error(
+                        "process_tokens_failed",
+                        format!("Failed to process tokens: {}", e),
+                    ))
                 }
             };
 

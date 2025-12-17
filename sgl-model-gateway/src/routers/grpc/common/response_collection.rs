@@ -58,7 +58,10 @@ pub async fn collect_responses(
     };
 
     if all_responses.is_empty() {
-        return Err(error::internal_error("No responses from server"));
+        return Err(error::internal_error(
+            "no_responses_from_server",
+            "No responses from server",
+        ));
     }
 
     Ok(all_responses)

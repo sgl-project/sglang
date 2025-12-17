@@ -55,6 +55,13 @@
         "reason": "top contributor",
         "can_rerun_stage": true
     },
+    "ClawSeven": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "DarkSharpness": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -293,6 +300,13 @@
         "reason": "top contributor",
         "can_rerun_stage": true
     },
+    "amysaq2023": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "ayrnb": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -354,6 +368,13 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "top contributor",
+        "can_rerun_stage": true
+    },
+    "cyb70289": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override",
         "can_rerun_stage": true
     },
     "dougyster": {
@@ -735,6 +756,13 @@
         "can_rerun_stage": true
     },
     "saienduri": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor",
+        "can_rerun_stage": true
+    },
+    "scottjlee": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
