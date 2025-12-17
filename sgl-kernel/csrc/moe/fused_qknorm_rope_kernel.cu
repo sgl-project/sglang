@@ -196,11 +196,10 @@ __global__ void fusedQKNormRopeKernel(
   float sin_vals[numElemsPerThread];
   float pos_id = static_cast<float>(position_ids[tokenIdx]);
   int const rotary_lanes = rotary_dim / numElemsPerThread;  // rotary range
-  bool const in_rotary = (laneId < rotary_lanes);
-
-  if constexpr (interleave) {
-    // Perform interleaving. Fill cos_vals and sin_vals.
-    if (in_rotary) {
+  bool const applyRotary = (laneId < rotary_lanes);
+  if (applyRotary) {
+    if constexpr (interleave) {
+      // Perform interleaving. Fill cos_vals and sin_vals.
       for (int i = 0; i < numElemsPerThread; i++) {
         elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
 
@@ -210,13 +209,11 @@ __global__ void fusedQKNormRopeKernel(
         float theta = pos_id * freq;
         __sincosf(theta, &sin_vals[i], &cos_vals[i]);
       }
-    }
 
-  } else {
-    // Neox style
-    // Before data exchange with in warp, we need to sync.
-    __syncwarp();
-    if (in_rotary) {
+    } else {
+      // Neox style
+      // Before data exchange with in warp, we need to sync.
+      __syncwarp();
       int const half_rotary_lanes = rotary_lanes / 2;
       unsigned int active_mask = (1u << rotary_lanes) - 1;
       for (int i = 0; i < numElemsPerThread; i++) {
@@ -232,12 +229,10 @@ __global__ void fusedQKNormRopeKernel(
         float theta = pos_id * freq;
         __sincosf(theta, &sin_vals[i], &cos_vals[i]);
       }
+      // __shfl_xor_sync does not provide memfence. Need to sync again.
+      __syncwarp();
     }
-    // __shfl_xor_sync does not provide memfence. Need to sync again.
-    __syncwarp();
-  }
 
-  if (in_rotary) {
     for (int i = 0; i < numElemsPerThread; i++) {
       elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
     }
