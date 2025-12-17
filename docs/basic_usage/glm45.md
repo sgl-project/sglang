@@ -1,3 +1,5 @@
+# GLM-4.5 / GLM-4.6 Usage
+
 ## Launch GLM-4.5 / GLM-4.6 with SGLang
 
 To serve GLM-4.5 / GLM-4.6 FP8 models on 8xH100/H200 GPUs:
@@ -5,11 +7,6 @@ To serve GLM-4.5 / GLM-4.6 FP8 models on 8xH100/H200 GPUs:
 ```bash
 python3 -m sglang.launch_server --model zai-org/GLM-4.6-FP8 --tp 8
 ```
-
-### Configuration Tips
-
-- `--max-mamba-cache-size`: Adjust `--max-mamba-cache-size` to increase mamba cache space and max running requests
-  capability. It will decrease KV cache space as a trade-off. You can adjust it according to workload.
 
 ### EAGLE Speculative Decoding
 
