@@ -710,9 +710,7 @@ class GroupCoordinator:
         )
 
         # Perform reduce-scatter operation
-        torch.distributed.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
+        self.reduce_scatter_tensor(output_tensor, input_tensor)
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
