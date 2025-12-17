@@ -7,7 +7,6 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -480,28 +479,9 @@ def _dp_gather_via_all_reduce(
 
     else:
         if get_global_server_args().rl_on_policy_target == "fsdp_tp":
-            global_tokens[:] = tensor_model_parallel_dp_attn_tree_all_reduce(
-                global_tokens
-            )
+            global_tokens[:] = tensor_model_parallel_tree_all_reduce(global_tokens)
         else:
             global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
-
-
-def tensor_model_parallel_dp_attn_tree_all_reduce(x: torch.Tensor) -> torch.Tensor:
-    if get_attention_tp_size() > 1:
-        x = tensor_model_parallel_tree_all_reduce(
-            x, get_attention_tp_group().device_group
-        )
-
-    all_gather_result = [torch.zeros_like(x) for _ in range(get_tp_group().world_size)]
-    dist.all_gather(all_gather_result, x, group=get_tp_group().device_group)
-
-    attn_tp_size = get_attention_tp_size()
-    result = torch.stack(
-        [all_gather_result[i] for i in range(0, len(all_gather_result), attn_tp_size)],
-        dim=0,
-    ).sum(dim=0)
-    return result
 
 
 def _dp_gather_via_all_gather(
