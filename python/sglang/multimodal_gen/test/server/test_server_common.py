@@ -468,13 +468,21 @@ Consider updating perf_baselines.json with the snippets below:
         # Check GT exists - if not, save to staging and fail
         if not gt_exists(case.id, num_gpus):
             # Convert output to frames for staging
-            if is_video:
-                output_frames = extract_key_frames_from_video(content)
-            else:
-                output_frames = [image_bytes_to_numpy(content)]
+            # Wrap in try-except to preserve helpful error message even if content is invalid
+            staging_path = None
+            try:
+                if is_video:
+                    output_frames = extract_key_frames_from_video(content)
+                else:
+                    output_frames = [image_bytes_to_numpy(content)]
 
-            # Save to staging directory if enabled
-            staging_path = save_gt_to_staging(output_frames, case, is_video)
+                # Save to staging directory if enabled
+                staging_path = save_gt_to_staging(output_frames, case, is_video)
+            except Exception as frame_err:
+                logger.warning(
+                    f"[Consistency] Failed to extract frames for staging: {frame_err}. "
+                    "GT guidance will still be shown."
+                )
 
             # Build helpful error message
             gpu_dir = f"{num_gpus}-gpu"
