@@ -7,59 +7,17 @@ Ollama API compatibility for SGLang, plus a Smart Router for intelligent routing
 1. **Ollama-compatible API** - Use Ollama CLI/library with SGLang backend
 2. **Smart Router** - LLM-based routing between local and remote models
 
-## Prerequisites
+## Ollama API
 
-```bash
-# Install ollama Python library
-pip install ollama
-```
-
----
-
-## Quick Start: Ollama API
-
-### 1. Start SGLang Server (GPU)
-
-```bash
-# Install sglang (if not already installed)
-pip install -e python
-
-# Start with any HuggingFace model
-python -m sglang.launch_server \
-    --model <YOUR_MODEL> \
-    --port 30001 \
-    --host 0.0.0.0
-```
-
-> **Note**: The model name used with `ollama run` must match exactly what you passed to `--model`.
-
-### 2. Connect from Local Machine
-
-```bash
-# SSH tunnel if behind firewall
-ssh -L 30001:localhost:30001 user@gpu-server -N &
-
-# Use Ollama CLI
-OLLAMA_HOST=http://localhost:30001 ollama list
-OLLAMA_HOST=http://localhost:30001 ollama run "<MODEL_NAME>"
-```
-
-### 3. Ollama Python Library
-
-```python
-import ollama
-
-client = ollama.Client(host='http://localhost:30001')
-response = client.chat(
-    model='<MODEL_NAME>',
-    messages=[{'role': 'user', 'content': 'Hello!'}]
-)
-print(response['message']['content'])
-```
-
----
+For basic Ollama API usage with SGLang (CLI and Python examples), see the [Ollama API documentation](https://sgl-project.github.io/basic_usage/ollama_api.html).
 
 ## Smart Router
+
+### Prerequisites
+
+```bash
+pip install ollama
+```
 
 Intelligently routes requests between local Ollama and remote SGLang using an LLM judge.
 
