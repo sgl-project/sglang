@@ -586,6 +586,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
@@ -707,6 +709,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -870,13 +874,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                if self.dcp_size > 1:
-                    assert forward_batch.dcp_kv_mask is not None
-                    k = k[forward_batch.dcp_kv_mask]
-                    v = v[forward_batch.dcp_kv_mask]
-                    cache_loc = cache_loc[forward_batch.dcp_kv_mask]
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    dcp_kv_mask=forward_batch.dcp_kv_mask,
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -902,13 +907,14 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.dcp_size > 1:
-                    assert forward_batch.dcp_kv_mask is not None
-                    k = k[forward_batch.dcp_kv_mask]
-                    v = v[forward_batch.dcp_kv_mask]
-                    cache_loc = cache_loc[forward_batch.dcp_kv_mask]
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    dcp_kv_mask=forward_batch.dcp_kv_mask,
                 )
 
         # Call the wrapped function
@@ -1149,6 +1155,8 @@ class FlashInferIndicesUpdaterDecode:
                 )
                 kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens_dcp, dim=0)
                 kv_indices = kv_indices[kv_indices % dcp_size == dcp_rank] // dcp_size
+                if wrapper.is_cuda_graph_enabled:
+                    wrapper._paged_kv_indices_buf[: len(kv_indices)].copy_(kv_indices)
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
@@ -1167,7 +1175,17 @@ class FlashInferIndicesUpdaterDecode:
             locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
-            global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
+            if dcp_size > 1:
+                dcp_seq_lens_cpu = seq_lens_cpu // dcp_size + (
+                    dcp_rank < seq_lens_cpu % dcp_size
+                )
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    dcp_seq_lens_cpu, dim=0
+                )
+            else:
+                global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    seq_lens_cpu, dim=0
+                )
 
         # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
         # by checking if it's a partial function with fast_decode_plan as the func
