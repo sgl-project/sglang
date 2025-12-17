@@ -82,7 +82,7 @@ void dispatch_w4a8_moe_mm_sm90(
     int64_t topk,
     int64_t num_experts) {
   // ll: num_max_dispatch_tokens_per_rank * rank / num_experts;  other: m
-  uint32_t const m = a_tensors.dim() == 2 ? a_tensors.size(0) / num_experts : a_tensors.size(1) / num_experts;
+  uint32_t const m = a_tensors.dim() == 2 ? a_tensors.size(0) / topk : a_tensors.size(1) / num_experts;
   uint32_t const n = d_tensors.size(-1);
   uint32_t const k = a_tensors.size(-1);
 
