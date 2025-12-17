@@ -2407,26 +2407,6 @@ class ServerArgs:
                 "--enable-non-generation-schedule-overlap is not supported with sparse heads. Please disable one of them."
             )
 
-    def _handle_remote_instance_weight_loader_support_transfer_engine(self):
-        try:
-            importlib.import_module("mooncake")
-            if importlib.util.find_spec("mooncake.engine") is None:
-                logger.warning(
-                    f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
-                )
-                self.remote_instance_weight_loader_support_transfer_engine = False
-            elif self.enable_memory_saver:
-                logger.warning(
-                    "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
-                )
-                self.remote_instance_weight_loader_support_transfer_engine = False
-            else:
-                self.remote_instance_weight_loader_support_transfer_engine = True
-        except ImportError:
-            logger.warning(
-                f"Failed to import mooncake. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-
     def _handle_remote_instance_weight_loader_start_seed_via_transfer_engine(self):
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
