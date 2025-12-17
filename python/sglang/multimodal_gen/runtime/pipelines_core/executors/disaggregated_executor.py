@@ -1,9 +1,8 @@
 """
 Pipeline executor for disaggregated execution.
 """
-
-import copy
-from typing import TYPE_CHECKING, List
+from enum import Enum, auto
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -15,14 +14,25 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     Timer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage, TimestepPreparationStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-
 logger = init_logger(__name__)
+
+
+class StageDisaggregationRole(Enum):
+    NONE_DENOISE = auto()
+    DENOISE = auto()
+    COMMON = auto()
+
+
+def get_stage_disagg_role(stage: PipelineStage):
+    if isinstance(stage, DenoisingStage) or isinstance(stage, TimestepPreparationStage):
+        return StageDisaggregationRole.DENOISE
+    else:
+        return StageDisaggregationRole.NONE_DENOISE
 
 
 class DisaggregatedExecutor(PipelineExecutor):
@@ -75,10 +85,8 @@ class DisaggregatedExecutor(PipelineExecutor):
             denoise_start_idx = -1
             denoise_end_idx = -1
 
-            batch_cp = copy.deepcopy(batch)
-
             for i, stage in enumerate(stages):
-                if isinstance(stage, DenoisingStage):
+                if get_stage_disagg_role(stage) == StageDisaggregationRole.DENOISE:
                     if denoise_start_idx == -1:
                         denoise_start_idx = i
                     denoise_end_idx = i
@@ -92,8 +100,8 @@ class DisaggregatedExecutor(PipelineExecutor):
                 return self._run_local(stages, batch)
 
             pre_denoise_stages = stages[:denoise_start_idx]
-            denoise_stages = stages[denoise_start_idx : denoise_end_idx + 1]
-            post_denoise_stages = stages[denoise_end_idx + 1 :]
+            denoise_stages = stages[denoise_start_idx:denoise_end_idx + 1]
+            post_denoise_stages = stages[denoise_end_idx + 1:]
 
             # --- PHASE 1: Pre-Denoise (Encoding) ---
             print(
@@ -181,36 +189,6 @@ class DisaggregatedExecutor(PipelineExecutor):
                     sys.stdout.flush()
                     raise
 
-            if self.comm.is_dit_rank():
-                for stage in pre_denoise_stages:
-                    print(
-                        f"[DiT Rank {dist.get_rank()}] Running stage: {stage.__class__.__name__}"
-                    )
-                    with Timer(stage.__class__.__name__):
-                        batch_cp = stage(batch_cp, server_args)
-
-                # ===== DEBUG: Compare batch vs batch_cp =====
-                print(f"\n{'='*80}")
-                print(
-                    f"[DiT Rank {dist.get_rank()}] COMPARING batch (from Non-DiT) vs batch_cp (generated locally)"
-                )
-                print(f"{'='*80}")
-
-
-
-
-
-
-                print(f"{'='*80}\n")
-                import sys
-
-                sys.stdout.flush()
-
-                # Now use the transmitted batch (with correctly restored generators)
-                # If generators still differ, the debug output above will show it
-
-            print(f"batch before denoising: {batch=} {server_args=}")
-            # --- PHASE 2: Denoise (DiT) ---
             if self.comm.is_dit_rank():
                 print("Phase 2: Running Denoise stages on DiT...")
                 for stage in denoise_stages:
@@ -361,25 +339,15 @@ class DisaggregatedExecutor(PipelineExecutor):
                 print(f"  {k}: {type(v)}, value_preview={str(v)[:100]}")
 
         # Metadata: everything that's not in tensors_to_send
-        metadata = {}
-        generator_states = {}  # Special handling for generator objects
+        metadata = {
+            k: v
+            for k, v in batch.__dict__.items()
+            if k not in tensor_infos and k not in list_tensor_infos
+        }
 
-        for k, v in batch.__dict__.items():
-            if k in tensor_infos or k in list_tensor_infos:
-                continue
-
-            # Special handling for generator list
-            if isinstance(v, list) and v and isinstance(v[0], torch.Generator):
-                # Save generator states instead of objects
-                generator_states[k] = [g.get_state() for g in v]
-            else:
-                metadata[k] = v
-
-        # Serialize metadata + tensor info + generator states
+        # Serialize metadata + tensor info
         buffer = io.BytesIO()
-        pickle.dump(
-            (metadata, tensor_infos, list_tensor_infos, generator_states), buffer
-        )
+        pickle.dump((metadata, tensor_infos, list_tensor_infos), buffer)
         meta_bytes = torch.tensor(
             bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
         )
@@ -442,24 +410,11 @@ class DisaggregatedExecutor(PipelineExecutor):
         # 2. Recv Metadata
         meta_bytes = self.comm.recv_from_non_dit(torch.Size([size]), torch.uint8)
         meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
-        metadata, tensor_infos, list_tensor_infos, generator_states = pickle.loads(
-            meta_data_cpu
-        )
+        metadata, tensor_infos, list_tensor_infos = pickle.loads(meta_data_cpu)
 
         # Update batch metadata
         for k, v in metadata.items():
             setattr(batch, k, v)
-
-        # Restore generator objects from states
-        for k, states in generator_states.items():
-            generators = []
-            for state in states:
-                gen = torch.Generator(
-                    device="cuda" if torch.cuda.is_available() else "cpu"
-                )
-                gen.set_state(state)
-                generators.append(gen)
-            setattr(batch, k, generators)
 
         # 3. Recv Single Tensors
         for name, (shape, dtype) in tensor_infos.items():
@@ -520,23 +475,14 @@ class DisaggregatedExecutor(PipelineExecutor):
                         tensors_to_send[k] = actual_tensors
                         list_tensor_infos[k] = (len(v), tensor_indices, shapes_dtypes)
 
-        metadata = {}
-        generator_states = {}
-
-        for k, v in batch.__dict__.items():
-            if k in tensor_infos or k in list_tensor_infos:
-                continue
-
-            # Special handling for generator list
-            if isinstance(v, list) and v and isinstance(v[0], torch.Generator):
-                generator_states[k] = [g.get_state() for g in v]
-            else:
-                metadata[k] = v
+        metadata = {
+            k: v
+            for k, v in batch.__dict__.items()
+            if k not in tensor_infos and k not in list_tensor_infos
+        }
 
         buffer = io.BytesIO()
-        pickle.dump(
-            (metadata, tensor_infos, list_tensor_infos, generator_states), buffer
-        )
+        pickle.dump((metadata, tensor_infos, list_tensor_infos), buffer)
         meta_bytes = torch.tensor(
             bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
         )
@@ -577,23 +523,10 @@ class DisaggregatedExecutor(PipelineExecutor):
 
         meta_bytes = self.comm.recv_from_dit(torch.Size([size]), torch.uint8)
         meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
-        metadata, tensor_infos, list_tensor_infos, generator_states = pickle.loads(
-            meta_data_cpu
-        )
+        metadata, tensor_infos, list_tensor_infos = pickle.loads(meta_data_cpu)
 
         for k, v in metadata.items():
             setattr(batch, k, v)
-
-        # Restore generator objects from states
-        for k, states in generator_states.items():
-            generators = []
-            for state in states:
-                gen = torch.Generator(
-                    device="cuda" if torch.cuda.is_available() else "cpu"
-                )
-                gen.set_state(state)
-                generators.append(gen)
-            setattr(batch, k, generators)
 
         # Recv single tensors
         for name, (shape, dtype) in tensor_infos.items():

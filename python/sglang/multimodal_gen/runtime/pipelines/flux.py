@@ -93,18 +93,18 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
         self.add_stage(
-            stage_name="timestep_preparation_stage",
-            stage=TimestepPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[prepare_mu],
-            ),
-        )
-
-        self.add_stage(
             stage_name="latent_preparation_stage",
             stage=LatentPreparationStage(
                 scheduler=self.get_module("scheduler"),
                 transformer=self.get_module("transformer"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="timestep_preparation_stage",
+            stage=TimestepPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                prepare_extra_set_timesteps_kwargs=[prepare_mu],
             ),
         )
 
