@@ -13,10 +13,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightly_metrics import run_metrics
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# NOTE: This test is NOT registered via register_cuda_ci() decorator.
-# It must be called directly from the YML workflow with appropriate timeout (180min).
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
 
 GLM_4_6_MODEL_PATH = "zai-org/GLM-4.6"
 
@@ -33,6 +33,9 @@ class TestGLM46Unified(unittest.TestCase):
 
     def test_glm_46(self):
         """Run performance and accuracy for GLM-4.6."""
+        print("\n" + "=" * 80)
+        print("RUNNING: TestGLM46Unified.test_glm_46")
+        print("=" * 80)
 
         variants = [
             ModelLaunchSettings(

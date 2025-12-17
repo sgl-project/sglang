@@ -12,10 +12,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightly_metrics import run_metrics
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# NOTE: This test is NOT registered via register_cuda_ci() decorator.
-# It must be called directly from the YML workflow with appropriate timeout (180min).
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
@@ -34,6 +34,9 @@ class TestDeepseekV31Unified(unittest.TestCase):
 
     def test_deepseek_v31_all_variants(self):
         """Run performance and accuracy for all DeepSeek-V3.1 variants."""
+        print("\n" + "=" * 80)
+        print("RUNNING: TestDeepseekV31Unified.test_deepseek_v31_all_variants")
+        print("=" * 80)
 
         variants = [
             # Variant: "basic" (from test_deepseek_v31_perf.py)

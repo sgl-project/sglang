@@ -48,6 +48,9 @@ class TestDeepseekV32Unified(unittest.TestCase):
 
     def test_deepseek_v32_all_variants(self):
         """Run performance and accuracy for all DeepSeek V3.2 variants."""
+        print("\n" + "=" * 80)
+        print("RUNNING: TestDeepseekV32Unified.test_deepseek_v32_all_variants")
+        print("=" * 80)
 
         # Define all model variants
         variants = [

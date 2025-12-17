@@ -12,10 +12,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightly_metrics import run_metrics
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# NOTE: This test is NOT registered via register_cuda_ci() decorator.
-# It must be called directly from the YML workflow with appropriate timeout (180min).
+# Registered to nightly-8-gpu-temp suite for testing
+# This suite should be run with --timeout-per-file=12000 (200 minutes)
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
 
 KIMI_K2_THINKING_MODEL_PATH = "moonshotai/Kimi-K2-Thinking"
 
@@ -31,6 +33,9 @@ class TestKimiK2Unified(unittest.TestCase):
 
     def test_kimi_k2(self):
         """Run performance and accuracy for Kimi-K2-Thinking."""
+        print("\n" + "=" * 80)
+        print("RUNNING: TestKimiK2Unified.test_kimi_k2")
+        print("=" * 80)
 
         variants = [
             ModelLaunchSettings(

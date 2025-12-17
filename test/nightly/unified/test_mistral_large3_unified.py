@@ -14,10 +14,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightly_metrics import run_metrics
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# NOTE: This test is NOT registered via register_cuda_ci() decorator.
-# It must be called directly from the YML workflow with appropriate timeout (180min).
+# Registered to nightly-8-gpu-temp suite for testing
+# This suite should be run with --timeout-per-file=12000 (200 minutes)
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
 
 MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"
@@ -48,6 +50,9 @@ class TestMistralLarge3Unified(unittest.TestCase):
 
     def test_mistral_large3_all_variants(self):
         """Run performance and accuracy for all Mistral-Large-3 variants."""
+        print("\n" + "=" * 80)
+        print("RUNNING: TestMistralLarge3Unified.test_mistral_large3_all_variants")
+        print("=" * 80)
 
         variants = [
             # Variant: "basic" (from test_mistral_large3_perf.py)

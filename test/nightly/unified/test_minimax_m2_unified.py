@@ -13,10 +13,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightly_metrics import run_metrics
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# NOTE: This test is NOT registered via register_cuda_ci() decorator.
-# It must be called directly from the YML workflow with appropriate timeout (180min).
+# Registered to nightly-8-gpu-temp suite for testing
+# This suite should be run with --timeout-per-file=12000 (200 minutes)
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
 
 MINIMAX_M2_MODEL_PATH = "MiniMaxAI/MiniMax-M2"
 
@@ -33,6 +35,9 @@ class TestMiniMaxM2Unified(unittest.TestCase):
 
     def test_minimax_m2(self):
         """Run performance and accuracy for MiniMax-M2."""
+        print("\n" + "=" * 80)
+        print("RUNNING: TestMiniMaxM2Unified.test_minimax_m2")
+        print("=" * 80)
 
         variants = [
             ModelLaunchSettings(
