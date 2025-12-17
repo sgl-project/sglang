@@ -1,0 +1,123 @@
+"""Unified Mistral-Large-3 performance and accuracy tests using nightly_metrics.
+
+This file replaces test_mistral_large3_perf.py which already had both perf + accuracy.
+Two variants: basic (TP=8 + trtllm_mla) and eagle (basic + EAGLE speculative decoding).
+Requires SGLANG_ENABLE_JIT_DEEPGEMM=0 environment variable.
+"""
+
+import os
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from nightly_metrics import run_metrics
+
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
+
+# NOTE: This test is NOT registered via register_cuda_ci() decorator.
+# It must be called directly from the YML workflow with appropriate timeout (180min).
+
+MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
+MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"
+
+
+class TestMistralLarge3Unified(unittest.TestCase):
+    """Unified test class for Mistral-Large-3 performance and accuracy.
+
+    Two variants:
+    - basic: TP=8 + trtllm_mla backend
+    - eagle: basic + EAGLE speculative decoding with draft model
+
+    Each variant runs BOTH:
+    - Performance test (using NightlyBenchmarkRunner)
+    - Accuracy test (using run_eval with mgsm_en)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Set environment variable to disable JIT DeepGemm
+        os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "0"
+
+    @classmethod
+    def tearDownClass(cls):
+        # Clean up environment variable
+        if "SGLANG_ENABLE_JIT_DEEPGEMM" in os.environ:
+            del os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"]
+
+    def test_mistral_large3_all_variants(self):
+        """Run performance and accuracy for all Mistral-Large-3 variants."""
+
+        variants = [
+            # Variant: "basic" (from test_mistral_large3_perf.py)
+            # TP=8 + trtllm_mla backend
+            ModelLaunchSettings(
+                MISTRAL_LARGE3_MODEL_PATH,
+                tp_size=8,
+                extra_args=[
+                    "--tp=8",
+                    "--attention-backend=trtllm_mla",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                    "--chat-template=mistral",
+                ],
+            ),
+            # Variant: "eagle" (from test_mistral_large3_perf.py)
+            # TP=8 + trtllm_mla + EAGLE speculative decoding with draft model
+            ModelLaunchSettings(
+                MISTRAL_LARGE3_MODEL_PATH,
+                tp_size=8,
+                extra_args=[
+                    "--tp=8",
+                    "--attention-backend=trtllm_mla",
+                    "--speculative-algorithm=EAGLE",
+                    f"--speculative-draft-model-path={MISTRAL_LARGE3_EAGLE_MODEL_PATH}",
+                    "--speculative-num-steps=3",
+                    "--speculative-eagle-topk=1",
+                    "--speculative-num-draft-tokens=4",
+                    "--kv-cache-dtype=auto",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                    "--chat-template=mistral",
+                ],
+            ),
+        ]
+
+        # Run both performance and accuracy for all variants
+        result = run_metrics(
+            models=variants,
+            run_perf=True,
+            run_accuracy=True,
+            is_vlm=False,
+            base_url=DEFAULT_URL_FOR_TEST,
+            profile_dir="performance_profiles_mistral_large3",
+            test_name="TestMistralLarge3Unified",
+            batch_sizes=[1, 1, 8, 16, 64],
+            eval_name="mgsm_en",
+        )
+
+        # Check results
+        self.assertTrue(
+            result["all_passed"], f"Some variants failed. Results: {result['results']}"
+        )
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("Mistral-Large-3 Unified Test Results")
+        print("=" * 60)
+        for i, model_result in enumerate(result["results"]):
+            variant_name = ["basic", "eagle"][i]
+            print(f"\nVariant: {variant_name}")
+            print(f"  Performance: {'✓' if model_result['perf_passed'] else '✗'}")
+            print(f"  Accuracy: {'✓' if model_result['accuracy_passed'] else '✗'}")
+            if model_result["accuracy_metrics"]:
+                print(
+                    f"  Score: {model_result['accuracy_metrics'].get('score', 'N/A')}"
+                )
+            if model_result["errors"]:
+                print(f"  Errors: {model_result['errors']}")
+
+
+if __name__ == "__main__":
+    unittest.main()

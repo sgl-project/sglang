@@ -108,17 +108,9 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          GPU_CONFIG: "8-gpu-h200"
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
-
-      - name: Run DeepSeek V3.2 unified test (perf + accuracy)
+      - name: Run unified tests (perf + accuracy) via run_suite
         if: always()
-        timeout-minutes: 180
+        timeout-minutes: 200
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
@@ -126,7 +118,15 @@ jobs:
         run: |
           rm -rf test/performance_profiles_deepseek_v32/
           cd test
-          python3 nightly/test_deepseek_v32_unified.py
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-temp --nightly --timeout-per-file=12000 --continue-on-error
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          GPU_CONFIG: "8-gpu-h200"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
 
       - name: Run MiniMax-M2 nightly performance test
         timeout-minutes: 180
