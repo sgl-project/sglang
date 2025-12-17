@@ -4,7 +4,7 @@ import dataclasses
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Union
 
 import httpx
 from fastapi import UploadFile
@@ -47,6 +47,13 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         return None, None
 
 
+async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
+    input_path = await _maybe_url_image(image, target_path)
+    if input_path is None:
+        input_path = await _save_upload_to_path(image, target_path)
+    return input_path
+
+
 # Helpers
 async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -56,7 +63,7 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def maybe_url_image(img_url: str, target_path: str) -> str:
+async def _maybe_url_image(img_url: str, target_path: str) -> str:
     if not isinstance(img_url, str):
         return None
 

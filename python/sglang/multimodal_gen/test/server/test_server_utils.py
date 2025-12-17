@@ -492,6 +492,7 @@ def get_generate_fn(
         prompt: str | None = None,
         seconds: int | None = None,
         input_reference: Any | None = None,
+        extra_body: dict[str] | None = None,
     ) -> str:
         """
         Create a video job via /v1/videos, poll until completion,
@@ -508,6 +509,8 @@ def get_generate_fn(
             create_kwargs["seconds"] = seconds
         if input_reference is not None:
             create_kwargs["input_reference"] = input_reference  # triggers multipart
+        if extra_body is not None:
+            create_kwargs["extra_body"] = extra_body
 
         job = client.videos.create(**create_kwargs)  # type: ignore[attr-defined]
         video_id = job.id
@@ -783,6 +786,19 @@ def get_generate_fn(
                 input_reference=fh,
             )
 
+    def generate_text_url_image_to_video(case_id, client) -> str:
+        if not sampling_params.prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
+        return _create_and_download_video(
+            client,
+            case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            size=sampling_params.output_size,
+            seconds=video_seconds,
+            extra_body={"reference_url": sampling_params.image_path},
+        )
+
     def generate_text_image_to_video(case_id, client) -> str:
         """TI2V: Text + Image ? Video."""
         if not sampling_params.prompt or not sampling_params.image_path:
@@ -808,7 +824,10 @@ def get_generate_fn(
 
     if modality == "video":
         if sampling_params.image_path and sampling_params.prompt:
-            fn = generate_text_image_to_video
+            if getattr(sampling_params, "direct_url_test", False):
+                fn = generate_text_url_image_to_video
+            else:
+                fn = generate_text_image_to_video
         elif sampling_params.image_path:
             fn = generate_image_to_video
         else:

@@ -20,9 +20,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
-    _save_upload_to_path,
-    maybe_url_image,
     process_generation_batch,
+    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -193,20 +192,17 @@ async def edits(
         image_list.extend(urls if isinstance(urls, list) else [urls])
 
     input_paths = []
-    for idx, img in enumerate(image_list):
-        try:
-            input_path = await maybe_url_image(
-                img, os.path.join(uploads_dir, f"{request_id}_{idx}_image_{idx}")
+    try:
+        for idx, img in enumerate(image_list):
+            filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+            input_path = await save_image_to_path(
+                img, os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
             )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"Failed to process image source: {str(e)}"
-            )
-        if input_path is None:
-            filename = img.filename or f"image_{idx}"
-            input_path = os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
-            await _save_upload_to_path(img, input_path)
-        input_paths.append(input_path)
+            input_paths.append(input_path)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to process image source: {str(e)}"
+        )
 
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
