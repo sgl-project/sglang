@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
+from torchvision.transforms.v2 import functional as F
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -231,7 +232,9 @@ class BaseMultimodalProcessor(ABC):
             )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
         else:
-            logger.info("[CUDA IPC] CUDA IPC transport disabled, using default CPU transport")
+            logger.info(
+                "[CUDA IPC] CUDA IPC transport disabled, using default CPU transport"
+            )
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -343,7 +346,8 @@ class BaseMultimodalProcessor(ABC):
                 img, _ = load_image(data)
                 if discard_alpha_channel and img.mode != "RGB":
                     img = img.convert("RGB")
-                return img
+                img_tenosr = F.pil_to_tensor(img)
+                return img_tenosr
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
@@ -733,6 +737,6 @@ class BaseMultimodalProcessor(ABC):
                             data=available_slice,
                             info_data=item.precomputed_embeddings,
                             sync_buffer_meta=sync_flag,
-                        )        
+                        )
 
         return all_collected_items, input_ids, ret
