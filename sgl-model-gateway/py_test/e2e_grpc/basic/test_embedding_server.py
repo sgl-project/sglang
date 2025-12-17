@@ -7,6 +7,7 @@ Test the embedding functionality of the gRPC router.
 import sys
 import unittest
 from pathlib import Path
+import os 
 
 import openai
 
@@ -33,6 +34,9 @@ class TestEmbeddingServer(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
+        worker_env = os.environ.copy()
+        worker_env["ROUTER_LOCAL_MODEL_PATH"] = "" 
+
         # Launch workers with --is-embedding flag
         cls.cluster = popen_launch_workers_and_router(
             cls.model,
@@ -43,6 +47,7 @@ class TestEmbeddingServer(CustomTestCase):
             policy="round_robin",
             api_key=cls.api_key,
             worker_args=["--is-embedding"],
+            env=worker_env
         )
 
         cls.base_url += "/v1"
