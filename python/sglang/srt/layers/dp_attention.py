@@ -7,6 +7,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -17,9 +18,13 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.communication_op import (
+    tensor_model_parallel_tree_all_reduce,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -67,19 +72,21 @@ class DpPaddingMode(IntEnum):
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
-        if sum_len * 2 > max_len * get_attention_dp_size():
-            return cls.MAX_LEN
-        else:
-            return cls.SUM_LEN
+        # if sum_len * 2 > max_len * get_attention_dp_size():
+        #     return cls.MAX_LEN
+        # else:
+        #     return cls.SUM_LEN
+        return cls.SUM_LEN
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
-            return cls.SUM_LEN
-        else:
-            return cls.MAX_LEN
+        # if _USE_ROCM700A_WA:
+        #     return cls.SUM_LEN
+        # else:
+        #     return cls.MAX_LEN
+        return cls.SUM_LEN
 
 
 class _DpGatheredBufferWrapper:
@@ -472,7 +479,29 @@ def _dp_gather_via_all_reduce(
         )
 
     else:
-        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        if get_global_server_args().rl_on_policy_target == "fsdp_tp":
+            global_tokens[:] = tensor_model_parallel_dp_attn_tree_all_reduce(
+                global_tokens
+            )
+        else:
+            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+
+
+def tensor_model_parallel_dp_attn_tree_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    if get_attention_tp_size() > 1:
+        x = tensor_model_parallel_tree_all_reduce(
+            x, get_attention_tp_group().device_group
+        )
+
+    all_gather_result = [torch.zeros_like(x) for _ in range(get_tp_group().world_size)]
+    dist.all_gather(all_gather_result, x, group=get_tp_group().device_group)
+
+    attn_tp_size = get_attention_tp_size()
+    result = torch.stack(
+        [all_gather_result[i] for i in range(0, len(all_gather_result), attn_tp_size)],
+        dim=0,
+    ).sum(dim=0)
+    return result
 
 
 def _dp_gather_via_all_gather(

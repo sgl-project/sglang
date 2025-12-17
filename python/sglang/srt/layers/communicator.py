@@ -34,6 +34,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_dp_size,
@@ -78,6 +79,10 @@ elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ScatterMode(Enum):
@@ -757,11 +762,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
-                hidden_states += residual
+            # if context.attn_tp_rank == 0:
+            #     hidden_states += residual
 
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
-            use_layer_norm_before_gather = context.attn_tp_size == 1
+            # use_layer_norm_before_gather = context.attn_tp_size == 1
+            use_layer_norm_before_gather = False
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
                 residual = hidden_states
                 with use_symmetric_memory(
@@ -777,9 +783,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
 
             if not use_layer_norm_before_gather:
-                dp_scatter(residual, hidden_states, forward_batch)
+                global_residual = torch.zeros_like(hidden_states).to(residual.dtype)
+                dp_gather_replicate(global_residual, residual, forward_batch)
+
                 if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, global_residual = layernorm(
+                        hidden_states, global_residual
+                    )
+                    dp_scatter(residual, global_residual, forward_batch)
         else:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
