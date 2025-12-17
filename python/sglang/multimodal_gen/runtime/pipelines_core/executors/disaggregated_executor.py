@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     PipelineExecutor,
     Timer,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -45,7 +45,7 @@ class DisaggregatedExecutor(PipelineExecutor):
         stages: List["PipelineStage"],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Executes the stages using a ping-pong mechanism between Non-DiT and DiT groups.
 
@@ -142,25 +142,68 @@ class DisaggregatedExecutor(PipelineExecutor):
                     with Timer(stage.__class__.__name__):
                         batch = stage(batch, server_args)
 
-                print("Phase 2 Complete. Sending data back to Non-DiT...")
-                # PONG: Send back to Non-DiT
-                self._send_batch_to_non_dit(batch)
+                # After denoising, latents are gathered (via gather_latents_for_sp)
+                # All dit ranks have the complete result, but only dit master sends to non-dit
+                if dist.get_rank() == self.comm.dit_master_rank:
+                    print("Phase 2 Complete. DiT Master sending data back to Non-DiT...")
+                    self._send_batch_to_non_dit(batch)
+                else:
+                    print(f"Phase 2 Complete. DiT Worker (rank {dist.get_rank()}) done for this request.")
+                    # DiT workers are done. Non-dit will handle decoding.
+                    # Return early to avoid unnecessary waiting
+                    return batch
 
-            elif self.comm.is_non_dit_rank():
-                # Non-DiT waits for result
-                print("Phase 2: Waiting for result from DiT...")
-                batch = self._recv_batch_from_dit(batch)
-
-            # --- PHASE 3: Post-Denoise (Decoding) ---
             if self.comm.is_non_dit_rank():
-                print("Phase 3: Running Post-Denoise stages on Non-DiT...")
-                for stage in post_denoise_stages:
-                    with Timer(stage.__class__.__name__):
-                        batch = stage(batch, server_args)
+                try:
+                    # Non-DiT waits for result from DiT Master
+                    print("Phase 2: Waiting for result from DiT Master...")
+                    batch = self._recv_batch_from_dit(batch)
 
-            # DiT is done for this request.
+                    # --- PHASE 3: Post-Denoise (Decoding) ---
+                    print("Phase 3: Running Post-Denoise stages on Non-DiT...")
+                    for stage in post_denoise_stages:
+                        with Timer(stage.__class__.__name__):
+                            batch = stage(batch, server_args)
+                    
+                    # Debug: check output status
+                    print(f"Phase 3 Complete. Output status: {batch.output is not None}, type: {type(batch.output) if batch.output is not None else 'None'}")
+                    if batch.output is not None and isinstance(batch.output, torch.Tensor):
+                        print(f"  Output shape: {batch.output.shape}, dtype: {batch.output.dtype}")
+                    
+                    # Convert Req to OutputBatch
+                    output_batch = OutputBatch(
+                        output=batch.output,
+                        trajectory_timesteps=batch.trajectory_timesteps,
+                        trajectory_latents=batch.trajectory_latents,
+                        trajectory_decoded=getattr(batch, 'trajectory_decoded', None),
+                        timings=batch.timings,
+                        error=None,
+                    )
+                    
+                    # Non-dit has the final output, send it back to dit master for client response
+                    print("Sending final result back to DiT Master...")
+                    self._send_final_result_to_dit_master(output_batch)
+                    print("Final result sent successfully.")
+                except Exception as e:
+                    logger.error(f"[Non-DiT Rank {dist.get_rank()}] Error in Phase 2/3: {e}", exc_info=True)
+                    # Still need to send error info to dit master to avoid deadlock
+                    # For now, just re-raise
+                    raise
 
-        return batch
+            # Dit master receives final result from non-dit
+            if dist.get_rank() == self.comm.dit_master_rank:
+                try:
+                    print("Receiving final result from Non-DiT...")
+                    output_batch = OutputBatch()
+                    output_batch = self._recv_final_result_from_non_dit(output_batch)
+                    print(f"Final result received. Output status: {output_batch.output is not None}")
+                    return output_batch
+                except Exception as e:
+                    logger.error(f"[Dit Master] Error receiving final result: {e}", exc_info=True)
+                    raise
+            
+            # Dit workers return empty batch (they don't handle client responses)
+            return OutputBatch()
 
     def _run_local(self, stages, batch):
         for stage in stages:
@@ -360,3 +403,106 @@ class DisaggregatedExecutor(PipelineExecutor):
             f"_recv_batch_from_dit: received {len(tensor_infos)} single tensors and {len(list_tensor_infos)} tensor lists"
         )
         return batch
+    
+    def _send_final_result_to_dit_master(self, output_batch: OutputBatch):
+        """Send OutputBatch from non-dit to dit master."""
+        import io
+        import pickle
+        
+        print(f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master called")
+        print(f"  non_dit_master_rank: {self.comm.non_dit_master_rank}, dit_master_rank: {self.comm.dit_master_rank}")
+        
+        # Prepare metadata (non-tensor fields)
+        has_output = output_batch.output is not None
+        has_error = output_batch.error is not None
+        
+        print(f"  has_output: {has_output}, has_error: {has_error}")
+        if has_output:
+            print(f"  output shape: {output_batch.output.shape}, dtype: {output_batch.output.dtype}")
+        
+        metadata = {
+            'timings': output_batch.timings,
+            'error': output_batch.error,
+            'has_output': has_output,
+        }
+        
+        if has_output:
+            metadata['output_shape'] = tuple(output_batch.output.shape)
+            metadata['output_dtype'] = str(output_batch.output.dtype)
+        
+        # Serialize and send metadata
+        buffer = io.BytesIO()
+        pickle.dump(metadata, buffer)
+        meta_bytes = torch.tensor(
+            bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
+        )
+        
+        if dist.get_backend() == "nccl":
+            meta_bytes = meta_bytes.cuda()
+        
+        print(f"  Sending metadata size: {meta_bytes.numel()}")
+        size_tensor = torch.tensor(
+            [meta_bytes.numel()], dtype=torch.long, device=meta_bytes.device
+        )
+        self.comm.send_to_dit(size_tensor)
+        self.comm.send_to_dit(meta_bytes)
+        print("  Metadata sent")
+        
+        # Send output tensor if it exists
+        if has_output:
+            output_tensor = output_batch.output
+            if not output_tensor.is_cuda:
+                output_tensor = output_tensor.cuda()
+            self.comm.send_to_dit(output_tensor)
+            print(f"  Output tensor sent with shape {output_tensor.shape}")
+        else:
+            print("  No output tensor to send")
+        
+        print(f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master completed")
+    
+    def _recv_final_result_from_non_dit(self, output_batch: OutputBatch):
+        """Receive OutputBatch from non-dit at dit master."""
+        import pickle
+        
+        print(f"[Dit Master Rank {dist.get_rank()}] _recv_final_result_from_non_dit called")
+        print(f"  Waiting for metadata size...")
+        
+        # Recv metadata
+        size_tensor = self.comm.recv_from_non_dit(torch.Size([1]), torch.long)
+        size = size_tensor.item()
+        print(f"  Metadata size: {size}")
+        
+        print(f"  Receiving metadata...")
+        meta_bytes = self.comm.recv_from_non_dit(torch.Size([size]), torch.uint8)
+        meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
+        metadata = pickle.loads(meta_data_cpu)
+        print(f"  Metadata received: has_output={metadata.get('has_output')}, error={metadata.get('error')}")
+        
+        # Update output_batch with metadata
+        output_batch.timings = metadata['timings']
+        output_batch.error = metadata['error']
+        
+        # Recv output tensor if it exists
+        if metadata['has_output']:
+            shape = metadata['output_shape']
+            dtype_str = metadata['output_dtype']
+            print(f"  Output shape: {shape}, dtype: {dtype_str}")
+            
+            # Parse dtype
+            if 'float32' in dtype_str:
+                dtype = torch.float32
+            elif 'float16' in dtype_str:
+                dtype = torch.float16
+            else:
+                dtype = torch.float32  # default
+            
+            print(f"  Receiving output tensor...")
+            output_tensor = self.comm.recv_from_non_dit(torch.Size(shape), dtype)
+            output_batch.output = output_tensor.to(get_local_torch_device())
+            print(f"  Output tensor received with shape {shape}")
+        else:
+            output_batch.output = None
+            print("  No output tensor")
+        
+        print(f"[Dit Master Rank {dist.get_rank()}] _recv_final_result_from_non_dit completed")
+        return output_batch
