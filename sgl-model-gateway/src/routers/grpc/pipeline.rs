@@ -230,7 +230,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
-            backend_type: smg_labels::BACKEND_REGULAR, // Embeddings are regular for now
+            backend_type: metrics_labels::BACKEND_REGULAR, // Embeddings are regular for now
         }
     }
 
@@ -457,12 +457,12 @@ impl RequestPipeline {
         let start = Instant::now();
 
         // Record request start
-        SmgMetrics::record_router_request(
-            smg_labels::ROUTER_GRPC,
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
             self.backend_type,
-            smg_labels::CONNECTION_GRPC,
+            metrics_labels::CONNECTION_GRPC,
             model_id.as_deref().unwrap_or("unknown"),
-            smg_labels::ENDPOINT_EMBEDDINGS,
+            metrics_labels::ENDPOINT_EMBEDDINGS,
             false,
         );
 
@@ -476,12 +476,12 @@ impl RequestPipeline {
                         "execute_embeddings: Stage {} returned final response.",
                         stage.name()
                     );
-                    SmgMetrics::record_router_duration(
-                        smg_labels::ROUTER_GRPC,
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_GRPC,
                         self.backend_type,
-                        smg_labels::CONNECTION_GRPC,
+                        metrics_labels::CONNECTION_GRPC,
                         model_id.as_deref().unwrap_or("unknown"),
-                        smg_labels::ENDPOINT_EMBEDDINGS,
+                        metrics_labels::ENDPOINT_EMBEDDINGS,
                         start.elapsed(),
                     );
                     return response;
@@ -499,12 +499,12 @@ impl RequestPipeline {
                         stage.name(),
                         response.status()
                     );
-                    SmgMetrics::record_router_error(
-                        smg_labels::ROUTER_GRPC,
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_GRPC,
                         self.backend_type,
-                        smg_labels::CONNECTION_GRPC,
+                        metrics_labels::CONNECTION_GRPC,
                         model_id.as_deref().unwrap_or("unknown"),
-                        smg_labels::ENDPOINT_EMBEDDINGS,
+                        metrics_labels::ENDPOINT_EMBEDDINGS,
                         error_type_from_status(response.status()),
                     );
                     return response;
@@ -520,12 +520,12 @@ impl RequestPipeline {
             Some(FinalResponse::Embedding(_)) => {
                 error!("execute_embeddings: Embedding FinalResponse found, but pipeline finished without returning response directly. This should be handled by the last stage.");
                 // Already handled in ResponseProcessingStage, but just in case
-                SmgMetrics::record_router_duration(
-                    smg_labels::ROUTER_GRPC,
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_GRPC,
                     self.backend_type,
-                    smg_labels::CONNECTION_GRPC,
+                    metrics_labels::CONNECTION_GRPC,
                     model_id.as_deref().unwrap_or("unknown"),
-                    smg_labels::ENDPOINT_EMBEDDINGS,
+                    metrics_labels::ENDPOINT_EMBEDDINGS,
                     start.elapsed(),
                 );
                 // The response should have been returned by the last stage
