@@ -198,7 +198,9 @@ def extract_key_frames_from_video(
         num_frames: Total number of frames (if known), used for validation
 
     Returns:
-        List of numpy arrays [first_frame, middle_frame, last_frame]
+        List of numpy arrays [first_frame, middle_frame, last_frame].
+        Always returns exactly 3 frames to ensure consistency with GT naming.
+        For very short videos, frames may be duplicated.
     """
     try:
         import cv2
@@ -227,9 +229,10 @@ def extract_key_frames_from_video(
         mid_idx = total_frames // 2
         last_idx = total_frames - 1
 
+        # Always use 3 indices to ensure consistent frame count for GT naming
+        # (frame_0.png, frame_mid.png, frame_last.png)
+        # For very short videos, some indices may be duplicated
         key_indices = [first_idx, mid_idx, last_idx]
-        # Remove duplicates while preserving order (for very short videos)
-        key_indices = list(dict.fromkeys(key_indices))
 
         frames = []
         for idx in key_indices:
