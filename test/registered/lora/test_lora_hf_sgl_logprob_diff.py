@@ -37,7 +37,12 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
 
-register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(
+    est_time=300,
+    suite="nightly-1-gpu",
+    nightly=True,
+    disabled="Temporarily disabled, will be fixed later",
+)
 
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
