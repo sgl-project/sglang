@@ -5,5 +5,9 @@
     "default_generator_device": "cuda",
     "default_ssim_threshold_image": 0.98,
     "default_ssim_threshold_video": 0.95,
-    "cases": {}
+    "cases": {
+        "qwen_image_t2i_2_gpus": {
+            "ssim_threshold": 0.92
+        }
+    }
 }
