@@ -101,7 +101,13 @@ class ComposedPipelineBase(ABC):
         self.modules = self.load_modules(server_args, loaded_modules)
 
     def build_executor(self, server_args: ServerArgs):
-        # TODO
+        if server_args.enable_disagg:
+            from sglang.multimodal_gen.runtime.pipelines_core.executors.disaggregated_executor import (
+                DisaggregatedExecutor,
+            )
+
+            return DisaggregatedExecutor(server_args=server_args)
+
         from sglang.multimodal_gen.runtime.pipelines_core.executors.parallel_executor import (
             ParallelExecutor,
         )
@@ -205,6 +211,27 @@ class ComposedPipelineBase(ABC):
         """
         return
 
+    def adjust_module_path(self, module_name: str, server_args: ServerArgs):
+        # we load the module from the extra config module map if it exists
+        if module_name in self._extra_config_module_map:
+            load_module_name = self._extra_config_module_map[module_name]
+        else:
+            load_module_name = module_name
+        # Use custom VAE path if provided, otherwise use default path
+        if module_name == "vae" and server_args.vae_path is not None:
+            component_model_path = server_args.vae_path
+            # Download from HuggingFace Hub if path doesn't exist locally
+            if not os.path.exists(component_model_path):
+                component_model_path = maybe_download_model(component_model_path)
+            logger.info(
+                "Using custom VAE path: %s instead of default path: %s",
+                component_model_path,
+                os.path.join(self.model_path, load_module_name),
+            )
+        else:
+            component_model_path = os.path.join(self.model_path, load_module_name)
+        return load_module_name, component_model_path
+
     def load_modules(
         self,
         server_args: ServerArgs,
@@ -232,16 +259,20 @@ class ComposedPipelineBase(ABC):
             if not server_args.enable_disagg:
                 return True
 
+            module_name = module_name.lower()
+            # TODO: better abstraction
+            is_common_modules = "scheduler" in module_name
+            if is_common_modules:
+                return True
             # Disaggregation Logic:
             # DiT Ranks load: transformer, transformer_2 (if MoE)
             # Non-DiT Ranks load: text_encoder, vae, tokenizer, scheduler, etc.
-
-            is_dit_module = "transformer" in module_name
+            is_denoising_required_modules = "transformer" in module_name
 
             if comm.is_dit_rank():
-                return is_dit_module
+                return is_denoising_required_modules
             else:  # Non-DiT rank
-                return not is_dit_module
+                return not is_denoising_required_modules
 
         def get_loading_process_group() -> Optional[dist.ProcessGroup]:
             if not server_args.enable_disagg or comm is None:
@@ -306,6 +337,22 @@ class ComposedPipelineBase(ABC):
                         f"Required module key: {module_name} value: {model_index.get(module_name)} was not found in loaded modules {model_index.keys()}"
                     )
 
+        # load configs into server_args, in disagg mode
+        for module_name, (
+            transformers_or_diffusers,
+            _,
+        ) in model_index.items():
+            load_module_name, component_model_path = self.adjust_module_path(
+                module_name, server_args
+            )
+            # this will make updates to server_args.pipeline_config
+            _ = PipelineComponentLoader.load_config(
+                load_module_name,
+                component_model_path=component_model_path,
+                transformers_or_diffusers=transformers_or_diffusers,
+                server_args=server_args,
+            )
+
         model_index = {
             module_name: v
             for module_name, v in model_index.items()
@@ -313,7 +360,6 @@ class ComposedPipelineBase(ABC):
         }
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
-        logger.info("Loading required components: %s", required_modules)
         logger.info("Loading modules: %s", model_index, main_process_only=False)
 
         print(f"{model_index=}")
@@ -338,26 +384,9 @@ class ComposedPipelineBase(ABC):
                 components[module_name] = loaded_modules[module_name]
                 continue
 
-            # we load the module from the extra config module map if it exists
-            if module_name in self._extra_config_module_map:
-                load_module_name = self._extra_config_module_map[module_name]
-            else:
-                load_module_name = module_name
-
-            # Use custom VAE path if provided, otherwise use default path
-            if module_name == "vae" and server_args.vae_path is not None:
-                component_model_path = server_args.vae_path
-                # Download from HuggingFace Hub if path doesn't exist locally
-                if not os.path.exists(component_model_path):
-                    component_model_path = maybe_download_model(component_model_path)
-                logger.info(
-                    "Using custom VAE path: %s instead of default path: %s",
-                    component_model_path,
-                    os.path.join(self.model_path, load_module_name),
-                )
-            else:
-                component_model_path = os.path.join(self.model_path, load_module_name)
-
+            load_module_name, component_model_path = self.adjust_module_path(
+                module_name, server_args
+            )
             # Determine process group for loading
             loading_group = get_loading_process_group()
 

@@ -5,6 +5,7 @@ from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen.runtime.distributed.dist_utils import get_disagg_communicator
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -105,6 +106,13 @@ class Scheduler:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
         """
+        # Check if this is a non-dit rank in disagg mode
+        is_non_dit_rank = False
+        if self.server_args.enable_disagg:
+            comm = get_disagg_communicator()
+            if comm is not None:
+                is_non_dit_rank = comm.is_non_dit_rank()
+
         if self.receiver is not None:
             try:
                 recv_reqs = self.receiver.recv_pyobj()
@@ -112,11 +120,20 @@ class Scheduler:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
 
-            # Ensure recv_reqs is a list
+            # ensure recv_reqs is a list
             if not isinstance(recv_reqs, list):
                 recv_reqs = [recv_reqs]
         else:
             recv_reqs = None
+
+        # Non-dit ranks don't participate in dit's parallel communication groups
+        # They only handle their own work (encoding/decoding)
+        if is_non_dit_rank:
+            # For non-dit ranks, just return the received requests without broadcasting
+            # They work independently and don't need to sync with dit ranks' parallel groups
+            if recv_reqs is None:
+                recv_reqs = []
+            return recv_reqs
 
         # TODO: fix this condition
         if self.server_args.sp_degree != 1:

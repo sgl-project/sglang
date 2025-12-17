@@ -107,6 +107,12 @@ class ComponentLoader(ABC):
         else:
             return get_local_torch_device()
 
+    def load_config(self, component_model_path: str, server_args: ServerArgs):
+        config = get_diffusers_component_config(model_path=component_model_path)
+
+        logger.info("HF model config: %s", config)
+        return config
+
     def load(
         self,
         component_model_path: str,
@@ -153,9 +159,10 @@ class ComponentLoader(ABC):
             component = component.to(device=target_device)
             source = "native"
             logger.warning(
-                "Native module %s: %s is loaded, performance may be sub-optimal",
+                "Native module %s: %s from: %s is loaded, performance may be sub-optimal",
                 module_name,
                 component.__class__.__name__,
+                transformers_or_diffusers,
             )
 
         if component is None:
@@ -207,6 +214,7 @@ class ComponentLoader(ABC):
         component_model_path: str,
         server_args: ServerArgs,
         module_name: str,
+        use_runai_model_streamer: bool,
         process_group: dist.ProcessGroup | None = None,
     ):
         """
@@ -600,32 +608,31 @@ class TokenizerLoader(ComponentLoader):
 class VAELoader(ComponentLoader):
     """Loader for VAE."""
 
-    def should_offload(self, server_args, cpu_offload_flag, model_config):
+    def load_config(self, component_model_path: str, server_args: ServerArgs):
+        hf_config = super().load_config(component_model_path, server_args)
+        config = server_args.pipeline_config.vae_config
+        config.update_model_arch(hf_config)
+        print(f"updating VAELoader config with: {hf_config=}")
+        server_args.model_paths["vae"] = component_model_path
+
+        # NOTE: some post init logics are only available after updated with config
+        config.post_init()
+        return config
+
+    def should_offload(self, server_args, model_config: ModelConfig | None = None):
         return True
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
     ):
         """Load the VAE based on the model path, and inference args."""
-        config = get_diffusers_component_config(model_path=component_model_path)
-        class_name = config.pop("_class_name", None)
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
-
-        server_args.model_paths["vae"] = component_model_path
-
-        logger.info("HF model config: %s", config)
-        vae_config = server_args.pipeline_config.vae_config
-        vae_config.update_model_arch(config)
-
-        # NOTE: some post init logics are only available after updated with config
-        vae_config.post_init()
-
+        hf_config = super().load_config(component_model_path, server_args)
+        config = self.load_config(component_model_path, server_args)
+        class_name = hf_config.pop("_class_name", None)
         target_device = self.target_device(server_args.vae_cpu_offload)
 
         # Check for auto_map first (custom VAE classes)
-        auto_map = config.get("auto_map", {})
+        auto_map = hf_config.get("auto_map", {})
         auto_model_map = auto_map.get("AutoModel")
         if auto_model_map:
             module_path, cls_name = auto_model_map.rsplit(".", 1)
@@ -652,7 +659,7 @@ class VAELoader(ComponentLoader):
             skip_init_modules(),
         ):
             vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-            vae = vae_cls(vae_config).to(target_device)
+            vae = vae_cls(config).to(target_device)
 
         safetensors_list = _list_safetensors_files(component_model_path)
         assert (
@@ -806,6 +813,30 @@ class PipelineComponentLoader:
     Utility class for loading pipeline components.
     This replaces the chain of if-else statements in load_pipeline_module.
     """
+
+    @staticmethod
+    def load_config(
+        module_name: str,
+        component_model_path: str,
+        transformers_or_diffusers: str,
+        server_args: ServerArgs,
+    ):
+        """
+        Load a pipeline module.
+
+        Args:
+            module_name: Name of the module (e.g., "vae", "text_encoder", "transformer", "scheduler")
+            component_model_path: Path to the component model
+            transformers_or_diffusers: Whether the module is from transformers or diffusers
+        """
+
+        # Get the appropriate loader for this module type
+        loader = ComponentLoader.for_module_type(module_name, transformers_or_diffusers)
+
+        return loader.load_config(
+            component_model_path,
+            server_args,
+        )
 
     @staticmethod
     def load_module(

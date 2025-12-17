@@ -262,10 +262,10 @@ class ServerArgs:
 
     # CPU offload parameters
     dit_cpu_offload: bool = True
-    use_fsdp_inference: bool = False
     text_encoder_cpu_offload: bool = True
     image_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
+    use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
 
     # Disaggregation config
@@ -352,6 +352,13 @@ class ServerArgs:
             # Given your previous code had `do_disaggregation = ...` hardcoded,
             # we should probably default it to True if it matches the pattern to maintain behavior.
             pass
+
+        if self.enable_disagg:
+            logger.info("Disabling all offload behaviors when disagg mode in on")
+            self.image_encoder_cpu_offload = False
+            self.text_encoder_cpu_offload = False
+            self.vae_cpu_offload = False
+            self.dit_cpu_offload = False
 
         # Add randomization to avoid race condition when multiple servers start simultaneously
         if self.attention_backend in ["fa3", "fa4"]:
@@ -843,15 +850,15 @@ class ServerArgs:
 
         return provided_args
 
-    def check_server_sp_args(self):
+    def check_server_sp_args(self, num_gpus):
         if self.sp_degree == -1:
             # assume we leave all remaining gpus to sp
             num_gpus_per_group = self.dp_size * self.tp_size
             if self.enable_cfg_parallel:
                 num_gpus_per_group *= 2
-            if self.num_gpus % num_gpus_per_group != 0:
+            if num_gpus % num_gpus_per_group != 0:
                 raise ValueError(f"{self.num_gpus=} % {num_gpus_per_group} != 0")
-            self.sp_degree = self.num_gpus // num_gpus_per_group
+            self.sp_degree = num_gpus // num_gpus_per_group
 
         if (
             self.ulysses_degree is None
@@ -953,9 +960,15 @@ class ServerArgs:
         self.pipeline_config.check_pipeline_config()
 
         # parallelism
+        num_gpus = self.num_gpus
+
+        if self.enable_disagg:
+            # num_gpus for dit
+            num_gpus = self.num_gpus - self.num_non_dit_ranks
+
         self.check_server_dp_args()
         # allocate all remaining gpus for sp-size
-        self.check_server_sp_args()
+        self.check_server_sp_args(num_gpus)
 
         if self.enable_cfg_parallel:
             if self.num_gpus == 1:

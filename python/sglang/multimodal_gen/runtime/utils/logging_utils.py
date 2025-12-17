@@ -164,6 +164,8 @@ def _log_process_aware(
         or (local_main_process_only and is_local_main_process)
     )
 
+    should_log = True
+
     if should_log:
         # stacklevel=3 to show the original caller's location,
         # as this function is called by the patched methods.

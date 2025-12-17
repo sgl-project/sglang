@@ -166,23 +166,27 @@ class GroupCoordinator:
         self.unique_name = _get_unique_name(group_name)
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
-        self.device_group = None
         self.cpu_group = None
+        self.device_group = None
 
+        # CRITICAL: torch.distributed.new_group is a collective operation that must be called
+        # by ALL ranks in the WORLD group, regardless of membership.
+        # All ranks must create groups in the same order with the same parameters.
         for ranks in group_ranks:
+            # ALL ranks call new_group with the same parameters
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
             with suppress_stdout():
                 cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+
+            # Only save the group if this rank is a member
             if self.rank in ranks:
+                self.device_group = device_group
+                self.cpu_group = cpu_group
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
-                self.device_group = device_group
-                self.cpu_group = cpu_group
 
         assert self.cpu_group is not None, f"{group_ranks=}, {local_rank=}"
         assert self.device_group is not None
@@ -796,44 +800,44 @@ class PipelineGroupCoordinator(GroupCoordinator):
         )
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
-        self.device_group = None
         self.cpu_group = None
         self.cpu_groups = []
         self.device_groups = []
+
+        # CRITICAL: All ranks must call new_group in the same order
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
             for ranks in group_ranks:
+                # ALL ranks create the group
                 device_group = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend
                 )
-                # a group with `gloo` backend, to allow direct coordination between
-                # processes through the CPU.
                 with suppress_stdout():
                     cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+
+                # Only save if this rank is a member
                 if self.rank in ranks:
+                    self.device_group = device_group
+                    self.cpu_group = cpu_group
                     self.ranks = ranks
                     self.world_size = len(ranks)
                     self.rank_in_group = ranks.index(self.rank)
-                    self.device_group = device_group
-                    self.cpu_group = cpu_group
+
         # when pipeline parallelism is 2, we need to create two groups to avoid
         #   communication stall.
-        # *_group_0_1 represents the group for communication from device 0 to
-        #   device 1.
-        # *_group_1_0 represents the group for communication from device 1 to
-        #   device 0.
         elif len(group_ranks[0]) == 2:
             for ranks in group_ranks:
+                # ALL ranks create these groups
                 device_group_0_1 = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend
                 )
                 device_group_1_0 = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend
                 )
-                # a group with `gloo` backend, to allow direct coordination between
-                # processes through the CPU.
                 with suppress_stdout():
                     cpu_group_0_1 = torch.distributed.new_group(ranks, backend="gloo")
                     cpu_group_1_0 = torch.distributed.new_group(ranks, backend="gloo")
+
+                # Only save if this rank is a member
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -865,12 +869,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
             Union[List[torch.Tensor], torch.Tensor]
         ] = None
         self.skip_device_group = None
+        # ALL ranks must create all skip groups
         for ranks in group_ranks:
-            skip_device_group = torch.distributed.new_group(
+            skip_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
+            # Only save if this rank is a member
             if self.rank in ranks:
-                self.skip_device_group = skip_device_group
+                self.skip_device_group = skip_group
         assert self.skip_device_group is not None
 
     def reset_buffer(self):
