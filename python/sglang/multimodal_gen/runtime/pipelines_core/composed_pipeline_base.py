@@ -11,9 +11,10 @@ import argparse
 import os
 from abc import ABC, abstractmethod
 from enum import IntEnum, auto
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 import torch
+import torch.distributed as dist  # Added import
 from tqdm import tqdm
 
 from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
@@ -38,6 +39,7 @@ logger = init_logger(__name__)
 class DisaggregationMode(IntEnum):
     NONE_DIT = auto()
     DIT = auto()
+
 
 class ComposedPipelineBase(ABC):
     """
@@ -214,34 +216,37 @@ class ComposedPipelineBase(ABC):
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
 
-        do_disaggregation = server_args.num_gpus > 1 and (server_args.num_gpus - 1) % 2 == 0
-        use_runai_model_streamer = False if do_disaggregation else None
+        # Initialize communicator to determine role and groups
+        from sglang.multimodal_gen.runtime.distributed.dist_utils import (
+            get_disagg_communicator,
+            init_disaggregated_topology,
+        )
 
-        def get_module_group_index(module_name: str) -> int:
-            if not do_disaggregation:
-                return 0
-            if "transformer" in module_name:
-                # dit
-                return DisaggregationMode.DIT
-            else:
-                # non-dit
-                return DisaggregationMode.NONE_DIT
+        # Ensure it's initialized if enabled
+        if server_args.enable_disagg and get_disagg_communicator() is None:
+            init_disaggregated_topology(server_args)
 
-        def get_rank_group_index():
-            if not do_disaggregation:
-                return 0
-            else:
-                rank = int(os.environ["RANK"])
-                if rank == 0:
-                    return DisaggregationMode.NONE_DIT
-                else:
-                    return DisaggregationMode.DIT
+        comm = get_disagg_communicator()
 
         def should_load_module(module_name: str) -> bool:
-            if get_module_group_index(module_name) == get_rank_group_index():
+            if not server_args.enable_disagg:
                 return True
-            else:
-                return False
+
+            # Disaggregation Logic:
+            # DiT Ranks load: transformer, transformer_2 (if MoE)
+            # Non-DiT Ranks load: text_encoder, vae, tokenizer, scheduler, etc.
+
+            is_dit_module = "transformer" in module_name
+
+            if comm.is_dit_rank():
+                return is_dit_module
+            else:  # Non-DiT rank
+                return not is_dit_module
+
+        def get_loading_process_group() -> Optional[dist.ProcessGroup]:
+            if not server_args.enable_disagg or comm is None:
+                return None
+            return comm.get_my_group()
 
         model_index = self._load_config()
 
@@ -301,7 +306,11 @@ class ComposedPipelineBase(ABC):
                         f"Required module key: {module_name} value: {model_index.get(module_name)} was not found in loaded modules {model_index.keys()}"
                     )
 
-        model_index = {module_name: v for module_name, v in model_index.items() if should_load_module(module_name)}
+        model_index = {
+            module_name: v
+            for module_name, v in model_index.items()
+            if should_load_module(module_name)
+        }
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
@@ -310,8 +319,8 @@ class ComposedPipelineBase(ABC):
         print(f"{model_index=}")
         components = {}
         for module_name, (
-                transformers_or_diffusers,
-                architecture,
+            transformers_or_diffusers,
+            architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -348,12 +357,25 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
+
+            # Determine process group for loading
+            loading_group = get_loading_process_group()
+
+            # Disable runai streamer if in disagg mode and we don't have a specific patch for it yet
+            # Or if loading_group is set, we pass it down (requires ComponentLoader update)
+            # Based on previous logic: use_runai_model_streamer = False if disagg
+
+            use_streamer = None
+            if server_args.enable_disagg:
+                use_streamer = False
+
             module = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
-                use_runai_model_streamer=use_runai_model_streamer,
+                use_runai_model_streamer=use_streamer,
+                process_group=loading_group,
             )
 
             if module_name in components:

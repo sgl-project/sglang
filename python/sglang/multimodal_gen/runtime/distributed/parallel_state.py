@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGrou
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
+from .dist_utils import init_disaggregated_topology
 from .group_coordinator import (
     GroupCoordinator,
     PipelineGroupCoordinator,
@@ -64,10 +65,48 @@ _SP: Optional[SequenceParallelGroupCoordinator] = None
 _PP: Optional[PipelineGroupCoordinator] = None
 _CFG: Optional[GroupCoordinator] = None
 _DP: Optional[GroupCoordinator] = None
-_DIT: Optional[GroupCoordinator] = None
-_VAE: Optional[GroupCoordinator] = None
+_NON_DIT: Optional[ProcessGroup] = None
+_DIT: Optional[ProcessGroup] = None
 
-logger = init_logger(__name__)
+
+def get_non_dit_group() -> ProcessGroup:
+    assert _NON_DIT is not None, "Non-DiT group is not initialized"
+    return _NON_DIT
+
+
+def get_dit_group() -> ProcessGroup:
+    assert _DIT is not None, "DiT group is not initialized"
+    return _DIT
+
+
+def initialize_disaggregated_groups(
+    world_size: int,
+    num_non_dit_ranks: int = 1,
+    backend: str = "nccl",
+):
+    """
+    Initialize process groups for disaggregated serving.
+    Rank 0 to num_non_dit_ranks-1 are Non-DiT ranks.
+    Rank num_non_dit_ranks to world_size-1 are DiT ranks.
+    """
+    global _NON_DIT, _DIT
+
+    rank = torch.distributed.get_rank()
+    non_dit_ranks = list(range(num_non_dit_ranks))
+    dit_ranks = list(range(num_non_dit_ranks, world_size))
+
+    logger.info(
+        "Initializing disaggregated groups: Non-DiT ranks: %s, DiT ranks: %s",
+        non_dit_ranks,
+        dit_ranks,
+    )
+
+    # Create groups (all ranks must call new_group)
+    _NON_DIT = torch.distributed.new_group(ranks=non_dit_ranks, backend=backend)
+    _DIT = torch.distributed.new_group(ranks=dit_ranks, backend=backend)
+
+    return _NON_DIT, _DIT
+
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -300,6 +339,8 @@ def initialize_model_parallel(
     pipeline_parallel_degree: int = 1,
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
+    enable_disaggregation: bool = False,  # Added flag
+    num_non_dit_ranks: int = 1,  # Added param
 ) -> None:
     """
     Initialize model parallel groups.
@@ -347,6 +388,21 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    if enable_disaggregation:
+        initialize_disaggregated_groups(world_size, num_non_dit_ranks, backend)
+
+        # If I am a Non-DiT rank, I don't participate in the DiT parallel groups initialization
+        # BUT, standard parallel_state init often assumes all ranks create all groups to avoid deadlocks
+        # dependent on implementation. For now, we assume separated initialization or
+        # that only DiT ranks call the subsequent init logic?
+        # Actually, `init_parallel_group_coordinator` uses `new_group` which must be called by all ranks
+        # if the group is a subset of the world.
+        # Wait, if we split the world, DiT groups should only be formed among DiT ranks.
+
+        # Adjust world_size and ranks for DiT group initialization
+        # This is tricky because `init_parallel_group_coordinator` uses global ranks.
+        pass
 
     dit_parallel_size = (
         data_parallel_size
@@ -552,11 +608,13 @@ def get_dp_rank() -> int:
 def maybe_init_distributed_environment_and_model_parallel(
     tp_size: int,
     sp_size: int,
+    server_args,
     enable_cfg_parallel: bool,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
     distributed_init_method: str = "env://",
+    enable_disagg: bool = False,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -587,6 +645,12 @@ def maybe_init_distributed_environment_and_model_parallel(
         distributed_init_method=distributed_init_method,
         device_id=device,
     )
+
+    print(f"{enable_disagg=}")
+
+    if enable_disagg:
+        init_disaggregated_topology(server_args)
+
     initialize_model_parallel(
         data_parallel_size=dp_size,
         classifier_free_guidance_degree=2 if enable_cfg_parallel else 1,

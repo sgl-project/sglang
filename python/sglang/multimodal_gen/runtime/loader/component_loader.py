@@ -114,6 +114,7 @@ class ComponentLoader(ABC):
         module_name: str,
         transformers_or_diffusers: str,
         use_runai_model_streamer: bool | None = None,
+        process_group: dist.ProcessGroup | None = None,
     ):
         """
         Template method that standardizes logging around the core load implementation.
@@ -130,6 +131,7 @@ class ComponentLoader(ABC):
                 server_args,
                 module_name,
                 use_runai_model_streamer=use_runai_model_streamer,
+                process_group=process_group,
             )
             source = "customized"
         except Exception as e:
@@ -201,7 +203,11 @@ class ComponentLoader(ABC):
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        process_group: dist.ProcessGroup | None = None,
     ):
         """
         Load the customized version component, implemented and optimized in SGL-diffusion
@@ -391,6 +397,7 @@ class TextEncoderLoader(ComponentLoader):
     ):
         """Load the text encoders based on the model path, and inference args."""
         use_runai_model_streamer = kwargs.get("use_runai_model_streamer", None)
+        process_group = kwargs.get("process_group", None)
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
         #     trust_remote_code=server_args.trust_remote_code,
@@ -426,6 +433,7 @@ class TextEncoderLoader(ComponentLoader):
             server_args,
             encoder_dtype,
             use_runai_model_streamer=use_runai_model_streamer,
+            process_group=process_group,
         )
 
     def load_model(
@@ -436,8 +444,16 @@ class TextEncoderLoader(ComponentLoader):
         dtype: str = "fp16",
         cpu_offload_flag: bool | None = None,
         use_runai_model_streamer: bool | None = None,
+        process_group: dist.ProcessGroup | None = None,
     ):
         # Determine CPU offload behavior and target device
+
+        # Check if we need to disable runai streamer due to process_group
+        if process_group is not None and use_runai_model_streamer:
+            logger.warning(
+                "Disabling RunAI model streamer because a custom process group is used."
+            )
+            use_runai_model_streamer = False
 
         local_torch_device = get_local_torch_device()
         should_offload = self.should_offload(server_args, model_config)
@@ -535,6 +551,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             server_args.pipeline_config.image_encoder_precision,
             cpu_offload_flag=server_args.image_encoder_cpu_offload,
             use_runai_model_streamer=use_runai_model_streamer,
+            process_group=kwargs.get("process_group", None),
         )
 
 
@@ -654,6 +671,7 @@ class TransformerLoader(ComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         use_runai_model_streamer = kwargs.get("use_runai_model_streamer", None)
+        process_group = kwargs.get("process_group", None)
         config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
@@ -712,6 +730,14 @@ class TransformerLoader(ComponentLoader):
 
         # Load the model using FSDP loader
         assert server_args.hsdp_shard_dim is not None
+
+        # Disable runai streamer if using custom process group
+        if process_group is not None and use_runai_model_streamer:
+            logger.warning(
+                "Disabling RunAI model streamer for transformer because a custom process group is used."
+            )
+            use_runai_model_streamer = False
+
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params={"config": dit_config, "hf_config": hf_config},
@@ -728,6 +754,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             use_runai_model_streamer=use_runai_model_streamer,
+            # process_group=process_group, # TODO: Pass process group to FSDP loader
         )
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -787,6 +814,7 @@ class PipelineComponentLoader:
         transformers_or_diffusers: str,
         server_args: ServerArgs,
         use_runai_model_streamer: bool | None = None,
+        process_group: dist.ProcessGroup | None = None,
     ):
         """
         Load a pipeline module.
@@ -796,6 +824,7 @@ class PipelineComponentLoader:
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the module is from transformers or diffusers
             use_runai_model_streamer: Whether to use runai_model_streamer
+            process_group: The process group to use for loading (optional)
 
         Returns:
             The loaded module
@@ -812,6 +841,7 @@ class PipelineComponentLoader:
                 module_name,
                 transformers_or_diffusers,
                 use_runai_model_streamer=use_runai_model_streamer,
+                process_group=process_group,
             )
         except Exception as e:
             logger.error(

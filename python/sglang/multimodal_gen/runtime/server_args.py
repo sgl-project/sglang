@@ -268,6 +268,10 @@ class ServerArgs:
     vae_cpu_offload: bool = True
     pin_cpu_memory: bool = True
 
+    # Disaggregation config
+    enable_disagg: bool = False
+    num_non_dit_ranks: int = 1  # Number of ranks dedicated to Non-DiT (Encoder/VAE)
+
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
@@ -336,6 +340,19 @@ class ServerArgs:
         return self.host is None or self.port is None
 
     def __post_init__(self):
+        # Auto-enable disaggregation if num_gpus > 1 and (num_gpus - 1) % 2 == 0
+        # (This preserves your existing logic logic: 1 rank for Non-DiT, N-1 for DiT, N-1 is even)
+        if (
+            self.num_gpus > 1
+            and (self.num_gpus - 1) % 2 == 0
+            and not self.enable_disagg
+        ):
+            self.enable_disagg = True  # Optional: Auto-enable?
+            # Let's keep it explicit for now or strictly follow the user's intent?
+            # Given your previous code had `do_disaggregation = ...` hardcoded,
+            # we should probably default it to True if it matches the pattern to maintain behavior.
+            pass
+
         # Add randomization to avoid race condition when multiple servers start simultaneously
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
@@ -508,6 +525,19 @@ class ServerArgs:
             type=str,
             default=ServerArgs.prompt_file_path,
             help="Path to a text file containing prompts (one per line) for batch processing",
+        )
+
+        parser.add_argument(
+            "--enable-disagg",
+            action=StoreBoolean,
+            default=ServerArgs.enable_disagg,
+            help="Enable disaggregated execution (split Non-DiT and DiT ranks).",
+        )
+        parser.add_argument(
+            "--num-non-dit-ranks",
+            type=int,
+            default=ServerArgs.num_non_dit_ranks,
+            help="Number of ranks to use for Non-DiT components (Encoder, VAE) in disaggregated mode.",
         )
 
         # STA (Sliding Tile Attention) parameters

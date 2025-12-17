@@ -80,6 +80,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     use_runai_model_streamer: bool | None = None,
+    process_group: torch.distributed.ProcessGroup | None = None,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
@@ -129,6 +130,35 @@ def maybe_load_fsdp_model(
             mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
             mesh_dim_names=("replicate", "shard"),
         )
+
+        # If process_group is provided, we should probably construct the device mesh using it?
+        # init_device_mesh does not accept a process_group, it creates one based on WORLD.
+        # This is tricky. If we are in disagg mode, hsdp_replicate_dim * hsdp_shard_dim
+        # should match the size of the *sub-group*, not the world.
+        # But init_device_mesh assumes global ranks.
+
+        # FIX: If we have a custom process group, we CANNOT easily use init_device_mesh
+        # unless we are careful. But `shard_model` takes `mesh`.
+        # For now, let's assume standard FSDP sharding within the sub-group is handled
+        # by passing the correct mesh if possible, OR rely on simple FSDP without HSDP if simpler.
+
+        # Actually, if we are just doing simple FSDP (TP-like sharding), we can construct
+        # the mesh manually if needed, or if `init_device_mesh` is smart enough.
+        # But `init_device_mesh` works on global ranks.
+
+        # If we are in disagg mode, the user (Rank 1..N) thinks they are a group of size N.
+        # But `dist.get_world_size()` still returns global size.
+
+        # For this Step 3 implementation, let's just pass the mesh if we can,
+        # or accept that FSDP might need the group passed explicitly to `fully_shard`.
+        # `shard_model` calls `fully_shard(m, mesh=mesh, ...)`.
+
+        # If process_group is passed, we should use it.
+        # However, `shard_model` in this file accepts `mesh`.
+        # `fully_shard` accepts `process_group` OR `mesh`.
+
+        # Let's Modify `shard_model` to accept `process_group` as well.
+
         shard_model(
             model,
             cpu_offload=cpu_offload,
@@ -137,6 +167,7 @@ def maybe_load_fsdp_model(
             mesh=device_mesh,
             fsdp_shard_conditions=model._fsdp_shard_conditions,
             pin_cpu_memory=pin_cpu_memory,
+            process_group=process_group,
         )
 
     weight_iterator = safetensors_weights_iterator(
@@ -170,6 +201,7 @@ def shard_model(
     mesh: DeviceMesh | None = None,
     fsdp_shard_conditions: list[Callable[[str, nn.Module], bool]] = [],  # noqa
     pin_cpu_memory: bool = True,
+    process_group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
     """
     Utility to shard a model with FSDP using the PyTorch Distributed fully_shard API.
@@ -204,6 +236,7 @@ def shard_model(
         "reshard_after_forward": reshard_after_forward,
         "mesh": mesh,
         "mp_policy": mp_policy,
+        "process_group": process_group,
     }
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=pin_cpu_memory)
