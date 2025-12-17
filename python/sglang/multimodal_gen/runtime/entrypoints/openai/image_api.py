@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
 )
@@ -185,11 +186,7 @@ async def edits(
     # Save all input images; additional images beyond the first are saved for potential future use
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    image_list = []
-    if images:
-        image_list.extend(images if isinstance(images, list) else [images])
-    if urls:
-        image_list.extend(urls if isinstance(urls, list) else [urls])
+    image_list = merge_image_input_list(images, urls)
 
     input_paths = []
     try:

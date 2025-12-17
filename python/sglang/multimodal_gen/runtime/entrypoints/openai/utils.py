@@ -4,7 +4,7 @@ import dataclasses
 import os
 import re
 import time
-from typing import Optional, Union
+from typing import Any, List, Optional, Union
 
 import httpx
 from fastapi import UploadFile
@@ -179,3 +179,31 @@ async def process_generation_batch(
     log_batch_completion(logger, 1, total_time)
 
     return save_file_path
+
+
+def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
+    """
+    Merge multiple image input sources into a single list.
+
+    This function handles both single items and lists of items, merging them
+    into a single flattened list. Useful for processing images, URLs, or other
+    multimedia inputs that can come as either single items or lists.
+
+    Args:
+        *inputs: Variable number of inputs, each can be None, single item, or list
+
+    Returns:
+        List: Flattened list of all non-None inputs
+
+    Example:
+        >>> merge_image_input_list(["img1", "img2"], "img3", None)
+        ["img1", "img2", "img3"]
+    """
+    result = []
+    for input_item in inputs:
+        if input_item is not None:
+            if isinstance(input_item, list):
+                result.extend(input_item)
+            else:
+                result.append(input_item)
+    return result

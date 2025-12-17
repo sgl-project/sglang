@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
 )
@@ -153,7 +154,9 @@ async def create_video(
                 status_code=400,
                 detail="input_reference file or reference_url is required",
             )
-        image = input_reference or reference_url
+        image_list = merge_image_input_list(input_reference, reference_url)
+        # Save first input image
+        image = image_list[0]
         uploads_dir = os.path.join("outputs", "uploads")
         os.makedirs(uploads_dir, exist_ok=True)
         filename = image.filename if hasattr(image, "filename") else f"url_image"
@@ -204,8 +207,10 @@ async def create_video(
             if isinstance(extra_json, dict):
                 payload.update(extra_json)
             # for not multipart/form-data type
-            if hasattr(payload, "reference_url") and payload.get("reference_url"):
-                image = payload.get("reference_url")
+            if payload.get("reference_url"):
+                image_list = merge_image_input_list(payload.get("reference_url"))
+                # Save first input image
+                image = image_list[0]
                 uploads_dir = os.path.join("outputs", "uploads")
                 os.makedirs(uploads_dir, exist_ok=True)
                 filename = (
