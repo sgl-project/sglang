@@ -343,7 +343,7 @@ def alloc_for_extend(
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
             batch.tree_cache.evict_swa(
-                req, pre_len, batch.model_config.attention_chunk_size
+                req, pre_len, batch.model_config.attention_chunk_size, batch.model_config.sliding_window_size
             )
 
     bs = len(batch.reqs)
@@ -438,7 +438,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
             batch.tree_cache.evict_swa(
-                req, req.seqlen - 1, batch.model_config.attention_chunk_size
+                req, req.seqlen - 1, batch.model_config.attention_chunk_size, batch.model_config.sliding_window_size
             )
 
     bs = batch.seq_lens.shape[0]

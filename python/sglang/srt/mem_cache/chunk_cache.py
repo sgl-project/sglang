@@ -90,14 +90,29 @@ class SWAChunkCache(ChunkCache):
         req: Req,
         prelen: int,
         attention_chunk_size: int,
+        sliding_window_size: int = -1,
     ):
-        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
-            new_evicted_seqlen_local = attention_chunk_size * (
-                prelen // attention_chunk_size
-            )
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
-            ]
+        attention_chunk_size = sliding_window_size if attention_chunk_size is None else attention_chunk_size
+        if prelen < req.evicted_seqlen_local + attention_chunk_size:
+            return
+
+        candidate_new = attention_chunk_size * (prelen // attention_chunk_size)
+
+        if sliding_window_size > 0:
+            keep_start = max(0, prelen - sliding_window_size)
+            keep_start_aligned = attention_chunk_size * (keep_start // attention_chunk_size)
+            allowed_evict_upto = keep_start_aligned
+            new_evicted_seqlen_local = min(candidate_new, allowed_evict_upto)
+        else:
+            new_evicted_seqlen_local = candidate_new
+
+        if new_evicted_seqlen_local <= req.evicted_seqlen_local:
+            return
+
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
+        ]
+        if free_slots.numel() > 0:
             self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.evicted_seqlen_local = new_evicted_seqlen_local
 

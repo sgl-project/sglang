@@ -1233,8 +1233,6 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
                     )
         elif model_arch in [
-            "Gemma2ForCausalLM",
-            "Gemma3ForCausalLM",
             "Gemma3ForConditionalGeneration",
             "Gemma3nForCausalLM",
             "Gemma3nForConditionalGeneration",
