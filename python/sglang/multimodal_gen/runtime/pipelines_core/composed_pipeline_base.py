@@ -10,6 +10,7 @@ This module defines the base class for pipelines that are composed of multiple s
 import argparse
 import os
 from abc import ABC, abstractmethod
+from enum import IntEnum, auto
 from typing import Any, cast
 
 import torch
@@ -33,6 +34,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+
+class DisaggregationMode(IntEnum):
+    NONE_DIT = auto()
+    DIT = auto()
 
 class ComposedPipelineBase(ABC):
     """
@@ -91,7 +96,6 @@ class ComposedPipelineBase(ABC):
         # )
 
         # Load modules directly in initialization
-        logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
 
     def build_executor(self, server_args: ServerArgs):
@@ -210,8 +214,36 @@ class ComposedPipelineBase(ABC):
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
 
+        do_disaggregation = server_args.num_gpus > 1 and (server_args.num_gpus - 1) % 2 == 0
+        use_runai_model_streamer = False if do_disaggregation else None
+
+        def get_module_group_index(module_name: str) -> int:
+            if not do_disaggregation:
+                return 0
+            if "transformer" in module_name:
+                # dit
+                return DisaggregationMode.DIT
+            else:
+                # non-dit
+                return DisaggregationMode.NONE_DIT
+
+        def get_rank_group_index():
+            if not do_disaggregation:
+                return 0
+            else:
+                rank = int(os.environ["RANK"])
+                if rank == 0:
+                    return DisaggregationMode.NONE_DIT
+                else:
+                    return DisaggregationMode.DIT
+
+        def should_load_module(module_name: str) -> bool:
+            if get_module_group_index(module_name) == get_rank_group_index():
+                return True
+            else:
+                return False
+
         model_index = self._load_config()
-        logger.info("Loading pipeline modules from config: %s", model_index)
 
         # remove keys that are not pipeline modules
         model_index.pop("_class_name")
@@ -269,14 +301,17 @@ class ComposedPipelineBase(ABC):
                         f"Required module key: {module_name} value: {model_index.get(module_name)} was not found in loaded modules {model_index.keys()}"
                     )
 
+        model_index = {module_name: v for module_name, v in model_index.items() if should_load_module(module_name)}
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
+        logger.info("Loading modules: %s", model_index, main_process_only=False)
 
+        print(f"{model_index=}")
         components = {}
         for module_name, (
-            transformers_or_diffusers,
-            architecture,
+                transformers_or_diffusers,
+                architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -318,6 +353,7 @@ class ComposedPipelineBase(ABC):
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
 
             if module_name in components:
@@ -325,11 +361,11 @@ class ComposedPipelineBase(ABC):
             components[module_name] = module
 
         # Check if all required modules were loaded
-        for module_name in required_modules:
-            if module_name not in components or components[module_name] is None:
-                raise ValueError(
-                    f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
-                )
+        # for module_name in required_modules:
+        #     if module_name not in components or components[module_name] is None:
+        #         raise ValueError(
+        #             f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
+        #         )
 
         return components
 

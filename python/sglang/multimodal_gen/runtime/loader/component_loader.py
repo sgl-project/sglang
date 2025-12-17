@@ -113,6 +113,7 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         module_name: str,
         transformers_or_diffusers: str,
+        use_runai_model_streamer: bool | None = None,
     ):
         """
         Template method that standardizes logging around the core load implementation.
@@ -125,7 +126,10 @@ class ComponentLoader(ABC):
         logger.info("Loading %s from %s", module_name, component_model_path)
         try:
             component = self.load_customized(
-                component_model_path, server_args, module_name
+                component_model_path,
+                server_args,
+                module_name,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
             source = "customized"
         except Exception as e:
@@ -327,7 +331,10 @@ class TextEncoderLoader(ComponentLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source", to_cpu: bool
+        self,
+        source: "Source",
+        to_cpu: bool,
+        use_runai_model_streamer: bool | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -337,7 +344,9 @@ class TextEncoderLoader(ComponentLoader):
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
-                hf_weights_files, to_cpu=to_cpu
+                hf_weights_files,
+                to_cpu=to_cpu,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
@@ -352,6 +361,7 @@ class TextEncoderLoader(ComponentLoader):
         model: nn.Module,
         model_path: str,
         to_cpu: bool,
+        use_runai_model_streamer: bool | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         primary_weights = TextEncoderLoader.Source(
             model_path,
@@ -359,19 +369,28 @@ class TextEncoderLoader(ComponentLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights, to_cpu)
+        yield from self._get_weights_iterator(
+            primary_weights, to_cpu, use_runai_model_streamer
+        )
 
         secondary_weights = cast(
             Iterable[TextEncoderLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source, to_cpu)
+            yield from self._get_weights_iterator(
+                source, to_cpu, use_runai_model_streamer
+            )
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        **kwargs,
     ):
         """Load the text encoders based on the model path, and inference args."""
+        use_runai_model_streamer = kwargs.get("use_runai_model_streamer", None)
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
         #     trust_remote_code=server_args.trust_remote_code,
@@ -406,6 +425,7 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             server_args,
             encoder_dtype,
+            use_runai_model_streamer=use_runai_model_streamer,
         )
 
     def load_model(
@@ -415,6 +435,7 @@ class TextEncoderLoader(ComponentLoader):
         server_args: ServerArgs,
         dtype: str = "fp16",
         cpu_offload_flag: bool | None = None,
+        use_runai_model_streamer: bool | None = None,
     ):
         # Determine CPU offload behavior and target device
 
@@ -428,7 +449,12 @@ class TextEncoderLoader(ComponentLoader):
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
-                self._get_all_weights(model, model_path, to_cpu=should_offload)
+                self._get_all_weights(
+                    model,
+                    model_path,
+                    to_cpu=should_offload,
+                    use_runai_model_streamer=use_runai_model_streamer,
+                )
             )
             self.counter_after_loading_weights = time.perf_counter()
             logger.info(
@@ -482,9 +508,10 @@ class ImageEncoderLoader(TextEncoderLoader):
         return use_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
     ):
         """Load the text encoders based on the model path, and inference args."""
+        use_runai_model_streamer = kwargs.get("use_runai_model_streamer", None)
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
         #     trust_remote_code=server_args.trust_remote_code,
@@ -507,6 +534,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             server_args,
             server_args.pipeline_config.image_encoder_precision,
             cpu_offload_flag=server_args.image_encoder_cpu_offload,
+            use_runai_model_streamer=use_runai_model_streamer,
         )
 
 
@@ -514,7 +542,11 @@ class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        **kwargs,
     ) -> Any:
         return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
 
@@ -523,7 +555,11 @@ class AutoProcessorLoader(ComponentLoader):
     """Loader for auto processor."""
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        **kwargs,
     ) -> Any:
         return AutoProcessor.from_pretrained(component_model_path)
 
@@ -532,7 +568,11 @@ class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        **kwargs,
     ) -> Any:
         return AutoTokenizer.from_pretrained(
             component_model_path,
@@ -547,7 +587,7 @@ class VAELoader(ComponentLoader):
         return True
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
@@ -610,9 +650,10 @@ class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
     ):
         """Load the transformer based on the model path, and inference args."""
+        use_runai_model_streamer = kwargs.get("use_runai_model_streamer", None)
         config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
@@ -686,6 +727,7 @@ class TransformerLoader(ComponentLoader):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=None,
+            use_runai_model_streamer=use_runai_model_streamer,
         )
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -704,7 +746,7 @@ class SchedulerLoader(ComponentLoader):
     """Loader for scheduler."""
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
     ):
         """Load the scheduler based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
@@ -744,6 +786,7 @@ class PipelineComponentLoader:
         component_model_path: str,
         transformers_or_diffusers: str,
         server_args: ServerArgs,
+        use_runai_model_streamer: bool | None = None,
     ):
         """
         Load a pipeline module.
@@ -752,6 +795,7 @@ class PipelineComponentLoader:
             module_name: Name of the module (e.g., "vae", "text_encoder", "transformer", "scheduler")
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the module is from transformers or diffusers
+            use_runai_model_streamer: Whether to use runai_model_streamer
 
         Returns:
             The loaded module
@@ -767,6 +811,7 @@ class PipelineComponentLoader:
                 server_args,
                 module_name,
                 transformers_or_diffusers,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
         except Exception as e:
             logger.error(

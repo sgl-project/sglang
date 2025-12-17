@@ -19,7 +19,10 @@ from tqdm.auto import tqdm
 try:
     from runai_model_streamer import SafetensorsStreamer
 
-    HAS_RUNAI_MODEL_STREAMER = True
+    if os.environ.get("SGLANG_DISABLE_RUNAI_STREAMER", "0") == "1":
+        HAS_RUNAI_MODEL_STREAMER = False
+    else:
+        HAS_RUNAI_MODEL_STREAMER = True
 except ImportError:
     HAS_RUNAI_MODEL_STREAMER = False
 
