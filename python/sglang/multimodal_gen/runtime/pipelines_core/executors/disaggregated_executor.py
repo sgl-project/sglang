@@ -133,9 +133,7 @@ class DisaggregatedExecutor(PipelineExecutor):
             elif self.comm.is_dit_rank():
                 # DiT waits for data
                 print("Phase 1: Waiting for data from Non-DiT...")
-                batch = self._recv_batch_from_non_dit(
-                    batch
-                )  # Update batch with received data
+                batch = self._recv_batch_from_non_dit(batch)
 
             # --- PHASE 2: Denoise (DiT) ---
             if self.comm.is_dit_rank():
@@ -178,21 +176,30 @@ class DisaggregatedExecutor(PipelineExecutor):
 
         tensors_to_send = {}
         tensor_infos = {}  # name -> (shape, dtype)
+        list_tensor_infos = {}  # name -> list of (shape, dtype)
 
-        # Identify tensors
+        # Identify tensors (both single and lists)
         if hasattr(batch, "__dict__"):
             for k, v in batch.__dict__.items():
                 if isinstance(v, torch.Tensor):
                     tensors_to_send[k] = v
                     tensor_infos[k] = (v.shape, v.dtype)
+                elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    # Handle list of tensors
+                    tensors_to_send[k] = v  # Store the list
+                    list_tensor_infos[k] = [(t.shape, t.dtype) for t in v]
 
+        # Metadata: everything that's not a tensor or list of tensors
         metadata = {
-            k: v for k, v in batch.__dict__.items() if not isinstance(v, torch.Tensor)
+            k: v
+            for k, v in batch.__dict__.items()
+            if not isinstance(v, torch.Tensor)
+            and not (isinstance(v, list) and v and isinstance(v[0], torch.Tensor))
         }
 
         # Serialize metadata + tensor info
         buffer = io.BytesIO()
-        pickle.dump((metadata, tensor_infos), buffer)
+        pickle.dump((metadata, tensor_infos, list_tensor_infos), buffer)
         meta_bytes = torch.tensor(
             bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
         )
@@ -207,13 +214,24 @@ class DisaggregatedExecutor(PipelineExecutor):
         self.comm.send_to_dit(size_tensor)
         self.comm.send_to_dit(meta_bytes)
 
-        # 2. Send Tensors
-        for name, tensor in tensors_to_send.items():
+        # 2. Send Single Tensors
+        for name in tensor_infos.keys():
+            tensor = tensors_to_send[name]
             if not tensor.is_cuda:
                 tensor = tensor.cuda()
             self.comm.send_to_dit(tensor)
 
-        print(f"_send_batch_to_dit: {batch}")
+        # 3. Send List of Tensors
+        for name in list_tensor_infos.keys():
+            tensor_list = tensors_to_send[name]
+            for tensor in tensor_list:
+                if not tensor.is_cuda:
+                    tensor = tensor.cuda()
+                self.comm.send_to_dit(tensor)
+
+        print(
+            f"_send_batch_to_dit: sent {len(tensor_infos)} single tensors and {len(list_tensor_infos)} tensor lists"
+        )
 
     def _recv_batch_from_non_dit(self, batch: Req):
         import pickle
@@ -225,54 +243,59 @@ class DisaggregatedExecutor(PipelineExecutor):
         # 2. Recv Metadata
         meta_bytes = self.comm.recv_from_non_dit(torch.Size([size]), torch.uint8)
         meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
-        metadata, tensor_infos = pickle.loads(meta_data_cpu)
+        metadata, tensor_infos, list_tensor_infos = pickle.loads(meta_data_cpu)
 
         # Update batch metadata
         for k, v in metadata.items():
             setattr(batch, k, v)
 
-        # 3. Recv Tensors
+        # 3. Recv Single Tensors
         for name, (shape, dtype) in tensor_infos.items():
             tensor = self.comm.recv_from_non_dit(shape, dtype)
-            # TODO: USE CUDA-IPC?
             tensor = tensor.to(get_local_torch_device())
             setattr(batch, name, tensor)
 
-        if isinstance(batch.prompt_embeds, list):
-            batch.prompt_embeds = [
-                prompt_embeds.to(get_local_torch_device())
-                for prompt_embeds in batch.prompt_embeds
-            ]
+        # 4. Recv List of Tensors
+        for name, shapes_dtypes in list_tensor_infos.items():
+            tensor_list = []
+            for shape, dtype in shapes_dtypes:
+                tensor = self.comm.recv_from_non_dit(shape, dtype)
+                tensor = tensor.to(get_local_torch_device())
+                tensor_list.append(tensor)
+            setattr(batch, name, tensor_list)
 
-        print(f"_recv_batch_from_non_dit: {batch}")
+        print(
+            f"_recv_batch_from_non_dit: received {len(tensor_infos)} single tensors and {len(list_tensor_infos)} tensor lists"
+        )
         return batch
 
     def _send_batch_to_non_dit(self, batch: Req):
-        # We assume only changed tensors need to be sent back?
-        # Or just send everything again?
-        # For simplicity/correctness, send everything that is a tensor.
-        # But efficiently, we might only want 'latents'.
-        # Let's send all tensors found in batch to be safe.
-
+        # Send all tensors back to Non-DiT (primarily latents after denoising)
         import io
         import pickle
 
         tensors_to_send = {}
         tensor_infos = {}
+        list_tensor_infos = {}
 
         if hasattr(batch, "__dict__"):
             for k, v in batch.__dict__.items():
                 if isinstance(v, torch.Tensor):
                     tensors_to_send[k] = v
                     tensor_infos[k] = (v.shape, v.dtype)
+                elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    tensors_to_send[k] = v
+                    list_tensor_infos[k] = [(t.shape, t.dtype) for t in v]
 
-        # No need to send metadata back? Maybe updated metadata (e.g. counters)?
         metadata = {
-            k: v for k, v in batch.__dict__.items() if not isinstance(v, torch.Tensor)
+            k: v
+            for k, v in batch.__dict__.items()
+            if not isinstance(v, torch.Tensor)
+            and not (isinstance(v, list) and v and isinstance(v[0], torch.Tensor))
         }
 
         buffer = io.BytesIO()
-        pickle.dump((metadata, tensor_infos), buffer)
+        pickle.dump((metadata, tensor_infos, list_tensor_infos), buffer)
         meta_bytes = torch.tensor(
             bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
         )
@@ -286,12 +309,24 @@ class DisaggregatedExecutor(PipelineExecutor):
         self.comm.send_to_non_dit(size_tensor)
         self.comm.send_to_non_dit(meta_bytes)
 
-        for name, tensor in tensors_to_send.items():
+        # Send single tensors
+        for name in tensor_infos.keys():
+            tensor = tensors_to_send[name]
             if not tensor.is_cuda:
                 tensor = tensor.cuda()
             self.comm.send_to_non_dit(tensor)
 
-        print(f"_send_batch_to_non_dit: {batch}")
+        # Send list of tensors
+        for name in list_tensor_infos.keys():
+            tensor_list = tensors_to_send[name]
+            for tensor in tensor_list:
+                if not tensor.is_cuda:
+                    tensor = tensor.cuda()
+                self.comm.send_to_non_dit(tensor)
+
+        print(
+            f"_send_batch_to_non_dit: sent {len(tensor_infos)} single tensors and {len(list_tensor_infos)} tensor lists"
+        )
 
     def _recv_batch_from_dit(self, batch: Req):
         import pickle
@@ -301,16 +336,27 @@ class DisaggregatedExecutor(PipelineExecutor):
 
         meta_bytes = self.comm.recv_from_dit(torch.Size([size]), torch.uint8)
         meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
-        metadata, tensor_infos = pickle.loads(meta_data_cpu)
+        metadata, tensor_infos, list_tensor_infos = pickle.loads(meta_data_cpu)
 
         for k, v in metadata.items():
             setattr(batch, k, v)
 
+        # Recv single tensors
         for name, (shape, dtype) in tensor_infos.items():
             tensor = self.comm.recv_from_dit(shape, dtype)
-            # TODO: USE CUDA-IPC?
             tensor = tensor.to(get_local_torch_device())
             setattr(batch, name, tensor)
 
-        print(f"_recv_batch_from_dit: {batch}")
+        # Recv list of tensors
+        for name, shapes_dtypes in list_tensor_infos.items():
+            tensor_list = []
+            for shape, dtype in shapes_dtypes:
+                tensor = self.comm.recv_from_dit(shape, dtype)
+                tensor = tensor.to(get_local_torch_device())
+                tensor_list.append(tensor)
+            setattr(batch, name, tensor_list)
+
+        print(
+            f"_recv_batch_from_dit: received {len(tensor_infos)} single tensors and {len(list_tensor_infos)} tensor lists"
+        )
         return batch

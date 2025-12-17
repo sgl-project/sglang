@@ -46,7 +46,6 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
             # Default assumption based on current logic
             # This assumes 1 non-dit rank and N-1 dit ranks
             non_dit_ranks = [world_size - server_args.num_non_dit_ranks]
-
         dit_ranks = [r for r in range(world_size) if r not in non_dit_ranks]
 
         self.non_dit_master_rank = non_dit_ranks[0]

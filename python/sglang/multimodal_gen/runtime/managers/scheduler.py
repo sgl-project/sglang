@@ -6,6 +6,7 @@ from typing import Any, List
 import zmq
 
 from sglang.multimodal_gen.runtime.distributed.dist_utils import get_disagg_communicator
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -126,15 +127,23 @@ class Scheduler:
         else:
             recv_reqs = None
 
-        # Non-dit ranks don't participate in dit's parallel communication groups
-        # They only handle their own work (encoding/decoding)
-        if is_non_dit_rank:
-            # For non-dit ranks, just return the received requests without broadcasting
-            # They work independently and don't need to sync with dit ranks' parallel groups
-            if recv_reqs is None:
-                recv_reqs = []
-            return recv_reqs
+        # In disagg mode, first broadcast to ALL ranks (dit + non-dit) using world group
+        # This ensures non-dit ranks receive the requests
+        if self.server_args.enable_disagg:
+            world_group = get_world_group()
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                world_group.rank_in_group,
+                world_group.cpu_group,
+                src=0,  # rank 0 is the source (dit master with ZMQ receiver)
+            )
 
+            # Non-dit ranks receive requests via world broadcast and return immediately
+            # They don't participate in dit's sp/cfg/tp parallel groups
+            if is_non_dit_rank:
+                return recv_reqs
+
+        # Dit ranks continue with their internal parallel group broadcasts
         # TODO: fix this condition
         if self.server_args.sp_degree != 1:
             recv_reqs = broadcast_pyobj(

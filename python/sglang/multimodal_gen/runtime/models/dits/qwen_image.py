@@ -618,8 +618,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         hidden_states = self.img_in(hidden_states)
 
         timestep = (timestep / 1000).to(hidden_states.dtype)
-        print(f"{encoder_hidden_states.device=}")
-        print(f"{self.txt_norm.weight.device=}")
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 

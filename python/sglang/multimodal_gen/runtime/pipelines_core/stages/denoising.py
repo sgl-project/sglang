@@ -639,6 +639,11 @@ class DenoisingStage(PipelineStage):
                 self.device,
                 getattr(self.transformer, "rotary_emb", None),
                 dtype=target_dtype,
+            )
+            | dict(
+                encoder_hidden_states=server_args.pipeline_config.get_pos_prompt_embeds(
+                    batch
+                )
             ),
         )
 
@@ -654,6 +659,11 @@ class DenoisingStage(PipelineStage):
                     self.device,
                     getattr(self.transformer, "rotary_emb", None),
                     dtype=target_dtype,
+                )
+                | dict(
+                    encoder_hidden_states=server_args.pipeline_config.get_neg_prompt_embeds(
+                        batch
+                    )
                 ),
             )
         else:
@@ -970,10 +980,7 @@ class DenoisingStage(PipelineStage):
         ):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
-                    # Skip if interrupted
-                    if hasattr(self, "interrupt") and self.interrupt:
-                        continue
-
+                    print(f"timestep: {i=}")
                     with StageProfiler(
                         f"denoising_step_{i}", logger=logger, timings=batch.timings
                     ):
@@ -1202,14 +1209,12 @@ class DenoisingStage(PipelineStage):
         current_model,
         latent_model_input,
         timestep,
-        prompt_embeds,
         target_dtype,
         guidance: torch.Tensor,
         **kwargs,
     ):
         return current_model(
             hidden_states=latent_model_input,
-            encoder_hidden_states=prompt_embeds,
             timestep=timestep,
             guidance=guidance,
             **kwargs,
@@ -1266,9 +1271,6 @@ class DenoisingStage(PipelineStage):
                     current_model=current_model,
                     latent_model_input=latent_model_input,
                     timestep=timestep,
-                    prompt_embeds=server_args.pipeline_config.get_pos_prompt_embeds(
-                        batch
-                    ),
                     target_dtype=target_dtype,
                     guidance=guidance,
                     **image_kwargs,
@@ -1294,9 +1296,6 @@ class DenoisingStage(PipelineStage):
                     current_model=current_model,
                     latent_model_input=latent_model_input,
                     timestep=timestep,
-                    prompt_embeds=server_args.pipeline_config.get_neg_prompt_embeds(
-                        batch
-                    ),
                     target_dtype=target_dtype,
                     guidance=guidance,
                     **image_kwargs,
