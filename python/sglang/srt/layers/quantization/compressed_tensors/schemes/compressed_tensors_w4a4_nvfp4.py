@@ -21,7 +21,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_quantize,
 )
-from sglang.srt.layers.quantization.utils import swizzle_blockscale
+from sglang.srt.layers.quantization.utils.utils import swizzle_blockscale
 
 logger = logging.getLogger(__name__)
 

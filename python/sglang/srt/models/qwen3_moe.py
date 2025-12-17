@@ -897,6 +897,9 @@ class Qwen3MoeModel(Qwen2MoeModel):
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    }
 
     def __init__(
         self,
