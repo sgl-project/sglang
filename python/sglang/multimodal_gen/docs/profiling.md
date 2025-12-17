@@ -42,15 +42,13 @@ sglang generate \
 
 ### Output Location
 
-By default, trace files are saved in the ./logs/ directory. The exact output file path will be shown in the console output, for example:
+By default, trace files are saved in the ./logs/ directory.
+
+The exact output file path will be shown in the console output, for example:
 
 ```bash
 [mm-dd hh:mm:ss] Saved profiler traces to: /sgl-workspace/sglang/logs/mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz
 ```
-{request_id}-{num_steps}_steps-global-rank{rank}.trace.json.gz
-```
-
-Example: `mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz`
 
 ### View Traces
 

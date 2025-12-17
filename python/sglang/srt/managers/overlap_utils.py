@@ -55,20 +55,22 @@ class FutureMap:
         self.future_buffer_len = self.future_limit + 2 * max_running_requests
         self.device = device
         self.spec_algo = spec_algo
-        self.buf_initialized = False
 
         if self.spec_algo.is_none():
+            # For non-speculative decoding, we only need to store the token ids.
+            self.buf_initialized = True
             self.token_ids_buf = torch.empty(
                 (self.future_buffer_len,), dtype=torch.int64, device=self.device
             )
+        else:
+            # For speculative decoding, we lazily initialize the buffers
+            # This is to make the shape derivation easier.
+            self.buf_initialized = False
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        if self.buf_initialized or not self.spec_algo.is_eagle():
-            return
-
         self.buf_initialized = True
 
-        # get the template for each tensor
+        # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
         hidden_states0 = draft_input.hidden_states[0]
@@ -147,10 +149,13 @@ class FutureMap:
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ):
         intv = future_indices.interval
-        # idle indices do not need store info
         if self.is_empty_slice(intv):
+            # idle indices in dp attention do not need store info
             return
-        self._lazy_init_buf(draft_input)
+
+        if not self.buf_initialized:
+            self._lazy_init_buf(draft_input)
+
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index
         self.hidden_states_buf[intv] = draft_input.hidden_states

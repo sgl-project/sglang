@@ -22,6 +22,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -1606,7 +1607,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if MOE_NVFP4_DISPATCH else None
+                    layer.w13_input_scale_quant
+                    if MOE_NVFP4_DISPATCH
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else None
                 )
             }
         )

@@ -39,9 +39,11 @@ class SchedulerMetricsMixin:
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
+        # Basic stats
+        self.forward_ct_decode = 0
+        self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
-
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -52,12 +54,19 @@ class SchedulerMetricsMixin:
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
+
+        # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.kv_transfer_bootstrap_ms: float = 0.0
         self.kv_transfer_alloc_ms: float = 0.0
 
         self.stats = SchedulerStats()
+
+        # Metrics
+        self.current_scheduler_metrics_enabled = (
+            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
 
         if self.enable_metrics:
             engine_type = "unified"
@@ -81,6 +90,14 @@ class SchedulerMetricsMixin:
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+
+    def reset_metrics(self):
+        self.forward_ct_decode = 0
+        self.num_generated_tokens = 0
+        self.spec_num_accepted_tokens = 0
+        self.spec_num_forward_ct = 0
+        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_forward_ct = 0
 
     def log_prefill_stats(
         self: Scheduler,

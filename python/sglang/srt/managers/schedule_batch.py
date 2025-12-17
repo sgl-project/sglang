@@ -1819,15 +1819,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     @property
-    def is_v2_eagle(self):
-        # FIXME: finally deprecate is_v2_eagle
+    def is_eagle_v2(self):
+        # FIXME: finally deprecate is_eagle_v2
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_v2_eagle:
+        if self.is_eagle_v2:
             # TODO(spec-v2): all v2 spec should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
@@ -1907,7 +1907,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_v2_eagle:
+        if self.is_eagle_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
@@ -1980,7 +1980,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_v2_eagle
+        has_been_filtered = v1_spec_info_filtered and not self.is_eagle_v2
 
         if self.spec_info:
             self.spec_info.filter_batch(
