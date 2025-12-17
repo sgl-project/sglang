@@ -51,6 +51,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "()");
   m.impl("all_reduce_unreg", torch::kCUDA, &all_reduce_unreg);
 
+  // Deterministic all-reduce for ROCm
   m.def("dispose", &dispose);
 
   m.def("meta_size", &meta_size);

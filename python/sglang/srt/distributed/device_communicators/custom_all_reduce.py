@@ -312,7 +312,7 @@ class CustomAllreduce:
             offsets = [d[1] for d in all_data]  # type: ignore
             ops.register_graph_buffers(self._ptr, handles, offsets)
 
-    def should_custom_ar(self, inp: torch.Tensor):
+    def should_custom_ar(self, inp: torch.Tensor, force_for_determinism: bool = False):
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -321,6 +321,11 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
+        
+        # For determinism, allow custom all-reduce even in non-optimal conditions
+        if force_for_determinism:
+            return inp_size < self.max_size
+        
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if not _is_hip:
@@ -365,13 +370,22 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
+        if _is_hip:
+            # ROCm uses different API
+            if registered:
+                ops.all_reduce_reg(self._ptr, inp, out)
+            else:
+                ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         else:
-            ops.all_reduce(
-                self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
-            )
+            # CUDA path
+            if registered:
+                ops.all_reduce(self._ptr, inp, out, 0, 0)
+            else:
+                ops.all_reduce(
+                    self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
+                )
         return out
+
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
@@ -411,7 +425,20 @@ class CustomAllreduce:
 
 
 def dispatch_custom_allreduce():
-    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
+    
+    When determinism is enabled (SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM=1),
+    always use sglang's CustomAllreduce to ensure RS+AG path works correctly.
+    """
+    # If determinism is enabled, always use sglang's CustomAllreduce
+    # to ensure RS+AG path works correctly for deterministic inference
+    if envs.SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM.get():
+        logger.info(
+            "Determinism enabled (SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM=1). "
+            "Using sglang CustomAllreduce for deterministic RS+AG."
+        )
+        return CustomAllreduce
+    
     if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (

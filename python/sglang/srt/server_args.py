@@ -2314,11 +2314,23 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
+                # For deterministic inference, use RS+AG (deterministic) instead of custom AR
+                # This is handled in parallel_state.py automatically when deterministic inference is enabled
+                # We disable custom AR here to ensure RS+AG path is used
+                prefer_custom_ar = envs.SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM.get()
+                if prefer_custom_ar:
+                    # Use optimized custom RS+AG ops (faster than torch.distributed RS+AG)
+                    logger.info(
+                        "Deterministic inference enabled: will use optimized custom RS+AG (SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM=1)"
+                    )
+                else:
+                    # Use torch.distributed RS+AG (deterministic but slower)
+                    logger.info(
+                        "Deterministic inference enabled: will use torch.distributed RS+AG for deterministic all-reduce"
+                    )
+                # Disable custom AR (non-deterministic) - RS+AG will be used instead
                 os.environ["NCCL_ALGO"] = "allreduce:tree"
                 self.disable_custom_all_reduce = True
-                logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
-                )
 
     def _handle_request_metrics_exporters(self):
         """Handle arguments for configuring `RequestMetricsExporter` usage."""

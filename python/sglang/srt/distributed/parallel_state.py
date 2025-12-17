@@ -209,6 +209,32 @@ if _supports_custom_op:
         fake_impl=reg_reduce_scatter_tensor_fake,
     )
 
+    def deterministic_all_reduce_rs_ag(
+        input: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        """Fused deterministic all-reduce using reduce-scatter + all-gather.
+        
+        This is a fused operation that combines reduce-scatter and all-gather
+        into a single custom op for better performance while maintaining determinism.
+        """
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._deterministic_all_reduce_rs_ag(input)
+
+    def deterministic_all_reduce_rs_ag_fake(
+        input: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        return torch.empty_like(input)
+
+    direct_register_custom_op(
+        op_name="deterministic_all_reduce_rs_ag",
+        op_func=deterministic_all_reduce_rs_ag,
+        mutates_args=[],
+        fake_impl=deterministic_all_reduce_rs_ag_fake,
+    )
+
 
 class GroupCoordinator:
     """
@@ -560,6 +586,136 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        # For determinism, ALWAYS use reduce-scatter + all-gather
+        # Custom all-reduce uses atomic operations and shared memory synchronization
+        # which can lead to non-deterministic floating-point rounding order
+        # Use reduce-scatter + all-gather for deterministic inference
+        enable_deterministic = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        prefer_custom_ar = envs.SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM.get()
+        
+        # If deterministic inference is enabled, use RS+AG (deterministic)
+        # prefer_custom_ar controls whether to use optimized custom ops or torch.distributed
+        if enable_deterministic or prefer_custom_ar:
+            import time
+            import logging
+            logger = logging.getLogger(__name__)
+            
+            start_time = time.perf_counter()
+            original_shape = input_.shape
+            
+            # Use custom reduce-scatter + all-gather for deterministic inference
+            logger.info(
+                f"[AllReduce] Method=reduce_scatter+all_gather (deterministic), "
+                f"shape={original_shape}, size={input_.numel() * input_.element_size()} bytes"
+            )
+            
+            if input_.numel() % self.world_size != 0:
+                raise RuntimeError(
+                    f"Tensor size ({input_.numel()}) must be divisible by world_size "
+                    f"({self.world_size}) for deterministic reduce-scatter + all-gather"
+                )
+            
+            # Ensure input is contiguous
+            if not input_.is_contiguous():
+                input_ = input_.contiguous()
+            
+            # Flatten tensor to 1D for reduce-scatter + all-gather operations
+            input_flat = input_.flatten()
+            total_size = input_flat.numel()
+            chunk_size = total_size // self.world_size
+            
+            if input_.is_cpu:
+                # For CPU tensors, use standard reduce-scatter + all-gather
+                input_chunks = [
+                    input_flat[i * chunk_size : (i + 1) * chunk_size].clone()
+                    for i in range(self.world_size)
+                ]
+                
+                output_chunk = torch.empty(chunk_size, dtype=input_.dtype)
+                torch.distributed.reduce_scatter(
+                    output_chunk,
+                    input_chunks,
+                    group=self.device_group
+                )
+                
+                output_chunks = [torch.empty(chunk_size, dtype=input_.dtype) for _ in range(self.world_size)]
+                torch.distributed.all_gather(output_chunks, output_chunk, group=self.device_group)
+                
+                output_flat = torch.cat(output_chunks, dim=0)
+                output = output_flat.reshape(original_shape)
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    f"[AllReduce] Method=reduce_scatter+all_gather (CPU), "
+                    f"shape={original_shape}, size={total_size * input_.element_size()} bytes, "
+                    f"latency={elapsed*1000:.3f}ms"
+                )
+                return output
+            else:
+                # For GPU tensors, use optimized reduce-scatter + all-gather
+                # Try to use fused custom op if available, otherwise use separate ops
+                if _supports_custom_op and not _is_npu and not _is_xpu:
+                    # Use fused deterministic all-reduce custom op (if implemented)
+                    # This would be a single kernel that does rs+ag together
+                    try:
+                        output = torch.ops.sglang.deterministic_all_reduce_rs_ag(
+                            input_, group_name=self.unique_name
+                        )
+                        elapsed = time.perf_counter() - start_time
+                        logger.info(
+                            f"[AllReduce] Method=deterministic_all_reduce_rs_ag (fused), "
+                            f"shape={original_shape}, size={total_size * input_.element_size()} bytes, "
+                            f"latency={elapsed*1000:.3f}ms"
+                        )
+                        return output
+                    except RuntimeError:
+                        # Fused op not available, fall through to separate ops
+                        pass
+                
+                # Fallback: use separate reduce-scatter + all-gather ops
+                # Optimized: use custom ops directly and reuse memory
+                if not input_flat.is_contiguous():
+                    input_flat = input_flat.contiguous()
+                
+                # Pre-allocate output tensor
+                output_flat = torch.empty(total_size, dtype=input_.dtype, device=input_.device)
+                
+                # Get the chunk for this rank (slice of output_flat to avoid extra allocation)
+                rank = self.rank_in_group
+                output_chunk = output_flat[rank * chunk_size : (rank + 1) * chunk_size]
+                
+                # Reduce-scatter: use custom op directly (faster, supports CUDA graphs)
+                rs_start = time.perf_counter()
+                if _is_npu or not supports_custom_op():
+                    # Fallback: need separate temp tensor
+                    temp_chunk = torch.empty(chunk_size, dtype=input_.dtype, device=input_.device)
+                    self._reduce_scatter_tensor(temp_chunk, input_flat)
+                    output_chunk.copy_(temp_chunk)
+                else:
+                    # Optimized: use custom op directly
+                    torch.ops.sglang.reg_reduce_scatter_tensor(
+                        output_chunk, input_flat, group_name=self.unique_name
+                    )
+                rs_time = time.perf_counter() - rs_start
+                
+                # All-gather: use custom op directly
+                ag_start = time.perf_counter()
+                if _is_npu or _is_xpu or not _supports_custom_op:
+                    self._all_gather_into_tensor(output_flat, output_chunk)
+                else:
+                    torch.ops.sglang.reg_all_gather_into_tensor(
+                        output_flat, output_chunk, group_name=self.unique_name
+                    )
+                ag_time = time.perf_counter() - ag_start
+                
+                output = output_flat.reshape(original_shape)
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    f"[AllReduce] Method=reduce_scatter+all_gather (GPU, optimized), "
+                    f"shape={original_shape}, size={total_size * input_.element_size()} bytes, "
+                    f"latency={elapsed*1000:.3f}ms (rs={rs_time*1000:.3f}ms, ag={ag_time*1000:.3f}ms)"
+                )
+                return output
+
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
@@ -588,43 +744,185 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
-        if (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            outplace_all_reduce_method = "ca"
-        elif (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "qr"
-        elif (
-            self.pymscclpp_comm is not None
-            and not self.pymscclpp_comm.disabled
-            and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "pymscclpp"
-        elif (
-            self.torch_symm_mem_comm is not None
-            and not self.torch_symm_mem_comm.disabled
-            and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "torch_symm_mem"
+        
+        # For determinism, prefer custom all-reduce when available
+        prefer_custom_ar = envs.SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM.get()
+        
+        # Check if should_custom_ar accepts force_for_determinism parameter
+        # (AiterCustomAllreduce on ROCm may not have this parameter)
+        has_force_param = False
+        if self.ca_comm is not None:
+            import inspect
+            try:
+                should_custom_ar_sig = inspect.signature(self.ca_comm.should_custom_ar)
+                has_force_param = 'force_for_determinism' in should_custom_ar_sig.parameters
+            except (TypeError, AttributeError):
+                # Fallback: assume it doesn't have the parameter
+                has_force_param = False
+        
+        # When prefer_custom_ar is True, we've already handled it above with rs+ag
+        # Skip custom all-reduce selection since it's not deterministic
+        if prefer_custom_ar:
+            # This path should not be reached - we already handled it above
+            # But keep this check to prevent falling through to non-deterministic paths
+            pass
+        elif False:  # Disabled: custom AR is not deterministic
+            if (
+                self.ca_comm is not None
+                and not self.ca_comm.disabled
+            ):
+                # Try to make tensor compatible with custom all-reduce requirements
+                # Custom all-reduce requires: contiguous, size multiple of 16 bytes
+                work_input = input_
+                if not input_.is_contiguous():
+                    work_input = input_.contiguous()
+                
+                # Check if custom all-reduce can be used with the (possibly fixed) tensor
+                import logging
+                logger = logging.getLogger(__name__)
+                
+                inp_size_bytes = work_input.numel() * work_input.element_size()
+                max_size = self.ca_comm.max_size if hasattr(self.ca_comm, 'max_size') else 'unknown'
+                is_multiple_of_16 = (inp_size_bytes % 16 == 0)
+                is_contiguous = work_input.is_contiguous()
+                size_ok = inp_size_bytes < max_size if isinstance(max_size, (int, float)) else False
+                
+                logger.info(
+                    f"[AllReduce] Checking custom AR eligibility: "
+                    f"shape={work_input.shape}, size_bytes={inp_size_bytes}, "
+                    f"multiple_of_16={is_multiple_of_16}, contiguous={is_contiguous}, "
+                    f"max_size={max_size}, size_ok={size_ok}"
+                )
+                
+                can_use_ca = (
+                    self.ca_comm.should_custom_ar(work_input, force_for_determinism=True)
+                    if has_force_param
+                    else self.ca_comm.should_custom_ar(work_input)
+                )
+                
+                logger.info(
+                    f"[AllReduce] should_custom_ar returned: {can_use_ca} "
+                    f"(has_force_param={has_force_param})"
+                )
+                
+                if can_use_ca:
+                    # Use the contiguous version if we made a copy
+                    if work_input is not input_:
+                        input_ = work_input
+                    outplace_all_reduce_method = "ca"
+                    logger.info(
+                        f"[AllReduce] ✓ Using custom all-reduce for tensor "
+                        f"shape={input_.shape}, size={inp_size_bytes} bytes"
+                    )
+                else:
+                    # Custom all-reduce required but can't be used - fallback to rs+ag
+                    logger.warning(
+                        f"[AllReduce] ✗ Custom all-reduce cannot be used, "
+                        f"falling back to reduce-scatter + all-gather. "
+                        f"Reason: multiple_of_16={is_multiple_of_16}, "
+                        f"contiguous={is_contiguous}, size_ok={size_ok}, "
+                        f"max_size={max_size}"
+                    )
+                    inp_size = work_input.numel() * work_input.element_size()
+                    max_size = self.ca_comm.max_size if hasattr(self.ca_comm, 'max_size') else 'unknown'
+                    size_ok = inp_size < max_size if isinstance(max_size, (int, float)) else False
+                    
+                    error_msg = (
+                        f"Custom all-reduce required (SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM=1) "
+                        f"but cannot be used. Tensor requirements: "
+                        f"size={inp_size} bytes, multiple_of_16={inp_size % 16 == 0}, "
+                        f"contiguous={work_input.is_contiguous()}, max_size={max_size}, "
+                        f"size_ok={size_ok}. "
+                        f"Custom all-reduce is required for deterministic inference. "
+                        f"Please ensure tensors meet these requirements or disable deterministic mode."
+                    )
+                    raise RuntimeError(error_msg)
+            else:
+                # Custom all-reduce required but not available
+                error_msg = (
+                    "Custom all-reduce required (SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM=1) "
+                    "but custom all-reduce is not available or disabled. "
+                    "Custom all-reduce is required for deterministic inference. "
+                    "Please ensure custom all-reduce is enabled or disable deterministic mode."
+                )
+                raise RuntimeError(error_msg)
+        else:
+            # Normal selection logic when not enforcing custom all-reduce
+            if (
+                self.ca_comm is not None
+                and not self.ca_comm.disabled
+                and (
+                    self.ca_comm.should_custom_ar(input_, force_for_determinism=prefer_custom_ar)
+                    if has_force_param
+                    else self.ca_comm.should_custom_ar(input_)
+                )
+            ):
+                outplace_all_reduce_method = "ca"
+            elif (
+                self.qr_comm is not None
+                and not self.qr_comm.disabled
+                and self.qr_comm.should_quick_allreduce(input_)
+            ):
+                outplace_all_reduce_method = "qr"
+            elif (
+                self.pymscclpp_comm is not None
+                and not self.pymscclpp_comm.disabled
+                and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+            ):
+                outplace_all_reduce_method = "pymscclpp"
+            elif (
+                self.torch_symm_mem_comm is not None
+                and not self.torch_symm_mem_comm.disabled
+                and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+            ):
+                outplace_all_reduce_method = "torch_symm_mem"
+        
         if outplace_all_reduce_method is not None:
-            return torch.ops.sglang.outplace_all_reduce(
+            import time
+            import logging
+            logger = logging.getLogger(__name__)
+            start_time = time.perf_counter()
+            
+            result = torch.ops.sglang.outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
+            
+            elapsed = time.perf_counter() - start_time
+            method_name = {
+                "ca": "custom_all_reduce",
+                "qr": "quick_all_reduce",
+                "pymscclpp": "pymscclpp_all_reduce",
+                "torch_symm_mem": "torch_symm_mem_all_reduce"
+            }.get(outplace_all_reduce_method, outplace_all_reduce_method)
+            
+            logger.info(
+                f"[AllReduce] Method={method_name}, "
+                f"shape={input_.shape}, size={input_.numel() * input_.element_size()} bytes, "
+                f"latency={elapsed*1000:.3f}ms"
+            )
+            
+            return result
         else:
+            # If custom all-reduce was required but not used, we should have errored above
+            # This fallback should only happen when prefer_custom_ar is False
+            if prefer_custom_ar:
+                raise RuntimeError(
+                    "Custom all-reduce was required but not selected. "
+                    "This should not happen - please report this bug."
+                )
             torch.ops.sglang.inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
+        import time
+        import logging
+        logger = logging.getLogger(__name__)
+        start_time = time.perf_counter()
+        
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
@@ -633,6 +931,11 @@ class GroupCoordinator:
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
+            elapsed = time.perf_counter() - start_time
+            logger.debug(
+                f"[AllReduce] custom_all_reduce completed, "
+                f"shape={input_.shape}, latency={elapsed*1000:.3f}ms"
+            )
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
@@ -646,6 +949,46 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        # For determinism, ALWAYS use reduce-scatter + all-gather (custom AR is not deterministic)
+        prefer_custom_ar = envs.SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM.get()
+        
+        if prefer_custom_ar:
+            # Custom all-reduce uses atomic operations which are not deterministic
+            # Always use reduce-scatter + all-gather for determinism
+            if input_.numel() % self.world_size != 0:
+                raise RuntimeError(
+                    f"Tensor size ({input_.numel()}) must be divisible by world_size "
+                    f"({self.world_size}) for deterministic reduce-scatter + all-gather"
+                )
+            
+            # Flatten to 1D for reduce-scatter-tensor
+            original_shape = input_.shape
+            input_flat = input_.flatten()
+            total_size = input_flat.numel()
+            chunk_size = total_size // self.world_size
+            
+            # Ensure input_flat is contiguous
+            if not input_flat.is_contiguous():
+                input_flat = input_flat.contiguous()
+            
+            # Create output chunk tensor
+            output_chunk = torch.empty(
+                chunk_size,
+                dtype=input_.dtype,
+                device=input_.device
+            )
+            
+            # Reduce-scatter
+            self.reduce_scatter_tensor(output_chunk, input_flat)
+            
+            # All-gather back into a new flat tensor, then copy to input_
+            output_flat = torch.empty(total_size, dtype=input_.dtype, device=input_.device)
+            self.all_gather_into_tensor(output_flat, output_chunk)
+            
+            # Copy back to input_ in-place
+            input_.view(-1).copy_(output_flat)
+            return
+        
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -747,6 +1090,61 @@ class GroupCoordinator:
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
             )
+
+    def _deterministic_all_reduce_rs_ag(self, input_: torch.Tensor) -> torch.Tensor:
+        """Optimized deterministic all-reduce using reduce-scatter + all-gather.
+        
+        This method optimizes the rs+ag path by:
+        1. Reusing memory (output_chunk is a slice of output_flat)
+        2. Using custom ops directly (faster, supports CUDA graphs)
+        3. Minimizing allocations
+        4. Optimized memory layout for better cache locality
+        """
+        if input_.numel() % self.world_size != 0:
+            raise RuntimeError(
+                f"Tensor size ({input_.numel()}) must be divisible by world_size "
+                f"({self.world_size}) for deterministic reduce-scatter + all-gather"
+            )
+        
+        # Ensure input is contiguous (critical for performance)
+        input_ = input_.contiguous()
+        
+        # Flatten to 1D
+        original_shape = input_.shape
+        input_flat = input_.view(-1)
+        total_size = input_flat.numel()
+        chunk_size = total_size // self.world_size
+        rank = self.rank_in_group
+        
+        # Pre-allocate output tensor (contiguous for better memory access)
+        output_flat = torch.empty_like(input_flat)
+        
+        # Get chunk as a slice (no extra allocation, direct memory reference)
+        output_chunk = output_flat[rank * chunk_size : (rank + 1) * chunk_size]
+        
+        # Reduce-scatter: use custom op if available (faster, supports CUDA graphs)
+        if _is_npu or not supports_custom_op():
+            # Fallback: need temp tensor for reduce_scatter_tensor API
+            temp_chunk = torch.empty(chunk_size, dtype=input_.dtype, device=input_.device)
+            self._reduce_scatter_tensor(temp_chunk, input_flat)
+            output_chunk.copy_(temp_chunk)
+        else:
+            # Direct custom op call - faster and CUDA graph compatible
+            torch.ops.sglang.reg_reduce_scatter_tensor(
+                output_chunk, input_flat, group_name=self.unique_name
+            )
+        
+        # All-gather: use custom op if available
+        if _is_npu or _is_xpu or not _supports_custom_op:
+            self._all_gather_into_tensor(output_flat, output_chunk)
+        else:
+            # Direct custom op call - faster and CUDA graph compatible
+            torch.ops.sglang.reg_all_gather_into_tensor(
+                output_flat, output_chunk, group_name=self.unique_name
+            )
+        
+        # Reshape back to original shape (no copy, just view)
+        return output_flat.view(original_shape)
 
     def cp_all_gather_into_tensor_async(
         self, output: torch.Tensor, input: torch.Tensor, stream=None
