@@ -980,7 +980,6 @@ class DenoisingStage(PipelineStage):
         ):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
-                    print(f"timestep: {i=}")
                     with StageProfiler(
                         f"denoising_step_{i}", logger=logger, timings=batch.timings
                     ):

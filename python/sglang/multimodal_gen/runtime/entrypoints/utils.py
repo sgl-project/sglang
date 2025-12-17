@@ -70,6 +70,8 @@ def post_process_sample(
     if sample.dim() == 3:
         # for images, dim t is missing
         sample = sample.unsqueeze(1)
+
+    sample = sample.to(device="cpu")
     videos = rearrange(sample, "c t h w -> t c h w")
     frames = []
     # TODO: this can be batched

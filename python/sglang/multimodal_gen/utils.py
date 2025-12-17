@@ -21,12 +21,8 @@ from functools import lru_cache, partial, wraps
 from typing import Any, TypeVar, cast
 
 import cloudpickle
-import imageio
-import numpy as np
 import torch
-import torchvision
 import yaml
-from einops import rearrange
 from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
@@ -786,8 +782,6 @@ def best_output_size(w, h, dw, dh, expected_area):
         return ow1, oh1
     else:
         return ow2, oh2
-
-
 
 
 def calculate_dimensions(target_area, ratio):
