@@ -121,18 +121,12 @@ def load_gt_frames(
     """
     from sglang.utils import download_and_cache_file
 
-    # Determine frame names from metadata
-    metadata = load_gt_metadata()
-    case_meta = metadata.get("cases", {}).get(case_id, {})
-
-    # Determine default frame count based on modality
-    default_num_frames = 3 if is_video else 1
-
-    if case_meta.get("num_frames", default_num_frames) == 3:
-        # Video with 3 key frames
+    # Determine frame names based on modality
+    # Video always uses 3 key frames (first, mid, last) to match extract_key_frames_from_video
+    # Image always uses 1 frame
+    if is_video:
         frame_names = ["frame_0.png", "frame_mid.png", "frame_last.png"]
     else:
-        # Single image
         frame_names = ["frame_0.png"]
 
     frames = []
