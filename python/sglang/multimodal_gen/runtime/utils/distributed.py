@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 
 def broadcast_pyobj(
     data: List[Any],
@@ -20,7 +22,7 @@ def broadcast_pyobj(
     of dist_group argument).
     """
     device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+        current_platform.device_type if not force_cpu_device else "cpu"
     )
 
     if rank == src:
@@ -32,7 +34,7 @@ def broadcast_pyobj(
             size = len(serialized_data)
 
             tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
+                np.frombuffer(serialized_data, dtype=np.uint8).copy()
             ).to(device)
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
