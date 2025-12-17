@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -6,7 +5,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -16,6 +14,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=3600, suite="nightly-8-gpu-b200", nightly=True)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
+SERVER_LAUNCH_TIMEOUT = 1000
 
 
 class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
@@ -52,19 +51,19 @@ class TestDeepseekR1Fp8Flashinfer(CustomTestCase):
             "10",
             "--attention-backend",
             "trtllm_mla",
+            "--fp8-gemm-backend",
+            "flashinfer_trtllm",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--enable-symm-mem",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
-            env={
-                **os.environ,
-                "SGLANG_ENABLE_FLASHINFER_FP8_GEMM": "1",
-            },
         )
 
     @classmethod

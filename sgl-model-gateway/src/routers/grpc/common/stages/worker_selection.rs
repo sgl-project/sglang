@@ -9,6 +9,7 @@ use tracing::{error, warn};
 use super::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    observability::metrics::{metrics_labels, Metrics},
     policies::PolicyRegistry,
     routers::{
         error,
@@ -52,7 +53,10 @@ impl PipelineStage for WorkerSelectionStage {
                 function = "WorkerSelectionStage::execute",
                 "Preparation stage not completed"
             );
-            error::internal_error("Preparation stage not completed")
+            error::internal_error(
+                "preparation_stage_not_completed",
+                "Preparation stage not completed",
+            )
         })?;
 
         // For Harmony, use selection_text produced during Harmony encoding
@@ -74,10 +78,10 @@ impl PipelineStage for WorkerSelectionStage {
                             model_id = ?ctx.input.model_id,
                             "No available workers for model"
                         );
-                        return Err(error::service_unavailable(format!(
-                            "No available workers for model: {:?}",
-                            ctx.input.model_id
-                        )));
+                        return Err(error::service_unavailable(
+                            "no_available_workers",
+                            format!("No available workers for model: {:?}", ctx.input.model_id),
+                        ));
                     }
                 }
             }
@@ -91,10 +95,13 @@ impl PipelineStage for WorkerSelectionStage {
                             model_id = ?ctx.input.model_id,
                             "No available PD worker pairs for model"
                         );
-                        return Err(error::service_unavailable(format!(
-                            "No available PD worker pairs for model: {:?}",
-                            ctx.input.model_id
-                        )));
+                        return Err(error::service_unavailable(
+                            "no_available_pd_worker_pairs",
+                            format!(
+                                "No available PD worker pairs for model: {:?}",
+                                ctx.input.model_id
+                            ),
+                        ));
                     }
                 }
             }
@@ -140,7 +147,17 @@ impl WorkerSelectionStage {
 
         // Select worker using the policy
         let idx = policy.select_worker(&available, text)?;
-        Some(available[idx].clone())
+        let selected = available[idx].clone();
+
+        // Record worker selection metric
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_GRPC,
+            model_id.unwrap_or("default"),
+            policy.name(),
+        );
+
+        Some(selected)
     }
 
     fn select_pd_pair(
@@ -188,6 +205,23 @@ impl WorkerSelectionStage {
 
         let prefill_idx = policy.select_worker(&available_prefill, text)?;
         let decode_idx = policy.select_worker(&available_decode, text)?;
+
+        let model = model_id.unwrap_or("default");
+        let policy_name = policy.name();
+
+        // Record worker selection metrics for both prefill and decode
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            policy_name,
+        );
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            policy_name,
+        );
 
         Some((
             available_prefill[prefill_idx].clone(),
