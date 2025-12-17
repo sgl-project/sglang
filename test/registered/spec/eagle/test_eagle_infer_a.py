@@ -1,4 +1,5 @@
 import os
+import random
 import unittest
 
 import requests
@@ -71,6 +72,7 @@ class TestEAGLEEngine(CustomTestCase):
                 engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
                 try:
                     self._test_single_generation(engine)
+                    self._test_first_token_finish(engine)
                     self._test_batch_generation(engine)
                     self._test_eos_token(engine)
                     self._test_acc_length(engine)
@@ -108,6 +110,20 @@ class TestEAGLEEngine(CustomTestCase):
         self.assertGreater(
             avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
         )
+
+    def _test_first_token_finish(self, engine):
+        prompt = [
+            f"There are {i} apples on the table. How to divide them equally?"
+            for i in range(8)
+        ]
+        params = [
+            {"temperature": 0, "max_new_tokens": random.randint(1, 3)} for _ in range(8)
+        ]
+        outputs = engine.generate(prompt, params)
+        for i, output in enumerate(outputs):
+            print(f"Prompt: {prompt[i]}")
+            print(f"Generated: {output['text']}")
+            print("-" * 40)
 
     def _test_eos_token(self, engine):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
@@ -212,6 +228,7 @@ class TestEAGLERadixCache(CustomTestCase):
             # Chunked prefill & Page Size > 1
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
             {**self.BASE_CONFIG, "page_size": 4},
+            {**self.BASE_CONFIG, "cuda_graph_bs": [5], "page_size": 4},
             # Preferred by some kernels
             {**self.BASE_CONFIG, "page_size": 64},
             # Disable CUDA Graph

@@ -15,7 +15,9 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.trtllm_fp8_kv_kernel import fused_fp8_set_kv_buffer
+from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+    fused_fp8_set_kv_buffer,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
@@ -527,7 +529,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.extend_prefix_lens_cpu
             ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+                max_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.max_seq_len_q = (
+                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+                )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )

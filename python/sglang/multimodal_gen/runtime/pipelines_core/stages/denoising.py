@@ -7,6 +7,7 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
+import os
 import time
 import weakref
 from collections.abc import Iterable
@@ -55,6 +56,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -116,17 +118,9 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            full_graph = False
-            self.transformer = torch.compile(
-                self.transformer, mode="max-autotune", fullgraph=full_graph
-            )
-            self.transformer_2 = (
-                torch.compile(
-                    self.transformer_2, mode="max-autotune", fullgraph=full_graph
-                )
-                if transformer_2 is not None
-                else None
-            )
+            self.torch_compile_module(self.transformer)
+            if transformer_2 is not None:
+                self.torch_compile_module(self.transformer_2)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -141,7 +135,7 @@ class DenoisingStage(PipelineStage):
                 AttentionBackendEnum.VMOBA_ATTN,
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN_THREE,
+                AttentionBackendEnum.SAGE_ATTN_3,
             },  # hack
         )
 
@@ -150,10 +144,30 @@ class DenoisingStage(PipelineStage):
 
         # misc
         self.profiler = None
-
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+
+    def torch_compile_module(self, module):
+        """
+        Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object has no forward.
+        """
+        if not self.server_args.enable_torch_compile or module is None:
+            return module
+        if not hasattr(module, "forward"):
+            return module
+        try:
+            import torch._inductor.config as _inductor_cfg
+
+            _inductor_cfg.reorder_for_compute_comm_overlap = True
+        except ImportError:
+            pass
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        logger.info(f"Compiling transformer with mode: {mode}")
+        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
+        setattr(module, "forward", compiled_forward)
+        return module
 
     def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
@@ -179,7 +193,11 @@ class DenoisingStage(PipelineStage):
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
 
-        from sglang.multimodal_gen.runtime.distributed import get_world_size
+        from sglang.multimodal_gen.runtime.distributed import (
+            get_sp_group,
+            get_tp_group,
+            get_world_size,
+        )
         from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
             CacheDitConfig,
             enable_cache_on_dual_transformer,
@@ -187,13 +205,30 @@ class DenoisingStage(PipelineStage):
             get_scm_mask,
         )
 
-        if get_world_size() > 1:
-            logger.warning(
-                "cache-dit is disabled in distributed environment (world_size=%d). "
-                "Distributed support will be added in a future version.",
-                get_world_size(),
+        world_size = get_world_size()
+        parallelized = world_size > 1
+
+        sp_group = None
+        tp_group = None
+        if parallelized:
+            sp_group_candidate = get_sp_group()
+            tp_group_candidate = get_tp_group()
+
+            sp_world_size = sp_group_candidate.world_size if sp_group_candidate else 1
+            tp_world_size = tp_group_candidate.world_size if tp_group_candidate else 1
+
+            has_sp = sp_world_size > 1
+            has_tp = tp_world_size > 1
+
+            sp_group = sp_group_candidate.device_group if has_sp else None
+            tp_group = tp_group_candidate.device_group if has_tp else None
+
+            logger.info(
+                "cache-dit enabled in distributed environment (world_size=%d, has_sp=%s, has_tp=%s)",
+                world_size,
+                has_sp,
+                has_tp,
             )
-            return
         # === Parse SCM configuration from envs ===
         # SCM is shared between primary and secondary transformers
         scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
@@ -275,6 +310,8 @@ class DenoisingStage(PipelineStage):
                 primary_config,
                 secondary_config,
                 model_name="wan2.2",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d)",
@@ -286,6 +323,8 @@ class DenoisingStage(PipelineStage):
                 self.transformer,
                 primary_config,
                 model_name="transformer",
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -581,7 +620,7 @@ class DenoisingStage(PipelineStage):
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            getattr(self.transformer, "forward", self.transformer),
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
@@ -590,7 +629,7 @@ class DenoisingStage(PipelineStage):
         )
 
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            getattr(self.transformer, "forward", self.transformer),
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
@@ -605,7 +644,7 @@ class DenoisingStage(PipelineStage):
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
-                self.transformer.forward,
+                getattr(self.transformer, "forward", self.transformer),
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
@@ -920,10 +959,12 @@ class DenoisingStage(PipelineStage):
         denoising_start_time = time.time()
 
         # to avoid device-sync caused by timestep comparison
+
+        self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
-            device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+            device_type=current_platform.device_type,
             dtype=target_dtype,
             enabled=autocast_enabled,
         ):
@@ -1074,10 +1115,8 @@ class DenoisingStage(PipelineStage):
             A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
-        if local_rank == 0:
-            return tqdm(iterable=iterable, total=total)
-        else:
-            return tqdm(iterable=iterable, total=total, disable=True)
+        disable = local_rank != 0
+        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def rescale_noise_cfg(
         self, noise_cfg, noise_pred_text, guidance_rescale=0.0
