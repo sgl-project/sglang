@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections import defaultdict
 from typing import (
     Any,
@@ -570,15 +571,44 @@ def download_weights_from_hf(
         # But we already checked for local cache above, so if we're here we need to download
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
-            fs = HfFileSystem()
-            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            # Retry HF API calls with exponential backoff to handle transient network issues
+            max_api_retries = 5
+            file_list = None
 
-            # depending on what is available we download different things
-            for pattern in allow_patterns:
-                matching = fnmatch.filter(file_list, pattern)
-                if len(matching) > 0:
-                    allow_patterns = [pattern]
-                    break
+            for attempt in range(max_api_retries):
+                try:
+                    fs = HfFileSystem()
+                    file_list = fs.ls(
+                        model_name_or_path, detail=False, revision=revision
+                    )
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    if attempt < max_api_retries - 1:
+                        # Exponential backoff: 2, 4, 8, 16 seconds
+                        sleep_time = 2 ** (attempt + 1)
+                        log_info_on_rank0(
+                            logger,
+                            f"HuggingFace API call failed for {model_name_or_path} "
+                            f"(attempt {attempt + 1}/{max_api_retries}): {e}. "
+                            f"Retrying in {sleep_time} seconds...",
+                        )
+                        time.sleep(sleep_time)
+                    else:
+                        log_info_on_rank0(
+                            logger,
+                            f"HuggingFace API call failed for {model_name_or_path} "
+                            f"after {max_api_retries} attempts: {e}. "
+                            "Proceeding with original allow_patterns.",
+                        )
+
+            # If we got a file list, filter allow_patterns based on what's available
+            if file_list is not None:
+                # depending on what is available we download different things
+                for pattern in allow_patterns:
+                    matching = fnmatch.filter(file_list, pattern)
+                    if len(matching) > 0:
+                        allow_patterns = [pattern]
+                        break
 
         log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
