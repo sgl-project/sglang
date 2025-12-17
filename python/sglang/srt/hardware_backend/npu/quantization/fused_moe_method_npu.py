@@ -431,7 +431,6 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 
     @staticmethod
     def apply_without_routing_weights(
-        cls,
         layer,
         hidden_states,
         hidden_states_scale,
