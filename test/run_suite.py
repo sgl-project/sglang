@@ -161,9 +161,14 @@ def run_a_suite(args):
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
+    # Add extra timeout when retry is enabled
+    timeout = args.timeout_per_file
+    if args.enable_retry:
+        timeout += args.retry_timeout_increase
+
     return run_unittest_files(
         ci_tests,
-        timeout_per_file=args.timeout_per_file,
+        timeout_per_file=timeout,
         continue_on_error=args.continue_on_error,
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
@@ -227,6 +232,12 @@ def main():
         type=int,
         default=60,
         help="Seconds to wait between retries (default: 60)",
+    )
+    parser.add_argument(
+        "--retry-timeout-increase",
+        type=int,
+        default=600,
+        help="Additional timeout in seconds when retry is enabled (default: 600)",
     )
     args = parser.parse_args()
 
