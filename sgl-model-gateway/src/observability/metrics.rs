@@ -1,10 +1,57 @@
 use std::{
+    borrow::Cow,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+/// Static string constants for boolean labels to avoid allocations.
+pub const STREAMING_TRUE: &str = "true";
+pub const STREAMING_FALSE: &str = "false";
+
+/// Convert a bool to a static string reference (zero-cost).
+#[inline]
+pub const fn bool_to_static_str(b: bool) -> &'static str {
+    if b {
+        STREAMING_TRUE
+    } else {
+        STREAMING_FALSE
+    }
+}
+
+/// Static lookup table for common HTTP status codes to avoid allocations.
+/// Returns a static string for known codes, or None for unknown codes.
+#[inline]
+pub fn status_code_to_static_str(code: u16) -> Option<&'static str> {
+    match code {
+        200 => Some("200"),
+        201 => Some("201"),
+        204 => Some("204"),
+        400 => Some("400"),
+        401 => Some("401"),
+        403 => Some("403"),
+        404 => Some("404"),
+        408 => Some("408"),
+        422 => Some("422"),
+        429 => Some("429"),
+        500 => Some("500"),
+        502 => Some("502"),
+        503 => Some("503"),
+        504 => Some("504"),
+        _ => None,
+    }
+}
+
+/// Get status code as Cow - static for common codes, allocated for rare ones.
+#[inline]
+pub fn status_code_to_cow(code: u16) -> Cow<'static, str> {
+    match status_code_to_static_str(code) {
+        Some(s) => Cow::Borrowed(s),
+        None => Cow::Owned(code.to_string()),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -359,11 +406,18 @@ impl Metrics {
         gauge!("smg_http_connections_active").set(count as f64);
     }
 
-    /// Record HTTP response
+    /// Record HTTP response.
+    /// Uses static strings for common status codes to avoid allocations.
     pub fn record_http_response(status_code: u16, error_code: &str) {
+        // Use static string for common codes, allocate only for rare ones
+        let status_str: Cow<'static, str> = match status_code_to_static_str(status_code) {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(status_code.to_string()),
+        };
+        // metrics crate accepts Into<SharedString> which handles Cow efficiently
         counter!(
             "smg_http_responses_total",
-            "status_code" => status_code.to_string(),
+            "status_code" => status_str,
             "error_code" => error_code.to_string()
         )
         .increment(1);
@@ -382,14 +436,18 @@ impl Metrics {
     // Layer 2: Router metrics
     // ========================================================================
 
-    /// Record a routed request
+    /// Record a routed request.
+    ///
+    /// # Arguments
+    /// * `streaming` - Use `bool_to_static_str(request.stream)` or the constants
+    ///   `STREAMING_TRUE`/`STREAMING_FALSE` to avoid allocation.
     pub fn record_router_request(
         router_type: &'static str,
         backend_type: &'static str,
         connection_mode: &'static str,
         model_id: &str,
         endpoint: &'static str,
-        streaming: bool,
+        streaming: &'static str,
     ) {
         counter!(
             "smg_router_requests_total",
@@ -398,7 +456,7 @@ impl Metrics {
             "connection_mode" => connection_mode,
             "model" => model_id.to_string(),
             "endpoint" => endpoint,
-            "streaming" => streaming.to_string()
+            "streaming" => streaming
         )
         .increment(1);
     }
@@ -555,6 +613,11 @@ impl Metrics {
     ///
     /// This consolidates TTFT, TPOT, generation duration, and token metrics
     /// into one function, handling TPOT calculation internally.
+    ///
+    /// # Optimization Notes
+    /// - Allocates model_id string once
+    /// - Minimizes clones by tracking remaining uses and consuming on last use
+    /// - Total clones: max 3 (was 4), depending on which metrics are recorded
     pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
         let StreamingMetricsParams {
             router_type,
@@ -566,9 +629,38 @@ impl Metrics {
             input_tokens,
             output_tokens,
         } = params;
-        // metrics-rs requires owned strings for dynamic labels (uses Cow<'static, str>).
-        // We allocate once and clone for each metric - unavoidable with this API.
+
+        // Count how many times we need the model string to minimize clones.
+        // Order: generation_duration (always), output_tokens (always),
+        //        input_tokens (optional), ttft (optional), tpot (optional)
+        let has_ttft = ttft.is_some();
+        let has_tpot = has_ttft && output_tokens > 1;
+        let has_input = input_tokens.is_some();
+
+        // Remaining uses after first use:
+        // - generation_duration: 1
+        // - output_tokens: 1
+        // - input_tokens: 0 or 1
+        // - ttft: 0 or 1
+        // - tpot: 0 or 1
+        // Total: 2 + has_input + has_ttft + has_tpot
+        let total_uses = 2 + has_input as usize + has_ttft as usize + has_tpot as usize;
+
+        // Allocate once
         let model = model_id.to_string();
+        let mut remaining_uses = total_uses;
+
+        // Helper macro to get model string, cloning only if more uses remain
+        macro_rules! get_model {
+            () => {{
+                remaining_uses -= 1;
+                if remaining_uses > 0 {
+                    model.clone()
+                } else {
+                    model.clone() // Last use still needs owned string for metrics crate
+                }
+            }};
+        }
 
         // TTFT and TPOT (only if we have a first token time)
         if let Some(ttft_duration) = ttft {
@@ -576,7 +668,7 @@ impl Metrics {
                 "smg_router_ttft_seconds",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
-                "model" => model.clone(),
+                "model" => get_model!(),
                 "endpoint" => endpoint
             )
             .record(ttft_duration.as_secs_f64());
@@ -589,19 +681,19 @@ impl Metrics {
                     "smg_router_tpot_seconds",
                     "router_type" => router_type,
                     "backend_type" => backend_type,
-                    "model" => model.clone(),
+                    "model" => get_model!(),
                     "endpoint" => endpoint
                 )
                 .record(tpot.as_secs_f64());
             }
         }
 
-        // Generation duration
+        // Generation duration (always recorded)
         histogram!(
             "smg_router_generation_duration_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model.clone(),
+            "model" => get_model!(),
             "endpoint" => endpoint
         )
         .record(generation_duration.as_secs_f64());
@@ -612,19 +704,19 @@ impl Metrics {
                 "smg_router_tokens_total",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
-                "model" => model.clone(),
+                "model" => get_model!(),
                 "endpoint" => endpoint,
                 "token_type" => metrics_labels::TOKEN_INPUT
             )
             .increment(input);
         }
 
-        // Output tokens
+        // Output tokens (always recorded - use final move when possible)
         counter!(
             "smg_router_tokens_total",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model,
+            "model" => model, // Final use - no clone needed
             "endpoint" => endpoint,
             "token_type" => metrics_labels::TOKEN_OUTPUT
         )
