@@ -639,7 +639,7 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def log_stats(self, stats: SchedulerStats) -> None:
+    def log_stats(self, stats: SchedulerStats, is_decode_stats: bool = False) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
@@ -655,13 +655,16 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
-        self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+
+        if not is_decode_stats:
+            self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
 
         # Speculative decoding
-        self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
-        self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        if is_decode_stats:
+            self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+            self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
         self._log_gauge(
