@@ -119,6 +119,7 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     # LoRA
@@ -518,6 +519,19 @@ TWO_GPU_CASES_B = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+            num_gpus=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            num_gpus=2,
+            tp_size=2,
         ),
         T2I_sampling_params,
     ),
