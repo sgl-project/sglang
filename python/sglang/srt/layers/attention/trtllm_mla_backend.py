@@ -5,6 +5,7 @@ Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -25,6 +26,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
 
+USE_CUTE_MLA = os.getenv("SGLANG_ENABLE_CUTE_MLA", "0").lower() in ("1", "true", "yes")
+
 if is_flashinfer_available():
     import flashinfer
 
@@ -37,6 +40,12 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
+
+    if USE_CUTE_MLA:
+        from sglang.srt.layers.attention.cute_ops import (
+            CutePadDraftExtendQueryKernel,
+            CuteUnpadDraftExtendOutputKernel,
+        )
 
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
@@ -257,6 +266,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+
+        # Optional CuTe path for padding/unpadding
+        self._use_cute_mla = bool(USE_CUTE_MLA and _is_cuda)
+        if self._use_cute_mla:
+            self._cute_pad_kernel = CutePadDraftExtendQueryKernel()
+            self._cute_unpad_kernel = CuteUnpadDraftExtendOutputKernel()
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
@@ -716,11 +731,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_q: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
     ) -> torch.Tensor:
-        """Pad draft extended query using Triton kernel."""
+        """Pad draft extended query using Triton kernel or CuTe (env gated)."""
         batch_size = cu_seqlens_q.shape[0] - 1
         max_seq_len_q = padded_q.shape[1]
         num_heads = padded_q.shape[2]
         head_dim = padded_q.shape[3]
+
+        if self._use_cute_mla:
+            # CuTe path: launch Python CuTe kernel
+            self._cute_pad_kernel(
+                q=q,
+                padded_q=padded_q,
+                seq_lens_q=seq_lens_q,
+                cumsum=cu_seqlens_q,
+            )
+            return padded_q
 
         # Launch Triton kernel with 3D grid for parallelized head and dim processing
         BLOCK_SIZE = 64
@@ -748,7 +773,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_q: torch.Tensor,
         sum_seq_lens_q: int,
     ) -> torch.Tensor:
-        """Unpad draft extended output using Triton kernel."""
+        """Unpad draft extended output using Triton kernel or CuTe (env gated)."""
         # raw_out: (batch_size, token_per_batch, layer.tp_q_head_num, layer.v_head_dim)
         batch_size = seq_lens_q.shape[0]
         token_per_batch = raw_out.shape[1]  # max_seq_len
@@ -769,6 +794,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dtype=raw_out.dtype,
                 device=raw_out.device,
             )
+
+        if self._use_cute_mla:
+            self._cute_unpad_kernel(
+                raw_out=raw_out,
+                output=output,
+                accept_lengths=seq_lens_q,
+                cumsum=cu_seqlens_q,
+            )
+            return output[:total_tokens, :, :]
 
         # Launch Triton kernel with 3D grid for parallelized head and dim processing
         BLOCK_SIZE = 64
