@@ -222,7 +222,7 @@ class TestDeepseekV32_TP_MTP(CustomTestCase):
             _write_summary_table()
 
         self.assertGreater(acc_length, 2.5)
-        self.assertGreater(speed, 70)
+        self.assertGreater(speed, 110)
 
 
 def _format_optional_metric(value, fmt=".2f", suffix=""):
