@@ -141,7 +141,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        layer.num_experts = num_experts
         layer.params_dtype = params_dtype
 
         w13_weight = torch.nn.Parameter(
@@ -283,7 +282,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             w13_input_global_scale = (
                 layer.w13_input_global_scale.min()
                 .to(torch.float32)
-                .expand(layer.num_experts)
+                .expand(layer.num_local_experts)
             )
         else:
             w13_input_global_scale = layer.w13_input_global_scale.min(dim=1).values.to(
@@ -303,7 +302,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             w2_input_global_scale = (
                 layer.w2_input_global_scale.min()
                 .to(torch.float32)
-                .expand(layer.num_experts)
+                .expand(layer.num_local_experts)
             )
         else:
             w2_input_global_scale = layer.w2_input_global_scale
