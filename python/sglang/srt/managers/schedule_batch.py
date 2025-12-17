@@ -1762,11 +1762,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-            if len(retracted_reqs) == 0:
-                # Corner case: only one request left
-                raise ValueError(
-                    "Failed to retract any request. No space left for only one request."
-                )
+        if len(retracted_reqs) == 0 and not self.check_decode_mem(
+            selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+        ):
+            # Corner case: only one request left
+            raise ValueError(
+                "Failed to retract any request. No space left for only one request."
+            )
 
         self.filter_batch(keep_indices=sorted_indices)
 
