@@ -2219,11 +2219,15 @@ class ModelRunner:
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
-        if not self.server_args.enable_flashinfer_autotune:
+        if self.server_args.disable_flashinfer_autotune:
             return False
 
-        backend_str = self.server_args.attention_backend
-        if backend_str not in ["flashinfer", "trtllm_mla", "trtllm_mha"]:
+        backend_str = self.server_args.moe_runner_backend
+        if backend_str not in [
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_mxfp4",
+        ]:
             return False
 
         major, _ = torch.cuda.get_device_capability()
@@ -2301,6 +2305,7 @@ class ModelRunner:
             encoder_len_fill_value=0,
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
         )
         buffers.num_token_non_padded[...] = num_tokens
 
