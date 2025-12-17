@@ -11,6 +11,8 @@ import torch
 from comfy_api.input import VideoInput
 from PIL import Image
 
+import folder_paths
+
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -80,28 +82,13 @@ def is_empty_image(image: torch.Tensor, tolerance: float = 1e-6) -> bool:
 def get_image_path(image: torch.Tensor) -> str:
     """
     Save tensor image to ComfyUI temp directory as PNG and return the path.
-
-    The function prefers ComfyUI's temp directory (`folder_paths.get_temp_directory`),
-    falling back to a local `temp` folder under this package.
     """
-    # Resolve temp directory
-    temp_dir: Optional[str] = None
-    try:
-        import folder_paths
-
-        temp_dir = folder_paths.get_temp_directory()
-    except Exception:
-        pass
-
-    if not temp_dir:
-        temp_dir = os.path.join(os.path.dirname(__file__), "temp")
-
-    _ensure_dir(temp_dir)
+    temp_dir = folder_paths.get_temp_directory()
 
     # Build file name
     ts = time.strftime("%Y%m%d-%H%M%S")
     unique = uuid.uuid4().hex[:8]
-    file_name = f"sgl_input_{ts}_{unique}.png"
+    file_name = f"sgl_output_{ts}_{unique}.png"
     file_path = os.path.join(temp_dir, file_name)
 
     # Save image

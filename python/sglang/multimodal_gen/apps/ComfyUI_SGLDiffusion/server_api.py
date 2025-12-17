@@ -53,7 +53,7 @@ class SGLDiffusionServerAPI:
         """
         try:
             # Remove /v1 from base_url for /models endpoint
-            models_url = self.base_url.replace("/v1", "/models")
+            models_url = self.base_url.removesuffix("/v1") + "/models"
             response = requests.get(models_url, headers=self.headers, timeout=30)
             response.raise_for_status()
             return response.json()

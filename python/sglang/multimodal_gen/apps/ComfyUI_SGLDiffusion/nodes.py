@@ -67,7 +67,7 @@ class SGLDiffusionGenerateImage:
         return {
             "required": {
                 "sgld_client": ("SGLD_CLIENT",),
-                "positve_prompt": (
+                "positive_prompt": (
                     "STRING",
                     {
                         "default": "",
@@ -152,7 +152,7 @@ class SGLDiffusionGenerateImage:
     def generate_image(
         self,
         sgld_client: SGLDiffusionServerAPI,
-        positve_prompt: str,
+        positive_prompt: str,
         negative_prompt: str = "",
         image: torch.Tensor = None,
         seed: int = 1024,
@@ -163,14 +163,14 @@ class SGLDiffusionGenerateImage:
         enable_teacache: bool = False,
     ):
         """Generate image using SGLang Diffusion API."""
-        if not positve_prompt:
+        if not positive_prompt:
             raise ValueError("Prompt cannot be empty")
 
         size = f"{width}x{height}"
 
         # Prepare request parameters
         request_params = {
-            "prompt": positve_prompt,
+            "prompt": positive_prompt,
             "size": size,
             "response_format": "b64_json",
         }
@@ -218,7 +218,7 @@ class SGLDiffusionGenerateVideo:
         return {
             "required": {
                 "sgld_client": ("SGLD_CLIENT",),
-                "positve_prompt": (
+                "positive_prompt": (
                     "STRING",
                     {
                         "default": "",
@@ -330,7 +330,7 @@ class SGLDiffusionGenerateVideo:
     def generate_video(
         self,
         sgld_client: SGLDiffusionServerAPI,
-        positve_prompt: str,
+        positive_prompt: str,
         negative_prompt: str = "",
         image: torch.Tensor = None,
         seed: int = 1024,
@@ -344,7 +344,7 @@ class SGLDiffusionGenerateVideo:
         enable_teacache: bool = False,
     ):
         """Generate video using SGLang Diffusion API."""
-        if not positve_prompt:
+        if not positive_prompt:
             raise ValueError("Prompt cannot be empty")
 
         size = f"{width}x{height}"
@@ -352,7 +352,7 @@ class SGLDiffusionGenerateVideo:
 
         # Prepare request parameters
         request_params = {
-            "prompt": positve_prompt,
+            "prompt": positive_prompt,
             "size": size,
             "seconds": seconds,
             "fps": fps,
@@ -394,15 +394,6 @@ class SGLDiffusionGenerateVideo:
 
 class SGLDiffusionSetLora:
     """Node to set LoRA adapter for SGLang Diffusion server."""
-
-    def __init__(self):
-        self.target = "all"
-        self.sgld_client = None
-
-    def __del__(self):
-        if self.sgld_client:
-            self.sgld_client.unset_lora(target=self.target)
-            self.sgld_client = None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -455,10 +446,7 @@ class SGLDiffusionSetLora:
     ):
         """Set LoRA adapter using SGLang Diffusion API."""
         if lora_nickname == "":
-            lora_nickname = lora_name[:-4]
-
-        self.sgld_client = sgld_client
-        self.target = target
+            lora_nickname = os.path.splitext(lora_name)[0]
 
         # Prepare request parameters
         request_params = {
@@ -469,10 +457,54 @@ class SGLDiffusionSetLora:
 
         # Call API
         try:
-            response = self.sgld_client.set_lora(**request_params)
-            return (self.sgld_client,)
+            response = sgld_client.set_lora(**request_params)
+            return (sgld_client,)
         except Exception as e:
             raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
+
+
+class SGLDiffusionUnsetLora:
+    """Node to unset LoRA adapter for SGLang Diffusion server."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sgld_client": ("SGLD_CLIENT",),
+            },
+            "optional": {
+                "target": (
+                    [
+                        "all",
+                        "transformer",
+                        "transformer_2",
+                        "critic",
+                    ],
+                    {
+                        "default": "all",
+                        "tooltip": "Which transformer(s) to unset the LoRA from",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("SGLD_CLIENT",)
+    RETURN_NAMES = ("sgld_client",)
+    FUNCTION = "unset_lora"
+    CATEGORY = "SGLDiffusion"
+    OUTPUT_NODE = False
+
+    def unset_lora(
+        self,
+        sgld_client: SGLDiffusionServerAPI,
+        target: str = "all",
+    ):
+        """Unset LoRA adapter using SGLang Diffusion API."""
+        try:
+            response = sgld_client.unset_lora(target=target)
+            return (sgld_client,)
+        except Exception as e:
+            raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
 
 
 # Register nodes
@@ -481,6 +513,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
     "SGLDiffusionSetLora": SGLDiffusionSetLora,
+    "SGLDiffusionUnsetLora": SGLDiffusionUnsetLora,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -488,4 +521,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionGenerateImage": "SGLDiffusion Generate Image",
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
     "SGLDiffusionSetLora": "SGLDiffusion Set LoRA",
+    "SGLDiffusionUnsetLora": "SGLDiffusion Unset LoRA",
 }

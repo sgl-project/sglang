@@ -20,7 +20,7 @@ Before using this plugin, you need to start the SGLang Diffusion server. The plu
 3. **Generate Content**: Use the generation nodes to create images or videos:
    - `SGLDiffusion Generate Image`: For text-to-image and image editing
    - `SGLDiffusion Generate Video`: For text-to-video and image-to-video
-4. **Optional**: Use `SGLDiffusion Set LoRA` to load LoRA adapters for style customization
+4. **Optional**: Use `SGLDiffusion Set LoRA` to load LoRA adapters for style customization, use `SGLDiffusion Unset LoRA` to remove LoRA
 
 ### Example Workflows
 
