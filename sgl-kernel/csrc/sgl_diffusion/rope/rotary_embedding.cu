@@ -26,6 +26,123 @@
 
 #include "utils.h"
 
+// -------------------------------------------------------------------------
+// Helper structures and functions for manual pipeline interleaving
+// -------------------------------------------------------------------------
+
+template <typename scalar_t, bool interleaved>
+struct RotaryVecData;
+
+template <typename scalar_t>
+struct RotaryVecData<scalar_t, true> {
+  float4 vec;
+  float2 cos_vec;
+  float2 sin_vec;
+};
+
+template <typename scalar_t>
+struct RotaryVecData<scalar_t, false> {
+  float4 vec_x;
+  float4 vec_y;
+  float4 cos_x;
+  float4 sin_x;
+  float4 cos_y;
+  float4 sin_y;
+};
+
+template <typename scalar_t, bool interleaved>
+inline __device__ RotaryVecData<scalar_t, interleaved> load_rotary_vec(
+    const scalar_t* __restrict__ arr,
+    const scalar_t* __restrict__ cos_ptr,
+    const scalar_t* __restrict__ sin_ptr,
+    int rot_offset,
+    int embed_dim) {
+  RotaryVecData<scalar_t, interleaved> data;
+  if constexpr (interleaved) {
+    data.vec = *reinterpret_cast<const float4*>(arr + rot_offset * 2);
+    data.cos_vec = *reinterpret_cast<const float2*>(cos_ptr + rot_offset);
+    data.sin_vec = *reinterpret_cast<const float2*>(sin_ptr + rot_offset);
+  } else {
+    data.vec_x = *reinterpret_cast<const float4*>(arr + rot_offset);
+    data.vec_y = *reinterpret_cast<const float4*>(arr + rot_offset + embed_dim);
+    data.cos_x = *reinterpret_cast<const float4*>(cos_ptr + rot_offset);
+    data.sin_x = *reinterpret_cast<const float4*>(sin_ptr + rot_offset);
+    data.cos_y = *reinterpret_cast<const float4*>(cos_ptr + rot_offset + embed_dim);
+    data.sin_y = *reinterpret_cast<const float4*>(sin_ptr + rot_offset + embed_dim);
+  }
+  return data;
+}
+
+template <typename scalar_t, bool interleaved>
+inline __device__ void compute_store_rotary_vec(
+    scalar_t* __restrict__ arr, const RotaryVecData<scalar_t, interleaved>& data, int rot_offset, int embed_dim) {
+  constexpr int kVecBytes = 16;
+  constexpr int kElePerVec = kVecBytes / sizeof(scalar_t);
+
+  if constexpr (interleaved) {
+    union VecUnion {
+      float4 vec;
+      scalar_t elems[kElePerVec];
+    };
+    union CosSinVec {
+      float2 vec;
+      scalar_t elems[kElePerVec / 2];
+    };
+
+    VecUnion v;
+    v.vec = data.vec;
+    CosSinVec c, s;
+    c.vec = data.cos_vec;
+    s.vec = data.sin_vec;
+
+#pragma unroll
+    for (int i = 0; i < kElePerVec; i += 2) {
+      int idx = i / 2;
+      float cos_val = static_cast<float>(c.elems[idx]);
+      float sin_val = static_cast<float>(s.elems[idx]);
+      float x = static_cast<float>(v.elems[i]);
+      float y = static_cast<float>(v.elems[i + 1]);
+      v.elems[i] = static_cast<scalar_t>(x * cos_val - y * sin_val);
+      v.elems[i + 1] = static_cast<scalar_t>(y * cos_val + x * sin_val);
+    }
+    *reinterpret_cast<float4*>(arr + rot_offset * 2) = v.vec;
+
+  } else {
+    union VecUnion {
+      float4 vec;
+      scalar_t elems[kElePerVec];
+    };
+    union CosSinVec {
+      float4 vec;
+      scalar_t elems[kElePerVec];
+    };
+
+    VecUnion vx, vy;
+    vx.vec = data.vec_x;
+    vy.vec = data.vec_y;
+    CosSinVec cx, sx, cy, sy;
+    cx.vec = data.cos_x;
+    sx.vec = data.sin_x;
+    cy.vec = data.cos_y;
+    sy.vec = data.sin_y;
+
+#pragma unroll
+    for (int i = 0; i < kElePerVec; ++i) {
+      float cos_val_x = static_cast<float>(cx.elems[i]);
+      float sin_val_x = static_cast<float>(sx.elems[i]);
+      float cos_val_y = static_cast<float>(cy.elems[i]);
+      float sin_val_y = static_cast<float>(sy.elems[i]);
+      float x = static_cast<float>(vx.elems[i]);
+      float y = static_cast<float>(vy.elems[i]);
+
+      vx.elems[i] = static_cast<scalar_t>(x * cos_val_x - y * sin_val_x);
+      vy.elems[i] = static_cast<scalar_t>(y * cos_val_y + x * sin_val_y);
+    }
+    *reinterpret_cast<float4*>(arr + rot_offset) = vx.vec;
+    *reinterpret_cast<float4*>(arr + rot_offset + embed_dim) = vy.vec;
+  }
+}
+
 template <typename scalar_t, bool interleaved>
 inline __device__ void apply_token_rotary_embedding(
     scalar_t* __restrict__ arr,            // [head_size]
@@ -234,27 +351,82 @@ __global__ void rotary_embedding_kernel_2d(
     constexpr int pairs_per_step = interleaved ? (kElePerVec / 2) : kElePerVec;
 
     const int pair_stride = blockDim.x * blocks_per_token * pairs_per_step;
-    const int thread_pair_offset = (local_block_idx * blockDim.x + threadIdx.x) * pairs_per_step;
+    int i = (local_block_idx * blockDim.x + threadIdx.x) * pairs_per_step;
     const int nq_pairs = num_heads * embed_dim_for_rotation;
 
-    for (int i = thread_pair_offset; i < nq_pairs; i += pair_stride) {
-      const int head_idx = i / embed_dim_for_rotation;
-      const int rot_offset = i % embed_dim_for_rotation;
+    // PROLOGUE: Preload 0-th batch
+    RotaryVecData<scalar_t, interleaved> curr_data;
+    if (i < nq_pairs) {
+      int head_idx = i / embed_dim_for_rotation;
+      int rot_offset = i % embed_dim_for_rotation;
+      scalar_t* ptr = query_for_token + head_idx * (int)head_stride_query;
+      curr_data = load_rotary_vec<scalar_t, interleaved>(
+          ptr, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+    }
 
-      scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
-      apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-          query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+    int next_i = i + pair_stride;
+
+    // MAIN LOOP
+    for (; i < nq_pairs; i += pair_stride, next_i += pair_stride) {
+      // 1. PREFETCH NEXT
+      RotaryVecData<scalar_t, interleaved> next_data;
+      bool active_next = (next_i < nq_pairs);
+      if (active_next) {
+        int head_idx_next = next_i / embed_dim_for_rotation;
+        int rot_offset_next = next_i % embed_dim_for_rotation;
+        scalar_t* ptr_next = query_for_token + head_idx_next * (int)head_stride_query;
+        next_data = load_rotary_vec<scalar_t, interleaved>(
+            ptr_next, current_token_cos_ptr, current_token_sin_ptr, rot_offset_next, embed_dim_for_rotation);
+      }
+
+      // 2. COMPUTE CURRENT
+      // The compute uses curr_data which corresponds to index 'i'
+      int head_idx = i / embed_dim_for_rotation;
+      int rot_offset = i % embed_dim_for_rotation;
+      scalar_t* ptr = query_for_token + head_idx * (int)head_stride_query;
+      compute_store_rotary_vec<scalar_t, interleaved>(ptr, curr_data, rot_offset, embed_dim_for_rotation);
+
+      // 3. SHIFT
+      curr_data = next_data;
     }
 
     if (key_for_token != nullptr) {
       const int nk_pairs = num_kv_heads * embed_dim_for_rotation;
-      for (int i = thread_pair_offset; i < nk_pairs; i += pair_stride) {
-        const int head_idx = i / embed_dim_for_rotation;
-        const int rot_offset = i % embed_dim_for_rotation;
+      int k_i = (local_block_idx * blockDim.x + threadIdx.x) * pairs_per_step;
 
-        scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
-        apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-            key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+      // PROLOGUE (Key)
+      RotaryVecData<scalar_t, interleaved> curr_data_k;
+      if (k_i < nk_pairs) {
+        int head_idx = k_i / embed_dim_for_rotation;
+        int rot_offset = k_i % embed_dim_for_rotation;
+        scalar_t* ptr = key_for_token + head_idx * (int)head_stride_key;
+        curr_data_k = load_rotary_vec<scalar_t, interleaved>(
+            ptr, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+      }
+
+      int next_k_i = k_i + pair_stride;
+
+      // MAIN LOOP (Key)
+      for (; k_i < nk_pairs; k_i += pair_stride, next_k_i += pair_stride) {
+        // 1. PREFETCH NEXT
+        RotaryVecData<scalar_t, interleaved> next_data_k;
+        bool active_next = (next_k_i < nk_pairs);
+        if (active_next) {
+          int head_idx_next = next_k_i / embed_dim_for_rotation;
+          int rot_offset_next = next_k_i % embed_dim_for_rotation;
+          scalar_t* ptr_next = key_for_token + head_idx_next * (int)head_stride_key;
+          next_data_k = load_rotary_vec<scalar_t, interleaved>(
+              ptr_next, current_token_cos_ptr, current_token_sin_ptr, rot_offset_next, embed_dim_for_rotation);
+        }
+
+        // 2. COMPUTE CURRENT
+        int head_idx = k_i / embed_dim_for_rotation;
+        int rot_offset = k_i % embed_dim_for_rotation;
+        scalar_t* ptr = key_for_token + head_idx * (int)head_stride_key;
+        compute_store_rotary_vec<scalar_t, interleaved>(ptr, curr_data_k, rot_offset, embed_dim_for_rotation);
+
+        // 3. SHIFT
+        curr_data_k = next_data_k;
       }
     }
   } else {
@@ -288,7 +460,7 @@ __global__ void rotary_embedding_kernel_2d(
 
 // 1D grid kernel: each block handles one token
 template <typename scalar_t, bool interleaved, bool vectorized, int ROT_EMBED_DIM>
-__global__ void rotary_embedding_kernel_1d(
+__launch_bounds__(512) __global__ void rotary_embedding_kernel_1d(
     const scalar_t* __restrict__ cos_data,  // [num_tokens, rot_dim_arg]
     const scalar_t* __restrict__ sin_data,  // [num_tokens, rot_dim_arg]
     scalar_t* __restrict__ query_total,
@@ -322,29 +494,101 @@ __global__ void rotary_embedding_kernel_1d(
   const int embed_dim_for_rotation = (ROT_EMBED_DIM > 0) ? ROT_EMBED_DIM : embed_dim_for_rotation_arg;
 
   if constexpr (vectorized) {
-    using vec_t = float4;
+    constexpr int kVecBytes = 16;
     constexpr int kElePerVec = kVecBytes / sizeof(scalar_t);
+    // Interleaved: 1 vec = kElePerVec elements = kElePerVec/2 pairs
+    // Non-Interleaved: 1 vec (X) + 1 vec (Y) = kElePerVec elements = kElePerVec pairs
     constexpr int pairs_per_step = interleaved ? (kElePerVec / 2) : kElePerVec;
-
     const int nq_pairs = num_heads * embed_dim_for_rotation;
-    for (int i = threadIdx.x * pairs_per_step; i < nq_pairs; i += blockDim.x * pairs_per_step) {
-      const int head_idx = i / embed_dim_for_rotation;
-      const int rot_offset = i % embed_dim_for_rotation;
-      scalar_t* query_for_token_head = query_for_token + head_idx * (int)head_stride_query;
 
-      apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-          query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+    // Original Stride
+    const int stride = blockDim.x * pairs_per_step;
+
+    int i = threadIdx.x * pairs_per_step;
+
+    // ==========================================
+    // PROLOGUE: Preload first batch
+    // ==========================================
+    RotaryVecData<scalar_t, interleaved> curr_data;
+
+    if (i < nq_pairs) {
+      int head_idx = i / embed_dim_for_rotation;
+      int rot_offset = i % embed_dim_for_rotation;
+      scalar_t* ptr = query_for_token + head_idx * (int)head_stride_query;
+      curr_data = load_rotary_vec<scalar_t, interleaved>(
+          ptr, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
     }
 
+    int next_i = i + stride;
+
+    // ==========================================
+    // MAIN LOOP
+    // ==========================================
+    for (; i < nq_pairs; i += stride, next_i += stride) {
+      // --- 1. PREFETCH NEXT BATCH ---
+      RotaryVecData<scalar_t, interleaved> next_data;
+
+      if (next_i < nq_pairs) {
+        int head_idx = next_i / embed_dim_for_rotation;
+        int rot_offset = next_i % embed_dim_for_rotation;
+        scalar_t* ptr = query_for_token + head_idx * (int)head_stride_query;
+        next_data = load_rotary_vec<scalar_t, interleaved>(
+            ptr, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+      }
+
+      // --- 2. COMPUTE CURRENT BATCH ---
+      if (i < nq_pairs) {
+        int head_idx = i / embed_dim_for_rotation;
+        int rot_offset = i % embed_dim_for_rotation;
+        scalar_t* ptr = query_for_token + head_idx * (int)head_stride_query;
+        compute_store_rotary_vec<scalar_t, interleaved>(ptr, curr_data, rot_offset, embed_dim_for_rotation);
+      }
+
+      // --- 3. SHIFT ---
+      curr_data = next_data;
+    }
+
+    // Key branch
     if (key_for_token != nullptr) {
       const int nk_pairs = num_kv_heads * embed_dim_for_rotation;
-      for (int i = threadIdx.x * pairs_per_step; i < nk_pairs; i += blockDim.x * pairs_per_step) {
-        const int head_idx = i / embed_dim_for_rotation;
-        const int rot_offset = i % embed_dim_for_rotation;
+      int k_i = threadIdx.x * pairs_per_step;
 
-        scalar_t* key_for_token_head = key_for_token + head_idx * (int)head_stride_key;
-        apply_token_rotary_embedding_vec<scalar_t, interleaved>(
-            key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+      // PROLOGUE (Key): Preload first batch
+      RotaryVecData<scalar_t, interleaved> curr_data_k;
+
+      if (k_i < nk_pairs) {
+        int head_idx = k_i / embed_dim_for_rotation;
+        int rot_offset = k_i % embed_dim_for_rotation;
+        scalar_t* ptr = key_for_token + head_idx * (int)head_stride_key;
+        curr_data_k = load_rotary_vec<scalar_t, interleaved>(
+            ptr, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+      }
+
+      int next_k_i = k_i + stride;
+
+      // MAIN LOOP (Key)
+      for (; k_i < nk_pairs; k_i += stride, next_k_i += stride) {
+        // --- 1. PREFETCH NEXT BATCH ---
+        RotaryVecData<scalar_t, interleaved> next_data_k;
+
+        if (next_k_i < nk_pairs) {
+          int head_idx = next_k_i / embed_dim_for_rotation;
+          int rot_offset = next_k_i % embed_dim_for_rotation;
+          scalar_t* ptr = key_for_token + head_idx * (int)head_stride_key;
+          next_data_k = load_rotary_vec<scalar_t, interleaved>(
+              ptr, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+        }
+
+        // --- 2. COMPUTE CURRENT BATCH ---
+        if (k_i < nk_pairs) {
+          int head_idx = k_i / embed_dim_for_rotation;
+          int rot_offset = k_i % embed_dim_for_rotation;
+          scalar_t* ptr = key_for_token + head_idx * (int)head_stride_key;
+          compute_store_rotary_vec<scalar_t, interleaved>(ptr, curr_data_k, rot_offset, embed_dim_for_rotation);
+        }
+
+        // --- 3. SHIFT ---
+        curr_data_k = next_data_k;
       }
     }
   } else {

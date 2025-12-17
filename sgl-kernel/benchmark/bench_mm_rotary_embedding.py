@@ -63,6 +63,7 @@ def benchmark_mm_rotary_embedding() -> None:
         (1, 32, 1, 128),
         (32, 8, 8, 128),
         (1, 32, 8, 80),
+        (1, 64, 8, 256),
     ]
 
     for batch_size, num_heads, num_kv_heads, head_size in configs:
