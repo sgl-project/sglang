@@ -2,6 +2,7 @@ import unittest
 
 from nightly_utils import NightlyBenchmarkRunner
 
+from sglang.bench_tool_call import get_parser_for_model
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
@@ -33,27 +34,41 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.runner.setup_profile_directory()
 
     def test_bench_one_batch(self):
-        all_model_succeed = True
+        all_perf_succeed = True
+        all_tool_call_succeed = True
 
         for model_setup in self.models:
             with self.subTest(model=model_setup.model_path):
-                results, success = self.runner.run_benchmark_for_model(
-                    model_path=model_setup.model_path,
-                    batch_sizes=self.batch_sizes,
-                    input_lens=self.input_lens,
-                    output_lens=self.output_lens,
-                    other_args=model_setup.extra_args,
+                # Get parser for this model (if supported)
+                parser = get_parser_for_model(model_setup.model_path)
+                parser_name = parser.value if parser else None
+
+                # Run combined perf + tool call benchmark (single server launch)
+                perf_results, tool_results, perf_ok, tool_ok = (
+                    self.runner.run_perf_and_tool_call_benchmark(
+                        model_path=model_setup.model_path,
+                        batch_sizes=self.batch_sizes,
+                        input_lens=self.input_lens,
+                        output_lens=self.output_lens,
+                        other_args=model_setup.extra_args,
+                        tool_call_parser=parser_name,
+                    )
                 )
 
-                if not success:
-                    all_model_succeed = False
+                if not perf_ok:
+                    all_perf_succeed = False
+                if not tool_ok:
+                    all_tool_call_succeed = False
 
-                self.runner.add_report(results)
+                self.runner.add_report(perf_results)
+                if tool_results:
+                    self.runner.add_tool_call_report(tool_results)
 
         self.runner.write_final_report()
 
-        if not all_model_succeed:
-            raise AssertionError("Some models failed the perf tests.")
+        # Fail at end if ANY test failed
+        if not all_perf_succeed or not all_tool_call_succeed:
+            raise AssertionError("Some benchmarks failed (perf or tool call).")
 
 
 if __name__ == "__main__":
