@@ -43,9 +43,9 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         if hasattr(server_args, "non_dit_ranks") and server_args.non_dit_ranks:
             non_dit_ranks = server_args.non_dit_ranks
         else:
-            # Default assumption based on current logic
-            # This assumes 1 non-dit rank and N-1 dit ranks
-            non_dit_ranks = [world_size - server_args.num_non_dit_ranks]
+            # Non-DiT ranks are the LAST ranks in the world
+            # E.g., if world_size=5 and num_non_dit_ranks=1, non_dit_ranks=[4]
+            non_dit_ranks = list(range(world_size - server_args.num_non_dit_ranks, world_size))
         dit_ranks = [r for r in range(world_size) if r not in non_dit_ranks]
 
         self.non_dit_master_rank = non_dit_ranks[0]

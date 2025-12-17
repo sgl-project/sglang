@@ -553,7 +553,8 @@ def initialize_model_parallel(
 
     if enable_disagg:
         # First, create trivial Non-DiT sequence parallel groups
-        for i in range(num_non_dit_ranks):
+        # Non-DiT ranks are the LAST ranks: [world_size - num_non_dit_ranks, ..., world_size-1]
+        for i in range(world_size - num_non_dit_ranks, world_size):
             non_dit_ulysses_group = torch.distributed.new_group([i])
             non_dit_ring_group = torch.distributed.new_group([i])
             if current_rank == i:
@@ -561,8 +562,9 @@ def initialize_model_parallel(
                 PROCESS_GROUP.RING_PG = non_dit_ring_group
 
         # Then, create DiT sequence parallel groups with offset
+        # DiT ranks are the FIRST ranks: [0, 1, ..., world_size - num_non_dit_ranks - 1]
         dit_world_size = world_size - num_non_dit_ranks
-        rank_offset = num_non_dit_ranks
+        rank_offset = 0  # Dit ranks start at 0, no offset needed
 
         sp_degree = orig_ring_degree * orig_ulysses_degree
         dp_degree = dit_world_size // sp_degree
