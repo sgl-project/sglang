@@ -20,16 +20,38 @@ pip3 install sgl-kernel --upgrade
 ```
 
 ## Building from Source
+
+### CUDA (NVIDIA GPUs)
 Requires
 - CMake ≥3.31,
 - Python ≥3.10
 - scikit-build-core
 - ninja(optional)
 
-### Use Makefile to build sgl-kernel
-
 ```bash
 make build
+```
+
+### ROCm (AMD GPUs)
+
+For AMD GPUs with ROCm, use the dedicated setup script:
+
+```bash
+cd sgl-kernel
+
+# Install in development mode
+python setup_rocm.py develop
+
+# Or build a wheel
+python setup_rocm.py bdist_wheel
+```
+
+**Supported GPU architectures:** gfx942, gfx950
+
+The build automatically detects your GPU architecture. To manually specify:
+
+```bash
+AMDGPU_TARGET=gfx942 python setup_rocm.py develop
 ```
 
 ## Contribution
@@ -100,7 +122,36 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
    - Incorporation of PDL (Programmatic Dependent Launch) effects into individual kernel results
    - More realistic performance data on PDL-supported architectures (SM >= 90)
 
-3. Run test suite
+3. Run test suite:
+
+```bash
+# Run all tests
+cd sgl-kernel
+pytest tests/ -v
+
+# Run specific test
+pytest tests/test_activation.py -v
+```
+
+### ROCm/AMD-specific Tests
+
+For AMD GPUs, there are specific tests for deterministic all-reduce:
+
+```bash
+# Test deterministic custom all-reduce kernel (requires 2+ GPUs)
+python tests/test_amd_deterministic_custom_allreduce.py
+
+# Test NCCL all-reduce determinism behavior (requires 2+ GPUs)
+python tests/test_amd_nccl_allreduce_determinism.py
+
+# Benchmark deterministic all-reduce vs standard all-reduce
+python benchmark/bench_amd_deterministic_allreduce.py
+```
+
+These tests verify:
+- **test_amd_deterministic_custom_allreduce.py**: Tests that the deterministic custom all-reduce kernel produces consistent results across different batch sizes
+- **test_amd_nccl_allreduce_determinism.py**: Tests NCCL all-reduce behavior to demonstrate non-determinism with varying batch sizes
+- **bench_amd_deterministic_allreduce.py**: Benchmarks latency comparison between all-reduce methods
 
 ## Kernel Size Analysis
 
