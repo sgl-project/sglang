@@ -88,3 +88,4 @@ For intelligent routing between local Ollama (fast) and remote SGLang (powerful)
 |-----------|---------|
 | **Ollama API** | Familiar CLI/API that developers already know |
 | **SGLang Backend** | High-performance inference engine |
+| **Smart Router** | Intelligent routing - fast local for simple tasks, powerful remote for complex tasks |
