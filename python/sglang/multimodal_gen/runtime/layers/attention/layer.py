@@ -112,6 +112,16 @@ class UlyssesAttention(nn.Module):
         local_rank = get_sp_parallel_rank()
         world_size = get_sp_world_size()
 
+        # Debug: Print SP group info once
+        import torch.distributed as dist
+
+        if not hasattr(self, "_debug_printed"):
+            self._debug_printed = True
+            global_rank = dist.get_rank() if dist.is_initialized() else 0
+            print(
+                f"  [Attention Debug] Global rank={global_rank}, SP local_rank={local_rank}, SP world_size={world_size}"
+            )
+
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 

@@ -88,6 +88,18 @@ class LatentPreparationStage(PipelineStage):
                 shape, generator=generator, device=device, dtype=dtype
             )
 
+            # Debug: Check generated noise
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(f"  [LatentPreparationStage Rank {rank}] Generated initial noise:")
+            print(
+                f"    shape={latents.shape}, sum={latents.sum().item():.6f}, mean={latents.mean().item():.6f}, std={latents.std().item():.6f}"
+            )
+            print(
+                f"    generator={type(generator).__name__}, device={device}, dtype={dtype}"
+            )
+
             latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
 
             if latent_ids is not None:
@@ -102,6 +114,16 @@ class LatentPreparationStage(PipelineStage):
         # Scale the initial noise if needed
         if hasattr(self.scheduler, "init_noise_sigma"):
             latents = latents * self.scheduler.init_noise_sigma
+            # Debug: Check after scaling
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(
+                f"  [LatentPreparationStage Rank {rank}] After scaling by init_noise_sigma={self.scheduler.init_noise_sigma:.6f}:"
+            )
+            print(
+                f"    sum={latents.sum().item():.6f}, mean={latents.mean().item():.6f}, std={latents.std().item():.6f}"
+            )
         # Update batch with prepared latents
         batch.latents = latents
         batch.raw_latent_shape = latents.shape

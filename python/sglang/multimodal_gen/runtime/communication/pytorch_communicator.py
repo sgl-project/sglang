@@ -134,6 +134,11 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         if group is None:
             return
 
+        # Check group size - if only 1 member, no need to broadcast
+        group_size = dist.get_world_size(group=group)
+        if group_size == 1:
+            return
+
         # We need to translate group-relative src rank to global rank for dist.broadcast
         # Wait, dist.broadcast(group=group) usually expects the `src` to be the GLOBAL rank
         # of the broadcaster.

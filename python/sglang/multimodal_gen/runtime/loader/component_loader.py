@@ -740,7 +740,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             use_runai_model_streamer=use_runai_model_streamer,
-            # process_group=process_group, # TODO: Pass process group to FSDP loader
+            process_group=process_group,  # Pass process group for disagg mode
         )
 
         total_params = sum(p.numel() for p in model.parameters())

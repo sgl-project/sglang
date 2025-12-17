@@ -14,7 +14,6 @@ from enum import IntEnum, auto
 from typing import Any, Optional, cast
 
 import torch
-import torch.distributed as dist  # Added import
 from tqdm import tqdm
 
 from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
@@ -24,7 +23,7 @@ from sglang.multimodal_gen.runtime.loader.component_loader import (
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -255,7 +254,18 @@ class ComposedPipelineBase(ABC):
 
         comm = get_disagg_communicator()
 
+        # Debug: Log disagg status
+        if server_args.enable_disagg and comm is not None:
+            import torch.distributed as dist
+
+            logger.info(
+                f"[Disagg Module Loading] Rank {dist.get_rank()}: "
+                f"role={comm.role}, is_dit={comm.is_dit_rank()}, "
+                f"dit_master={comm.dit_master_rank}, non_dit_master={comm.non_dit_master_rank}"
+            )
+
         def should_load_module(module_name: str) -> bool:
+            return True
             if not server_args.enable_disagg:
                 return True
 
@@ -270,9 +280,20 @@ class ComposedPipelineBase(ABC):
             is_denoising_required_modules = "transformer" in module_name
 
             if comm.is_dit_rank():
-                return is_denoising_required_modules
+                return True
+                should_load = is_denoising_required_modules
+                logger.info(
+                    f"[Disagg Module Loading] Rank {dist.get_rank()} (DiT): "
+                    f"module={module_name}, should_load={should_load}"
+                )
+                return should_load
             else:  # Non-DiT rank
-                return not is_denoising_required_modules
+                should_load = not is_denoising_required_modules
+                logger.info(
+                    f"[Disagg Module Loading] Rank {dist.get_rank()} (Non-DiT): "
+                    f"module={module_name}, should_load={should_load}"
+                )
+                return should_load
 
         def get_loading_process_group() -> Optional[dist.ProcessGroup]:
             if not server_args.enable_disagg or comm is None:
@@ -338,26 +359,41 @@ class ComposedPipelineBase(ABC):
                     )
 
         # load configs into server_args, in disagg mode
-        for module_name, (
-            transformers_or_diffusers,
-            _,
-        ) in model_index.items():
-            load_module_name, component_model_path = self.adjust_module_path(
-                module_name, server_args
-            )
-            # this will make updates to server_args.pipeline_config
-            _ = PipelineComponentLoader.load_config(
-                load_module_name,
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
-            )
+        # for module_name, (
+        #     transformers_or_diffusers,
+        #     _,
+        # ) in model_index.items():
+        #     load_module_name, component_model_path = self.adjust_module_path(
+        #         module_name, server_args
+        #     )
+        #     # this will make updates to server_args.pipeline_config
+        #     _ = PipelineComponentLoader.load_config(
+        #         load_module_name,
+        #         component_model_path=component_model_path,
+        #         transformers_or_diffusers=transformers_or_diffusers,
+        #         server_args=server_args,
+        #     )
 
         model_index = {
             module_name: v
             for module_name, v in model_index.items()
             if should_load_module(module_name)
         }
+
+        # In disagg mode, set model_loaded to False for modules that are NOT being loaded
+        # This ensures delayed loading logic works correctly
+        # if server_args.enable_disagg:
+        #     all_modules = set(self.required_config_modules)
+        #     loaded_modules_set = set(model_index.keys())
+        #     for module_name in all_modules:
+        #         if module_name not in loaded_modules_set:
+        #             if module_name in server_args.model_loaded:
+        #                 server_args.model_loaded[module_name] = False
+        #                 logger.info(
+        #                     f"[Disagg Mode] Rank {dist.get_rank()}: Setting model_loaded['{module_name}'] = False (not loading on this rank)",
+        #                     main_process_only=False,
+        #                 )
+
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading modules: %s", model_index, main_process_only=False)
@@ -432,7 +468,7 @@ class ComposedPipelineBase(ABC):
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Generate a video or image using the pipeline.
 

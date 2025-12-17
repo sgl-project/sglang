@@ -118,33 +118,64 @@ def maybe_load_fsdp_model(
         use_fsdp = False
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
-    if use_fsdp:
-        world_size = hsdp_replicate_dim * hsdp_shard_dim
-        if not fsdp_inference:
-            hsdp_replicate_dim = world_size
-            hsdp_shard_dim = 1
+    # Disable FSDP in disagg mode (temporary workaround)
+    from sglang.multimodal_gen.runtime.distributed.dist_utils import (
+        get_disagg_communicator,
+    )
 
-        device_mesh = init_device_mesh(
-            current_platform.device_type,
-            # (Replicate(), Shard(dim=0))
-            mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
-            mesh_dim_names=("replicate", "shard"),
+    disagg_comm = get_disagg_communicator()
+    if disagg_comm is not None:
+        if use_fsdp:
+            logger.warning(
+                "Disabling FSDP in disaggregation mode due to device mesh incompatibility. "
+                "FSDP requires global world size but disagg mode uses sub-groups."
+            )
+        use_fsdp = False
+
+    if use_fsdp:
+        # Check if we're in disagg mode
+        from sglang.multimodal_gen.runtime.distributed.dist_utils import (
+            get_disagg_communicator,
         )
 
-        # If process_group is provided, we should probably construct the device mesh using it?
-        # init_device_mesh does not accept a process_group, it creates one based on WORLD.
-        # This is tricky. If we are in disagg mode, hsdp_replicate_dim * hsdp_shard_dim
-        # should match the size of the *sub-group*, not the world.
-        # But init_device_mesh assumes global ranks.
+        disagg_comm = get_disagg_communicator()
+        is_disagg_mode = disagg_comm is not None
 
-        # FIX: If we have a custom process group, we CANNOT easily use init_device_mesh
-        # unless we are careful. But `shard_model` takes `mesh`.
-        # For now, let's assume standard FSDP sharding within the sub-group is handled
-        # by passing the correct mesh if possible, OR rely on simple FSDP without HSDP if simpler.
+        if is_disagg_mode and disagg_comm.is_dit_rank():
+            # In disagg mode, DiT ranks should use their sub-group size
+            # Get the actual DiT group ranks
+            dit_ranks = disagg_comm.dit_ranks
+            world_size = len(dit_ranks)
 
-        # Actually, if we are just doing simple FSDP (TP-like sharding), we can construct
-        # the mesh manually if needed, or if `init_device_mesh` is smart enough.
-        # But `init_device_mesh` works on global ranks.
+            logger.info(
+                f"[FSDP Disagg Mode] Rank {torch.distributed.get_rank()}: "
+                f"Using DiT sub-group size {world_size} instead of global world size. "
+                f"DiT ranks: {dit_ranks}"
+            )
+
+            # For disagg mode, we need to create device mesh using the DiT sub-group
+            # Create a device mesh with the DiT process group
+            device_mesh = init_device_mesh(
+                "cuda",
+                mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
+                mesh_dim_names=("replicate", "shard"),
+            )
+
+            # Note: init_device_mesh still uses global ranks, but we've adjusted
+            # the mesh_shape to match the DiT sub-group size
+        else:
+            # Non-disagg mode or Non-DiT rank: use standard world size
+            world_size = hsdp_replicate_dim * hsdp_shard_dim
+            if not fsdp_inference:
+                hsdp_replicate_dim = world_size
+                hsdp_shard_dim = 1
+
+            device_mesh = init_device_mesh(
+                current_platform.device_type,
+                # (Replicate(), Shard(dim=0))
+                mesh_shape=(hsdp_replicate_dim, hsdp_shard_dim),
+                mesh_dim_names=("replicate", "shard"),
+            )
 
         # If we are in disagg mode, the user (Rank 1..N) thinks they are a group of size N.
         # But `dist.get_world_size()` still returns global size.
@@ -170,19 +201,45 @@ def maybe_load_fsdp_model(
             process_group=process_group,
         )
 
+    # Debug: Log weight loading
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        logger.info(
+            f"[Weight Loading] Rank {dist.get_rank()}: "
+            f"Loading weights from {weight_dir_list}, "
+            f"use_fsdp={use_fsdp}, process_group={process_group is not None}"
+        )
+
     weight_iterator = safetensors_weights_iterator(
         weight_dir_list, use_runai_model_streamer=use_runai_model_streamer
     )
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+
+    # Count loaded parameters for debugging
+    loaded_params = 0
+
+    def counting_iterator(it):
+        nonlocal loaded_params
+        for item in it:
+            loaded_params += 1
+            yield item
+
     load_model_from_full_model_state_dict(
         model,
-        weight_iterator,
+        counting_iterator(weight_iterator),
         device,
         default_dtype,
         strict=True,
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
+
+    if dist.is_initialized():
+        logger.info(
+            f"[Weight Loading] Rank {dist.get_rank()}: "
+            f"Loaded {loaded_params} parameters"
+        )
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")

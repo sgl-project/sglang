@@ -508,6 +508,9 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+f = True
+
+
 class QwenImageTransformer2DModel(CachableDiT):
     """
     The Transformer model introduced in Qwen.
@@ -611,6 +614,24 @@ class QwenImageTransformer2DModel(CachableDiT):
             logger.warning(
                 "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
             )
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        global f
+        if rank == 0 and f:
+            print(
+                f"   shape={hidden_states.shape}, sum={hidden_states.sum().item():.6f}"
+            )
+            print(
+                f"   shape={encoder_hidden_states[0].shape}, sum={encoder_hidden_states[0].sum().item():.6f}"
+            )
+            # print(f"   shape={encoder_hidden_states_mask.shape}, sum={encoder_hidden_states_mask.sum().item():.6f}")
+            print(f"   shape={timestep.shape}, sum={timestep.sum().item():.6f}")
+            print(f"   {txt_seq_lens=}")
+            print(f"   {freqs_cis=}")
+            # print(f"   shape={guidance.shape}, sum={guidance.sum().item():.6f}")
+            print(f"   {attention_kwargs=}")
+            f = False
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]

@@ -2,6 +2,7 @@
 Pipeline executor for disaggregated execution.
 """
 
+import copy
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -74,6 +75,8 @@ class DisaggregatedExecutor(PipelineExecutor):
             denoise_start_idx = -1
             denoise_end_idx = -1
 
+            batch_cp = copy.deepcopy(batch)
+
             for i, stage in enumerate(stages):
                 if isinstance(stage, DenoisingStage):
                     if denoise_start_idx == -1:
@@ -82,7 +85,7 @@ class DisaggregatedExecutor(PipelineExecutor):
 
             if denoise_start_idx == -1:
                 logger.warning(
-                    "No denoising stage found! Running all on Non-DiT (fallback)."
+                    "No denoising stage found! Running all on DiT (fallback)."
                 )
                 # Fallback: Run everything on Non-DiT? Or maybe this is an image encoder only pipeline?
                 # For safety in this proof-of-concept, we assume standard diffusion.
@@ -178,6 +181,202 @@ class DisaggregatedExecutor(PipelineExecutor):
                     sys.stdout.flush()
                     raise
 
+            if self.comm.is_dit_rank():
+                for stage in pre_denoise_stages:
+                    print(
+                        f"[DiT Rank {dist.get_rank()}] Running stage: {stage.__class__.__name__}"
+                    )
+                    with Timer(stage.__class__.__name__):
+                        batch_cp = stage(batch_cp, server_args)
+
+                # ===== DEBUG: Compare batch vs batch_cp =====
+                print(f"\n{'='*80}")
+                print(
+                    f"[DiT Rank {dist.get_rank()}] COMPARING batch (from Non-DiT) vs batch_cp (generated locally)"
+                )
+                print(f"{'='*80}")
+
+                if hasattr(batch, "__dict__") and hasattr(batch_cp, "__dict__"):
+                    batch_keys = set(batch.__dict__.keys())
+                    batch_cp_keys = set(batch_cp.__dict__.keys())
+
+                    # Keys that differ
+                    only_in_batch = batch_keys - batch_cp_keys
+                    only_in_batch_cp = batch_cp_keys - batch_keys
+                    common_keys = batch_keys & batch_cp_keys
+
+                    if only_in_batch:
+                        print(f"  Keys ONLY in batch (Non-DiT): {only_in_batch}")
+                    if only_in_batch_cp:
+                        print(f"  Keys ONLY in batch_cp (DiT): {only_in_batch_cp}")
+
+                    print(f"\n  Comparing {len(common_keys)} common attributes:")
+                    print(f"  {'-'*76}")
+
+                    for key in sorted(common_keys):
+                        val_batch = getattr(batch, key, None)
+                        val_batch_cp = getattr(batch_cp, key, None)
+
+                        # Type check
+                        type_batch = type(val_batch).__name__
+                        type_batch_cp = type(val_batch_cp).__name__
+
+                        if type_batch != type_batch_cp:
+                            print(f"  ❌ {key}: TYPE MISMATCH")
+                            print(
+                                f"      batch: {type_batch}, batch_cp: {type_batch_cp}"
+                            )
+                            continue
+
+                        # Tensor comparison
+                        if isinstance(val_batch, torch.Tensor):
+                            shape_match = val_batch.shape == val_batch_cp.shape
+                            dtype_match = val_batch.dtype == val_batch_cp.dtype
+                            device_batch = str(val_batch.device)
+                            device_batch_cp = str(val_batch_cp.device)
+
+                            if shape_match and dtype_match:
+                                # Check values
+                                if val_batch.device != val_batch_cp.device:
+                                    val_batch_compare = val_batch.to(
+                                        val_batch_cp.device
+                                    )
+                                else:
+                                    val_batch_compare = val_batch
+
+                                try:
+                                    values_match = torch.allclose(
+                                        val_batch_compare,
+                                        val_batch_cp,
+                                        rtol=1e-3,
+                                        atol=1e-5,
+                                    )
+                                    if not values_match:
+                                        diff = (val_batch_compare - val_batch_cp).abs()
+                                        max_diff = diff.max().item()
+                                        mean_diff = diff.mean().item()
+                                        print(f"  ❌ {key}: TENSOR VALUES DIFFER")
+                                        print(
+                                            f"      shape={val_batch.shape}, dtype={val_batch.dtype}"
+                                        )
+                                        print(
+                                            f"      max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}"
+                                        )
+                                        print(
+                                            f"      batch: sum={val_batch.sum().item():.6f}, mean={val_batch.mean().item():.6f}, std={val_batch.std().item():.6f}"
+                                        )
+                                        print(
+                                            f"      batch_cp: sum={val_batch_cp.sum().item():.6f}, mean={val_batch_cp.mean().item():.6f}, std={val_batch_cp.std().item():.6f}"
+                                        )
+                                    else:
+                                        print(
+                                            f"  ✅ {key}: tensor match (shape={val_batch.shape}, device={device_batch})"
+                                        )
+                                except:
+                                    print(
+                                        f"  ⚠️  {key}: tensor (shape={val_batch.shape}, dtype={val_batch.dtype}, cannot compare values)"
+                                    )
+                            else:
+                                print(f"  ❌ {key}: TENSOR SHAPE/DTYPE MISMATCH")
+                                print(
+                                    f"      batch: {val_batch.shape}, {val_batch.dtype}"
+                                )
+                                print(
+                                    f"      batch_cp: {val_batch_cp.shape}, {val_batch_cp.dtype}"
+                                )
+
+                        # List comparison
+                        elif isinstance(val_batch, list):
+                            if len(val_batch) != len(val_batch_cp):
+                                print(
+                                    f"  ❌ {key}: LIST LENGTH MISMATCH (batch={len(val_batch)}, batch_cp={len(val_batch_cp)})"
+                                )
+                            else:
+                                # Check if list of tensors
+                                has_tensor = any(
+                                    isinstance(x, torch.Tensor)
+                                    for x in val_batch
+                                    if x is not None
+                                )
+                                if has_tensor:
+                                    all_match = True
+                                    for i, (item_batch, item_batch_cp) in enumerate(
+                                        zip(val_batch, val_batch_cp)
+                                    ):
+                                        if (item_batch is None) != (
+                                            item_batch_cp is None
+                                        ):
+                                            print(f"  ❌ {key}[{i}]: None mismatch")
+                                            all_match = False
+                                        elif isinstance(
+                                            item_batch, torch.Tensor
+                                        ) and isinstance(item_batch_cp, torch.Tensor):
+                                            if (
+                                                item_batch.shape != item_batch_cp.shape
+                                                or item_batch.dtype
+                                                != item_batch_cp.dtype
+                                            ):
+                                                print(
+                                                    f"  ❌ {key}[{i}]: tensor shape/dtype mismatch"
+                                                )
+                                                all_match = False
+                                            else:
+                                                try:
+                                                    if not torch.allclose(
+                                                        item_batch.to(
+                                                            item_batch_cp.device
+                                                        ),
+                                                        item_batch_cp,
+                                                        rtol=1e-3,
+                                                        atol=1e-5,
+                                                    ):
+                                                        print(
+                                                            f"  ❌ {key}[{i}]: tensor values differ"
+                                                        )
+                                                        all_match = False
+                                                except:
+                                                    pass
+                                    if all_match:
+                                        print(
+                                            f"  ✅ {key}: list of {len(val_batch)} tensors match"
+                                        )
+                                else:
+                                    if val_batch == val_batch_cp:
+                                        print(
+                                            f"  ✅ {key}: list match (len={len(val_batch)})"
+                                        )
+                                    else:
+                                        print(f"  ❌ {key}: LIST VALUES DIFFER")
+                                        print(f"      batch: {val_batch}")
+                                        print(f"      batch_cp: {val_batch_cp}")
+
+                        # Tuple comparison
+                        elif isinstance(val_batch, tuple):
+                            if val_batch == val_batch_cp:
+                                print(f"  ✅ {key}: tuple match ({val_batch})")
+                            else:
+                                print(f"  ❌ {key}: TUPLE VALUES DIFFER")
+                                print(f"      batch: {val_batch}")
+                                print(f"      batch_cp: {val_batch_cp}")
+
+                        # Other types
+                        else:
+                            if val_batch == val_batch_cp:
+                                print(f"  ✅ {key}: match ({type_batch})")
+                            else:
+                                print(f"  ❌ {key}: VALUES DIFFER ({type_batch})")
+                                print(f"      batch: {val_batch}")
+                                print(f"      batch_cp: {val_batch_cp}")
+
+                print(f"{'='*80}\n")
+                import sys
+
+                sys.stdout.flush()
+
+                # Now use the transmitted batch (with correctly restored generators)
+                # If generators still differ, the debug output above will show it
+
+            print(f"batch before denoising: {batch=} {server_args=}")
             # --- PHASE 2: Denoise (DiT) ---
             if self.comm.is_dit_rank():
                 print("Phase 2: Running Denoise stages on DiT...")
@@ -301,13 +500,13 @@ class DisaggregatedExecutor(PipelineExecutor):
                     tensor_indices = []
                     actual_tensors = []
                     shapes_dtypes = []
-                    
+
                     for idx, t in enumerate(v):
                         if isinstance(t, torch.Tensor):
                             tensor_indices.append(idx)
                             actual_tensors.append(t)
                             shapes_dtypes.append((t.shape, t.dtype))
-                    
+
                     if actual_tensors:  # Only if there's at least one tensor
                         # Store: (list_length, tensor_indices, shapes_dtypes)
                         tensors_to_send[k] = actual_tensors
@@ -329,15 +528,25 @@ class DisaggregatedExecutor(PipelineExecutor):
                 print(f"  {k}: {type(v)}, value_preview={str(v)[:100]}")
 
         # Metadata: everything that's not in tensors_to_send
-        metadata = {
-            k: v
-            for k, v in batch.__dict__.items()
-            if k not in tensor_infos and k not in list_tensor_infos
-        }
+        metadata = {}
+        generator_states = {}  # Special handling for generator objects
 
-        # Serialize metadata + tensor info
+        for k, v in batch.__dict__.items():
+            if k in tensor_infos or k in list_tensor_infos:
+                continue
+
+            # Special handling for generator list
+            if isinstance(v, list) and v and isinstance(v[0], torch.Generator):
+                # Save generator states instead of objects
+                generator_states[k] = [g.get_state() for g in v]
+            else:
+                metadata[k] = v
+
+        # Serialize metadata + tensor info + generator states
         buffer = io.BytesIO()
-        pickle.dump((metadata, tensor_infos, list_tensor_infos), buffer)
+        pickle.dump(
+            (metadata, tensor_infos, list_tensor_infos, generator_states), buffer
+        )
         meta_bytes = torch.tensor(
             bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
         )
@@ -400,11 +609,24 @@ class DisaggregatedExecutor(PipelineExecutor):
         # 2. Recv Metadata
         meta_bytes = self.comm.recv_from_non_dit(torch.Size([size]), torch.uint8)
         meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
-        metadata, tensor_infos, list_tensor_infos = pickle.loads(meta_data_cpu)
+        metadata, tensor_infos, list_tensor_infos, generator_states = pickle.loads(
+            meta_data_cpu
+        )
 
         # Update batch metadata
         for k, v in metadata.items():
             setattr(batch, k, v)
+
+        # Restore generator objects from states
+        for k, states in generator_states.items():
+            generators = []
+            for state in states:
+                gen = torch.Generator(
+                    device="cuda" if torch.cuda.is_available() else "cpu"
+                )
+                gen.set_state(state)
+                generators.append(gen)
+            setattr(batch, k, generators)
 
         # 3. Recv Single Tensors
         for name, (shape, dtype) in tensor_infos.items():
@@ -415,19 +637,19 @@ class DisaggregatedExecutor(PipelineExecutor):
         # 4. Recv List of Tensors
         for name, list_info in list_tensor_infos.items():
             list_length, tensor_indices, shapes_dtypes = list_info
-            
+
             # Receive actual tensors
             actual_tensors = []
             for shape, dtype in shapes_dtypes:
                 tensor = self.comm.recv_from_non_dit(shape, dtype)
                 tensor = tensor.to(get_local_torch_device())
                 actual_tensors.append(tensor)
-            
+
             # Reconstruct list with None placeholders
             result_list = [None] * list_length
             for idx, tensor in zip(tensor_indices, actual_tensors):
                 result_list[idx] = tensor
-            
+
             setattr(batch, name, result_list)
 
         print(
@@ -454,25 +676,34 @@ class DisaggregatedExecutor(PipelineExecutor):
                     tensor_indices = []
                     actual_tensors = []
                     shapes_dtypes = []
-                    
+
                     for idx, t in enumerate(v):
                         if isinstance(t, torch.Tensor):
                             tensor_indices.append(idx)
                             actual_tensors.append(t)
                             shapes_dtypes.append((t.shape, t.dtype))
-                    
+
                     if actual_tensors:
                         tensors_to_send[k] = actual_tensors
                         list_tensor_infos[k] = (len(v), tensor_indices, shapes_dtypes)
 
-        metadata = {
-            k: v
-            for k, v in batch.__dict__.items()
-            if k not in tensor_infos and k not in list_tensor_infos
-        }
+        metadata = {}
+        generator_states = {}
+
+        for k, v in batch.__dict__.items():
+            if k in tensor_infos or k in list_tensor_infos:
+                continue
+
+            # Special handling for generator list
+            if isinstance(v, list) and v and isinstance(v[0], torch.Generator):
+                generator_states[k] = [g.get_state() for g in v]
+            else:
+                metadata[k] = v
 
         buffer = io.BytesIO()
-        pickle.dump((metadata, tensor_infos, list_tensor_infos), buffer)
+        pickle.dump(
+            (metadata, tensor_infos, list_tensor_infos, generator_states), buffer
+        )
         meta_bytes = torch.tensor(
             bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
         )
@@ -513,10 +744,23 @@ class DisaggregatedExecutor(PipelineExecutor):
 
         meta_bytes = self.comm.recv_from_dit(torch.Size([size]), torch.uint8)
         meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
-        metadata, tensor_infos, list_tensor_infos = pickle.loads(meta_data_cpu)
+        metadata, tensor_infos, list_tensor_infos, generator_states = pickle.loads(
+            meta_data_cpu
+        )
 
         for k, v in metadata.items():
             setattr(batch, k, v)
+
+        # Restore generator objects from states
+        for k, states in generator_states.items():
+            generators = []
+            for state in states:
+                gen = torch.Generator(
+                    device="cuda" if torch.cuda.is_available() else "cpu"
+                )
+                gen.set_state(state)
+                generators.append(gen)
+            setattr(batch, k, generators)
 
         # Recv single tensors
         for name, (shape, dtype) in tensor_infos.items():
@@ -527,19 +771,19 @@ class DisaggregatedExecutor(PipelineExecutor):
         # Recv list of tensors
         for name, list_info in list_tensor_infos.items():
             list_length, tensor_indices, shapes_dtypes = list_info
-            
+
             # Receive actual tensors
             actual_tensors = []
             for shape, dtype in shapes_dtypes:
                 tensor = self.comm.recv_from_dit(shape, dtype)
                 tensor = tensor.to(get_local_torch_device())
                 actual_tensors.append(tensor)
-            
+
             # Reconstruct list with None placeholders
             result_list = [None] * list_length
             for idx, tensor in zip(tensor_indices, actual_tensors):
                 result_list[idx] = tensor
-            
+
             setattr(batch, name, result_list)
 
         print(
