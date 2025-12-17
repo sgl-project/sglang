@@ -19,11 +19,12 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import glob
 import json
 import os
 from functools import reduce
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Dict, List, Optional, cast
 
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
@@ -37,6 +38,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_other_loggers,
 )
+from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 
 logger = init_logger(__name__)
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -160,6 +162,96 @@ def get_diffusers_component_config(
     )
 
     return combined_config
+
+
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
+def get_quant_config(
+    model_config,
+    packed_modules_mapping: Dict[str, List[str]] = {},
+    remap_prefix: Dict[str, str] | None = None,
+) -> QuantizationConfig:
+    quant_cls = get_quantization_config(
+        model_config["quantization_config"]["quant_method"]
+    )
+
+    # GGUF doesn't have config file
+    if model_config["quantization_config"]["quant_method"] == "gguf":
+        return quant_cls.from_config({})
+
+    # Read the quantization config from the HF model config, if available.
+    hf_quant_config = model_config["quantization_config"]
+    # some vision model may keep quantization_config in their text_config
+    hf_text_config = getattr(model_config, "text_config", None)
+    if hf_quant_config is None and hf_text_config is not None:
+        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
+    if hf_quant_config is None:
+        # compressed-tensors uses a compressions_config
+        hf_quant_config = getattr(model_config, "compression_config", None)
+    if hf_quant_config is not None:
+        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        return quant_cls.from_config(hf_quant_config)
+    # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
+    else:
+        model_name_or_path = model_config["model_path"]
+    is_local = os.path.isdir(model_name_or_path)
+    hf_folder = model_name_or_path
+
+    possible_config_filenames = quant_cls.get_config_filenames()
+
+    # If the quantization config is not found, use the default config.
+    if not possible_config_filenames:
+        return quant_cls()
+
+    config_files = glob.glob(os.path.join(hf_folder, "*.json"))
+
+    quant_config_files = [
+        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
+    ]
+    if len(quant_config_files) == 0:
+        raise ValueError(f"Cannot find the config file for {model_config.quantization}")
+    if len(quant_config_files) > 1:
+        raise ValueError(
+            f"Found multiple config files for {model_config.quantization}: "
+            f"{quant_config_files}"
+        )
+
+    quant_config_file = quant_config_files[0]
+    with open(quant_config_file) as f:
+        config = json.load(f)
+        if remap_prefix is not None:
+            exclude_modules = [
+                replace_prefix(key, remap_prefix)
+                for key in config["quantization"]["exclude_modules"]
+            ]
+            config["quantization"]["exclude_modules"] = exclude_modules
+        config["packed_modules_mapping"] = packed_modules_mapping
+        """
+        if model_config.quantization == "bitsandbytes":
+            config["adapter_name_or_path"] = model_name_or_path
+        elif model_config.quantization.startswith("modelopt") and (
+            config.get("producer", {}).get("name", "").startswith("modelopt")
+        ):
+            quant_algo = config["quantization"]["quant_algo"]
+            if quant_algo is None:
+                # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+                if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
+                    raise ValueError(
+                        f"Invalid quant_config, quantization method: {model_config.quantization},"
+                        f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                    )
+                return None
+            elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                return ModelOptFp8Config.from_config(config)
+            elif "FP4" in quant_algo:
+                return ModelOptFp4Config.from_config(config)
+        """
+        return quant_cls.from_config(config)
 
 
 # Models don't use the same configuration key for determining the maximum

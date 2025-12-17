@@ -185,7 +185,7 @@ class Fp8Config(QuantizationConfig):
             return Fp8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
-        return None
+        return Fp8LinearMethod(self)
 
     def get_scaled_act_names(self) -> List[str]:
         return []

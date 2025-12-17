@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization import QuantizationConfig
 
 
 class MLP(nn.Module):
@@ -23,6 +24,7 @@ class MLP(nn.Module):
         act_type: str = "gelu_pytorch_tanh",
         dtype: torch.dtype | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
         self.fc_in = ReplicatedLinear(
@@ -30,13 +32,18 @@ class MLP(nn.Module):
             mlp_hidden_dim,  # For activation func like SiLU that need 2x width
             bias=bias,
             params_dtype=dtype,
+            quant_config=quant_config,
         )
 
         self.act = get_act_fn(act_type)
         if output_dim is None:
             output_dim = input_dim
         self.fc_out = ReplicatedLinear(
-            mlp_hidden_dim, output_dim, bias=bias, params_dtype=dtype
+            mlp_hidden_dim,
+            output_dim,
+            bias=bias,
+            params_dtype=dtype,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -15,6 +15,7 @@ def fuse_linear_projections(
 ) -> Union[nn.Linear, ReplicatedLinear]:
     device = q_proj.weight.data.device
     dtype = q_proj.weight.data.dtype
+    bias_dtype = q_proj.bias.data.dtype
 
     concatenated_weights = torch.cat(
         [q_proj.weight.data, k_proj.weight.data, v_proj.weight.data]
@@ -25,14 +26,26 @@ def fuse_linear_projections(
     if linear_cls is None:
         linear_cls = type(q_proj)
 
-    fused_layer = linear_cls(in_features, out_features, bias=use_bias)
+    fused_layer = linear_cls(
+        in_features, out_features, bias=use_bias, quant_config=q_proj.quant_config
+    )
     fused_layer.weight.data = concatenated_weights.to(device=device, dtype=dtype)
+
+    if hasattr(q_proj, "weight_scale_inv"):
+        concatenated_weights_scale = torch.cat(
+            [
+                q_proj.weight_scale_inv.data,
+                k_proj.weight_scale_inv.data,
+                v_proj.weight_scale_inv.data,
+            ]
+        )
+        fused_layer.weight_scale_inv.data = concatenated_weights_scale
 
     if use_bias:
         concatenated_bias = torch.cat(
             [q_proj.bias.data, k_proj.bias.data, v_proj.bias.data]
         )
-        fused_layer.bias.data = concatenated_bias.to(device=device, dtype=dtype)
+        fused_layer.bias.data = concatenated_bias.to(device=device, dtype=bias_dtype)
 
     return fused_layer
 

@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
@@ -109,6 +110,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         out_dim: int = None,
         context_pre_only: Optional[bool] = None,
         pre_only: bool = False,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
 
@@ -127,14 +129,25 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
 
         self.norm_k = RMSNorm(dim_head, eps=eps)
-        self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
+        self.to_q = ReplicatedLinear(
+            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+        )
+        self.to_k = ReplicatedLinear(
+            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+        )
+        self.to_v = ReplicatedLinear(
+            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+        )
 
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.out_dim, bias=out_bias)
+                ReplicatedLinear(
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    quant_config=quant_config,
+                )
             )
             if dropout != 0.0:
                 self.to_out.append(torch.nn.Dropout(dropout))
@@ -143,15 +156,26 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
             self.add_q_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                quant_config=quant_config,
             )
             self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                quant_config=quant_config,
             )
             self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                quant_config=quant_config,
             )
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = ReplicatedLinear(
+                self.inner_dim, query_dim, bias=out_bias, quant_config=quant_config
+            )
 
         self.attn = USPAttention(
             num_heads=num_heads,
@@ -257,14 +281,19 @@ class FluxSingleTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = ReplicatedLinear(dim, self.mlp_hidden_dim)
+        self.proj_mlp = ReplicatedLinear(
+            dim, self.mlp_hidden_dim, quant_config=quant_config
+        )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = ReplicatedLinear(dim + self.mlp_hidden_dim, dim)
+        self.proj_out = ReplicatedLinear(
+            dim + self.mlp_hidden_dim, dim, quant_config=quant_config
+        )
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -274,6 +303,7 @@ class FluxSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -321,6 +351,7 @@ class FluxTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
 
@@ -336,17 +367,26 @@ class FluxTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.ff = MLP(
-            input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
+            input_dim=dim,
+            mlp_hidden_dim=dim * 4,
+            output_dim=dim,
+            act_type="gelu",
+            quant_config=quant_config,
         )
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.ff_context = MLP(
-            input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
+            input_dim=dim,
+            mlp_hidden_dim=dim * 4,
+            output_dim=dim,
+            act_type="gelu",
+            quant_config=quant_config,
         )
 
         self.ff_context = FeedForward(
@@ -445,7 +485,12 @@ class FluxTransformer2DModel(CachableDiT):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
-    def __init__(self, config: FluxConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: FluxConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         self.config = config.arch_config
 
@@ -478,6 +523,7 @@ class FluxTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for _ in range(self.config.num_layers)
             ]
@@ -489,6 +535,7 @@ class FluxTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for _ in range(self.config.num_single_layers)
             ]
@@ -501,6 +548,7 @@ class FluxTransformer2DModel(CachableDiT):
             self.inner_dim,
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
+            quant_config=quant_config,
         )
 
     def fuse_qkv_projections(self):

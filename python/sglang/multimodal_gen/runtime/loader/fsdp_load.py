@@ -253,16 +253,17 @@ def load_model_from_full_model_state_dict(
     )  # type: ignore
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
         if meta_sharded_param is None:
             raise ValueError(
                 f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
             )
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=meta_sharded_param_dtype)
             # In cases where parts of the model aren't sharded, some parameters will be plain tensors
             sharded_tensor = full_tensor
         else:
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=meta_sharded_param_dtype)
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,
@@ -291,15 +292,16 @@ def load_model_from_full_model_state_dict(
                 f"Currently only parameters containing {ALLOWED_NEW_PARAM_PATTERNS} are allowed."
             )
         meta_sharded_param = meta_sd.get(new_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
         if not hasattr(meta_sharded_param, "device_mesh"):
             # Initialize with zeros
             sharded_tensor = torch.zeros_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
         else:
             # Initialize with zeros and distribute
             full_tensor = torch.zeros_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             sharded_tensor = distribute_tensor(
                 full_tensor,

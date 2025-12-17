@@ -334,7 +334,12 @@ class ColumnParallelLinear(LinearBase):
             ]
 
         super().__init__(
-            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix,
         )
 
         self.gather_output = gather_output
