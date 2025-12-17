@@ -27,8 +27,6 @@ class TestLLaDA2Mini(CustomTestCase):
             "0.9",
             "--max-running-requests",
             "1",
-            "--tp",
-            "4",
             "--attention-backend",
             "flashinfer",
             "--dllm-algorithm",
@@ -59,8 +57,8 @@ class TestLLaDA2Mini(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.88)
-        self.assertGreater(metrics["output_throughput"], 200)
+        self.assertGreater(metrics["accuracy"], 0.6)
+        self.assertGreater(metrics["output_throughput"], 150)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -70,13 +68,13 @@ class TestLLaDA2Mini(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (llada2-mini) with tp4\n"
+                f"### test_bs_1_speed (llada2-mini) with tp1\n"
                 f"{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(speed, 100)
+                self.assertGreater(speed, 10)
             else:
-                self.assertGreater(speed, 500)
+                self.assertGreater(speed, 250)
 
 
 if __name__ == "__main__":

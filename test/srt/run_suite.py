@@ -56,6 +56,7 @@ suites = {
         TestFile("rl/test_fp32_lm_head.py", 9),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 195),
+        TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_create_kvindices.py", 7),
@@ -153,7 +154,6 @@ suites = {
         TestFile("test_pp_single_node.py", 800),
         TestFile("test_piecewise_cuda_graph.py", 1200),
         TestFile("test_epd_disaggregation.py", 400),
-        TestFile("dllm/test_llada2_mini.py", 300),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
