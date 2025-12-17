@@ -92,7 +92,11 @@ class SWAChunkCache(ChunkCache):
         attention_chunk_size: int,
         sliding_window_size: int = -1,
     ):
-        attention_chunk_size = sliding_window_size if attention_chunk_size is None else attention_chunk_size
+        attention_chunk_size = (
+            sliding_window_size
+            if attention_chunk_size is None
+            else attention_chunk_size
+        )
         if prelen < req.evicted_seqlen_local + attention_chunk_size:
             return
 
@@ -100,7 +104,9 @@ class SWAChunkCache(ChunkCache):
 
         if sliding_window_size > 0:
             keep_start = max(0, prelen - sliding_window_size)
-            keep_start_aligned = attention_chunk_size * (keep_start // attention_chunk_size)
+            keep_start_aligned = attention_chunk_size * (
+                keep_start // attention_chunk_size
+            )
             allowed_evict_upto = keep_start_aligned
             new_evicted_seqlen_local = min(candidate_new, allowed_evict_upto)
         else:
