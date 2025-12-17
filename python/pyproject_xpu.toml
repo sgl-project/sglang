@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.5.post3"
+version = "0.5.6.post2"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,8 @@ classifiers = [
 
 dependencies = [
   "torch==2.9.0",
+  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
+  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
   "torchaudio==2.9.0",
   "torchvision",
   "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
@@ -63,7 +65,7 @@ dependencies = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop==0.21.0",
+  "uvloop",
   # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
@@ -100,8 +102,13 @@ dev = ["sglang[test]"]
   "srt/layers/moe/fused_moe_triton/configs/*/*.json",
   "srt/layers/quantization/configs/*.json",
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
+  "srt/mem_cache/cpp_radix_tree/*.cpp",
+  "srt/mem_cache/cpp_radix_tree/*.h",
   "srt/speculative/cpp_ngram/*.cpp",
   "srt/speculative/cpp_ngram/*.h",
+  "jit_kernel/include/sgl_kernel/*.h",
+  "jit_kernel/include/sgl_kernel/*.cuh",
+  "jit_kernel/csrc/*.cuh"
 ]
 
 [tool.setuptools.packages.find]

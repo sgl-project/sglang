@@ -3,31 +3,60 @@ name: PR Test (XPU)
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xpu.yml"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "!python/sglang/multimodal_gen/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xpu.yml"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
 
 concurrency:
   group: pr-test-xpu-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
+              - "scripts/ci/**"
+              - "test/**"
+              - "sgl-kernel/**"
+              - ".github/workflows/pr-test-xpu.yml"
+              - "docker/xpu.Dockerfile"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
   build-and-test:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: intel-bmg
     env:
       HF_HOME: /home/sdp/.cache/huggingface
@@ -69,7 +98,7 @@ jobs:
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
           docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run E2E Bfloat16 tests
@@ -87,14 +116,15 @@ jobs:
 
   finish:
     if: always()
-    needs: [build-and-test]
+    needs: [build-and-test, pr-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
-            echo "Job failed with result: ${{ needs.build-and-test.result }}"
+          result="${{ needs.build-and-test.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "Job failed with result: $result"
             exit 1
           fi
-          echo "All jobs completed successfully"
+          echo "All jobs completed successfully (result: $result)"
           exit 0

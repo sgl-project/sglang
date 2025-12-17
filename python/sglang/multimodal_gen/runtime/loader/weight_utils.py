@@ -16,6 +16,13 @@ import torch
 from safetensors.torch import safe_open
 from tqdm.auto import tqdm
 
+try:
+    from runai_model_streamer import SafetensorsStreamer
+
+    HAS_RUNAI_MODEL_STREAMER = True
+except ImportError:
+    HAS_RUNAI_MODEL_STREAMER = False
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -115,25 +122,96 @@ def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[s
 _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 
+def _validate_safetensors_file(file_path: str) -> bool:
+    """
+    Validate that a safetensors file is readable and not corrupted.
+
+    Args:
+        file_path: Path to the safetensors file
+
+    Returns:
+        True if file is valid, False if corrupted
+    """
+    try:
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            _ = list(f.keys())
+        return True
+    except Exception as e:
+        logger.error(
+            "Corrupted safetensors file detected: %s - %s: %s",
+            file_path,
+            type(e).__name__,
+            str(e),
+        )
+        return False
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
+    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     device = "cpu" if to_cpu else str(get_local_torch_device())
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=_BAR_FORMAT,
-    ):
-        with safe_open(st_file, framework="pt", device=device) as f:
-            for name in f.keys():  # noqa: SIM118
-                param = f.get_tensor(name)
-                yield name, param
+
+    # Validate files before loading
+    corrupted_files = [
+        st_file
+        for st_file in hf_weights_files
+        if not _validate_safetensors_file(st_file)
+    ]
+
+    if corrupted_files:
+        # Delete corrupted files (both symlink and blob if applicable)
+        for file_path in corrupted_files:
+            try:
+                if os.path.islink(file_path):
+                    blob_path = os.path.realpath(file_path)
+                    os.remove(file_path)
+                    logger.info(
+                        "Removed corrupted symlink: %s", os.path.basename(file_path)
+                    )
+                    if os.path.exists(blob_path):
+                        os.remove(blob_path)
+                        logger.info(
+                            "Removed corrupted blob: %s", os.path.basename(blob_path)
+                        )
+                elif os.path.isfile(file_path):
+                    os.remove(file_path)
+                    logger.info(
+                        "Removed corrupted file: %s", os.path.basename(file_path)
+                    )
+            except Exception as e:
+                logger.warning("Failed to remove corrupted file %s: %s", file_path, e)
+
+        raise RuntimeError(
+            f"Found {len(corrupted_files)} corrupted safetensors file(s). "
+            f"Files have been removed: {[os.path.basename(f) for f in corrupted_files]}. "
+            "Please retry - the files will be re-downloaded automatically."
+        )
+
+    if use_runai_model_streamer:
+        with SafetensorsStreamer() as streamer:
+            streamer.stream_files(hf_weights_files)
+            for name, tensor in streamer.get_tensors():
+                if to_cpu:
+                    yield name, tensor.clone().detach()
+                else:
+                    yield name, tensor.to(device)
+    else:
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        ):
+            with safe_open(st_file, framework="pt", device=device) as f:
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
+                    yield name, param
 
 
 def pt_weights_iterator(

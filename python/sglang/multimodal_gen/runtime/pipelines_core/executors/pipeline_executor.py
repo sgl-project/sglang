@@ -4,39 +4,32 @@
 """
 Base class for all pipeline executors.
 """
-import time
+
+import contextlib
 from abc import ABC, abstractmethod
-from typing import List
+from typing import TYPE_CHECKING, List
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+if TYPE_CHECKING:
+    # Only for type checkers; avoids runtime circular import
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
 
 
-class Timer:
+class Timer(StageProfiler):
     """
-    A very simple timer that doesn't for cuda-stream to be synced
+    A wrapper around StageProfiler to maintain backward compatibility.
+    It forces simple logging behavior (log start/end) regardless of env vars.
     """
 
     def __init__(self, name="Stage"):
-        self.name = name
-        self.start = None
-        self.end = None
-        self.elapsed = None
-
-    def __enter__(self):
-        self.start = time.perf_counter()
-        logger.info(f"[{self.name}] started...")
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.end = time.perf_counter()
-        self.elapsed = self.end - self.start
-        logger.info(f"[{self.name}] finished in {self.elapsed:.4f} seconds")
-        return False
+        super().__init__(stage_name=name, timings=None, simple_log=True, logger=logger)
 
 
 class PipelineExecutor(ABC):
@@ -53,7 +46,7 @@ class PipelineExecutor(ABC):
     @abstractmethod
     def execute(
         self,
-        stages: List[PipelineStage],
+        stages: List["PipelineStage"],
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
@@ -69,3 +62,28 @@ class PipelineExecutor(ABC):
             The processed batch.
         """
         raise NotImplementedError
+
+    @contextlib.contextmanager
+    def profile_execution(self, batch: Req, check_rank: int = 0, dump_rank: int = 0):
+        """
+        Context manager for profiling execution.
+        """
+        do_profile = batch.profile
+
+        if not do_profile:
+            yield
+            return
+
+        request_id = batch.request_id
+        profiler = SGLDiffusionProfiler(
+            request_id=request_id,
+            rank=check_rank,
+            full_profile=batch.profile_all_stages,
+            num_steps=batch.num_profiled_timesteps,
+            num_inference_steps=batch.num_inference_steps,
+        )
+        try:
+            yield
+        finally:
+            should_export = check_rank == 0
+            profiler.stop(export_trace=should_export, dump_rank=dump_rank)

@@ -21,13 +21,22 @@ python3 -m sglang.launch_server \
 
 - **OOM Mitigation**: Adjust `--context-length` to avoid a GPU out-of-memory issue. For the Scout model, we recommend setting this value up to 1M on 8\*H100 and up to 2.5M on 8\*H200. For the Maverick model, we don't need to set context length on 8\*H200. When hybrid kv cache is enabled, `--context-length` can be set up to 5M on 8\*H100 and up to 10M on 8\*H200 for the Scout model.
 
+- **Attention Backend Auto-Selection**: SGLang automatically selects the optimal attention backend for Llama 4 based on your hardware. You typically don't need to specify `--attention-backend` manually:
+  - **Blackwell GPUs (B200/GB200)**: `trtllm_mha`
+  - **Hopper GPUs (H100/H200)**: `fa3`
+  - **AMD GPUs**: `aiter`
+  - **Intel XPU**: `intel_xpu`
+  - **Other platforms**: `triton` (fallback)
+
+  To override the auto-selection, explicitly specify `--attention-backend` with one of the supported backends: `fa3`, `aiter`, `triton`, `trtllm_mha`, or `intel_xpu`.
+
 - **Chat Template**: Add `--chat-template llama-4` for chat completion tasks.
 - **Enable Multi-Modal**: Add `--enable-multimodal` for multi-modal capabilities.
 - **Enable Hybrid-KVCache**: Add `--hybrid-kvcache-ratio` for hybrid kv cache. Details can be seen in [this PR](https://github.com/sgl-project/sglang/pull/6563)
 
 
 ### EAGLE Speculative Decoding
-**Description**: SGLang has supported Llama 4 Maverick (400B) with [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding).
+**Description**: SGLang has supported Llama 4 Maverick (400B) with [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding).
 
 **Usage**:
 Add arguments `--speculative-draft-model-path`, `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:

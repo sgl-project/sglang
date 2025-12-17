@@ -2,6 +2,7 @@
 
 import importlib
 import ipaddress
+import logging
 import os
 import platform
 import signal
@@ -14,9 +15,8 @@ import psutil
 import torch
 import zmq
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
+# use the native logger to avoid circular import
+logger = logging.getLogger(__name__)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):

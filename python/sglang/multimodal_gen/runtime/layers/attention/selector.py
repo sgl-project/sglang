@@ -41,7 +41,7 @@ def backend_name_to_enum(backend_name: str) -> AttentionBackendEnum | None:
 
 def get_env_variable_attn_backend() -> AttentionBackendEnum | None:
     """
-    Get the backend override specified by the sgl-diffusion attention
+    Get the backend override specified by the sglang-diffusion attention
     backend environment variable, if one is specified.
 
     Returns:
@@ -169,7 +169,7 @@ def global_force_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum,
 ) -> Generator[None, None, None]:
     """
-    Globally force a sgl-diffusion attention backend override within a
+    Globally force a sglang-diffusion attention backend override within a
     context manager, reverting the global attention backend
     override to its prior state upon exiting the context
     manager.
