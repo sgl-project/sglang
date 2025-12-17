@@ -95,9 +95,7 @@ pub fn apply_proxy_to_builder(
 /// # Returns
 /// A configured reqwest::Client or error
 pub fn create_http_client(proxy_config: Option<&McpProxyConfig>) -> McpResult<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
 
     // Apply MCP-specific proxy if configured
     if let Some(proxy_cfg) = proxy_config {

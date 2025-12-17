@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::conversions;
 use crate::{
     mcp::{self, McpManager},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -257,7 +258,10 @@ pub(super) async fn execute_tool_loop(
                 error = %e,
                 "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
             );
-            error::bad_request(format!("Failed to convert request: {}", e))
+            error::bad_request(
+                "convert_request_failed",
+                format!("Failed to convert request: {}", e),
+            )
         })?;
 
         // Prepare tools and tool_choice for this iteration
@@ -279,6 +283,9 @@ pub(super) async fn execute_tool_loop(
 
         if !tool_calls.is_empty() {
             state.iteration += 1;
+
+            // Record tool loop iteration metric
+            Metrics::record_mcp_tool_iteration(&current_request.model);
 
             debug!(
                 "Tool loop iteration {}: found {} tool call(s)",
@@ -315,7 +322,10 @@ pub(super) async fn execute_tool_loop(
                         context = "function_tool_calls",
                         "Failed to convert ChatCompletionResponse to ResponsesResponse"
                     );
-                    error::internal_error(format!("Failed to convert to responses format: {}", e))
+                    error::internal_error(
+                        "convert_to_responses_format_failed",
+                        format!("Failed to convert to responses format: {}", e),
+                    )
                 })?;
 
                 // Return response with function tool calls to caller
@@ -352,7 +362,10 @@ pub(super) async fn execute_tool_loop(
                         context = "max_tool_calls_limit",
                         "Failed to convert ChatCompletionResponse to ResponsesResponse"
                     );
-                    error::internal_error(format!("Failed to convert to responses format: {}", e))
+                    error::internal_error(
+                        "convert_to_responses_format_failed",
+                        format!("Failed to convert to responses format: {}", e),
+                    )
                 })?;
 
                 // Mark as completed but with incomplete details
@@ -369,6 +382,7 @@ pub(super) async fn execute_tool_loop(
                     tool_name, call_id, args_json_str
                 );
 
+                let tool_start = Instant::now();
                 let (output_str, success, error) = match ctx
                     .mcp_manager
                     .call_tool(tool_name.as_str(), args_json_str.as_str())
@@ -391,6 +405,23 @@ pub(super) async fn execute_tool_loop(
                         (error_json, false, Some(err_str))
                     }
                 };
+                let tool_duration = tool_start.elapsed();
+
+                // Record MCP tool metrics
+                Metrics::record_mcp_tool_duration(
+                    &current_request.model,
+                    &tool_name,
+                    tool_duration,
+                );
+                Metrics::record_mcp_tool_call(
+                    &current_request.model,
+                    &tool_name,
+                    if success {
+                        metrics_labels::RESULT_SUCCESS
+                    } else {
+                        metrics_labels::RESULT_ERROR
+                    },
+                );
 
                 // Record the call in state
                 state.record_call(
@@ -481,7 +512,10 @@ pub(super) async fn execute_tool_loop(
                     context = "final_response",
                     "Failed to convert ChatCompletionResponse to ResponsesResponse"
                 );
-                error::internal_error(format!("Failed to convert to responses format: {}", e))
+                error::internal_error(
+                    "convert_to_responses_format_failed",
+                    format!("Failed to convert to responses format: {}", e),
+                )
             })?;
 
             // Inject MCP metadata into output
@@ -607,7 +641,7 @@ async fn execute_tool_loop_streaming_internal(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let mut emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
+    let mut emitter = ResponseStreamEventEmitter::new(response_id, model.clone(), created_at);
     emitter.set_original_request(original_request.clone());
 
     // Emit initial response.created and response.in_progress events
@@ -629,6 +663,10 @@ async fn execute_tool_loop_streaming_internal(
 
     loop {
         state.iteration += 1;
+
+        // Record tool loop iteration metric
+        Metrics::record_mcp_tool_iteration(&model);
+
         if state.iteration > MAX_ITERATIONS {
             return Err(format!(
                 "Tool loop exceeded maximum iterations ({})",
@@ -803,6 +841,7 @@ async fn execute_tool_loop_streaming_internal(
                     "Calling MCP tool '{}' with args: {}",
                     tool_name, args_json_str
                 );
+                let tool_start = Instant::now();
                 let (output_str, success, error) = match ctx
                     .mcp_manager
                     .call_tool(tool_name.as_str(), args_json_str.as_str())
@@ -886,6 +925,19 @@ async fn execute_tool_loop_streaming_internal(
                         (error_json, false, Some(err_str))
                     }
                 };
+                let tool_duration = tool_start.elapsed();
+
+                // Record MCP tool metrics
+                Metrics::record_mcp_tool_duration(&model, &tool_name, tool_duration);
+                Metrics::record_mcp_tool_call(
+                    &model,
+                    &tool_name,
+                    if success {
+                        metrics_labels::RESULT_SUCCESS
+                    } else {
+                        metrics_labels::RESULT_ERROR
+                    },
+                );
 
                 // Record the call in state
                 state.record_call(

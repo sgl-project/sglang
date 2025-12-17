@@ -124,6 +124,7 @@ def init_process_seed(
             str(rank),
             "--tp-size",
             str(tp_size),
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine",
         ),
     )
     torch.cuda.synchronize()
@@ -190,6 +191,9 @@ def init_process_dst(
             remote_instance_weight_loader_send_weights_group_ports=ports,
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
+            remote_instance_weight_loader_start_seed_via_transfer_engine=(
+                remote_instance_loader_backend == "transfer_engine"
+            ),
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -219,6 +223,7 @@ def init_process_dst(
                 "remote_instance",
                 "--remote-instance-weight-loader-backend",
                 remote_instance_loader_backend,
+                "--remote-instance-weight-loader-start-seed-via-transfer-engine",
             ),
         )
     torch.cuda.synchronize()
@@ -361,7 +366,7 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
         else:
             test_suits = [
                 (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine"], "nccl"),
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Sever"], "nccl"),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Server"], "nccl"),
                 (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine", "Server"], "nccl"),
                 (
                     1,
@@ -370,7 +375,13 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
                     ["Engine"],
                     "transfer_engine",
                 ),
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Sever"], "transfer_engine"),
+                (
+                    1,
+                    1,
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    ["Server"],
+                    "transfer_engine",
+                ),
                 (
                     2,
                     2,
