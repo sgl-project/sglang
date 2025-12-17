@@ -7,6 +7,10 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    NPUW8A8Int8DynamicLinearMethod,
+    NPUW8A8Int8LinearMethod,
+)
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -14,10 +18,6 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
-)
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-    NPUW8A8Int8DynamicLinearMethod,
-    NPUW8A8Int8LinearMethod
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -94,15 +94,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
 
 class GPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
-    
+
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
-        super.__init__(
-            strategy,
-            is_static_input_scheme,
-            input_symmetric
-        )
+        super.__init__(strategy, is_static_input_scheme, input_symmetric)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -190,15 +186,11 @@ class GPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
 
 class NPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
-    
+
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
-        super.__init__(
-            strategy,
-            is_static_input_scheme,
-            input_symmetric
-        )
+        super.__init__(strategy, is_static_input_scheme, input_symmetric)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -209,10 +201,9 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             return NPUW8A8Int8LinearMethod.process_weights_after_loading(layer)
         else:
             return NPUW8A8Int8DynamicLinearMethod.process_weights_after_loading(layer)
-    
+
     def apply_weights(self, layer, x, bias):
         if self.is_static_input_scheme:
             return NPUW8A8Int8LinearMethod.apply(layer)
         else:
             return NPUW8A8Int8DynamicLinearMethod.apply(layer)
-

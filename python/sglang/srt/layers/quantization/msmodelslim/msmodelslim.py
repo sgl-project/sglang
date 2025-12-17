@@ -5,41 +5,35 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
-from pydantic import BaseModel
 
 # from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
 #     NPUW4A8Int4DynamicMoEMethod,
 #     NPUW4A16Int4DynamicMoEMethod,
 #     NPUW8A8Int8DynamicMoEMethod,
 # )
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-    _NPULinearMethodBase
-    # NPUW8A8Int8DynamicLinearMethod,
-    # NPUW8A8Int8LinearMethod,
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (  # NPUW8A8Int8DynamicLinearMethod,; NPUW8A8Int8LinearMethod,
+    _NPULinearMethodBase,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.msmodelslim.msmodelslim_moe import (
     ModelSlimMoEMethod,
 )
 from sglang.srt.layers.quantization.msmodelslim.schemes import (
     ModelSlimScheme,
-    ModelSlimW8A8Int8,
     ModelSlimW4A4Int4,
+    ModelSlimW8A8Int8,
 )
-from sglang.srt.layers.quantization.compressed_tensors.utils import (
-    find_matched_target,
-    is_activation_quantization_format,
-    should_ignore_layer
-)
-#from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+
+# from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
 logger = logging.getLogger(__name__)
+
 
 # func refers to RMSNorm.__init__
 def npu_wrapper_rmsnorm_init(func):
@@ -50,6 +44,7 @@ def npu_wrapper_rmsnorm_init(func):
         self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
 
     return init
+
 
 # func refers to RMSNorm.forward_oot
 def npu_wrapper_rmsnorm_forward(func):
@@ -122,7 +117,7 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
-    
+
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
 
@@ -183,29 +178,28 @@ class ModelSlimConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix_in_quant_config)
             if scheme is None:
-                raise NotImplementedError("At the moment SGLang on Ascend supports only w4a4 dynamic, w8a8 static/dynamic linear schemes.")
+                raise NotImplementedError(
+                    "At the moment SGLang on Ascend supports only w4a4 dynamic, w8a8 static/dynamic linear schemes."
+                )
             layer.scheme = scheme
-            return (
-                ModelSlimLinearMethod(self)
-            )
+            return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return ModelSlimMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     def _get_scheme_from_parts(
-            self, layer_name: str,
-        ) -> ModelSlimScheme:
+        self,
+        layer_name: str,
+    ) -> ModelSlimScheme:
 
-        quant_type = self.quant_description[layer_name + '.weight']
+        quant_type = self.quant_description[layer_name + ".weight"]
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
             return ModelSlimW8A8Int8(
-                quant_config=self.quant_description,
-                prefix=layer_name
+                quant_config=self.quant_description, prefix=layer_name
             )
         elif quant_type == "W4A4_DYNAMIC":
             return ModelSlimW4A4Int4(
-                quant_config=self.quant_description,
-                prefix=layer_name
+                quant_config=self.quant_description, prefix=layer_name
             )
 
             # Detect If Mixed Precision
@@ -225,66 +219,66 @@ class ModelSlimConfig(QuantizationConfig):
             #             "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
             #         )
 
-            #if is_activation_quantization_format(self.quant_format):
-                # if self._is_fp8_w8a8(weight_quant, input_quant):
-                #     is_fp8_w8a8_supported = self._check_scheme_supported(
-                #         CompressedTensorsW8A8Fp8.get_min_capability(), error=False
-                #     )
-                #     if is_fp8_w8a8_supported:
-                #         return CompressedTensorsW8A8Fp8(
-                #             strategy=weight_quant.strategy,
-                #             is_static_input_scheme=(
-                #                 input_quant and not input_quant.dynamic
-                #             ),
-                #         )
-                #     else:
-                #         # note: input_quant will be present for converted models;
-                #         # will be ignored during inference post loading
-                #         return CompressedTensorsW8A16Fp8(
-                #             strategy=weight_quant.strategy,
-                #             is_static_input_scheme=not input_quant.dynamic,
-                #         )
+            # if is_activation_quantization_format(self.quant_format):
+            # if self._is_fp8_w8a8(weight_quant, input_quant):
+            #     is_fp8_w8a8_supported = self._check_scheme_supported(
+            #         CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+            #     )
+            #     if is_fp8_w8a8_supported:
+            #         return CompressedTensorsW8A8Fp8(
+            #             strategy=weight_quant.strategy,
+            #             is_static_input_scheme=(
+            #                 input_quant and not input_quant.dynamic
+            #             ),
+            #         )
+            #     else:
+            #         # note: input_quant will be present for converted models;
+            #         # will be ignored during inference post loading
+            #         return CompressedTensorsW8A16Fp8(
+            #             strategy=weight_quant.strategy,
+            #             is_static_input_scheme=not input_quant.dynamic,
+            #         )
 
-                # # note: input_quant can be None
-                # if self._is_fp8_w8a16(weight_quant, input_quant):
-                #     is_static_input_scheme = input_quant and not input_quant.dynamic
-                #     return CompressedTensorsW8A16Fp8(
-                #         strategy=weight_quant.strategy,
-                #         is_static_input_scheme=is_static_input_scheme,
-                #     )
-
-            #raise NotImplementedError("No msmodelslim compatible scheme was found.")
-    
-    def get_scheme(
-            self, layer: torch.nn.Module, layer_name: Optional[str] = None
-        ) -> Optional[ModelSlimScheme]:
-            """
-            get_scheme method adjusted for modelslim, taken from
-            python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
-            """
-            # if self.target_scheme_map:
-            #     matched_target = find_matched_target(
-            #         layer_name=layer_name,
-            #         module=layer,
-            #         targets=self.target_scheme_map.keys(),
-            #         fused_mapping=self.packed_modules_mapping,
+            # # note: input_quant can be None
+            # if self._is_fp8_w8a16(weight_quant, input_quant):
+            #     is_static_input_scheme = input_quant and not input_quant.dynamic
+            #     return CompressedTensorsW8A16Fp8(
+            #         strategy=weight_quant.strategy,
+            #         is_static_input_scheme=is_static_input_scheme,
             #     )
 
-            #     scheme_dict = self.target_scheme_map[matched_target]
-            #     weight_quant = scheme_dict.get("weights")
-            #     input_quant = scheme_dict.get("input_activations")
-            # else:
-                # Find the quant_scheme
-            scheme = self._get_scheme_from_parts(  # type: ignore
-                # weight_quant=weight_quant,
-                # input_quant=input_quant,
-                layer_name=layer_name,
-            )
+            # raise NotImplementedError("No msmodelslim compatible scheme was found.")
 
-            # Ascend doesn't support device capability
-            # self._check_scheme_supported(scheme.get_min_capability())
-            logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
-            return scheme
+    def get_scheme(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ) -> Optional[ModelSlimScheme]:
+        """
+        get_scheme method adjusted for modelslim, taken from
+        python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+        """
+        # if self.target_scheme_map:
+        #     matched_target = find_matched_target(
+        #         layer_name=layer_name,
+        #         module=layer,
+        #         targets=self.target_scheme_map.keys(),
+        #         fused_mapping=self.packed_modules_mapping,
+        #     )
+
+        #     scheme_dict = self.target_scheme_map[matched_target]
+        #     weight_quant = scheme_dict.get("weights")
+        #     input_quant = scheme_dict.get("input_activations")
+        # else:
+        # Find the quant_scheme
+        scheme = self._get_scheme_from_parts(  # type: ignore
+            # weight_quant=weight_quant,
+            # input_quant=input_quant,
+            layer_name=layer_name,
+        )
+
+        # Ascend doesn't support device capability
+        # self._check_scheme_supported(scheme.get_min_capability())
+        logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
+        return scheme
 
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
