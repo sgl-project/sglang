@@ -283,7 +283,7 @@ class TestLayerNorm(CustomTestCase):
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
     @parametrize(
-        l=[1024, 256],
+        l=[4096, 1024],
         m=[1, 4],
         n=[4096, 4109, 2304],
         dtype=[torch.float16, torch.bfloat16],
