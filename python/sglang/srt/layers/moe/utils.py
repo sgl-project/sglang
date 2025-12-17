@@ -286,6 +286,9 @@ def speculative_moe_a2a_backend_context():
     global MOE_A2A_BACKEND
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     original_backend = MOE_A2A_BACKEND
+    original_disable_flashinfer_cutlass_moe_fp4_allgather = (
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    )
     try:
         MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
@@ -293,7 +296,9 @@ def speculative_moe_a2a_backend_context():
         yield
     finally:
         MOE_A2A_BACKEND = original_backend
-        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = False
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
+            original_disable_flashinfer_cutlass_moe_fp4_allgather
+        )
 
 
 # The type of method in top-K routing, for use in torch custom op
