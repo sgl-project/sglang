@@ -7,19 +7,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-    ReqToTokenPool,
+from sglang.srt.disaggregation.base.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
 )
+from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -27,58 +23,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class DecodeKVCacheOffloadManager:
+class HiCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
     """Manage decode-side KV cache offloading lifecycle and operations."""
 
-    def __init__(
-        self,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        tp_group: torch.distributed.ProcessGroup,
-        tree_cache: BasePrefixCache,
-        server_args: ServerArgs,
-    ) -> None:
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.page_size = server_args.page_size
-        self.server_args = server_args
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.request_counter = 0
-        self.tree_cache = tree_cache
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = MHATokenToKVPoolHost(
                 kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                self.server_args.hicache_ratio,
+                self.server_args.hicache_size,
                 self.page_size,
-                server_args.hicache_mem_layout,
+                self.server_args.hicache_mem_layout,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
                 kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                self.server_args.hicache_ratio,
+                self.server_args.hicache_size,
                 self.page_size,
-                server_args.hicache_mem_layout,
+                self.server_args.hicache_mem_layout,
             )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")
-
-        self.tp_group = tp_group
-        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
-            tp_group=tp_group,
-            io_backend=server_args.hicache_io_backend,
+            tp_group=self.tp_group,
+            io_backend=self.server_args.hicache_io_backend,
             load_cache_event=threading.Event(),
-            storage_backend=server_args.hicache_storage_backend,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+            storage_backend=self.server_args.hicache_storage_backend,
+            model_name=self.server_args.served_model_name,
+            storage_backend_extra_config=self.server_args.hicache_storage_backend_extra_config,
         )
-
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         logger.info("Enable offload kv cache for decode side")
@@ -233,3 +214,6 @@ class DecodeKVCacheOffloadManager:
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes
+
+    def ongoing_size(self) -> int:
+        return len(self.ongoing_offload)

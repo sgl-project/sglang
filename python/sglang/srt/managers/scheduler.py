@@ -44,9 +44,6 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-    DecodeKVCacheOffloadManager,
-)
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -825,12 +822,27 @@ class Scheduler(
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
         ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+            if server_args.enable_lmcache:
+                from sglang.srt.mem_cache.storage.lmcache.lmc_decode_offload_manager import (
+                    LMCCacheDecodeKVCacheOffloadManager,
+                )
+
+                offload_cls = LMCCacheDecodeKVCacheOffloadManager
+            else:
+                from sglang.srt.mem_cache.hicache_decode_offload_manager import (
+                    HiCacheDecodeKVCacheOffloadManager,
+                )
+
+                offload_cls = HiCacheDecodeKVCacheOffloadManager
+            self.decode_offload_manager = offload_cls(
+                model_config=self.model_config,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=params.tp_cache_group,
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
             )
         else:
             self.decode_offload_manager = None
