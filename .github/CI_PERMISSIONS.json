@@ -762,6 +762,13 @@
         "reason": "top contributor",
         "can_rerun_stage": true
     },
+    "scottjlee": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor",
+        "can_rerun_stage": true
+    },
     "sglang-bot": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
