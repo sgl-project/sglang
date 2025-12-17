@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
+      multimodal_gen: $({ steps.filter.outputs.main_package })
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -32,6 +33,12 @@ jobs:
               - "scripts/ci/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
+              - "python/*.toml"
+              - "scripts/ci/npu_ci_install_dependency.sh"
+              - ".github/workflows/pr-test-npu.yml"
+
 
   # ==================== PR Gate ==================== #
   pr-gate:
@@ -204,9 +211,9 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-per-commit-diffusion-1-npu-a2:
+  per-commit-diffusion-1-npu-a2:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
     runs-on: linux-arm64-npu-1
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-910b-ubuntu22.04-py3.11
