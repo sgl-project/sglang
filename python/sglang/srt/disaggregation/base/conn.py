@@ -37,6 +37,11 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    # nvshmem tensors
+    nvshmem_enabled: bool
+    nvshmem_buffers: List["torch.Tensor"]
+    aux_nvshmem_enabled: bool
+    aux_nvshmem_buffers: List["torch.Tensor"]
 
 
 class KVPoll:
