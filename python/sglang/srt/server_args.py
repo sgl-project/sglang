@@ -726,6 +726,9 @@ class ServerArgs:
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
 
+        # Handle two-batch overlap settings.
+        self._handle_two_batch_overlap()
+
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -2379,6 +2382,12 @@ class ServerArgs:
             self.remote_instance_weight_loader_support_transfer_engine = False
         else:
             self.remote_instance_weight_loader_support_transfer_engine = True
+
+    def _handle_two_batch_overlap(self):
+        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+            raise ValueError(
+                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

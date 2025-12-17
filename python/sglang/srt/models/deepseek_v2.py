@@ -2664,7 +2664,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        kv_indices = forward_batch.attn_backend.forward_metadata.page_table_1_flattened
+        backend = forward_batch.attn_backend
+        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
+            backend = backend.primary
+        kv_indices = backend.forward_metadata.page_table_1_flattened
         assert (
             kv_indices is not None
         ), "page_table_1_flattened should have been generated for FP8 MHA path"
