@@ -77,7 +77,7 @@ diffusion = [
   "moviepy>=2.0.0",
   "opencv-python==4.10.0.84",
   "remote-pdb",
-  "st_attn ==0.0.7",
+  "st_attn==0.0.7",
   "vsa==0.0.4",
   "yunchang@git+https://github.com/feifeibear/long-context-attention.git@b192e97", # fix torch_cpp_ext._get_cuda_arch_flags() https://github.com/feifeibear/long-context-attention/pull/148,
   "runai_model_streamer==0.15.3",

@@ -128,7 +128,6 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
-
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
             k=key,
