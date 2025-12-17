@@ -103,11 +103,11 @@ class RocmPlatform(Platform):
             try:
                 import flash_attn  # noqa: F401
 
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
-                    FlashAttentionBackend,
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
+                    FlashAttention2Backend,
                 )
 
-                supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                supported_sizes = FlashAttention2Backend.get_supported_head_sizes()
                 if head_size not in supported_sizes:
                     logger.info(
                         "Cannot use FlashAttention-2 backend for head size %d.",
@@ -130,7 +130,7 @@ class RocmPlatform(Platform):
 
         logger.info("Using Flash Attention backend.")
 
-        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
