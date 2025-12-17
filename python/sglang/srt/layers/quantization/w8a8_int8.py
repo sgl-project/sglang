@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_host_cpu_arm64,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -156,10 +158,12 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_weight_after_loading(layer, ["weight"])
+            if _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["weight"])
+            elif _is_cpu_arm64:
+                layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            else:
+                assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
         else:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -201,7 +205,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if use_intel_amx_backend(layer):
+        if use_intel_amx_backend(layer) or _is_cpu_arm64:
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -307,10 +311,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
+        if _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
@@ -338,10 +339,11 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        if use_intel_amx_backend(layer):
+        if use_intel_amx_backend(layer) or _is_cpu_arm64:
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
+            topk_ids = topk_ids.int()
             x, topk_weights = apply_topk_weights_cpu(
                 self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
