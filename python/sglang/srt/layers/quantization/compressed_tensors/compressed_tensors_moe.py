@@ -857,6 +857,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
+        # Skip if the layer is already converted to Marlin format to prevent double-packing.
+        if getattr(layer, "is_marlin_converted", False):
+            return
+
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
         def replace_tensor(name, new_t):
             target_attr = getattr(layer, name)
 
