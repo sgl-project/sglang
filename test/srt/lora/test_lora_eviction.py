@@ -39,6 +39,12 @@ ADAPTERS = [
 
 BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
+# Embedding LoRA test configuration (TinyLlama with lora_target_modules=["all"])
+EMBEDDING_LORA_BASE_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+EMBEDDING_LORA_ADAPTER = (
+    "ash256/sglang_embedding_lora_test_adapter"  # includes embed_tokens and lm_head
+)
+
 
 @contextlib.contextmanager
 def dynamically_loaded_adapter(runner, lora_path: str, lora_name: str):
@@ -73,6 +79,31 @@ class TestLoRAEviction(CustomTestCase):
         self._run_test(ADAPTERS, output_history, reuse_lora_name=True, repeat=1)
         self._run_test(ADAPTERS, output_history, reuse_lora_name=False, repeat=1)
 
+    def test_lora_eviction_with_embedding_lora_all_target_modules(self):
+        """
+        Test LoRA eviction with lora_target_modules=["all"] using an embedding LoRA adapter.
+
+        This test verifies that the csgmv backend properly handles eviction when using
+        lora_target_modules=["all"] which includes embed_tokens and lm_head layers.
+        Uses TinyLlama base model with the ash256/sglang_embedding_lora_test_adapter.
+        """
+        output_history = {}
+        self._run_test(
+            [EMBEDDING_LORA_ADAPTER],
+            output_history,
+            base_model=EMBEDDING_LORA_BASE_MODEL,
+            lora_target_modules=["all"],
+            max_lora_rank=16,
+        )
+        self._run_test(
+            [EMBEDDING_LORA_ADAPTER],
+            output_history,
+            reverse=True,
+            base_model=EMBEDDING_LORA_BASE_MODEL,
+            lora_target_modules=["all"],
+            max_lora_rank=16,
+        )
+
     def _run_test(
         self,
         lora_paths: List[str],
@@ -80,26 +111,16 @@ class TestLoRAEviction(CustomTestCase):
         reverse: bool = False,
         repeat: int = 2,
         reuse_lora_name: bool = False,
+        base_model: str = BASE_MODEL,
+        lora_target_modules: List[str] = None,
+        max_lora_rank: int = 256,
     ):
         REUSED_LORA_NAME = "lora"
         max_new_tokens = 256
         torch_dtype = torch.float16
-        base_path = BASE_MODEL
-        assert len(lora_paths) >= 2
 
-        initial_lora_paths = lora_paths if not reuse_lora_name else None
-        # Initialize runners
-        with SRTRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            lora_paths=initial_lora_paths,
-            max_loras_per_batch=1,
-            enable_lora=True,
-            max_lora_rank=256,
-            # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-            # lora_target_modules=["all"],
-            lora_target_modules=[
+        if lora_target_modules is None:
+            lora_target_modules = [
                 "q_proj",
                 "k_proj",
                 "v_proj",
@@ -107,7 +128,19 @@ class TestLoRAEviction(CustomTestCase):
                 "gate_proj",
                 "up_proj",
                 "down_proj",
-            ],
+            ]
+
+        initial_lora_paths = lora_paths if not reuse_lora_name else None
+        # Initialize runners
+        with SRTRunner(
+            base_model,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            lora_paths=initial_lora_paths,
+            max_loras_per_batch=1,
+            enable_lora=True,
+            max_lora_rank=max_lora_rank,
+            lora_target_modules=lora_target_modules,
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 

@@ -43,6 +43,12 @@ PROMPTS = [
 
 MEM_FRACTION_STATIC = 0.8
 
+# Embedding LoRA test configuration (TinyLlama with lora_target_modules=["all"])
+EMBEDDING_LORA_BASE_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+EMBEDDING_LORA_ADAPTER = (
+    "ash256/sglang_embedding_lora_test_adapter"  # includes embed_tokens and lm_head
+)
+
 
 class OperationType(Enum):
     LOAD = "load"
@@ -218,17 +224,7 @@ BASIC_TESTS = [
         base="meta-llama/Llama-3.1-8B-Instruct",
         enable_lora=True,
         max_lora_rank=256,
-        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-        # lora_target_modules=["all"],
-        lora_target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        lora_target_modules=["all"],
         max_loras_per_batch=4,
         all_adapters=[
             "philschmid/code-llama-3-1-8b-text-to-sql-lora",
@@ -763,17 +759,7 @@ EVICTION_TESTS = [
         ],
         enable_lora=True,
         max_lora_rank=256,
-        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-        # lora_target_modules=["all"],
-        lora_target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        lora_target_modules=["all"],
         op_sequence=[
             Operation(
                 type=OperationType.LOAD,
@@ -884,12 +870,84 @@ EVICTION_TESTS = [
     ),
 ]
 
+# Embedding LoRA tests with lora_target_modules=["all"] (tests csgmv backend with embed_tokens/lm_head)
+EMBEDDING_LORA_TESTS = [
+    TestCase(
+        description="dynamic lora update with embedding LoRA and lora_target_modules=all",
+        base=EMBEDDING_LORA_BASE_MODEL,
+        max_loras_per_batch=1,
+        all_adapters=[EMBEDDING_LORA_ADAPTER],
+        initial_adapters=[EMBEDDING_LORA_ADAPTER],
+        enable_lora=True,
+        max_lora_rank=16,
+        lora_target_modules=["all"],  # This includes embed_tokens and lm_head
+        op_sequence=[
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(EMBEDDING_LORA_ADAPTER),
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data=EMBEDDING_LORA_ADAPTER,
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data=EMBEDDING_LORA_ADAPTER,
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(EMBEDDING_LORA_ADAPTER),
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(None),  # Test base model inference
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(EMBEDDING_LORA_ADAPTER),
+            ),
+        ],
+    ),
+    TestCase(
+        description="dynamic lora update without initial paths with embedding LoRA and lora_target_modules=all",
+        base=EMBEDDING_LORA_BASE_MODEL,
+        max_loras_per_batch=1,
+        all_adapters=[EMBEDDING_LORA_ADAPTER],
+        enable_lora=True,
+        max_lora_rank=16,
+        lora_target_modules=["all"],  # This includes embed_tokens and lm_head
+        op_sequence=[
+            Operation(
+                type=OperationType.LOAD,
+                data=EMBEDDING_LORA_ADAPTER,
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(EMBEDDING_LORA_ADAPTER),
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(None),  # Test base model inference
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data=EMBEDDING_LORA_ADAPTER,
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(EMBEDDING_LORA_ADAPTER),  # Implicit reload
+            ),
+        ],
+    ),
+]
+
 ALL_TESTS = (
     BASIC_TESTS
     + TARGET_MODULE_TESTS
     + MAX_LORA_RANK_TESTS
     + MAX_LOADED_LORAS_TESTS
     + EVICTION_TESTS
+    + EMBEDDING_LORA_TESTS
 )
 
 
@@ -1525,17 +1583,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
             lora_paths=[],
             max_loras_per_batch=2,
             max_lora_rank=256,
-            # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-            # lora_target_modules=["all"],
-            lora_target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            lora_target_modules=["all"],
             enable_lora=True,
         ) as session:
             # Test with no adapters loaded

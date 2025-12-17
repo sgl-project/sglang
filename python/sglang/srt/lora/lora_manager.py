@@ -96,9 +96,16 @@ class LoRAManager:
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
     ):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+
+        # Check if target_modules includes embedding layers
+        has_embedding_layers = (
+            "embed_tokens" in self.target_modules or "lm_head" in self.target_modules
+        )
+
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
+            has_embedding_layers=has_embedding_layers,
         )
 
     def create_lora_update_result(
