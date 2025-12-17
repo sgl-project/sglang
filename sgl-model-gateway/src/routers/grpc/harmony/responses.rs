@@ -32,7 +32,7 @@
 //! ```
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::response::Response;
@@ -45,6 +45,7 @@ use uuid::Uuid;
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
     mcp::{self, McpManager},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
@@ -324,6 +325,9 @@ async fn execute_with_mcp_loop(
     loop {
         iteration_count += 1;
 
+        // Record tool loop iteration metric
+        Metrics::record_mcp_tool_iteration(&current_request.model);
+
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
             error!(
@@ -332,10 +336,10 @@ async fn execute_with_mcp_loop(
                 max_iterations = MAX_TOOL_ITERATIONS,
                 "Maximum tool iterations exceeded"
             );
-            return Err(error::internal_error(format!(
-                "Maximum tool iterations ({}) exceeded",
-                MAX_TOOL_ITERATIONS
-            )));
+            return Err(error::internal_error(
+                "tool_iterations_exceeded",
+                format!("Maximum tool iterations ({}) exceeded", MAX_TOOL_ITERATIONS),
+            ));
         }
 
         debug!(
@@ -434,7 +438,13 @@ async fn execute_with_mcp_loop(
 
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
-                    execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking).await?
+                    execute_mcp_tools(
+                        &ctx.mcp_manager,
+                        &mcp_tool_calls,
+                        &mut mcp_tracking,
+                        &current_request.model,
+                    )
+                    .await?
                 } else {
                     Vec::new()
                 };
@@ -759,6 +769,9 @@ async fn execute_mcp_tool_loop_streaming(
     loop {
         iteration_count += 1;
 
+        // Record tool loop iteration metric
+        Metrics::record_mcp_tool_iteration(&current_request.model);
+
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
             emitter.emit_error(
@@ -869,8 +882,13 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // Execute MCP tools (if any)
                 let mcp_results = if !mcp_tool_calls.is_empty() {
-                    match execute_mcp_tools(&ctx.mcp_manager, &mcp_tool_calls, &mut mcp_tracking)
-                        .await
+                    match execute_mcp_tools(
+                        &ctx.mcp_manager,
+                        &mcp_tool_calls,
+                        &mut mcp_tracking,
+                        &current_request.model,
+                    )
+                    .await
                     {
                         Ok(results) => results,
                         Err(err_response) => {
@@ -1156,6 +1174,7 @@ async fn execute_mcp_tools(
     mcp_manager: &Arc<McpManager>,
     tool_calls: &[ToolCall],
     tracking: &mut McpCallTracking,
+    model_id: &str,
 ) -> Result<Vec<ToolResult>, Response> {
     let mut results = Vec::new();
 
@@ -1176,10 +1195,13 @@ async fn execute_mcp_tools(
                 error = %e,
                 "Failed to parse tool arguments JSON"
             );
-            error::internal_error(format!(
-                "Invalid tool arguments JSON for tool '{}': {}",
-                tool_call.function.name, e
-            ))
+            error::internal_error(
+                "invalid_tool_args",
+                format!(
+                    "Invalid tool arguments JSON for tool '{}': {}",
+                    tool_call.function.name, e
+                ),
+            )
         })?;
 
         // Execute tool via MCP manager
@@ -1189,10 +1211,13 @@ async fn execute_mcp_tools(
             None
         };
 
-        match mcp_manager
+        let tool_start = Instant::now();
+        let tool_result = mcp_manager
             .call_tool(&tool_call.function.name, args_map)
-            .await
-        {
+            .await;
+        let tool_duration = tool_start.elapsed();
+
+        match tool_result {
             Ok(mcp_result) => {
                 debug!(
                     tool_name = %tool_call.function.name,
@@ -1227,6 +1252,22 @@ async fn execute_mcp_tools(
                     },
                 );
 
+                // Record MCP tool metrics
+                Metrics::record_mcp_tool_duration(
+                    model_id,
+                    &tool_call.function.name,
+                    tool_duration,
+                );
+                Metrics::record_mcp_tool_call(
+                    model_id,
+                    &tool_call.function.name,
+                    if is_error {
+                        metrics_labels::RESULT_ERROR
+                    } else {
+                        metrics_labels::RESULT_SUCCESS
+                    },
+                );
+
                 results.push(ToolResult {
                     call_id: tool_call.id.clone(),
                     tool_name: tool_call.function.name.clone(),
@@ -1257,6 +1298,18 @@ async fn execute_mcp_tools(
                     error_output_str.clone(),
                     false,
                     Some(error_msg),
+                );
+
+                // Record MCP tool metrics
+                Metrics::record_mcp_tool_duration(
+                    model_id,
+                    &tool_call.function.name,
+                    tool_duration,
+                );
+                Metrics::record_mcp_tool_call(
+                    model_id,
+                    &tool_call.function.name,
+                    metrics_labels::RESULT_ERROR,
                 );
 
                 // Return error result to model (let it handle gracefully)
@@ -1544,10 +1597,13 @@ async fn load_previous_messages(
                 error = %e,
                 "Failed to load previous response chain from storage"
             );
-            error::internal_error(format!(
-                "Failed to load previous response chain for {}: {}",
-                prev_id_str, e
-            ))
+            error::internal_error(
+                "load_previous_response_chain_failed",
+                format!(
+                    "Failed to load previous response chain for {}: {}",
+                    prev_id_str, e
+                ),
+            )
         })?;
 
     // Build conversation history from stored responses
