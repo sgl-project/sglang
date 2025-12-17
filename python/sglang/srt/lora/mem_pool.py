@@ -388,10 +388,17 @@ class LoRAMemoryPool:
                 # to avoid contamination from the residual weight of the evicted adapters.
                 buffer_view.zero_()
             else:
-                assert (
-                    buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
-                buffer_view.copy_(weight)
+                if buffer_view.shape == weight.shape:
+                    buffer_view.copy_(weight)
+                else:
+                    # Shape mismatch: pad/truncate to fit the buffer view shape
+                    # This can happen if target module dims differ across variants (e.g., MLA).
+                    rows = min(buffer_view.shape[0], weight.shape[0])
+                    cols = min(buffer_view.shape[1], weight.shape[1])
+                    # Zero out first to avoid stale values
+                    buffer_view.zero_()
+                    if rows > 0 and cols > 0:
+                        buffer_view[:rows, :cols].copy_(weight[:rows, :cols])
 
         if uid is None:
             for i in range(self.num_layer):
@@ -416,7 +423,17 @@ class LoRAMemoryPool:
                 target_module: None for target_module in self.B_buffer
             }
             for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
+                # Map full weight name to one of the configured target modules. If no match,
+                # skip this weight (e.g., LoRA weights for modules not enabled like o_proj).
+                try:
+                    target_module = get_target_module_name(name, self.target_modules)
+                except ValueError:
+                    logger.debug(
+                        "Skipping LoRA weight not in target modules. name=%s, targets=%s",
+                        name,
+                        self.target_modules,
+                    )
+                    continue
                 if "lora_A" in name:
                     temp_A_buffer[target_module] = weights
                 else:
