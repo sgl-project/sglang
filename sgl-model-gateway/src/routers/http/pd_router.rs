@@ -22,7 +22,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{metrics_labels, Metrics},
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
@@ -288,7 +288,7 @@ impl PDRouter {
             metrics_labels::CONNECTION_HTTP,
             model,
             endpoint,
-            context.is_stream,
+            bool_to_static_str(context.is_stream),
         );
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
