@@ -411,6 +411,14 @@ class MooncakeKVManager(CommonKVManager):
         # Calculate head distribution
         src_heads_per_rank = num_kv_heads
         dst_heads_per_rank = num_kv_heads * self.attn_tp_size // dst_attn_tp_size
+        if dst_attn_tp_size == 0:
+            logger.error(
+                f"[{num_kv_heads}] num_kv_heads is ({num_kv_heads})"
+                f"[{self.attn_tp_size}] self.attn_tp_size is ({self.attn_tp_size}) "
+                f"dst_attn_tp_size is ({dst_attn_tp_size})."
+                f"dst_heads_per_rank will be set to zero which will trigger an exception."
+            )
+            return -1
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
