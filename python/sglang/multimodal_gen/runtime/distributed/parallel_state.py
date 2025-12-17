@@ -195,7 +195,6 @@ def init_parallel_group_coordinator(
         "sequence",
         "classifier_free_guidance",
     ], f"parallel_mode {parallel_mode} is not supported"
-    print(f"{group_ranks=} {local_rank=}")
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
             group_ranks=group_ranks,

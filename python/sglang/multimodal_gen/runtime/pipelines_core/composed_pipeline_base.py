@@ -359,20 +359,20 @@ class ComposedPipelineBase(ABC):
                     )
 
         # load configs into server_args, in disagg mode
-        # for module_name, (
-        #     transformers_or_diffusers,
-        #     _,
-        # ) in model_index.items():
-        #     load_module_name, component_model_path = self.adjust_module_path(
-        #         module_name, server_args
-        #     )
-        #     # this will make updates to server_args.pipeline_config
-        #     _ = PipelineComponentLoader.load_config(
-        #         load_module_name,
-        #         component_model_path=component_model_path,
-        #         transformers_or_diffusers=transformers_or_diffusers,
-        #         server_args=server_args,
-        #     )
+        for module_name, (
+            transformers_or_diffusers,
+            _,
+        ) in model_index.items():
+            load_module_name, component_model_path = self.adjust_module_path(
+                module_name, server_args
+            )
+            # this will make updates to server_args.pipeline_config
+            _ = PipelineComponentLoader.load_config(
+                load_module_name,
+                component_model_path=component_model_path,
+                transformers_or_diffusers=transformers_or_diffusers,
+                server_args=server_args,
+            )
 
         model_index = {
             module_name: v
@@ -380,25 +380,10 @@ class ComposedPipelineBase(ABC):
             if should_load_module(module_name)
         }
 
-        # In disagg mode, set model_loaded to False for modules that are NOT being loaded
-        # This ensures delayed loading logic works correctly
-        # if server_args.enable_disagg:
-        #     all_modules = set(self.required_config_modules)
-        #     loaded_modules_set = set(model_index.keys())
-        #     for module_name in all_modules:
-        #         if module_name not in loaded_modules_set:
-        #             if module_name in server_args.model_loaded:
-        #                 server_args.model_loaded[module_name] = False
-        #                 logger.info(
-        #                     f"[Disagg Mode] Rank {dist.get_rank()}: Setting model_loaded['{module_name}'] = False (not loading on this rank)",
-        #                     main_process_only=False,
-        #                 )
-
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading modules: %s", model_index, main_process_only=False)
 
-        print(f"{model_index=}")
         components = {}
         for module_name, (
             transformers_or_diffusers,

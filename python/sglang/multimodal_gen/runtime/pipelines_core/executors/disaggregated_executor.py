@@ -266,21 +266,6 @@ class DisaggregatedExecutor(PipelineExecutor):
                         tensors_to_send[k] = actual_tensors
                         list_tensor_infos[k] = (len(v), tensor_indices, shapes_dtypes)
 
-        # Debug: Print all fields and their types
-        print(f"[DEBUG _send_batch_to_dit] All batch fields:")
-        for k, v in batch.__dict__.items():
-            if isinstance(v, torch.Tensor):
-                print(f"  {k}: Tensor, shape={v.shape}")
-            elif isinstance(v, list):
-                if len(v) > 0:
-                    print(f"  {k}: List[{len(v)}], first={type(v[0])}")
-                else:
-                    print(f"  {k}: List[empty]")
-            elif isinstance(v, tuple):
-                print(f"  {k}: Tuple[{len(v)}], types={[type(x) for x in v]}")
-            else:
-                print(f"  {k}: {type(v)}, value_preview={str(v)[:100]}")
-
         # Metadata: everything that's not in tensors_to_send
         metadata = {
             k: v
@@ -505,22 +490,9 @@ class DisaggregatedExecutor(PipelineExecutor):
         import io
         import pickle
 
-        print(
-            f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master called"
-        )
-        print(
-            f"  non_dit_master_rank: {self.comm.non_dit_master_rank}, dit_master_rank: {self.comm.dit_master_rank}"
-        )
 
         # Prepare metadata (non-tensor fields)
         has_output = output_batch.output is not None
-        has_error = output_batch.error is not None
-
-        print(f"  has_output: {has_output}, has_error: {has_error}")
-        if has_output:
-            print(
-                f"  output shape: {output_batch.output.shape}, dtype: {output_batch.output.dtype}"
-            )
 
         metadata = {
             "timings": output_batch.timings,
@@ -542,13 +514,11 @@ class DisaggregatedExecutor(PipelineExecutor):
         if dist.get_backend() == "nccl":
             meta_bytes = meta_bytes.cuda()
 
-        print(f"  Sending metadata size: {meta_bytes.numel()}")
         size_tensor = torch.tensor(
             [meta_bytes.numel()], dtype=torch.long, device=meta_bytes.device
         )
         self.comm.send_to_dit(size_tensor)
         self.comm.send_to_dit(meta_bytes)
-        print("  Metadata sent")
 
         # Send output tensor if it exists
         if has_output:
@@ -556,22 +526,10 @@ class DisaggregatedExecutor(PipelineExecutor):
             if not output_tensor.is_cuda:
                 output_tensor = output_tensor.cuda()
             self.comm.send_to_dit(output_tensor)
-            print(f"  Output tensor sent with shape {output_tensor.shape}")
-        else:
-            print("  No output tensor to send")
-
-        print(
-            f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master completed"
-        )
 
     def _recv_final_result_from_non_dit(self, output_batch: OutputBatch):
         """Receive OutputBatch from non-dit at dit master."""
         import pickle
-
-        print(
-            f"[Dit Master Rank {dist.get_rank()}] _recv_final_result_from_non_dit called"
-        )
-        print(f"  Waiting for metadata size...")
 
         # Recv metadata
         size_tensor = self.comm.recv_from_non_dit(torch.Size([1]), torch.long)
