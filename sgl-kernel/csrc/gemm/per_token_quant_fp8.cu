@@ -6,11 +6,16 @@
 #include <c10/util/Float8_e5m2.h>
 #include <type_traits>
 
+#ifdef USE_ROCM
+#if defined(HIP_FP8_TYPE_FNUZ)
+#include <c10/util/Float8_e4m3fnuz.h>
+#endif
+#endif
+
 #include "utils.h"
 
 static constexpr int kWarpSize = 32;
 
-// 基于输出 FP8 类型（__nv_fp8_e4m3 / __nv_fp8_e5m2）返回对应 c10 FP8 最大值
 template <typename DstFp8T>
 __host__ __device__ __forceinline__ float fp8_max() {
   if constexpr (std::is_same_v<DstFp8T, __nv_fp8_e4m3>) {
@@ -22,7 +27,6 @@ __host__ __device__ __forceinline__ float fp8_max() {
   }
 }
 
-// 显式的 half/ bf16 与 float 互转工具
 template <typename T>
 __device__ __forceinline__ float to_float(T x) {
     if constexpr (std::is_same_v<T, __half>) {
@@ -110,7 +114,14 @@ __global__ void per_token_quant_fp8_kernel(
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = to_float(input_vec[j]) * scale_inv;
       val = fmaxf(fminf(val, FP8_MAX), -FP8_MAX);
-      output_arr[j] = from_float<DST_Q_DTYPE>(val);
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
+      output_arr[j] = static_cast<DST_Q_DTYPE>(val);
+#else
+      // ROCM with FNUZ type
+      output_arr[j] = c10::Float8_e4m3fnuz(
+          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
+          c10::Float8_e4m3fnuz::from_bits());
+#endif
     }
     if constexpr (kVecSize == 16) {
       *(uint4*)(token_output + i * kVecSize) = *(uint4*)output_arr;
@@ -182,7 +193,14 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
     for (uint32_t j = 0; j < kVecSize; ++j) {
       const float FP8_MAX = fp8_max<DST_Q_DTYPE>();
       float val = fmaxf(fminf(to_float(input_vec[j]) * scale_inv, FP8_MAX), -FP8_MAX);
-      output_arr[j] = from_float<DST_Q_DTYPE>(val);
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
+      output_arr[j] = static_cast<DST_Q_DTYPE>(val);
+#else
+      // ROCM with FNUZ type
+      output_arr[j] = c10::Float8_e4m3fnuz(
+          __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
+          c10::Float8_e4m3fnuz::from_bits());
+#endif
     }
 
     if constexpr (kVecSize == 16) {
@@ -205,10 +223,18 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
           input.scalar_type() == torch::kBFloat16,
       "Input must be a Float, Half, or BFloat16 tensor, but got ",
       input.scalar_type());
+#ifdef USE_ROCM
+  // ROCM platform only supports e4m3, not e5m2
+  TORCH_CHECK(
+      output_q.scalar_type() == torch::kFloat8_e4m3fn,
+      "Output_q must be a Float8_e4m3fn tensor on ROCM platform, but got ",
+      output_q.scalar_type());
+#else
   TORCH_CHECK(
       output_q.scalar_type() == torch::kFloat8_e4m3fn || output_q.scalar_type() == torch::kFloat8_e5m2,
       "Output_q must be a Float8_e4m3fn or Float8_e5m2 tensor, but got ",
       output_q.scalar_type());
+#endif
   TORCH_CHECK(
       output_s.scalar_type() == torch::kFloat || output_s.scalar_type() == torch::kHalf ||
           output_s.scalar_type() == torch::kBFloat16,
