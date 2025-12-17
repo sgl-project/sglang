@@ -34,7 +34,8 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200",
         "nightly-8-gpu-h20",
         "nightly-8-gpu-b200",
-        "nightly-8-gpu-temp",  # Temporary suite for testing unified perf+accuracy tests
+        "nightly-8-gpu-temp",  # Temporary suite for testing unified perf+accuracy tests (H200)
+        "nightly-8-gpu-temp-b200",  # Temporary suite for B200-only unified tests
     ],
     HWBackend.AMD: ["nightly-amd"],
     HWBackend.CPU: [],

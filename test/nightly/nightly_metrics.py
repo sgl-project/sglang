@@ -68,15 +68,11 @@ def run_performance_for_model(
     print(f"Running PERFORMANCE test for {model.model_path}")
     print(f"{'='*60}\n")
 
-    # Build extra args for VLM benchmarks
-    extra_bench_args = []
+    # Build extra args for benchmarks
+    # Always include --trust-remote-code for models that need custom code
+    extra_bench_args = ["--trust-remote-code"]
     if is_vlm:
-        extra_bench_args.extend(
-            [
-                "--trust-remote-code",
-                f"--dataset-name={dataset_name}",
-            ]
-        )
+        extra_bench_args.append(f"--dataset-name={dataset_name}")
 
     try:
         results, success = perf_runner.run_benchmark_for_model(

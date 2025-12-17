@@ -20,13 +20,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightly_metrics import run_metrics
 
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
 # Registered to nightly-8-gpu-temp suite for testing
 # This suite should be run with --timeout-per-file=12000 (200 minutes)
 # because each test runs 5 variants with both perf + accuracy (~100+ minutes)
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
+# register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
