@@ -39,9 +39,11 @@ class SchedulerMetricsMixin:
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
+        # Basic stats
+        self.forward_ct_decode = 0
+        self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
-
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -52,12 +54,19 @@ class SchedulerMetricsMixin:
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
+
+        # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.kv_transfer_bootstrap_ms: float = 0.0
         self.kv_transfer_alloc_ms: float = 0.0
 
         self.stats = SchedulerStats()
+
+        # Metrics
+        self.current_scheduler_metrics_enabled = (
+            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
 
         if self.enable_metrics:
             engine_type = "unified"
@@ -81,6 +90,14 @@ class SchedulerMetricsMixin:
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+
+    def reset_metrics(self):
+        self.forward_ct_decode = 0
+        self.num_generated_tokens = 0
+        self.spec_num_accepted_tokens = 0
+        self.spec_num_forward_ct = 0
+        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_forward_ct = 0
 
     def log_prefill_stats(
         self: Scheduler,
@@ -112,7 +129,7 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_ssm_model:
+        elif self.is_hybrid_ssm:
             (
                 full_num_used,
                 _,
@@ -166,7 +183,7 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_ssm_model:
+            if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
@@ -238,7 +255,7 @@ class SchedulerMetricsMixin:
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
-        elif self.is_ssm_model:
+        elif self.is_hybrid_ssm:
             (
                 full_num_used,
                 mamba_used,
@@ -315,8 +332,9 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
-            if self.is_ssm_model:
+            if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
+            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
@@ -401,7 +419,7 @@ class SchedulerMetricsMixin:
         if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
             num_tokens = max(full_num_used, swa_num_used)
-        elif self.is_ssm_model:
+        elif self.is_hybrid_ssm:
             num_tokens = self._get_mamba_token_info()[0]
         else:
             num_tokens = self._get_token_info()[0]
