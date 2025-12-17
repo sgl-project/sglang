@@ -199,8 +199,11 @@ inline int getMultiProcessorCount() {
   return multi_processor_count;  // Return the cached value on subsequent calls
 }
 
-void scaled_fp4_quant_sm100a(
-    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf) {
+void scaled_fp4_quant_sm100a_sm120a(
+    torch::Tensor const& output,
+    torch::Tensor const& input,
+    torch::Tensor const& output_sf,
+    torch::Tensor const& input_sf) {
   auto sm_version = getSMVersion();
   TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
 

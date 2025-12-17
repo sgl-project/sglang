@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt import _custom_ops as ops
+import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -18,25 +18,11 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
-
-logger = logging.getLogger(__name__)
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-
-try:
-    if ops.use_vllm_custom_allreduce and not _is_hip:
-        # Use vLLM custom allreduce
-        ops.meta_size()
-    else:
-        # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-        import sgl_kernel  # noqa: F401
-    custom_ar = True
-except Exception:
-    # For CPUs
-    custom_ar = False
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +66,10 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self.disabled = True
+        self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
+        self.original_disabled = True  # To store the original state
 
-        if not custom_ar:
+        if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
             return
@@ -210,6 +197,8 @@ class CustomAllreduce:
             self.register_buffer(self.buffer)
 
         self.disabled = False
+        self.original_disabled = False  # Ensure original_disabled == disabled
+        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod
     def create_shared_buffer(
@@ -394,7 +383,7 @@ class CustomAllreduce:
                 if _is_hip:
                     return self.all_reduce_reg(input)
                 else:
-                    return self.all_reduce(input, registered=True)
+                    return self.all_reduce(input, registered=not self.tms_cudagraph)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
@@ -419,3 +408,23 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
+
+def dispatch_custom_allreduce():
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
+    if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+        try:
+            from aiter.dist.device_communicators.custom_all_reduce import (
+                CustomAllreduce as AiterCustomAllreduce,
+            )
+
+            logger.info("Using AiterCustomAllreduce for ROCm.")
+            return AiterCustomAllreduce
+        except ImportError as e:
+            logger.warning(
+                "Aiter custom all-reduce not available (optional dependency missing); "
+                "falling back to sglang CustomAllreduce. Details: %s",
+                e,
+            )
+            return CustomAllreduce
+    return CustomAllreduce

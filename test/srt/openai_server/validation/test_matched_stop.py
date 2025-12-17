@@ -2,7 +2,7 @@ import unittest
 
 from sglang.srt.sampling.sampling_params import MAX_LEN, get_max_seq_length
 from sglang.srt.utils import kill_process_tree
-from sglang.test.kit_matched_stop import MatchedStopMixin
+from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,

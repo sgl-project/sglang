@@ -18,9 +18,14 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from packaging.version import Version
+import torch.nn.functional as F
 
+from sglang.srt.batch_invariant_ops import (
+    is_batch_invariant_mode_enabled,
+    rms_norm_batch_invariant,
+)
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -41,11 +46,19 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_flashinfer_layernorm_available = False
 
 if _is_cuda or _is_xpu:
-    # if _is_flashinfer_available:
-    #     from flashinfer.norm import fused_add_rmsnorm
-    # else:
+    if _is_flashinfer_available:
+        try:
+            from flashinfer.norm import layernorm
+
+            _flashinfer_layernorm_available = True
+        except (ImportError, AttributeError):
+            _flashinfer_layernorm_available = False
+    else:
+        _flashinfer_layernorm_available = False
+
     from sgl_kernel import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -56,10 +69,7 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
-    import vllm
     from vllm._custom_ops import fused_add_rms_norm, rms_norm
-
-    _vllm_version = Version(vllm.__version__)
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +100,6 @@ class RMSNorm(CustomOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
-        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
-            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,
@@ -100,6 +108,17 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
@@ -146,21 +165,12 @@ class RMSNorm(CustomOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            if _vllm_version < Version("0.9"):
-                fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
-                return x, residual
-            else:
-                residual_out = torch.empty_like(x)
-                output = torch.empty_like(x)
-                fused_add_rms_norm(
-                    output,
-                    x,
-                    residual_out,
-                    residual,
-                    self.weight.data,
-                    self.variance_epsilon,
-                )
-                return output, residual_out
+            out = torch.empty_like(x)
+            residual_out = torch.empty_like(x)
+            fused_add_rms_norm(
+                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
+            )
+            return out, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -275,6 +285,78 @@ class RMSNorm(CustomOp):
         return self.forward(x, residual)
 
 
+class LayerNorm(CustomOp):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+        self.elementwise_affine = elementwise_affine
+        self.use_bias = bias
+        self.dtype = dtype
+
+        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=self.dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=self.dtype))
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            _flashinfer_layernorm_available
+            and x.dtype == torch.bfloat16
+            and self.dtype == torch.float32
+        ):
+            return layernorm(x, self.weight, self.bias, self.variance_epsilon)
+        else:
+            return self.forward_native(x)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = self.weight if self.elementwise_affine else None
+        bias = self.bias if self.use_bias else None
+        orig_dtype = x.dtype
+        x = x.to(self.dtype)
+        return F.layer_norm(
+            x,
+            (self.hidden_size,),
+            weight=self.weight,
+            bias=bias,
+            eps=self.variance_epsilon,
+        ).to(orig_dtype)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.layernorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        else:
+            return self.forward_native(x)
+
+
 class GemmaRMSNorm(CustomOp):
     def __init__(
         self,
@@ -326,6 +408,22 @@ class GemmaRMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual)
 
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_cpu_amx_available:
+            if residual is not None:
+                torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+                return x, residual
+            return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        return self.forward_native(x, residual)
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -362,6 +460,11 @@ class Gemma3RMSNorm(CustomOp):
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
+
+    def forward_cpu(self, x):
+        if _is_cpu_amx_available and x.stride(-1) == 1:
+            return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
+        return self.forward_native(x)
 
     def forward_cuda(self, x):
         return self.forward_native(x)

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -242,9 +243,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        self.fmha_backend = "auto"
         if is_sm100_supported():
             self.fmha_backend = "cutlass"
+        else:
+            self.fmha_backend = "auto"
+
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
@@ -320,6 +323,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             use_ragged = (
                 not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
+                # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
+                and not is_in_piecewise_cuda_graph()
             )
 
             self.indices_updater_prefill.update(

@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
+# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -19,19 +19,18 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
+    CompressedTensorsW4A4Fp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
@@ -71,8 +70,6 @@ class DeviceCapability(NamedTuple):
 
 
 class CompressedTensorsConfig(QuantizationConfig):
-    DeepSeekFP8Config = None
-
     def __init__(
         self,
         target_scheme_map: Dict[str, Any],
@@ -83,6 +80,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        linear_fp8_config: Optional[Any] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -94,6 +92,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
+        self.linear_fp8_config = linear_fp8_config
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -123,12 +122,15 @@ class CompressedTensorsConfig(QuantizationConfig):
         if should_ignore_layer(
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
-            return UnquantizedLinearMethod()
-        if isinstance(layer, LinearBase):
-            if CompressedTensorsConfig.DeepSeekFP8Config is not None:
-                return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-            if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+            if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
+            return None
+
+        if isinstance(layer, LinearBase):
+            # If linear_fp8_config is set, use FP8 for linear layers
+            # This allows mixed quantization: experts with int4, linear layers with fp8
+            if self.linear_fp8_config is not None:
+                return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -137,8 +139,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
             return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
+        return None
+
+    @property
+    def weight_block_size(self) -> Optional[List[int]]:
+        """Get the weight block size from the quantization config."""
+        if "Linear" in self.target_scheme_map:
+            weights_config = self.target_scheme_map["Linear"].get("weights")
+            if weights_config and hasattr(weights_config, "block_structure"):
+                return weights_config.block_structure
         return None
 
     @classmethod
@@ -151,6 +161,23 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         packed_modules_mapping = config.get("packed_modules_mapping", {})
 
+        # Parse linear_fp8_config if present (for mixed quantization scenarios)
+        # Format: {"activation_scheme": "dynamic", "fmt": "e4m3",
+        #          "quant_method": "fp8", "weight_block_size": [128, 128]}
+        linear_fp8_config = None
+        if "linear_fp8_config" in config:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            fp8_cfg = config["linear_fp8_config"]
+            # Check if it's fp8 format based on quant_method field
+            is_fp8 = fp8_cfg.get("quant_method") == "fp8"
+            linear_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=is_fp8,
+                activation_scheme=fp8_cfg.get("activation_scheme", "dynamic"),
+                ignored_layers=fp8_cfg.get("ignored_layers"),
+                weight_block_size=fp8_cfg.get("weight_block_size"),
+            )
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -159,6 +186,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
+            linear_fp8_config=linear_fp8_config,
         )
 
     @classmethod
@@ -287,7 +315,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
-    def _is_fp8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+    def _is_fp8_w8a8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
         # Confirm weights and activations quantized.
         if weight_quant is None or input_quant is None:
             return False
@@ -299,15 +329,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         is_symmetric_weight = weight_quant.symmetric
         is_static_weight = not weight_quant.dynamic
-        is_per_tensor_or_channel_weight = weight_quant.strategy in [
+        is_tensor_or_channel_or_block_weight = weight_quant.strategy in [
             QuantizationStrategy.TENSOR,
             QuantizationStrategy.CHANNEL,
+            QuantizationStrategy.BLOCK,
         ]
         if not (
             is_floating_point
             and is_symmetric_weight
             and is_static_weight
-            and is_per_tensor_or_channel_weight
+            and is_tensor_or_channel_or_block_weight
         ):
             return False
 
@@ -346,6 +377,35 @@ class CompressedTensorsConfig(QuantizationConfig):
         # All conditions satisfied.
         return True
 
+    def _is_fp4a4_nvfp4(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ):
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_tensor_group_quant = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+            and input_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+        )
+        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+
+        is_group_size_16 = (
+            weight_quant.group_size == 16 and input_quant.group_size == 16
+        )
+        is_float_type = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        is_4_bits = weight_quant.num_bits == 4 and input_quant.num_bits == 4
+
+        return (
+            is_tensor_group_quant
+            and is_float_type
+            and is_4_bits
+            and is_group_size_16
+            and is_symmetric
+        )
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -381,13 +441,24 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
         if is_activation_quantization_format(self.quant_format):
+            if self._is_fp4a4_nvfp4(weight_quant, input_quant):
+                is_fp4a4_nvfp4_supported = self._check_scheme_supported(
+                    CompressedTensorsW4A4Fp4.get_min_capability(), error=False
+                )
+                if is_fp4a4_nvfp4_supported:
+                    return CompressedTensorsW4A4Fp4()
+                else:
+                    raise NotImplementedError(
+                        "Current platform does not support w4a4 nvfp4 quantization."
+                    )
+
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 is_fp8_w8a8_supported = self._check_scheme_supported(
                     CompressedTensorsW8A8Fp8.get_min_capability(), error=False
                 )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
-                        strategy=weight_quant.strategy,
+                        weight_quant=weight_quant,
                         is_static_input_scheme=(
                             input_quant and not input_quant.dynamic
                         ),
@@ -589,6 +660,7 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
+        self.quant_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
