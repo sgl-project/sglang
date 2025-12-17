@@ -70,10 +70,6 @@ class EnvField:
         os.environ.pop(self.name, None)
         self._set_to_none = False
 
-    @property
-    def value(self):
-        return self.get()
-
     def __bool__(self):
         raise RuntimeError(
             "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
