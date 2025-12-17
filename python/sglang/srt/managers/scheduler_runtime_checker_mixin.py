@@ -72,7 +72,7 @@ class SchedulerRuntimeCheckerMixin:
 
         # Check index_k buffer
         index_k_available = self.token_to_kv_pool_allocator.index_k_available_size()
-        index_k_expected = self.max_total_num_tokens
+        index_k_expected = self.token_to_kv_pool_allocator.index_k_expected_size()
         index_k_memory_leak = index_k_available != index_k_expected
 
         memory_leak = kv_memory_leak or index_k_memory_leak

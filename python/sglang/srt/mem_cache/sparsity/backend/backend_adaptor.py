@@ -141,6 +141,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         diff = page_size - positions_in_page - 1
         sparse_seq_lens = (valid_lengths * page_size - diff).to(torch.int32)
 
+        logger.info(f"Adapt for attn metadata, sparse_seq_lens: {sparse_seq_lens.tolist()}, original_cache_seqlens_int32: {self._original_metadata['cache_seqlens_int32'].tolist()}")
         current_metadata.cache_seqlens_int32 = torch.where(
             sparse_mask, sparse_seq_lens, self._original_metadata["cache_seqlens_int32"]
         )

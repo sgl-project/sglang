@@ -441,6 +441,7 @@ class ServerArgs:
     # Sparse Attn
     enable_sparse_attn: bool = False
     enable_hierarchical_nsa: bool = False
+    max_nsa_index_k_cache_size: Optional[int] = None
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -3044,6 +3045,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_hierarchical_nsa,
             help="Enable hierarchical NSA (NSA models only).",
+        )
+        parser.add_argument(
+            "--max-nsa-index-k-cache-size",
+            type=int,
+            default=ServerArgs.max_nsa_index_k_cache_size,
+            help="The maximum size of the NSA index_k cache pool. If not set, defaults to max_total_tokens * 4.",
         )
 
         # Ktransformer server args

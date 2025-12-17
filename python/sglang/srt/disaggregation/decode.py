@@ -49,9 +49,13 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    is_enable_hierarchical_nsa,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import release_kv_cache, truncate_kv_cache_after_prefill
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -132,6 +136,38 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
+
+
+class NSADecodeReqToTokenPool(DecodeReqToTokenPool):
+    """NSA DecodeReqToTokenPool: separate mapping for KV cache and nsa indexer_k"""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        pre_alloc_size: int,
+    ):
+        super().__init__(size, max_context_len, device, enable_memory_saver, pre_alloc_size)
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+        with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
+            self.req_to_nsa_index_k = torch.zeros(
+                (size + pre_alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=device,
+            )
+
+    def write_index_token(self, indices, values):
+        """Write indexer_k mapping"""
+        self.req_to_nsa_index_k[indices] = values
+
+    def clear(self):
+        super().clear()
+        self.req_to_nsa_index_k.zero_()
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -510,9 +546,14 @@ class DecodePreallocQueue:
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
+                if isinstance(self.req_to_token_pool, NSADecodeReqToTokenPool):
+                    kv_indices_full = self.req_to_token_pool.req_to_nsa_index_k[
+                        decode_req.req.req_pool_idx, :seq_len
+                    ]
+                else:
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, :seq_len
+                    ]
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             else:
@@ -624,10 +665,10 @@ class DecodePreallocQueue:
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+            alloc_result = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+            alloc_result = self.token_to_kv_pool_allocator.alloc_extend(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
@@ -637,10 +678,24 @@ class DecodePreallocQueue:
             )
 
         assert (
-            kv_loc is not None
+            alloc_result is not None
         ), "KV cache is full! There is a bug in memory estimation."
 
+        if is_enable_hierarchical_nsa(self.token_to_kv_pool_allocator):
+            kv_loc, index_k_loc = alloc_result
+        else:
+            kv_loc = alloc_result
+            index_k_loc = None
+
+        # Write KV indices to req_to_token
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
+
+        # Write index_k indices for NSA
+        if index_k_loc is not None:
+            self.req_to_token_pool.write_index_token(
+                (req.req_pool_idx, slice(0, len(index_k_loc))),
+                index_k_loc.to(torch.int32),
+            )
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
@@ -959,4 +1014,15 @@ class SchedulerDisaggregationDecodeMixin:
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+
+            # NSA: Register, Offload and Truncate after KV transfer completes
+            sparse_coordinator = get_sparse_coordinator()
+            if sparse_coordinator is not None:
+                for req in alloc_reqs:
+                    sparse_coordinator.on_request_begin(req)
+                    sparse_coordinator.on_request_prefill_end(req)
+                    truncate_kv_cache_after_prefill(
+                        req, self.req_to_token_pool, self.tree_cache
+                    )
+
             self.waiting_queue.extend(alloc_reqs)

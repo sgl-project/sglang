@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
-
 import torch
 
+from sglang.srt.disaggregation.decode import NSADecodeReqToTokenPool
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -668,7 +668,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         real_page_table = self._transform_table_1_to_real(page_table_1)
         index_real_page_table = None
 
-        if isinstance(self.req_to_token_pool, NSAReqToTokenPool):
+        if isinstance(self.req_to_token_pool, NSAReqToTokenPool) or isinstance(self.req_to_token_pool, NSADecodeReqToTokenPool):
             index_real_page_table = torch.zeros_like(real_page_table)
         else:
             index_real_page_table = None

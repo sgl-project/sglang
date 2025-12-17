@@ -116,11 +116,11 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
-                    # Truncate KV cache after prefill completes
-                    truncate_kv_cache_after_prefill(
-                        req, batch.req_to_token_pool, self.tree_cache
-                    )
-                    if req.finished():
+                    if req.finished():  
+                        # Truncate KV cache after prefill completes
+                        truncate_kv_cache_after_prefill(
+                            req, batch.req_to_token_pool, self.tree_cache
+                        )                      
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -129,6 +129,10 @@ class SchedulerOutputProcessorMixin:
 
                         if sparse_coordinator is not None:
                             sparse_coordinator.on_request_prefill_end(req)
+                            # Truncate KV cache after prefill completes
+                            truncate_kv_cache_after_prefill(
+                                req, batch.req_to_token_pool, self.tree_cache
+                            )
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None

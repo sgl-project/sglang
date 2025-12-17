@@ -276,7 +276,8 @@ def truncate_kv_cache_after_prefill(req: "Req", req_to_token_pool, tree_cache):
         req.prefix_indices = req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_keep_len
         ].to(dtype=torch.int64, copy=True)
-        tree_cache.protected_size_ -= old_prefix_len - kv_keep_len
+        if old_prefix_len > 0:
+            tree_cache.protected_size_ -= old_prefix_len - kv_keep_len
 
 
 def alloc_paged_token_slots_extend(

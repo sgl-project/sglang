@@ -1654,6 +1654,7 @@ class ModelRunner:
                 from sglang.srt.disaggregation.decode import (
                     DecodeReqToTokenPool,
                     HybridMambaDecodeReqToTokenPool,
+                    NSADecodeReqToTokenPool,
                 )
 
                 # subscribe memory for pre-allocated requests
@@ -1668,6 +1669,19 @@ class ModelRunner:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         cache_params=config.mamba2_cache_params,
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        pre_alloc_size=pre_alloc_size,
+                    )
+                elif (
+                    self.server_args.enable_hierarchical_nsa
+                    and is_deepseek_nsa(self.model_config.hf_config)
+                ):
+                    # Use NSA DecodeReqToTokenPool for hierarchical NSA
+                    self.req_to_token_pool = NSADecodeReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
                         pre_alloc_size=pre_alloc_size,
                     )
                 else:
@@ -1749,6 +1763,11 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
+            index_k_max_size = (
+                self.server_args.max_nsa_index_k_cache_size
+                if self.server_args.max_nsa_index_k_cache_size is not None
+                else self.max_total_num_tokens
+            )         
             self.token_to_kv_pool = NSATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1761,6 +1780,7 @@ class ModelRunner:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                index_k_max_size=index_k_max_size,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
@@ -1893,10 +1913,15 @@ class ModelRunner:
                         and is_nsa_model
                         and isinstance(self.token_to_kv_pool, NSATokenToKVPool)
                     ):
+                        index_k_max_size = (
+                            self.server_args.max_nsa_index_k_cache_size
+                            if self.server_args.max_nsa_index_k_cache_size is not None
+                            else self.max_total_num_tokens
+                        )
                         self.token_to_kv_pool_allocator = (
                             NSAHybridTokenToKVPoolAllocator(
                                 kv_size=self.max_total_num_tokens,
-                                index_k_size=self.max_total_num_tokens,
+                                index_k_size=index_k_max_size,
                                 page_size=self.page_size,
                                 dtype=self.kv_cache_dtype,
                                 device=self.device,
@@ -1905,7 +1930,8 @@ class ModelRunner:
                             )
                         )
                         logger.info(
-                            "Using NSAHybridTokenToKVPoolAllocator with separate KV and indexer_k allocation"
+                            f"Using NSAHybridTokenToKVPoolAllocator with separate KV and indexer_k allocation, "
+                            f"kv_size={self.max_total_num_tokens}, index_k_size={index_k_max_size}"
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(

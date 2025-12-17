@@ -205,6 +205,7 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kv_size, page_size, dtype, device, kvcache, need_sort
         )
 
+        self.index_k_max_total_size = index_k_size
         self.index_k_allocator = PagedTokenToKVPoolAllocator(
             index_k_size, page_size, dtype, device, kvcache, need_sort
         )
@@ -308,6 +309,10 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def index_k_available_size(self):
         """Return index_k allocator's available size"""
         return self.index_k_allocator.available_size()
+
+    def index_k_expected_size(self):
+        """Return index_k allocator's expected size"""
+        return self.index_k_allocator.num_pages * self.index_k_allocator.page_size
 
     def clear(self):
         self.kv_allocator.clear()
