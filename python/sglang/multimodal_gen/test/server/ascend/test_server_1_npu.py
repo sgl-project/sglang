@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.ascend.testcase_configs import ONE_NPU_CASES
+from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import ONE_NPU_CASES
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
