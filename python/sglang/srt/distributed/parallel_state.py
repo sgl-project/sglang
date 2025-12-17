@@ -560,6 +560,17 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        # On AMD with deterministic inference, use the deterministic 1-stage kernel
+        if is_hip() and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            if not input_.is_cpu and self.ca_comm is not None:
+                inp_size = input_.numel() * input_.element_size()
+                # Try unregistered mode first (faster for smaller tensors)
+                if inp_size < self.ca_comm.max_size:
+                    return self.ca_comm.deterministic_all_reduce(input_, registered=False)
+                # Use registered mode for larger tensors
+                self.ca_comm.register_buffer(input_)
+                return self.ca_comm.deterministic_all_reduce(input_, registered=True)
+
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)

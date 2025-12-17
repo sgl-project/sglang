@@ -373,6 +373,23 @@ class CustomAllreduce:
             )
         return out
 
+    def deterministic_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor = None,
+        registered: bool = False,
+    ):
+        """Deterministic all-reduce using 1-stage kernel with fixed ordering (AMD only)."""
+        if out is None:
+            out = torch.empty_like(inp)
+        if registered:
+            ops.deterministic_all_reduce_reg(self._ptr, inp, out)
+        else:
+            reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
+            ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
+        return out
+
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -411,7 +428,19 @@ class CustomAllreduce:
 
 
 def dispatch_custom_allreduce():
-    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
+    
+    On AMD with deterministic inference, use sglang's CustomAllreduce
+    (has deterministic_all_reduce method). Otherwise use AiterCustomAllreduce if available.
+    """
+    # On AMD with deterministic inference, use sglang's CustomAllreduce
+    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
+    if is_hip() and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        logger.info(
+            "AMD/ROCm with deterministic inference: Using sglang CustomAllreduce"
+        )
+        return CustomAllreduce
+    
     if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (

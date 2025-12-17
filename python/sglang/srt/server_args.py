@@ -2314,11 +2314,20 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                os.environ["NCCL_ALGO"] = "allreduce:tree"
-                self.disable_custom_all_reduce = True
-                logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
-                )
+                # Check if running on AMD/ROCm
+                import torch
+                if torch.version.hip is not None:
+                    # AMD: use deterministic 1-stage kernel (keep custom all-reduce enabled)
+                    logger.info(
+                        "AMD/ROCm: Using deterministic 1-stage all-reduce kernel"
+                    )
+                else:
+                    # CUDA: use NCCL tree algorithm
+                    os.environ["NCCL_ALGO"] = "allreduce:tree"
+                    self.disable_custom_all_reduce = True
+                    logger.warning(
+                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                    )
 
     def _handle_request_metrics_exporters(self):
         """Handle arguments for configuring `RequestMetricsExporter` usage."""
