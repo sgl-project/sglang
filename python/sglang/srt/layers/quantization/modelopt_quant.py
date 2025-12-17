@@ -22,6 +22,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -46,7 +47,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils.common import (
-    direct_register_custom_op,
     get_bool_env_var,
     is_cuda,
     is_sm120_supported,
@@ -102,6 +102,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
 def _sglang_fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -120,6 +121,7 @@ def _sglang_fp4_gemm(
         return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
+@torch.library.register_fake("sglang::fp4_gemm")
 def _sglang_fp4_gemm_fake(
     input,
     weight,
@@ -132,14 +134,6 @@ def _sglang_fp4_gemm_fake(
     M = input.shape[-2]
     N = int(out_features)
     return input.new_empty((M, N), dtype=out_dtype)
-
-
-direct_register_custom_op(
-    op_name="fp4_gemm",
-    op_func=_sglang_fp4_gemm,
-    mutates_args=[],
-    fake_impl=_sglang_fp4_gemm_fake,
-)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -792,6 +786,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     use_routing_scales_on_input=use_routing_scales_on_input,
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 )
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1606,7 +1601,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if MOE_NVFP4_DISPATCH else None
+                    layer.w13_input_scale_quant
+                    if MOE_NVFP4_DISPATCH
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else None
                 )
             }
         )
