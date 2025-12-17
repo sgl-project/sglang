@@ -8,6 +8,7 @@ import argparse
 import dataclasses
 import inspect
 import json
+import os
 import random
 import sys
 import tempfile
@@ -954,6 +955,15 @@ class ServerArgs:
             if self.num_gpus == 1:
                 raise ValueError(
                     "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
+                )
+
+        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            has_sp = self.sp_degree > 1
+            has_tp = self.tp_size > 1
+            if has_sp and has_tp:
+                raise ValueError(
+                    "cache-dit does not support hybrid parallelism (SP + TP). "
+                    "Please use either sequence parallelism or tensor parallelism, not both."
                 )
 
 

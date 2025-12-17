@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -110,6 +111,8 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
 ]
+
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -431,6 +434,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
+    speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -611,6 +615,8 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+    remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
+    remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -687,6 +693,9 @@ class ServerArgs:
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
 
+        # Handle remote instance weight loader.
+        self._handle_remote_instance_weight_loader_start_seed_via_transfer_engine()
+
         # Handle model loading format.
         self._handle_load_format()
 
@@ -747,8 +756,15 @@ class ServerArgs:
             # TODO: when extra_buffer is more verified, we can set the default path based on
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
+        # In speculative scenario:
+        # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
+        # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self.speculative_draft_model_quantization is None:
+            self.speculative_draft_model_quantization = self.quantization
+        elif self.speculative_draft_model_quantization == "unquant":
+            self.speculative_draft_model_quantization = None
 
-        # Handle ModelScope model downloads
+            # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             if not os.path.exists(self.model_path):
                 from modelscope import snapshot_download
@@ -1266,6 +1282,9 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
+            assert (
+                not self.enable_mamba_extra_buffer()
+            ), f"mamba extra_buffer is not supported for {model_arch} model"
             model_config = self.get_model_config()
             if model_config.quantization in [
                 "modelopt",
@@ -1369,9 +1388,6 @@ class ServerArgs:
                 assert (
                     is_cuda()
                 ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
-                assert (
-                    self.disaggregation_mode == "null"
-                ), "Mamba extra_buffer is not compatible with disaggregation mode yet."
                 if self.speculative_num_draft_tokens is not None:
                     assert (
                         self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -1430,7 +1446,9 @@ class ServerArgs:
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
-        is_h20_device = "H20" in device_name and "H200" not in device_name
+        is_h20_device = (
+            device_name and "H20" in device_name and "H200" not in device_name
+        )
         if (
             not self.enable_flashinfer_allreduce_fusion
             and model_arch
@@ -1490,7 +1508,14 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
-                elif is_sm100_supported() and is_no_spec_infer_or_topk_one(self):
+                elif (
+                    is_sm100_supported()
+                    and is_no_spec_infer_or_topk_one(self)
+                    and (
+                        self.speculative_algorithm is None
+                        or self.speculative_eagle_topk is not None
+                    )
+                ):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
@@ -2088,8 +2113,26 @@ class ServerArgs:
             if (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
-                or self.remote_instance_weight_loader_send_weights_group_ports is None
             ):
+                logger.warning(
+                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader settings."
+                )
+                self.load_format = "auto"
+            elif (
+                self.remote_instance_weight_loader_send_weights_group_ports is None
+                and self.remote_instance_weight_loader_backend == "nccl"
+            ):
+                logger.warning(
+                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader NCCL group ports settings."
+                )
+                self.load_format = "auto"
+            elif (
+                not self.validate_transfer_engine()
+                and self.remote_instance_weight_loader_backend == "transfer_engine"
+            ):
+                logger.warning(
+                    "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
+                )
                 self.load_format = "auto"
 
     def _handle_encoder_disaggregation(self):
@@ -2347,19 +2390,12 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
-    def _handle_remote_instance_weight_loader_support_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
-            logger.warning(
-                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+    def _handle_remote_instance_weight_loader_start_seed_via_transfer_engine(self):
+        # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
+        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
+            self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
+                self.validate_transfer_engine()
             )
-            self.remote_instance_weight_loader_support_transfer_engine = False
-        elif self.enable_memory_saver:
-            logger.warning(
-                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            self.remote_instance_weight_loader_support_transfer_engine = False
-        else:
-            self.remote_instance_weight_loader_support_transfer_engine = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3389,6 +3425,13 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_a2a_backend,
             help="Choose the backend for MoE A2A in speculative decoding",
         )
+        parser.add_argument(
+            "--speculative-draft-model-quantization",
+            type=str,
+            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+            default=ServerArgs.speculative_draft_model_quantization,
+            help="The quantization method for speculative model.",
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -4251,6 +4294,18 @@ class ServerArgs:
             default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
             help="The communication group ports for loading weights from remote instance.",
         )
+        parser.add_argument(
+            "--remote-instance-weight-loader-backend",
+            type=str,
+            choices=["transfer_engine", "nccl"],
+            default=ServerArgs.remote_instance_weight_loader_backend,
+            help="The backend for loading weights from remote instance. Can be 'transfer_engine' or 'nccl'. Default is 'nccl'.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+            action="store_true",
+            help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
 
         # For PD-Multiplexing
         parser.add_argument(
@@ -4755,6 +4810,33 @@ class ServerArgs:
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
         )
+
+    def validate_transfer_engine(self):
+        if importlib.util.find_spec("mooncake.engine") is None:
+            logger.warning(
+                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            return False
+        elif self.enable_memory_saver:
+            logger.warning(
+                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            return False
+        else:
+            return True
+
+    def remote_instance_weight_loader_use_transfer_engine(self):
+        # Use TransferEngine as seed backend.
+        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
+            return True
+        # Use TransferEngine as client backend.
+        elif (
+            self.load_format == "remote_instance"
+            and self.remote_instance_weight_loader_backend == "transfer_engine"
+        ):
+            return True
+        else:
+            return False
 
 
 # NOTE: This is a global variable to hold the server args for scheduler.
