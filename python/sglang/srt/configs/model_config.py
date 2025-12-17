@@ -821,7 +821,7 @@ class ModelConfig:
                 f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
                 "If you experience issues related to RoPE parameters, "
                 "they may be due to incompatibilities between Transformers >=5.0.0 and some models. "
-                "You can try downgrading to transformers==4.57.1 as a workaround."
+                "You can try downgrading to transformers==4.57.3 as a workaround."
             )
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:

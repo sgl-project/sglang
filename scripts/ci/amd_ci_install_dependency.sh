@@ -55,6 +55,7 @@ case "${GPU_ARCH}" in
     install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]" --no-deps
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    # IMPORTANT: do not let lmms-eval override core deps (e.g. transformers) pinned by sglang.
     install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . --no-deps
     ;;
   mi30x|mi300|mi325)
@@ -63,7 +64,8 @@ case "${GPU_ARCH}" in
     install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]"
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+    # IMPORTANT: do not let lmms-eval override core deps (e.g. transformers) pinned by sglang.
+    install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . --no-deps
     ;;
   *)
     echo "Runner architecture '${GPU_ARCH}' unrecognised;" >&2
