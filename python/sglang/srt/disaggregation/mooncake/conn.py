@@ -1204,8 +1204,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
 
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(
                     [
