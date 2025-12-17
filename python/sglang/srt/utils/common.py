@@ -3497,9 +3497,19 @@ def get_device_sm_nvidia_smi():
 
 
 def numa_bind_to_node(node: int):
-    libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
+    libnuma = None
+    try:
+        libnuma = ctypes.CDLL("libnuma.so")
+    except Exception as e:
+        logger.error(f"{e}, try to import libnuma.so.1")
+        try:
+            libnuma = ctypes.CDLL("libnuma.so.1")
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            libnuma = None
+
+        if libnuma is None or libnuma.numa_available() < 0:
+            raise SystemError("numa not available on this system")
 
     libnuma.numa_run_on_node(ctypes.c_int(node))
     libnuma.numa_set_localalloc()
