@@ -427,7 +427,7 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
     Some(MultimodalInputs {
         image_urls,
         video_urls,
-        audio_urls: Vec::new(), // Audio not yet supported in ContentPart
+        audio_urls: Vec::new(),
         processed_features: None,
         image_data,
         video_data,
@@ -441,6 +441,12 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
 /// Supports format: `data:<mediatype>;base64,<data>`
 /// Example: `data:image/jpeg;base64,/9j/4AAQ...`
 const MAX_DATA_URI_DECODED_SIZE: usize = 10 * 1024 * 1024; // 10 MiB guard for inline payloads
+
+/// Maximum encoded size that could decode to MAX_DATA_URI_DECODED_SIZE.
+/// Base64 uses 4 characters per 3 bytes, plus up to 2 padding characters.
+/// We add a small buffer for padding: (MAX / 3 * 4) + 4
+const MAX_DATA_URI_ENCODED_SIZE: usize = MAX_DATA_URI_DECODED_SIZE / 3 * 4 + 4;
+
 fn parse_data_uri(url: &str) -> Option<Vec<u8>> {
     if !url.starts_with("data:") {
         return None;
@@ -452,9 +458,21 @@ fn parse_data_uri(url: &str) -> Option<Vec<u8>> {
     let data_start = base64_start + base64_marker.len();
     let encoded = &url[data_start..];
 
-    // Rough pre-check so base64 decode never allocates an enormous buffer
-    let chunks = (encoded.len().saturating_add(3)) / 4;
-    let estimated_decoded_len = chunks.saturating_mul(3);
+    // Early rejection based on encoded length to avoid arithmetic on maliciously large inputs.
+    // This check is simpler and more robust than computing decoded size estimates.
+    if encoded.len() > MAX_DATA_URI_ENCODED_SIZE {
+        warn!(
+            function = "parse_data_uri",
+            encoded_len = encoded.len(),
+            limit = MAX_DATA_URI_ENCODED_SIZE,
+            "Data URI encoded payload exceeds allowed size"
+        );
+        return None;
+    }
+
+    // Secondary pre-check on estimated decoded size for defense in depth
+    let chunks = encoded.len().div_ceil(4);
+    let estimated_decoded_len = chunks * 3;
     if estimated_decoded_len > MAX_DATA_URI_DECODED_SIZE {
         warn!(
             function = "parse_data_uri",
