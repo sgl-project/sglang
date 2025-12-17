@@ -245,7 +245,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     string=current_text,
                     flags=re.DOTALL,
                 )
-                if not invoke_match:
+                if not invoke_match or current_text.rstrip().endswith(">"):
                     break
 
                 func_name = invoke_match.group(1).strip()
@@ -261,6 +261,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 is_tool_end = bool(invoke_match.group(3))
 
                 func_args_raw, format = self._parse_parameters_partially(invoke_content)
+
                 if is_tool_end and format == "xml":
                     func_args_raw += "}"
 
