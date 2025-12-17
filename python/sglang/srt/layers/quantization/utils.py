@@ -612,8 +612,6 @@ def reorder_w1w3_to_w3w1(
 
 
 def prepare_static_weights_for_trtllm_fp4_moe(
-    # args_dequant,
-    # args,
     gemm1_weights,
     gemm2_weights,
     gemm1_scales_linear_fp4_bytes,
