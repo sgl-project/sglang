@@ -308,6 +308,7 @@ class USPAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
+        dtype=None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -319,7 +320,7 @@ class USPAttention(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        dtype = get_compute_dtype()
+        dtype = dtype if dtype is not None else get_compute_dtype()
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )

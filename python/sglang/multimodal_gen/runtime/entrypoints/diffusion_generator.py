@@ -280,6 +280,9 @@ class DiffGenerator:
                         continue
                     for output_idx, sample in enumerate(output_batch.output):
                         num_outputs = len(output_batch.output)
+                        # print(f"283: {output_batch.output}", flush=True)
+                        print(f"283: {output_idx}", flush=True)
+                        print(f"284: {sample}", flush=True)
                         frames = self.post_process_sample(
                             sample,
                             fps=req.fps,

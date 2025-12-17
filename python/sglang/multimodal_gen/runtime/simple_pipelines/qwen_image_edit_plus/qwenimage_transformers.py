@@ -5,7 +5,6 @@
 import functools
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from diffusers.models.attention import FeedForward
@@ -13,7 +12,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
-from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
@@ -21,7 +19,6 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     apply_rotary_embedding,
     fuse_scale_shift_kernel,
 )
-from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.utils import (
     delete_projection_layers,
     fuse_linear_projections,
@@ -331,6 +328,7 @@ class QwenImageCrossAttention(nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            dtype=torch.bfloat16,
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
@@ -568,31 +566,24 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class QwenImageTransformer2DModel(CachableDiT):
+class QwenImageTransformer2DModel(nn.Module):
     """
     The Transformer model introduced in Qwen.
-
     """
-
-    _supports_gradient_checkpointing = True
-    _no_split_modules = ["QwenImageTransformerBlock"]
-    _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
-    _repeated_blocks = ["QwenImageTransformerBlock"]
 
     def __init__(
         self,
-        config: QwenImageDitConfig,
-        hf_config: dict[str, Any],
+        config,
     ):
-        super().__init__(config=config, hf_config=hf_config)
+        super().__init__()
         patch_size = config.patch_size
         in_channels = config.in_channels
         out_channels = config.out_channels
-        num_layers = config.arch_config.num_layers
-        attention_head_dim = config.arch_config.attention_head_dim
-        num_attention_heads = config.arch_config.num_attention_heads
-        joint_attention_dim = config.arch_config.joint_attention_dim
-        axes_dims_rope = config.arch_config.axes_dims_rope
+        num_layers = config.num_layers
+        attention_head_dim = config.attention_head_dim
+        num_attention_heads = config.num_attention_heads
+        joint_attention_dim = config.joint_attention_dim
+        axes_dims_rope = config.axes_dims_rope
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
 
@@ -625,13 +616,6 @@ class QwenImageTransformer2DModel(CachableDiT):
             self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
 
-    def fuse_qkv_projections(self):
-        for block in self.transformer_blocks:
-            if hasattr(block.attn, "fuse_projections") and getattr(
-                block.attn, "_supports_qkv_fusion", True
-            ):
-                block.attn.fuse_projections()
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -642,7 +626,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
         attention_kwargs: Optional[Dict[str, Any]] = None,
-        controlnet_block_samples=None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
@@ -669,13 +652,6 @@ class QwenImageTransformer2DModel(CachableDiT):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        if (
-            attention_kwargs is not None
-            and attention_kwargs.get("scale", None) is not None
-        ):
-            logger.warning(
-                "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-            )
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -699,22 +675,8 @@ class QwenImageTransformer2DModel(CachableDiT):
                 joint_attention_kwargs=attention_kwargs,
             )
 
-            # controlnet residual
-            if controlnet_block_samples is not None:
-                interval_control = len(self.transformer_blocks) / len(
-                    controlnet_block_samples
-                )
-                interval_control = int(np.ceil(interval_control))
-                hidden_states = (
-                    hidden_states
-                    + controlnet_block_samples[index_block // interval_control]
-                )
-
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
 
         output = self.proj_out(hidden_states)
         return output
-
-
-EntryClass = QwenImageTransformer2DModel

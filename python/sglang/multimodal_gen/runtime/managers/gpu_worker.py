@@ -103,7 +103,7 @@ class GPUWorker:
             start_time = time.monotonic()
             timings = RequestTimings(request_id=req.request_id)
             req.timings = timings
-
+            print(f"106: {req}", flush=True)
             output_batch = self.pipeline.forward(req, self.server_args)
             duration_ms = (time.monotonic() - start_time) * 1000
 
