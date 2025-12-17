@@ -98,12 +98,12 @@ class TestAscendW8A8(CustomTestCase):
 
         if is_in_ci():
             self.assertGreaterEqual(throughput, 25)
-
+            
 
 class TestAscendW8A8CompressedTensors(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        # TODO: Move model to CI or Modelscope
+        #TODO: Move model to CI or Modelscope
         cls.model = "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

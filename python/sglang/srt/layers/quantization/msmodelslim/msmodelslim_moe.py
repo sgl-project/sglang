@@ -2,16 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import enum
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from enum import Enum
+from typing import Callable, Optional, TYPE_CHECKING
+from typing import Any, Dict, List
 
 import torch
 
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.layers.quantization.msmodelslim.schemes import (
+    ModelSlimScheme,
+)
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8DynamicMoEMethod,
     NPUW8A8Int8DynamicMoEMethod,
 )
-from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -20,7 +29,9 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.msmodelslim.msmodelslim import ModelSlimConfig
+    from sglang.srt.layers.quantization.msmodelslim.msmodelslim import (
+        ModelSlimConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +73,7 @@ class ModelSlimMoEMethod(FusedMoEMethodBase):
 class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
 
     def __init__(
-        self,
-        quant_config: Dict[str, Any],
-        prefix: str = None,
+            self, quant_config: Dict[str, Any], prefix: str = None,
     ):
         self.quant_config = quant_config
         self.group_size = 0
@@ -164,9 +173,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
                 ),
                 requires_grad=False,
             )
-            layer.register_parameter(
-                "w13_weight_offset_second", w13_weight_offset_second
-            )
+            layer.register_parameter("w13_weight_offset_second", w13_weight_offset_second)
             set_weight_attrs(w13_weight_offset_second, extra_weight_attrs)
 
             w2_weight_scale_second = torch.nn.Parameter(
@@ -218,13 +225,14 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
         self.moe_runner_config = moe_runner_config
-
+    
     def apply(
         self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
         return NPUW4A8Int8DynamicMoEMethod.apply(layer, dispatch_output)
+    
 
     def apply_without_routing_weights(
         self,
@@ -235,22 +243,18 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         group_list,
         output_dtype,
     ):
-        return NPUW4A8Int8DynamicMoEMethod.apply_without_routing_weights(
-            layer,
-            hidden_states,
-            hidden_states_scale,
-            group_list_type,
-            group_list,
-            output_dtype,
-        )
+        return NPUW4A8Int8DynamicMoEMethod.apply_without_routing_weights(layer,
+                                                                        hidden_states,
+                                                                        hidden_states_scale,
+                                                                        group_list_type,
+                                                                        group_list,
+                                                                        output_dtype,)
 
 
 class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
 
     def __init__(
-        self,
-        quant_config: Dict[str, Any],
-        prefix: str = None,
+            self, quant_config: Dict[str, Any], prefix: str = None,
     ):
         self.quant_config = quant_config
 
@@ -331,13 +335,14 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
         self.moe_runner_config = moe_runner_config
-
+    
     def apply(
         self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
         return NPUW8A8Int8DynamicMoEMethod.apply(layer, dispatch_output)
+    
 
     def apply_without_routing_weights(
         self,
@@ -348,11 +353,9 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
         group_list,
         output_dtype,
     ):
-        return NPUW8A8Int8DynamicMoEMethod.apply_without_routing_weights(
-            layer,
-            hidden_states,
-            hidden_states_scale,
-            group_list_type,
-            group_list,
-            output_dtype,
-        )
+        return NPUW8A8Int8DynamicMoEMethod.apply_without_routing_weights(layer,
+                                                                        hidden_states,
+                                                                        hidden_states_scale,
+                                                                        group_list_type,
+                                                                        group_list,
+                                                                        output_dtype,)

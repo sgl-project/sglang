@@ -1,8 +1,13 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.layers.parameter import (
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
 if TYPE_CHECKING:
@@ -20,7 +25,7 @@ class _NPULinearMethodBase(LinearMethodBase):
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
-
+    
     @staticmethod
     def apply(
         layer: torch.nn.Module,

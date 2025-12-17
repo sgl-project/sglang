@@ -1,31 +1,38 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, List, Optional
+from typing import Callable, Optional
 
 import torch
+from torch.nn import Parameter
 
+from typing import Any, Dict, List
+
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
-    NPUW8A8Int8LinearMethod,
+    NPUW8A8Int8LinearMethod
 )
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization.msmodelslim.schemes import ModelSlimScheme
+from sglang.srt.layers.quantization.msmodelslim.schemes import (
+    ModelSlimScheme,
+)
 
 
 class ModelSlimW8A8Int8(ModelSlimScheme):
 
     def __init__(
-        self,
-        quant_config: Dict[str, any],
-        prefix: str,
+        self, quant_config: Dict[str, any], prefix: str,
     ):
         self.quant_config = quant_config
-        self.is_dynamic = self.quant_config[prefix + ".weight"] == "W8A8_DYNAMIC"
+        self.is_dynamic = (
+            self.quant_config[prefix + ".weight"]
+            == "W8A8_DYNAMIC"
+        )
 
     def create_weights(
         self,
@@ -63,7 +70,7 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight_offset", weight_offset)
-
+        
         if not self.is_dynamic:
             input_scale = PerTensorScaleParameter(
                 data=torch.empty(1, dtype=params_dtype),
@@ -104,7 +111,7 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
             NPUW8A8Int8DynamicLinearMethod.process_weights_after_loading(layer)
         else:
             NPUW8A8Int8LinearMethod.process_weights_after_loading(layer)
-
+    
     def apply_weights(
         self,
         layer: torch.nn.Module,
