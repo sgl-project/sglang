@@ -42,7 +42,7 @@ sglang generate \
 
 ### Output Location
 
-By default, trace files are saved in the ./logs/ directory. 
+By default, trace files are saved in the ./logs/ directory.
 
 The exact output file path will be shown in the console output, for example:
 
