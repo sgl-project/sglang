@@ -576,7 +576,7 @@ class ModelRunner:
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.value
+            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
         )
         self.remote_instance_transfer_engine_session_id = (
             f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
