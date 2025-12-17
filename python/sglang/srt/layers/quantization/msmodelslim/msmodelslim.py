@@ -6,12 +6,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 
-# from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-#     NPUW4A8Int4DynamicMoEMethod,
-#     NPUW4A16Int4DynamicMoEMethod,
-#     NPUW8A8Int8DynamicMoEMethod,
-# )
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (  # NPUW8A8Int8DynamicLinearMethod,; NPUW8A8Int8LinearMethod,
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -28,7 +23,6 @@ from sglang.srt.layers.quantization.msmodelslim.schemes import (
     ModelSlimW8A8Int8,
 )
 
-# from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -90,20 +84,6 @@ class ModelSlimConfig(QuantizationConfig):
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
-        # self.target_scheme_map = (
-        #     CompressedTensorsConfig._quantization_scheme_map_from_config(
-        #         config=quant_config
-        #     )
-        # )
-        # target = "MoEGMM" if "MoEGMM" in self.target_scheme_map else "Linear"
-        # target_scheme = self.target_scheme_map.get(target, None)
-        # if target_scheme is None:
-        #     self.is_moe_w4_dynamic = False
-        # else:
-        #     weight_quant = target_scheme.get("weights")
-        #     input_quant = target_scheme.get("input_activations")
-        #     self.is_moe_w4_dynamic = self.is_dynamic_token_w4(weight_quant, input_quant)
-        #     self.is_moe_input_quant = input_quant
 
         for name in self.quant_description.keys():
             if "norm.bias" in name:
@@ -169,10 +149,6 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
-            # self.is_dynamic = (
-            #     self.quant_description[prefix_in_quant_config + ".weight"]
-            #     == "W8A8_DYNAMIC"
-            # )
 
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
@@ -210,14 +186,11 @@ class ModelSlimConfig(QuantizationConfig):
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
         """
-        scheme = self._get_scheme_from_parts(  # type: ignore
-            # weight_quant=weight_quant,
-            # input_quant=input_quant,
+        scheme = self._get_scheme_from_parts(
             layer_name=layer_name,
         )
 
         # Ascend doesn't support device capability
-        # self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 
