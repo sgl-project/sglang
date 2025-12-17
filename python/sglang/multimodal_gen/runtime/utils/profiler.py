@@ -153,5 +153,6 @@ class SGLDiffusionProfiler:
                     return False
             
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Trace file integrity check failed: {e}")
             return False
