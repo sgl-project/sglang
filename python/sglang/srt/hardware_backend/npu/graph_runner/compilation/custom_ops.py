@@ -1,6 +1,6 @@
 from typing import List
 
-import sgl_kernel_npu.norm.split_qkv_rmsnorm_rope
+import sgl_kernel_npu.norm.split_qkv_rmsnorm_rope as sgl_kernel_npu
 import torch
 
 
@@ -18,7 +18,7 @@ def split_qkv_rmsnorm_rope(
     q_bias: torch.Tensor,
     k_bias: torch.Tensor,
 ) -> List[torch.Tensor]:
-    q, k, v = sgl_kernel_npu.norm.split_qkv_rmsnorm_rope.split_qkv_rmsnorm_rope(
+    q, k, v = sgl_kernel_npu.split_qkv_rmsnorm_rope(
         input,
         sin,
         cos,
