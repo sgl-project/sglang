@@ -10,6 +10,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -177,6 +178,7 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
         subprocess.run(cmd, check=True, timeout=3600)
 
+    @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
     def test_mmmu(self):
         """Test MMMU evaluation with EPD disaggregation"""
         import glob
