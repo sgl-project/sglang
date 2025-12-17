@@ -629,7 +629,7 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm])
+        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
