@@ -125,7 +125,7 @@ impl PipelineStage for WorkerSelectionStage {
                             "No available EPD worker triple for model"
                         );
                         return Err(error::service_unavailable(
-                            "no_available_encode_prefill_deocde_workers_for_model",
+                            "no_available_encode_prefill_decode_workers_for_model",
                             format!(
                                 "No available Encode-Prefill-Decode workers for model: {:?}",
                                 ctx.input.model_id
