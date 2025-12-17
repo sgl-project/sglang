@@ -28,9 +28,11 @@ if TYPE_CHECKING:
 try:
     from aiter import (
         flash_attn_varlen_func,
+        flash_attn_varlen_fp8_pertensor_func,
         mha_batch_prefill_func,
         paged_attention_ragged,
     )
+    from aiter import dtypes, per_tensor_quant
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     print(
@@ -1003,19 +1005,24 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
+            # Convert q, k, v to FP8 format
+            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            
+            # Quantize to FP8
+            q_fp8, _ = per_tensor_quant(q_reshaped, scale=torch.tensor(1.0), quant_dtype=dtypes.fp8)
+            k_fp8, _ = per_tensor_quant(k, scale=torch.tensor(1.0), quant_dtype=dtypes.fp8)
+            v_fp8, _ = per_tensor_quant(v, scale=torch.tensor(1.0), quant_dtype=dtypes.fp8)
+
+            o = flash_attn_varlen_fp8_pertensor_func(
+                q=q_fp8,
+                k=k_fp8,
+                v=v_fp8,
+                cu_seqlens_q=self.qo_indptr[:bs0],
+                cu_seqlens_k=self.forward_metadata.kv_indptr[:bs0],
+                max_seqlen_q=self.forward_metadata.max_q_len,
+                max_seqlen_k=self.forward_metadata.max_kv_len,
+                softmax_scale=layer.scaling,
                 causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
