@@ -1232,6 +1232,8 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     group_name: str = "weight_send_group"
     # The backend
     backend: str = "nccl"
+    # Draft model flag
+    is_draft_model: bool = False
 
 
 # Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
@@ -1266,6 +1268,8 @@ class SendWeightsToRemoteInstanceReqInput(BaseReq):
     ports: str
     # The group name
     group_name: str = "weight_send_group"
+    # Draft model flag
+    is_draft_model: bool = False
 
 
 @dataclass
