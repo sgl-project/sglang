@@ -531,7 +531,6 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
-    enable_piecewise_npu_graph_decode: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -1535,7 +1534,6 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
-            self.enable_piecewise_npu_graph_decode = False
 
         if self.attention_backend == "flex_attention":
             logger.warning(
@@ -1822,7 +1820,6 @@ class ServerArgs:
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
-                self.enable_piecewise_npu_graph_decode = False
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -2174,10 +2171,6 @@ class ServerArgs:
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
-            if self.enable_piecewise_npu_graph_decode:
-                self.enable_piecewise_npu_graph_decode = False
-                logger.warning("NPU piecewise graph is disabled for decode server")
-
             if not self.enable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True
                 logger.warning(
@@ -2388,12 +2381,6 @@ class ServerArgs:
                 self.enable_torch_compile = False
                 logger.warning(
                     "Torch compile is disabled because custom ops are not supported"
-                )
-
-            if self.enable_piecewise_npu_graph_decode:
-                self.enable_piecewise_npu_graph_decode = False
-                logger.warning(
-                    "Piecewise graph decode is disabled because custom ops are not supported"
                 )
 
             if self.enable_torchair_compile:
@@ -3888,11 +3875,6 @@ class ServerArgs:
             "--disable-cuda-graph",
             action="store_true",
             help="Disable cuda graph.",
-        )
-        parser.add_argument(
-            "--enable-piecewise-npu-graph-decode",
-            action="store_true",
-            help="Optimize the model with piecewise npu graph for decode.",
         )
         parser.add_argument(
             "--disable-cuda-graph-padding",

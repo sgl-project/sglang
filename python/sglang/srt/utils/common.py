@@ -1950,7 +1950,6 @@ def get_compiler_backend(
     mode: str = None,
     model_runner=None,
     compilation_config: CompilationConfig = None,
-    compilation_context=None,
 ) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
@@ -1978,15 +1977,6 @@ def get_compiler_backend(
             compiler_config.debug.run_eagerly = True
             npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
             return npu_backend
-
-        if compilation_config.compiler == "piecewise":
-            from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_graph_compiler_backend import (
-                PiecewiseNpuGraphCompilerBackend,
-            )
-
-            return PiecewiseNpuGraphCompilerBackend(
-                model_runner, compilation_config, compilation_context
-            )
 
         if compilation_config.compiler == "npugraph":
             from sglang.srt.hardware_backend.npu.graph_runner.compilation.npu_graph_compiler_backend import (

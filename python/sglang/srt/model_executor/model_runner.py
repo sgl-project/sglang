@@ -80,9 +80,6 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
-from sglang.srt.hardware_backend.npu.graph_runner.piecewise_npu_graph_runner_decode import (
-    PiecewiseNPUGraphRunnerDecode,
-)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -2535,11 +2532,7 @@ class ModelRunner:
             lambda: CudaGraphRunner,
             {
                 "cpu": CPUGraphRunner,
-                "npu": (
-                    PiecewiseNPUGraphRunnerDecode
-                    if self.server_args.enable_piecewise_npu_graph_decode
-                    else NPUGraphRunner
-                ),
+                "npu": NPUGraphRunner,
             },
         )
         self.graph_runner = graph_runners[self.device](self)

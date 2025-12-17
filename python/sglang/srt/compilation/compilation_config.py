@@ -11,13 +11,11 @@ class CompilationConfig:
         capture_sizes: List[int] = [],
         compiler: str = "eager",
         enable_debug_mode: bool = False,
-        splitting_ops: List[str] = [],
     ):
         self.traced_files = set()
         self.capture_sizes = capture_sizes
         self.compiler = compiler
         self.enable_debug_mode = enable_debug_mode
-        self.splitting_ops = splitting_ops
 
     def add_traced_file(self, file_path: str):
         self.traced_files.add(file_path)
@@ -35,6 +33,3 @@ class CompilationConfig:
 
     def get_enable_debug_mode(self):
         return self.enable_debug_mode
-
-    def get_splitting_ops(self):
-        return self.splitting_ops

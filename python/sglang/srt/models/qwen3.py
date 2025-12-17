@@ -39,10 +39,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_npu:
-    if supports_custom_op() and (
-        get_global_server_args().enable_torch_compile
-        or get_global_server_args().enable_piecewise_npu_graph_decode
-    ):
+    if supports_custom_op() and get_global_server_args().enable_torch_compile:
         from sglang.srt.hardware_backend.npu.cmo import get_weight_cache
         from sglang.srt.hardware_backend.npu.cmo_custom_ops import (
             get_cmo_stream,
