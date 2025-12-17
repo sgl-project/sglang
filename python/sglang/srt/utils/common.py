@@ -2290,7 +2290,7 @@ def pyspy_dump_schedulers():
     try:
         pid = psutil.Process().pid
         # Command to run py-spy with the PID
-        cmd = f"py-spy dump --pid {pid}"
+        cmd = f"py-spy dump --native --pid {pid}"
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
