@@ -148,7 +148,9 @@ class PipelineStage(ABC):
     @property
     def device(self) -> torch.device:
         """Get the device for this stage."""
-        return torch.device(current_platform.device_type)
+        return torch.device(
+            current_platform.device_type,
+        )
 
     def set_logging(self, enable: bool):
         """
