@@ -14,6 +14,8 @@ pub struct RouterConfigBuilder {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
     mcp_config_path: Option<String>,
 }
 
@@ -29,6 +31,8 @@ impl RouterConfigBuilder {
             client_cert_path: None,
             client_key_path: None,
             ca_cert_paths: Vec::new(),
+            server_cert_path: None,
+            server_key_path: None,
             mcp_config_path: None,
         }
     }
@@ -582,6 +586,30 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== Server TLS ====================
+
+    /// Both paths must be provided together. Files read during build()
+    pub fn server_cert_and_key<S1: Into<String>, S2: Into<String>>(
+        mut self,
+        cert_path: S1,
+        key_path: S2,
+    ) -> Self {
+        self.server_cert_path = Some(cert_path.into());
+        self.server_key_path = Some(key_path.into());
+        self
+    }
+
+    /// Files read during build()
+    pub fn maybe_server_cert_and_key(
+        mut self,
+        cert_path: Option<impl Into<String>>,
+        key_path: Option<impl Into<String>>,
+    ) -> Self {
+        self.server_cert_path = cert_path.map(|p| p.into());
+        self.server_key_path = key_path.map(|p| p.into());
+        self
+    }
+
     // ==================== MCP ====================
 
     /// Config file loaded during build()
@@ -609,6 +637,9 @@ impl RouterConfigBuilder {
     pub fn build_with_validation(mut self, validate: bool) -> ConfigResult<RouterConfig> {
         // Read mTLS certificates from paths if provided
         self = self.read_mtls_certificates()?;
+
+        // Read Server TLS certificates from paths if provided
+        self = self.read_server_certificates()?;
 
         // Read MCP config from path if provided
         self = self.read_mcp_config()?;
@@ -669,6 +700,33 @@ impl RouterConfigBuilder {
             self.config.ca_certificates.push(cert);
         }
 
+        Ok(self)
+    }
+
+    /// Internal method to read Server TLS certificates from paths
+    fn read_server_certificates(mut self) -> ConfigResult<Self> {
+        match (&self.server_cert_path, &self.server_key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert = std::fs::read(cert_path).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!(
+                        "Failed to read server certificate from {}: {}",
+                        cert_path, e
+                    ),
+                })?;
+                let key = std::fs::read(key_path).map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!("Failed to read server key from {}: {}", key_path, e),
+                })?;
+                self.config.server_cert = Some(cert);
+                self.config.server_key = Some(key);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Both --tls-cert-path and --tls-key-path must be specified together"
+                        .to_string(),
+                });
+            }
+        }
         Ok(self)
     }
 
