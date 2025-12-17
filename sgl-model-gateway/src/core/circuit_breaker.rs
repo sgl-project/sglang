@@ -8,7 +8,7 @@ use std::{
 
 use tracing::info;
 
-use crate::observability::metrics::{RouterMetrics, SmgMetrics};
+use crate::observability::metrics::Metrics;
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
@@ -96,10 +96,7 @@ impl CircuitBreaker {
     /// Create a new circuit breaker with custom configuration and metric label
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         let init_state = CircuitState::Closed;
-        // New metrics
-        SmgMetrics::set_worker_cb_state(&metric_label, init_state.to_int());
-        // Legacy metrics
-        RouterMetrics::set_cb_state(&metric_label, init_state.to_int());
+        Metrics::set_worker_cb_state(&metric_label, init_state.to_int());
         Self {
             state: Arc::new(RwLock::new(init_state)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
@@ -156,10 +153,7 @@ impl CircuitBreaker {
         }
 
         let outcome_str = if success { "success" } else { "failure" };
-        // New metrics
-        SmgMetrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
-        // Legacy metrics
-        RouterMetrics::record_cb_outcome(&self.metric_label, outcome_str);
+        Metrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
         self.publish_gauge_metrics();
     }
 
@@ -238,23 +232,19 @@ impl CircuitBreaker {
             let from = old_state.as_str();
             let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
-            // New metrics
-            SmgMetrics::record_worker_cb_transition(&self.metric_label, from, to);
-            SmgMetrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
-            // Legacy metrics
-            RouterMetrics::record_cb_state_transition(&self.metric_label, from, to);
-            RouterMetrics::set_cb_state(&self.metric_label, new_state.to_int());
+            Metrics::record_worker_cb_transition(&self.metric_label, from, to);
+            Metrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
             self.publish_gauge_metrics();
         }
     }
 
     /// Get the number of consecutive failures
-    pub fn failure_count(&self) -> u32 {
+    pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Acquire)
     }
 
     /// Get the number of consecutive successes
-    pub fn success_count(&self) -> u32 {
+    pub fn consecutive_successes(&self) -> u32 {
         self.consecutive_successes.load(Ordering::Acquire)
     }
 
@@ -314,8 +304,8 @@ impl CircuitBreaker {
     pub fn stats(&self) -> CircuitBreakerStats {
         CircuitBreakerStats {
             state: self.state(),
-            consecutive_failures: self.failure_count(),
-            consecutive_successes: self.success_count(),
+            consecutive_failures: self.consecutive_failures(),
+            consecutive_successes: self.consecutive_successes(),
             total_failures: self.total_failures(),
             total_successes: self.total_successes(),
             time_since_last_failure: self.time_since_last_failure(),
@@ -323,14 +313,9 @@ impl CircuitBreaker {
         }
     }
 
-    // TODO maybe publish whenever the variable is changed
     fn publish_gauge_metrics(&self) {
-        // New metrics
-        SmgMetrics::set_worker_cb_consecutive_failures(&self.metric_label, self.failure_count());
-        SmgMetrics::set_worker_cb_consecutive_successes(&self.metric_label, self.success_count());
-        // Legacy metrics
-        RouterMetrics::set_cb_consecutive_failures(&self.metric_label, self.failure_count());
-        RouterMetrics::set_cb_consecutive_successes(&self.metric_label, self.success_count());
+        Metrics::set_worker_cb_consecutive_failures(&self.metric_label, self.failure_count());
+        Metrics::set_worker_cb_consecutive_successes(&self.metric_label, self.success_count());
     }
 }
 
@@ -379,8 +364,8 @@ mod tests {
         let cb = CircuitBreaker::new();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert!(cb.can_execute());
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 0);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
     }
 
     #[test]
@@ -400,7 +385,7 @@ mod tests {
 
         assert_eq!(cb.state(), CircuitState::Open);
         assert!(!cb.can_execute());
-        assert_eq!(cb.failure_count(), 3);
+        assert_eq!(cb.consecutive_failures(), 3);
     }
 
     #[test]
@@ -476,11 +461,11 @@ mod tests {
 
         cb.record_failure();
         cb.record_failure();
-        assert_eq!(cb.failure_count(), 2);
+        assert_eq!(cb.consecutive_failures(), 2);
 
         cb.record_success();
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 1);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 1);
 
         cb.record_failure();
         cb.record_failure();
@@ -500,8 +485,8 @@ mod tests {
 
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed);
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 0);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
     }
 
     #[test]
@@ -540,10 +525,10 @@ mod tests {
         cb1.record_failure();
 
         let cb2 = cb1.clone();
-        assert_eq!(cb2.failure_count(), 1);
+        assert_eq!(cb2.consecutive_failures(), 1);
 
         cb1.record_failure();
-        assert_eq!(cb2.failure_count(), 2);
+        assert_eq!(cb2.consecutive_failures(), 2);
     }
 
     #[test]

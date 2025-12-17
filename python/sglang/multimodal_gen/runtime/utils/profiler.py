@@ -1,8 +1,9 @@
+import gzip
 import os
 
 import torch
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
 logger = init_logger(__name__)
 
@@ -118,6 +119,12 @@ class SGLDiffusionProfiler:
         if dump_rank is None:
             dump_rank = self.rank
 
+        current_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        if current_rank != dump_rank:
+            return
+
         try:
             os.makedirs(self.log_dir, exist_ok=True)
             sanitized_profile_mode_id = self.profile_mode_id.replace(" ", "_")
@@ -127,7 +134,27 @@ class SGLDiffusionProfiler:
                     f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
                 )
             )
-            logger.info(f"Saving profiler traces to: {trace_path}")
             self.profiler.export_chrome_trace(trace_path)
+
+            if self._check_trace_integrity(trace_path):
+                logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
+            else:
+                logger.warning(f"Trace file may be corrupted: {trace_path}")
         except Exception as e:
-            logger.error(f"Failed to export trace: {e}")
+            logger.error(f"Failed to save trace: {e}")
+
+    def _check_trace_integrity(self, trace_path: str) -> bool:
+        try:
+            if not os.path.exists(trace_path) or os.path.getsize(trace_path) == 0:
+                return False
+
+            with gzip.open(trace_path, "rb") as f:
+                content = f.read()
+                if content.count(b"\x1f\x8b") > 1:
+                    logger.warning("Multiple gzip headers detected")
+                    return False
+
+            return True
+        except Exception as e:
+            logger.warning(f"Trace file integrity check failed: {e}")
+            return False
