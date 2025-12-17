@@ -703,6 +703,8 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
             ).reshape(-1, 1)
 
         if visual_token_mask is not None:
+            assert visual_token_mask.dtype == torch.bool, visual_token_mask.dtype
+            assert visual_token_mask.numel() > 0
             if visual_token_mask.shape[0] != input_ids.shape[0]:
                 padding_len = input_ids.shape[0] - visual_token_mask.shape[0]
                 # right pad False
@@ -722,12 +724,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
             visual_token_mask=visual_token_mask,
         )
 
-        # if get_embedding:
-        #     return self.pooler(hidden_states, forward_batch)
-        # else:
-        #     return self.logits_processor(
-        #         input_ids, hidden_states, self.lm_head, forward_batch
-        #     )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

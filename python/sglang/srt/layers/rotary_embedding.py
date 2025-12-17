@@ -2220,7 +2220,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                 device=input_ids.device,
             )
             image_index, video_index = 0, 0
-            video_group_index = 0
             for i, input_ids in enumerate(total_input_ids):
                 input_tokens = input_ids.tolist()
 
@@ -2331,12 +2330,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                                 torch.stack([t_index, h_index, w_index]) + st_idx
                             )
 
-                        video_group_index += 1
-
-                        if video_group_index >= video_grid_thw[video_index][0]:
-                            video_index += 1
-                            video_group_index = 0
-
+                        video_index += 1
                         video_frame_num += 1
 
                     else:
@@ -2410,6 +2404,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
     """3D rotary positional embedding. [h w h w h w h w... t t t...]"""
 
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward_native(  # type: ignore[override]
         self,
         positions: torch.Tensor,
@@ -2471,6 +2466,24 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.forward_native(positions, query, key)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
         return self.forward_native(positions, query, key)
 
 

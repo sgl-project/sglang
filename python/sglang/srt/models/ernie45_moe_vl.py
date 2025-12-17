@@ -16,10 +16,9 @@
 
 import logging
 from itertools import islice
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -35,20 +34,14 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import Ernie4_5_VLRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 
 # from sglang.srt.models.llama import LlamaAttention as Ernie4_5_VLMoeAttention
@@ -157,25 +150,6 @@ class Ernie4_5_VLMoeAttention(nn.Module):
         return output
 
 
-class MoEGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty((config.moe_num_experts, config.hidden_size))
-        )
-        self.e_score_correction_bias = nn.Parameter(
-            torch.empty((1, config.moe_num_experts))
-        )
-
-    def forward(self, hidden_states):
-        logits = F.linear(hidden_states, self.weight, None)
-        return logits
-
-
 class Ernie4_5_VLMoeMoE(nn.Module):
     def __init__(
         self,
@@ -250,21 +224,13 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("text_experts", prefix),
             )
-        # else:
-        #     self.text_experts = Ernie4_5_VLMoeMLP(
-        #         hidden_size=config.hidden_size,
-        #         intermediate_size=config.intermediate_size,
-        #         hidden_act=config.hidden_act,
-        #         use_bias=getattr(config, "use_bias", False),
-        #         quant_config=quant_config,
-        #         prefix=add_prefix("mlp", prefix),
-        #     )
 
         assert vision_moe_layer_start_index <= vision_moe_layer_end_index
         if (
             layer_id >= vision_moe_layer_start_index
             and layer_id <= vision_moe_layer_end_index
         ):
+
             self.vision_experts_gate = ReplicatedLinear(
                 config.hidden_size,
                 config.moe_num_experts[1],
@@ -292,15 +258,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("vision_experts", prefix),
             )
-        # else:
-        #     self.vision_experts = Ernie4_5_VLMoeMLP(
-        #         hidden_size=config.hidden_size,
-        #         intermediate_size=config.intermediate_size,
-        #         hidden_act=config.hidden_act,
-        #         use_bias=getattr(config, "use_bias", False),
-        #         quant_config=quant_config,
-        #         prefix=add_prefix("mlp", prefix),
-        #     )
 
         if self.moe_num_shared_experts > 0:
             intermediate_size = (
@@ -335,14 +292,11 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         capturing = torch.cuda.is_current_stream_capturing()
 
         if visual_token_mask is not None and not capturing:
-            # Safe to compute boolean value on CPU
-            all_visual = visual_token_mask.all().item()
-            any_visual = visual_token_mask.any().item()
+            all_visual = visual_token_mask.all()
+            any_visual = visual_token_mask.any()
         else:
-            # During CUDA Graph capture, forbid CPU sync ops
-            # Fallback: treat as "not all visual"
+            # During CUDA Graph capture, all set false
             all_visual = False
-            any_visual = visual_token_mask is not None  # mixed tokens path
             any_visual = False
 
         if all_visual:
@@ -357,36 +311,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 hidden_states=hidden_states, topk_output=vision_topk_output
             )
         elif any_visual:
-            # Mixed tokens (or we are in capture and mask exists) — avoid boolean indexing.
-            # Compute both experts on the full hidden_states and then select per-token results with torch.where.
-            # This avoids hidden_states[mask] style indexing which may not be allowed in CUDA Graph capture.
-            # Make sure mask has shape [N, 1] for broadcasting
-            # mask = visual_token_mask.view(-1).bool().unsqueeze(-1)  # [N, 1]
-
-            # Text branch computed on full sequence
-            # text_router_logits, _ = self.text_experts_gate(
-            #     hidden_states.to(dtype=torch.float32)
-            # )
-            # text_topk_output = self.text_experts_topk(hidden_states, text_router_logits)
-            # text_out = self.text_experts(
-            #     hidden_states=hidden_states, topk_output=text_topk_output
-            # )  # [N, H]
-
-            # # Vision branch computed on full sequence
-            # vision_router_logits, _ = self.vision_experts_gate(
-            #     hidden_states.to(dtype=torch.float32)
-            # )
-            # vision_topk_output = self.vision_experts_topk(
-            #     hidden_states, vision_router_logits
-            # )
-            # vision_out = self.vision_experts(
-            #     hidden_states=hidden_states, topk_output=vision_topk_output
-            # )  # [N, H]
-
-            # mask_broadcast = visual_token_mask.expand_as(text_out)  # [N, H]
-            # # Merge per-token outputs: for visual tokens take vision_out, else text_out
-            # final_hidden_states = torch.where(mask_broadcast, vision_out, text_out)
-
             # assert visual_token_mask.shape[0] != hidden_states.shape[0]
             visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
             text_token_mask = ~visual_token_mask
@@ -547,6 +471,7 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+# only used as text backbone for ernie4.5 vl
 class Ernie4_5_VLMoeModel(nn.Module):
     def __init__(
         self,
@@ -636,185 +561,3 @@ class Ernie4_5_VLMoeModel(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
 
         return hidden_states
-
-
-# only used as text backbone for ernie4.5 vl
-class Ernie4_5_VLMoeForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.pp_group = get_pp_group()
-        self.config = config
-        self.quant_config = quant_config
-        self.model = Ernie4_5_VLMoeModel(
-            config, quant_config, add_prefix("model", prefix)
-        )
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix="lm_head",
-            )
-        self.logits_processor = LogitsProcessor(config)
-
-    @torch.no_grad()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return hidden_states
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, weight_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.moe_num_experts,
-        )
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            if "mtp" in name or "vision_model" in name or "resampler_model" in name:
-                continue
-
-            # if "moe_statics.e_score_correction_bias" in name:
-            #     name = name.replace("moe_statics", "gate")
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-
-                # Distinguish between vision experts and text experts
-                if "mlp.experts" in name:
-                    moe_offset = int(name.split(".")[-3])
-                    vision_expert_start_idx = self.config.moe_num_experts[0]
-                    is_text_expert = moe_offset <= vision_expert_start_idx - 1
-                    if is_text_expert:
-                        name = name.replace(".experts.", ".text_experts.")
-                    else:
-                        name = name.replace(
-                            f".experts.{moe_offset}",
-                            f".vision_experts.{moe_offset - vision_expert_start_idx}",
-                        )
-
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-
-                    # Distinguish between vision experts and text experts
-                    moe_offset = int(name.split(".")[-3])
-                    is_text_expert = moe_offset <= self.config.moe_num_experts[0] - 1
-
-                    name = name.replace(weight_name, param_name)
-                    if is_text_expert:
-                        name = name.replace(".experts.", ".text_experts.")
-                    else:
-                        name = name.replace(".experts.", ".vision_experts.")
-
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        weight_loader(
-                            param,
-                            loaded_weight,
-                            name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
-                    break
-                else:
-                    # Distinguish between vision expert gate
-                    # and text expert gate
-                    if name.endswith("mlp.gate.weight"):
-                        name = name.replace("gate.weight", "text_experts_gate.weight")
-                        loaded_weight = loaded_weight.T
-                    elif name.endswith("mlp.gate.weight_1"):
-                        name = name.replace(
-                            "gate.weight_1", "vision_experts_gate.weight"
-                        )
-                        loaded_weight = loaded_weight.T
-
-                    if "e_score_correction_bias" in name:
-                        name = name.replace(".moe_statics.", ".")
-
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
-
-EntryClass = [Ernie4_5_VLMoeForCausalLM]
