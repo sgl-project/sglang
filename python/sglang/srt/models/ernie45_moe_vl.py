@@ -192,7 +192,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
 
         assert text_moe_layer_start_index <= text_moe_layer_end_index
 
-        # TODO 文本专家和视觉专家
         if (
             layer_id >= text_moe_layer_start_index
             and layer_id <= text_moe_layer_end_index
@@ -210,9 +209,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 top_k=config.moe_k,
                 renormalize=True,
                 use_grouped_topk=False,
-                correction_bias=self.e_score_correction_bias[
-                    0
-                ],  # TODO 这个bias最后要确定下是否正确
+                correction_bias=self.e_score_correction_bias[0],
             )
 
             self.text_experts = get_moe_impl_class(quant_config)(
@@ -244,9 +241,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 top_k=config.moe_k,
                 renormalize=True,
                 use_grouped_topk=False,
-                correction_bias=self.e_score_correction_bias[
-                    1
-                ],  # TODO 这个bias最后要确定下是否正确
+                correction_bias=self.e_score_correction_bias[1],
             )
 
             self.vision_experts = get_moe_impl_class(quant_config)(

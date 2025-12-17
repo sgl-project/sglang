@@ -48,30 +48,6 @@ FPS_MIN_FRAMES = 16
 FPS_MAX_FRAMES = 180
 
 
-import imageio
-import numpy as np
-
-
-def save_resized_video(video_tensor, fps, save_path="resized_debug.mp4"):
-    """
-    video_tensor: torch.Tensor, shape [T, C, H, W]
-    fps: float
-    """
-    # 转成 numpy 且转回 THWC
-    video_np = video_tensor.detach().cpu().numpy()
-
-    # 如果是 float，要 clamp & 转 uint8
-    if video_np.dtype != np.uint8:
-        video_np = (video_np.clip(0, 255)).astype(np.uint8)
-
-    writer = imageio.get_writer(save_path, fps=fps)
-    for frame in video_np:
-        writer.append_data(frame)
-    writer.close()
-
-    print(f"Resized video saved to {save_path}")
-
-
 def smart_resize(
     height: int,
     width: int,
@@ -200,69 +176,10 @@ def smart_nframes(
 async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
-    num_frame_samples: int = 16,
-    # vr: VideoReader, image_factor: int = IMAGE_FACTOR
 ) -> torch.Tensor:
 
-    # --- 0. 基本信息 ---
-    # video_fps = vr.get_avg_fps()
-    # total_num_frames = len(vr)
-    # duration = total_num_frames / video_fps if video_fps else 0
-
-    # # 原视频分辨率（Decord 提供）
-    # height, width = vr[0].shape[0], vr[0].shape[1]
-
-    # # --- 1. 使用 smart_resize 计算目标 H, W ---
-    # resized_height, resized_width = smart_resize(
-    #     height,
-    #     width,
-    #     factor=image_factor,
-    #     min_pixels=VIDEO_MIN_PIXELS,
-    #     max_pixels=VIDEO_MAX_PIXELS,
-    # )
-
-    # # --- 2. 计算均匀采样的 32 帧索引 ---
-    # if total_num_frames >= num_frame_samples:
-    #     indices = np.linspace(0, total_num_frames - 1, num_frame_samples, dtype=int).tolist()
-    # else:
-    #     base_idx = np.linspace(0, total_num_frames - 1, total_num_frames, dtype=int).tolist()
-    #     repeat_factor = (num_frame_samples + total_num_frames - 1) // total_num_frames
-    #     indices = (base_idx * repeat_factor)[:num_frame_samples]
-
-    # # --- 3. 解码选取到的帧 ---
-    # frames = vr.get_batch(indices).asnumpy()       # uint8, shape (N, H, W, C)
-    # video = torch.from_numpy(frames)               # 转为 torch Tensor
-
-    # # --- 4. Resize each frame according to smart_resize output ---
-    # # (N, H, W, C) → (N, C, H, W)
-    # video = video.permute(0, 3, 1, 2)
-    # video = torchvision.transforms.functional.resize(
-    #     video,
-    #     [resized_height, resized_width],
-    #     # [height, width],
-    #     # interpolation=InterpolationMode.BILINEAR,
-    # )
-    # video = video.permute(0, 2, 3, 1)
-    # # --- 5. pin_memory 加速后续搬运到 GPU ---
-    # video = video.pin_memory()
-
-    # # --- 6. metadata ---
-    # metadata = {
-    #     "total_num_frames": int(total_num_frames),
-    #     "fps": float(video_fps),
-    #     "duration": float(duration),
-    #     "video_backend": "decord",
-    #     "frames_indices": indices,
-    #     "resized_height": resized_height,
-    #     "resized_width": resized_width,
-    # }
-
-    # return video, metadata
-
-    # return frames, metadata
     total_frames, video_fps = len(vr), vr.get_avg_fps()
-    # nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
-    nframes = 32
+    nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
     video_np = vr.get_batch(idx).asnumpy()
@@ -286,7 +203,6 @@ async def preprocess_video(
     video = torchvision.transforms.functional.resize(
         video,
         [resized_height, resized_width],
-        # [height, width],
         interpolation=InterpolationMode.BILINEAR,
     )
 
@@ -299,8 +215,6 @@ async def preprocess_video(
         "frames_indices": idx,
         "video_backend": "torchvision",
     }
-    print(video_metadata)
-    # save_resized_video(video, video_fps, "video_resized.mp4")
 
     return video, video_metadata
 
@@ -328,7 +242,6 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             image_token_id=hf_config.im_patch_id,
             video_token_id=hf_config.im_patch_id,  # image and video use the same token_id
         ).build(_processor)
-        # self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.IMAGE})
 
         self.tokenizer = self._processor.tokenizer
         self.image_processor = self._processor.image_processor
@@ -461,17 +374,16 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        # Qwen-specific: resize images if they are raw Image objects
+        # resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
-        video_metadata = None
         if base_output.videos:
             videos_processed = [
                 await preprocess_video(video) for video in base_output.videos
             ]
-            base_output.videos, video_metadata = map(list, zip(*videos_processed))
+            base_output.videos, _ = map(list, zip(*videos_processed))
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens

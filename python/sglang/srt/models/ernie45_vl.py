@@ -639,8 +639,8 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         return self.model.embed_tokens
 
     def should_apply_lora(self, module_name: str) -> bool:
-        # skip visual tower
-        return not module_name.startswith("visual")
+        # skip vision_model
+        return not module_name.startswith("vision_model")
 
     def forward(
         self,
