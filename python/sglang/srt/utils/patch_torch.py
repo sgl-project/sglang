@@ -77,6 +77,12 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
 
 
 def _modify_tuple(t, index: int, modifier: Callable):
+    # Handle cases where tuple is shorter than expected (e.g., LoRA tensors)
+    if index >= len(t):
+        return t
+    # If index is the last element, don't include the tail slice
+    if index == len(t) - 1:
+        return *t[:index], modifier(t[index])
     return *t[:index], modifier(t[index]), *t[index + 1 :]
 
 
