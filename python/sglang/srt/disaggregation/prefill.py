@@ -595,7 +595,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
-        if self.chunked_req:
+        if self.chunked_req and self.is_last_chunk_req_scheduled:
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             if self.enable_overlap:

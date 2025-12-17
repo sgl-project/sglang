@@ -248,6 +248,8 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.disaggregation_prefill_enable_interleave = server_args.disaggregation_prefill_enable_interleave
+        self.is_last_chunk_req_scheduled: bool = not self.disaggregation_prefill_enable_interleave
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
         )
@@ -1839,22 +1841,36 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            self.max_prefill_tokens,
+            self.max_prefill_tokens if not self.disaggregation_prefill_enable_interleave else self.chunked_prefill_size,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
         )
 
+        has_small_req_in_waiting_queue = (
+            self.disaggregation_prefill_enable_interleave 
+            and any(len(req.origin_input_ids) <= self.chunked_prefill_size for req in self.waiting_queue)
+        )
+
+        chunked_req_added = False
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if (
+                not has_small_req_in_waiting_queue 
+                or (self.disaggregation_prefill_enable_interleave and not self.is_last_chunk_req_scheduled)
+            ):
+                self.chunked_req.init_next_round_input()
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+                chunked_req_added = True
+                self.is_last_chunk_req_scheduled = True
 
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if self.disaggregation_prefill_enable_interleave and self.chunked_req is not None and len(req.origin_input_ids) > self.chunked_prefill_size:
+                continue
 
             if self.enable_lora:
                 new_lora_set = (
@@ -1928,11 +1944,20 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
+        chunked_req_changed = False
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
+            self.is_last_chunk_req_scheduled = True
+            chunked_req_changed = True
 
-        if self.chunked_req:
+        self.is_last_chunk_req_scheduled = (
+            not self.disaggregation_prefill_enable_interleave 
+            or chunked_req_added 
+            or chunked_req_changed
+        )
+
+        if self.chunked_req and self.is_last_chunk_req_scheduled:
             self.chunked_req.is_chunked += 1
 
         # Print stats
