@@ -22,7 +22,6 @@ from sglang.srt.layers.quantization.msmodelslim.schemes import (
     ModelSlimW4A4Int4,
     ModelSlimW8A8Int8,
 )
-
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -177,7 +176,6 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimW4A4Int4(
                 quant_config=self.quant_description, prefix=layer_name
             )
-
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
