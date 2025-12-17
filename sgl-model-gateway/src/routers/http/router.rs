@@ -24,7 +24,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{metrics_labels, Metrics},
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
     policies::PolicyRegistry,
@@ -189,7 +189,7 @@ impl Router {
             metrics_labels::CONNECTION_HTTP,
             model,
             endpoint,
-            is_stream,
+            bool_to_static_str(is_stream),
         );
 
         let response = RetryExecutor::execute_response_with_retry(
