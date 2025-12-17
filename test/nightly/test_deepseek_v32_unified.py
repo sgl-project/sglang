@@ -16,10 +16,11 @@ import unittest
 
 from nightly_metrics import run_metrics
 
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-h200", nightly=True)
+# NOTE: This test is NOT registered via register_cuda_ci() decorator.
+# It must be called directly from the YML workflow with appropriate timeout (180min).
+# This is because running 5 variants with both perf + accuracy takes ~100+ minutes.
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
