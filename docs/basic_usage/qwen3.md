@@ -18,7 +18,7 @@ python3 -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 4
 ### Mamba Radix Cache
 SGLang supports prefix caching for Qwen3-Next models named `MambaRadixCache`, which improves inference speed by reusing computation results. There are two versions of `MambaRadixCache`:
 - `MambaRadixCacheV1`: The default version, which is also other hybrid linear models' choice. When it is enabled, SGLang will automatically close overlap schedule for compatibility reasons.
-- `MambaRadixCacheV2`: An optimized version that can be compatible with features like page size > 1 and overlap schedule and speculative decoding, which also supports store mamba state in branching positions as well. While it needs two extra mamba spaces for pingpong buffer for each requests. To enable it, add the argument `--mamba-scheduler-strategy extra_buffer` when launching the server.
+- `MambaRadixCacheV2`: An optimized version that is compatible with features like page size > 1, overlap schedule, and speculative decoding. It also supports storing mamba state in branching positions. However, it requires two extra mamba spaces for a ping-pong buffer for each request. Note that overlap schedule is disabled when speculative decoding is enabled. To enable it, add the argument `--mamba-scheduler-strategy extra_buffer` when launching the server.
 
 ### EAGLE Speculative Decoding
 **Description**: SGLang has supported Qwen3-Next models with [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding).
