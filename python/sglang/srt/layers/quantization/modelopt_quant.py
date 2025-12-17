@@ -1664,6 +1664,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
 
         if self.enable_flashinfer_cutlass_moe:
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
             assert (
                 not moe_runner_config.apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
@@ -1673,10 +1675,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
-            if (
-                hasattr(dispatch_output, "moe_output")
-                and dispatch_output.moe_output is not None
-            ):
+            if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
                 symm_output = dispatch_output.moe_output
             else:
                 # If x_sf is not None, x is FP4 packed (half size), so we need * 2
