@@ -15,12 +15,17 @@ use crate::{
     },
 };
 
-/// Preparation stage for embedding requests
 pub struct EmbeddingPreparationStage;
 
 impl EmbeddingPreparationStage {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for EmbeddingPreparationStage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

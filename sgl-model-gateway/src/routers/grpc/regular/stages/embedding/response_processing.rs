@@ -28,6 +28,12 @@ impl EmbeddingResponseProcessingStage {
     }
 }
 
+impl Default for EmbeddingResponseProcessingStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl PipelineStage for EmbeddingResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
@@ -55,9 +61,11 @@ impl PipelineStage for EmbeddingResponseProcessingStage {
         };
 
         // Convert proto response to HTTP response
-        let embedding_response = self.convert_response(ctx, proto_response)?;
+        let embedding_response = self
+            .convert_response(ctx, proto_response)
+            .map_err(|boxed_err| *boxed_err)?;
 
-        // Store in context (optional, mostly for consistency)
+        // Store in context
         ctx.state.response.final_response =
             Some(FinalResponse::Embedding(embedding_response.clone()));
 
@@ -75,7 +83,7 @@ impl EmbeddingResponseProcessingStage {
         &self,
         ctx: &RequestContext,
         proto: ProtoEmbedComplete,
-    ) -> Result<EmbeddingResponse, Response> {
+    ) -> Result<EmbeddingResponse, Box<Response>> {
         let dispatch = ctx.state.dispatch.as_ref().ok_or_else(|| {
             error!(
                 function = "EmbeddingResponseProcessingStage::convert_response",

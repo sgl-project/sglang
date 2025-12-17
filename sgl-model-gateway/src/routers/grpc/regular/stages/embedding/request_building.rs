@@ -22,6 +22,12 @@ impl EmbeddingRequestBuildingStage {
     }
 }
 
+impl Default for EmbeddingRequestBuildingStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl PipelineStage for EmbeddingRequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
@@ -70,7 +76,7 @@ impl PipelineStage for EmbeddingRequestBuildingStage {
             .map(|d| d.request_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Extract original text (optional)
+        // Extract original text
         let original_text = prep_output.original_text.clone();
 
         // Use backend-specific builder to create ProtoEmbedRequest
