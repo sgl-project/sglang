@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     PipelineExecutor,
     Timer,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req, OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -93,47 +93,90 @@ class DisaggregatedExecutor(PipelineExecutor):
             post_denoise_stages = stages[denoise_end_idx + 1 :]
 
             # --- PHASE 1: Pre-Denoise (Encoding) ---
+            print(
+                f"[Rank {dist.get_rank()}] Entering Phase 1. is_non_dit={self.comm.is_non_dit_rank()}, is_dit={self.comm.is_dit_rank()}"
+            )
             if self.comm.is_non_dit_rank():
-                print("Phase 1: Running Pre-Denoise stages on Non-DiT...")
+                print(
+                    f"[Non-DiT Rank {dist.get_rank()}] Phase 1: Running Pre-Denoise stages..."
+                )
                 for stage in pre_denoise_stages:
+                    print(
+                        f"[Non-DiT Rank {dist.get_rank()}] Running stage: {stage.__class__.__name__}"
+                    )
                     with Timer(stage.__class__.__name__):
                         batch = stage(batch, server_args)
 
-                # Prepare data to send to DiT
-                # What needs to be sent? Usually 'prompt_embeds', 'latents' (if img2img), 'timesteps'
-                # For now, we assume 'batch' object contains everything needed in tensors.
-                # But 'batch' is a python object. We need to serialize it or send specific tensors.
+                print(
+                    f"[Non-DiT Rank {dist.get_rank()}] Phase 1 Complete. Sending data to DiT..."
+                )
+                print(
+                    f"[Non-DiT Rank {dist.get_rank()}] self={self}, type={type(self)}"
+                )
+                print(
+                    f"[Non-DiT Rank {dist.get_rank()}] hasattr _send_batch_to_dit: {hasattr(self, '_send_batch_to_dit')}"
+                )
+                print(f"[Non-DiT Rank {dist.get_rank()}] batch type: {type(batch)}")
+                print(
+                    f"[Non-DiT Rank {dist.get_rank()}] About to call _send_batch_to_dit..."
+                )
+                import sys
 
-                # Simplified: Send specific critical tensors.
-                # In a robust system, we'd serialize the Batch/Req object (metadata) + Tensors (P2P).
+                sys.stdout.flush()  # Force flush
 
-                # PING: Send to DiT
-                # We need to know WHAT tensors to send.
-                # This is model specific.
-                # For this generic implementation, we might need a contract.
-                # Let's assume the batch object holds a dictionary of tensors we can introspect?
+                # Get method reference first
+                send_method = self._send_batch_to_dit
+                print(
+                    f"[Non-DiT Rank {dist.get_rank()}] Got method reference: {send_method}"
+                )
+                sys.stdout.flush()
 
-                # HACK for PoC: Assume Wan/Flux specific keys or iterate batch attributes.
-                # Better: Pickle the whole batch metadata (small), and send big tensors separately?
-                # Or use torch.save to buffer?
+                try:
+                    send_method(batch)
+                    print(
+                        f"[Non-DiT Rank {dist.get_rank()}] _send_batch_to_dit returned successfully"
+                    )
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(
+                        f"[Non-DiT Rank {dist.get_rank()}] ERROR in _send_batch_to_dit: {e}"
+                    )
+                    import traceback
 
-                # Let's try to send the key tensors:
-                # 1. prompt_embeds / encoder_hidden_states
-                # 2. pooled_prompt_embeds
-                # 3. latents (initial noise)
-
-                # For this Step 4, let's implement the CONTROL FLOW first.
-                # The actual tensor transfer details might need refinement based on 'Req' structure.
-
-                print("Phase 1 Complete. Sending data to DiT...")
-                # self.comm.send_to_dit(batch_tensors)
-                # Placeholder: We need a method to extract/inject tensors from Req
-                self._send_batch_to_dit(batch)
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    raise
 
             elif self.comm.is_dit_rank():
                 # DiT waits for data
-                print("Phase 1: Waiting for data from Non-DiT...")
-                batch = self._recv_batch_from_non_dit(batch)
+                print(
+                    f"[Dit Rank {dist.get_rank()}] Phase 1: Waiting for data from Non-DiT..."
+                )
+                print(
+                    f"[Dit Rank {dist.get_rank()}] self.comm.non_dit_master_rank={self.comm.non_dit_master_rank}"
+                )
+                print(
+                    f"[Dit Rank {dist.get_rank()}] self.comm.dit_master_rank={self.comm.dit_master_rank}"
+                )
+                import sys
+
+                sys.stdout.flush()
+
+                try:
+                    batch = self._recv_batch_from_non_dit(batch)
+                    print(
+                        f"[Dit Rank {dist.get_rank()}] Received data from Non-DiT successfully"
+                    )
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(
+                        f"[Dit Rank {dist.get_rank()}] ERROR in _recv_batch_from_non_dit: {e}"
+                    )
+                    import traceback
+
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    raise
 
             # --- PHASE 2: Denoise (DiT) ---
             if self.comm.is_dit_rank():
@@ -145,13 +188,17 @@ class DisaggregatedExecutor(PipelineExecutor):
                 # After denoising, latents are gathered (via gather_latents_for_sp)
                 # All dit ranks have the complete result, but only dit master sends to non-dit
                 if dist.get_rank() == self.comm.dit_master_rank:
-                    print("Phase 2 Complete. DiT Master sending data back to Non-DiT...")
+                    print(
+                        "Phase 2 Complete. DiT Master sending data back to Non-DiT..."
+                    )
                     self._send_batch_to_non_dit(batch)
                 else:
-                    print(f"Phase 2 Complete. DiT Worker (rank {dist.get_rank()}) done for this request.")
+                    print(
+                        f"Phase 2 Complete. DiT Worker (rank {dist.get_rank()}) done for this request."
+                    )
                     # DiT workers are done. Non-dit will handle decoding.
                     # Return early to avoid unnecessary waiting
-                    return batch
+                    return OutputBatch()
 
             if self.comm.is_non_dit_rank():
                 try:
@@ -164,28 +211,37 @@ class DisaggregatedExecutor(PipelineExecutor):
                     for stage in post_denoise_stages:
                         with Timer(stage.__class__.__name__):
                             batch = stage(batch, server_args)
-                    
+
                     # Debug: check output status
-                    print(f"Phase 3 Complete. Output status: {batch.output is not None}, type: {type(batch.output) if batch.output is not None else 'None'}")
-                    if batch.output is not None and isinstance(batch.output, torch.Tensor):
-                        print(f"  Output shape: {batch.output.shape}, dtype: {batch.output.dtype}")
-                    
+                    print(
+                        f"Phase 3 Complete. Output status: {batch.output is not None}, type: {type(batch.output) if batch.output is not None else 'None'}"
+                    )
+                    if batch.output is not None and isinstance(
+                        batch.output, torch.Tensor
+                    ):
+                        print(
+                            f"  Output shape: {batch.output.shape}, dtype: {batch.output.dtype}"
+                        )
+
                     # Convert Req to OutputBatch
                     output_batch = OutputBatch(
                         output=batch.output,
                         trajectory_timesteps=batch.trajectory_timesteps,
                         trajectory_latents=batch.trajectory_latents,
-                        trajectory_decoded=getattr(batch, 'trajectory_decoded', None),
+                        trajectory_decoded=getattr(batch, "trajectory_decoded", None),
                         timings=batch.timings,
                         error=None,
                     )
-                    
+
                     # Non-dit has the final output, send it back to dit master for client response
                     print("Sending final result back to DiT Master...")
                     self._send_final_result_to_dit_master(output_batch)
                     print("Final result sent successfully.")
                 except Exception as e:
-                    logger.error(f"[Non-DiT Rank {dist.get_rank()}] Error in Phase 2/3: {e}", exc_info=True)
+                    logger.error(
+                        f"[Non-DiT Rank {dist.get_rank()}] Error in Phase 2/3: {e}",
+                        exc_info=True,
+                    )
                     # Still need to send error info to dit master to avoid deadlock
                     # For now, just re-raise
                     raise
@@ -196,12 +252,16 @@ class DisaggregatedExecutor(PipelineExecutor):
                     print("Receiving final result from Non-DiT...")
                     output_batch = OutputBatch()
                     output_batch = self._recv_final_result_from_non_dit(output_batch)
-                    print(f"Final result received. Output status: {output_batch.output is not None}")
+                    print(
+                        f"Final result received. Output status: {output_batch.output is not None}"
+                    )
                     return output_batch
                 except Exception as e:
-                    logger.error(f"[Dit Master] Error receiving final result: {e}", exc_info=True)
+                    logger.error(
+                        f"[Dit Master] Error receiving final result: {e}", exc_info=True
+                    )
                     raise
-            
+
             # Dit workers return empty batch (they don't handle client responses)
             return OutputBatch()
 
@@ -214,6 +274,11 @@ class DisaggregatedExecutor(PipelineExecutor):
     # These would ideally be in a Serializer/Deserializer class
 
     def _send_batch_to_dit(self, batch: Req):
+        print(f"[_send_batch_to_dit ENTRY] Function entered, rank={dist.get_rank()}")
+        import sys
+
+        sys.stdout.flush()
+
         import io
         import pickle
 
@@ -221,23 +286,53 @@ class DisaggregatedExecutor(PipelineExecutor):
         tensor_infos = {}  # name -> (shape, dtype)
         list_tensor_infos = {}  # name -> list of (shape, dtype)
 
+        print(f"[_send_batch_to_dit] Checking batch attributes...")
+        sys.stdout.flush()
+
         # Identify tensors (both single and lists)
         if hasattr(batch, "__dict__"):
             for k, v in batch.__dict__.items():
                 if isinstance(v, torch.Tensor):
                     tensors_to_send[k] = v
                     tensor_infos[k] = (v.shape, v.dtype)
-                elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
-                    # Handle list of tensors
-                    tensors_to_send[k] = v  # Store the list
-                    list_tensor_infos[k] = [(t.shape, t.dtype) for t in v]
+                elif isinstance(v, list) and v and len(v) > 0:
+                    # Check if it's a list of tensors
+                    # Build list with None placeholders and extract tensors separately
+                    tensor_indices = []
+                    actual_tensors = []
+                    shapes_dtypes = []
+                    
+                    for idx, t in enumerate(v):
+                        if isinstance(t, torch.Tensor):
+                            tensor_indices.append(idx)
+                            actual_tensors.append(t)
+                            shapes_dtypes.append((t.shape, t.dtype))
+                    
+                    if actual_tensors:  # Only if there's at least one tensor
+                        # Store: (list_length, tensor_indices, shapes_dtypes)
+                        tensors_to_send[k] = actual_tensors
+                        list_tensor_infos[k] = (len(v), tensor_indices, shapes_dtypes)
 
-        # Metadata: everything that's not a tensor or list of tensors
+        # Debug: Print all fields and their types
+        print(f"[DEBUG _send_batch_to_dit] All batch fields:")
+        for k, v in batch.__dict__.items():
+            if isinstance(v, torch.Tensor):
+                print(f"  {k}: Tensor, shape={v.shape}")
+            elif isinstance(v, list):
+                if len(v) > 0:
+                    print(f"  {k}: List[{len(v)}], first={type(v[0])}")
+                else:
+                    print(f"  {k}: List[empty]")
+            elif isinstance(v, tuple):
+                print(f"  {k}: Tuple[{len(v)}], types={[type(x) for x in v]}")
+            else:
+                print(f"  {k}: {type(v)}, value_preview={str(v)[:100]}")
+
+        # Metadata: everything that's not in tensors_to_send
         metadata = {
             k: v
             for k, v in batch.__dict__.items()
-            if not isinstance(v, torch.Tensor)
-            and not (isinstance(v, list) and v and isinstance(v[0], torch.Tensor))
+            if k not in tensor_infos and k not in list_tensor_infos
         }
 
         # Serialize metadata + tensor info
@@ -254,8 +349,16 @@ class DisaggregatedExecutor(PipelineExecutor):
         size_tensor = torch.tensor(
             [meta_bytes.numel()], dtype=torch.long, device=meta_bytes.device
         )
+        print(f"[_send_batch_to_dit] About to send size_tensor: {size_tensor.item()}")
+        import sys
+
+        sys.stdout.flush()
         self.comm.send_to_dit(size_tensor)
+        print(f"[_send_batch_to_dit] size_tensor sent, about to send meta_bytes")
+        sys.stdout.flush()
         self.comm.send_to_dit(meta_bytes)
+        print(f"[_send_batch_to_dit] meta_bytes sent")
+        sys.stdout.flush()
 
         # 2. Send Single Tensors
         for name in tensor_infos.keys():
@@ -279,9 +382,20 @@ class DisaggregatedExecutor(PipelineExecutor):
     def _recv_batch_from_non_dit(self, batch: Req):
         import pickle
 
+        print(
+            f"[_recv_batch_from_non_dit Rank {dist.get_rank()}] Entered, waiting for size_tensor..."
+        )
+        import sys
+
+        sys.stdout.flush()
+
         # 1. Recv Metadata Size
         size_tensor = self.comm.recv_from_non_dit(torch.Size([1]), torch.long)
         size = size_tensor.item()
+        print(
+            f"[_recv_batch_from_non_dit Rank {dist.get_rank()}] Received size: {size}"
+        )
+        sys.stdout.flush()
 
         # 2. Recv Metadata
         meta_bytes = self.comm.recv_from_non_dit(torch.Size([size]), torch.uint8)
@@ -299,13 +413,22 @@ class DisaggregatedExecutor(PipelineExecutor):
             setattr(batch, name, tensor)
 
         # 4. Recv List of Tensors
-        for name, shapes_dtypes in list_tensor_infos.items():
-            tensor_list = []
+        for name, list_info in list_tensor_infos.items():
+            list_length, tensor_indices, shapes_dtypes = list_info
+            
+            # Receive actual tensors
+            actual_tensors = []
             for shape, dtype in shapes_dtypes:
                 tensor = self.comm.recv_from_non_dit(shape, dtype)
                 tensor = tensor.to(get_local_torch_device())
-                tensor_list.append(tensor)
-            setattr(batch, name, tensor_list)
+                actual_tensors.append(tensor)
+            
+            # Reconstruct list with None placeholders
+            result_list = [None] * list_length
+            for idx, tensor in zip(tensor_indices, actual_tensors):
+                result_list[idx] = tensor
+            
+            setattr(batch, name, result_list)
 
         print(
             f"_recv_batch_from_non_dit: received {len(tensor_infos)} single tensors and {len(list_tensor_infos)} tensor lists"
@@ -326,15 +449,26 @@ class DisaggregatedExecutor(PipelineExecutor):
                 if isinstance(v, torch.Tensor):
                     tensors_to_send[k] = v
                     tensor_infos[k] = (v.shape, v.dtype)
-                elif isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
-                    tensors_to_send[k] = v
-                    list_tensor_infos[k] = [(t.shape, t.dtype) for t in v]
+                elif isinstance(v, list) and v and len(v) > 0:
+                    # Check if it's a list of tensors (may contain None)
+                    tensor_indices = []
+                    actual_tensors = []
+                    shapes_dtypes = []
+                    
+                    for idx, t in enumerate(v):
+                        if isinstance(t, torch.Tensor):
+                            tensor_indices.append(idx)
+                            actual_tensors.append(t)
+                            shapes_dtypes.append((t.shape, t.dtype))
+                    
+                    if actual_tensors:
+                        tensors_to_send[k] = actual_tensors
+                        list_tensor_infos[k] = (len(v), tensor_indices, shapes_dtypes)
 
         metadata = {
             k: v
             for k, v in batch.__dict__.items()
-            if not isinstance(v, torch.Tensor)
-            and not (isinstance(v, list) and v and isinstance(v[0], torch.Tensor))
+            if k not in tensor_infos and k not in list_tensor_infos
         }
 
         buffer = io.BytesIO()
@@ -391,55 +525,70 @@ class DisaggregatedExecutor(PipelineExecutor):
             setattr(batch, name, tensor)
 
         # Recv list of tensors
-        for name, shapes_dtypes in list_tensor_infos.items():
-            tensor_list = []
+        for name, list_info in list_tensor_infos.items():
+            list_length, tensor_indices, shapes_dtypes = list_info
+            
+            # Receive actual tensors
+            actual_tensors = []
             for shape, dtype in shapes_dtypes:
                 tensor = self.comm.recv_from_dit(shape, dtype)
                 tensor = tensor.to(get_local_torch_device())
-                tensor_list.append(tensor)
-            setattr(batch, name, tensor_list)
+                actual_tensors.append(tensor)
+            
+            # Reconstruct list with None placeholders
+            result_list = [None] * list_length
+            for idx, tensor in zip(tensor_indices, actual_tensors):
+                result_list[idx] = tensor
+            
+            setattr(batch, name, result_list)
 
         print(
             f"_recv_batch_from_dit: received {len(tensor_infos)} single tensors and {len(list_tensor_infos)} tensor lists"
         )
         return batch
-    
+
     def _send_final_result_to_dit_master(self, output_batch: OutputBatch):
         """Send OutputBatch from non-dit to dit master."""
         import io
         import pickle
-        
-        print(f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master called")
-        print(f"  non_dit_master_rank: {self.comm.non_dit_master_rank}, dit_master_rank: {self.comm.dit_master_rank}")
-        
+
+        print(
+            f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master called"
+        )
+        print(
+            f"  non_dit_master_rank: {self.comm.non_dit_master_rank}, dit_master_rank: {self.comm.dit_master_rank}"
+        )
+
         # Prepare metadata (non-tensor fields)
         has_output = output_batch.output is not None
         has_error = output_batch.error is not None
-        
+
         print(f"  has_output: {has_output}, has_error: {has_error}")
         if has_output:
-            print(f"  output shape: {output_batch.output.shape}, dtype: {output_batch.output.dtype}")
-        
+            print(
+                f"  output shape: {output_batch.output.shape}, dtype: {output_batch.output.dtype}"
+            )
+
         metadata = {
-            'timings': output_batch.timings,
-            'error': output_batch.error,
-            'has_output': has_output,
+            "timings": output_batch.timings,
+            "error": output_batch.error,
+            "has_output": has_output,
         }
-        
+
         if has_output:
-            metadata['output_shape'] = tuple(output_batch.output.shape)
-            metadata['output_dtype'] = str(output_batch.output.dtype)
-        
+            metadata["output_shape"] = tuple(output_batch.output.shape)
+            metadata["output_dtype"] = str(output_batch.output.dtype)
+
         # Serialize and send metadata
         buffer = io.BytesIO()
         pickle.dump(metadata, buffer)
         meta_bytes = torch.tensor(
             bytearray(buffer.getvalue()), dtype=torch.uint8, device="cpu"
         )
-        
+
         if dist.get_backend() == "nccl":
             meta_bytes = meta_bytes.cuda()
-        
+
         print(f"  Sending metadata size: {meta_bytes.numel()}")
         size_tensor = torch.tensor(
             [meta_bytes.numel()], dtype=torch.long, device=meta_bytes.device
@@ -447,7 +596,7 @@ class DisaggregatedExecutor(PipelineExecutor):
         self.comm.send_to_dit(size_tensor)
         self.comm.send_to_dit(meta_bytes)
         print("  Metadata sent")
-        
+
         # Send output tensor if it exists
         if has_output:
             output_tensor = output_batch.output
@@ -457,45 +606,51 @@ class DisaggregatedExecutor(PipelineExecutor):
             print(f"  Output tensor sent with shape {output_tensor.shape}")
         else:
             print("  No output tensor to send")
-        
-        print(f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master completed")
-    
+
+        print(
+            f"[Non-DiT Rank {dist.get_rank()}] _send_final_result_to_dit_master completed"
+        )
+
     def _recv_final_result_from_non_dit(self, output_batch: OutputBatch):
         """Receive OutputBatch from non-dit at dit master."""
         import pickle
-        
-        print(f"[Dit Master Rank {dist.get_rank()}] _recv_final_result_from_non_dit called")
+
+        print(
+            f"[Dit Master Rank {dist.get_rank()}] _recv_final_result_from_non_dit called"
+        )
         print(f"  Waiting for metadata size...")
-        
+
         # Recv metadata
         size_tensor = self.comm.recv_from_non_dit(torch.Size([1]), torch.long)
         size = size_tensor.item()
         print(f"  Metadata size: {size}")
-        
+
         print(f"  Receiving metadata...")
         meta_bytes = self.comm.recv_from_non_dit(torch.Size([size]), torch.uint8)
         meta_data_cpu = meta_bytes.cpu().numpy().tobytes()
         metadata = pickle.loads(meta_data_cpu)
-        print(f"  Metadata received: has_output={metadata.get('has_output')}, error={metadata.get('error')}")
-        
+        print(
+            f"  Metadata received: has_output={metadata.get('has_output')}, error={metadata.get('error')}"
+        )
+
         # Update output_batch with metadata
-        output_batch.timings = metadata['timings']
-        output_batch.error = metadata['error']
-        
+        output_batch.timings = metadata["timings"]
+        output_batch.error = metadata["error"]
+
         # Recv output tensor if it exists
-        if metadata['has_output']:
-            shape = metadata['output_shape']
-            dtype_str = metadata['output_dtype']
+        if metadata["has_output"]:
+            shape = metadata["output_shape"]
+            dtype_str = metadata["output_dtype"]
             print(f"  Output shape: {shape}, dtype: {dtype_str}")
-            
+
             # Parse dtype
-            if 'float32' in dtype_str:
+            if "float32" in dtype_str:
                 dtype = torch.float32
-            elif 'float16' in dtype_str:
+            elif "float16" in dtype_str:
                 dtype = torch.float16
             else:
                 dtype = torch.float32  # default
-            
+
             print(f"  Receiving output tensor...")
             output_tensor = self.comm.recv_from_non_dit(torch.Size(shape), dtype)
             output_batch.output = output_tensor.to(get_local_torch_device())
@@ -503,6 +658,8 @@ class DisaggregatedExecutor(PipelineExecutor):
         else:
             output_batch.output = None
             print("  No output tensor")
-        
-        print(f"[Dit Master Rank {dist.get_rank()}] _recv_final_result_from_non_dit completed")
+
+        print(
+            f"[Dit Master Rank {dist.get_rank()}] _recv_final_result_from_non_dit completed"
+        )
         return output_batch
