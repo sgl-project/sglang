@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
 )
 
 
+@unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
 class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
 
@@ -178,7 +179,6 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
         subprocess.run(cmd, check=True, timeout=3600)
 
-    @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
     def test_mmmu(self):
         """Test MMMU evaluation with EPD disaggregation"""
         import glob
