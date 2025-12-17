@@ -228,10 +228,7 @@ class Engine(EngineBase):
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-
-        scheduler_info = scheduler_infos[0]
-        self.scheduler_info = scheduler_info
-
+        self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
