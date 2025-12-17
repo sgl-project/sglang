@@ -2425,6 +2425,7 @@ class ServerArgs:
         except ImportError:
             logger.warning(
                 f"Failed to import mooncake. Does not support using TransferEngine as remote instance weight loader backend."
+            )
 
     def _handle_remote_instance_weight_loader_start_seed_via_transfer_engine(self):
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
