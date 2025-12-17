@@ -265,7 +265,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            draft_model_idx=0,
+            draft_model_idx=0 if is_mtp_worker else None,
         )
         if is_mtp_worker:
             self.model_runner_list.append(self.model_runner)
