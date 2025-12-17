@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ import orjson
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
@@ -40,6 +42,7 @@ from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
     get_device_memory_capacity,
+    get_device_name,
     get_device_sm,
     is_blackwell_supported,
     is_cuda,
@@ -108,6 +111,8 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
 ]
+
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -184,6 +189,8 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
+
+mamba_scheduler_strategy_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 
 # Allow external code to add more choices
@@ -427,6 +434,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
+    speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -466,6 +474,8 @@ class ServerArgs:
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
     mamba_full_memory_ratio: float = 0.9
+    mamba_scheduler_strategy: str = "auto"
+    mamba_track_interval: int = 256
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -605,6 +615,8 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+    remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
+    remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -642,16 +654,16 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
+        # Handle device-specific backends.
+        self._handle_hpu_backends()
+        self._handle_cpu_backends()
+        self._handle_npu_backends()
+
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
-
-        # Handle device-specific backends.
-        self._handle_hpu_backends()
-        self._handle_cpu_backends()
-        self._handle_npu_backends()
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -681,6 +693,9 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+
+        # Handle remote instance weight loader.
+        self._handle_remote_instance_weight_loader_start_seed_via_transfer_engine()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -738,8 +753,19 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+        if self.mamba_scheduler_strategy == "auto":
+            # TODO: when extra_buffer is more verified, we can set the default path based on
+            #       [overlap, non-overlap]
+            self.mamba_scheduler_strategy = "no_buffer"
+        # In speculative scenario:
+        # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
+        # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self.speculative_draft_model_quantization is None:
+            self.speculative_draft_model_quantization = self.quantization
+        elif self.speculative_draft_model_quantization == "unquant":
+            self.speculative_draft_model_quantization = None
 
-        # Handle ModelScope model downloads
+            # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             if not os.path.exists(self.model_path):
                 from modelscope import snapshot_download
@@ -781,16 +807,6 @@ class ServerArgs:
                     self.chunked_prefill_size = 2048
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 8
-            elif is_npu() and gpu_mem < 32 * 1024:
-                # Atlas A2B4
-                # (chunked_prefill_size 32k, cuda_graph_max_bs 16 if tp < 4 else 64)
-                if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 32768
-                if self.cuda_graph_max_bs is None:
-                    if self.tp_size < 4:
-                        self.cuda_graph_max_bs = 16
-                    else:
-                        self.cuda_graph_max_bs = 64
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, cuda_graph_max_bs 24 if tp < 4 else 80)
@@ -814,16 +830,6 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 32
                     else:
                         self.cuda_graph_max_bs = 160
-            elif is_npu() and gpu_mem < 64 * 1024:
-                # Atlas A2 and Atlas A3
-                # (chunked_prefill_size 32k, cuda_graph_max_bs 64 if tp < 4 else 128)
-                if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 32768
-                if self.cuda_graph_max_bs is None:
-                    if self.tp_size < 4:
-                        self.cuda_graph_max_bs = 64
-                    else:
-                        self.cuda_graph_max_bs = 128
             elif gpu_mem < 90 * 1024:
                 # H100, A100
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
@@ -1101,12 +1107,6 @@ class ServerArgs:
 
             # common to all Deepseek MoE models
             if is_cuda() and is_sm100_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
-                    )
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1158,13 +1158,6 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            if is_blackwell_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                    )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -1270,6 +1263,9 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
+            assert (
+                not self.enable_mamba_extra_buffer()
+            ), f"mamba extra_buffer is not supported for {model_arch} model"
             model_config = self.get_model_config()
             if model_config.quantization in [
                 "modelopt",
@@ -1334,12 +1330,6 @@ class ServerArgs:
                         f"{model_arch}"
                     )
         elif model_arch in ["Qwen3NextForCausalLM"]:
-            if not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
-                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
             if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
@@ -1373,15 +1363,49 @@ class ServerArgs:
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
+
+            # Mamba radix cache v2
+            if self.enable_mamba_extra_buffer():
+                assert (
+                    is_cuda()
+                ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+                if self.speculative_num_draft_tokens is not None:
+                    assert (
+                        self.mamba_track_interval >= self.speculative_num_draft_tokens
+                    ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+
+                if self.page_size is not None:
+                    assert (
+                        self.mamba_track_interval % self.page_size == 0
+                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                    assert (
+                        FLA_CHUNK_SIZE % self.page_size == 0
+                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+
+                if self.speculative_algorithm is not None:
+                    logger.info(
+                        f"Disable overlap schedule for {model_arch} model speculative decoding."
+                    )
+                    self.disable_overlap_schedule = True
+            elif not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
+                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
+                )
+                self.disable_overlap_schedule = True
+
         elif model_arch in [
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
+            assert (
+                not self.enable_mamba_extra_buffer()
+            ), f"mamba extra_buffer is not supported for {model_arch} model"
             if not self.disable_radix_cache:
                 logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
-                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
+                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
                 )
                 self.disable_overlap_schedule = True
                 if is_sm100_supported():
@@ -1397,6 +1421,34 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
+
+        # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
+        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
+        # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
+        # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
+        device_name = get_device_name()
+        is_h20_device = (
+            device_name and "H20" in device_name and "H200" not in device_name
+        )
+        if (
+            not self.enable_flashinfer_allreduce_fusion
+            and model_arch
+            in [
+                "DeepseekV3ForCausalLM",
+                "GptOssForCausalLM",
+                "Glm4MoeForCausalLM",
+                "Qwen3MoeForCausalLM",
+            ]
+            and (is_sm90_supported() or is_blackwell_supported())
+            and not self.enable_dp_attention
+            and self.nnodes == 1
+            and not is_h20_device
+            and self.moe_a2a_backend == "none"
+        ):
+            self.enable_flashinfer_allreduce_fusion = True
+            logger.info(
+                f"Enable FlashInfer AllReduce Fusion by default for {model_arch}"
+            )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1437,7 +1489,14 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
-                elif is_sm100_supported() and is_no_spec_infer_or_topk_one(self):
+                elif (
+                    is_sm100_supported()
+                    and is_no_spec_infer_or_topk_one(self)
+                    and (
+                        self.speculative_algorithm is None
+                        or self.speculative_eagle_topk is not None
+                    )
+                ):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
@@ -1908,6 +1967,7 @@ class ServerArgs:
                 self.disable_overlap_schedule = True
                 logger.warning(
                     "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
+                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
                 )
 
             if self.enable_mixed_chunk:
@@ -2035,8 +2095,26 @@ class ServerArgs:
             if (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
-                or self.remote_instance_weight_loader_send_weights_group_ports is None
             ):
+                logger.warning(
+                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader settings."
+                )
+                self.load_format = "auto"
+            elif (
+                self.remote_instance_weight_loader_send_weights_group_ports is None
+                and self.remote_instance_weight_loader_backend == "nccl"
+            ):
+                logger.warning(
+                    "Fallback load_format to 'auto' due to incomplete remote instance weight loader NCCL group ports settings."
+                )
+                self.load_format = "auto"
+            elif (
+                not self.validate_transfer_engine()
+                and self.remote_instance_weight_loader_backend == "transfer_engine"
+            ):
+                logger.warning(
+                    "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
+                )
                 self.load_format = "auto"
 
     def _handle_encoder_disaggregation(self):
@@ -2294,19 +2372,12 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
-    def _handle_remote_instance_weight_loader_support_transfer_engine(self):
-        if importlib.util.find_spec("mooncake.engine") is None:
-            logger.warning(
-                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+    def _handle_remote_instance_weight_loader_start_seed_via_transfer_engine(self):
+        # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
+        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
+            self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
+                self.validate_transfer_engine()
             )
-            self.remote_instance_weight_loader_support_transfer_engine = False
-        elif self.enable_memory_saver:
-            logger.warning(
-                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            self.remote_instance_weight_loader_support_transfer_engine = False
-        else:
-            self.remote_instance_weight_loader_support_transfer_engine = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3336,6 +3407,13 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_a2a_backend,
             help="Choose the backend for MoE A2A in speculative decoding",
         )
+        parser.add_argument(
+            "--speculative-draft-model-quantization",
+            type=str,
+            choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
+            default=ServerArgs.speculative_draft_model_quantization,
+            help="The quantization method for speculative model.",
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -3535,6 +3613,19 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
             help="The ratio of mamba state memory to full kv cache memory.",
+        )
+        parser.add_argument(
+            "--mamba-scheduler-strategy",
+            type=str,
+            choices=mamba_scheduler_strategy_CHOICES,
+            default=ServerArgs.mamba_scheduler_strategy,
+            help="The strategy to use for mamba radix cache.",
+        )
+        parser.add_argument(
+            "--mamba-track-interval",
+            type=int,
+            default=ServerArgs.mamba_track_interval,
+            help="The interval to track the mamba state during decode.",
         )
 
         # Hierarchical cache
@@ -4185,6 +4276,18 @@ class ServerArgs:
             default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
             help="The communication group ports for loading weights from remote instance.",
         )
+        parser.add_argument(
+            "--remote-instance-weight-loader-backend",
+            type=str,
+            choices=["transfer_engine", "nccl"],
+            default=ServerArgs.remote_instance_weight_loader_backend,
+            help="The backend for loading weights from remote instance. Can be 'transfer_engine' or 'nccl'. Default is 'nccl'.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+            action="store_true",
+            help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
 
         # For PD-Multiplexing
         parser.add_argument(
@@ -4333,6 +4436,9 @@ class ServerArgs:
 
         model_config = self.get_model_config()
         return model_config.attention_arch == AttentionArch.MLA
+
+    def enable_mamba_extra_buffer(self) -> bool:
+        return self.mamba_scheduler_strategy == "extra_buffer"
 
     def check_server_args(self):
         # Check parallel size constraints
@@ -4693,6 +4799,33 @@ class ServerArgs:
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
         )
+
+    def validate_transfer_engine(self):
+        if importlib.util.find_spec("mooncake.engine") is None:
+            logger.warning(
+                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            return False
+        elif self.enable_memory_saver:
+            logger.warning(
+                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
+            )
+            return False
+        else:
+            return True
+
+    def remote_instance_weight_loader_use_transfer_engine(self):
+        # Use TransferEngine as seed backend.
+        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
+            return True
+        # Use TransferEngine as client backend.
+        elif (
+            self.load_format == "remote_instance"
+            and self.remote_instance_weight_loader_backend == "transfer_engine"
+        ):
+            return True
+        else:
+            return False
 
 
 # NOTE: This is a global variable to hold the server args for scheduler.
