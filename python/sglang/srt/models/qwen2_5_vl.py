@@ -113,12 +113,23 @@ class Qwen2_5_VLMLP(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.act = ACT2FN[hidden_act]
+        self.hidden_act = hidden_act
+        if self.hidden_act == "silu":
+            from sglang.srt.layers.activation import SiluAndMul
+            self.act = SiluAndMul()
+        elif self.hidden_act == "gelu":
+            from sglang.srt.layers.activation import GeluAndMul
+            self.act = GeluAndMul()
+        else:
+            self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act(gate) * up
+        if self.hidden_act in ["silu", "gelu"]:
+            x = self.act(gate_up)
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            x = self.act(gate) * up
         x_down, _ = self.down_proj(x)
         return x_down
 
