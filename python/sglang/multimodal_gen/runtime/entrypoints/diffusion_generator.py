@@ -13,22 +13,18 @@ import os
 import time
 from typing import Any
 
-import imageio
 import numpy as np
-import torch
-import torchvision
-from einops import rearrange
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    post_process_sample,
+    prepare_request,
+)
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -39,7 +35,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
     suppress_loggers,
-    suppress_other_loggers,
 )
 
 suppress_loggers(["imageio", "imageio_ffmpeg", "PIL", "PIL_Image"])
@@ -162,49 +157,6 @@ class DiffGenerator:
             f"{self.server_args.scheduler_endpoint()}."
         )
 
-    def post_process_sample(
-        self,
-        sample: torch.Tensor,
-        data_type: DataType,
-        fps: int,
-        save_output: bool = True,
-        save_file_path: str = None,
-    ):
-        """
-        Process a single sample output and save output if necessary
-        """
-        # Process outputs
-        if sample.dim() == 3:
-            # for images, dim t is missing
-            sample = sample.unsqueeze(1)
-        sample = rearrange(sample, "c t h w -> t c h w")
-        frames = []
-        # TODO: this can be batched
-        for x in sample:
-            x = torchvision.utils.make_grid(x, nrow=6)
-            x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-            frames.append((x * 255).numpy().astype(np.uint8))
-
-        # Save outputs if requested
-        if save_output:
-            if save_file_path:
-                os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-                with suppress_other_loggers():
-                    if data_type == DataType.VIDEO:
-                        imageio.mimsave(
-                            save_file_path,
-                            frames,
-                            fps=fps,
-                            format=data_type.get_default_extension(),
-                        )
-                    else:
-                        imageio.imwrite(save_file_path, frames[0])
-                logger.info("Saved output to %s", save_file_path)
-            else:
-                logger.warning("No output path provided, output not saved")
-
-        return frames
-
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
@@ -280,7 +232,7 @@ class DiffGenerator:
                         continue
                     for output_idx, sample in enumerate(output_batch.output):
                         num_outputs = len(output_batch.output)
-                        frames = self.post_process_sample(
+                        frames = post_process_sample(
                             sample,
                             fps=req.fps,
                             save_output=req.save_output,

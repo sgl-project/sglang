@@ -36,7 +36,7 @@ use crate::{
     app_context::AppContext,
     core::{model_type::Endpoint, ModelCard, ProviderType, RuntimeType, Worker, WorkerRegistry},
     data_connector::{ConversationId, ListParams, ResponseId, SortOrder},
-    observability::metrics::{smg_labels, SmgMetrics},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
         responses::{
@@ -583,12 +583,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let streaming = body.stream;
 
         // Record request start
-        SmgMetrics::record_router_request(
-            smg_labels::ROUTER_OPENAI,
-            smg_labels::BACKEND_EXTERNAL,
-            smg_labels::CONNECTION_HTTP,
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
             model,
-            smg_labels::ENDPOINT_CHAT,
+            metrics_labels::ENDPOINT_CHAT,
             streaming,
         );
 
@@ -600,13 +600,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         {
             Ok(w) => w,
             Err(response) => {
-                SmgMetrics::record_router_error(
-                    smg_labels::ROUTER_OPENAI,
-                    smg_labels::BACKEND_EXTERNAL,
-                    smg_labels::CONNECTION_HTTP,
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
                     model,
-                    smg_labels::ENDPOINT_CHAT,
-                    smg_labels::ERROR_NO_WORKERS,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_NO_WORKERS,
                 );
                 return response;
             }
@@ -615,13 +615,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut payload = match to_value(body) {
             Ok(v) => v,
             Err(e) => {
-                SmgMetrics::record_router_error(
-                    smg_labels::ROUTER_OPENAI,
-                    smg_labels::BACKEND_EXTERNAL,
-                    smg_labels::CONNECTION_HTTP,
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
                     model,
-                    smg_labels::ENDPOINT_CHAT,
-                    smg_labels::ERROR_VALIDATION,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_VALIDATION,
                 );
                 return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
@@ -629,13 +629,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
-            SmgMetrics::record_router_error(
-                smg_labels::ROUTER_OPENAI,
-                smg_labels::BACKEND_EXTERNAL,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
                 model,
-                smg_labels::ENDPOINT_CHAT,
-                smg_labels::ERROR_VALIDATION,
+                metrics_labels::ENDPOINT_CHAT,
+                metrics_labels::ERROR_VALIDATION,
             );
             return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
@@ -672,13 +672,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             Ok(r) => r,
             Err(e) => {
                 worker.circuit_breaker().record_failure();
-                SmgMetrics::record_router_error(
-                    smg_labels::ROUTER_OPENAI,
-                    smg_labels::BACKEND_EXTERNAL,
-                    smg_labels::CONNECTION_HTTP,
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
                     model,
-                    smg_labels::ENDPOINT_CHAT,
-                    smg_labels::ERROR_BACKEND,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_BACKEND,
                 );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -696,12 +696,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             match resp.bytes().await {
                 Ok(body) => {
                     worker.circuit_breaker().record_success();
-                    SmgMetrics::record_router_duration(
-                        smg_labels::ROUTER_OPENAI,
-                        smg_labels::BACKEND_EXTERNAL,
-                        smg_labels::CONNECTION_HTTP,
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_OPENAI,
+                        metrics_labels::BACKEND_EXTERNAL,
+                        metrics_labels::CONNECTION_HTTP,
                         model,
-                        smg_labels::ENDPOINT_CHAT,
+                        metrics_labels::ENDPOINT_CHAT,
                         start.elapsed(),
                     );
                     let mut response = Response::new(Body::from(body));
@@ -713,13 +713,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
                 Err(e) => {
                     worker.circuit_breaker().record_failure();
-                    SmgMetrics::record_router_error(
-                        smg_labels::ROUTER_OPENAI,
-                        smg_labels::BACKEND_EXTERNAL,
-                        smg_labels::CONNECTION_HTTP,
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_OPENAI,
+                        metrics_labels::BACKEND_EXTERNAL,
+                        metrics_labels::CONNECTION_HTTP,
                         model,
-                        smg_labels::ENDPOINT_CHAT,
-                        smg_labels::ERROR_BACKEND,
+                        metrics_labels::ENDPOINT_CHAT,
+                        metrics_labels::ERROR_BACKEND,
                     );
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -730,12 +730,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         } else {
             // For streaming, record duration at start since we can't track completion
-            SmgMetrics::record_router_duration(
-                smg_labels::ROUTER_OPENAI,
-                smg_labels::BACKEND_EXTERNAL,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
                 model,
-                smg_labels::ENDPOINT_CHAT,
+                metrics_labels::ENDPOINT_CHAT,
                 start.elapsed(),
             );
             let stream = resp.bytes_stream();
@@ -776,12 +776,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let streaming = body.stream.unwrap_or(false);
 
         // Record request start
-        SmgMetrics::record_router_request(
-            smg_labels::ROUTER_OPENAI,
-            smg_labels::BACKEND_EXTERNAL,
-            smg_labels::CONNECTION_HTTP,
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
             model,
-            smg_labels::ENDPOINT_RESPONSES,
+            metrics_labels::ENDPOINT_RESPONSES,
             streaming,
         );
 
@@ -793,13 +793,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         {
             Ok(w) => w,
             Err(response) => {
-                SmgMetrics::record_router_error(
-                    smg_labels::ROUTER_OPENAI,
-                    smg_labels::BACKEND_EXTERNAL,
-                    smg_labels::CONNECTION_HTTP,
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
                     model,
-                    smg_labels::ENDPOINT_RESPONSES,
-                    smg_labels::ERROR_NO_WORKERS,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_NO_WORKERS,
                 );
                 return response;
             }
@@ -853,13 +853,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .get_conversation(&conv_id)
                 .await
             {
-                SmgMetrics::record_router_error(
-                    smg_labels::ROUTER_OPENAI,
-                    smg_labels::BACKEND_EXTERNAL,
-                    smg_labels::CONNECTION_HTTP,
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
                     model,
-                    smg_labels::ENDPOINT_RESPONSES,
-                    smg_labels::ERROR_VALIDATION,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_VALIDATION,
                 );
                 return error_responses::not_found("conversation", &conv_id.0);
             }
@@ -970,13 +970,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut payload = match to_value(&request_body) {
             Ok(v) => v,
             Err(e) => {
-                SmgMetrics::record_router_error(
-                    smg_labels::ROUTER_OPENAI,
-                    smg_labels::BACKEND_EXTERNAL,
-                    smg_labels::CONNECTION_HTTP,
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
                     model,
-                    smg_labels::ENDPOINT_RESPONSES,
-                    smg_labels::ERROR_VALIDATION,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_VALIDATION,
                 );
                 return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
@@ -984,13 +984,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
-            SmgMetrics::record_router_error(
-                smg_labels::ROUTER_OPENAI,
-                smg_labels::BACKEND_EXTERNAL,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
                 model,
-                smg_labels::ENDPOINT_RESPONSES,
-                smg_labels::ERROR_VALIDATION,
+                metrics_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ERROR_VALIDATION,
             );
             return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
@@ -1021,12 +1021,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         // Record duration only for successful requests (errors tracked inside handlers)
         if response.status().is_success() {
-            SmgMetrics::record_router_duration(
-                smg_labels::ROUTER_OPENAI,
-                smg_labels::BACKEND_EXTERNAL,
-                smg_labels::CONNECTION_HTTP,
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
                 model,
-                smg_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ENDPOINT_RESPONSES,
                 start.elapsed(),
             );
         }
