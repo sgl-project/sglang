@@ -59,7 +59,9 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         layer.weight.data = npu_format_cast(layer.weight.data)
 
         layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
+        # Compressed-tensors format doesn't have this field
+        if hasattr(layer, "weight_offset"):
+            layer.weight_offset.data = layer.weight_offset.data.flatten()
 
         expanding_factor = layer.weight.data.shape[0]
         layer.aclnn_input_scale = torch.nn.Parameter(
@@ -101,7 +103,9 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         layer.weight.data = npu_format_cast(layer.weight.data)
 
         layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
+        # Compressed-tensors format doesn't have this field
+        if hasattr(layer, "weight_offset"):
+            layer.weight_offset.data = layer.weight_offset.data.flatten()
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):

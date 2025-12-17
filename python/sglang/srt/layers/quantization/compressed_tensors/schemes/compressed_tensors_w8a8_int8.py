@@ -93,12 +93,12 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 layer.register_parameter("input_zero_point", input_zero_point)
 
 
-class GPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
+class GPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
 
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
-        super.__init__(strategy, is_static_input_scheme, input_symmetric)
+        super().__init__(strategy, is_static_input_scheme, input_symmetric)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -185,25 +185,25 @@ class GPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
         )
 
 
-class NPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
+class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
 
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
-        super.__init__(strategy, is_static_input_scheme, input_symmetric)
+        super().__init__(strategy, is_static_input_scheme, input_symmetric)
+        # TODO: Currently, NPU kernel for static quant requires quant_bias field,
+        # which can't be replicated in compressed-tensors.
+        if self.is_static_input_scheme:
+            raise NotImplementedError(
+                "Static compressed-tensors scheme is not yet supported on NPU."
+            )
 
     @classmethod
     def get_min_capability(cls) -> int:
         return NotImplementedError
 
     def process_weights_after_loading(self, layer):
-        if self.is_static_input_scheme:
-            return NPUW8A8Int8LinearMethod.process_weights_after_loading(layer)
-        else:
-            return NPUW8A8Int8DynamicLinearMethod.process_weights_after_loading(layer)
+        return NPUW8A8Int8DynamicLinearMethod.process_weights_after_loading(layer)
 
     def apply_weights(self, layer, x, bias):
-        if self.is_static_input_scheme:
-            return NPUW8A8Int8LinearMethod.apply(layer)
-        else:
-            return NPUW8A8Int8DynamicLinearMethod.apply(layer)
+        return NPUW8A8Int8DynamicLinearMethod.apply(layer, x, bias)

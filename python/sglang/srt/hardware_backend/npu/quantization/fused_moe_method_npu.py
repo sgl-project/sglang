@@ -165,12 +165,15 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = torch.nn.Parameter(
             layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
         )
-        layer.w13_weight_offset = torch.nn.Parameter(
-            layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
-        )
-        layer.w2_weight_offset = torch.nn.Parameter(
-            layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
-        )
+        # Compressed-tensors format doesn't have this field
+        if hasattr(layer, "w13_weight_offset"):
+            layer.w13_weight_offset = torch.nn.Parameter(
+                layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+            )
+        if hasattr(layer, "w2_weight_offset"):
+            layer.w2_weight_offset = torch.nn.Parameter(
+                layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+            )
 
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)

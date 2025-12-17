@@ -15,6 +15,9 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW8A8Int8DynamicMoEMethod,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
@@ -32,7 +35,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     swizzle_blockscale,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -45,6 +48,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _is_cuda = is_cuda()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -67,6 +71,7 @@ __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW4A4Nvfp4MoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
+    "NPUCompressedTensorsW8A8Int8MoEMethod"
     "CompressedTensorsWNA16MoEMethod",
 ]
 
@@ -98,6 +103,12 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoEMethod")
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
+        elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
+            if _is_npu:
+                logger.info_once("Using NPUCompressedTensorsW8A8Int8MoEMethod")
+                return NPUCompressedTensorsW8A8Int8MoEMethod(quant_config)
+            else:
+                raise NotImplementedError(f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now.")
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -679,6 +690,120 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
             )
             return self.runner.run(dispatch_output, quant_info)
+
+
+class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
+
+    def __init__(self, quant_config: CompressedTensorsConfig):
+        self.quant_config = quant_config
+        self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
+        self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
+            "input_activations"
+        )
+        if not _is_npu:
+            raise NotImplementedError(
+                "w8a8 int8 compressed tensors moe scheme is supported only for Ascend device for now."
+            )
+        self.static_input_scales = not self.input_quant.dynamic
+        per_channel = (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        )
+        if not per_channel:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found "
+                f"{self.weight_quant}, {self.input_quant}"
+            )
+
+        self.static_input_scales = not self.input_quant.dynamic
+        if self.static_input_scales:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found static input scales."
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        params_dtype = torch.int8
+
+        # WEIGHTS
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # WEIGHT_SCALES
+        assert self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        # Add PER-CHANNEL quantization for FusedMoE.weight_loader.
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # INPUT_SCALES
+        assert not self.static_input_scales
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        NPUW8A8Int8DynamicMoEMethod.process_weights_after_loading(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        return NPUW8A8Int8DynamicMoEMethod.apply(layer, dispatch_output)
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):

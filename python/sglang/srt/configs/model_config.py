@@ -602,6 +602,9 @@ class ModelConfig:
         if quant_config_file.is_file():
             with open(quant_config_file) as f:
                 quant_cfg = json.load(f)
+            # This field is required for flagless model loading but is not present in
+            # modelslim model description, so we're adding it here manually.
+            quant_cfg['quant_method'] = 'modelslim'
 
         return quant_cfg
 
@@ -721,11 +724,17 @@ class ModelConfig:
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
-        # Parse quantization method from the HF model config, if available.
-        quant_cfg = self._parse_quant_hf_config()
-        if _is_npu:
-            quant_cfg = self._find_quant_modelslim_config()
-            self.quantization = "modelslim"
+        # Parse quantization method from the HF and ModelSlim model config, if available.
+        # Only one function should return config, other should return None.
+        cfg_list = []
+        cfg_list.append(self._parse_quant_hf_config)
+        cfg_list.append(self._find_quant_modelslim_config)
+
+        # Filter out None values
+        cfg_list = [item for item in cfg_list if item is not None]
+        assert (len(cfg_list) == 1), "Config list contains configs from 2 methods, must be only 1"
+        
+        quant_cfg = cfg_list[0]
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
