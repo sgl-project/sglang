@@ -129,15 +129,16 @@ def run_accuracy_for_model(
     print(f"  Eval: {eval_name}, Examples: {num_examples}")
     print(f"{'='*60}\n")
 
-    # Launch server
-    process = popen_launch_server(
-        model=model.model_path,
-        base_url=base_url,
-        other_args=model.extra_args,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    )
-
+    process = None
     try:
+        # Launch server
+        process = popen_launch_server(
+            model=model.model_path,
+            base_url=base_url,
+            other_args=model.extra_args,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
+
         # Build eval args
         args = SimpleNamespace(
             base_url=base_url,
@@ -177,7 +178,8 @@ def run_accuracy_for_model(
         return False, error_msg, None
 
     finally:
-        kill_process_tree(process.pid)
+        if process:
+            kill_process_tree(process.pid)
 
 
 def run_metrics(
@@ -380,6 +382,34 @@ def run_metrics(
     # Write performance report if we ran perf tests
     if run_perf and perf_runner:
         perf_runner.write_final_report()
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print(f"{test_name} Results Summary")
+    print("=" * 60)
+    for i, model_result in enumerate(all_results):
+        print(f"\nModel {i + 1}: {model_result['model']}")
+        if run_perf:
+            print(f"  Performance: {'PASS' if model_result['perf_passed'] else 'FAIL'}")
+        if run_accuracy:
+            print(
+                f"  Accuracy: {'PASS' if model_result['accuracy_passed'] else 'FAIL'}"
+            )
+            if model_result["accuracy_metrics"]:
+                print(f"  Metrics: {model_result['accuracy_metrics']}")
+        if model_result["errors"]:
+            print(f"  Errors: {model_result['errors']}")
+
+    print("\n" + "=" * 60)
+    print(f"OVERALL: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+    print("=" * 60 + "\n")
+
+    # Raise assertion error if any test failed (so unittest marks it as failure)
+    if not all_passed:
+        failed_models = [r["model"] for r in all_results if r["errors"]]
+        raise AssertionError(
+            f"Tests failed for models: {failed_models}. See results above for details."
+        )
 
     return {
         "all_passed": all_passed,

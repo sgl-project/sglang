@@ -71,38 +71,18 @@ class TestDeepseekV31Unified(unittest.TestCase):
         ]
 
         # Run both performance and accuracy for all variants
-        result = run_metrics(
+        # run_metrics() handles summary printing and raises AssertionError on failure
+        run_metrics(
             models=variants,
             run_perf=True,
             run_accuracy=True,
             is_vlm=False,
             base_url=DEFAULT_URL_FOR_TEST,
             profile_dir="performance_profiles_deepseek_v31",
-            test_name="TestDeepseekV31Unified",
+            test_name="DeepSeek-V3.1 Unified",
             batch_sizes=[1, 1, 8, 16, 64],
             eval_name="mgsm_en",
         )
-
-        # Check results
-        self.assertTrue(
-            result["all_passed"], f"Some variants failed. Results: {result['results']}"
-        )
-
-        # Print summary
-        print("\n" + "=" * 60)
-        print("DeepSeek-V3.1 Unified Test Results")
-        print("=" * 60)
-        for i, model_result in enumerate(result["results"]):
-            variant_name = ["basic", "mtp"][i]
-            print(f"\nVariant: {variant_name}")
-            print(f"  Performance: {'✓' if model_result['perf_passed'] else '✗'}")
-            print(f"  Accuracy: {'✓' if model_result['accuracy_passed'] else '✗'}")
-            if model_result["accuracy_metrics"]:
-                print(
-                    f"  Score: {model_result['accuracy_metrics'].get('score', 'N/A')}"
-                )
-            if model_result["errors"]:
-                print(f"  Errors: {model_result['errors']}")
 
 
 if __name__ == "__main__":

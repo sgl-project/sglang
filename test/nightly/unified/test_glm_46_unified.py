@@ -13,9 +13,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightly_metrics import run_metrics
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-temp", nightly=True)
 
 GLM_4_6_MODEL_PATH = "zai-org/GLM-4.6"
 
@@ -48,34 +49,18 @@ class TestGLM46Unified(unittest.TestCase):
         ]
 
         # Run both performance and accuracy
-        result = run_metrics(
+        # run_metrics() handles summary printing and raises AssertionError on failure
+        run_metrics(
             models=variants,
             run_perf=True,
             run_accuracy=True,
             is_vlm=False,
             base_url=DEFAULT_URL_FOR_TEST,
             profile_dir="performance_profiles_glm_4_6",
-            test_name="TestGLM46Unified",
+            test_name="GLM-4.6 Unified",
             batch_sizes=[1, 1, 8, 16, 64],
             eval_name="mgsm_en",
         )
-
-        # Check results
-        self.assertTrue(
-            result["all_passed"], f"Test failed. Results: {result['results']}"
-        )
-
-        # Print summary
-        print("\n" + "=" * 60)
-        print("GLM-4.6 Unified Test Results")
-        print("=" * 60)
-        model_result = result["results"][0]
-        print(f"Performance: {'✓' if model_result['perf_passed'] else '✗'}")
-        print(f"Accuracy: {'✓' if model_result['accuracy_passed'] else '✗'}")
-        if model_result["accuracy_metrics"]:
-            print(f"Score: {model_result['accuracy_metrics'].get('score', 'N/A')}")
-        if model_result["errors"]:
-            print(f"Errors: {model_result['errors']}")
 
 
 if __name__ == "__main__":
