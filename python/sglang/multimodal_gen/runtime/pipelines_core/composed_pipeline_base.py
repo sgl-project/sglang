@@ -411,25 +411,11 @@ class ComposedPipelineBase(ABC):
             # Determine process group for loading
             loading_group = get_loading_process_group()
 
-            # Disable runai streamer if in disagg mode and we don't have a specific patch for it yet
-            # Or if loading_group is set, we pass it down (requires ComponentLoader update)
-            # Based on previous logic: use_runai_model_streamer = False if disagg
-
-            # use_streamer = None
-            # if server_args.enable_disagg:
-            #     use_streamer = False
-            #
-
-            use_streamer = True
-
-
-
             module = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
-                use_runai_model_streamer=use_streamer,
                 process_group=loading_group,
             )
 
