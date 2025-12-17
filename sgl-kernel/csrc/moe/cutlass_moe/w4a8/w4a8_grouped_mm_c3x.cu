@@ -81,8 +81,8 @@ void dispatch_w4a8_moe_mm_sm90(
     int64_t chunk_size,
     int64_t topk) {
   uint32_t const m = a_tensors.size(0) / topk;
-  uint32_t const n = d_tensors.size(1);
-  uint32_t const k = a_tensors.size(1);
+  uint32_t const n = d_tensors.size(-1);
+  uint32_t const k = a_tensors.size(-1);
 
   if (n == 4096 && k == 7168) {
     // group gemm 1
