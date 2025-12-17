@@ -2305,6 +2305,7 @@ class ModelRunner:
             encoder_len_fill_value=0,
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
         )
         buffers.num_token_non_padded[...] = num_tokens
 
