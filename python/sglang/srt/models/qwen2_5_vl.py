@@ -612,6 +612,25 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+
+        expected_dim = getattr(self.visual, "embed_dim", -1)
+
+        if expected_dim == -1:
+            vision_conf = self.config.vision_config
+            expected_dim = getattr(
+                vision_conf, "embed_dim", getattr(vision_conf, "hidden_size", -1)
+            )
+
+        raw_patch_dim = 1176
+
+        if pixel_values.dim() == 2:
+            current_dim = pixel_values.shape[-1]
+            if current_dim == expected_dim:
+                return pixel_values
+            if current_dim != raw_patch_dim:
+
+                return pixel_values
+
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         if self.use_data_parallel:
