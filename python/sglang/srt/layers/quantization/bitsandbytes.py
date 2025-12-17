@@ -505,7 +505,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         if self.quant_config.load_in_8bit:
             w13, w2 = self._apply_8bit_dequant(layer)
         else:
-            w13, w2 = self._apply_4bit_dequnt(layer)
+            w13, w2 = self._apply_4bit_dequant(layer)
 
         moe_runner_config = self.moe_runner_config
         output = fused_moe(
@@ -597,7 +597,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
     ):
         raise NotImplementedError
 
-    def _apply_4bit_dequnt(
+    def _apply_4bit_dequant(
         self, layer: torch.nn.Module
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from bitsandbytes.functional import dequantize_4bit
