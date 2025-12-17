@@ -51,7 +51,8 @@ def benchmark_mm_rotary_embedding() -> None:
     dtype = torch.bfloat16
     max_seq_len = 65536
 
-    seq_lens = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    # Include Qwen-image observed shapes (e.g., 3015 image tokens, small text token counts)
+    seq_lens = [1, 2, 4, 6, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 3015, 4096, 8192]
 
     # Test configurations: (batch_size, num_heads, num_kv_heads, head_size)
     configs = [
@@ -64,6 +65,8 @@ def benchmark_mm_rotary_embedding() -> None:
         (32, 8, 8, 128),
         (1, 32, 8, 80),
         (1, 64, 8, 256),
+        # Qwen-image observed: q/k view is [num_tokens, 24, 128] and cos/sin is [num_tokens, 64], interleaved=True
+        (1, 24, 24, 128),
     ]
 
     for batch_size, num_heads, num_kv_heads, head_size in configs:
