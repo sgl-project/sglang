@@ -18,6 +18,7 @@ import os
 import random
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -27,6 +28,7 @@ from transformers import AutoModelForCausalLM
 
 import sglang as sgl
 from sglang.srt.utils import init_custom_process_group
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -68,6 +70,9 @@ def init_process(
     backend,
     checking_parameters,
     tie_word_embeddings,
+    load_format,
+    barrier,
+    pause_generation_mode,
 ):
     torch.cuda.set_device(rank)
 
@@ -81,6 +86,8 @@ def init_process(
             checking_parameters,
             tie_word_embeddings,
             state_dict_key_to_shape,
+            load_format,
+            barrier,
         )
     elif rank in [1, 2]:
         init_process_sgl(
@@ -94,6 +101,9 @@ def init_process(
             state_dict_key_to_shape,
             backend,
             tp_size,
+            load_format,
+            barrier,
+            pause_generation_mode,
         )
 
 
@@ -106,6 +116,8 @@ def init_process_hf(
     checking_parameters,
     tie_word_embeddings,
     state_dict_key_to_shape,
+    load_format,
+    barrier,
 ):
     # These two environment variables are very important
     # to avoid unexpected behaviors of CUDA and NCCL.
@@ -162,6 +174,7 @@ def init_process_hf(
         group_name="test_parameter_update_group",
     )
     torch.cuda.synchronize()
+    barrier.wait()
     time_begin_broadcast = time.perf_counter()
 
     # The last parameter is lm_head.weight, which is tied
@@ -171,14 +184,23 @@ def init_process_hf(
     if tie_word_embeddings:
         broadcast_parameters.remove("lm_head.weight")
 
-    # Broadcast all the weights from the training
-    # engine to other ranks (inference engine).
-    for parameter_name in broadcast_parameters:
-        torch.distributed.broadcast(
-            hf_base_model.get_parameter(parameter_name),
-            src=0,
-            group=group,
-        )
+    if load_format == "flattened_bucket":
+        named_tensors = [
+            (parameter_name, hf_base_model.get_parameter(parameter_name))
+            for parameter_name in broadcast_parameters
+        ]
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = bucket.get_flattened_tensor()
+        torch.distributed.broadcast(flattened_tensor, src=0, group=group)
+    else:
+        # Broadcast all the weights from the training
+        # engine to other ranks (inference engine).
+        for parameter_name in broadcast_parameters:
+            torch.distributed.broadcast(
+                hf_base_model.get_parameter(parameter_name),
+                src=0,
+                group=group,
+            )
     torch.cuda.synchronize()
     time_end_broadcast = time.perf_counter()
 
@@ -186,6 +208,9 @@ def init_process_hf(
     broadcast_time = time_end_broadcast - time_begin_broadcast
     print(f"[hf] {rank=} {broadcast_time=:.3f}s")
     param_queue.put(("broadcast_time", broadcast_time))
+
+    # Destroy process group and release related resource
+    torch.distributed.destroy_process_group(group)
 
     # Delete the huggingface models to free up memory.
     del hf_instruct_model
@@ -205,6 +230,9 @@ def init_process_sgl(
     state_dict_key_to_shape,
     backend,
     tp_size,
+    load_format,
+    barrier,
+    pause_generation_mode,
 ):
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
@@ -279,8 +307,25 @@ def init_process_sgl(
             },
         )
 
-    torch.cuda.synchronize()
-    time_begin_update = time.perf_counter()
+    if pause_generation_mode in ["in_place", "retract"]:
+
+        def run_decode(max_new_tokens=32):
+            response = requests.post(
+                url + "/generate",
+                json={
+                    "text": f"Question: {random.randint(0, 100)},The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": max_new_tokens,
+                        "ignore_eos": True,
+                    },
+                },
+            )
+            return response.json()
+
+        with ThreadPoolExecutor(32) as executor:
+            futures = [executor.submit(run_decode, 1000) for _ in range(32)]
+            time.sleep(2)
 
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
@@ -297,12 +342,21 @@ def init_process_sgl(
     dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
+    if pause_generation_mode in ["in_place", "retract"]:
+        requests.post(
+            url + "/pause_generation",
+            json={"mode": pause_generation_mode},
+        )
+    torch.cuda.synchronize()
+    barrier.wait()
+    time_begin_update = time.perf_counter()
     if backend == "Engine":
         engine.update_weights_from_distributed(
             names,
             dtypes=dtypes,
             shapes=shapes,
             group_name="test_parameter_update_group",
+            load_format=load_format,
         )
     else:
         requests.post(
@@ -312,10 +366,24 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
+                "load_format": load_format,
+                "flush_cache": not (pause_generation_mode == "in_place"),
             },
         )
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
+    if pause_generation_mode in ["in_place", "retract"]:
+        requests.post(
+            url + "/continue_generation",
+            json={},
+        )
+
+        # discard unfinished requests to save test overhead
+        time.sleep(2)
+        requests.post(
+            url + "/pause_generation",
+            json={"mode": "abort"},
+        )
 
     # Measure the latency of broadcast/weights update.
     update_time = time_end_update - time_begin_update
@@ -380,6 +448,8 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
+    load_format=None,
+    pause_generation_mode=None,
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -390,6 +460,7 @@ def test_update_weights_from_distributed(
     )
     param_queue = mp.Queue()
     results = {}
+    barrier = mp.Barrier(1 + dp_size)
 
     context = mp.spawn(
         init_process,
@@ -403,6 +474,9 @@ def test_update_weights_from_distributed(
             backend,
             checking_parameters,
             tie_word_embeddings,
+            load_format,
+            barrier,
+            pause_generation_mode,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -555,28 +629,82 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():
             mode = random.choice(["Engine", "Server"])
+            if mode == "Server":
+                pause_generation_mode = random.choice(["in_place", "retract"])
+            else:
+                pause_generation_mode = None
+            load_format = random.choice(["flattened_bucket", None])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode),
+                (
+                    1,
+                    1,
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    mode,
+                    pause_generation_mode,
+                    load_format,
+                ),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                (1, 1, DEFAULT_MODEL_NAME_FOR_TEST, "Sever"),
+                (
+                    1,
+                    1,
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "Engine",
+                    None,
+                    random.choice(["flattened_bucket", None]),
+                ),
+                (
+                    1,
+                    1,
+                    DEFAULT_MODEL_NAME_FOR_TEST,
+                    "Sever",
+                    random.choice(["in_place", "retract"]),
+                    random.choice(["flattened_bucket", None]),
+                ),
             ]
 
             if torch.cuda.device_count() >= 4:
                 test_suits.extend(
                     [
-                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                        (1, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                        (
+                            2,
+                            1,
+                            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                            "Engine",
+                            None,
+                            random.choice(["flattened_bucket", None]),
+                        ),
+                        (
+                            1,
+                            2,
+                            DEFAULT_MODEL_NAME_FOR_TEST,
+                            "Server",
+                            random.choice(["in_place", "retract"]),
+                            random.choice(["flattened_bucket", None]),
+                        ),
                     ]
                 )
 
             if torch.cuda.device_count() >= 5:
                 test_suits.extend(
                     [
-                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
-                        (2, 2, DEFAULT_MODEL_NAME_FOR_TEST, "Server"),
+                        (
+                            2,
+                            2,
+                            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                            "Engine",
+                            None,
+                            random.choice(["flattened_bucket", None]),
+                        ),
+                        (
+                            2,
+                            2,
+                            DEFAULT_MODEL_NAME_FOR_TEST,
+                            "Server",
+                            random.choice(["in_place", "retract"]),
+                            random.choice(["flattened_bucket", None]),
+                        ),
                     ]
                 )
 
@@ -612,7 +740,14 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             "lm_head.weight",
         ]
 
-        for tp_size, dp_size, model_name, backend in test_suits:
+        for (
+            tp_size,
+            dp_size,
+            model_name,
+            backend,
+            pause_generation_mode,
+            load_format,
+        ) in test_suits:
             test_update_weights_from_distributed(
                 tp_size,
                 dp_size,
@@ -621,6 +756,8 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,
+                load_format,
+                pause_generation_mode,
             )
 
 

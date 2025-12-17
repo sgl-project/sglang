@@ -1,11 +1,11 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
+from typing import Any
 
 import zmq
 import zmq.asyncio
 
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -47,7 +47,7 @@ class SchedulerClient:
         )
         # Worker will be lazily started on the first forward call to ensure a running loop exists
 
-    async def forward(self, batch: Req) -> Req:
+    async def forward(self, batch: Any) -> Any:
         """Enqueue a request to the backend Scheduler and await the reply."""
         if self._closing:
             raise RuntimeError(

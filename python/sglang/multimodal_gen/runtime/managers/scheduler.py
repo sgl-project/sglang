@@ -1,12 +1,18 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any
+from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -62,6 +68,32 @@ class Scheduler:
         self.gpu_id = gpu_id
         self._running = True
 
+        self.request_handlers = {
+            SetLoraReq: self._handle_set_lora,
+            MergeLoraWeightsReq: self._handle_merge_lora,
+            UnmergeLoraWeightsReq: self._handle_unmerge_lora,
+            Req: self._handle_generation,
+        }
+
+    def _handle_set_lora(self, reqs: List[Any]):
+        # TODO: return set status
+        req = reqs[0]
+        self.worker.set_lora(req.lora_nickname, req.lora_path, req.target)
+        return {"status": "ok"}
+
+    def _handle_merge_lora(self, reqs: List[Any]):
+        req = reqs[0]
+        self.worker.merge_lora_weights(req.target)
+        return {"status": "ok"}
+
+    def _handle_unmerge_lora(self, reqs: List[Any]):
+        req = reqs[0]
+        self.worker.unmerge_lora_weights(req.target)
+        return {"status": "ok"}
+
+    def _handle_generation(self, reqs: List[Req]):
+        return self.worker.execute_forward(reqs)
+
     def return_result(self, output_batch: OutputBatch):
         """
         replies to client, only on rank 0
@@ -69,13 +101,20 @@ class Scheduler:
         if self.receiver is not None:
             self.receiver.send_pyobj(output_batch)
 
-    def recv_reqs(self):
+    def recv_reqs(self) -> List[Any]:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
         """
         if self.receiver is not None:
-            recv_reqs = self.receiver.recv_pyobj()
-            assert isinstance(recv_reqs, list)
+            try:
+                recv_reqs = self.receiver.recv_pyobj()
+            except zmq.ZMQError:
+                # re-raise or handle appropriately to let the outer loop continue
+                raise
+
+            # Ensure recv_reqs is a list
+            if not isinstance(recv_reqs, list):
+                recv_reqs = [recv_reqs]
         else:
             recv_reqs = None
 
@@ -133,13 +172,27 @@ class Scheduler:
 
             # 2: execute, make sure a reply is always sent
             try:
-                output_batch = self.worker.execute_forward(reqs, self.server_args)
+                first_req = reqs[0] if reqs else None
+
+                handler = self.request_handlers.get(type(first_req))
+                if handler:
+                    output_batch = handler(reqs)
+                else:
+                    output_batch = {
+                        "status": "error",
+                        "message": f"Unknown request type: {type(first_req)}",
+                    }
             except Exception as e:
                 logger.error(
-                    f"Error executing forward in scheduler event loop: {e}",
+                    f"Error executing request in scheduler event loop: {e}",
                     exc_info=True,
                 )
-                output_batch = OutputBatch(error=str(e))
+                # Determine appropriate error response format
+                output_batch = (
+                    OutputBatch(error=str(e))
+                    if reqs and isinstance(reqs[0], Req)
+                    else {"status": "error", "message": str(e)}
+                )
 
             try:
                 self.return_result(output_batch)
@@ -171,7 +224,7 @@ class Scheduler:
             return {"status": "ok", "result": result}
         return {"status": "error", "error": f"Unknown method: {method}"}
 
-    def _collect_slave_results(self) -> list[dict[str, Any]]:
+    def _collect_slave_results(self) -> List[dict[str, Any]]:
         """Collect results from all slave worker processes."""
         results = []
         for pipe in self.result_pipes_from_slaves:

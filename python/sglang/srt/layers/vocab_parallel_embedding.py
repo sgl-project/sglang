@@ -473,11 +473,13 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         else:
             masked_input = input_
+
         # Get the embeddings.
         with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
-        # Mask the output embedding.
+
         if self.tp_size > 1:
+            # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             if not get_attn_tp_context().input_scattered:
                 # Reduce across all the model parallel GPUs.

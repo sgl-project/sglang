@@ -7,11 +7,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
-from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -31,6 +36,8 @@ from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
+from sglang.srt.server_args import get_global_server_args
 from sglang.utils import logger
 
 
@@ -39,6 +46,7 @@ class InternAttention(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -60,6 +68,7 @@ class InternAttention(nn.Module):
             qk_normalization=getattr(config, "qk_normalization", False)
             or getattr(config, "use_qk_norm", False),
             flatten_batch=False,
+            use_data_parallel=use_data_parallel,
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
@@ -163,17 +172,39 @@ class InternRMSNorm(nn.Module):
 
 
 class InternMLP(nn.Module):
-    def __init__(self, config: PretrainedConfig):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        use_data_parallel: bool = False,
+    ):
         super().__init__()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.config = config
-        self.act = ACT2FN[config.hidden_act]
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.act = get_act_fn(config.hidden_act)
+        self.fc1 = ColumnParallelLinear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=True,
+            quant_config=None,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        )
+        self.fc2 = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=True,
+            quant_config=None,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.fc1(hidden_states)
+        hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.act(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
         return hidden_states
 
 
@@ -190,13 +221,18 @@ class InternVisionEncoderLayer(nn.Module):
         config: PretrainedConfig,
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
-        self.attn = InternAttention(config=config, quant_config=quant_config)
-        self.mlp = InternMLP(config)
+        self.attn = InternAttention(
+            config=config,
+            quant_config=quant_config,
+            use_data_parallel=use_data_parallel,
+        )
+        self.mlp = InternMLP(config, use_data_parallel)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
 
@@ -251,6 +287,7 @@ class InternVisionEncoder(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -261,7 +298,9 @@ class InternVisionEncoder(nn.Module):
         ]
         self.layers = nn.ModuleList(
             [
-                InternVisionEncoderLayer(config, dpr[idx], quant_config)
+                InternVisionEncoderLayer(
+                    config, dpr[idx], quant_config, use_data_parallel
+                )
                 for idx in range(config.num_hidden_layers)
             ]
         )
@@ -322,14 +361,16 @@ class InternVisionModel(PreTrainedModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        use_data_parallel: bool = False,
     ):
         super().__init__(config)
-        self.config = config
 
+        self.config = config
+        self.use_data_parallel = use_data_parallel
         self.embeddings = InternVisionEmbeddings(
             config,
         )
-        self.encoder = InternVisionEncoder(config, quant_config)
+        self.encoder = InternVisionEncoder(config, quant_config, use_data_parallel)
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
         pos_emb = self.embeddings.position_embedding
@@ -384,23 +425,36 @@ class InternVisionModel(PreTrainedModel):
                 hidden_states = self.embeddings(pixel_values)
             else:
                 raise ValueError(f"wrong pixel_values size: {pixel_values.shape}")
-        encoder_outputs = self.encoder(
-            inputs_embeds=hidden_states,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        last_hidden_state = encoder_outputs.last_hidden_state
+
+        if self.use_data_parallel:
+            encoder_outputs = run_dp_sharded_vision_model(hidden_states, self.encoder)
+            last_hidden_state = encoder_outputs
+        else:
+            encoder_outputs = self.encoder(
+                inputs_embeds=hidden_states,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            last_hidden_state = encoder_outputs.last_hidden_state
         pooled_output = last_hidden_state[:, 0, :]
 
         if not return_dict:
             return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-        )
+        if self.use_data_parallel:
+            return BaseModelOutputWithPooling(
+                last_hidden_state=last_hidden_state,
+                pooler_output=pooled_output,
+                hidden_states=None,
+                attentions=None,
+            )
+        else:
+            return BaseModelOutputWithPooling(
+                last_hidden_state=last_hidden_state,
+                pooler_output=pooled_output,
+                hidden_states=encoder_outputs.hidden_states,
+                attentions=encoder_outputs.attentions,
+            )
 
 
 class InternVLChatModel(nn.Module):
@@ -412,6 +466,7 @@ class InternVLChatModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.quant_config = quant_config
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         image_size = config.force_image_size or config.vision_config.image_size
@@ -433,7 +488,10 @@ class InternVLChatModel(nn.Module):
         logger.info(f"num_image_token: {self.num_image_token}")
         logger.info(f"ps_version: {self.ps_version}")
 
-        self.vision_model = InternVisionModel(config.vision_config)
+        self.vision_model = InternVisionModel(
+            config.vision_config,
+            use_data_parallel=self.use_data_parallel,
+        )
         if config.llm_config.architectures[0] == "Qwen2ForCausalLM":
             self.language_model = Qwen2ForCausalLM(
                 config=config.llm_config, quant_config=quant_config
@@ -470,6 +528,12 @@ class InternVLChatModel(nn.Module):
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size),
         )
+
+        self.external_mm_data_embedding_funcs = {
+            Modality.IMAGE: self.get_image_feature,
+        }
+
+        self.model = self.language_model.model
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -531,17 +595,16 @@ class InternVLChatModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        hs = general_mm_embed_routine(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
-            },
+            multimodal_model=self,
+            data_embedding_funcs=self.external_mm_data_embedding_funcs,
             positions=positions,
         )
 
-        return hs
+        return hidden_states
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs

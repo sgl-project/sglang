@@ -2,9 +2,9 @@
 <img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
 </div>
 
-**sgl-diffusion is an inference framework for accelerated image/video generation.**
+**SGLang diffusion is an inference framework for accelerated image/video generation.**
 
-SGLang-Diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
+SGLang diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
 
 ## Key Features
 
@@ -37,15 +37,14 @@ def main():
         num_gpus=1,  # Adjust based on your hardware
     )
 
-    # Provide a prompt for your video
-    prompt = "A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest."
-
     # Generate the video
     video = generator.generate(
-        prompt,
-        return_frames=True,  # Also return frames from this call (defaults to False)
-        output_path="my_videos/",  # Controls where videos are saved
-        save_output=True
+        sampling_params_kwargs=dict(
+            prompt="A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest.",
+            return_frames=True,  # Also return frames from this call (defaults to False)
+            output_path="my_videos/",  # Controls where videos are saved
+            save_output=True
+        )
     )
 
 if __name__ == '__main__':
@@ -65,12 +64,12 @@ For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md
 
 ## Contributing
 
-All contributions are welcome.
+All contributions are welcome. The contribution guide is available [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/contributing.md).
 
 ## Acknowledgement
 
 We learnt and reused code from the following projects:
 
-- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVide on Sept. 24, 2025.
+- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVideo on Sept. 24, 2025.
 - [xDiT](https://github.com/xdit-project/xDiT). We used the parallelism library from it.
 - [diffusers](https://github.com/huggingface/diffusers) We used the pipeline design from it.

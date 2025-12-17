@@ -103,14 +103,6 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, 
 /*
  * From csrc/attention
  */
-void lightning_attention_decode(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& past_kv,
-    const torch::Tensor& slope,
-    torch::Tensor output,
-    torch::Tensor new_kv);
 void merge_state(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
@@ -156,6 +148,14 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& k_buffer,
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc);
+
+void rotary_embedding(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    std::optional<torch::Tensor> key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
 
 void downcast_fp8(
     at::Tensor& k,
@@ -317,6 +317,13 @@ void topk_softmax(
     double moe_softcapping,
     const c10::optional<torch::Tensor>& correction_bias);
 
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    const c10::optional<torch::Tensor>& correction_bias);
+
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
@@ -378,6 +385,23 @@ void apply_shuffle_mul_sum(
     torch::Tensor& output,
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors);
+
+void fused_qk_norm_rope(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    bool is_neox,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
@@ -443,7 +467,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     torch::Tensor& a,
     std::optional<torch::Tensor> const& c_or_none,
     torch::Tensor& b_q_weight,
+    std::optional<torch::Tensor> const& b_bias_or_none,
     torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& global_scale_or_none,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
     std::optional<torch::Tensor> const& perm_or_none,
@@ -890,6 +916,24 @@ void es_fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
+
+void es_sm100_mxfp8_blockscaled_grouped_mm(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& sfa,
+    const torch::Tensor& sfb,
+    torch::Tensor& d,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& blockscale_offsets);
+
+void es_sm100_mxfp8_blockscaled_grouped_quant(
+    const torch::Tensor& input,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& blockscale_offsets,
+    torch::Tensor& quant_output,
+    torch::Tensor& scale_factor);
 
 /*
  * From fast-hadamard-transform

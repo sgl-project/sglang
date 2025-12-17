@@ -119,9 +119,9 @@ class SlidingTileAttentionImpl(AttentionImpl):
             raise ValueError("st attn not supported")
         # TODO(will-refactor): for now this is the mask strategy, but maybe we should
         # have a more general config for STA?
-        config_file = envs.SGL_DIFFUSION_ATTENTION_CONFIG
+        config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
         if config_file is None:
-            raise ValueError("SGL_DIFFUSION_ATTENTION_CONFIG is not set")
+            raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")
 
         # TODO(kevin): get mask strategy for different STA modes
         with open(config_file) as f:
