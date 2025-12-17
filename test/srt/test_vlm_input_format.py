@@ -219,8 +219,15 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
         model = Gemma3ForConditionalGeneration.from_pretrained(
             cls.model_path, torch_dtype=torch.bfloat16
         )
-        cls.vision_tower = model.vision_tower.eval().to(cls.device)
-        cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+        base_model = model.model
+
+        cls.vision_tower = base_model.vision_tower.eval().to(cls.device)
+
+        if hasattr(base_model, "multi_modal_projector"):
+            cls.mm_projector = base_model.multi_modal_projector.eval().to(cls.device)
+        else:
+            cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+
         cls.visual = lambda processor_output: cls.mm_projector(
             cls.vision_tower(
                 pixel_values=processor_output["pixel_values"]
