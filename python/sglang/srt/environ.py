@@ -70,10 +70,6 @@ class EnvField:
         os.environ.pop(self.name, None)
         self._set_to_none = False
 
-    @property
-    def value(self):
-        return self.get()
-
     def __bool__(self):
         raise RuntimeError(
             "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
@@ -425,9 +421,9 @@ def example_with_exit_stack():
     # Use this style of context manager in unit test
     exit_stack = ExitStack()
     exit_stack.enter_context(envs.SGLANG_TEST_RETRACT.override(False))
-    assert envs.SGLANG_TEST_RETRACT.value is False
+    assert envs.SGLANG_TEST_RETRACT.get() is False
     exit_stack.close()
-    assert envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.get() is None
 
 
 def example_with_subprocess():
@@ -472,29 +468,29 @@ def example_with_implicit_bool_avoidance():
 def examples():
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
-    assert envs.SGLANG_TEST_RETRACT.value is False
+    assert envs.SGLANG_TEST_RETRACT.get() is False
 
     envs.SGLANG_TEST_RETRACT.set(None)
-    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
 
     envs.SGLANG_TEST_RETRACT.clear()
     assert not envs.SGLANG_TEST_RETRACT.is_set()
 
     envs.SGLANG_TEST_RETRACT.set(True)
-    assert envs.SGLANG_TEST_RETRACT.value is True
+    assert envs.SGLANG_TEST_RETRACT.get() is True
 
     with envs.SGLANG_TEST_RETRACT.override(None):
         assert (
-            envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+            envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
         )
 
-    assert envs.SGLANG_TEST_RETRACT.value is True
+    assert envs.SGLANG_TEST_RETRACT.get() is True
 
     envs.SGLANG_TEST_RETRACT.set(None)
     with envs.SGLANG_TEST_RETRACT.override(True):
-        assert envs.SGLANG_TEST_RETRACT.value is True
+        assert envs.SGLANG_TEST_RETRACT.get() is True
 
-    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
+    assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.get() is None
 
     example_with_exit_stack()
     example_with_subprocess()

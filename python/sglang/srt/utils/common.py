@@ -2290,7 +2290,7 @@ def pyspy_dump_schedulers():
     try:
         pid = psutil.Process().pid
         # Command to run py-spy with the PID
-        cmd = f"py-spy dump --pid {pid}"
+        cmd = f"py-spy dump --native --pid {pid}"
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
@@ -3718,9 +3718,9 @@ def reserve_rope_cache_for_long_sequences(
     """Pre-expand RoPE cache for long sequences and speculative decoding."""
     from sglang.srt.environ import envs
 
-    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
-    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
-    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.get()
 
     # 1) Estimate base context upper bound
     base_ctx = (

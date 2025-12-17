@@ -215,10 +215,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
-            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
-                import_processors(
-                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
-                )
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
             _processor = _get_processor_wrapper(server_args)
             transport_mode = _determine_tensor_transport_mode(self.server_args)
 

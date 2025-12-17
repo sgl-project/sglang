@@ -325,9 +325,16 @@ class SchedulerMetricsCollector:
         )
 
         # Retract
+        # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
             name="sglang:num_retracted_reqs",
             documentation="The number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_reqs_total = Counter(
+            # The name is `requests` instead of `reqs` to avoid dup name error
+            name="sglang:num_retracted_requests_total",
+            documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -605,11 +612,17 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        # TODO maybe remove this old gauge in favor of the new counter
         self.is_cuda_graph = Gauge(
             name="sglang:is_cuda_graph",
             documentation="Whether the batch is using CUDA graph.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.cuda_graph_passes_total = Counter(
+            name="sglang:cuda_graph_passes_total",
+            documentation="Total number of forward passes categorized by CUDA graph.",
+            labelnames=list(labels.keys()) + ["mode"],
         )
 
         self.new_token_ratio = Gauge(
@@ -617,6 +630,22 @@ class SchedulerMetricsCollector:
             documentation="The new token ratio.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+
+        self.realtime_prefill_compute_tokens_total = Counter(
+            name="sglang:realtime_prefill_compute_tokens_total",
+            documentation="Total number of prefill compute tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_prefill_cache_tokens_total = Counter(
+            name="sglang:realtime_prefill_cache_tokens_total",
+            documentation="Total number of prefill cache tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_decode_tokens_total = Counter(
+            name="sglang:realtime_decode_tokens_total",
+            documentation="Total number of decode tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -638,6 +667,25 @@ class SchedulerMetricsCollector:
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def increment_num_retracted_reqs(self, num: int) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+
+    def increment_cuda_graph_pass(self, value: bool) -> None:
+        # leave room for piecewise cuda graph, etc
+        mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_realtime_tokens(
+        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+    ):
+        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(
+            prefill_compute_tokens
+        )
+        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(
+            prefill_cache_tokens
+        )
+        self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)

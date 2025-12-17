@@ -239,12 +239,12 @@ impl CircuitBreaker {
     }
 
     /// Get the number of consecutive failures
-    pub fn failure_count(&self) -> u32 {
+    pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Acquire)
     }
 
     /// Get the number of consecutive successes
-    pub fn success_count(&self) -> u32 {
+    pub fn consecutive_successes(&self) -> u32 {
         self.consecutive_successes.load(Ordering::Acquire)
     }
 
@@ -304,8 +304,8 @@ impl CircuitBreaker {
     pub fn stats(&self) -> CircuitBreakerStats {
         CircuitBreakerStats {
             state: self.state(),
-            consecutive_failures: self.failure_count(),
-            consecutive_successes: self.success_count(),
+            consecutive_failures: self.consecutive_failures(),
+            consecutive_successes: self.consecutive_successes(),
             total_failures: self.total_failures(),
             total_successes: self.total_successes(),
             time_since_last_failure: self.time_since_last_failure(),
@@ -364,8 +364,8 @@ mod tests {
         let cb = CircuitBreaker::new();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert!(cb.can_execute());
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 0);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
     }
 
     #[test]
@@ -385,7 +385,7 @@ mod tests {
 
         assert_eq!(cb.state(), CircuitState::Open);
         assert!(!cb.can_execute());
-        assert_eq!(cb.failure_count(), 3);
+        assert_eq!(cb.consecutive_failures(), 3);
     }
 
     #[test]
@@ -461,11 +461,11 @@ mod tests {
 
         cb.record_failure();
         cb.record_failure();
-        assert_eq!(cb.failure_count(), 2);
+        assert_eq!(cb.consecutive_failures(), 2);
 
         cb.record_success();
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 1);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 1);
 
         cb.record_failure();
         cb.record_failure();
@@ -485,8 +485,8 @@ mod tests {
 
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed);
-        assert_eq!(cb.failure_count(), 0);
-        assert_eq!(cb.success_count(), 0);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
     }
 
     #[test]
@@ -525,10 +525,10 @@ mod tests {
         cb1.record_failure();
 
         let cb2 = cb1.clone();
-        assert_eq!(cb2.failure_count(), 1);
+        assert_eq!(cb2.consecutive_failures(), 1);
 
         cb1.record_failure();
-        assert_eq!(cb2.failure_count(), 2);
+        assert_eq!(cb2.consecutive_failures(), 2);
     }
 
     #[test]
