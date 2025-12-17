@@ -4,14 +4,16 @@ import pickle
 import random
 import threading
 import uuid
-from typing import List
+from typing import List, Optional
 
 import aiohttp
 import torch
 import zmq
 import zmq.asyncio
+from transformers import PretrainedConfig
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.server_args import ServerArgs
@@ -208,11 +210,11 @@ class MMReceiver:
     def __init__(
         self,
         server_args: ServerArgs,
-        dtype=None,
-        hf_config=None,
-        pp_rank=None,
-        tp_rank=None,
-        tp_group=None,
+        dtype: Optional[torch.dtype] = None,
+        hf_config: Optional[PretrainedConfig] = None,
+        pp_rank: Optional[int] = None,
+        tp_rank: Optional[int] = None,
+        tp_group: Optional[GroupCoordinator] = None,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
