@@ -714,66 +714,6 @@ class TransformerLoader(ComponentLoader):
         )
         return create_nunchaku_config_from_server_args(server_args)
 
-    def _load_nunchaku_transformer(
-        self,
-        server_args: ServerArgs,
-        quant_config,
-        model_type: str,
-        default_dtype: torch.dtype,
-    ):
-        """
-        Load a Nunchaku quantized transformer using full model replacement.
-
-        This follows the AWQ pattern but uses Nunchaku's pre-quantized models
-        for complex architectures like Qwen-Image where layer-by-layer
-        quantization is not practical.
-
-        Args:
-            server_args: Server configuration arguments.
-            quant_config: NunchakuConfig instance.
-            model_type: Type of model (e.g., "qwen_image", "flux").
-            default_dtype: Default dtype for non-quantized parameters.
-
-        Returns:
-            Loaded quantized transformer model.
-        """
-        from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
-            load_nunchaku_model,
-        )
-
-        logger.info(
-            "Loading Nunchaku quantized transformer: %s with config: %s",
-            model_type,
-            quant_config,
-        )
-
-        model = load_nunchaku_model(
-            model_type=model_type,
-            quantization_config=quant_config,
-            torch_dtype=default_dtype,
-            device=get_local_torch_device(),
-        )
-
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info(
-            "Loaded Nunchaku quantized model with %.2fB parameters",
-            total_params / 1e9,
-        )
-
-        return model.eval()
-
-    def _infer_model_type(self, cls_name: str) -> str:
-        """Infer model type from class name for Nunchaku loading."""
-        cls_name_lower = cls_name.lower()
-        if "qwen" in cls_name_lower and "image" in cls_name_lower:
-            return "qwen_image"
-        elif "flux" in cls_name_lower:
-            return "flux"
-        elif "sana" in cls_name_lower:
-            return "sana"
-        else:
-            return cls_name_lower
-
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
