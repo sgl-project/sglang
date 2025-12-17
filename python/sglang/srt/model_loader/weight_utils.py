@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import tempfile
-import time
 from collections import defaultdict
 from typing import (
     Any,
@@ -41,7 +40,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
-from sglang.srt.model_loader.weight_validation import (
+from sglang.srt.model_loader.ci_weight_validation import (
     _cleanup_corrupted_files_selective,
     _cleanup_corrupted_model_cache,
     _validate_safetensors_file,
@@ -571,39 +570,19 @@ def download_weights_from_hf(
         # But we already checked for local cache above, so if we're here we need to download
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
-            # Retry HF API calls with exponential backoff to handle transient network issues
-            max_api_retries = 5
-            file_list = None
+            # In CI, use retry logic to handle transient network issues
+            if is_in_ci():
+                from sglang.srt.model_loader.ci_weight_validation import (
+                    ci_get_hf_file_list_with_retry,
+                )
 
-            for attempt in range(max_api_retries):
-                try:
-                    fs = HfFileSystem()
-                    file_list = fs.ls(
-                        model_name_or_path, detail=False, revision=revision
-                    )
-                    break  # Success, exit retry loop
-                except Exception as e:
-                    if attempt < max_api_retries - 1:
-                        # Exponential backoff: 2, 4, 8, 16 seconds
-                        sleep_time = 2 ** (attempt + 1)
-                        log_info_on_rank0(
-                            logger,
-                            f"HuggingFace API call failed for {model_name_or_path} "
-                            f"(attempt {attempt + 1}/{max_api_retries}): {e}. "
-                            f"Retrying in {sleep_time} seconds...",
-                        )
-                        time.sleep(sleep_time)
-                    else:
-                        log_info_on_rank0(
-                            logger,
-                            f"HuggingFace API call failed for {model_name_or_path} "
-                            f"after {max_api_retries} attempts: {e}. "
-                            "Proceeding with original allow_patterns.",
-                        )
+                file_list = ci_get_hf_file_list_with_retry(model_name_or_path, revision)
+            else:
+                fs = HfFileSystem()
+                file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
 
-            # If we got a file list, filter allow_patterns based on what's available
+            # depending on what is available we download different things
             if file_list is not None:
-                # depending on what is available we download different things
                 for pattern in allow_patterns:
                     matching = fnmatch.filter(file_list, pattern)
                     if len(matching) > 0:
