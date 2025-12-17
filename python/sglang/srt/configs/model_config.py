@@ -604,7 +604,7 @@ class ModelConfig:
                 quant_cfg = json.load(f)
             # This field is required for flagless model loading but is not present in
             # modelslim model description, so we're adding it here manually.
-            quant_cfg['quant_method'] = 'modelslim'
+            quant_cfg["quant_method"] = "modelslim"
 
         return quant_cfg
 
@@ -732,8 +732,10 @@ class ModelConfig:
 
         # Filter out None values
         cfg_list = [item for item in cfg_list if item is not None]
-        assert (len(cfg_list) == 1), "Config list contains configs from 2 methods, must be only 1"
-        
+        assert (
+            len(cfg_list) == 1
+        ), "Config list contains configs from 2 methods, must be only 1"
+
         quant_cfg = cfg_list[0]
 
         if quant_cfg is not None:

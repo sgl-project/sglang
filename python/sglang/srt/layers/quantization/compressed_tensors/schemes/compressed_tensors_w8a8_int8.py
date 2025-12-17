@@ -9,7 +9,6 @@ from torch.nn import Parameter
 
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
-    NPUW8A8Int8LinearMethod,
 )
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,

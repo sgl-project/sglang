@@ -12,12 +12,12 @@ from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW8A8Int8DynamicMoEMethod,
 )
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
@@ -35,7 +35,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     swizzle_blockscale,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -71,8 +71,7 @@ __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW4A4Nvfp4MoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
-    "NPUCompressedTensorsW8A8Int8MoEMethod"
-    "CompressedTensorsWNA16MoEMethod",
+    "NPUCompressedTensorsW8A8Int8MoEMethod" "CompressedTensorsWNA16MoEMethod",
 ]
 
 
@@ -108,7 +107,9 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8MoEMethod")
                 return NPUCompressedTensorsW8A8Int8MoEMethod(quant_config)
             else:
-                raise NotImplementedError(f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now.")
+                raise NotImplementedError(
+                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
