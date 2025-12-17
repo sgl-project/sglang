@@ -543,8 +543,6 @@ class QwenImageTransformerBlock(nn.Module):
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
-        print(f"img_mod1: {img_mod1.shape}")
-        print(f"txt_mod1: {txt_mod1.shape}")
         # Process image stream - norm1 + modulation
 
         img_normed = self.img_norm1(hidden_states)
@@ -562,8 +560,6 @@ class QwenImageTransformerBlock(nn.Module):
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
-        print(f"img_modulated: {img_modulated.shape}")
-        print(f"txt_modulated: {txt_modulated.shape}")
         attn_output = self.attn(
             hidden_states=img_modulated,  # Image stream (will be processed as "sample")
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
@@ -710,9 +706,9 @@ class QwenImageTransformer2DModel(CachableDiT):
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
-
+        print(f"hidden_states0: {hidden_states.shape}")
         hidden_states = self.img_in(hidden_states)
-
+        print(f"hidden_states1: {hidden_states.shape}")
         timestep = (timestep / 1000).to(hidden_states.dtype)
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)

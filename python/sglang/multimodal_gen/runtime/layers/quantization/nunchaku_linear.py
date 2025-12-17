@@ -206,7 +206,6 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         # Expect input in (..., in_features) shape; flatten to 2D for kernels.
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
-
         # Quantize activations and compute low-rank hidden states, mirroring
         # SVDQW4A4Linear.quantize.
         quantized_x, ascales, lora_act_out = svdq_quantize_w4a4_act_fuse_lora_cuda(
@@ -214,16 +213,15 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             lora_down=layer.proj_down,
             smooth=layer.smooth_factor,
             fp4=layer.precision == "nvfp4",
+            pad_size=256,
         )
-
         # Allocate output buffer.
         out_2d = torch.empty(
-            quantized_x.shape[0],
+            orig_shape[0]*orig_shape[1],
             layer.output_size_per_partition,
             dtype=x_2d.dtype,
             device=x_2d.device,
         )
-
         # Global scale (for FP4); may be a tensor or float.
         alpha: float | None
         wtscale = getattr(layer, "wtscale", None)
@@ -251,7 +249,6 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             wcscales=wcscales,
             act_unsigned=getattr(layer, "act_unsigned", False),
         )
-
         out = out_2d.reshape(*orig_shape[:-1], layer.output_size_per_partition)
         return out
 
@@ -360,9 +357,7 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
 
         # Expect input in (..., in_features) shape; flatten to 2D for AWQ GEMV.
         orig_shape = x.shape
-        print(f"orig_shape: {orig_shape}")
         x_2d = x.reshape(-1, orig_shape[-1])
-        print(f"x_2d: {x_2d.shape}")
 
         in_features = layer.input_size_per_partition
         out_features = layer.output_size_per_partition
@@ -378,13 +373,11 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
             k=in_features,
             group_size=layer.group_size,
         )
-        print(f"out_2d: {out_2d.shape}")
         if bias is not None:
             view_shape = [1] * (out_2d.ndim - 1) + [-1]
             out_2d.add_(bias.view(view_shape))
 
         out = out_2d.reshape(*orig_shape[:-1], out_features)
-        print(f"out: {out[0].shape}")
         return out
 
 
