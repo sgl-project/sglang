@@ -376,6 +376,31 @@ class TestFixedBugs(unittest.TestCase):
         )
 
 
+class TestPPSleepOnIdle(unittest.TestCase):
+    def test_pp_sleep_on_idle_basic(self):
+        """Test that PP sleep on idle doesn't break basic functionality"""
+        model = DEFAULT_MODEL_NAME_FOR_TEST
+        server_args = ServerArgs(model_path=model)
+        bench_args = OneBatchBenchArgs(
+            batch_size=(1,),
+            input_len=(10,),
+            output_len=(10,),
+            base_url=DEFAULT_URL_FOR_TEST,
+        )
+        other_server_args = [
+            "--pp-size",
+            2,
+            "--enable-pp-sleep-on-idle",
+        ]
+        run_bench_one_batch_server(
+            model,
+            DEFAULT_URL_FOR_TEST,
+            server_args,
+            bench_args,
+            other_server_args,
+        )
+
+
 @unittest.skipIf(
     is_in_ci(), "Skipping GLM41V PP accuracy test before it gets more stable"
 )
