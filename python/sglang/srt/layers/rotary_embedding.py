@@ -183,7 +183,7 @@ class RotaryEmbedding(CustomOp):
             return
 
         # Align to reduce realloc frequency
-        align = envs.SGLANG_ROPE_CACHE_ALIGN.value
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
         new_len = ((needed_max_pos + align) // align) * align
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
