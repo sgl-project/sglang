@@ -788,19 +788,6 @@ def best_output_size(w, h, dw, dh, expected_area):
         return ow2, oh2
 
 
-def save_decoded_latents_as_video(
-    decoded_latents: list[torch.Tensor], output_path: str, fps: int
-):
-    # Process outputs
-    videos = rearrange(decoded_latents, "b c t h w -> t b c h w")
-    frames = []
-    for x in videos:
-        x = torchvision.utils.make_grid(x, nrow=6)
-        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-        frames.append((x * 255).numpy().astype(np.uint8))
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    imageio.mimsave(output_path, frames, fps=fps, format="mp4")
 
 
 def calculate_dimensions(target_area, ratio):

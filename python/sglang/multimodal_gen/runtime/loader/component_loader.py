@@ -705,27 +705,6 @@ class TransformerLoader(ComponentLoader):
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {component_model_path}")
 
-        # Check if we should use custom initialization weights
-        custom_weights_path = getattr(
-            server_args, "init_weights_from_safetensors", None
-        )
-        use_custom_weights = False
-
-        if use_custom_weights:
-            logger.info(
-                "Using custom initialization weights from: %s", custom_weights_path
-            )
-            assert (
-                custom_weights_path is not None
-            ), "Custom initialization weights must be provided"
-            if os.path.isdir(custom_weights_path):
-                safetensors_list = _list_safetensors_files(custom_weights_path)
-            else:
-                assert custom_weights_path.endswith(
-                    ".safetensors"
-                ), "Custom initialization weights must be a safetensors file"
-                safetensors_list = [custom_weights_path]
-
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
         logger.info(
