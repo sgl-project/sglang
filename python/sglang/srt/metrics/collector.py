@@ -622,7 +622,7 @@ class SchedulerMetricsCollector:
         self.cuda_graph_passes_total = Counter(
             name="sglang:cuda_graph_passes_total",
             documentation="Total number of forward passes categorized by CUDA graph.",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["mode"],
         )
 
         self.new_token_ratio = Gauge(
