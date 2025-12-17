@@ -366,6 +366,12 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def get_remote_instance_transfer_engine_info(self):
+        return (
+            self.model_runner.remote_instance_transfer_engine_session_id,
+            self.model_runner.remote_instance_transfer_engine_weight_info,
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -377,6 +383,7 @@ class TpModelWorker(BaseTpWorker):
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
+        # Get forward batch from model worker batch
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
@@ -386,10 +393,10 @@ class TpModelWorker(BaseTpWorker):
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
 
-        if self.pp_group.is_last_rank:
-            if self.is_dllm():
-                return self._forward_batch_generation_dllm(forward_batch)
+        if self.is_dllm():
+            return self._forward_batch_generation_dllm(forward_batch)
 
+        if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -419,7 +426,12 @@ class TpModelWorker(BaseTpWorker):
                 batch_result.delay_sample_func = sample_batch_func
                 return batch_result
 
-            if model_worker_batch.is_prefill_only:
+            if not model_worker_batch.is_prefill_only:
+                # For normal requests, sample the next token ids.
+                batch_result.next_token_ids = self.model_runner.sample(
+                    logits_output, forward_batch
+                )
+            else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
                 batch_result.next_token_ids = torch.zeros(
@@ -435,10 +447,6 @@ class TpModelWorker(BaseTpWorker):
                     self.model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch
                     )
-            else:
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
-                )
 
             return batch_result
         else:

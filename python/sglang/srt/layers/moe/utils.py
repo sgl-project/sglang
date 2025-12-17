@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from enum import Enum, IntEnum
-from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
@@ -251,7 +250,6 @@ def get_tbo_token_distribution_threshold() -> float:
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
 
-@lru_cache(maxsize=1)
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
@@ -288,14 +286,23 @@ def speculative_moe_a2a_backend_context():
     """
     global MOE_A2A_BACKEND
     global IS_IN_SPEC
+    global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     original_backend = MOE_A2A_BACKEND
     IS_IN_SPEC = True
+    original_disable_flashinfer_cutlass_moe_fp4_allgather = (
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    )
     try:
         MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
+        # Disable FP4 allgather for spec decode since MTP layers are unquantized
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = True
         yield
     finally:
         MOE_A2A_BACKEND = original_backend
         IS_IN_SPEC = False
+        DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
+            original_disable_flashinfer_cutlass_moe_fp4_allgather
+        )
 
 
 def get_is_in_spec() -> bool:
