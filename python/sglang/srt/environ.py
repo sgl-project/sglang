@@ -258,6 +258,11 @@ class Envs:
     SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
+    # FlashInfer-Bench Integration
+    FIB_ENABLE_TRACING = EnvBool(False)
+    FIB_ENABLE_APPLY = EnvBool(False)
+    FIB_DATASET_PATH = EnvStr(os.path.expanduser("~/.cache/flashinfer_bench/dataset"))
+
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)

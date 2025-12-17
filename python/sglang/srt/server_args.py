@@ -451,6 +451,11 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+
+    # FlashInfer-Bench integration
+    enable_flashinfer_bench_tracing: bool = False
+    enable_flashinfer_bench_apply: bool = False
+    flashinfer_bench_dataset_path: Optional[str] = None
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -719,6 +724,9 @@ class ServerArgs:
 
         # Handle deterministic inference.
         self._handle_deterministic_inference()
+
+        # Handle FlashInfer-Bench integration.
+        self._handle_flashinfer_bench()
 
         # Handle exporting request-level metrics.
         self._handle_request_metrics_exporters()
@@ -2325,6 +2333,23 @@ class ServerArgs:
                     "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                 )
 
+    def _handle_flashinfer_bench(self):
+        """Handle FlashInfer-Bench integration settings."""
+        # Set environment variables if CLI arguments are provided
+        if self.enable_flashinfer_bench_tracing:
+            envs.FIB_ENABLE_TRACING.set(True)
+            logger.info("FlashInfer-Bench tracing enabled via CLI argument")
+
+        if self.enable_flashinfer_bench_apply:
+            envs.FIB_ENABLE_APPLY.set(True)
+            logger.info("FlashInfer-Bench kernel substitution enabled via CLI argument")
+
+        if self.flashinfer_bench_dataset_path:
+            envs.FIB_DATASET_PATH.set(self.flashinfer_bench_dataset_path)
+            logger.info(
+                f"FlashInfer-Bench dataset path set to: {self.flashinfer_bench_dataset_path}"
+            )
+
     def _handle_request_metrics_exporters(self):
         """Handle arguments for configuring `RequestMetricsExporter` usage."""
         if self.export_metrics_to_file and self.export_metrics_to_file_dir is None:
@@ -3493,6 +3518,24 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+
+        # FlashInfer-Bench integration
+        parser.add_argument(
+            "--enable-flashinfer-bench-tracing",
+            action="store_true",
+            help="Enable FlashInfer-Bench workload tracing. Can also be set via FIB_ENABLE_TRACING=1 environment variable.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-bench-apply",
+            action="store_true",
+            help="Enable FlashInfer-Bench kernel substitution for optimization. Can also be set via FIB_ENABLE_APPLY=1 environment variable.",
+        )
+        parser.add_argument(
+            "--flashinfer-bench-dataset-path",
+            type=str,
+            default=None,
+            help="Path to FlashInfer-Bench dataset for tracing/optimization. Defaults to ~/.cache/flashinfer_bench/dataset. Can also be set via FIB_DATASET_PATH environment variable.",
         )
         parser.add_argument(
             "--deepep-mode",

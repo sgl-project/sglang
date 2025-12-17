@@ -122,6 +122,9 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         super().__init__()
 
+        # Initialize FlashInfer-Bench integration if enabled
+        self._init_flashinfer_bench()
+
         # Store multi-item scoring delimiter for efficient access
         self.multi_item_scoring_delimiter = (
             model_runner.server_args.multi_item_scoring_delimiter
@@ -735,6 +738,27 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             raise ValueError("Invalid forward mode")
+
+    def _init_flashinfer_bench(self) -> None:
+        """Initialize FlashInfer-Bench integration if enabled"""
+        self.flashinfer_bench_enabled = False
+
+        if not (envs.FIB_ENABLE_TRACING.get() or envs.FIB_ENABLE_APPLY.get()):
+            return
+
+        try:
+            from sglang.srt.layers.flashinfer_bench_integration import (
+                initialize_flashinfer_bench,
+            )
+
+            # Initialize the integration - this automatically patches FlashInfer
+            # functions via install_flashinfer_integrations()
+            self.flashinfer_bench_enabled = initialize_flashinfer_bench()
+
+            if self.flashinfer_bench_enabled:
+                logger.info("FlashInfer-Bench integration initialized")
+        except ImportError as e:
+            logger.debug(f"FlashInfer-Bench integration not available: {e}")
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
