@@ -325,9 +325,15 @@ class SchedulerMetricsCollector:
         )
 
         # Retract
+        # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
             name="sglang:num_retracted_reqs",
             documentation="The number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_reqs_total = Counter(
+            name="sglang:num_retracted_reqs_total",
+            documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -605,11 +611,17 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        # TODO maybe remove this old gauge in favor of the new counter
         self.is_cuda_graph = Gauge(
             name="sglang:is_cuda_graph",
             documentation="Whether the batch is using CUDA graph.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.cuda_graph_passes_total = Counter(
+            name="sglang:cuda_graph_passes_total",
+            documentation="Total number of forward passes categorized by CUDA graph.",
+            labelnames=labels.keys(),
         )
 
         self.new_token_ratio = Gauge(
@@ -654,6 +666,14 @@ class SchedulerMetricsCollector:
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def increment_num_retracted_reqs(self, num: int) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+
+    def increment_cuda_graph_pass(self, value: bool) -> None:
+        # leave room for piecewise cuda graph, etc
+        mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
     def increment_realtime_tokens(
         self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
