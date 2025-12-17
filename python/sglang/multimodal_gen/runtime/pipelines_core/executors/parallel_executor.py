@@ -5,7 +5,6 @@ from typing import List
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_sp_group
-from sglang.multimodal_gen.runtime.distributed.communication_backend import get_backend
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -64,72 +63,10 @@ class ParallelExecutor(PipelineExecutor):
         Execute all pipeline stages respecting their declared parallelism type.
         """
         rank = get_classifier_free_guidance_rank()
-        world_rank = get_world_rank()
         cfg_group = get_cfg_group()
-
-        # Disaggregation Logic
-        do_disaggregation = (
-            server_args.num_gpus > 1 and (server_args.num_gpus - 1) % 2 == 0
-        )
-
-        is_non_dit = False
-        is_dit = False
-        if do_disaggregation:
-            # Assume Rank 0 is Non-DiT
-            is_non_dit = world_rank == 0
-            is_dit = world_rank > 0
-            backend = get_backend()
 
         # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
         for stage in stages:
-            stage_name = stage.__class__.__name__
-
-            # --- Disaggregation Interception ---
-            if do_disaggregation:
-                # Text Encoding (Non-DiT -> DiT)
-                if "Text" in stage_name or "Encoding" in stage_name:
-                    if "Image" in stage_name and "Encoding" in stage_name:
-                        # ImageEncoding might be on Non-DiT too? Assuming yes.
-                        pass
-
-                    if is_non_dit:
-                        with Timer(stage_name):
-                            batch = stage(batch, server_args)
-                        # After encoding, send to DiT leader (Rank 1)
-                        # We send after the *last* encoding stage.
-                        # But simpler: send after *every* encoding stage?
-                        # Or just send before Denoising?
-                        # Let's simply send the batch object. Overhead is pickle.
-                        backend.send_object(batch, dst=1)
-                    else:
-                        # DiT ranks wait for data
-                        batch = backend.recv_object(src=0)
-                    continue
-
-                # Denoising (DiT -> Non-DiT)
-                if "Denoising" in stage_name or "Transformer" in stage_name:
-                    if is_dit:
-                        with Timer(stage_name):
-                            batch = stage(batch, server_args)
-                        # After denoising, send back to Non-DiT (Rank 0)
-                        if world_rank == 1:  # DiT Leader
-                            backend.send_object(batch, dst=0)
-                    else:
-                        # Non-DiT rank waits for data
-                        batch = backend.recv_object(src=1)
-                    continue
-
-                # Decoding (Non-DiT)
-                if "Decoding" in stage_name or "VAE" in stage_name:
-                    if is_non_dit:
-                        with Timer(stage_name):
-                            batch = stage(batch, server_args)
-                    else:
-                        pass  # DiT doesn't participate
-                    continue
-
-            # --- End Disaggregation Interception ---
-
             with Timer(stage.__class__.__name__):
                 paradigm = stage.parallelism_type
 

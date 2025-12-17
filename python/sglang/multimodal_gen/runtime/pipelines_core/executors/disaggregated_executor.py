@@ -1,6 +1,7 @@
 """
 Pipeline executor for disaggregated execution.
 """
+
 from enum import Enum, auto
 from typing import List
 
@@ -14,7 +15,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     Timer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage, TimestepPreparationStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    DenoisingStage,
+    TimestepPreparationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -100,17 +104,14 @@ class DisaggregatedExecutor(PipelineExecutor):
                 return self._run_local(stages, batch)
 
             pre_denoise_stages = stages[:denoise_start_idx]
-            denoise_stages = stages[denoise_start_idx:denoise_end_idx + 1]
-            post_denoise_stages = stages[denoise_end_idx + 1:]
+            denoise_stages = stages[denoise_start_idx : denoise_end_idx + 1]
+            post_denoise_stages = stages[denoise_end_idx + 1 :]
 
             # --- PHASE 1: Pre-Denoise (Encoding) ---
             print(
                 f"[Rank {dist.get_rank()}] Entering Phase 1. is_non_dit={self.comm.is_non_dit_rank()}, is_dit={self.comm.is_dit_rank()}"
             )
             if self.comm.is_non_dit_rank():
-                print(
-                    f"[Non-DiT Rank {dist.get_rank()}] Phase 1: Running Pre-Denoise stages..."
-                )
                 for stage in pre_denoise_stages:
                     print(
                         f"[Non-DiT Rank {dist.get_rank()}] Running stage: {stage.__class__.__name__}"
@@ -118,40 +119,18 @@ class DisaggregatedExecutor(PipelineExecutor):
                     with Timer(stage.__class__.__name__):
                         batch = stage(batch, server_args)
 
-                print(
-                    f"[Non-DiT Rank {dist.get_rank()}] Phase 1 Complete. Sending data to DiT..."
-                )
-                print(
-                    f"[Non-DiT Rank {dist.get_rank()}] self={self}, type={type(self)}"
-                )
-                print(
-                    f"[Non-DiT Rank {dist.get_rank()}] hasattr _send_batch_to_dit: {hasattr(self, '_send_batch_to_dit')}"
-                )
-                print(f"[Non-DiT Rank {dist.get_rank()}] batch type: {type(batch)}")
-                print(
-                    f"[Non-DiT Rank {dist.get_rank()}] About to call _send_batch_to_dit..."
-                )
                 import sys
 
                 sys.stdout.flush()  # Force flush
 
                 # Get method reference first
                 send_method = self._send_batch_to_dit
-                print(
-                    f"[Non-DiT Rank {dist.get_rank()}] Got method reference: {send_method}"
-                )
                 sys.stdout.flush()
 
                 try:
                     send_method(batch)
-                    print(
-                        f"[Non-DiT Rank {dist.get_rank()}] _send_batch_to_dit returned successfully"
-                    )
                     sys.stdout.flush()
                 except Exception as e:
-                    print(
-                        f"[Non-DiT Rank {dist.get_rank()}] ERROR in _send_batch_to_dit: {e}"
-                    )
                     import traceback
 
                     traceback.print_exc()
@@ -160,15 +139,6 @@ class DisaggregatedExecutor(PipelineExecutor):
 
             elif self.comm.is_dit_rank():
                 # DiT waits for data
-                print(
-                    f"[Dit Rank {dist.get_rank()}] Phase 1: Waiting for data from Non-DiT..."
-                )
-                print(
-                    f"[Dit Rank {dist.get_rank()}] self.comm.non_dit_master_rank={self.comm.non_dit_master_rank}"
-                )
-                print(
-                    f"[Dit Rank {dist.get_rank()}] self.comm.dit_master_rank={self.comm.dit_master_rank}"
-                )
                 import sys
 
                 sys.stdout.flush()
@@ -198,14 +168,8 @@ class DisaggregatedExecutor(PipelineExecutor):
                 # After denoising, latents are gathered (via gather_latents_for_sp)
                 # All dit ranks have the complete result, but only dit master sends to non-dit
                 if dist.get_rank() == self.comm.dit_master_rank:
-                    print(
-                        "Phase 2 Complete. DiT Master sending data back to Non-DiT..."
-                    )
                     self._send_batch_to_non_dit(batch)
                 else:
-                    print(
-                        f"Phase 2 Complete. DiT Worker (rank {dist.get_rank()}) done for this request."
-                    )
                     # DiT workers are done. Non-dit will handle decoding.
                     # Return early to avoid unnecessary waiting
                     return OutputBatch()
@@ -213,25 +177,12 @@ class DisaggregatedExecutor(PipelineExecutor):
             if self.comm.is_non_dit_rank():
                 try:
                     # Non-DiT waits for result from DiT Master
-                    print("Phase 2: Waiting for result from DiT Master...")
                     batch = self._recv_batch_from_dit(batch)
 
                     # --- PHASE 3: Post-Denoise (Decoding) ---
-                    print("Phase 3: Running Post-Denoise stages on Non-DiT...")
                     for stage in post_denoise_stages:
                         with Timer(stage.__class__.__name__):
                             batch = stage(batch, server_args)
-
-                    # Debug: check output status
-                    print(
-                        f"Phase 3 Complete. Output status: {batch.output is not None}, type: {type(batch.output) if batch.output is not None else 'None'}"
-                    )
-                    if batch.output is not None and isinstance(
-                        batch.output, torch.Tensor
-                    ):
-                        print(
-                            f"  Output shape: {batch.output.shape}, dtype: {batch.output.dtype}"
-                        )
 
                     # Convert Req to OutputBatch
                     output_batch = OutputBatch(
@@ -244,9 +195,7 @@ class DisaggregatedExecutor(PipelineExecutor):
                     )
 
                     # Non-dit has the final output, send it back to dit master for client response
-                    print("Sending final result back to DiT Master...")
                     self._send_final_result_to_dit_master(output_batch)
-                    print("Final result sent successfully.")
                 except Exception as e:
                     logger.error(
                         f"[Non-DiT Rank {dist.get_rank()}] Error in Phase 2/3: {e}",
@@ -259,12 +208,8 @@ class DisaggregatedExecutor(PipelineExecutor):
             # Dit master receives final result from non-dit
             if dist.get_rank() == self.comm.dit_master_rank:
                 try:
-                    print("Receiving final result from Non-DiT...")
                     output_batch = OutputBatch()
                     output_batch = self._recv_final_result_from_non_dit(output_batch)
-                    print(
-                        f"Final result received. Output status: {output_batch.output is not None}"
-                    )
                     return output_batch
                 except Exception as e:
                     logger.error(
@@ -284,7 +229,6 @@ class DisaggregatedExecutor(PipelineExecutor):
     # These would ideally be in a Serializer/Deserializer class
 
     def _send_batch_to_dit(self, batch: Req):
-        print(f"[_send_batch_to_dit ENTRY] Function entered, rank={dist.get_rank()}")
         import sys
 
         sys.stdout.flush()
@@ -296,7 +240,6 @@ class DisaggregatedExecutor(PipelineExecutor):
         tensor_infos = {}  # name -> (shape, dtype)
         list_tensor_infos = {}  # name -> list of (shape, dtype)
 
-        print(f"[_send_batch_to_dit] Checking batch attributes...")
         sys.stdout.flush()
 
         # Identify tensors (both single and lists)

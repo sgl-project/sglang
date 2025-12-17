@@ -40,7 +40,6 @@ class StageVerificationError(Exception):
     pass
 
 
-
 class PipelineStage(ABC):
     """
     Abstract base class for all pipeline stages.
@@ -52,7 +51,6 @@ class PipelineStage(ABC):
 
     def __init__(self):
         self.server_args = get_global_server_args()
-
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""

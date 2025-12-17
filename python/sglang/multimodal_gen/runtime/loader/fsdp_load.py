@@ -201,16 +201,6 @@ def maybe_load_fsdp_model(
             process_group=process_group,
         )
 
-    # Debug: Log weight loading
-    import torch.distributed as dist
-
-    if dist.is_initialized():
-        logger.info(
-            f"[Weight Loading] Rank {dist.get_rank()}: "
-            f"Loading weights from {weight_dir_list}, "
-            f"use_fsdp={use_fsdp}, process_group={process_group is not None}"
-        )
-
     weight_iterator = safetensors_weights_iterator(
         weight_dir_list, use_runai_model_streamer=use_runai_model_streamer
     )
@@ -234,12 +224,6 @@ def maybe_load_fsdp_model(
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
-
-    if dist.is_initialized():
-        logger.info(
-            f"[Weight Loading] Rank {dist.get_rank()}: "
-            f"Loaded {loaded_params} parameters"
-        )
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")

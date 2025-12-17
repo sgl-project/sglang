@@ -141,7 +141,7 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
             stage=InputValidationStage(
                 vae_image_processor=VaeImageProcessor(
                     vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-                                     * 2
+                    * 2
                 )
             ),
         )
