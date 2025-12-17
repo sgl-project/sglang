@@ -1931,7 +1931,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 decode_time = state.finished_time_perf - state.first_token_time_perf
                 output_throughput = completion_tokens / decode_time
 
-
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
