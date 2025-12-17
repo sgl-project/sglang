@@ -35,12 +35,13 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 class TestDeepseekV32Unified(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
-    Tests 5 variants:
+    Tests 6 variants:
     - basic: Standard TP=8 + DP=8 with dp-attention
     - mtp: Basic + EAGLE speculative decoding
     - nsa: NSA backend with flashmla + DP=8
     - pure_tp: Pure TP=8 without DP
     - partial_tp: Partial TP=8 + DP=4 (hybrid parallelism)
+    - tp+mtp: Pure TP=8 + EAGLE speculative decoding (no DP)
 
     Each variant runs BOTH:
     - Performance test (using NightlyBenchmarkRunner)
@@ -133,6 +134,23 @@ class TestDeepseekV32Unified(unittest.TestCase):
                     "--attention-backend=nsa",
                     "--nsa-prefill-backend=flashmla_sparse",
                     "--nsa-decode-backend=flashmla_kv",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                ],
+            ),
+            # Variant: "tp+mtp" (from test_deepseek_v32_perf.py)
+            # Pure TP=8 + EAGLE speculative decoding (no DP)
+            ModelLaunchSettings(
+                DEEPSEEK_V32_MODEL_PATH,
+                tp_size=8,
+                extra_args=[
+                    "--trust-remote-code",
+                    "--tp=8",
+                    "--speculative-algorithm=EAGLE",
+                    "--speculative-num-steps=3",
+                    "--speculative-eagle-topk=1",
+                    "--speculative-num-draft-tokens=4",
+                    "--mem-frac=0.7",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],

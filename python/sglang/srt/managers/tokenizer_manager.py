@@ -215,10 +215,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
-            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
-                import_processors(
-                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
-                )
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
             _processor = _get_processor_wrapper(server_args)
             transport_mode = _determine_tensor_transport_mode(self.server_args)
 
@@ -1540,6 +1538,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self._add_metric_if_present(
                     recv_obj, "prefill_launch_latency", meta_info, i
                 )
+                self._add_metric_if_present(
+                    recv_obj, "prefill_finished_ts", meta_info, i
+                )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -1838,12 +1839,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             meta_info["request_sent_to_scheduler_ts"] = (
                 state.request_sent_to_scheduler_ts
             )
-        # For embeddings, there's no separate prefill phase, so omit `prefill_finished_ts`.
-        if (
-            not isinstance(recv_obj, BatchEmbeddingOutput)
-            and state.first_token_time > 0
-        ):
-            meta_info["prefill_finished_ts"] = state.first_token_time
         if state.response_sent_to_client_ts > 0:
             meta_info["response_sent_to_client_ts"] = state.response_sent_to_client_ts
         if state.finished_time > 0:
