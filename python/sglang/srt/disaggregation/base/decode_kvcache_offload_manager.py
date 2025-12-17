@@ -42,10 +42,12 @@ class DecodeKVCacheOffloadManager(ABC):
         self.tree_cache = tree_cache
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        self.ongoing_offload = {}
 
     @abstractmethod
     def offload_kv_cache(self, req: Req) -> bool: ...
 
     @abstractmethod
     def check_offload_progress(self): ...
+
+    @abstractmethod
+    def ongoing_size(self) -> int: ...

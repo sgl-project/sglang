@@ -3,9 +3,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.disaggregation.base.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
 try:
@@ -48,6 +51,8 @@ class LMCCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
             v_pool=kv_cache.v_buffer,
         )
         self.chunk_size = self.lmcache_connector.chunk_size()
+        self.store_stream = torch.cuda.Stream()
+        self.ongoing_offload = {}
         logger.info("Enable offload kv cache for decode side")
 
     def offload_kv_cache(self, req) -> bool:
@@ -71,17 +76,28 @@ class LMCCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
 
         # prefill offload tokens is also needed for hash calculation
         decode_offload_len = prefill_offloaded_len + incremental_aligned_len
+        decode_offload_tokens = all_tokens[:decode_offload_len]
         decode_offload_indices = token_indices[:decode_offload_len]
         store_md = StoreMetadata(
             last_node=None,
-            token_ids=all_tokens[:decode_offload_len],
+            token_ids=decode_offload_tokens,
             kv_indices=decode_offload_indices,
             offset=0,
         )
+        self.request_counter += 1
+        ack_id = self.request_counter
+
         # offload incremental KV cache from device to host
-        self.lmcache_connector.store_kv(store_md)
-        # offload to cpu is already done. let scheduler free gpu memory so return False
-        return False
+        with torch.cuda.stream(self.store_stream):
+            self.lmcache_connector.store_kv(store_md)
+        self.ongoing_offload[ack_id] = req
+        return True
 
     def check_offload_progress(self):
-        pass
+        self.store_stream.synchronize()
+        for req in self.ongoing_offload.values():
+            release_kv_cache(req, self.tree_cache)
+        self.ongoing_offload.clear()
+
+    def ongoing_size(self) -> int:
+        return len(self.ongoing_offload)

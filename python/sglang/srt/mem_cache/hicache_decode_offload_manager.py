@@ -60,7 +60,7 @@ class HiCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
             model_name=self.server_args.served_model_name,
             storage_backend_extra_config=self.server_args.hicache_storage_backend_extra_config,
         )
-
+        self.ongoing_offload = {}
         self.ongoing_backup = {}
         logger.info("Enable offload kv cache for decode side")
 
@@ -214,3 +214,6 @@ class HiCacheDecodeKVCacheOffloadManager(DecodeKVCacheOffloadManager):
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)
             page_hashes.append(last_hash)
         return page_hashes
+
+    def ongoing_size(self) -> int:
+        return len(self.ongoing_offload)
