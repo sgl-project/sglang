@@ -245,9 +245,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
-    embedding_ports: Optional[List] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -730,7 +730,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
-    embedding_ports: Optional[List] = None
 
 
 @dataclass

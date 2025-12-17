@@ -2127,12 +2127,6 @@ class ServerArgs:
             raise ValueError(
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
-        if (
-            self.language_only
-            and self.encoder_transfer_backend == "zmq_to_scheduler"
-            and self.pp_size > 1
-        ):
-            raise ValueError("zmq_to_scheduler not support pp_size > 1")
 
         if self.language_only and len(self.encoder_urls) == 0:
             raise ValueError(
