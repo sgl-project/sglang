@@ -813,7 +813,6 @@ class Scheduler(
 
                 self.tree_cache = ChunkCache(params)
             else:
-
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
                 self.tree_cache = SWAChunkCache(params)

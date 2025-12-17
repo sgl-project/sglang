@@ -567,11 +567,13 @@ class LogitsProcessor(nn.Module):
                 assert False, "Should never reach"
 
         del hidden_states
+
         if (
             logits_metadata.return_hidden_states_before_norm
             and hidden_states_to_store_before_norm is not None
         ):
             hidden_states_to_store = hidden_states_to_store_before_norm
+
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
