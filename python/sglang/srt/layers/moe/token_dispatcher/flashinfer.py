@@ -4,21 +4,34 @@ import logging
 from typing import NamedTuple, Optional
 
 import torch
-import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-from sglang.srt.layers.moe.token_dispatcher.base import (
+from sglang.srt.layers.moe.token_dispatcher import (
     BaseDispatcher,
     CombineInput,
+    CombineInputFormat,
     DispatchOutput,
     DispatchOutputFormat,
+)
+from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+    TorchDistributedCommBackend,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_int_env_var, is_flashinfer_available
+from sglang.srt.utils import get_int_env_var
+
+try:
+    from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
+    from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
+    from flashinfer.comm.mapping import Mapping
+    from flashinfer.comm.mnnvl import MnnvlConfig
+
+    use_flashinfer = True
+except ImportError:
+    use_flashinfer = False
 
 logger = logging.getLogger(__name__)
 
@@ -30,45 +43,29 @@ class FlashinferDispatchOutput(NamedTuple):
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
-    topk_output: TopKOutput
+    topk_output: StandardTopKOutput
     # Provide an output tensor to fused_moe so it writes directly to our buffer
     moe_output: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.STANDARD
+        return DispatchOutputFormat.FLASHINFER
 
 
 assert isinstance(FlashinferDispatchOutput, DispatchOutput)
 
-if is_flashinfer_available():
-    from flashinfer.comm.mnnvl import CommBackend
 
-    class TorchDistributedCommBackend(CommBackend):
-        """
-        Use torch distributed instead of MPI to set up flashinfer MNNVL workspaces during initialization
-        """
+class FlashinferCombineInput(NamedTuple):
+    """Flashinfer combine input."""
 
-        def __init__(self, group: dist.ProcessGroup):
-            self._group = group
+    hidden_states: torch.Tensor
 
-        def Get_rank(self) -> int:
-            return self._group.rank()
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.FLASHINFER
 
-        def Get_size(self) -> int:
-            return self._group.size()
 
-        def allgather(self, data: int):
-            gathered = [None] * self.Get_size()
-            dist.all_gather_object(gathered, data, group=self._group)
-            return gathered
-
-        def Split(self, color: int, key: int):
-            # No need to split, we already use the proper group
-            return self
-
-        def barrier(self):
-            dist.barrier(group=self._group)
+assert isinstance(FlashinferCombineInput, CombineInput)
 
 
 class FlashinferDispatcher(BaseDispatcher):
@@ -84,15 +81,12 @@ class FlashinferDispatcher(BaseDispatcher):
         params_dtype: torch.dtype = None,  # Unused
     ):
         super().__init__()
-        try:
-            from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
-            from flashinfer.comm.mapping import Mapping
-            from flashinfer.comm.mnnvl import MnnvlConfig
-        except ImportError:
+        if not use_flashinfer:
             raise ImportError(
                 "Flashinfer is not installed or does not support A2A. "
                 "Please install the appropriate version of Flashinfer."
             )
+
         self.ep_size = group.size()
         self.ep_rank = group.rank()
         self.router_topk = router_topk
@@ -154,9 +148,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
-    ) -> DispatchOutput:
-        from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
-
+    ) -> FlashinferDispatchOutput:
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
@@ -240,7 +232,7 @@ class FlashinferDispatcher(BaseDispatcher):
             moe_output,
         )
 
-    def combine(self, combine_input: CombineInput) -> torch.Tensor:
+    def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
         output_hidden_size = hidden_states.shape[-1]
         hidden_states = self.moe_a2a.combine(
