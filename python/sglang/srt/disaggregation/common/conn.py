@@ -42,8 +42,10 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
-SYNC_PREFILL_DP_RANK = envs.SGLANG_SYNC_PREFILL_DP_RANK.get()
-ENTRY_CLEANUP_INTERVAL = envs.SGLANG_PREFILL_ENTRY_CLEANUP_INTERVAL.get()
+NOTIFY_DP_RANK = envs.SGLANG_DISAGGREGATION_NOTIFY_DP_RANK.get()
+BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = (
+    envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
+)
 
 
 class CommonKVManager(BaseKVManager):
@@ -207,7 +209,7 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if SYNC_PREFILL_DP_RANK:
+        if NOTIFY_DP_RANK:
             self._register_prefill_dp_rank()
 
     def _register_prefill_dp_rank(self):
@@ -380,7 +382,7 @@ class CommonKVReceiver(BaseKVReceiver):
         if prefill_dp_rank is not None:
             logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
             self.prefill_dp_rank = prefill_dp_rank
-        elif not SYNC_PREFILL_DP_RANK:
+        elif not NOTIFY_DP_RANK:
             self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
         else:  # use bootstrap server to sync prefill dp rank
             self.prefill_dp_rank = None
@@ -400,7 +402,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_prefill_response_num
         )
 
-        if not SYNC_PREFILL_DP_RANK:
+        if not NOTIFY_DP_RANK:
             self._setup_bootstrap_infos()
 
     def _setup_bootstrap_infos(self):
@@ -676,12 +678,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     async def _cleanup_expired_entries(self):
         """Remove entries older than 10 minutes from prefill_dp_rank_table."""
         while True:
-            await asyncio.sleep(ENTRY_CLEANUP_INTERVAL)  # Run every 30 secs
+            await asyncio.sleep(BOOTSTRAP_ENTRY_CLEANUP_INTERVAL)  # Run every 30 secs
             current_time = time.time()
             expired_keys = [
                 key
                 for key, value in self.prefill_dp_rank_table.items()
-                if current_time - value["timestamp"] > ENTRY_CLEANUP_INTERVAL
+                if current_time - value["timestamp"] > BOOTSTRAP_ENTRY_CLEANUP_INTERVAL
             ]
             if expired_keys:
                 start_time = time.time()
@@ -706,7 +708,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             asyncio.set_event_loop(self._loop)
 
             # Schedule the cleanup task for prefill_dp_rank_table
-            if SYNC_PREFILL_DP_RANK:
+            if NOTIFY_DP_RANK:
                 self._loop.create_task(self._cleanup_expired_entries())
 
             access_log = None

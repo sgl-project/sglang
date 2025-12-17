@@ -140,8 +140,8 @@ export MC_FORCE_MNNVL=True
 | **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KVCache transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8)`, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions |
 | **`SGLANG_DISAGGREGATION_QUEUE_SIZE`** | Sets the number of parallel transfer queues. KVCache transfer requests from multiple decode instances will be sharded into these queues so that they can share the threads and the transfer bandwidth at the same time. If it is set to `1`, then we transfer requests one by one according to fcfs strategy | `4` |
 | **`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`** | Timeout (seconds) for receiving destination KV indices during request initialization | `300` |
-| **`SGLANG_SYNC_PREFILL_DP_RANK`** | Sync prefill dp rank through bootstrap server for data parallel controller | `false` |
-| **`SGLANG_PREFILL_ENTRY_CLEANUP_INTERVAL`** | Interval (seconds) between cleanups of prefill dp rank table | `30` |
+| **`SGLANG_DISAGGREGATION_NOTIFY_DP_RANK`** | Notify prefill dp rank through bootstrap server for PD disaggregation | `false` |
+| **`SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL`** | Interval (seconds) between cleanups of bootstrap entries | `30` |
 
 If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600` (10 minutes) to relax the timeout condition.
 Please be aware that this setting will cause prefill instances to take a longer time to clean up the affected memory resources when a running decode node loses connection.

@@ -38,7 +38,7 @@ from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_
 
 logger = logging.getLogger(__name__)
 
-SYNC_PREFILL_DP_RANK = envs.SGLANG_SYNC_PREFILL_DP_RANK.get()
+NOTIFY_DP_RANK = envs.SGLANG_DISAGGREGATION_NOTIFY_DP_RANK.get()
 
 
 class KVTransferError(Exception):
@@ -1233,7 +1233,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         prefill_dp_rank: Optional[int] = None,
     ):
         # Dp rank for prefill server is synchronized now.
-        if SYNC_PREFILL_DP_RANK:
+        if NOTIFY_DP_RANK:
             self.prefill_dp_rank = prefill_dp_rank
             self._setup_bootstrap_infos()
 
