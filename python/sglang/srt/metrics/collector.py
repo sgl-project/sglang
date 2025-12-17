@@ -217,11 +217,6 @@ class SchedulerStats:
     # CUDA graph
     is_cuda_graph: float = 0.0
 
-    # Realtime token counters (updated on each log interval)
-    realtime_prefill_compute_tokens_accumulator: int = 0
-    realtime_prefill_cache_tokens_accumulator: int = 0
-    realtime_decode_tokens_accumulator: int = 0
-
 
 class SchedulerMetricsCollector:
 
