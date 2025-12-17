@@ -667,12 +667,13 @@ class MLATokenToKVPoolHost(HostKVCache):
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
 
-        return (
-            (self.kv_lora_rank + self.qk_rope_head_dim)
-            * 1
-            * self.dtype.itemsize
-            * self.layer_num
+        # Use kv_cache_dim from device_pool to support DeepSeekV3.2 NSA
+        # NSA uses override_kv_cache_dim which includes FP8 scale and rope storage
+        self.kv_cache_dim = getattr(
+            self.device_pool, "kv_cache_dim", self.kv_lora_rank + self.qk_rope_head_dim
         )
+
+        return self.kv_cache_dim * 1 * self.dtype.itemsize * self.layer_num
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -683,14 +684,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.size,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             )
         elif self.layout == "page_first":
             dims = (
                 self.size,
                 self.layer_num,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             )
         elif self.layout == "page_first_direct":
             dims = (
@@ -698,7 +699,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             )
         # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
@@ -727,9 +728,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             return self.k_buffer
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        self.token_stride_size = (
-            self.kv_lora_rank + self.qk_rope_head_dim
-        ) * self.dtype.itemsize
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -882,7 +881,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             ),
             dtype=self.dtype,
             device=self.device,
@@ -895,14 +894,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             )
         elif self.layout == "page_first":
             self.kv_buffer[index : index + self.page_size, :, :, :] = data_page.reshape(
                 self.page_size,
                 self.layer_num,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             )
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
@@ -911,7 +910,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -929,20 +928,11 @@ class MLATokenToKVPoolHost(HostKVCache):
                 for layer_id in range(self.layer_num):
                     k_ptr = (
                         kv_buffer_data_ptr
-                        + indices[index]
-                        * (self.kv_lora_rank + self.qk_rope_head_dim)
-                        * self.dtype.itemsize
-                        + layer_id
-                        * self.size
-                        * (self.kv_lora_rank + self.qk_rope_head_dim)
-                        * self.dtype.itemsize
+                        + indices[index] * self.kv_cache_dim * self.dtype.itemsize
+                        + layer_id * self.size * self.kv_cache_dim * self.dtype.itemsize
                     )
                     ptr_list.append(k_ptr)
-            element_size = (
-                self.dtype.itemsize
-                * self.page_size
-                * (self.kv_lora_rank + self.qk_rope_head_dim)
-            )
+            element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct"]:
             for index in range(0, len(indices), self.page_size):
@@ -950,7 +940,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     kv_buffer_data_ptr
                     + indices[index]
                     * self.layer_num
-                    * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    * self.kv_cache_dim
                     * self.dtype.itemsize
                 )
                 ptr_list.append(k_ptr)
@@ -958,7 +948,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num
                 * self.dtype.itemsize
                 * self.page_size
-                * (self.kv_lora_rank + self.qk_rope_head_dim)
+                * self.kv_cache_dim
             )
             element_size_list = [element_size] * len(ptr_list)
         else:
