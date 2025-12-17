@@ -529,7 +529,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.extend_prefix_lens_cpu
             ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+                max_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.max_seq_len_q = (
+                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+                )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
