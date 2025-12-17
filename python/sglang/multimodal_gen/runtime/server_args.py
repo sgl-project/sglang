@@ -852,20 +852,16 @@ class ServerArgs:
 
     def check_server_sp_args(self, num_gpus):
         # CRITICAL: In disagg mode, force recalculate sp_degree based on dit ranks only
-        if self.enable_disagg:
-            orig_sp = self.sp_degree
-            # Force recalculation
-            num_gpus_per_group = self.dp_size * self.tp_size
-            if self.enable_cfg_parallel:
-                num_gpus_per_group *= 2
-            if num_gpus % num_gpus_per_group != 0:
-                raise ValueError(f"dit_gpus={num_gpus} % {num_gpus_per_group} != 0")
-            self.sp_degree = num_gpus // num_gpus_per_group
-            logger.warning(
-                f"[Disagg Mode] Forcing sp_degree recalculation: "
-                f"{orig_sp} -> {self.sp_degree} (for {num_gpus} dit ranks)"
-            )
-        elif self.sp_degree == -1:
+        # if self.enable_disagg:
+        #     # Force recalculation
+        #     num_gpus_per_group = self.dp_size * self.tp_size
+        #     if self.enable_cfg_parallel:
+        #         num_gpus_per_group *= 2
+        #     if num_gpus % num_gpus_per_group != 0:
+        #         raise ValueError(f"dit_gpus={num_gpus} % {num_gpus_per_group} != 0")
+        #     self.sp_degree = num_gpus // num_gpus_per_group
+        # el
+        if self.sp_degree == -1:
             # assume we leave all remaining gpus to sp
             num_gpus_per_group = self.dp_size * self.tp_size
             if self.enable_cfg_parallel:
@@ -878,9 +874,6 @@ class ServerArgs:
         if self.enable_disagg and self.sp_degree != 1:
             self.ulysses_degree = self.sp_degree
             self.ring_degree = 1
-            logger.warning(
-                f"[Disagg Mode] Forcing ulysses_degree={self.ulysses_degree}, ring_degree=1"
-            )
         elif (
             self.ulysses_degree is None
             and self.ring_degree is None

@@ -457,11 +457,11 @@ class TextEncoderLoader(ComponentLoader):
         # Determine CPU offload behavior and target device
 
         # Check if we need to disable runai streamer due to process_group
-        if process_group is not None and use_runai_model_streamer:
-            logger.warning(
-                "Disabling RunAI model streamer because a custom process group is used."
-            )
-            use_runai_model_streamer = False
+        # if process_group is not None and use_runai_model_streamer:
+        #     logger.warning(
+        #         "Disabling RunAI model streamer because a custom process group is used."
+        #     )
+        #     use_runai_model_streamer = False
 
         local_torch_device = get_local_torch_device()
         should_offload = self.should_offload(server_args, model_config)
@@ -717,12 +717,12 @@ class TransformerLoader(ComponentLoader):
         # Load the model using FSDP loader
         assert server_args.hsdp_shard_dim is not None
 
-        # Disable runai streamer if using custom process group
-        if process_group is not None and use_runai_model_streamer:
-            logger.warning(
-                "Disabling RunAI model streamer for transformer because a custom process group is used."
-            )
-            use_runai_model_streamer = False
+        # # Disable runai streamer if using custom process group
+        # if process_group is not None and use_runai_model_streamer:
+        #     logger.warning(
+        #         "Disabling RunAI model streamer for transformer because a custom process group is used."
+        #     )
+        #     use_runai_model_streamer = False
 
         model = maybe_load_fsdp_model(
             model_cls=model_cls,

@@ -490,7 +490,6 @@ class DisaggregatedExecutor(PipelineExecutor):
         import io
         import pickle
 
-
         # Prepare metadata (non-tensor fields)
         has_output = output_batch.output is not None
 

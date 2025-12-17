@@ -415,9 +415,14 @@ class ComposedPipelineBase(ABC):
             # Or if loading_group is set, we pass it down (requires ComponentLoader update)
             # Based on previous logic: use_runai_model_streamer = False if disagg
 
-            use_streamer = None
-            if server_args.enable_disagg:
-                use_streamer = False
+            # use_streamer = None
+            # if server_args.enable_disagg:
+            #     use_streamer = False
+            #
+
+            use_streamer = True
+
+
 
             module = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
