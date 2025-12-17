@@ -332,7 +332,8 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
         self.num_retracted_reqs_total = Counter(
-            name="sglang:num_retracted_reqs_total",
+            # The name is `requests` instead of `reqs` to avoid dup name error
+            name="sglang:num_retracted_requests_total",
             documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
