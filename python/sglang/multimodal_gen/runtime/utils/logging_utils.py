@@ -24,6 +24,8 @@ SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
+# color
+CYAN = "\033[1;36m"
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -484,10 +486,6 @@ def log_generation_timer(
             total_requests,
             prompt[:100],
         )
-    else:
-        max_len = 100
-        suffix = "..." if len(prompt) > max_len else ""
-        logger.info(f"Processing prompt: {prompt[:100]}{suffix}")
 
     timer = GenerationTimer()
     timer.start_time = time.perf_counter()

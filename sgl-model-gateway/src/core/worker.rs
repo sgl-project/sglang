@@ -16,8 +16,8 @@ use super::{
     CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
 };
 use crate::{
-    core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
-    observability::metrics::RouterMetrics,
+    core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
 };
@@ -129,33 +129,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Record the outcome of a request to this worker
     fn record_outcome(&self, success: bool) {
-        let outcome_str = if success { "success" } else { "failure" };
-        RouterMetrics::record_cb_outcome(self.url(), outcome_str);
-
-        let before = self.circuit_breaker().state();
         self.circuit_breaker().record_outcome(success);
-        let after = self.circuit_breaker().state();
-
-        if before != after {
-            let from = match before {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            let to = match after {
-                CircuitState::Closed => "closed",
-                CircuitState::Open => "open",
-                CircuitState::HalfOpen => "half_open",
-            };
-            RouterMetrics::record_cb_state_transition(self.url(), from, to);
-        }
-
-        let state_code = match self.circuit_breaker().state() {
-            CircuitState::Closed => 0u8,
-            CircuitState::Open => 1u8,
-            CircuitState::HalfOpen => 2u8,
-        };
-        RouterMetrics::set_cb_state(self.url(), state_code);
     }
 
     /// Check if this worker is DP-aware
@@ -336,6 +310,14 @@ impl ConnectionMode {
             _ => false,
         }
     }
+
+    /// Get the metric label for this connection mode
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            ConnectionMode::Http => metrics_labels::CONNECTION_HTTP,
+            ConnectionMode::Grpc { .. } => metrics_labels::CONNECTION_GRPC,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionMode {
@@ -414,6 +396,17 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+        }
+    }
+}
+
+impl WorkerType {
+    /// Get the metric label for this worker type
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            WorkerType::Regular => metrics_labels::WORKER_REGULAR,
+            WorkerType::Prefill { .. } => metrics_labels::WORKER_PREFILL,
+            WorkerType::Decode => metrics_labels::WORKER_DECODE,
         }
     }
 }
@@ -561,6 +554,11 @@ impl BasicWorker {
             Ok(self.url())
         }
     }
+
+    fn update_running_requests_metrics(&self) {
+        let load = self.load();
+        Metrics::set_worker_requests_active(self.url(), load);
+    }
 }
 
 #[async_trait]
@@ -587,7 +585,6 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
-        RouterMetrics::set_worker_health(self.url(), healthy);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -596,9 +593,15 @@ impl Worker for BasicWorker {
             ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
         };
 
+        // Get worker type label for metrics
+        let worker_type_str = self.metadata.worker_type.as_metric_label();
+
         if health_result {
             self.consecutive_failures.store(0, Ordering::Release);
             let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Record health check success metric
+            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_SUCCESS);
 
             if !self.is_healthy()
                 && successes >= self.metadata.health_config.success_threshold as usize
@@ -610,6 +613,9 @@ impl Worker for BasicWorker {
         } else {
             self.consecutive_successes.store(0, Ordering::Release);
             let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Record health check failure metric
+            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_FAILURE);
 
             if self.is_healthy()
                 && failures >= self.metadata.health_config.failure_threshold as usize
@@ -631,18 +637,28 @@ impl Worker for BasicWorker {
 
     fn increment_load(&self) {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn decrement_load(&self) {
-        self.load_counter
+        if self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
-            .ok();
+            .is_err()
+        {
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                "Attempted to decrement load counter that is already at 0"
+            );
+        }
+        self.update_running_requests_metrics();
     }
 
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        self.update_running_requests_metrics();
     }
 
     fn processed_requests(&self) -> usize {
@@ -1046,6 +1062,24 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
 }
 
+// TODO migrate code to V2 (and then remove this name suffix)
+pub struct WorkerLoadGuardV2 {
+    worker: Arc<dyn Worker>,
+}
+
+impl WorkerLoadGuardV2 {
+    pub fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self { worker }
+    }
+}
+
+impl Drop for WorkerLoadGuardV2 {
+    fn drop(&mut self) {
+        self.worker.decrement_load();
+    }
+}
+
 /// RAII guard for worker load management
 pub struct WorkerLoadGuard<'a> {
     workers: Vec<&'a dyn Worker>,
@@ -1156,7 +1190,7 @@ mod tests {
     use std::{thread, time::Duration};
 
     use super::*;
-    use crate::core::CircuitBreakerConfig;
+    use crate::core::{CircuitBreakerConfig, CircuitState};
 
     #[test]
     fn test_worker_type_display() {
