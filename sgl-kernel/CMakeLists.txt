@@ -127,11 +127,6 @@ endif()
 # Enable gencode below SM90
 option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
 
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    set(ENABLE_BELOW_SM90 OFF)
-    message(STATUS "For aarch64, disable gencode below SM90 by default")
-endif()
-
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/csrc
