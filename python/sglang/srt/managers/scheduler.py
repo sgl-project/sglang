@@ -2013,7 +2013,7 @@ class Scheduler(
             )
             self.num_retracted_reqs = len(retracted_reqs)
             if (
-                self.current_scheduler_metrics_enabled()
+                self.current_scheduler_metrics_enabled
                 and (x := len(retracted_reqs)) > 0
             ):
                 self.metrics_collector.increment_num_retracted_reqs(x)
