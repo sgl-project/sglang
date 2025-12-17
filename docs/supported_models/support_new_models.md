@@ -74,7 +74,7 @@ For VLMs, also include a test in `test_vision_openai_server_{x}.py` (e.g. [test_
 This is an example command to run to test a new model on your local machine:
 
 ```bash
-ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others
+ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels
 ```
 
 ### Benchmark
