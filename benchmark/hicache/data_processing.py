@@ -17,6 +17,7 @@ from sglang.bench_serving import (
     download_and_cache_file,
     gen_prompt,
     get_gen_prefix_cache_path,
+    get_hf_token,
 )
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
@@ -104,14 +105,7 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path):
-        token = os.getenv("HF_TOKEN", None)
-        token_path = os.getenv("HF_TOKEN_PATH", None)
-
-        if token_path and token is None:
-            with open(token_path, "r") as f:
-                token = f.read().strip()
-
-        dataset_path = download_and_cache_file(SHAREGPT_URL, token=token)
+        dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -374,7 +368,7 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
 
         # Load the dataset.
         with open(dataset_path) as f:
