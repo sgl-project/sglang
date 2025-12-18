@@ -24,12 +24,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
 from sglang.multimodal_gen.test.server.consistency_utils import (
-    compare_frames_with_gt,
+    compare_with_gt,
     extract_key_frames_from_video,
     get_consistency_config,
     gt_exists,
     image_bytes_to_numpy,
-    load_gt_frames,
+    load_gt_embeddings,
     save_gt_to_staging,
 )
 from sglang.multimodal_gen.test.server.test_server_utils import (
@@ -431,7 +431,7 @@ Consider updating perf_baselines.json with the snippets below:
         case: DiffusionTestCase,
         content: bytes,
     ) -> None:
-        """Validate output consistency against ground truth.
+        """Validate output consistency against ground truth using CLIP similarity.
 
         Args:
             case: Test case configuration
@@ -489,53 +489,47 @@ Consider updating perf_baselines.json with the snippets below:
 
             error_msg = f"""
 --- MISSING GROUND TRUTH DETECTED ---
-GT not found for '{case.id}' ({num_gpus}-gpu).
+GT embedding not found for '{case.id}' ({num_gpus}-gpu).
 
 """
             if staging_path:
-                error_msg += f"""GT frames have been generated and saved to staging directory.
+                error_msg += f"""GT embeddings have been generated and saved to staging directory.
 These are available in the 'missing-gt' CI artifact.
 
-To add GT files to pass consistency tests:
+To add GT embeddings to pass consistency tests:
 1. Download the 'missing-gt' artifact from this CI run
 
-2. Fork and clone sgl-test-files repo:
-   # Fork https://github.com/sgl-project/sgl-test-files on GitHub first
-   git clone https://github.com/<your-username>/sgl-test-files.git
-   cd sgl-test-files
+2. Copy the embedding file to the sglang repository:
+   cp <downloaded-artifact>/{gpu_dir}/{case.id}.npy \\
+      python/sglang/multimodal_gen/test/consistency_gt/embeddings/{gpu_dir}/
 
-3. Copy the frame files:
-   mkdir -p diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
-   cp -r <downloaded-artifact>/{gpu_dir}/{case.id}/* diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
+3. Commit and push:
+   git add python/sglang/multimodal_gen/test/consistency_gt/embeddings/
+   git commit -m "Add consistency GT embedding for {case.id}"
+   git push
 
-4. Commit, push and create PR:
-   git add diffusion-ci/consistency_gt/
-   git commit -m "Add consistency GT for {case.id}"
-   git push origin main
-   # Create a PR to sgl-project/sgl-test-files on GitHub
-
-5. After the sgl-test-files PR is merged, re-run this CI.
+4. Re-run this CI after the commit is merged.
 """
             else:
-                error_msg += f"""GT staging is not enabled. To generate GT files:
+                error_msg += f"""GT staging is not enabled. To generate GT embeddings:
 1. Set environment variable: SGLANG_GT_STAGING_DIR=/path/to/staging
-2. Re-run this test to generate GT frames
-3. Upload the generated frames to sgl-test-files repository:
-   https://github.com/sgl-project/sgl-test-files/tree/main/diffusion-ci/consistency_gt/{gpu_dir}/{case.id}/
+2. Re-run this test to generate GT embeddings
+3. Copy the generated .npy file to:
+   python/sglang/multimodal_gen/test/consistency_gt/embeddings/{gpu_dir}/{case.id}.npy
 """
             error_msg += f"""
-(Optional) Add custom SSIM threshold to gt_metadata.json if needed:
+(Optional) Add custom CLIP threshold to gt_metadata.json if needed:
    "{case.id}": {{
-       "ssim_threshold": 0.98
+       "clip_threshold": 0.92
    }}
 """
             logger.error(error_msg)
             pytest.fail(
-                f"GT not found for {case.id}. See logs for instructions to add GT."
+                f"GT embedding not found for {case.id}. See logs for instructions to add GT."
             )
 
-        # Load GT frames
-        gt_frames = load_gt_frames(case.id, num_gpus, is_video=is_video)
+        # Load GT embeddings
+        gt_embeddings = load_gt_embeddings(case.id, num_gpus, is_video=is_video)
 
         # Convert output to frames
         if is_video:
@@ -546,29 +540,31 @@ To add GT files to pass consistency tests:
         # Get consistency config for threshold
         config = get_consistency_config(case)
 
-        # Compare frames
-        result = compare_frames_with_gt(
+        # Compare frames with GT embeddings using CLIP similarity
+        result = compare_with_gt(
             output_frames=output_frames,
-            gt_frames=gt_frames,
-            threshold=config.ssim_threshold,
+            gt_embeddings=gt_embeddings,
+            threshold=config.clip_threshold,
             case_id=case.id,
         )
 
         if not result.passed:
             # Build detailed failure message
             failed_frames = [
-                f"  Frame {d['frame_index']}: SSIM={d['ssim']:.4f}"
+                f"  Frame {d['frame_index']}: similarity={d['similarity']:.4f}"
                 for d in result.frame_details
                 if not d["passed"]
             ]
             pytest.fail(
                 f"Consistency check failed for {case.id}:\n"
-                f"  Min SSIM: {result.min_ssim:.4f}\n"
+                f"  Min similarity: {result.min_similarity:.4f}\n"
                 f"  Threshold: {result.threshold}\n"
                 f"  Failed frames:\n" + "\n".join(failed_frames)
             )
 
-        logger.info(f"[Consistency] {case.id}: PASSED (min_ssim={result.min_ssim:.4f})")
+        logger.info(
+            f"[Consistency] {case.id}: PASSED (min_similarity={result.min_similarity:.4f})"
+        )
 
     def _test_lora_api_functionality(
         self,

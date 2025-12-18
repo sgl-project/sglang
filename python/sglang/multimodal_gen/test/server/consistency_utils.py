@@ -2,15 +2,14 @@
 Utility functions for consistency testing of diffusion models.
 
 This module provides functions for:
-- Loading and comparing ground truth (GT) frames
-- Computing SSIM similarity metrics
+- Loading and comparing ground truth (GT) CLIP embeddings
+- Computing CLIP similarity metrics
 - Extracting key frames from videos
-- Saving GT frames for consistency testing
+- Saving GT embeddings for consistency testing
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import tempfile
@@ -26,20 +25,26 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 
-# Remote GT base URL (sgl-test-files repository)
-GT_REMOTE_BASE_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/diffusion-ci/consistency_gt"
-
 # Path to the GT metadata file (kept in sglang repo)
 GT_METADATA_PATH = Path(__file__).parent.parent / "consistency_gt" / "gt_metadata.json"
 
+# Path to the embeddings directory (kept in sglang repo)
+EMBEDDINGS_DIR = Path(__file__).parent.parent / "consistency_gt" / "embeddings"
+
+# CLIP configuration
+CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
+
 # Default thresholds
-DEFAULT_SSIM_THRESHOLD_IMAGE = 0.98
-DEFAULT_SSIM_THRESHOLD_VIDEO = 0.95
+DEFAULT_CLIP_THRESHOLD_IMAGE = 0.92
+DEFAULT_CLIP_THRESHOLD_VIDEO = 0.90
 DEFAULT_SEED = 1024
 DEFAULT_GENERATOR_DEVICE = "cuda"
 
 # Environment variable for staging directory
 GT_STAGING_DIR_ENV = "SGLANG_GT_STAGING_DIR"
+
+# Global cache for CLIP model (singleton pattern)
+_clip_model_cache: dict[str, Any] = {}
 
 
 @dataclass
@@ -50,7 +55,7 @@ class ConsistencyConfig:
     num_gpus: int
     seed: int
     generator_device: str
-    ssim_threshold: float
+    clip_threshold: float
     key_frame_indices: list[
         int | str
     ]  # int for specific index, "mid", "last" for dynamic
@@ -64,8 +69,8 @@ class ConsistencyResult:
 
     case_id: str
     passed: bool
-    ssim_scores: list[float]
-    min_ssim: float
+    similarity_scores: list[float]
+    min_similarity: float
     threshold: float
     frame_details: list[dict[str, Any]]
 
@@ -99,85 +104,137 @@ def get_staging_dir() -> Path | None:
     return None
 
 
-def load_gt_frames(
+def get_clip_model() -> tuple[Any, Any]:
+    """
+    Get CLIP model and processor (lazy loading with singleton pattern).
+
+    Returns:
+        Tuple of (model, processor)
+
+    Raises:
+        ImportError: If transformers is not installed
+    """
+    global _clip_model_cache
+
+    if "model" not in _clip_model_cache:
+        try:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
+        except ImportError:
+            raise ImportError(
+                "transformers and torch are required for CLIP consistency check. "
+                "Install with: pip install transformers torch"
+            )
+
+        logger.info(f"Loading CLIP model: {CLIP_MODEL_NAME}")
+        processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+        model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
+
+        # Move to GPU if available
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        model.eval()
+
+        _clip_model_cache["model"] = model
+        _clip_model_cache["processor"] = processor
+        _clip_model_cache["device"] = device
+        logger.info(f"CLIP model loaded on {device}")
+
+    return _clip_model_cache["model"], _clip_model_cache["processor"]
+
+
+def compute_clip_embedding(image: np.ndarray) -> np.ndarray:
+    """
+    Compute CLIP embedding for a single image.
+
+    Args:
+        image: numpy array (H, W, C) in RGB format
+
+    Returns:
+        768-dimensional numpy array (L2 normalized)
+    """
+    try:
+        import torch
+    except ImportError:
+        raise ImportError(
+            "torch is required for CLIP consistency check. "
+            "Install with: pip install torch"
+        )
+
+    model, processor = get_clip_model()
+    device = _clip_model_cache["device"]
+
+    # Convert numpy to PIL Image
+    pil_image = Image.fromarray(image)
+
+    # Process image
+    inputs = processor(images=pil_image, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    # Get embedding
+    with torch.no_grad():
+        image_features = model.get_image_features(**inputs)
+        # L2 normalize
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+    return image_features.cpu().numpy().flatten()
+
+
+def compute_clip_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
+    """
+    Compute cosine similarity between two CLIP embeddings.
+
+    Args:
+        emb1: 768-dimensional numpy array
+        emb2: 768-dimensional numpy array
+
+    Returns:
+        Cosine similarity score [-1, 1], typically [0.5, 1.0] for images
+    """
+    # Both embeddings should already be L2 normalized
+    # Cosine similarity = dot product for normalized vectors
+    similarity = np.dot(emb1, emb2)
+    return float(similarity)
+
+
+def load_gt_embeddings(
     case_id: str, num_gpus: int, is_video: bool = False
 ) -> list[np.ndarray]:
     """
-    Load ground truth frames for a specific case from remote repository.
-
-    Downloads frames from sgl-test-files repository and caches locally.
+    Load ground truth CLIP embeddings for a specific case.
 
     Args:
         case_id: Test case identifier.
         num_gpus: Number of GPUs used.
         is_video: Whether this is a video case (default: False).
-            Used to determine default frame count when metadata is not available.
 
     Returns:
-        List of numpy arrays (RGB images) for each key frame.
+        List of numpy arrays (embeddings) for each key frame.
+        Image: 1 embedding, Video: 3 embeddings (first, mid, last)
 
     Raises:
-        FileNotFoundError: If GT frames are not available remotely.
+        FileNotFoundError: If GT embeddings are not available.
     """
-    from sglang.utils import download_and_cache_file
+    embedding_path = EMBEDDINGS_DIR / f"{num_gpus}-gpu" / f"{case_id}.npy"
 
-    # Determine frame names based on modality
-    # Video always uses 3 key frames (first, mid, last) to match extract_key_frames_from_video
-    # Image always uses 1 frame
-    if is_video:
-        frame_names = ["frame_0.png", "frame_mid.png", "frame_last.png"]
-    else:
-        frame_names = ["frame_0.png"]
-
-    frames = []
-    for frame_name in frame_names:
-        # Construct URL and cache path
-        url = f"{GT_REMOTE_BASE_URL}/{num_gpus}-gpu/{case_id}/{frame_name}"
-        cache_filename = f"/tmp/sglang_gt_{num_gpus}gpu_{case_id}_{frame_name}"
-
-        try:
-            # Download and cache
-            local_path = download_and_cache_file(url, cache_filename)
-        except Exception as e:
-            raise FileNotFoundError(
-                f"GT frame not found at {url}. "
-                f"Please upload GT files to sgl-test-files repository. Error: {e}"
-            )
-
-        img = Image.open(local_path).convert("RGB")
-        frames.append(np.array(img))
-
-    logger.info(f"Loaded {len(frames)} GT frames for {case_id} from remote repository")
-    return frames
-
-
-def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
-    """
-    Compute Structural Similarity Index (SSIM) between two images.
-
-    Args:
-        img1: First image as numpy array (H, W, C) in RGB format
-        img2: Second image as numpy array (H, W, C) in RGB format
-
-    Returns:
-        SSIM score between 0 and 1 (1 = identical)
-    """
-    try:
-        from skimage.metrics import structural_similarity as ssim
-    except ImportError:
-        raise ImportError(
-            "scikit-image is required for SSIM computation. "
-            "Install it with: pip install scikit-image"
+    if not embedding_path.exists():
+        raise FileNotFoundError(
+            f"GT embedding not found at {embedding_path}. "
+            f"Please generate GT embeddings first."
         )
 
-    # Ensure images have the same shape
-    if img1.shape != img2.shape:
-        raise ValueError(f"Image shapes do not match: {img1.shape} vs {img2.shape}")
+    embeddings = np.load(embedding_path)
 
-    # Compute SSIM for each channel and average
-    # Use channel_axis parameter for multichannel images
-    score = ssim(img1, img2, channel_axis=2, data_range=255)
-    return float(score)
+    # Handle shape: (768,) for image, (3, 768) for video
+    if embeddings.ndim == 1:
+        embeddings = [embeddings]
+    else:
+        embeddings = list(embeddings)
+
+    logger.info(
+        f"Loaded {len(embeddings)} GT embeddings for {case_id} from {embedding_path}"
+    )
+    return embeddings
 
 
 def extract_key_frames_from_video(
@@ -251,83 +308,92 @@ def extract_key_frames_from_video(
 
 def image_bytes_to_numpy(image_bytes: bytes) -> np.ndarray:
     """Convert image bytes to numpy array."""
+    import io
+
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return np.array(img)
 
 
-def compare_frames_with_gt(
+def compare_with_gt(
     output_frames: list[np.ndarray],
-    gt_frames: list[np.ndarray],
+    gt_embeddings: list[np.ndarray],
     threshold: float,
     case_id: str,
 ) -> ConsistencyResult:
     """
-    Compare output frames with ground truth frames using SSIM.
+    Compare output frames with ground truth embeddings using CLIP similarity.
 
     Args:
         output_frames: List of output frames as numpy arrays
-        gt_frames: List of GT frames as numpy arrays
-        threshold: SSIM threshold for passing
+        gt_embeddings: List of GT CLIP embeddings
+        threshold: Similarity threshold for passing
         case_id: Test case identifier
 
     Returns:
         ConsistencyResult with comparison details
     """
-    if len(output_frames) != len(gt_frames):
+    if len(output_frames) != len(gt_embeddings):
         raise ValueError(
-            f"Frame count mismatch: output={len(output_frames)}, gt={len(gt_frames)}"
+            f"Frame count mismatch: output={len(output_frames)}, gt={len(gt_embeddings)}"
         )
 
-    ssim_scores = []
+    similarity_scores = []
     frame_details = []
 
-    for i, (out_frame, gt_frame) in enumerate(zip(output_frames, gt_frames)):
-        # Resize if shapes don't match (shouldn't happen normally)
-        if out_frame.shape != gt_frame.shape:
-            logger.warning(
-                f"Frame {i} shape mismatch: output={out_frame.shape}, gt={gt_frame.shape}. "
-                "Resizing output to match GT."
-            )
-            out_pil = Image.fromarray(out_frame)
-            out_pil = out_pil.resize((gt_frame.shape[1], gt_frame.shape[0]))
-            out_frame = np.array(out_pil)
+    for i, (out_frame, gt_emb) in enumerate(zip(output_frames, gt_embeddings)):
+        # Compute CLIP embedding for output frame
+        out_emb = compute_clip_embedding(out_frame)
 
-        ssim_score = compute_ssim(out_frame, gt_frame)
-        ssim_scores.append(ssim_score)
+        # Compute similarity
+        similarity = compute_clip_similarity(out_emb, gt_emb)
+        similarity_scores.append(similarity)
         frame_details.append(
             {
                 "frame_index": i,
-                "ssim": ssim_score,
-                "passed": ssim_score >= threshold,
+                "similarity": similarity,
+                "passed": similarity >= threshold,
                 "output_shape": out_frame.shape,
-                "gt_shape": gt_frame.shape,
             }
         )
 
-    min_ssim = min(ssim_scores)
-    passed = all(s >= threshold for s in ssim_scores)
+    min_similarity = min(similarity_scores)
+    passed = all(s >= threshold for s in similarity_scores)
 
     result = ConsistencyResult(
         case_id=case_id,
         passed=passed,
-        ssim_scores=ssim_scores,
-        min_ssim=min_ssim,
+        similarity_scores=similarity_scores,
+        min_similarity=min_similarity,
         threshold=threshold,
         frame_details=frame_details,
     )
 
+    # Always print detailed similarity info
+    status = "PASSED" if passed else "FAILED"
+    print(f"\n{'='*60}")
+    print(f"[CLIP Consistency] {case_id}: {status}")
+    print(f"  Threshold: {threshold}")
+    print(f"  Min similarity: {min_similarity:.4f}")
+    print(f"  Frame details:")
+    for detail in frame_details:
+        frame_status = "✓" if detail["passed"] else "✗"
+        print(
+            f"    Frame {detail['frame_index']}: similarity={detail['similarity']:.4f} {frame_status}"
+        )
+    print(f"{'='*60}\n")
+
     if passed:
         logger.info(
-            f"[Consistency] {case_id}: PASSED (min_ssim={min_ssim:.4f}, threshold={threshold})"
+            f"[Consistency] {case_id}: PASSED (min_similarity={min_similarity:.4f}, threshold={threshold})"
         )
     else:
         logger.error(
-            f"[Consistency] {case_id}: FAILED (min_ssim={min_ssim:.4f}, threshold={threshold})"
+            f"[Consistency] {case_id}: FAILED (min_similarity={min_similarity:.4f}, threshold={threshold})"
         )
         for detail in frame_details:
             if not detail["passed"]:
                 logger.error(
-                    f"  Frame {detail['frame_index']}: SSIM={detail['ssim']:.4f} < {threshold}"
+                    f"  Frame {detail['frame_index']}: similarity={detail['similarity']:.4f} < {threshold}"
                 )
 
     return result
@@ -352,11 +418,11 @@ def get_consistency_config(
 
     # Get threshold (use case-specific if available, otherwise default)
     default_threshold = (
-        metadata.get("default_ssim_threshold_video", DEFAULT_SSIM_THRESHOLD_VIDEO)
+        metadata.get("default_clip_threshold_video", DEFAULT_CLIP_THRESHOLD_VIDEO)
         if is_video
-        else metadata.get("default_ssim_threshold_image", DEFAULT_SSIM_THRESHOLD_IMAGE)
+        else metadata.get("default_clip_threshold_image", DEFAULT_CLIP_THRESHOLD_IMAGE)
     )
-    threshold = case_meta.get("ssim_threshold", default_threshold)
+    threshold = case_meta.get("clip_threshold", default_threshold)
 
     # Get key frame indices
     if is_video:
@@ -372,14 +438,14 @@ def get_consistency_config(
             "generator_device",
             metadata.get("default_generator_device", DEFAULT_GENERATOR_DEVICE),
         ),
-        ssim_threshold=threshold,
+        clip_threshold=threshold,
         key_frame_indices=key_frame_indices,
         resolution=case.sampling_params.output_size,
         num_frames=case.sampling_params.num_frames,
     )
 
 
-def save_frames_as_gt(
+def save_embeddings_as_gt(
     frames: list[np.ndarray],
     case_id: str,
     num_gpus: int,
@@ -387,59 +453,48 @@ def save_frames_as_gt(
     output_dir: Path | None = None,
 ) -> Path:
     """
-    Save frames as ground truth PNG files to staging directory.
+    Convert frames to CLIP embeddings and save as .npy file.
 
     Args:
         frames: List of frames as numpy arrays
         case_id: Test case identifier
         num_gpus: Number of GPUs used
-        is_video: Whether this is a video (affects naming)
-        output_dir: Output directory (required, GT files are no longer stored locally)
+        is_video: Whether this is a video (affects expected frame count)
+        output_dir: Output directory (defaults to EMBEDDINGS_DIR)
 
     Returns:
-        Path to the GT directory
+        Path to the saved .npy file
     """
     if output_dir is None:
-        raise ValueError(
-            "output_dir is required. GT files are now stored in sgl-test-files repository."
-        )
-    case_dir = output_dir / f"{num_gpus}-gpu" / case_id
+        output_dir = EMBEDDINGS_DIR
+
+    case_dir = output_dir / f"{num_gpus}-gpu"
     case_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clear existing frames
-    for old_file in case_dir.glob("frame_*.png"):
-        old_file.unlink()
+    # Compute embeddings for all frames
+    embeddings = []
+    for frame in frames:
+        emb = compute_clip_embedding(frame)
+        embeddings.append(emb)
 
-    # Save frames with appropriate naming
-    if is_video and len(frames) == 3:
-        names = ["frame_0.png", "frame_mid.png", "frame_last.png"]
+    # Stack embeddings: (768,) for single frame, (N, 768) for multiple
+    if len(embeddings) == 1:
+        embeddings_array = embeddings[0]
     else:
-        names = [f"frame_{i}.png" for i in range(len(frames))]
+        embeddings_array = np.stack(embeddings)
 
-    for frame, name in zip(frames, names):
-        img = Image.fromarray(frame)
-        img.save(case_dir / name)
-        logger.info(f"Saved GT frame: {case_dir / name}")
+    # Save as .npy
+    output_path = case_dir / f"{case_id}.npy"
+    np.save(output_path, embeddings_array)
+    logger.info(f"Saved GT embeddings: {output_path} (shape: {embeddings_array.shape})")
 
-    return case_dir
+    return output_path
 
 
 def gt_exists(case_id: str, num_gpus: int) -> bool:
-    """Check if GT exists (cached locally or available remotely)."""
-    import requests
-
-    # Check local cache first
-    cache_filename = f"/tmp/sglang_gt_{num_gpus}gpu_{case_id}_frame_0.png"
-    if os.path.exists(cache_filename):
-        return True
-
-    # Check remote
-    url = f"{GT_REMOTE_BASE_URL}/{num_gpus}-gpu/{case_id}/frame_0.png"
-    try:
-        response = requests.head(url, timeout=10)
-        return response.status_code == 200
-    except Exception:
-        return False
+    """Check if GT embedding exists locally."""
+    embedding_path = EMBEDDINGS_DIR / f"{num_gpus}-gpu" / f"{case_id}.npy"
+    return embedding_path.exists()
 
 
 def save_gt_to_staging(
@@ -448,11 +503,10 @@ def save_gt_to_staging(
     is_video: bool,
 ) -> Path | None:
     """
-    Save GT frames to staging directory for later upload to sgl-test-files.
+    Save GT embeddings to staging directory for later commit to sglang repo.
 
     This function is called when GT doesn't exist during test execution.
-    The staging directory can be uploaded as a CI artifact for developers
-    to download and upload to the sgl-test-files repository.
+    The staging directory can be committed directly to the sglang repository.
 
     Args:
         frames: List of frames as numpy arrays
@@ -460,7 +514,7 @@ def save_gt_to_staging(
         is_video: Whether this is a video (affects frame naming)
 
     Returns:
-        Path to saved GT directory, or None if staging is not enabled.
+        Path to saved GT embedding file, or None if staging is not enabled.
     """
     staging_dir = get_staging_dir()
     if staging_dir is None:
@@ -469,7 +523,7 @@ def save_gt_to_staging(
     num_gpus = case.server_args.num_gpus
     case_id = case.id
 
-    gt_path = save_frames_as_gt(
+    gt_path = save_embeddings_as_gt(
         frames=frames,
         case_id=case_id,
         num_gpus=num_gpus,
@@ -477,5 +531,5 @@ def save_gt_to_staging(
         output_dir=staging_dir,
     )
 
-    logger.info(f"[Staging] Saved GT frames for {case_id} to {gt_path}")
+    logger.info(f"[Staging] Saved GT embeddings for {case_id} to {gt_path}")
     return gt_path
