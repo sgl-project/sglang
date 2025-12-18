@@ -63,8 +63,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     return method_to_config[quantization]
 
 
-# --- Built-in/custom quantization configs ---
-# Register Nunchaku SVDQuant config under the method name "svdquant".
+# Register Nunchaku SVDQuant
 try:
     from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
         NunchakuConfig,
@@ -72,7 +71,6 @@ try:
     from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
         NunchakuAWQLinearMethod,
         NunchakuSVDQLinearMethod,
-        NunchakuTransformerMethod,
     )
 
     @register_quantization_config("svdquant")
@@ -88,7 +86,6 @@ except Exception:
     NunchakuConfig = None  # type: ignore[assignment]
     NunchakuSVDQLinearMethod = None  # type: ignore[assignment]
     NunchakuAWQLinearMethod = None  # type: ignore[assignment]
-    NunchakuTransformerMethod = None  # type: ignore[assignment]
 
 
 __all__ = [
@@ -100,5 +97,4 @@ __all__ = [
     "NunchakuConfig",
     "NunchakuSVDQLinearMethod",
     "NunchakuAWQLinearMethod",
-    "NunchakuTransformerMethod",
 ]
