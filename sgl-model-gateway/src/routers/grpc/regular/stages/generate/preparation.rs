@@ -1,7 +1,5 @@
 //! Generate preparation stage: Resolve input, tokenize, create stop decoder
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
@@ -16,7 +14,6 @@ use crate::{
             utils,
         },
     },
-    tokenizer::traits::Tokenizer,
 };
 
 /// Generate preparation stage
@@ -44,8 +41,8 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
-        // Resolve input (text, prompt, or input_ids)
-        let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
+        // Await the async resolution (which contains the spawn_blocking)
+        let (original_text, token_ids) = match self.resolve_generate_input(ctx, request).await {
             Ok(res) => res,
             Err(msg) => {
                 error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
@@ -82,15 +79,26 @@ impl GeneratePreparationStage {
         Ok(())
     }
 
-    fn resolve_generate_input(
+    async fn resolve_generate_input(
         &self,
         ctx: &RequestContext,
         request: &GenerateRequest,
     ) -> Result<(Option<String>, Vec<u32>), String> {
         if let Some(text) = &request.text {
-            return self
-                .tokenize_single_text(&ctx.components.tokenizer, text)
-                .map(|(original, ids)| (Some(original), ids));
+            // Offload CPU-intensive tokenization to blocking thread
+            let tokenizer = ctx.components.tokenizer.clone();
+            let text_owned = text.clone();
+
+            let (original, ids) = tokio::task::spawn_blocking(move || {
+                let encoding = tokenizer
+                    .encode(&text_owned)
+                    .map_err(|e| format!("Tokenization failed: {}", e))?;
+                Ok::<_, String>((text_owned, encoding.token_ids().to_vec()))
+            })
+            .await
+            .map_err(|e| format!("Tokenization task join error: {}", e))??;
+
+            return Ok((Some(original), ids));
         }
 
         // Handle input_ids - validate and convert
@@ -109,16 +117,5 @@ impl GeneratePreparationStage {
         }
 
         Err("Either `text` or `input_ids` must be provided".to_string())
-    }
-
-    fn tokenize_single_text(
-        &self,
-        tokenizer: &Arc<dyn Tokenizer>,
-        text: &str,
-    ) -> Result<(String, Vec<u32>), String> {
-        let encoding = tokenizer
-            .encode(text)
-            .map_err(|e| format!("Tokenization failed: {}", e))?;
-        Ok((text.to_string(), encoding.token_ids().to_vec()))
     }
 }
