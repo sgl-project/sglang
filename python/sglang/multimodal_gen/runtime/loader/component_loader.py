@@ -120,6 +120,7 @@ class ComponentLoader(ABC):
         module_name: str,
         transformers_or_diffusers: str,
         process_group: dist.ProcessGroup | None = None,
+        use_runai_model_streamer: bool = True,
     ):
         """
         Template method that standardizes logging around the core load implementation.
@@ -136,6 +137,7 @@ class ComponentLoader(ABC):
                 server_args,
                 module_name,
                 process_group=process_group,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
             source = "customized"
         except Exception as e:
@@ -213,6 +215,7 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         module_name: str,
         process_group: dist.ProcessGroup | None = None,
+        use_runai_model_streamer: bool = True,
     ):
         """
         Load the customized version component, implemented and optimized in SGL-diffusion
@@ -342,9 +345,7 @@ class TextEncoderLoader(ComponentLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self,
-        source: "Source",
-        to_cpu: bool,
+        self, source: "Source", to_cpu: bool, use_runai_model_streamer: bool = True
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -356,6 +357,7 @@ class TextEncoderLoader(ComponentLoader):
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 to_cpu=to_cpu,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
@@ -370,6 +372,7 @@ class TextEncoderLoader(ComponentLoader):
         model: nn.Module,
         model_path: str,
         to_cpu: bool,
+        use_runai_model_streamer: bool = True,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         primary_weights = TextEncoderLoader.Source(
             model_path,
@@ -377,20 +380,25 @@ class TextEncoderLoader(ComponentLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights, to_cpu)
+        yield from self._get_weights_iterator(
+            primary_weights, to_cpu, use_runai_model_streamer
+        )
 
         secondary_weights = cast(
             Iterable[TextEncoderLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source, to_cpu)
+            yield from self._get_weights_iterator(
+                source, to_cpu, use_runai_model_streamer
+            )
 
     def load_customized(
         self,
         component_model_path: str,
         server_args: ServerArgs,
         module_name: str,
+        use_runai_model_streamer: bool = True,
         **kwargs,
     ):
         """Load the text encoders based on the model path, and inference args."""
@@ -430,6 +438,7 @@ class TextEncoderLoader(ComponentLoader):
             server_args,
             encoder_dtype,
             process_group=process_group,
+            use_runai_model_streamer=use_runai_model_streamer,
         )
 
     def load_model(
@@ -440,6 +449,7 @@ class TextEncoderLoader(ComponentLoader):
         dtype: str = "fp16",
         cpu_offload_flag: bool | None = None,
         process_group: dist.ProcessGroup | None = None,
+        use_runai_model_streamer: bool = True,
     ):
         # Determine CPU offload behavior and target device
 
@@ -457,6 +467,7 @@ class TextEncoderLoader(ComponentLoader):
                     model,
                     model_path,
                     to_cpu=should_offload,
+                    use_runai_model_streamer=use_runai_model_streamer,
                 )
             )
             self.counter_after_loading_weights = time.perf_counter()
@@ -511,7 +522,12 @@ class ImageEncoderLoader(TextEncoderLoader):
         return use_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        use_runai_model_streamer: bool = True,
+        *args,
+        **kwargs,
     ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
@@ -537,6 +553,7 @@ class ImageEncoderLoader(TextEncoderLoader):
             server_args.pipeline_config.image_encoder_precision,
             cpu_offload_flag=server_args.image_encoder_cpu_offload,
             process_group=kwargs.get("process_group", None),
+            use_runai_model_streamer=use_runai_model_streamer,
         )
 
 
@@ -651,7 +668,14 @@ class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        process_group: dist.ProcessGroup | None = None,
+        use_runai_model_streamer: bool = True,
+        *args,
+        **kwargs,
     ):
         """Load the transformer based on the model path, and inference args."""
         process_group = kwargs.get("process_group", None)
@@ -708,6 +732,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             process_group=process_group,  # Pass process group for disagg mode
+            use_runai_model_streamer=use_runai_model_streamer,
         )
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -791,6 +816,7 @@ class PipelineComponentLoader:
         transformers_or_diffusers: str,
         server_args: ServerArgs,
         process_group: dist.ProcessGroup | None = None,
+        use_runai_model_streamer: bool = True,
     ):
         """
         Load a pipeline module.
@@ -816,6 +842,7 @@ class PipelineComponentLoader:
                 module_name,
                 transformers_or_diffusers,
                 process_group=process_group,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
         except Exception as e:
             logger.error(

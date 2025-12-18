@@ -80,6 +80,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     process_group: torch.distributed.ProcessGroup | None = None,
+    use_runai_model_streamer: bool = True,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
@@ -194,7 +195,9 @@ def maybe_load_fsdp_model(
             process_group=process_group,
         )
 
-    weight_iterator = safetensors_weights_iterator(weight_dir_list)
+    weight_iterator = safetensors_weights_iterator(
+        weight_dir_list, use_runai_model_streamer=use_runai_model_streamer
+    )
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
 
     # Count loaded parameters for debugging
@@ -301,6 +304,7 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
+    use_runai_model_streamer: bool = True,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict

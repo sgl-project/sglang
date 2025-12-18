@@ -11,7 +11,7 @@ import argparse
 import os
 from abc import ABC, abstractmethod
 from enum import IntEnum, auto
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 import torch
 from tqdm import tqdm
@@ -38,6 +38,36 @@ logger = init_logger(__name__)
 class DisaggregationMode(IntEnum):
     NONE_DIT = auto()
     DIT = auto()
+
+
+def should_load_module(module_name: str, enable_disagg: bool) -> bool:
+    if not enable_disagg:
+        return True
+
+    # Disaggregation Logic:
+    # DiT Ranks load: transformer, transformer_2 (if MoE)
+    # Non-DiT Ranks load: text_encoder, vae, tokenizer, scheduler, etc.
+
+    module_name = module_name.lower()
+    # TODO: better abstraction
+    is_common_modules = "scheduler" in module_name
+    if is_common_modules:
+        return True
+
+    is_denoising_required_modules = "transformer" in module_name
+    from sglang.multimodal_gen.runtime.distributed.dist_utils import (
+        get_disagg_communicator,
+    )
+
+    comm = get_disagg_communicator()
+
+    if comm.is_dit_rank():
+        should_load = is_denoising_required_modules
+        return should_load
+    else:
+        # Non-DiT rank
+        should_load = not is_denoising_required_modules
+        return should_load
 
 
 class ComposedPipelineBase(ABC):
@@ -241,43 +271,6 @@ class ComposedPipelineBase(ABC):
         loaded_modules: Optional[Dict[str, torch.nn.Module]] = None,
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
-
-        def should_load_module(module_name: str) -> bool:
-            return True
-            if not server_args.enable_disagg:
-                return True
-
-            module_name = module_name.lower()
-            # TODO: better abstraction
-            is_common_modules = "scheduler" in module_name
-            if is_common_modules:
-                return True
-            # Disaggregation Logic:
-            # DiT Ranks load: transformer, transformer_2 (if MoE)
-            # Non-DiT Ranks load: text_encoder, vae, tokenizer, scheduler, etc.
-            is_denoising_required_modules = "transformer" in module_name
-
-            if comm.is_dit_rank():
-                return True
-                should_load = is_denoising_required_modules
-                logger.info(
-                    f"[Disagg Module Loading] Rank {dist.get_rank()} (DiT): "
-                    f"module={module_name}, should_load={should_load}"
-                )
-                return should_load
-            else:  # Non-DiT rank
-                should_load = not is_denoising_required_modules
-                logger.info(
-                    f"[Disagg Module Loading] Rank {dist.get_rank()} (Non-DiT): "
-                    f"module={module_name}, should_load={should_load}"
-                )
-                return should_load
-        #
-        # def get_loading_process_group() -> Optional[dist.ProcessGroup]:
-        #     if not server_args.enable_disagg or comm is None:
-        #         return None
-        #     return comm.get_my_group()
-
         model_index = self._load_config()
 
         # remove keys that are not pipeline modules
@@ -338,8 +331,8 @@ class ComposedPipelineBase(ABC):
 
         # load configs into server_args, in disagg mode
         for module_name, (
-                transformers_or_diffusers,
-                _,
+            transformers_or_diffusers,
+            _,
         ) in model_index.items():
             load_module_name, component_model_path = self.adjust_module_path(
                 module_name, server_args
@@ -355,17 +348,28 @@ class ComposedPipelineBase(ABC):
         model_index = {
             module_name: v
             for module_name, v in model_index.items()
-            if should_load_module(module_name)
+            if should_load_module(module_name, server_args.enable_disagg)
         }
 
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading modules: %s", model_index, main_process_only=False)
 
+        # CRITICAL: Disable runai_model_streamer in disagg mode to avoid deadlock
+        # In disagg mode, ranks load different modules at different times.
+        # runai_model_streamer's set_params() calls find_local_ranks() which does
+        # dist.new_group() - a collective operation requiring all ranks to participate.
+        # This causes deadlock when ranks are not synchronized.
+        # Solution: Use standard safetensors.safe_open instead in disagg mode.
+        if server_args.enable_disagg:
+            use_runai_model_streamer = False
+        else:
+            use_runai_model_streamer = True
+
         components = {}
         for module_name, (
-                transformers_or_diffusers,
-                architecture,
+            transformers_or_diffusers,
+            architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -395,6 +399,7 @@ class ComposedPipelineBase(ABC):
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
                 # process_group=loading_group,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
 
             if module_name in components:

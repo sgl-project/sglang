@@ -49,7 +49,7 @@ def build_pipeline(
     # instantiate the pipelines
     pipeline = pipeline_cls(model_path, server_args)
 
-    logger.info("Pipeline instantiated")
+    logger.debug("Pipeline instantiated")
 
     return cast(PipelineWithLoRA, pipeline)
 
