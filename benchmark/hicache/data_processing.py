@@ -13,12 +13,8 @@ from transformers import PreTrainedTokenizerBase
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-from sglang.bench_serving import (
-    download_and_cache_file,
-    gen_prompt,
-    get_gen_prefix_cache_path,
-    get_hf_token,
-)
+from python.sglang.bench_serving import download_and_cache_hf_file
+from sglang.bench_serving import gen_prompt, get_gen_prefix_cache_path
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64
@@ -105,7 +101,10 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path):
-        dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
+        dataset_path = download_and_cache_hf_file(
+            repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
+            filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+        )
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -368,7 +367,10 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
+            dataset_path = download_and_cache_hf_file(
+                repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
+                filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+            )
 
         # Load the dataset.
         with open(dataset_path) as f:

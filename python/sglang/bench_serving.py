@@ -938,14 +938,17 @@ class TokenAuth(AuthBase):
         return request
 
 
-def get_hf_token():
-    """Get the Hugging Face token from the environment variables or the token file."""
-    token = os.getenv("HF_TOKEN", None)
-    token_path = os.getenv("HF_TOKEN_PATH", None)
-    if token_path and token is None:
-        with open(token_path, "r") as f:
-            token = f.read().strip()
-    return token
+def download_and_cache_hf_file(
+    repo_id: str,
+    filename: str,
+    repo_type: str = "dataset",
+):
+    """Download a file from Hugging Face and cache it locally."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(
+        repo_id=repo_id, filename=filename, local_dir="/tmp", repo_type=repo_type
+    )
 
 
 def download_and_cache_file(
@@ -1196,7 +1199,10 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not is_file_valid_json(dataset_path) and dataset_path == "":
-        dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
+        dataset_path = download_and_cache_hf_file(
+            repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
+            filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+        )
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -1308,7 +1314,10 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not is_file_valid_json(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
+            dataset_path = download_and_cache_hf_file(
+                repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
+                filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+            )
 
         # Load the dataset.
         with open(dataset_path) as f:
