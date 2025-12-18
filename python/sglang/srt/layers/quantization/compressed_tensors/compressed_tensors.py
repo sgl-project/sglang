@@ -54,10 +54,10 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
-
 
 if TYPE_CHECKING:
     from sglang.srt.models.utils import WeightsMapper
