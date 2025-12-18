@@ -96,11 +96,8 @@ class SWAChunkCache(ChunkCache):
 
         if prelen >= thresh:
             new_evicted_seqlen_local = (
-                (prelen // attention_chunk_size * attention_chunk_size)
-                - attention_chunk_size
-                if not self.is_local_attention
-                else 0
-            )
+                prelen // attention_chunk_size * attention_chunk_size
+            ) - (attention_chunk_size if not self.is_local_attention else 0)
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]
