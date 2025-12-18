@@ -705,16 +705,17 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
-            utilization_rate = torch.mean(utilization_rate_tensor).item()
-            self._history.append(utilization_rate)
+            utilization_rate_gpu = torch.mean(compute_utilization_rate(gpu_physical_count))
+
+            utilization_rate_cpu = utilization_rate_gpu.item()
+            self._history.append(utilization_rate_cpu)
 
             gpu_physical_count_sum = gpu_physical_count.sum().item()
 
             logger.info(
                 f"[Expert Balancedness] "
                 f"forward_pass_id={forward_pass_id} "
-                f"current_pass_balancedness={utilization_rate:.03f} "
+                f"current_pass_balancedness={utilization_rate_cpu:.03f} "
                 f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in self._history.mean().items())} "
                 f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
