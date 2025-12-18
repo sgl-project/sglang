@@ -228,9 +228,11 @@ def popen_launch_server_for_base_model(
     config: BaseModelConfig,
 ) -> "subprocess.Popen":
     """Launch server for a base model with appropriate configuration."""
-    # Set environment variables
+    # Build environment - start with current env and add config-specific vars
+    env = os.environ.copy()
     for key, value in config.env_vars.items():
-        os.environ[key] = value
+        env[key] = value
+        print(f"Setting env: {key}={value}")
 
     # Build other_args
     other_args = list(config.other_args)
@@ -248,6 +250,7 @@ def popen_launch_server_for_base_model(
         base_url=base_url,
         timeout=timeout,
         other_args=other_args,
+        env=env,  # Pass environment explicitly
     )
     return process
 
