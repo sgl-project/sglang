@@ -43,7 +43,7 @@ def _can_p2p(rank: int, world_size: int) -> bool:
 
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
-    _MAX_CAR_SIZE = 8192 * 1024 * 4
+    _MAX_CAR_SIZE = 8192 * 1024
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024

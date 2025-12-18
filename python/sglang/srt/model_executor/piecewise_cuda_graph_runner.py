@@ -265,12 +265,14 @@ class PiecewiseCudaGraphRunner:
                 )
 
                 with set_compiled(True), enable_piecewise_cuda_graph_compile():
-                    warmup_range = (
+                    compile_range = (
                         tqdm.tqdm(list(reversed(self.capture_num_tokens)))
                         if get_tensor_model_parallel_rank() == 0
                         else reversed(self.capture_num_tokens)
                     )
-                    for num_tokens in warmup_range:
+                    for _, num_tokens in enumerate(compile_range):
+                        if get_tensor_model_parallel_rank() == 0:
+                            compile_range.set_description(f"Compiling num tokens ({num_tokens=})")
                         self.warmup_torch_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
