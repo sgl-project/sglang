@@ -238,7 +238,6 @@ class DisaggregatedExecutor(PipelineExecutor):
     def _broadcast_batch_in_dit_group(self, batch: Req):
         """Broadcast batch data within DiT group after master receives from Non-DiT."""
         # This ensures all DiT workers have the input for SP/TP parallel processing
-        print(f"_broadcast_batch_in_dit_group...")
         from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 
         # Step 1: Broadcast metadata info so all workers know what tensors to expect

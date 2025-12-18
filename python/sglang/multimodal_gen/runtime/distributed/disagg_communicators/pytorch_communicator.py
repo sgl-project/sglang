@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import Work
 
-from sglang.multimodal_gen.runtime.communication.base_communicator import (
+from sglang.multimodal_gen.runtime.distributed.disagg_communicators.base_communicator import (
     DisaggCommunicator,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
