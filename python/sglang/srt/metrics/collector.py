@@ -28,6 +28,7 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 
 logger = logging.getLogger(__name__)
 
+
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
     """
     Get the histogram configuration from the environment variable.
@@ -710,9 +711,7 @@ class SchedulerMetricsCollector:
 
     def increment_gpu_execution_seconds(self, category: str, t: float):
         logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
-        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(
-            t
-        )
+        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
