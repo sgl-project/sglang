@@ -26,7 +26,7 @@ class DeviceTimer:
     def _report(self):
         while len(self._intervals) >= self._DELAY_THRESHOLD:
             interval = self._intervals.popleft()
-            self._reporter(interval.category, interval.elapsed_time())
+            self._reporter(interval.category, interval.elapsed_time() / 1000.0)
 
 
 @dataclass
