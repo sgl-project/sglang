@@ -768,9 +768,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
-        new_seq_lens = batch.seq_lens + accept_length
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
@@ -816,6 +813,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
             output_predict = predict
+
+        new_seq_lens = batch.seq_lens + accept_length
+        verify_done = torch.get_device_module(self.device).Event()
+        verify_done.record()
 
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
