@@ -47,8 +47,10 @@ class TestMiniMaxM2Unified(unittest.TestCase):
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
-                    "--tp=8",
-                    "--ep=8",
+                    "--tp",
+                    "8",
+                    "--ep",
+                    "8",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],

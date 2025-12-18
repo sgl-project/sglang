@@ -45,7 +45,8 @@ class TestQwen3235BUnified(unittest.TestCase):
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
-                    "--tp=8",
+                    "--tp",
+                    "8",
                 ],
             ),
         ]

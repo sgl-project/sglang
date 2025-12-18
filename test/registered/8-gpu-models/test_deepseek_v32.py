@@ -1,11 +1,7 @@
-"""Unified DeepSeek V3.2 performance and accuracy tests using nightly_metrics.
+"""Unified DeepSeek V3.2 performance and accuracy tests using run_combined_tests.
 
-This file combines:
-- test_deepseek_v32_perf.py (performance with 4 variants)
-- test_deepseek_v32_tp.py (accuracy for pure_tp and partial_tp variants)
-
-It uses nightly_metrics.run_metrics() to run both performance and accuracy
-for standard model configurations.
+This file tests the 4 variants from test_deepseek_v32_perf.py with both
+performance and accuracy tests.
 
 Custom backend tests remain separate:
 - test_deepseek_v32_nsabackend.py (NSA backend variants with custom eval)
@@ -25,9 +21,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
 # Registered to nightly-8-gpu-h200-basic suite
-# This suite should be run with --timeout-per-file=12000 (200 minutes)
-# because each test runs 5 variants with both perf + accuracy (~100+ minutes)
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-h200-basic", nightly=True)
+# This suite should be run with --timeout-per-file=8000 (133 minutes)
+# because each test runs 4 variants with both perf + accuracy
+register_cuda_ci(est_time=8000, suite="nightly-8-gpu-h200-basic", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
@@ -35,13 +31,11 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 class TestDeepseekV32Unified(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
-    Tests 6 variants:
-    - basic: Standard TP=8 + DP=8 with dp-attention
-    - mtp: Basic + EAGLE speculative decoding
-    - nsa: NSA backend with flashmla + DP=8
-    - pure_tp: Pure TP=8 without DP
-    - partial_tp: Partial TP=8 + DP=4 (hybrid parallelism)
-    - tp+mtp: Pure TP=8 + EAGLE speculative decoding (no DP)
+    Tests 4 variants (matching test_deepseek_v32_perf.py on main):
+    - dp: Standard TP=8 + DP=8 with dp-attention
+    - dp+mtp: DP + EAGLE speculative decoding
+    - tp: Pure TP=8 only
+    - tp+mtp: Pure TP=8 + EAGLE speculative decoding
 
     Each variant runs BOTH:
     - Performance test (using NightlyBenchmarkRunner)
@@ -54,103 +48,82 @@ class TestDeepseekV32Unified(unittest.TestCase):
         print("RUNNING: TestDeepseekV32Unified.test_deepseek_v32_all_variants")
         print("=" * 80)
 
-        # Define all model variants
+        # Define all model variants (matching test_deepseek_v32_perf.py on main)
         variants = [
-            # Variant: "basic" (from test_deepseek_v32_perf.py)
+            # Variant: "dp"
             # Standard TP=8 + DP=8 with dp-attention
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
-                    "--tp=8",
-                    "--dp=8",
+                    "--tp",
+                    "8",
+                    "--dp",
+                    "8",
                     "--enable-dp-attention",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
             ),
-            # Variant: "mtp" (from test_deepseek_v32_perf.py)
-            # Basic + EAGLE speculative decoding
+            # Variant: "dp+mtp"
+            # DP + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
-                    "--tp=8",
-                    "--dp=8",
+                    "--tp",
+                    "8",
+                    "--dp",
+                    "8",
                     "--enable-dp-attention",
-                    "--speculative-algorithm=EAGLE",
-                    "--speculative-num-steps=3",
-                    "--speculative-eagle-topk=1",
-                    "--speculative-num-draft-tokens=4",
-                    "--mem-frac=0.7",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--mem-frac",
+                    "0.7",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
             ),
-            # Variant: "nsa" (from test_deepseek_v32_perf.py)
-            # NSA backend with flashmla + DP=8
+            # Variant: "tp"
+            # Pure TP=8 only
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
-                    "--tp=8",
-                    "--dp=8",
-                    "--enable-dp-attention",
-                    "--attention-backend=nsa",
-                    "--nsa-prefill-backend=flashmla_sparse",
-                    "--nsa-decode-backend=flashmla_kv",
+                    "--tp",
+                    "8",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
             ),
-            # Variant: "pure_tp" (from test_deepseek_v32_perf.py + test_deepseek_v32_tp.py)
-            # Pure TP=8 without DP (NSA backend with flashmla)
+            # Variant: "tp+mtp"
+            # Pure TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
-                    "--tp=8",
-                    "--attention-backend=nsa",
-                    "--nsa-prefill-backend=flashmla_sparse",
-                    "--nsa-decode-backend=flashmla_kv",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
-            ),
-            # Variant: "partial_tp" (from test_deepseek_v32_tp.py)
-            # Partial TP=8 + DP=4 with dp-attention (hybrid parallelism)
-            ModelLaunchSettings(
-                DEEPSEEK_V32_MODEL_PATH,
-                tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp=8",
-                    "--dp=4",
-                    "--enable-dp-attention",
-                    "--attention-backend=nsa",
-                    "--nsa-prefill-backend=flashmla_sparse",
-                    "--nsa-decode-backend=flashmla_kv",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
-            ),
-            # Variant: "tp+mtp" (from test_deepseek_v32_perf.py)
-            # Pure TP=8 + EAGLE speculative decoding (no DP)
-            ModelLaunchSettings(
-                DEEPSEEK_V32_MODEL_PATH,
-                tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp=8",
-                    "--speculative-algorithm=EAGLE",
-                    "--speculative-num-steps=3",
-                    "--speculative-eagle-topk=1",
-                    "--speculative-num-draft-tokens=4",
-                    "--mem-frac=0.7",
+                    "--tp",
+                    "8",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--mem-frac",
+                    "0.7",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],

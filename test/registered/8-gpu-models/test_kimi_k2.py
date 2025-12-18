@@ -45,9 +45,12 @@ class TestKimiK2Unified(unittest.TestCase):
                 tp_size=8,
                 extra_args=[
                     "--trust-remote-code",
-                    "--tp=8",
-                    "--tool-call-parser=kimi_k2",
-                    "--reasoning-parser=kimi_k2",
+                    "--tp",
+                    "8",
+                    "--tool-call-parser",
+                    "kimi_k2",
+                    "--reasoning-parser",
+                    "kimi_k2",
                 ],
             ),
         ]
