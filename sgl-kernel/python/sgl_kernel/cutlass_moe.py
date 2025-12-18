@@ -57,6 +57,7 @@ def cutlass_w4a8_moe_mm(
     s_strides: torch.tensor,
     chunk_size: int = 128,
     topk: int = 8,
+    expected_m_per_group: int = 64,
 ):
     """
     Perform grouped matrix multiplication between int4 weights and fp8 activations.
@@ -83,6 +84,8 @@ def cutlass_w4a8_moe_mm(
         d_strides: Strides information for D matrices
         s_strides: Strides information for b_scales matrices
         chunk_size: Number of elements each scale value applies to (K//512), default to 128
+        topk: Number of top experts to process per token, default to 8
+        expected_m_per_group: Expected m per group, default to 64
 
     Requirements:
         - All tensors must be on a CUDA device
@@ -109,4 +112,5 @@ def cutlass_w4a8_moe_mm(
         s_strides,
         chunk_size,
         topk,
+        expected_m_per_group,
     )

@@ -79,10 +79,12 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
-  uint32_t const m = a_tensors.size(0) / topk;
-  uint32_t const n = d_tensors.size(1);
-  uint32_t const k = a_tensors.size(1);
+    int64_t topk,
+    int64_t expected_m_per_group) {
+  // ll and normal: int(num_max_dispatch_tokens_per_rank * rank / num_experts);  other: int(m / num_local_experts * topk)
+  uint32_t const m = expected_m_per_group;
+  uint32_t const n = d_tensors.size(-1);
+  uint32_t const k = a_tensors.size(-1);
 
   if (n == 4096 && k == 7168) {
     // group gemm 1
@@ -102,6 +104,20 @@ void dispatch_w4a8_moe_mm_sm90(
           chunk_size);
     } else if (m <= 16) {
       invoke_gemm<SM90_CO<128, 16, 512, 2, 1, 1>>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
+    } else if (m <= 64) {
+      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -161,6 +177,20 @@ void dispatch_w4a8_moe_mm_sm90(
     // group gemm 2
     if (m <= 8) {
       invoke_gemm<SM90_PP<64, 16, 512, 1, 1, 1>>(
+          d_tensors,
+          a_tensors,
+          b_tensors,
+          a_scales,
+          b_scales,
+          expert_offsets,
+          problem_sizes,
+          a_strides,
+          b_strides,
+          d_strides,
+          s_strides,
+          chunk_size);
+    } else if (m <= 64) {
+      invoke_gemm<SM90_CO<128, 32, 512, 1, 1, 1>>(
           d_tensors,
           a_tensors,
           b_tensors,
@@ -368,7 +398,8 @@ void cutlass_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
+    int64_t topk,
+    int64_t expected_m_per_group) {
   dispatch_w4a8_moe_mm_sm90(
       d_tensors,
       a_tensors,
@@ -382,5 +413,6 @@ void cutlass_w4a8_moe_mm_sm90(
       d_strides,
       s_strides,
       chunk_size,
-      topk);
+      topk,
+      expected_m_per_group);
 }
