@@ -13,8 +13,10 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
@@ -40,6 +42,7 @@ class FunctionCallParser:
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
+        "deepseekv32": DeepSeekV32Detector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "gpt-oss": GptOssDetector,
@@ -52,6 +55,7 @@ class FunctionCallParser:
         "qwen3_coder": Qwen3CoderDetector,
         "step3": Step3Detector,
         "minimax-m2": MinimaxM2Detector,
+        "interns1": InternlmDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -152,7 +156,7 @@ class FunctionCallParser:
             tool_structures.append(
                 StructuresResponseFormat(
                     begin=info.begin,
-                    schema=schema,  # type: ignore
+                    schema=schema or {},  # type: ignore
                     end=info.end,
                 )
             )

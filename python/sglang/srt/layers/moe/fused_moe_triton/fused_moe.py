@@ -434,6 +434,7 @@ def fused_experts_impl(
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
+        per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
 

@@ -176,7 +176,7 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_decode_backend(self):
-        from sglang.srt.layers.attention.ascend_backend import (
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
             AscendAttnMultiStepDraftBackend,
         )
 
@@ -231,7 +231,9 @@ class DraftBackendFactory:
         return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_ascend_prefill_backend(self):
-        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+            AscendAttnBackend,
+        )
 
         return AscendAttnBackend(self.draft_model_runner)
 

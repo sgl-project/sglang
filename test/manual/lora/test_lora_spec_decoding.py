@@ -15,7 +15,7 @@
 import multiprocessing as mp
 import unittest
 
-from utils import (
+from lora_utils import (
     CI_MULTI_LORA_MODELS,
     LoRAAdaptor,
     LoRAModelCase,

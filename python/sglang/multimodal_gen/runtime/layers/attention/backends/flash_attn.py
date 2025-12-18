@@ -7,7 +7,6 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
