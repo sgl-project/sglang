@@ -74,7 +74,11 @@ class BaseModelConfig:
 # Model path mapping for different platforms:
 # - MI300X (in-house): lmsys/gpt-oss-*-bf16
 # - MI325X (in-house): openai/gpt-oss-*
-AMD_BASE_MODELS_TP8 = [
+# NOTE: TP=8 models are internal/private and not available on upstream CI runners.
+# These models are only available on in-house MI300X/MI325X machines.
+# The list is kept here for reference and local testing.
+# To enable for in-house testing, set AMD_ENABLE_TP8_MODELS=1 environment variable.
+AMD_BASE_MODELS_TP8_INTERNAL = [
     # GPT-OSS-20B - smaller model, run first for faster feedback
     BaseModelConfig(
         model_path="lmsys/gpt-oss-20b-bf16",
@@ -157,6 +161,13 @@ AMD_BASE_MODELS_TP8 = [
         },
     ),
 ]
+
+# Enable internal models only if explicitly requested via environment variable
+AMD_BASE_MODELS_TP8 = (
+    AMD_BASE_MODELS_TP8_INTERNAL
+    if os.environ.get("AMD_ENABLE_TP8_MODELS", "0") == "1"
+    else []
+)
 
 
 def check_model_available(model_path: str) -> bool:
