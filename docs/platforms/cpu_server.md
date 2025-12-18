@@ -54,29 +54,60 @@ docker run \
 
 ### Install From Source
 
-If you'd prefer to install SGLang in a bare metal environment,
-the command list is as below.
-It is worth noting that the environment variable `SGLANG_USE_CPU_ENGINE=1`
-is required to enable SGLang service with CPU engine.
+If you prefer to install SGLang in a bare metal environment,
+the setup process is as follows:
+
+Please install the required packages and libraries beforehand if
+they are not already present on your system.
+You can refer to the Ubuntu-based installation commands in
+[the Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile#L11)
+for guidance.
+
+1. Install `uv` package manager, then create and activate a virtual environment:
 
 ```bash
-# Create and activate a conda environment
-conda create -n sgl-cpu python=3.12 -y
-conda activate sgl-cpu
+# Taking '/opt' as the example uv env folder, feel free to change it as needed
+cd /opt
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+uv venv --python 3.12
+source .venv/bin/activate
+```
 
-# Set PyTorch CPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip config set global.index-url https://download.pytorch.org/whl/cpu
-pip config set global.extra-index-url https://pypi.org/simple
+2. Create a config file to direct the installation channel
+    (a.k.a. index-url) of `torch` related packages:
 
-# Check if some conda related environment variables have been set
-env | grep -i conda
-# The following environment variable settings are required
-# if they have not been set properly
-export CONDA_EXE=$(which conda)
-export CONDA_ROOT=${CONDA_EXE}/../..
-export CONDA_PREFIX=${CONDA_ROOT}/envs/sgl-cpu
-export PATH=${PATH}:${CONDA_ROOT}/bin:${CONDA_ROOT}/condabin
+```bash
+vim .venv/uv.toml
+```
 
+Press 'a' to enter insert mode of `vim`, paste the following content into the created file
+
+```file
+[[index]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cpu"
+
+[[index]]
+name = "torchvision"
+url = "https://download.pytorch.org/whl/cpu"
+
+[[index]]
+name = "triton"
+url = "https://download.pytorch.org/whl/cpu"
+
+```
+
+Save the file (in `vim`, press 'esc' to exit insert mode, then ':x+Enter'),
+and set it as the default `uv` config.
+
+```bash
+export UV_CONFIG_FILE=/opt/.venv/uv.toml
+```
+
+3. Clone the `sglang` source code and build the packages
+
+```bash
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
@@ -86,21 +117,50 @@ git checkout <YOUR-DESIRED-VERSION>
 cd python
 cp pyproject_cpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
-pip install --upgrade pip setuptools
-conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install .
-pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
+uv pip install --upgrade pip setuptools
+uv pip install .
+uv pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
 
 # Build the CPU backend kernels
 cd ../sgl-kernel
 cp pyproject_cpu.toml pyproject.toml
-pip install .
-
-# Other required environment variables
-# Recommend to set these in ~/.bashrc in order not to set every time in a new terminal
-export SGLANG_USE_CPU_ENGINE=1
-export LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so:${CONDA_PREFIX}/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libtbbmalloc.so.2
+uv pip install .
 ```
+
+4. Set the required environment variables
+
+```bash
+export SGLANG_USE_CPU_ENGINE=1
+
+# Set 'LD_LIBRARY_PATH' and 'LD_PRELOAD' to ensure the libs can be loaded by sglang processes
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu
+export LD_PRELOAD=${LD_PRELOAD}:/opt/.venv/lib/libiomp5.so:${LD_LIBRARY_PATH}/libtcmalloc.so.4:${LD_LIBRARY_PATH}/libtbbmalloc.so.2
+```
+
+Notes:
+
+- Note that the environment variable `SGLANG_USE_CPU_ENGINE=1`
+    is required to enable the SGLang service with the CPU engine.
+
+- If you encounter code compilation issues during the `sgl-kernel` building process,
+    please check your `gcc` and `g++` versions and upgrade them if they are outdated.
+    It is recommended to use `gcc-13` and `g++-13` as they have been verified
+    in the official Docker container.
+
+- The system library path is typically located in one of the following directories:
+    `~/.local/lib/`, `/usr/local/lib/`, `/usr/local/lib64/`, `/usr/lib/`, `/usr/lib64/`
+    and `/usr/lib/x86_64-linux-gnu/`. In the above example commands, `/usr/lib/x86_64-linux-gnu`
+    is used. Please adjust the path according to your server configuration.
+
+- It is recommended to add the following to your `~/.bashrc` file to
+    avoid setting these variables every time you open a new terminal:
+
+    ```bash
+    source .venv/bin/activate
+    export SGLANG_USE_CPU_ENGINE=1
+    export LD_LIBRARY_PATH=<YOUR-SYSTEM-LIBRARY-FOLDER>
+    export LD_PRELOAD=<YOUR-LIBS-PATHS>
+    ```
 
 ## Launch of the Serving Engine
 
@@ -154,7 +214,7 @@ Notes:
 ## Benchmarking with Requests
 
 You can benchmark the performance via the `bench_serving` script.
-Run the command in another terminal.
+Run the command in another terminal. An example command would be:
 
 ```bash
 python -m sglang.bench_serving   \
@@ -166,51 +226,91 @@ python -m sglang.bench_serving   \
     --random-range-ratio 1.0
 ```
 
-The detail explanations of the parameters can be looked up by the command:
+Detailed parameter descriptions are available via the command:
 
 ```bash
 python -m sglang.bench_serving -h
 ```
 
-Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
-and sent via the command line (e.g. using `curl`) or via your own script.
+Additionally, requests can be formatted using
+[the OpenAI Completions API](https://docs.sglang.io/basic_usage/openai_api_completions.html)
+and sent via the command line (e.g., using `curl`) or through your own scripts.
 
-## Example: Running DeepSeek-V3.1-Terminus
+## Example Usage Commands
 
-An example command to launch service for W8A8_INT8 DeepSeek-V3.1-Terminus on a Xeon® 6980P server:
+Large Language Models can range from fewer than 1 billion to several hundred billion parameters.
+Dense models larger than 20B are expected to run on flagship 6th Gen Intel® Xeon® processors
+with dual sockets and a total of 6 sub-NUMA clusters. Dense models of approximately 10B parameters or fewer,
+or MoE (Mixture of Experts) models with fewer than 10B activated parameters, can run on more common
+4th generation or newer Intel® Xeon® processors, or utilize a single socket of the flagship 6th Gen Intel® Xeon® processors.
+
+### Example: Running DeepSeek-V3.1-Terminus
+
+An example command to launch service of W8A8_INT8 DeepSeek-V3.1-Terminus on a Xeon® 6980P server:
 
 ```bash
-python -m sglang.launch_server                                   \
-    --model IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8   \
-    --trust-remote-code                                          \
-    --disable-overlap-schedule                                   \
-    --device cpu                                                 \
-    --quantization w8a8_int8                                     \
-    --host 0.0.0.0                                               \
-    --mem-fraction-static 0.8                                    \
-    --enable-torch-compile                                       \
-    --torch-compile-max-bs 4                                     \
+python -m sglang.launch_server                                 \
+    --model IntervitensInc/DeepSeek-V3.1-Terminus-Channel-int8 \
+    --trust-remote-code                                        \
+    --disable-overlap-schedule                                 \
+    --device cpu                                               \
+    --quantization w8a8_int8                                   \
+    --host 0.0.0.0                                             \
+    --enable-torch-compile                                     \
+    --torch-compile-max-bs 4                                   \
     --tp 6
 ```
 
-Similarly, an example command to launch service for FP8 DeepSeek-V3.1-Terminus would be:
+Similarly, an example command to launch service of FP8 DeepSeek-V3.1-Terminus would be:
 
 ```bash
-python -m sglang.launch_server                 \
-    --model deepseek-ai/DeepSeek-V3.1-Terminus \
-    --trust-remote-code                        \
-    --disable-overlap-schedule                 \
-    --device cpu                               \
-    --host 0.0.0.0                             \
-    --mem-fraction-static 0.8                  \
-    --enable-torch-compile                     \
-    --torch-compile-max-bs 4                   \
+python -m sglang.launch_server                     \
+    --model deepseek-ai/DeepSeek-V3.1-Terminus     \
+    --trust-remote-code                            \
+    --disable-overlap-schedule                     \
+    --device cpu                                   \
+    --host 0.0.0.0                                 \
+    --enable-torch-compile                         \
+    --torch-compile-max-bs 4                       \
     --tp 6
 ```
 
 Note: Please set `--torch-compile-max-bs` to the maximum desired batch size for your deployment,
 which can be up to 16. The value `4` in the examples is illustrative.
 
-Then you can test with `bench_serving` command or construct your own command or script
-following [the benchmarking example](#benchmarking-with-requests).
+### Example: Running Llama-3.2-3B
+
+An example command to launch service of Llama-3.2-3B with BF16 precision:
+
+```bash
+python -m sglang.launch_server                     \
+    --model meta-llama/Llama-3.2-3B-Instruct       \
+    --trust-remote-code                            \
+    --disable-overlap-schedule                     \
+    --device cpu                                   \
+    --host 0.0.0.0                                 \
+    --enable-torch-compile                         \
+    --torch-compile-max-bs 16                      \
+    --tp 2
+```
+
+The example command to launch service of W8A8_INT8 version of Llama-3.2-3B:
+
+```bash
+python -m sglang.launch_server                     \
+    --model RedHatAI/Llama-3.2-3B-quantized.w8a8   \
+    --trust-remote-code                            \
+    --disable-overlap-schedule                     \
+    --device cpu                                   \
+    --quantization w8a8_int8                       \
+    --host 0.0.0.0                                 \
+    --enable-torch-compile                         \
+    --torch-compile-max-bs 16                      \
+    --tp 2
+```
+
+Note: The `--torch-compile-max-bs` and `--tp` settings are examples that should be adjusted for your setup.
+For instance, use `--tp 3` to utilize 1 socket with 3 sub-NUMA clusters on an Intel® Xeon® 6980P server.
+
+Once the server have been launched, you can test it using the `bench_serving` command or create
+your own commands or scripts following [the benchmarking example](#benchmarking-with-requests).

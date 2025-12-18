@@ -11,7 +11,7 @@ python3 -m sglang.launch_server \
   --port 30000 \
 ```
 
-> See the [OpenAI APIs section](https://docs.sglang.ai/basic_usage/openai_api_vision.html) for how to send multimodal requests.
+> See the [OpenAI APIs section](https://docs.sglang.io/basic_usage/openai_api_vision.html) for how to send multimodal requests.
 
 ## Supported models
 
