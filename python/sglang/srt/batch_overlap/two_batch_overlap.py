@@ -743,6 +743,7 @@ class TboForwardBatchPreparer:
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
+                return_hidden_states_before_norm=False,
             )
         )
 
