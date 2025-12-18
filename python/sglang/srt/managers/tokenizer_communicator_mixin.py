@@ -45,6 +45,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
@@ -613,6 +615,47 @@ class TokenizerCommunicatorMixin:
                 return result
         except ValueError as e:
             return LoadLoRAAdapterReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
+    async def load_lora_adapter_from_tensors(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromTensorsReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start load Lora adapter from tensors. Lora name=%s",
+                obj.lora_name,
+            )
+
+            async with self.lora_update_lock:
+                new_adapter = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path="__tensor__",
+                    pinned=obj.pinned,
+                )
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                if result.success:
+                    await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+
+                return result
+        except ValueError as e:
+            return LoadLoRAAdapterFromTensorsReqOutput(
                 success=False,
                 error_message=str(e),
             )
