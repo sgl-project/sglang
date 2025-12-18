@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -637,7 +638,7 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["mode"],
         )
 
-        if labels["moe_ep_rank"] == 0:
+        if (labels["moe_ep_rank"] == 0) and envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
