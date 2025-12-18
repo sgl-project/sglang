@@ -449,6 +449,29 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_channel_group and input_quant_none and is_symmetric and is_static
 
+    def _is_dynamic_token_w4(
+        self, weight_quant: BaseModel, input_quant: BaseModel
+        ) -> bool:
+        is_w4 = weight_quant.num_bits == 4
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            or weight_quant.strategy == QuantizationStrategy.GROUP.value
+        )
+        if input_quant is not None:
+            is_token = (
+                weight_strategy
+                and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            )
+            is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+        else:
+            is_token = weight_strategy
+            is_dynamic = not weight_quant.dynamic
+
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return is_w4 and weight_quant.symmetric and is_token and is_dynamic
+
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> CompressedTensorsScheme:
