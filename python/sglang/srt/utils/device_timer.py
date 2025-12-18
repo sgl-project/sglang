@@ -21,7 +21,7 @@ class DeviceTimer:
             self._report()
 
     def _report(self):
-        while True:
+        while len(self._intervals) > 0:
             interval = self._intervals[0]
             if not interval.end_event.query():
                 break
