@@ -12,7 +12,7 @@ from sglang.srt.configs.dots_vlm import DotsVisionConfig
 from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +315,9 @@ class DotsVisionTransformer(PreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
 
         for blk in self.blocks:
             hidden_states = blk(
