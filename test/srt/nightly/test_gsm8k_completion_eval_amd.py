@@ -69,8 +69,26 @@ class BaseModelConfig:
 # - MI300X (in-house): lmsys/gpt-oss-*-bf16
 # - MI325X (in-house): openai/gpt-oss-*
 AMD_BASE_MODELS_TP8 = [
-    # GPT-OSS-20B - smaller model, more likely to be available
-    # Using lmsys path for in-house MI300X testing
+    # GPT-OSS-120B - large model, needs longer timeout
+    BaseModelConfig(
+        model_path="lmsys/gpt-oss-120b-bf16",
+        tp_size=8,
+        accuracy_threshold=0.82,
+        timeout=900,  # 15 minutes for 120B model
+        other_args=[
+            "--chunked-prefill-size",
+            "130172",
+            "--max-running-requests",
+            "128",
+            "--mem-fraction-static",
+            "0.85",
+            "--attention-backend",
+            "triton",
+            "--trust-remote-code",
+        ],
+        env_vars={"SGLANG_USE_AITER": "0"},
+    ),
+    # GPT-OSS-20B - smaller model
     BaseModelConfig(
         model_path="lmsys/gpt-oss-20b-bf16",
         tp_size=8,
