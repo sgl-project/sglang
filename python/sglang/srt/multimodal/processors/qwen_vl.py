@@ -347,9 +347,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     audio_item.feature_attention_mask, dim=1
                 )
 
-        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
-            ret, "video_second_per_grid", None
-        )
+        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None)
+        if second_per_grid_ts is None:
+            second_per_grid_ts = getattr(ret, "video_second_per_grid", None)
 
         process_time = time.perf_counter()
 

@@ -1682,7 +1682,9 @@ class MiniCPMO(MiniCPMBaseModel):
                         flattened.extend(item)
                     else:
                         flattened.append(item)
-                audio_feature_lens_raw = [[item] if not isinstance(item, list) else item for item in flattened]
+                audio_feature_lens_raw = [
+                    [item] if not isinstance(item, list) else item for item in flattened
+                ]
 
         final_audio_embeds = []
 
