@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
-from prometheus_client import Summary
+import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
@@ -239,7 +239,7 @@ class SchedulerMetricsCollector:
         labels: Dict[str, str],
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import Counter, Gauge, Histogram, Summary
 
         self.labels = labels
         self.last_log_time = time.perf_counter()
@@ -639,11 +639,13 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["mode"],
         )
 
-        self.eplb_balancedness = Summary(
-            name="sglang:eplb_balancedness",
-            documentation="Balancedness of MoE in expert parallelism.",
-            labelnames=list(labels.keys()) + ["forward_mode"],
-        )
+        # TODO support ETP
+        if torch.distributed.get_rank() == 0:
+            self.eplb_balancedness = Summary(
+                name="sglang:eplb_balancedness",
+                documentation="Balancedness of MoE in expert parallelism.",
+                labelnames=list(labels.keys()) + ["forward_mode"],
+            )
 
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
