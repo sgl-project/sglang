@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import base64
+import dataclasses
 import os
 import time
 from typing import List, Optional
@@ -76,9 +77,8 @@ def _build_sampling_params_from_request(
 
 
 def _build_req_from_sampling(s: SamplingParams) -> Req:
-    return Req(
-        **shallow_asdict(s),
-    )
+    req_fields = {f.name for f in dataclasses.fields(Req)}
+    return Req(**{k: v for k, v in shallow_asdict(s).items() if k in req_fields})
 
 
 @router.post("/generations", response_model=ImageResponse)
