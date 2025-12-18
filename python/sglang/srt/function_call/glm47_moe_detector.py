@@ -43,9 +43,12 @@ def get_argument_type(
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    if arg_key not in tool.function.parameters["properties"]:
+    properties = (tool.function.parameters or {}).get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    if arg_key not in properties:
         return None
-    return tool.function.parameters["properties"][arg_key].get("type", None)
+    return properties[arg_key].get("type", None)
 
 
 def _convert_to_number(value: str) -> Any:
@@ -178,10 +181,11 @@ class Glm47MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 func_name = func_detail.group(1)
                 func_args = func_detail.group(2)
-                pairs = self.func_arg_regex.findall(func_args)
-
-                # Parse arguments using shared method
-                arguments = self._parse_argument_pairs(pairs, func_name, tools)
+                arguments = {}
+                if func_args:
+                    pairs = self.func_arg_regex.findall(func_args)
+                    # Parse arguments using shared method
+                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": arguments}
