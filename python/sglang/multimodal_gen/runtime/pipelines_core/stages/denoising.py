@@ -720,6 +720,7 @@ class DenoisingStage(PipelineStage):
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
+
         if torch.backends.mps.is_available():
             logger.info(
                 "Memory before deallocating transformer: %s",
@@ -733,6 +734,20 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+
+        # In offline local mode (`sglang generate`), offload transformer weights to CPU
+        # after denoising to reduce peak VRAM during VAE decoding.
+        if current_platform.is_cuda_alike() and server_args.offline_mode:
+            for model in (self.transformer, self.transformer_2):
+                if model is not None:
+                    model.to("cpu")
+            logger.info(
+                "Offloaded denoiser transformer weights to CPU after denoising to reduce peak VRAM during VAE decoding."
+            )
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""

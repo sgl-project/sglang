@@ -218,6 +218,12 @@ class ServerArgs:
     # Workload type
     workload_type: WorkloadType = WorkloadType.T2V
 
+    # Execution context
+    # True when running "offline local mode" (e.g., `sglang generate`), where we can
+    # trade some throughput for lower peak VRAM by aggressively offloading models
+    # between stages. This is set programmatically (not a CLI flag).
+    offline_mode: bool = False
+
     # Cache strategy
     cache_strategy: str = "none"
 

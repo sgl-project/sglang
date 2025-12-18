@@ -140,6 +140,11 @@ class DiffGenerator:
         # First, we need a client to test the server. Initialize it temporarily.
         sync_scheduler_client.initialize(self.server_args)
 
+        # Mark this run as "offline local mode" so worker processes can apply
+        # more aggressive memory-saving behaviors between stages (e.g., offload
+        # the denoiser before VAE decoding to reduce peak VRAM).
+        self.server_args.offline_mode = True
+
         processes = launch_server(self.server_args, launch_http_server=False)
 
         return processes
