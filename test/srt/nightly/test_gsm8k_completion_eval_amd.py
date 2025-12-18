@@ -74,11 +74,8 @@ class BaseModelConfig:
 # Model path mapping for different platforms:
 # - MI300X (in-house): lmsys/gpt-oss-*-bf16
 # - MI325X (in-house): openai/gpt-oss-*
-# NOTE: TP=8 models are internal/private and not available on upstream CI runners.
-# These models are only available on in-house MI300X/MI325X machines.
-# The list is kept here for reference and local testing.
-# To enable for in-house testing, set AMD_ENABLE_TP8_MODELS=1 environment variable.
-AMD_BASE_MODELS_TP8_INTERNAL = [
+# GPT-OSS models - available on upstream CI (cached at /sgl-data/hf-cache/hub/)
+AMD_BASE_MODELS_TP8 = [
     # GPT-OSS-20B - smaller model, run first for faster feedback
     BaseModelConfig(
         model_path="lmsys/gpt-oss-20b-bf16",
@@ -116,58 +113,57 @@ AMD_BASE_MODELS_TP8_INTERNAL = [
         ],
         env_vars={"SGLANG_USE_AITER": "0"},
     ),
-    # GROK1-FP8 - uses aiter backend, needs extended timeout for kernel compilation
-    BaseModelConfig(
-        model_path="lmzheng/grok-1",
-        tp_size=8,
-        accuracy_threshold=0.80,
-        timeout=600,  # 10 minutes for kernel compilation
-        tokenizer_path="Xenova/grok-1-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "0",
-        },
-    ),
-    # GROK1-IN4 - INT4 quantized version
-    BaseModelConfig(
-        model_path="amd/grok-1-W4A8KV8",
-        tp_size=8,
-        accuracy_threshold=0.80,
-        timeout=600,  # 10 minutes for kernel compilation
-        tokenizer_path="Xenova/grok-1-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "1",
-        },
-    ),
 ]
 
-# Enable internal models only if explicitly requested via environment variable
-AMD_BASE_MODELS_TP8 = (
-    AMD_BASE_MODELS_TP8_INTERNAL
-    if os.environ.get("AMD_ENABLE_TP8_MODELS", "0") == "1"
-    else []
-)
+# GROK models - NOT cached on upstream CI yet, uncomment when cached
+# Request to cache: lmzheng/grok-1, amd/grok-1-W4A8KV8, xai-org/grok-2
+# AMD_GROK_MODELS_TP8 = [
+#     # GROK1-FP8 - uses aiter backend, needs extended timeout for kernel compilation
+#     BaseModelConfig(
+#         model_path="lmzheng/grok-1",
+#         tp_size=8,
+#         accuracy_threshold=0.80,
+#         timeout=600,  # 10 minutes for kernel compilation
+#         tokenizer_path="Xenova/grok-1-tokenizer",
+#         other_args=[
+#             "--quantization",
+#             "fp8",
+#             "--attention-backend",
+#             "aiter",
+#             "--mem-fraction-static",
+#             "0.85",
+#             "--trust-remote-code",
+#         ],
+#         env_vars={
+#             "RCCL_MSCCL_ENABLE": "0",
+#             "SGLANG_USE_AITER": "1",
+#             "SGLANG_INT4_WEIGHT": "0",
+#         },
+#     ),
+#     # GROK1-IN4 - INT4 quantized version
+#     BaseModelConfig(
+#         model_path="amd/grok-1-W4A8KV8",
+#         tp_size=8,
+#         accuracy_threshold=0.80,
+#         timeout=600,  # 10 minutes for kernel compilation
+#         tokenizer_path="Xenova/grok-1-tokenizer",
+#         other_args=[
+#             "--quantization",
+#             "fp8",
+#             "--attention-backend",
+#             "aiter",
+#             "--mem-fraction-static",
+#             "0.85",
+#             "--trust-remote-code",
+#         ],
+#         env_vars={
+#             "RCCL_MSCCL_ENABLE": "0",
+#             "SGLANG_USE_AITER": "1",
+#             "SGLANG_INT4_WEIGHT": "1",
+#         },
+#     ),
+# ]
+# AMD_BASE_MODELS_TP8.extend(AMD_GROK_MODELS_TP8)  # Uncomment when GROK models are cached
 
 
 def check_model_available(model_path: str) -> bool:
