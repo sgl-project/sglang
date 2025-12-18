@@ -656,11 +656,12 @@ class ImagePipelineConfig(PipelineConfig):
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         seq_len = latents.shape[1]
 
+        # TODO: reuse code in PipelineConfig::shard_latents_for_sp
         # Pad to next multiple of SP degree if needed
         if seq_len % sp_world_size != 0:
             pad_len = sp_world_size - (seq_len % sp_world_size)
             pad = torch.zeros(
-                (latents.shape[0], pad_len, latents.shape[2]),
+                (*latents.shape[:1], pad_len, *latents.shape[2:]),
                 dtype=latents.dtype,
                 device=latents.device,
             )
