@@ -95,6 +95,10 @@ class RequestTimingMetricsMixin:
     # Calculated as: prefill_end_time_host - prefill_start_time_host
     prefill_launch_latency: Optional[List[Optional[float]]]
 
+    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
+    # This marks when the prefill computation finishes.
+    prefill_finished_ts: Optional[List[Optional[float]]]
+
 
 @dataclass
 class SpeculativeDecodingMetricsMixin:
@@ -248,6 +252,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: Optional[bool] = None
+    num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -731,6 +739,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: bool = False
+    num_items_assigned: Optional[List] = None
+    embedding_ports: Optional[List] = None
 
 
 @dataclass
