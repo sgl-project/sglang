@@ -20,6 +20,7 @@ import time
 from abc import ABC
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
 
@@ -41,6 +42,11 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- Entrypoint -----------------------------------------
 
 _OutputMode = Literal["file", "object"]
+
+
+@dataclass
+class ExpertDistributionMetrics:
+    TODO: TODO
 
 
 class ExpertDistributionRecorder(ABC):
@@ -78,7 +84,7 @@ class ExpertDistributionRecorder(ABC):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
-        yield
+        return {}
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
@@ -157,12 +163,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
             try:
-                yield
+                yield outputs
             finally:
                 self._on_forward_pass_end(forward_pass_id)
+                outputs["metrics"] = TODO
 
     @contextmanager
     def disable_this_region(self):

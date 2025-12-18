@@ -2738,19 +2738,20 @@ class ModelRunner:
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
-        ):
-            output = self._forward_raw(
+        ) as recorder_outputs:
+            ret, can_run_graph = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
             )
+        ret.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
-        return output
+        return ret, can_run_graph
 
     def _forward_raw(
         self,
