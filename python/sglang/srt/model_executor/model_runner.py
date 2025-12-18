@@ -2732,7 +2732,7 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+    ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(
