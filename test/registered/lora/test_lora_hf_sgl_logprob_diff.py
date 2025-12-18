@@ -28,27 +28,23 @@ Usage:
 """
 
 import multiprocessing as mp
-import os
-import sys
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
-# Add sglang to path if needed
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../python"))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
 
-register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
-
-from sglang.test.test_utils import (
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-    CustomTestCase,
-    is_in_ci,
+register_cuda_ci(
+    est_time=300,
+    suite="nightly-1-gpu",
+    nightly=True,
+    disabled="Temporarily disabled, will be fixed later",
 )
+
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 # Test configuration constants
 LORA_BACKEND = "triton"
@@ -510,10 +506,6 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Basic test comparing HF and SGLang LoRA logprobs with small model.
         """
-        # Use a smaller model and shorter prompts for CI
-        if is_in_ci():
-            self.skipTest("Skipping in CI environment - requires large models")
-
         model_path = "meta-llama/Llama-2-7b-hf"
         lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
@@ -529,9 +521,6 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Full test comparing HF and SGLang LoRA logprobs with all prompts.
         """
-        if is_in_ci():
-            self.skipTest("Skipping in CI environment - requires large models")
-
         model_path = "meta-llama/Llama-2-7b-hf"
         lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
         prompts = DEFAULT_TEST_PROMPTS
