@@ -333,13 +333,6 @@ class Scheduler(
 
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
-        
-        # Check whether overlap can be enabled
-        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-            self.enable_overlap = False
-            logger.info(
-                f"Overlap scheduler is disabled when using sparse head for embedding model."
-            )
 
         # Launch a tensor parallel worker
         self.init_model_worker()
