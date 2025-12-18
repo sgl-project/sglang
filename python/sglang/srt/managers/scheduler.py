@@ -1571,34 +1571,20 @@ class Scheduler(
 
                     if not cache_hit:
                         req.grammar_key = key
-                        logger.debug(
-                            f"[TP Rank {self.tp_rank}] Compiling grammar for req {req.rid}, "
-                            f"type={key[0]}"
-                        )
                     else:
-                        logger.debug(
-                            f"[TP Rank {self.tp_rank}] Grammar cache hit for req {req.rid}, "
-                            f"type={key[0]}"
-                        )
                         if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                             error_msg = f"Invalid grammar request with cache hit: {key=}"
                             req.set_finish_with_abort(error_msg)
 
-                    # When TP > 1, always add to grammar_queue for synchronization across ranks
-                    # (even on cache hit, to ensure all ranks participate in the sync)
+                    # When TP > 1, always add to grammar_queue for synchronization across ranks                    
                     if self.tp_size > 1:
                         add_to_grammar_queue = True
                     elif not cache_hit:
-                        # TP == 1: only add to queue if compilation is needed
+                        # TP == 1: only add to queue if we didn't get a cache hit.
                         add_to_grammar_queue = True
             else:
-                # Non-rank-0 workers add to grammar queue for synchronization,
-                # but don't compile grammar (req.grammar stays None)
+                # Non-rank-0 workers add to grammar queue for synchronization, but no compilation.
                 add_to_grammar_queue = True
-                logger.debug(
-                    f"[TP Rank {self.tp_rank}] Skipping grammar compilation for req {req.rid}. "
-                    f"Waiting for rank 0 to compile."
-                )
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -2369,8 +2355,7 @@ class Scheduler(
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
         num_ready_reqs = 0
-        num_timeout_reqs = 0
-        num_skipped_compilation = 0  # Track requests that skip compilation (non-rank-0 or cache hit)
+        num_timeout_reqs = 0        
         for req in self.grammar_queue:
             try:
                 if req.finished():  # It is aborted by AbortReq
@@ -2420,20 +2405,6 @@ class Scheduler(
             )
             num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
 
-            # Log the synchronization result
-            if num_ready_reqs_max > 0:
-                if self.tp_rank == 0:
-                    logger.debug(
-                        f"[TP Rank {self.tp_rank}] Grammar queue sync: "
-                        f"{num_ready_reqs_max} requests ready (compiled on this rank)"
-                    )
-                else:
-                    logger.debug(
-                        f"[TP Rank {self.tp_rank}] Grammar queue sync: "
-                        f"{num_ready_reqs_max} requests ready "
-                        f"({num_skipped_compilation} skipped compilation, delegated to rank 0)"
-                    )
-
             for i in range(num_ready_reqs, num_ready_reqs_max):
                 req = self.grammar_queue[i]
                 if req.finished():  # It is aborted by AbortReq
@@ -2455,8 +2426,8 @@ class Scheduler(
 
         for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
             req = self.grammar_queue[i]
-            # On non-rank-0, req.grammar is None, skip timeout handling
-            # On cache hit, req.grammar is already compiled, skip timeout handling
+            # On non-rank-0, req.grammar is None, skip timeout handling   
+            # Or if we have a cache hit, the grammar is already compiled.         
             if req.grammar is None or not isinstance(req.grammar, futures.Future):
                 continue
             req.grammar.cancel()

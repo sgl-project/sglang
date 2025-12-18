@@ -210,7 +210,8 @@ class Sampler(nn.Module):
 
         if sampling_info.grammars:
             if self.tp_size > 1:
-                # Grammar-aware sampling only runs on TP rank 0; broadcast its choice to keep ranks in sync.
+                # Grammar-aware sampling only runs on TP rank 0
+                # We broadcast its choice to keep ranks in sync.
                 dist.broadcast(
                     batch_next_token_ids,
                     src=self.tp_root_rank,
