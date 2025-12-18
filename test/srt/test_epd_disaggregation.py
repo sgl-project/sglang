@@ -10,10 +10,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_server,
 )
 
 
+@unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
 class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
 
