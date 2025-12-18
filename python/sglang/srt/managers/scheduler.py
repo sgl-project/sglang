@@ -1571,7 +1571,6 @@ class Scheduler(
 
                     if not cache_hit:
                         req.grammar_key = key
-                        add_to_grammar_queue = True
                         logger.debug(
                             f"[TP Rank {self.tp_rank}] Compiling grammar for req {req.rid}, "
                             f"type={key[0]}"
@@ -1584,6 +1583,14 @@ class Scheduler(
                         if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                             error_msg = f"Invalid grammar request with cache hit: {key=}"
                             req.set_finish_with_abort(error_msg)
+
+                    # When TP > 1, always add to grammar_queue for synchronization across ranks
+                    # (even on cache hit, to ensure all ranks participate in the sync)
+                    if self.tp_size > 1:
+                        add_to_grammar_queue = True
+                    elif not cache_hit:
+                        # TP == 1: only add to queue if compilation is needed
+                        add_to_grammar_queue = True
             else:
                 # Non-rank-0 workers add to grammar queue for synchronization,
                 # but don't compile grammar (req.grammar stays None)
@@ -2363,7 +2370,7 @@ class Scheduler(
 
         num_ready_reqs = 0
         num_timeout_reqs = 0
-        num_skipped_compilation = 0  # Track requests that skip compilation (non-rank-0)
+        num_skipped_compilation = 0  # Track requests that skip compilation (non-rank-0 or cache hit)
         for req in self.grammar_queue:
             try:
                 if req.finished():  # It is aborted by AbortReq
@@ -2372,6 +2379,13 @@ class Scheduler(
 
                 # On non-rank-0, req.grammar is None (no compilation needed)
                 if req.grammar is None:
+                    num_ready_reqs += 1
+                    num_skipped_compilation += 1
+                    continue
+
+                # On rank 0 with cache hit, req.grammar is already compiled (not a Future)
+                if not isinstance(req.grammar, futures.Future):
+                    # Grammar already compiled (cache hit), immediately ready
                     num_ready_reqs += 1
                     num_skipped_compilation += 1
                     continue
@@ -2427,6 +2441,9 @@ class Scheduler(
                 # On non-rank-0, req.grammar is None (no compilation needed)
                 if req.grammar is None:
                     continue
+                # On rank 0 with cache hit, req.grammar is already compiled (not a Future)
+                if not isinstance(req.grammar, futures.Future):
+                    continue
                 req.grammar = req.grammar.result()
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
                 if req.grammar is INVALID_GRAMMAR_OBJ:
@@ -2439,7 +2456,8 @@ class Scheduler(
         for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
             req = self.grammar_queue[i]
             # On non-rank-0, req.grammar is None, skip timeout handling
-            if req.grammar is None:
+            # On cache hit, req.grammar is already compiled, skip timeout handling
+            if req.grammar is None or not isinstance(req.grammar, futures.Future):
                 continue
             req.grammar.cancel()
             self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
