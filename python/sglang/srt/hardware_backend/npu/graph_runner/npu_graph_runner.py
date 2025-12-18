@@ -104,7 +104,9 @@ class NPUGraphRunner(CudaGraphRunner):
         model_runner.attn_backend.enable_torch_compile = (
             model_runner.server_args.enable_torch_compile
         )
-        self.enable_torchair_compile = model_runner.server_args.enable_torchair_compile
+        self.enable_npu_torchair_compile = (
+            model_runner.server_args.enable_npu_torchair_compile
+        )
 
         super().__init__(model_runner)
         self.update_attr_name = None
@@ -143,7 +145,7 @@ class NPUGraphRunner(CudaGraphRunner):
         compilation_config = get_global_server_args().compilation_config
         if (
             self.enable_torch_compile
-            and (not self.enable_torchair_compile)
+            and (not self.enable_npu_torchair_compile)
             and (not self.compile_bs or bs in self.compile_bs)
         ):
             compiler = NpuGraphCompiler(
@@ -182,7 +184,7 @@ class NPUGraphRunner(CudaGraphRunner):
                 compiled_function(*args)
 
         else:
-            if self.enable_torchair_compile:
+            if self.enable_npu_torchair_compile:
                 skip_guard_context = torch.compiler.set_stance(
                     skip_guard_eval_unsafe=True
                 )

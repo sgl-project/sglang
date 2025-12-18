@@ -82,16 +82,16 @@ def set_default_server_args(args: "ServerArgs"):
         else:
             args.hicache_mem_layout = "page_first_direct"
 
-    if args.enable_torchair_compile and args.enable_torch_compile:
+    if args.enable_npu_torchair_compile and args.enable_torch_compile:
         raise ValueError(
-            "Cannot enable both --enable-torchair-compile and --enable-torch-compile"
+            "Cannot enable both --enable-npu-torchair-compile and --enable-torch-compile"
         )
 
     if args.disable_cuda_graph and (
-        args.enable_torch_compile or args.enable_torchair_compile
+        args.enable_torch_compile or args.enable_npu_torchair_compile
     ):
         raise ValueError(
-            f"--enable-torch-compile or --enable-torchair-compile is not appropriate for --disable-cuda-graph"
+            f"--enable-torch-compile or --enable-npu-torchair-compile is not appropriate for --disable-cuda-graph"
         )
 
     if args.compilation_config:
@@ -103,21 +103,21 @@ def set_default_server_args(args: "ServerArgs"):
                     f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --disable-cuda-graph"
                 )
 
-            if args.enable_torchair_compile:
+            if args.enable_npu_torchair_compile:
                 raise ValueError(
-                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-torchair-compile"
+                    f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --enable-npu-torchair-compile"
                 )
 
         if args.compilation_config.compiler == "npugraph_ex":
-            args.enable_torchair_compile = True
+            args.enable_npu_torchair_compile = True
 
             if args.disable_cuda_graph:
                 raise ValueError(
                     f"compilation_config.compiler '{args.compilation_config.compiler}' is not appropriate for --disable-cuda-graph"
                 )
 
-        if args.enable_torchair_compile:
-            args.enable_torch_compile = True
+    if args.enable_npu_torchair_compile:
+        args.enable_torch_compile = True
 
 
 @_call_once

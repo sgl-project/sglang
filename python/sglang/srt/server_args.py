@@ -552,7 +552,7 @@ class ServerArgs:
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
-    enable_torchair_compile: bool = False
+    enable_npu_torchair_compile: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: int = 4096
@@ -2376,6 +2376,18 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
+        if not is_npu() and (
+            self.enable_npu_torchair_compile
+            or (
+                self.compilation_config is not None
+                and self.compilation_config.compiler == "npugraph_ex"
+            )
+        ):
+            self.enable_npu_torchair_compile = False
+            logger.warning(
+                "NPU TorchAir compile is disabled, the argument is appropriate for NPU only"
+            )
+
         if is_npu() and not supports_custom_op():
             if self.enable_torch_compile:
                 self.enable_torch_compile = False
@@ -2383,10 +2395,10 @@ class ServerArgs:
                     "Torch compile is disabled because custom ops are not supported"
                 )
 
-            if self.enable_torchair_compile:
-                self.enable_torchair_compile = False
+            if self.enable_npu_torchair_compile:
+                self.enable_npu_torchair_compile = False
                 logger.warning(
-                    "TorchAir compile is disabled because custom ops are not supported"
+                    "NPU TorchAir compile is disabled because custom ops are not supported"
                 )
 
     def _handle_remote_instance_weight_loader_start_seed_via_transfer_engine(self):
@@ -3988,7 +4000,7 @@ class ServerArgs:
             help="Enable debug mode for torch compile",
         )
         parser.add_argument(
-            "--enable-torchair-compile",
+            "--enable-npu-torchair-compile",
             action="store_true",
             help="Optimize the model with Torch Ascend Intermediate Representation compilation. Experimental feature.",
         )
