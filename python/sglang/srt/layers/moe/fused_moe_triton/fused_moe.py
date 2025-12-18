@@ -566,8 +566,6 @@ def fused_experts_impl(
             filter_expert=filter_expert,
         )
 
-        activation = "gelu"
-
         # Activation function with multiplication
         if activation == "silu" and is_gated:
             if gemm1_alpha is not None:
