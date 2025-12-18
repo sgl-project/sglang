@@ -1799,14 +1799,16 @@ class ModelRunner:
             max_running_requests = min(max(heuristic, 2048), 4096)
             log_info_on_rank0(
                 logger,
-                f"req_to_token_pool: max_running_requests={max_running_requests} "
-                f"(heuristic={heuristic}, clamp=[2048,4096]), "
+                f"req_to_token_pool: slots={max_running_requests} "
+                f"(heuristic={heuristic}, clamp=[2048,4096], "
+                f"profiled_max_total_num_tokens={self.max_total_num_tokens}, "
+                f"context_len={self.model_config.context_len}), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
         else:
             log_info_on_rank0(
                 logger,
-                f"req_to_token_pool: max_running_requests={max_running_requests} (from arg), "
+                f"req_to_token_pool: slots={max_running_requests} (from --max-running-requests), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
 
@@ -1863,6 +1865,13 @@ class ModelRunner:
                     f"Use the profiled value instead."
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+            # Clarify the common confusion: req_to_token_pool slots control concurrent request slots,
+            # while max_total_num_tokens controls KV capacity (and later scheduler limits).
+            log_info_on_rank0(
+                logger,
+                f"note: req_to_token_pool slots={max_running_requests}; "
+                f"effective scheduler max_running_requests will be computed later and clamped by slots if needed",
+            )
         else:
             log_info_on_rank0(
                 logger,

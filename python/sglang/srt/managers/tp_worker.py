@@ -297,20 +297,24 @@ class TpModelWorker(BaseTpWorker):
             running_limit = self.max_total_num_tokens // 2
             log_info_on_rank0(
                 logger,
-                f"max_running_requests: no arg, using total_tokens//2 = {running_limit}",
+                f"max_running_requests: no arg, token_limit=total_tokens//2={self.max_total_num_tokens}//2={running_limit}",
             )
         else:
             dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
             running_limit = server_args.max_running_requests // dp_divisor
             log_info_on_rank0(
                 logger,
-                f"max_running_requests: arg={server_args.max_running_requests} // dp_divisor={dp_divisor} = {running_limit}",
+                f"max_running_requests: arg=({server_args.max_running_requests})//dp_divisor({dp_divisor})={running_limit}",
             )
         self.max_running_requests = min(running_limit, token_pool_size)
+        log_info_on_rank0(
+            logger,
+            f"max_running_requests: effective=min(token_limit={running_limit}, req_to_token_pool.slots={token_pool_size})={self.max_running_requests}",
+        )
         if self.max_running_requests < running_limit:
             log_info_on_rank0(
                 logger,
-                f"max_running_requests: clamped by token_pool_size {running_limit} -> {self.max_running_requests}",
+                f"max_running_requests: clamped by req_to_token_pool.slots {running_limit} -> {self.max_running_requests}",
             )
 
         assert self.max_running_requests > 0, "max_running_request is zero"
