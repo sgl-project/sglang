@@ -8,8 +8,16 @@ This test compares:
 1. Deterministic kernel (same batch size)
 2. Deterministic kernel (different batch size)
 
+Setup (Important for MI350/gfx950):
+    If a pre-built sgl-kernel package is installed, uninstall it first:
+        pip uninstall sgl-kernel -y
+    
+    Then build from source:
+        cd sgl-kernel
+        python setup_rocm.py develop
+
 Usage:
-    python test_kernel_ar.py
+    python test_amd_deterministic_custom_allreduce.py
 """
 
 import multiprocessing as mp

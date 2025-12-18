@@ -46,12 +46,34 @@ python setup_rocm.py develop
 python setup_rocm.py bdist_wheel
 ```
 
-**Supported GPU architectures:** gfx942, gfx950
+**Supported GPU architectures:** gfx942 (MI300), gfx950 (MI350)
 
 The build automatically detects your GPU architecture. To manually specify:
 
 ```bash
 AMDGPU_TARGET=gfx942 python setup_rocm.py develop
+```
+
+#### Important: MI350 (gfx950) Installation
+
+If you have a pre-built `sgl-kernel` package installed (e.g., from PyPI), you **must uninstall it first** before using the source build. The pre-built package may not include MI350-specific kernels like the deterministic all-reduce:
+
+```bash
+# Uninstall any pre-built sgl-kernel package
+pip uninstall sgl-kernel -y
+
+# Then build from source
+cd sgl-kernel
+python setup_rocm.py develop
+```
+
+To verify the deterministic all-reduce kernel is available:
+
+```python
+import sgl_kernel
+# These functions should be available:
+print(sgl_kernel.deterministic_all_reduce_reg)
+print(sgl_kernel.deterministic_all_reduce_unreg)
 ```
 
 ## Contribution
@@ -133,9 +155,65 @@ pytest tests/ -v
 pytest tests/test_activation.py -v
 ```
 
-### ROCm/AMD-specific Tests
+### ROCm/AMD Deterministic Inference
 
-For AMD GPUs, there are specific tests for deterministic all-reduce:
+For AMD GPUs (MI300/MI350), SGLang supports deterministic inference using a custom all-reduce kernel.
+
+#### Setup
+
+1. **Uninstall pre-built sgl-kernel** (if installed):
+   ```bash
+   pip uninstall sgl-kernel -y
+   ```
+
+2. **Build from source** (ensures deterministic kernel is included):
+   ```bash
+   cd sgl-kernel
+   python setup_rocm.py develop
+   ```
+
+3. **Pre-compile aiter modules** (required before multi-GPU server launch to avoid deadlock):
+   ```bash
+   # Clean any stale lock files
+   rm -f /path/to/aiter/aiter/jit/build/*/build/.ninja_lock
+   rm -f /path/to/aiter/aiter/jit/build/lock_*
+
+   # Pre-compile aiter modules with single GPU
+   python3 -c "
+   import torch
+   torch.cuda.set_device(0)
+   from aiter.ops.triton.rmsnorm import rms_norm
+   x = torch.randn(1, 4096, dtype=torch.bfloat16, device='cuda:0')
+   weight = torch.randn(4096, dtype=torch.bfloat16, device='cuda:0')
+   rms_norm(x, weight, 1e-6)
+   torch.cuda.synchronize()
+   print('aiter pre-compiled successfully')
+   "
+   ```
+
+#### Running Deterministic Inference
+
+1. **Launch the server**:
+   ```bash
+   source scripts/killall_sglang.sh rocm && \
+   SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM=1 \
+   python -m sglang.launch_server \
+       --model-path Qwen/Qwen3-8B \
+       --tp 8 \
+       --attention-backend triton \
+       --enable-deterministic-inference \
+       --host 127.0.0.1 \
+       --port 30000
+   ```
+
+2. **Test determinism**:
+   ```bash
+   python3 -m sglang.test.test_deterministic --n-trials 50
+   ```
+
+#### ROCm/AMD-specific Kernel Tests
+
+For testing the deterministic all-reduce kernel directly:
 
 ```bash
 # Test deterministic custom all-reduce kernel (requires 2+ GPUs)
