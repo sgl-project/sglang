@@ -11,6 +11,7 @@ diffusion models.
 import multiprocessing as mp
 import os
 import time
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 import numpy as np
@@ -393,10 +394,8 @@ class DiffGenerator:
         sampling_params_kwargs = kwargs.pop("sampling_params_kwargs", None)
 
         # `generate()` only accepts `sampling_params_kwargs`. Merge legacy + new inputs.
-        merged_kwargs: dict = {}
+        merged_kwargs: dict[str, Any] = {}
         if sampling_params is not None:
-            from dataclasses import asdict, is_dataclass
-
             if is_dataclass(sampling_params):
                 # Avoid overriding defaults with None (None often means "use model default").
                 merged_kwargs.update(

@@ -72,6 +72,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_path: str | None = None
         # Optional: set by the pipeline when wrapping, used for more helpful warnings.
         self.layer_name: str | None = None
+        self.strength: float = 1.0
 
         # Legacy single-LoRA support
         self.lora_A = None
@@ -217,7 +218,7 @@ class BaseLayerWithLoRA(nn.Module):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            out = out + delta
+            out = out + (self.strength * delta)
 
         return out, output_bias
 
