@@ -196,11 +196,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            o = self._accumulator.append(
-                forward_pass_id, gatherer_key, single_pass_data
-            )
-            if o is not None:
-                outputs.update(o)
+            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data, outputs)
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -650,6 +646,7 @@ class _Accumulator(ABC):
         forward_pass_id: int,
         gatherer_key: str,
         single_pass_data: Dict,
+        outputs: Dict[str, Any],
     ):
         pass
 
@@ -680,8 +677,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         forward_pass_id: int,
         gatherer_key: str,
         single_pass_data: Dict,
+        outputs: Dict[str, Any],
     ):
-        super().append(forward_pass_id, gatherer_key, single_pass_data)
+        super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         if self._enable:
             return self._append_utilization_rate(
                 forward_pass_id, single_pass_data["global_physical_count"]
@@ -792,8 +790,9 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         forward_pass_id: int,
         gatherer_key: str,
         single_pass_data: Dict,
+        outputs: Dict[str, Any],
     ):
-        super().append(forward_pass_id, gatherer_key, single_pass_data)
+        super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
 
         def _process_object(obj):
             if isinstance(obj, torch.Tensor):
@@ -849,8 +848,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         forward_pass_id: int,
         gatherer_key: str,
         single_pass_data: Dict,
+        outputs: Dict[str, Any],
     ):
-        super().append(forward_pass_id, gatherer_key, single_pass_data)
+        super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         # Can optimize if overhead here is large
         self._global_physical_count_of_buffered_step.append(
             single_pass_data["global_physical_count"]
