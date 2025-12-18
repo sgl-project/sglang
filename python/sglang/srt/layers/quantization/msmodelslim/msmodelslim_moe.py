@@ -69,7 +69,6 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         self.quant_config = quant_config
         self.group_size = 0
         self.tp_size = 1
-        self.is_per_channel_weight = self.group_size == 0
 
     def create_weights(
         self,
@@ -82,6 +81,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
     ) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        self.is_per_channel_weight = self.group_size == 0
         self.num_experts = num_experts
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
@@ -141,9 +141,9 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         )
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
-
+        
+        # >>> special param for w4a8
         if not self.is_per_channel_weight:
-            # >>> special param for w4a8
             w13_weight_scale_second = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
