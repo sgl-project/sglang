@@ -258,12 +258,12 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         scale = scale.transpose(1, 2).contiguous()
 
         ### TODO fix group_size=0 behavior
-        '''if cls.is_per_channel_weight:
+        """if cls.is_per_channel_weight:
             scale_np = scale.cpu().numpy()
             scale_np.dtype = np.uint32
             scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-            return scale_uint64_tensor, None'''
-        
+            return scale_uint64_tensor, None"""
+
         per_group_scale = per_group_scale.transpose(1, 2).contiguous()
         group_num, k, n = weight.shape
         # the weight of the new version is reduced by half by pack n, so it needs to be restored
