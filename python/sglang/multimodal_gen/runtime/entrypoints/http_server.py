@@ -1,15 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
-from contextlib import asynccontextmanager
-import os
-
-from fastapi import APIRouter, FastAPI, Request
-
-from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-import asyncio
 import base64
 import os
 import uuid
@@ -20,19 +11,22 @@ import numpy as np
 import torch
 import torchvision
 from einops import rearrange
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType, SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, image_api, video_api
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client, run_zeromq_broker
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, prepare_server_args, get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger
+from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.srt.managers.io_struct import VertexGenerateReqInput
 
 DEFAULT_SEED = 1024
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -94,17 +88,24 @@ async def health_generate():
     # TODO : health generate endpoint
     return {"status": "ok"}
 
+
 def make_serializable(obj):
     """Recursively converts Tensors to None for JSON serialization."""
-    if isinstance(obj, torch.Tensor): return None
-    if isinstance(obj, dict): return {k: make_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, list): return [make_serializable(v) for v in obj]
+    if isinstance(obj, torch.Tensor):
+        return None
+    if isinstance(obj, dict):
+        return {k: make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_serializable(v) for v in obj]
     return obj
 
+
 def encode_video_to_base64(file_path: str):
-    if not os.path.exists(file_path): return None
+    if not os.path.exists(file_path):
+        return None
     with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode('utf-8')
+        return base64.b64encode(f.read()).decode("utf-8")
+
 
 def post_process_sample(
     sample: torch.Tensor,
@@ -116,9 +117,9 @@ def post_process_sample(
     """Process sample output (Tensors) and save video to disk."""
     if sample.dim() == 3:
         sample = sample.unsqueeze(1)
-    
+
     videos = rearrange(sample, "c t h w -> t c h w")
-    
+
     frames = []
     for x in videos:
         x = torchvision.utils.make_grid(x, nrow=6)
@@ -128,13 +129,14 @@ def post_process_sample(
     if save_output and save_file_path:
         os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
         print(f"Saving video to: {save_file_path}")
-        
+
         if data_type == DataType.VIDEO:
             imageio.mimsave(save_file_path, frames, fps=fps, format="mp4")
         else:
             imageio.imwrite(save_file_path, frames[0])
-            
+
     return frames
+
 
 async def forward_to_scheduler(req_obj, sp):
     """Forwards request to scheduler and processes the result."""
@@ -142,14 +144,14 @@ async def forward_to_scheduler(req_obj, sp):
         response = await scheduler_client.forward(req_obj)
         if response.output is None:
             raise RuntimeError("Model generation returned no output.")
-        
+
         output_file_path = sp.output_file_path()
         post_process_sample(
             sample=response.output[0],
             data_type=sp.data_type,
             fps=sp.fps or 24,
             save_output=True,
-            save_file_path=output_file_path
+            save_file_path=output_file_path,
         )
 
         if hasattr(response, "model_dump"):
@@ -160,7 +162,7 @@ async def forward_to_scheduler(req_obj, sp):
         if output_file_path:
             print(f"Processing output file: {output_file_path}")
             b64_video = encode_video_to_base64(output_file_path)
-            
+
             if b64_video:
                 data["output"] = b64_video
                 data.pop("video_data", None)
@@ -174,6 +176,8 @@ async def forward_to_scheduler(req_obj, sp):
 
 
 vertex_router = APIRouter()
+
+
 @vertex_router.post(VERTEX_ROUTE)
 async def vertex_generate(vertex_req: VertexGenerateReqInput):
     if not vertex_req.instances:
@@ -181,12 +185,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
 
     server_args = get_global_server_args()
     params = vertex_req.parameters or {}
-    
+
     futures = []
-    
+
     for inst in vertex_req.instances:
         rid = f"vertex_{uuid.uuid4()}"
-        
+
         prompt = inst.get("prompt") or inst.get("text")
         image_input = inst.get("image") or inst.get("image_url")
         seed_val = params.get("seed", DEFAULT_SEED)
@@ -203,7 +207,7 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
             guidance_scale=params.get("guidance_scale"),
             seed=seed_val,
             server_args=server_args,
-            save_output=params.get("save_output")
+            save_output=params.get("save_output"),
         )
 
         backend_req = prepare_request(server_args, sampling_params=sp)
