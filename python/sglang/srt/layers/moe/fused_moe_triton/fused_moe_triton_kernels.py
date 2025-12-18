@@ -901,15 +901,10 @@ def silu_and_mul_triton(
     expert_ids: Optional[torch.Tensor] = None,
     num_tokens_post_padded: Optional[torch.Tensor] = None,
     sorted_token_ids: Optional[torch.Tensor] = None,
+    down_moe_use_tma: bool = False,
 ) -> None:
     """SiLU and multiply wrapper."""
-    use_sorted = (
-        expert_ids is not None
-        and num_tokens_post_padded is not None
-        and sorted_token_ids is not None
-    )
-
-    if use_sorted:
+    if down_moe_use_tma:
         grid = (triton.cdiv(sorted_token_ids.shape[0], config["BLOCK_SIZE_M"]),)
         silu_and_mul_triton_kernel_sorted[grid](
             gateup_output,
@@ -1068,15 +1063,10 @@ def gelu_and_mul_triton(
     expert_ids: Optional[torch.Tensor] = None,
     num_tokens_post_padded: Optional[torch.Tensor] = None,
     sorted_token_ids: Optional[torch.Tensor] = None,
+    down_moe_use_tma: bool = False,
 ) -> None:
     """GELU and multiply wrapper."""
-    use_sorted = (
-        expert_ids is not None
-        and num_tokens_post_padded is not None
-        and sorted_token_ids is not None
-    )
-
-    if use_sorted:
+    if down_moe_use_tma:
         grid = (triton.cdiv(sorted_token_ids.shape[0], config["BLOCK_SIZE_M"]),)
         gelu_and_mul_triton_kernel_sorted[grid](
             gateup_output,
@@ -1094,7 +1084,8 @@ def gelu_and_mul_triton(
             down_input,
             hidden_size,
             topk_ids,
-            BLOCK_SIZE=config["BLOCK_SIZE_M"] * config["BLOCK_SIZE_N"],
+            # BLOCK_SIZE=config["BLOCK_SIZE_M"] * config["BLOCK_SIZE_N"],
+            BLOCK_SIZE=512,
         )
 
 

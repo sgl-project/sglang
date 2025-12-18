@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -374,7 +374,7 @@ def _prepare_activation_kernel_args(
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
     sorted_token_ids: torch.Tensor,
-) -> Dict[str, Optional[torch.Tensor]]:
+) -> Dict[str, Any]:
     """Prepare arguments for activation kernels based on sorted mode."""
     return {
         "topk_ids": curr_topk_ids if not down_moe_use_tma else None,
@@ -383,6 +383,7 @@ def _prepare_activation_kernel_args(
             num_tokens_post_padded if down_moe_use_tma else None
         ),
         "sorted_token_ids": sorted_token_ids if down_moe_use_tma else None,
+        "down_moe_use_tma": down_moe_use_tma,
     }
 
 
@@ -564,6 +565,9 @@ def fused_experts_impl(
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
         )
+
+        activation = "gelu"
+
         # Activation function with multiplication
         if activation == "silu" and is_gated:
             if gemm1_alpha is not None:
@@ -598,23 +602,24 @@ def fused_experts_impl(
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_hip or (_is_cuda and down_moe_use_tma):
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            elif _is_cuda:
-                kwargs = _prepare_activation_kernel_args(
-                    down_moe_use_tma,
-                    curr_topk_ids,
-                    expert_ids,
-                    num_tokens_post_padded,
-                    sorted_token_ids,
-                )
-                gelu_and_mul_triton(
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    N,
-                    config,
-                    **kwargs,
-                )
+            if _is_hip or _is_cuda:
+                if not filter_expert:
+                    gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    kwargs = _prepare_activation_kernel_args(
+                        down_moe_use_tma,
+                        curr_topk_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        sorted_token_ids,
+                    )
+                    gelu_and_mul_triton(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        N,
+                        config,
+                        **kwargs,
+                    )
             else:
                 vllm_ops.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
