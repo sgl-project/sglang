@@ -2,7 +2,7 @@
 import enum
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import orjson
 
@@ -29,6 +29,7 @@ class LoadFormat(str, enum.Enum):
     REMOTE_INSTANCE = "remote_instance"
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
+    PRIVATE = "private"
 
 
 @dataclass
@@ -72,6 +73,8 @@ class LoadConfig:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+    remote_instance_weight_loader_backend: Optional[str] = None
+    remote_instance_weight_loader_transfer_engine: Optional[Any] = None
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None

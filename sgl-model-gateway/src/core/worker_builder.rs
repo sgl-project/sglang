@@ -131,7 +131,7 @@ impl BasicWorkerBuilder {
             Arc, RwLock as StdRwLock,
         };
 
-        use tokio::sync::RwLock;
+        use tokio::sync::OnceCell;
 
         let bootstrap_host = match url::Url::parse(&self.url) {
             Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
@@ -176,7 +176,16 @@ impl BasicWorkerBuilder {
             default_model_type: ModelType::LLM, // Standard LLM capabilities
         };
 
-        let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
+        // Use OnceCell for lock-free gRPC client access after initialization
+        let grpc_client = Arc::new(match self.grpc_client {
+            Some(client) => {
+                let cell = OnceCell::new();
+                // Pre-set the client if provided (blocking set is fine during construction)
+                cell.set(Arc::new(client)).ok();
+                cell
+            }
+            None => OnceCell::new(),
+        });
 
         BasicWorker {
             metadata,
@@ -185,7 +194,10 @@ impl BasicWorkerBuilder {
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            circuit_breaker: CircuitBreaker::with_config_and_label(
+                self.circuit_breaker_config,
+                self.url.clone(),
+            ),
             grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
         }
