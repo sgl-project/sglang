@@ -1793,14 +1793,16 @@ class ModelRunner:
             self.max_total_num_tokens = small_kv_size
 
         if max_running_requests is None:
+            minimum_slots = 2048
+            maximum_slots = 4096
             heuristic = int(
                 self.max_total_num_tokens / self.model_config.context_len * 512
             )
-            max_running_requests = min(max(heuristic, 2048), 4096)
+            max_running_requests = min(max(heuristic, minimum_slots), maximum_slots)
             log_info_on_rank0(
                 logger,
                 f"req_to_token_pool: slots={max_running_requests} "
-                f"(heuristic={heuristic}, clamp=[2048,4096], "
+                f"(heuristic={heuristic}, clamp=[{minimum_slots},{maximum_slots}], "
                 f"profiled_max_total_num_tokens={self.max_total_num_tokens}, "
                 f"context_len={self.model_config.context_len}), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
