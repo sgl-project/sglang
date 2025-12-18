@@ -637,13 +637,13 @@ class SchedulerPPMixin:
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
-            if self.tp_size > 1:
+            if self.attn_tp_size > 1:
                 data_to_sync_tp = [seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
-                    self.tp_rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
                 )
                 seq_lens, latencies = data_to_sync_tp
 
@@ -876,7 +876,7 @@ class SchedulerPPMixin:
         else:
             data = None
 
-        if self.attn_tp_size != 1:
+        if self.attn_tp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
