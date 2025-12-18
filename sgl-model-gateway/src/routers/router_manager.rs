@@ -269,13 +269,8 @@ impl RouterManager {
         let mut best_router = None;
         let mut best_score = 0.0;
 
-        // Cache worker list to avoid duplicate get_all() calls
-        let all_workers = self.worker_registry.get_all();
-        let num_regular_workers = all_workers
-            .iter()
-            .filter(|w| matches!(w.worker_type(), WorkerType::Regular))
-            .count();
-        let num_pd_workers = all_workers.len() - num_regular_workers;
+        //  Uses O(1) lookups instead of allocating a full vector of workers via get_all()
+        let (num_regular_workers, num_pd_workers) = self.worker_registry.get_worker_distribution();
 
         for router in candidate_routers {
             let mut score = 1.0;

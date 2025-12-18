@@ -12,6 +12,7 @@ from torchvision.transforms import InterpolationMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
@@ -235,6 +236,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
+        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
+        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
+        self.IM_TOKEN_ID = hf_config.image_token_id
+
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
 
@@ -254,6 +259,42 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.video_token_id,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+    def get_mm_data(self, prompt, embeddings, img_grid_thw):
+        input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
+            image_grid_thw=img_grid_thw,
+            tokens_per_second=getattr(
+                self.hf_config.vision_config, "tokens_per_second", None
+            ),
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=offsets,
+                precomputed_embeddings=embeddings,
+            )
+        ]
+
+        return {
+            "input_ids": input_ids,
+            "mm_items": mm_items,
+            "im_start_id": self.IM_START_TOKEN_ID,
+            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
+            "video_token_id": self.mm_tokens.video_token_id,
+            "audio_token_id": self.mm_tokens.audio_token_id,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": mrope_position_delta,
+        }
 
     async def process_mm_data_async(
         self,
