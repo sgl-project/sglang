@@ -31,6 +31,7 @@ from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
     set_forward_context,
+    set_pcg_capture_stream,
 )
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -263,11 +264,7 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with freeze_gc(
-                    self.model_runner.server_args.enable_cudagraph_gc
-                ), set_compiled(True), enable_piecewise_cuda_graph_compile():
-                    # self.capture_one_batch_size(num_tokens=2)
-                    # self.capture_one_batch_size(num_tokens=8)
+                with set_compiled(True), enable_piecewise_cuda_graph_compile():
                     warmup_range = (
                         tqdm.tqdm(list(reversed(self.capture_num_tokens)))
                         if get_tensor_model_parallel_rank() == 0
@@ -279,7 +276,6 @@ class PiecewiseCudaGraphRunner:
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
 
-                # Optionally also hard sync
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
                 # Capture
@@ -384,32 +380,32 @@ class PiecewiseCudaGraphRunner:
         with freeze_gc(
             self.model_runner.server_args.enable_cudagraph_gc
         ), graph_capture() as graph_capture_context:
-            # self.stream = graph_capture_context.stream
-            avail_mem = get_available_gpu_memory(
-                self.model_runner.device,
-                self.model_runner.gpu_id,
-                empty_cache=False,
-            )
-            # Reverse the order to enable better memory sharing across cuda graphs.
-            capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_num_tokens)
-            )
-            for i, num_tokens in enumerate(capture_range):
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
-                    )
+            stream = graph_capture_context.stream
+            with set_pcg_capture_stream(stream):
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
+                )
+                # Reverse the order to enable better memory sharing across cuda graphs.
+                capture_range = (
+                    tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                    if get_tensor_model_parallel_rank() == 0
+                    else reversed(self.capture_num_tokens)
+                )
+                for i, num_tokens in enumerate(capture_range):
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_range.set_description(
+                            f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                        )
 
-                with set_compiled(True):
-                    # self.warmup_torch_compile(num_tokens=num_tokens)
-                    self.capture_one_batch_size(num_tokens)
+                    with set_compiled(True):
+                        self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
         bs = 1
