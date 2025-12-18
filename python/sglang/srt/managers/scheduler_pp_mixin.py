@@ -614,7 +614,7 @@ class SchedulerPPMixin:
                 forward_batch = ForwardBatch.init_new(
                     model_worker_batch, self.tp_worker.model_runner
                 )
-                _, _ = self.tp_worker.model_runner.forward(
+                _ = self.tp_worker.model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
 
@@ -639,6 +639,16 @@ class SchedulerPPMixin:
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
+
+            if self.attn_tp_size > 1:
+                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = broadcast_pyobj(
+                    data_to_sync_tp,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+                seq_lens, latencies = data_to_sync_tp
 
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -869,7 +879,7 @@ class SchedulerPPMixin:
         else:
             data = None
 
-        if self.attn_tp_size != 1:
+        if self.attn_tp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
