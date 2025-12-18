@@ -703,7 +703,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         torch.distributed.reduce(
             gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
-        print(f"hi append_utilization_rate {gpu_physical_count=}")
 
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
