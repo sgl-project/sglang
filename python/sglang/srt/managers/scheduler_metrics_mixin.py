@@ -462,7 +462,7 @@ class SchedulerMetricsMixin:
         )
 
     @contextmanager
-    def record_metrics_around_forward(self: Scheduler, batch):
+    def record_forward_metrics(self: Scheduler, batch):
         if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
             yield
             return

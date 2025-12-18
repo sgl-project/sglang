@@ -2100,7 +2100,7 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    with self.record_metrics_around_forward(batch):
+                    with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
                             # here pp is not compatible with overlap
@@ -2140,7 +2140,7 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                with self.record_metrics_around_forward(batch):
+                with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
                     )
