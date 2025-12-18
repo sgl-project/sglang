@@ -272,7 +272,9 @@ class PiecewiseCudaGraphRunner:
                     )
                     for _, num_tokens in enumerate(compile_range):
                         if get_tensor_model_parallel_rank() == 0:
-                            compile_range.set_description(f"Compiling num tokens ({num_tokens=})")
+                            compile_range.set_description(
+                                f"Compiling num tokens ({num_tokens=})"
+                            )
                         self.warmup_torch_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
