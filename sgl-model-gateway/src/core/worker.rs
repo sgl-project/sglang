@@ -10,14 +10,14 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use tokio::{sync::RwLock, time};
+use tokio::{sync::OnceCell, time};
 
 use super::{
     CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
 };
 use crate::{
     core::{BasicWorkerBuilder, DPAwareWorkerBuilder},
-    observability::metrics::{smg_labels, RouterMetrics, SmgMetrics},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
 };
@@ -314,8 +314,8 @@ impl ConnectionMode {
     /// Get the metric label for this connection mode
     pub fn as_metric_label(&self) -> &'static str {
         match self {
-            ConnectionMode::Http => smg_labels::CONNECTION_HTTP,
-            ConnectionMode::Grpc { .. } => smg_labels::CONNECTION_GRPC,
+            ConnectionMode::Http => metrics_labels::CONNECTION_HTTP,
+            ConnectionMode::Grpc { .. } => metrics_labels::CONNECTION_GRPC,
         }
     }
 }
@@ -404,9 +404,9 @@ impl WorkerType {
     /// Get the metric label for this worker type
     pub fn as_metric_label(&self) -> &'static str {
         match self {
-            WorkerType::Regular => smg_labels::WORKER_REGULAR,
-            WorkerType::Prefill { .. } => smg_labels::WORKER_PREFILL,
-            WorkerType::Decode => smg_labels::WORKER_DECODE,
+            WorkerType::Regular => metrics_labels::WORKER_REGULAR,
+            WorkerType::Prefill { .. } => metrics_labels::WORKER_PREFILL,
+            WorkerType::Decode => metrics_labels::WORKER_DECODE,
         }
     }
 }
@@ -515,8 +515,9 @@ pub struct BasicWorker {
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
-    /// Lazily initialized gRPC client for gRPC workers
-    pub grpc_client: Arc<RwLock<Option<Arc<GrpcClient>>>>,
+    /// Lazily initialized gRPC client for gRPC workers.
+    /// Uses OnceCell for lock-free reads after initialization.
+    pub grpc_client: Arc<OnceCell<Arc<GrpcClient>>>,
     /// Runtime-mutable models override (for lazy discovery)
     /// When set, overrides metadata.models for routing decisions.
     /// Uses std::sync::RwLock for synchronous access in supports_model().
@@ -557,8 +558,7 @@ impl BasicWorker {
 
     fn update_running_requests_metrics(&self) {
         let load = self.load();
-        RouterMetrics::set_running_requests(self.url(), load);
-        SmgMetrics::set_worker_requests_active(self.url(), load);
+        Metrics::set_worker_requests_active(self.url(), load);
     }
 }
 
@@ -586,7 +586,6 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
-        RouterMetrics::set_worker_health(self.url(), healthy);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -603,7 +602,7 @@ impl Worker for BasicWorker {
             let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
             // Record health check success metric
-            SmgMetrics::record_worker_health_check(worker_type_str, smg_labels::CB_SUCCESS);
+            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_SUCCESS);
 
             if !self.is_healthy()
                 && successes >= self.metadata.health_config.success_threshold as usize
@@ -617,7 +616,7 @@ impl Worker for BasicWorker {
             let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
 
             // Record health check failure metric
-            SmgMetrics::record_worker_health_check(worker_type_str, smg_labels::CB_FAILURE);
+            Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_FAILURE);
 
             if self.is_healthy()
                 && failures >= self.metadata.health_config.failure_threshold as usize
@@ -717,64 +716,53 @@ impl Worker for BasicWorker {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
-                {
-                    let client_guard = self.grpc_client.read().await;
-                    if let Some(ref client) = *client_guard {
-                        return Ok(Some(client.clone()));
-                    }
-                }
-
-                let mut client_guard = self.grpc_client.write().await;
-
-                if let Some(ref client) = *client_guard {
-                    return Ok(Some(client.clone()));
-                }
-
-                let runtime_str = self.metadata.runtime_type.to_string();
-                tracing::info!(
-                    "Lazily initializing gRPC client ({}) for worker: {}",
-                    runtime_str,
-                    self.metadata.url
-                );
-                match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
-                    Ok(client) => {
-                        let client_arc = Arc::new(client);
-                        *client_guard = Some(client_arc.clone());
+                // OnceCell provides lock-free reads after initialization.
+                // get_or_try_init only acquires internal lock on first call.
+                let client = self
+                    .grpc_client
+                    .get_or_try_init(|| async {
+                        let runtime_str = self.metadata.runtime_type.to_string();
                         tracing::info!(
-                            "Successfully connected gRPC client ({}) for worker: {}",
+                            "Lazily initializing gRPC client ({}) for worker: {}",
                             runtime_str,
                             self.metadata.url
                         );
-                        Ok(Some(client_arc))
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to connect gRPC client for worker {}: {}",
-                            self.metadata.url,
-                            e
-                        );
-                        Err(WorkerError::ConnectionFailed {
-                            url: self.metadata.url.clone(),
-                            reason: format!("Failed to connect to gRPC server: {}", e),
-                        })
-                    }
-                }
+                        match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
+                            Ok(client) => {
+                                tracing::info!(
+                                    "Successfully connected gRPC client ({}) for worker: {}",
+                                    runtime_str,
+                                    self.metadata.url
+                                );
+                                Ok(Arc::new(client))
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to connect gRPC client for worker {}: {}",
+                                    self.metadata.url,
+                                    e
+                                );
+                                Err(WorkerError::ConnectionFailed {
+                                    url: self.metadata.url.clone(),
+                                    reason: format!("Failed to connect to gRPC server: {}", e),
+                                })
+                            }
+                        }
+                    })
+                    .await?;
+                Ok(Some(Arc::clone(client)))
             }
         }
     }
 
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
-        match self.metadata.connection_mode {
-            ConnectionMode::Http => Ok(()),
-            ConnectionMode::Grpc { .. } => {
-                let mut client_guard = self.grpc_client.write().await;
-                if client_guard.is_some() {
-                    tracing::info!("Resetting gRPC client for worker: {}", self.metadata.url);
-                    *client_guard = None;
-                }
-                Ok(())
-            }
-        }
+        // OnceCell doesn't support resetting. This is intentional for lock-free performance.
+        // If a connection fails, the worker should be removed and re-added.
+        tracing::debug!(
+            "reset_grpc_client called for {} (no-op with OnceCell)",
+            self.metadata.url
+        );
+        Ok(())
     }
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
