@@ -753,6 +753,15 @@ class ModelConfig:
                         f"({self.quantization})."
                     )
 
+            # Check if the scale_fmt is ue8m0, and warn user if deepgemm is enabled for non-ue8m0 models on blackwell
+            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                logger.warning(
+                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
+                )
+
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(
@@ -1040,8 +1049,8 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
 ]
 
-if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
-    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
+if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
+    multimodal_model_archs.append(external_mm_model_arch)
 
 
 def is_multimodal_model(model_architectures: List[str]):
