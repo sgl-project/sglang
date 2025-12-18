@@ -1,4 +1,9 @@
+from typing import Deque
+
+import torch
+from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -18,8 +23,13 @@ def time_device_forward_pass(forward_mode: ForwardMode):
 
 
 class DeviceTimer:
+    @dataclass
+    class Interval:
+        start: torch.cuda.Event
+        end: torch.cuda.Event
+
     def __init__(self):
-        TODO
+        self._intervals: Deque[DeviceTimer.Interval] = deque()
 
     @contextmanager
     def wrap(self, category: str):
