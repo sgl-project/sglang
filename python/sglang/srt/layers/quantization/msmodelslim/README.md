@@ -12,6 +12,7 @@ Also MsModelSlim module include:
 - [x] Unit-tests for w4a4 modelslim, w8a8 modelslim
 
 Examples of launch:
+
 server: 
 `SGLANG_SET_CPU_AFFINITY=1
 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
