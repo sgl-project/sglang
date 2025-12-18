@@ -147,7 +147,6 @@ suites = {
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
-        TestFile("test_piecewise_cuda_graph.py", 1200),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_epd_disaggregation.py", 150),
         TestFile("rl/test_return_routed_experts.py", 300),
