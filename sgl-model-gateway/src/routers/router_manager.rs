@@ -117,15 +117,17 @@ impl RouterManager {
         } else {
             info!("Initializing RouterManager in single-router mode");
 
-            let single_router = Arc::from(RouterFactory::create_router(app_context).await?);
-            let router_id = Self::determine_router_id(
-                &config.router_config.mode,
-                &config.router_config.connection_mode,
-            );
+            for connection_mode in [ConnectionMode::Http, ConnectionMode::Grpc { port: None }] {
+                let router = Arc::from(
+                    RouterFactory::create_router_by_connection_mode(app_context, &connection_mode)
+                        .await?,
+                );
+                let router_id =
+                    Self::determine_router_id(&config.router_config.mode, &connection_mode);
 
-            info!("Created single router with ID: {}", router_id.as_str());
-            manager.register_router(router_id.clone(), single_router);
-            manager.set_default_router(router_id);
+                info!("Created router with ID: {}", router_id.as_str());
+                manager.register_router(router_id.clone(), router);
+            }
         }
 
         if manager.router_count() == 0 {

@@ -21,7 +21,14 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
-        match ctx.router_config.connection_mode {
+        Self::create_router_by_connection_mode(ctx, &ctx.router_config.connection_mode)
+    }
+
+    pub async fn create_router_by_connection_mode(
+        ctx: &Arc<AppContext>,
+        connection_mode: &ConnectionMode,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        match connection_mode {
             ConnectionMode::Grpc { .. } => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_grpc_router(ctx).await,
                 RoutingMode::PrefillDecode {
