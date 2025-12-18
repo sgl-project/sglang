@@ -706,7 +706,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(compute_utilization_rate(gpu_physical_count))
-            if TODO:
+            if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
                 return {
                     "metrics": ExpertDistributionMetrics(eplb_balancedness=TODO)
                 }
