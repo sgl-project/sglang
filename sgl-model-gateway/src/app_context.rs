@@ -273,8 +273,8 @@ impl AppContextBuilder {
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .maybe_tokenizer(&router_config)?
-            .with_reasoning_parser_factory(&router_config)
-            .with_tool_parser_factory(&router_config)
+            .maybe_reasoning_parser_factory(&router_config)
+            .maybe_tool_parser_factory(&router_config)
             .with_worker_registry()
             .with_policy_registry(&router_config)
             .with_storage(&router_config)?
@@ -370,12 +370,16 @@ impl AppContextBuilder {
 
     /// Create tokenizer for gRPC mode
     fn maybe_tokenizer(mut self, config: &RouterConfig) -> Result<Self, String> {
-        let tokenizer_path = config
-            .tokenizer_path
-            .clone()
-            .or_else(|| config.model_path.clone());
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
+            let tokenizer_path = config
+                .tokenizer_path
+                .clone()
+                .or_else(|| config.model_path.clone())
+                .ok_or_else(|| {
+                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
+                        .to_string()
+                })?;
 
-        if let Some(tokenizer_path) = tokenizer_path {
             let base_tokenizer = tokenizer_factory::create_tokenizer_with_chat_template_blocking(
                 &tokenizer_path,
                 config.chat_template.as_deref(),
@@ -410,14 +414,18 @@ impl AppContextBuilder {
     }
 
     /// Create reasoning parser factory for gRPC mode
-    fn with_reasoning_parser_factory(mut self, _config: &RouterConfig) -> Self {
-        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
+    fn maybe_reasoning_parser_factory(mut self, config: &RouterConfig) -> Self {
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
+            self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
+        }
         self
     }
 
     /// Create tool parser factory for gRPC mode
-    fn with_tool_parser_factory(mut self, _config: &RouterConfig) -> Self {
-        self.tool_parser_factory = Some(ToolParserFactory::new());
+    fn maybe_tool_parser_factory(mut self, config: &RouterConfig) -> Self {
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
+            self.tool_parser_factory = Some(ToolParserFactory::new());
+        }
         self
     }
 
