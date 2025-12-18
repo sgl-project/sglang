@@ -106,6 +106,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+        self._is_wfp8afp8_moe = False
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -533,7 +534,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         Detect whether a layer_name is found in any target and
         use the quantization scheme corresponding to the matched target
-        to select the CompressedTensorsScheme used for infernece.
+        to select the CompressedTensorsScheme used for inference.
         """
 
         # Find the "target" in the compressed-tensors config
@@ -557,7 +558,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             input_quant = scheme_dict.get("input_activations")
 
         # Find the sparsity scheme of the layer
-        # assume that fused layers inerhit first component's sparsity scheme
+        # assume that fused layers inherit first component's sparsity scheme
         sparsity_targets = self.sparsity_scheme_map.keys() - set(
             self.sparsity_ignore_list
         )
