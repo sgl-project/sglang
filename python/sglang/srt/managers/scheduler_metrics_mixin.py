@@ -71,9 +71,6 @@ class SchedulerMetricsMixin:
             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
         )
 
-        if self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER:
-            self.forward_pass_device_timer = DeviceTimer(reporter=TODO)
-
         if self.enable_metrics:
             engine_type = "unified"
             labels = {
@@ -85,6 +82,9 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self.forward_pass_device_timer = DeviceTimer(reporter=TODO)
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
