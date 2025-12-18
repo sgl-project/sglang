@@ -11,15 +11,12 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
-    write_github_step_summary,
 )
 
 
@@ -38,10 +35,11 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
                     "flashmla",
                 ]
             )
+        # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
             other_args=other_args,
         )
 
@@ -94,10 +92,11 @@ class TestFlashMLAMTP(CustomTestCase):
                     "flashmla",
                 ]
             )
+        # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
             other_args=other_args,
         )
 

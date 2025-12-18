@@ -8,6 +8,7 @@ import copy
 import gc
 import logging
 import math
+import os
 from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -18,9 +19,9 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
-from flash_attn.cute import utils
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn_origin.cute import utils
+from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 
 def maybe_contiguous(x):
@@ -416,6 +417,15 @@ def warmup_flash_attn(f):
     - Executes sequentially to minimize peak GPU mem
     - Does not modify user tensors (clones)
     """
+    disable_warmup = os.getenv("SGLANG_DISABLE_FA4_WARMUP", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if disable_warmup:
+        return f
+
     done = False
 
     def _clone_args(args, kwargs):

@@ -179,6 +179,9 @@ benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
 
+# Torch Compile logs
+tl_out/
+
 # Plots
 *.png
 *.pdf
@@ -237,7 +240,15 @@ compile_commands.json
 # Rust lib
 Cargo.lock
 
+# Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
+sgl-model-gateway/tests/fixtures/golden/
+
 lmms-eval
 
 **/.claude/
 **/.serena/
+ctags/
+outputs/
+
+# Eval Cache
+.longbench_cache/

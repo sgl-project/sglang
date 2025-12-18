@@ -127,6 +127,7 @@ class TiktokenTokenizer:
         add_generation_prompt,
         tools=None,
         reasoning_effort=None,
+        **kwargs,  # Accept additional parameters (e.g., return_dict) for compatibility
     ):
         ret = self.chat_template_jinja.render(
             messages=messages, add_generation_prompt=add_generation_prompt

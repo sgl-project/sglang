@@ -259,7 +259,7 @@ spec:
             value: "8"
           - name: SGLANG_ENABLE_JIT_DEEPGEMM
             value: "1"
-          - name: SGL_CHUNKED_PREFIX_CACHE_THRESHOLD
+          - name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD
             value: "0"
           - name: NCCL_IB_QPS_PER_CONNECTION
             value: "8"
