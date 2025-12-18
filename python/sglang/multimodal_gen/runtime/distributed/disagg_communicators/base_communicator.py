@@ -150,3 +150,44 @@ class DisaggCommunicator(ABC):
         Filters out None values automatically.
         """
         pass
+
+    # --- Batched P2P Communication API (for avoiding serialization) ---
+
+    @abstractmethod
+    def batch_isend_to_dit(
+        self, tensors: List[Any], metadata: Optional[Dict] = None
+    ) -> List[Work]:
+        """
+        Batched non-blocking send from Non-DiT to DiT group.
+        Uses torch.distributed.batch_isend_irecv to avoid serialization.
+        Returns list of Work handles (empty if not responsible for sending).
+        """
+        pass
+
+    @abstractmethod
+    def batch_irecv_from_non_dit(
+        self, shapes_dtypes: List[tuple]
+    ) -> tuple[List[Any], List[Work]]:
+        """
+        Batched non-blocking receive from Non-DiT group at DiT group.
+        Returns (list of tensors, list of Work handles).
+        """
+        pass
+
+    @abstractmethod
+    def batch_isend_to_non_dit(self, tensors: List[Any]) -> List[Work]:
+        """
+        Batched non-blocking send from DiT to Non-DiT group.
+        Returns list of Work handles.
+        """
+        pass
+
+    @abstractmethod
+    def batch_irecv_from_dit(
+        self, shapes_dtypes: List[tuple]
+    ) -> tuple[List[Any], List[Work]]:
+        """
+        Batched non-blocking receive from DiT group at Non-DiT group.
+        Returns (list of tensors, list of Work handles).
+        """
+        pass

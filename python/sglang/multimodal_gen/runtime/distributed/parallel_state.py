@@ -322,38 +322,87 @@ def adjust_dist_setting_for_disagg(
     data_parallel_size: int = 1,
 ):
     world_size: int = torch.distributed.get_world_size()
-
     rank = torch.distributed.get_rank()
+
     if rank >= world_size - num_non_dit_ranks:
-        # Non-DiT Ranks
-        logger.info(
-            f"Rank {rank} is Non-DiT. Forcing TP=1, SP=1, PP=1, CFG=1, DP={num_non_dit_ranks}"
-        )
-        tensor_parallel_degree = 1
-        pipeline_parallel_degree = 1
-        sequence_parallel_degree = 1
-        ulysses_degree = 1
-        ring_degree = 1
-        classifier_free_guidance_degree = 1
-        data_parallel_size = num_non_dit_ranks
-        effective_world_size = num_non_dit_ranks
+        return 1, 1, 1, 1, 1, 1, num_non_dit_ranks, num_non_dit_ranks
     else:
-        # DiT Ranks
         effective_world_size = world_size - num_non_dit_ranks
-        logger.info(
-            f"Rank {rank} is DiT. Using effective world size {effective_world_size}"
+        return (
+            tensor_parallel_degree,
+            pipeline_parallel_degree,
+            sequence_parallel_degree,
+            ulysses_degree,
+            ring_degree,
+            classifier_free_guidance_degree,
+            data_parallel_size,
+            effective_world_size,
         )
 
+
+def _create_non_dit_groups(world_size: int, num_non_dit_ranks: int):
+    """Create trivial groups for Non-DiT ranks (each rank in its own group)."""
+    non_dit_start = world_size - num_non_dit_ranks
     return (
-        tensor_parallel_degree,
-        pipeline_parallel_degree,
-        sequence_parallel_degree,
-        ulysses_degree,
-        ring_degree,
-        classifier_free_guidance_degree,
-        data_parallel_size,
-        effective_world_size,
+        [[i] for i in range(non_dit_start, world_size)],  # dp_groups
+        [[i] for i in range(non_dit_start, world_size)],  # cfg_groups
+        [[i] for i in range(non_dit_start, world_size)],  # pp_groups
+        [[i] for i in range(non_dit_start, world_size)],  # sp_groups
+        [[i] for i in range(non_dit_start, world_size)],  # tp_groups
     )
+
+
+def _setup_sequence_parallel_for_disagg(
+    world_size: int,
+    num_non_dit_ranks: int,
+    orig_ulysses_degree: int,
+    orig_ring_degree: int,
+):
+    """
+    Setup sequence parallel groups for all ranks in disaggregation mode.
+
+    using the original set_seq_parallel_pg from xdit could introduce new problems, as it doesn't take of non-dit ranks
+    """
+    from yunchang.globals import PROCESS_GROUP
+
+    current_rank = torch.distributed.get_rank()
+    non_dit_start = world_size - num_non_dit_ranks
+    dit_world_size = non_dit_start
+
+    # set mocked PG for non-dit ranks
+    for i in range(non_dit_start, world_size):
+        ulysses_group = torch.distributed.new_group([i])
+        ring_group = torch.distributed.new_group([i])
+        if current_rank == i:
+            PROCESS_GROUP.ULYSSES_PG = ulysses_group
+            PROCESS_GROUP.RING_PG = ring_group
+
+    sp_degree = orig_ring_degree * orig_ulysses_degree
+    dp_degree = dit_world_size // sp_degree
+
+    for dp_rank in range(dp_degree):
+        offset = dp_rank * sp_degree
+
+        # Ulysses groups
+        for i in range(orig_ring_degree):
+            ulysses_ranks = list(
+                range(
+                    i * orig_ulysses_degree + offset,
+                    (i + 1) * orig_ulysses_degree + offset,
+                )
+            )
+            group = torch.distributed.new_group(ulysses_ranks)
+            if current_rank in ulysses_ranks:
+                PROCESS_GROUP.ULYSSES_PG = group
+
+        # Ring groups
+        for i in range(orig_ulysses_degree):
+            ring_ranks = list(
+                range(i + offset, sp_degree + offset, orig_ulysses_degree)
+            )
+            group = torch.distributed.new_group(ring_ranks)
+            if current_rank in ring_ranks:
+                PROCESS_GROUP.RING_PG = group
 
 
 # xDiT
@@ -382,71 +431,38 @@ def initialize_model_parallel(
         tensor_parallel_degree: number of GPUs used for tensor parallelism.
         pipeline_parallel_degree: number of GPUs used for pipeline parallelism.
         backend: distributed backend of pytorch collective comm.
-
-    Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
-    use 2 groups to parallelize the batch dim(dp), 2 groups to parallelize
-    split batch caused by CFG, and 2 GPUs to parallelize sequence.
-
-    dp_degree (2) * cfg_degree (2) * sp_degree (2) * pp_degree (2) = 16.
-
-    The present function will create 8 data-parallel groups,
-    8 CFG group, 8 pipeline-parallel group, and
-    8 sequence-parallel groups:
-        8 data-parallel groups:
-            [g0, g8], [g1, g9], [g2, g10], [g3, g11],
-            [g4, g12], [g5, g13], [g6, g14], [g7, g15]
-        8 CFG-parallel groups:
-            [g0, g4], [g1, g5], [g2, g6], [g3, g7],
-            [g8, g12], [g9, g13], [g10, g14], [g11, g15]
-        8 sequence-parallel groups:
-            [g0, g1], [g2, g3], [g4, g5], [g6, g7],
-            [g8, g9], [g10, g11], [g12, g13], [g14, g15]
-        8 pipeline-parallel groups:
-            [g0, g2], [g4, g6], [g8, g10], [g12, g14],
-            [g1, g3], [g5, g7], [g9, g11], [g13, g15]
-    Note that for efficiency, the caller should make sure adjacent ranks
-    are on the same DGX box. For example if we are using 2 DGX-1 boxes
-    with a total of 16 GPUs, rank 0 to 7 belong to the first box and
-    ranks 8 to 15 belong to the second box.
+        enable_disagg: enable disaggregated execution (separate Non-DiT and DiT ranks).
+        num_non_dit_ranks: number of ranks dedicated to Non-DiT components.
     """
 
     if backend is None:
         backend = envs.get_torch_distributed_backend()
-    # Get world size and rank. Ensure some consistencies.
+
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    # Store original parameters for Non-DiT to use during group creation
-    orig_ulysses_degree = ulysses_degree
-    orig_ring_degree = ring_degree
-    orig_tensor_parallel_degree = tensor_parallel_degree
-    orig_pipeline_parallel_degree = pipeline_parallel_degree
-    orig_classifier_free_guidance_degree = classifier_free_guidance_degree
-    orig_data_parallel_size = data_parallel_size
+    # Store original parallelism settings for DiT ranks
+    orig_params = (
+        ulysses_degree,
+        ring_degree,
+        tensor_parallel_degree,
+        pipeline_parallel_degree,
+        classifier_free_guidance_degree,
+        data_parallel_size,
+    )
 
-    # For disaggregation: ALL ranks must use the same rank_generator (DiT's parameters)
-    # to ensure they create groups in the same order
-    if enable_disagg:
-        # Use DiT parameters for rank generation for ALL ranks
-        rank_generator: RankGenerator = RankGenerator(
-            tensor_parallel_degree,
-            ring_degree * ulysses_degree,  # sequence_parallel_degree
-            pipeline_parallel_degree,
-            classifier_free_guidance_degree,
-            data_parallel_size,
-            "tp-sp-pp-cfg-dp",
-        )
-    else:
-        rank_generator: RankGenerator = RankGenerator(
-            tensor_parallel_degree,
-            sequence_parallel_degree,
-            pipeline_parallel_degree,
-            classifier_free_guidance_degree,
-            data_parallel_size,
-            "tp-sp-pp-cfg-dp",
-        )
+    # Create rank generator using DiT parallelism settings (all ranks use same generator)
+    rank_generator: RankGenerator = RankGenerator(
+        tensor_parallel_degree,
+        sequence_parallel_degree if not enable_disagg else ring_degree * ulysses_degree,
+        pipeline_parallel_degree,
+        classifier_free_guidance_degree,
+        data_parallel_size,
+        "tp-sp-pp-cfg-dp",
+    )
 
+    # Initialize disaggregation topology and adjust settings per rank
     if enable_disagg:
         initialize_disaggregated_groups(world_size, num_non_dit_ranks, backend)
         (
@@ -471,6 +487,7 @@ def initialize_model_parallel(
     else:
         effective_world_size = world_size
 
+    # Validate parallelism configuration
     dit_parallel_size = (
         data_parallel_size
         * classifier_free_guidance_degree
@@ -478,65 +495,50 @@ def initialize_model_parallel(
         * pipeline_parallel_degree
         * tensor_parallel_degree
     )
-
     if effective_world_size < dit_parallel_size:
         raise RuntimeError(
             f"Effective world_size ({effective_world_size}) is less than "
-            f"tensor_parallel_degree ({tensor_parallel_degree}) x "
-            f"pipeline_parallel_degree ({pipeline_parallel_degree}) x"
-            f"sequence_parallel_degree ({sequence_parallel_degree}) x"
-            f"classifier_free_guidance_degree "
-            f"({classifier_free_guidance_degree}) x"
-            f"data_parallel_degree ({data_parallel_size})"
+            f"required parallelism ({dit_parallel_size})"
         )
 
-    # For disaggregation: generate the FULL set of groups (Non-DiT + DiT)
-    # All ranks must see the same group_ranks list for collective operations
+    dp_groups = rank_generator.get_ranks("dp")
+    cfg_groups = rank_generator.get_ranks("cfg")
+    pp_groups = rank_generator.get_ranks("pp")
+    sp_groups = rank_generator.get_ranks("sp")
+    tp_groups = rank_generator.get_ranks("tp")
+
+    # generate process groups
     if enable_disagg:
-        # Non-DiT groups (if num_non_dit_ranks > 0)
-        non_dit_dp_groups = [
-            [i] for i in range(world_size - num_non_dit_ranks, world_size)
-        ]
-        non_dit_cfg_groups = [
-            [i] for i in range(world_size - num_non_dit_ranks, world_size)
-        ]
-        non_dit_pp_groups = [
-            [i] for i in range(world_size - num_non_dit_ranks, world_size)
-        ]
+        non_dit_dp, non_dit_cfg, non_dit_pp, non_dit_sp, non_dit_tp = (
+            _create_non_dit_groups(world_size, num_non_dit_ranks)
+        )
 
-        # DiT groups (offset by num_non_dit_ranks)
-        dit_dp_groups = rank_generator.get_ranks("dp")
-        dit_cfg_groups = rank_generator.get_ranks("cfg")
-        dit_pp_groups = rank_generator.get_ranks("pp")
+        dp_groups += non_dit_dp
+        cfg_groups += non_dit_cfg
+        pp_groups += non_dit_pp
+        sp_groups += non_dit_sp
+        tp_groups += non_dit_tp
 
-        # Combine: Non-DiT groups + DiT groups (all ranks will create all groups)
-        dp_groups = non_dit_dp_groups + dit_dp_groups
-        cfg_groups = non_dit_cfg_groups + dit_cfg_groups
-        pp_groups = non_dit_pp_groups + dit_pp_groups
-    else:
-        dp_groups = rank_generator.get_ranks("dp")
-        cfg_groups = rank_generator.get_ranks("cfg")
-        pp_groups = rank_generator.get_ranks("pp")
-
-    global _DP
+    # Initialize group coordinators
+    global _DP, _CFG, _PP, _SP, _TP
     assert _DP is None, "data parallel group is already initialized"
+    assert _CFG is None, "classifier_free_guidance group is already initialized"
+    assert _PP is None, "pipeline model parallel group is already initialized"
+    assert _SP is None, "sequence parallel group is already initialized"
+    assert _TP is None, "tensor parallel group is already initialized"
+
     _DP = init_parallel_group_coordinator(
         group_ranks=dp_groups,
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="data",
     )
-
-    global _CFG
-    assert _CFG is None, "classifier_free_guidance group is already initialized"
     _CFG = init_parallel_group_coordinator(
         group_ranks=cfg_groups,
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="classifier_free_guidance",
     )
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
     _PP = init_parallel_group_coordinator(
         group_ranks=pp_groups,
         local_rank=get_world_group().local_rank,
@@ -544,90 +546,21 @@ def initialize_model_parallel(
         parallel_mode="pipeline",
     )
 
-    global _SP
-    assert _SP is None, "sequence parallel group is already initialized"
-
+    # Setup sequence parallel groups (requires special handling for disagg)
+    from yunchang import set_seq_parallel_pg
     from yunchang.globals import PROCESS_GROUP
 
-    # CRITICAL: All ranks must create sequence parallel groups in the same order.
-    # In disaggregation mode, DiT ranks are offset (e.g., 1,2,3,4 instead of 0,1,2,3).
-    # We need a custom implementation that supports rank offsets.
-    current_rank = torch.distributed.get_rank()
-
     if enable_disagg:
-        # First, create trivial Non-DiT sequence parallel groups
-        # Non-DiT ranks are the LAST ranks: [world_size - num_non_dit_ranks, ..., world_size-1]
-        for i in range(world_size - num_non_dit_ranks, world_size):
-            non_dit_ulysses_group = torch.distributed.new_group([i])
-            non_dit_ring_group = torch.distributed.new_group([i])
-            if current_rank == i:
-                PROCESS_GROUP.ULYSSES_PG = non_dit_ulysses_group
-                PROCESS_GROUP.RING_PG = non_dit_ring_group
-
-        # Then, create DiT sequence parallel groups with offset
-        # DiT ranks are the FIRST ranks: [0, 1, ..., world_size - num_non_dit_ranks - 1]
-        dit_world_size = world_size - num_non_dit_ranks
-        rank_offset = 0  # Dit ranks start at 0, no offset needed
-
-        sp_degree = orig_ring_degree * orig_ulysses_degree
-        dp_degree = dit_world_size // sp_degree
-        num_ulysses_pgs = orig_ring_degree
-        num_ring_pgs = orig_ulysses_degree
-
-        # Create groups with offset ranks (DiT ranks are [1,2,3,4] not [0,1,2,3])
-        for dp_rank in range(dp_degree):
-            offset = (
-                dp_rank * sp_degree + rank_offset
-            )  # Add rank_offset for disaggregation
-
-            for i in range(num_ulysses_pgs):
-                ulysses_ranks = list(
-                    range(
-                        i * orig_ulysses_degree + offset,
-                        (i + 1) * orig_ulysses_degree + offset,
-                    )
-                )
-                group = torch.distributed.new_group(ulysses_ranks)
-                # Only DiT ranks save their groups
-                if current_rank in ulysses_ranks:
-                    PROCESS_GROUP.ULYSSES_PG = group
-
-            for i in range(num_ring_pgs):
-                ring_ranks = list(range(i + offset, sp_degree + offset, num_ring_pgs))
-                group = torch.distributed.new_group(ring_ranks)
-                # Only DiT ranks save their groups
-                if current_rank in ring_ranks:
-                    PROCESS_GROUP.RING_PG = group
+        _setup_sequence_parallel_for_disagg(
+            world_size, num_non_dit_ranks, orig_params[0], orig_params[1]
+        )
     else:
-        # Normal case: use yunchang's implementation
-        from yunchang import set_seq_parallel_pg
-
-        yunchang_rank = get_world_group().rank_in_group
-
         set_seq_parallel_pg(
             sp_ulysses_degree=ulysses_degree,
             sp_ring_degree=ring_degree,
-            rank=yunchang_rank,
+            rank=get_world_group().rank_in_group,
             world_size=dit_parallel_size,
         )
-
-    # SP and TP groups
-    if enable_disagg:
-        non_dit_sp_groups = [
-            [i] for i in range(world_size - num_non_dit_ranks, world_size)
-        ]
-        non_dit_tp_groups = [
-            [i] for i in range(world_size - num_non_dit_ranks, world_size)
-        ]
-
-        dit_sp_groups = rank_generator.get_ranks("sp")
-        dit_tp_groups = rank_generator.get_ranks("tp")
-
-        sp_groups = non_dit_sp_groups + dit_sp_groups
-        tp_groups = non_dit_tp_groups + dit_tp_groups
-    else:
-        sp_groups = rank_generator.get_ranks("sp")
-        tp_groups = rank_generator.get_ranks("tp")
 
     _SP = init_parallel_group_coordinator(
         group_ranks=sp_groups,
@@ -637,9 +570,6 @@ def initialize_model_parallel(
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
     )
-
-    global _TP
-    assert _TP is None, "Tensor parallel group is already initialized"
     _TP = init_parallel_group_coordinator(
         group_ranks=tp_groups,
         local_rank=get_world_group().local_rank,
@@ -647,6 +577,7 @@ def initialize_model_parallel(
         parallel_mode="tensor",
     )
 
+    # Initialize VAE and DiT groups
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
@@ -1221,6 +1152,7 @@ def init_vae_group(
     assert _VAE is None, "VAE parallel group is already initialized"
     vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
     _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
+    return _VAE
 
 
 def destroy_model_parallel() -> None:

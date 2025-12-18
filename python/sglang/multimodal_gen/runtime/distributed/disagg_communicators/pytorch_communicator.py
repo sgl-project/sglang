@@ -20,6 +20,7 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
     def __init__(self):
         self.non_dit_group = None
         self.dit_group = None
+        self.p2p_group = None  # Dedicated P2P group for master-to-master communication
         self.role = None  # "non_dit" or "dit"
         self.group_rank = -1
         self.world_rank = -1
@@ -57,6 +58,15 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         self.non_dit_group = dist.new_group(ranks=non_dit_ranks)
         self.dit_group = dist.new_group(ranks=dit_ranks)
 
+        # Create dedicated P2P group for master-to-master communication
+        # This avoids serialization warnings on the default ProcessGroup
+        p2p_ranks = [self.dit_master_rank, self.non_dit_master_rank]
+        self.p2p_group = dist.new_group(ranks=p2p_ranks)
+        logger.info(
+            f"Created P2P group for ranks {p2p_ranks} "
+            f"(DiT master={self.dit_master_rank}, Non-DiT master={self.non_dit_master_rank})"
+        )
+
         if self.world_rank in non_dit_ranks:
             self.role = "non_dit"
             self.group_rank = non_dit_ranks.index(self.world_rank)
@@ -84,9 +94,8 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         if self.world_rank != self.non_dit_master_rank:
             return  # Only master sends cross-group
 
-        # P2P Send to DiT Master
-        # Note: dist.send uses global rank
-        dist.send(tensor, dst=self.dit_master_rank)
+        # P2P Send to DiT Master using dedicated P2P group
+        dist.send(tensor, dst=self.dit_master_rank, group=self.p2p_group)
 
     def recv_from_non_dit(self, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -96,7 +105,7 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         tensor = torch.empty(shape, dtype=dtype, device="cuda")  # Todo: proper device
 
         if self.world_rank == self.dit_master_rank:
-            dist.recv(tensor, src=self.non_dit_master_rank)
+            dist.recv(tensor, src=self.non_dit_master_rank, group=self.p2p_group)
 
         # Broadcast within DiT group so all workers have the input
         self.broadcast_in_group(tensor)
@@ -107,14 +116,14 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         if self.world_rank != self.dit_master_rank:
             return
 
-        dist.send(tensor, dst=self.non_dit_master_rank)
+        dist.send(tensor, dst=self.non_dit_master_rank, group=self.p2p_group)
 
     def recv_from_dit(self, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
         """Called by Non-DiT Master to receive result."""
         tensor = torch.empty(shape, dtype=dtype, device="cuda")
 
         if self.world_rank == self.non_dit_master_rank:
-            dist.recv(tensor, src=self.dit_master_rank)
+            dist.recv(tensor, src=self.dit_master_rank, group=self.p2p_group)
 
         return tensor
 
@@ -171,53 +180,124 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
 
     # --- Async Communication Implementation ---
 
+    def batch_isend_to_dit(self, tensors: List[torch.Tensor]) -> List[Work]:
+        """
+        Batched non-blocking send from Non-DiT to DiT group.
+        Uses torch.distributed.batch_isend_irecv to avoid serialization.
+
+        Returns:
+            List of Work handles (empty if not master)
+        """
+        if self.world_rank != self.non_dit_master_rank:
+            return []  # Only master sends cross-group
+
+        # Create P2P operation list
+        p2p_ops = []
+        for tensor in tensors:
+            op = dist.P2POp(
+                dist.isend, tensor, self.dit_master_rank, group=self.p2p_group
+            )
+            p2p_ops.append(op)
+
+        # Execute all operations in a batch
+        works = dist.batch_isend_irecv(p2p_ops)
+        return works
+
+    def batch_irecv_from_non_dit(
+        self, shapes_dtypes: List[tuple[torch.Size, torch.dtype]]
+    ) -> tuple[List[torch.Tensor], List[Work]]:
+        """
+        Batched non-blocking receive from Non-DiT group at DiT group.
+
+        Args:
+            shapes_dtypes: List of (shape, dtype) tuples for tensors to receive
+
+        Returns:
+            (list of tensors, list of Work handles)
+        """
+        tensors = [
+            torch.empty(shape, dtype=dtype, device="cuda")
+            for shape, dtype in shapes_dtypes
+        ]
+
+        works = []
+        if self.world_rank == self.dit_master_rank:
+            # Create P2P operation list
+            p2p_ops = []
+            for tensor in tensors:
+                op = dist.P2POp(
+                    dist.irecv, tensor, self.non_dit_master_rank, group=self.p2p_group
+                )
+                p2p_ops.append(op)
+
+            # Execute all operations in a batch
+            works = dist.batch_isend_irecv(p2p_ops)
+
+        return tensors, works
+
+    def batch_isend_to_non_dit(self, tensors: List[torch.Tensor]) -> List[Work]:
+        """Batched non-blocking send from DiT to Non-DiT group."""
+        if self.world_rank != self.dit_master_rank:
+            return []
+
+        p2p_ops = []
+        for tensor in tensors:
+            op = dist.P2POp(
+                dist.isend, tensor, self.non_dit_master_rank, group=self.p2p_group
+            )
+            p2p_ops.append(op)
+
+        works = dist.batch_isend_irecv(p2p_ops)
+        return works
+
+    def batch_irecv_from_dit(
+        self, shapes_dtypes: List[tuple[torch.Size, torch.dtype]]
+    ) -> tuple[List[torch.Tensor], List[Work]]:
+        """Batched non-blocking receive from DiT group at Non-DiT group."""
+        tensors = [
+            torch.empty(shape, dtype=dtype, device="cuda")
+            for shape, dtype in shapes_dtypes
+        ]
+
+        works = []
+        if self.world_rank == self.non_dit_master_rank:
+            p2p_ops = []
+            for tensor in tensors:
+                op = dist.P2POp(
+                    dist.irecv, tensor, self.dit_master_rank, group=self.p2p_group
+                )
+                p2p_ops.append(op)
+
+            works = dist.batch_isend_irecv(p2p_ops)
+
+        return tensors, works
+
+    # Legacy single-tensor methods (kept for backward compatibility, but should use batched versions)
     def isend_to_dit(
         self, tensor: torch.Tensor, metadata: Optional[Dict] = None
     ) -> Optional[Work]:
         """Non-blocking send from Non-DiT to DiT group."""
-        if self.world_rank != self.non_dit_master_rank:
-            return None  # Only master sends cross-group
-
-        # P2P Non-blocking send to DiT Master
-        work = dist.isend(tensor, dst=self.dit_master_rank)
-        return work
+        works = self.batch_isend_to_dit([tensor])
+        return works[0] if works else None
 
     def irecv_from_non_dit(
         self, shape: torch.Size, dtype: torch.dtype
     ) -> tuple[torch.Tensor, Optional[Work]]:
-        """
-        Non-blocking receive from Non-DiT group at DiT group.
-        DiT Master receives, then will broadcast to workers.
-        """
-        tensor = torch.empty(shape, dtype=dtype, device="cuda")
-
-        work = None
-        if self.world_rank == self.dit_master_rank:
-            work = dist.irecv(tensor, src=self.non_dit_master_rank)
-
-        # Return tensor and work handle
-        # Note: broadcast to other DiT workers happens separately after wait
-        return tensor, work
+        """Non-blocking receive from Non-DiT group at DiT group."""
+        tensors, works = self.batch_irecv_from_non_dit([(shape, dtype)])
+        return tensors[0], works[0] if works else None
 
     def isend_to_non_dit(self, tensor: torch.Tensor) -> Optional[Work]:
         """Non-blocking send from DiT to Non-DiT group."""
-        if self.world_rank != self.dit_master_rank:
-            return None
-
-        work = dist.isend(tensor, dst=self.non_dit_master_rank)
-        return work
+        works = self.batch_isend_to_non_dit([tensor])
+        return works[0] if works else None
 
     def irecv_from_dit(
         self, shape: torch.Size, dtype: torch.dtype
     ) -> tuple[torch.Tensor, Optional[Work]]:
         """Non-blocking receive from DiT group at Non-DiT group."""
-        tensor = torch.empty(shape, dtype=dtype, device="cuda")
-
-        work = None
-        if self.world_rank == self.non_dit_master_rank:
-            work = dist.irecv(tensor, src=self.dit_master_rank)
-
-        return tensor, work
+        tensors, works = self.batch_irecv_from_dit([(shape, dtype)])
+        return tensors[0], works[0] if works else None
 
     def wait_work(self, work: Optional[Work]) -> None:
         """Wait for a Work handle to complete."""
