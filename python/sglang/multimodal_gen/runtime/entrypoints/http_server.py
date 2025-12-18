@@ -19,7 +19,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request, post_process_sample
 from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.srt.managers.io_struct import VertexGenerateReqInput
@@ -105,37 +105,6 @@ def encode_video_to_base64(file_path: str):
         return None
     with open(file_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
-
-
-def post_process_sample(
-    sample: torch.Tensor,
-    data_type: DataType,
-    fps: int,
-    save_output: bool = True,
-    save_file_path: str = None,
-):
-    """Process sample output (Tensors) and save video to disk."""
-    if sample.dim() == 3:
-        sample = sample.unsqueeze(1)
-
-    videos = rearrange(sample, "c t h w -> t c h w")
-
-    frames = []
-    for x in videos:
-        x = torchvision.utils.make_grid(x, nrow=6)
-        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-        frames.append((x * 255).cpu().numpy().astype(np.uint8))
-
-    if save_output and save_file_path:
-        os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-        print(f"Saving video to: {save_file_path}")
-
-        if data_type == DataType.VIDEO:
-            imageio.mimsave(save_file_path, frames, fps=fps, format="mp4")
-        else:
-            imageio.imwrite(save_file_path, frames[0])
-
-    return frames
 
 
 async def forward_to_scheduler(req_obj, sp):
