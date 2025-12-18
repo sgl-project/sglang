@@ -75,8 +75,6 @@ class ModelSlimConfig(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
-        # self.is_dynamic = quant_config.get("is_dynamic", False)
-        # self.is_moe_w4_dynamic = False
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
