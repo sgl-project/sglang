@@ -11,6 +11,7 @@ _in_torch_compile = False
 def is_in_piecewise_cuda_graph():
     return _in_piecewise_cuda_graph
 
+
 def is_in_torch_compile():
     return _in_torch_compile
 
@@ -21,6 +22,7 @@ def enable_piecewise_cuda_graph_compile():
     _in_torch_compile = True
     yield
     _in_torch_compile = False
+
 
 @contextmanager
 def enable_piecewise_cuda_graph():

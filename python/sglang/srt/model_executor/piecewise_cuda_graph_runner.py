@@ -297,7 +297,9 @@ class PiecewiseCudaGraphRunner:
         input_ids = self.input_ids[:num_tokens]
         input_embeds = self.input_embeds[:num_tokens] if self.is_multimodal else None
         positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+        mrope_positions = (
+            self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+        )
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = (
             self.out_cache_loc_swa[:num_tokens]

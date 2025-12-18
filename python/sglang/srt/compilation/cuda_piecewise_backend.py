@@ -11,8 +11,9 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 from sglang.srt.compilation.piecewise_context_manager import is_in_torch_compile
+from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+
 logger = logging.getLogger(__name__)
 
 
