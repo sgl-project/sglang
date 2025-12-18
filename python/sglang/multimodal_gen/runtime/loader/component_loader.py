@@ -688,7 +688,10 @@ class TransformerLoader(ComponentLoader):
             if isinstance(quant_method, NunchakuSVDQLinearMethod):
                 # Store as a tensor attribute; the kernel wrapper will read it
                 # and pass it as ``alpha`` to svdq_gemm_w4a4_cuda.
-                module.wtscale = tensor
+                if isinstance(module.wtscale, nn.Parameter):
+                    module.wtscale.data.copy_(tensor)
+                else:
+                    module.wtscale = tensor
                 num_patched += 1
 
         if num_patched > 0:

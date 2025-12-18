@@ -295,7 +295,7 @@ def load_model_from_full_model_state_dict(
     # parameters even if they are not present in the checkpoint. This is used
     # for newly introduced parameters that have reasonable defaults, such as
     # gate compressors or FP4 per-channel scales (wcscales).
-    ALLOWED_NEW_PARAM_PATTERNS = ["gate_compress", "wcscales"]  # Can be extended as needed
+    ALLOWED_NEW_PARAM_PATTERNS = ["gate_compress", "wcscales", "wtscale"]  # Can be extended as needed
     for new_param_name in unused_keys:
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
             logger.error(
@@ -311,7 +311,7 @@ def load_model_from_full_model_state_dict(
         meta_sharded_param = meta_sd.get(new_param_name)
         # Initialize defaults: for wcscales we follow Nunchaku's behavior and
         # use ones; for other patterns we use zeros.
-        if "wcscales" in new_param_name:
+        if "wcscales" in new_param_name or "wtscale" in new_param_name:
             init_like = torch.ones_like
         else:
             init_like = torch.zeros_like

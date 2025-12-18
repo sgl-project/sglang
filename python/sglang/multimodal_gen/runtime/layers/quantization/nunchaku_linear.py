@@ -135,12 +135,19 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         else:
             wcscales = None
 
+        # Global weight scale
+        wtscale = Parameter(
+            torch.empty(1, dtype=params_dtype),
+            requires_grad=False,
+        )
+
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("wscales", wscales)
         layer.register_parameter("smooth_factor", smooth_factor)
         layer.register_parameter("smooth_factor_orig", smooth_factor_orig)
         layer.register_parameter("proj_down", proj_down)
         layer.register_parameter("proj_up", proj_up)
+        layer.register_parameter("wtscale", wtscale)
         if wcscales is not None:
             layer.register_parameter("wcscales", wcscales)
 
@@ -152,8 +159,6 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         layer.group_size = self.group_size
         # Whether to use unsigned activations in INT4 mode.
         layer.act_unsigned = self.act_unsigned
-        # Global weight scale (set later from checkpoint when available).
-        layer.wtscale = None
 
         weight_loader = extra_weight_attrs.get("weight_loader")
         if weight_loader is not None:
@@ -163,6 +168,7 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             set_weight_attrs(smooth_factor_orig, {"weight_loader": weight_loader})
             set_weight_attrs(proj_down, {"weight_loader": weight_loader})
             set_weight_attrs(proj_up, {"weight_loader": weight_loader})
+            set_weight_attrs(wtscale, {"weight_loader": weight_loader})
             if wcscales is not None:
                 set_weight_attrs(wcscales, {"weight_loader": weight_loader})
 
@@ -178,6 +184,7 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             )
         layer.proj_down = Parameter(layer.proj_down.data, requires_grad=False)
         layer.proj_up = Parameter(layer.proj_up.data, requires_grad=False)
+        layer.wtscale = Parameter(layer.wtscale.data, requires_grad=False)
         if hasattr(layer, "wcscales") and layer.wcscales is not None:
             layer.wcscales = Parameter(layer.wcscales.data, requires_grad=False)
 
@@ -217,7 +224,7 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         )
         # Allocate output buffer.
         out_2d = torch.empty(
-            orig_shape[0]*orig_shape[1],
+            x_2d.shape[0],
             layer.output_size_per_partition,
             dtype=x_2d.dtype,
             device=x_2d.device,
