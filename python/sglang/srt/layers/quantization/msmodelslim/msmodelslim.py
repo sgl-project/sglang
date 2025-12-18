@@ -167,7 +167,7 @@ class ModelSlimConfig(QuantizationConfig):
         layer_name: str,
     ) -> ModelSlimScheme:
 
-        quant_type = self.quant_description[layer_name + ".weight"]
+        quant_type = self.quant_description.get(layer_name + ".weight", "")
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
             return ModelSlimW8A8Int8(
                 quant_config=self.quant_description, prefix=layer_name
@@ -206,7 +206,7 @@ class ModelSlimConfig(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -218,7 +218,7 @@ class ModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
 
         assert is_skipped is not None
         return is_skipped
