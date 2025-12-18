@@ -4,7 +4,6 @@ ROCM_VERSION=$1
 
 PYTHON_ROOT_PATH="/opt/venv/bin"
 AMDGPU_TARGET="gfx942;gfx950"
-TORCH_INSTALL_CMD="${PYTHON_ROOT_PATH}/pip install --index-url https://download.pytorch.org/whl/nightly/rocm7.0 torch==2.10.0.dev20251011+rocm7.0 torchvision==0.25.0.dev20251012+rocm7.0"
 
 echo "Python root path is: $PYTHON_ROOT_PATH"
 
@@ -122,9 +121,7 @@ docker run --rm \
   mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64 /opt/cmake
   export PATH=/opt/cmake/bin:\$PATH
 
-  ${PYTHON_ROOT_PATH}/pip uninstall -y torch torchvision && \
-  ${TORCH_INSTALL_CMD} && \
-  ${PYTHON_ROOT_PATH}/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
+  ${PYTHON_ROOT_PATH}/pip install --no-cache-dir ninja setuptools wheel numpy uv scikit-build-core && \
 
   cd /sgl-kernel && \
   rm -rf CMakeLists.txt && mv CMakeLists_rocm.txt CMakeLists.txt && \
