@@ -238,7 +238,8 @@ class Fp8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        tp_size = get_tensor_model_parallel_world_size()
+        # tp_size = get_tensor_model_parallel_world_size()
+        tp_size = 1
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
