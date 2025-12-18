@@ -14,6 +14,7 @@ import zmq.asyncio
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -22,46 +23,22 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None):
+    def __init__(self, req_id, num_parts, part_idx, grid_dim, modality, embedding=None):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
-        self.image_grid_dim = image_grid_dim
+        self.grid_dim = grid_dim
+        self.modality = modality
         self.embedding = embedding
         self.send_time = None
         self.dtype = embedding.dtype if embedding is not None else None
         self.shape = list(embedding.shape) if embedding is not None else None
-        # aggregated data
-        self.ready_list = [i == self.part_idx for i in range(self.num_parts)]
-        self.embedding_list = [
-            embedding if i == self.part_idx else None for i in range(self.num_parts)
-        ]
-        self.image_grid_dim_list = [
-            self.image_grid_dim if i == self.part_idx else None
-            for i in range(self.num_parts)
-        ]
 
-    def add(self, embedding_data):
-        assert self.req_id == embedding_data.req_id
-        assert not self.ready_list[embedding_data.part_idx]
-        self.ready_list[embedding_data.part_idx] = True
-        self.image_grid_dim_list[embedding_data.part_idx] = (
-            embedding_data.image_grid_dim
-        )
-        self.embedding_list[embedding_data.part_idx] = embedding_data.embedding
+    def get_grid(self):
+        return self.grid_dim
 
-    def get_embedding(self, is_concat=False):
-        if is_concat:
-            return torch.concat([embedding.cuda() for embedding in self.embedding_list])
-        else:
-            return self.embedding_list
-
-    def get_img_grid(self):
-        return torch.concatenate(self.image_grid_dim_list)
-
-    @property
-    def ready(self):
-        return sum(self.ready_list) == self.num_parts
+    def get_embedding(self):
+        return self.embedding
 
     def __repr__(self):
         return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx})"
@@ -71,12 +48,96 @@ class EmbeddingData:
             req_id=self.req_id,
             num_parts=self.num_parts,
             part_idx=self.part_idx,
-            image_grid_dim=self.image_grid_dim,
+            grid_dim=self.grid_dim,
+            modality=self.modality,
         )
         new_data.send_time = self.send_time
         new_data.dtype = self.dtype
         new_data.shape = self.shape
         return new_data
+
+
+class MultiModalEmbeddingData(EmbeddingData):
+    def __init__(self, part_idx, num_parts, req_id, grid_dim, modality, embedding):
+        super().__init__(req_id, num_parts, part_idx, grid_dim, modality, embedding)
+        self.img_grid_thw = [None] * num_parts
+        self.video_grid_thw = [None] * num_parts
+        self.modality_list = [
+            modality if part_idx == i else None for i in range(num_parts)
+        ]
+        self.ready_list = [i == part_idx for i in range(num_parts)]
+        self.embedding_list = [
+            embedding if i == part_idx else None for i in range(num_parts)
+        ]
+        if modality == Modality.IMAGE:
+            self.img_grid_thw[part_idx] = self.get_grid()
+        elif modality == Modality.VIDEO:
+            self.video_grid_thw[part_idx] = self.get_grid()
+
+    @classmethod
+    def from_embedding_data(cls, embedding_data: EmbeddingData):
+        """Create MultiModalEmbeddingData from an EmbeddingData instance."""
+        mm_data = cls(
+            part_idx=embedding_data.part_idx,
+            num_parts=embedding_data.num_parts,
+            req_id=embedding_data.req_id,
+            grid_dim=embedding_data.grid_dim,
+            modality=embedding_data.modality,
+            embedding=embedding_data.embedding,
+        )
+        # Copy over additional attributes
+        mm_data.send_time = embedding_data.send_time
+        return mm_data
+
+    def __repr__(self):
+        return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality}"
+
+    def _get_mm_grid(self, modality):
+        if modality == Modality.IMAGE:
+            grid_dims = self.img_grid_thw
+        elif modality == Modality.VIDEO:
+            grid_dims = self.video_grid_thw
+
+        valid_grid_dims = []
+        for grid_dim in grid_dims:
+            if grid_dim is None:
+                continue
+            if grid_dim.dim() == 1:
+                valid_grid_dims.append(grid_dim.unsqueeze(0))
+            else:
+                valid_grid_dims.append(grid_dim)
+        if len(valid_grid_dims) == 0:
+            return None
+        return torch.cat(valid_grid_dims, dim=0)
+
+    def get_embedding(self, is_concat=False):
+        if is_concat:
+            return torch.concat([embedding.cuda() for embedding in self.embedding_list])
+        else:
+            return self.embedding_list
+
+    @property
+    def ready(self):
+        return sum(self.ready_list) == self.num_parts
+
+    def get_img_grid(self):
+        return self._get_mm_grid(Modality.IMAGE)
+
+    def get_video_grid(self):
+        return self._get_mm_grid(Modality.VIDEO)
+
+    def add(self, embedding_data: EmbeddingData):
+        assert self.req_id == embedding_data.req_id
+        assert not self.ready_list[embedding_data.part_idx]
+        self.ready_list[embedding_data.part_idx] = True
+        self.modality_list[embedding_data.part_idx] = embedding_data.modality
+        self.embedding_list[embedding_data.part_idx] = embedding_data.get_embedding()
+        if embedding_data.modality == Modality.IMAGE:
+            self.img_grid_thw[embedding_data.part_idx] = embedding_data.get_grid()
+        elif embedding_data.modality == Modality.VIDEO:
+            self.video_grid_thw[embedding_data.part_idx] = embedding_data.get_grid()
+        else:
+            raise ValueError(f"Invalid modality: {embedding_data.modality}")
 
 
 # For zmq_to_scheduler
@@ -176,17 +237,20 @@ class WaitingImageRequest:
             recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
                 recv_obj.shape
             )
-            recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
+
             if self.recv_embedding_data is None:
-                self.recv_embedding_data = recv_obj
+                self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
+                    recv_obj
+                )
             else:
                 self.recv_embedding_data.add(recv_obj)
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         img_grid_thw = self.recv_embedding_data.get_img_grid()
+        video_grid_thw = self.recv_embedding_data.get_video_grid()
 
         mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text, recv_embedding, img_grid_thw
+            self.recv_req.input_text, recv_embedding, img_grid_thw, video_grid_thw
         )
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
@@ -511,7 +575,7 @@ class MMReceiver:
 
         recv_embedding = None
 
-        recv_embedding_data: EmbeddingData = None
+        recv_embedding_data: MultiModalEmbeddingData = None
 
         while recv_embedding_data is None or not recv_embedding_data.ready:
             parts = await recv_socket.recv_multipart(copy=False)
@@ -523,9 +587,12 @@ class MMReceiver:
                 recv_obj.embedding = torch.frombuffer(
                     buffer, dtype=recv_obj.dtype
                 ).reshape(recv_obj.shape)
+
             if recv_embedding_data is None:
                 recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
-                recv_embedding_data = recv_obj
+                recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
+                    recv_obj
+                )
             else:
                 recv_embedding_data.add(recv_obj)
 
@@ -539,6 +606,9 @@ class MMReceiver:
         recv_socket.close()
 
         img_grid_thw = recv_embedding_data.get_img_grid()
+        video_grid_thw = recv_embedding_data.get_video_grid()
 
-        mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
+        mm_inputs = mm_processor.get_mm_data(
+            prompt, recv_embedding, img_grid_thw, video_grid_thw
+        )
         return mm_inputs

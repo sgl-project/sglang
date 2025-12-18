@@ -16,8 +16,6 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
-from transformers import AutoImageProcessor
-from transformers.image_utils import load_images
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -38,6 +36,8 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
+from transformers import AutoImageProcessor
+from transformers.image_utils import load_images
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +280,7 @@ class MMEncoder:
                 num_parts,
                 part_idx,
                 image_grid_dim,
+                Modality.IMAGE,
                 mm_embedding,
             )
             self.embedding_to_send[mm_data.req_id] = mm_data

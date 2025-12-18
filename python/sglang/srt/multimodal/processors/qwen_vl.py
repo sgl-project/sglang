@@ -12,7 +12,7 @@ from torchvision.transforms import InterpolationMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
@@ -239,6 +239,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.IM_TOKEN_ID = hf_config.image_token_id
+        self.VIDEO_TOKEN_ID = hf_config.video_token_id
 
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
@@ -256,12 +257,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             image_token_regex=re.compile(
                 r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),
-            video_token_id=hf_config.video_token_id,
+            video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
-    def get_mm_data(self, prompt, embeddings, img_grid_thw):
-        input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
+    def get_mm_data(self, prompt, embeddings, img_grid_thw, video_grid_thw):
+        input_ids, offsets, modality_list = self.build_input_ids(
+            prompt, img_grid_thw, video_grid_thw
+        )
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
@@ -276,13 +279,20 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
-        mm_items = [
-            MultimodalDataItem(
-                modality=Modality.IMAGE,
-                offsets=offsets,
-                precomputed_embeddings=embeddings,
+        mm_items = []
+        embedding_index = 0
+        for modality, offset in zip(modality_list, offsets):
+            start_idx, end_idx = offset
+            num_tokens = end_idx - start_idx + 1
+            embedding_slice = embeddings[embedding_index : embedding_index + num_tokens]
+            embedding_index += num_tokens
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=modality,
+                    offsets=offset,
+                    precomputed_embeddings=embedding_slice,
+                )
             )
-        ]
 
         return {
             "input_ids": input_ids,
