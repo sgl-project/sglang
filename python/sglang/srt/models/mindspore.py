@@ -291,7 +291,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Tensor:
+    ) -> "ms.Tensor":
         # prepare base inputs
         model_inputs = self.prepare_inputs(input_ids, positions, forward_batch)
         # prepare model inputs
