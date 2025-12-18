@@ -410,18 +410,16 @@ impl AppContextBuilder {
     }
 
     /// Create reasoning parser factory for gRPC mode
-    fn maybe_reasoning_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        }
+    fn maybe_reasoning_parser_factory(mut self, _config: &RouterConfig) -> Self {
+        // Unconditionally register because we initialize both HTTP and gRPC router
+        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
         self
     }
 
     /// Create tool parser factory for gRPC mode
-    fn maybe_tool_parser_factory(mut self, config: &RouterConfig) -> Self {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            self.tool_parser_factory = Some(ToolParserFactory::new());
-        }
+    fn maybe_tool_parser_factory(mut self, _config: &RouterConfig) -> Self {
+        // Unconditionally register because we initialize both HTTP and gRPC router
+        self.tool_parser_factory = Some(ToolParserFactory::new());
         self
     }
 
