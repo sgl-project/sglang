@@ -6,8 +6,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from sglang import ServerArgs
 from sglang.srt.environ import envs
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 

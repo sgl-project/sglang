@@ -30,6 +30,7 @@ from sgl_kernel.elementwise import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     rmsnorm,
+    rotary_embedding,
     silu_and_mul,
 )
 from sgl_kernel.expert_specialization import (
