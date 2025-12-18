@@ -77,7 +77,8 @@ class TestQwenImageEdit(TestGenerateBase):
 
     def test_mixed(self):
         pass
-        
+
+
 class TestQwenImageEditPlusMultiImageURL(TestGenerateBase):
     """CLI-level test for multi-image URL input with Qwen-Image-Edit."""
 
@@ -89,7 +90,9 @@ class TestQwenImageEditPlusMultiImageURL(TestGenerateBase):
         "test_single_gpu": 33.4 * 1.05,
     }
 
-    prompt: str | None = "The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square."
+    prompt: str | None = (
+        "The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square."
+    )
 
     def setUp(self):
         super().setUp()
@@ -122,6 +125,7 @@ class TestQwenImageEditPlusMultiImageURL(TestGenerateBase):
 
     def test_mixed(self):
         pass
+
 
 if __name__ == "__main__":
     del TestGenerateBase
