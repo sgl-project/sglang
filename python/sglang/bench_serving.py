@@ -40,7 +40,6 @@ import pybase64
 import requests
 from datasets import load_dataset
 from PIL import Image
-from requests.auth import AuthBase
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoProcessor,
@@ -928,16 +927,6 @@ MOONCAKE_DATASET_URL = {
 }
 
 
-class TokenAuth(AuthBase):
-    def __init__(self, token, scheme="Bearer"):
-        self.token = token
-        self.scheme = scheme
-
-    def __call__(self, request):
-        request.headers["Authorization"] = f"{self.scheme} {self.token}"
-        return request
-
-
 def download_and_cache_hf_file(
     repo_id: str,
     filename: str,
@@ -951,12 +940,8 @@ def download_and_cache_hf_file(
     )
 
 
-def download_and_cache_file(
-    url: str, filename: Optional[str] = None, token: Optional[str] = None
-):
+def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
-    auth = TokenAuth(token) if token else None
-
     if filename is None:
         filename = os.path.join("/tmp", url.split("/")[-1])
 
@@ -967,7 +952,7 @@ def download_and_cache_file(
     print(f"Downloading from {url} to {filename}")
 
     # Stream the response to show the progress bar
-    response = requests.get(url, stream=True, auth=auth)
+    response = requests.get(url, stream=True)
     response.raise_for_status()  # Check for request errors
 
     # Total size of the file in bytes
