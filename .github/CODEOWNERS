@@ -16,6 +16,7 @@
 /python/sglang/srt/grpc @CatherineSue @slin1237
 /python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname
 /python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
+/python/sglang/srt/layers/attention @merrymercy @Fridge003 @ispobock
 /python/sglang/srt/layers/attention/fla @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py @yizhang2077 @hebiao064 @hanming-lu
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
@@ -28,6 +29,7 @@
 /python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
+/python/sglang/srt/utils @merrymercy @zhyncs @hnyls2002 @CatherineSue @Ying1123 @ispobock @BBuf @mickqian @Fridge003 @JustinTong0323 @ch-wan @zhaochenyang20 @ShangmingCai @xiezhq-hermann @Qiaolin-Yu
 /sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
