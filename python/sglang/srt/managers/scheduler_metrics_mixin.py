@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
@@ -13,6 +14,7 @@ from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.device_timer import time_device_forward_pass
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -452,3 +454,8 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
+
+    @contextmanager
+    def record_metrics_around_forward(self, batch):
+        with time_device_forward_pass(batch.forward_mode):
+            TODO
