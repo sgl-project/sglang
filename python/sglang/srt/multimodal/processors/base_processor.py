@@ -653,7 +653,6 @@ class BaseMultimodalProcessor(ABC):
                             if is_precomputed
                             else multimodal_tokens.video_token
                         )
-                        videos += [result]
                         new_text_parts += mm_tokens
                     elif modality == Modality.AUDIO:
                         # audio
@@ -662,7 +661,6 @@ class BaseMultimodalProcessor(ABC):
                             if is_precomputed
                             else multimodal_tokens.audio_token
                         )
-                        audios += [result]
                         new_text_parts += mm_tokens
                 else:
                     # normal text
