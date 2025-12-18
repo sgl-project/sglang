@@ -51,6 +51,7 @@ export ENABLE_ASCEND_MOE_NZ=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`
 `python3 -m sglang.launch_server --model-path *model* --tp 4 --trust-remote-code --attention-backend ascend --device npu  --host 127.0.0.1 --port 30088 --mem-fraction-static 0.8 --quantization modelslim --moe-a2a-backend deepep --deepep-mode auto`
+
 client: 
 `python ./benchmark/gsm8k/bench_sglang.py --num-questions 1319 --port 30088 --data-path ../gsm8k/test.jsonl --parallel 16`
 
