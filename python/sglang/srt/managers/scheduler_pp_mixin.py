@@ -637,6 +637,16 @@ class SchedulerPPMixin:
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
+            if self.tp_size > 1:
+                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = broadcast_pyobj(
+                    data_to_sync_tp,
+                    self.tp_rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+                seq_lens, latencies = data_to_sync_tp
+
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             data_to_sync = [seq_lens, latencies]
