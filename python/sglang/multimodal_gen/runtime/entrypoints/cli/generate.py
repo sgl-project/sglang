@@ -71,6 +71,7 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
 
     timings = RequestTimings(request_id=timings_dict.get("request_id"))
     timings.stages = timings_dict.get("stages", {})
+    timings.steps = timings_dict.get("steps", [])
     timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
 
     PerformanceLogger.dump_benchmark_report(
