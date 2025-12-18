@@ -1863,6 +1863,11 @@ class ModelRunner:
                     f"Use the profiled value instead."
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+        else:
+            log_info_on_rank0(
+                logger,
+                f"max_total_num_tokens: arg=None, profiled={self.max_total_num_tokens}",
+            )
 
         self.max_total_num_tokens = (
             self.max_total_num_tokens
@@ -1932,7 +1937,7 @@ class ModelRunner:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_running_requests,
                     mamba_size=self.server_args.max_mamba_cache_size,
-                    mamba_spec_state_size=max_num_reqs,
+                    mamba_spec_state_size=max_running_requests,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
