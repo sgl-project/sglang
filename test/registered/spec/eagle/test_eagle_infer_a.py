@@ -230,6 +230,7 @@ class TestEAGLERadixCache(CustomTestCase):
             {**self.BASE_CONFIG, "page_size": 4},
             # Large page size tend to expose IMA bugs.
             {**self.BASE_CONFIG, "page_size": 256},
+            {**self.BASE_CONFIG, "cuda_graph_bs": [5], "page_size": 4},
             # Disable CUDA Graph
             {
                 **self.BASE_CONFIG,

@@ -100,6 +100,8 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        encoder_only: bool = False,
+        language_only: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -218,6 +220,9 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
+        self.hf_config.encoder_only = encoder_only
+        self.hf_config.language_only = language_only
+
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
             self.hf_config, "matryoshka_dimensions", None
@@ -231,8 +236,14 @@ class ModelConfig:
         server_args: ServerArgs,
         model_path: str = None,
         model_revision: str = None,
+        is_draft_model: bool = False,
         **kwargs,
     ):
+        quantization = (
+            server_args.speculative_draft_model_quantization
+            if is_draft_model
+            else server_args.quantization
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -242,12 +253,15 @@ class ModelConfig:
             is_embedding=server_args.is_embedding,
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
-            quantization=server_args.quantization,
+            quantization=quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
+            language_only=server_args.language_only,
+            encoder_only=server_args.encoder_only,
+            is_draft_model=is_draft_model,
             **kwargs,
         )
 
@@ -739,6 +753,15 @@ class ModelConfig:
                         f"({self.quantization})."
                     )
 
+            # Check if the scale_fmt is ue8m0, and warn user if deepgemm is enabled for non-ue8m0 models on blackwell
+            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                logger.warning(
+                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
+                )
+
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(
@@ -1026,8 +1049,8 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
 ]
 
-if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
-    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
+if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
+    multimodal_model_archs.append(external_mm_model_arch)
 
 
 def is_multimodal_model(model_architectures: List[str]):

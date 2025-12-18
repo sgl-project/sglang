@@ -70,7 +70,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import RotaryPosMixin, permute_inv
+from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
@@ -547,6 +547,24 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+        orig_to_new_prefix={
+            # mapping for new names in checkpoint saved after transformers v4.52
+            "model.language_model.": "language_model.model.",
+            "model.visual.": "visual.",
+            # mapping for original checkpoint
+            "lm_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
+        },
+    )
+
     def __init__(
         self,
         config: Qwen2_5_VLConfig,
@@ -558,6 +576,31 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+
+        if not self.config.encoder_only:
+            self.model = Qwen2Model(
+                config,
+                quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
+        else:
+            # encoder_only mode: no language model, so no lm_head needed
+            self.lm_head = None
+
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
@@ -568,26 +611,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             use_data_parallel=self.use_data_parallel,
             max_context_len=self.config.max_position_embeddings,
         )
-
-        self.model = Qwen2Model(
-            config,
-            quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -738,6 +761,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -751,6 +782,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
+                    and hasattr(self, "model")
                     and hasattr(self.model, "start_layer")
                     and (
                         layer_id < self.model.start_layer
@@ -761,6 +793,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.encoder_only or self.config.language_only
+                ) and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -778,7 +815,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                     else:
-                        raise ValueError(f"Weight {name} not found in params_dict")
+                        continue
+
                 except KeyError:
                     print(params_dict.keys())
                     raise

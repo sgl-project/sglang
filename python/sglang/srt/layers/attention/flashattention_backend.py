@@ -2492,3 +2492,4 @@ def update_draft_decode_set_expand_metadata_with_page_size(
     packed = torch.zeros_like(cache_loc)
     packed.scatter_(1, positions, cache_loc)
     return packed
+
