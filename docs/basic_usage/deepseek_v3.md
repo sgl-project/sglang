@@ -12,6 +12,7 @@ To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 | Weight Type | Configuration |
 |------------|-------------------|
 | **Full precision [FP8](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528)**<br>*(recommended)* | 8 x H200 |
+| | 8 x B200 |
 | | 8 x MI300X |
 | | 2 x 8 x H100/800/20 |
 | | Xeon 6980P CPU |
@@ -27,7 +28,7 @@ To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 | **Quantized weights ([AWQ](https://huggingface.co/QuixiAI/DeepSeek-R1-0528-AWQ))** | 8 x H100/800/20 |
 | | 8 x A100/A800 |
 | **Quantized weights ([MXFP4](https://huggingface.co/amd/DeepSeek-R1-MXFP4-Preview))** | 8, 4 x MI355X/350X |
-| **Quantized weights ([NVFP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4))** | 8, 4 x B200 |
+| **Quantized weights ([NVFP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4-v2))** | 8, 4 x B200 |
 
 <style>
 .md-typeset__table {
@@ -65,6 +66,7 @@ The official DeepSeek V3 is already in FP8 format, so you should not run it with
 Detailed commands for reference:
 
 - [8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended)
+- [4 x B200, 8 x B200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-one-b200-node)
 - [8 x MI300X](../platforms/amd_gpu.md#running-deepseek-v3)
 - [2 x 8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes)
 - [4 x 8 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes)
