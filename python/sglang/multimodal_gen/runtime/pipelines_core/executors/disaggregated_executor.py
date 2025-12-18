@@ -148,14 +148,23 @@ class DisaggregatedExecutor(PipelineExecutor):
 
                 # Async receive from Non-DiT
                 batch, recv_works = self._async_recv_batch_from_non_dit(batch)
+                logger.debug(
+                    f"[DiT Rank {dist.get_rank()}] Phase 2: _async_recv_batch_from_non_dit"
+                )
 
                 # Wait for receive to complete before denoising
                 if recv_works:
                     self.comm.wait_all_works(recv_works)
                     logger.debug(f"[DiT] Received batch from Non-DiT")
 
+                logger.debug(f"[DiT Rank {dist.get_rank()}] Phase 2: wait_all_works")
+
                 # Broadcast to all DiT workers (if SP/TP)
                 self._broadcast_batch_in_dit_group(batch)
+
+                logger.debug(
+                    f"[DiT Rank {dist.get_rank()}] Phase 2: _broadcast_batch_in_dit_group"
+                )
 
                 try:
                     # Run denoising stages
@@ -248,14 +257,21 @@ class DisaggregatedExecutor(PipelineExecutor):
             # Single rank in group, no need to broadcast
             return
 
-        # Broadcast using CPU group (simpler than pickle + tensor)
+        # Broadcast metadata using CUDA tensors (NCCL backend requires CUDA)
         world_rank = dist.get_rank()
+        backend = dist.get_backend(group=dit_group)
+        use_cpu = backend != "nccl"  # Only use CPU if not NCCL
+
+        logger.debug(
+            f"[DiT Rank {dist.get_rank()}] Broadcasting metadata with backend={backend}, use_cpu={use_cpu}"
+        )
+
         metadata_pkg = broadcast_pyobj(
             (metadata, tensor_infos, list_tensor_infos),
             rank=world_rank,  # current rank (global)
             dist_group=dit_group,  # dit group
             src=self.comm.dit_master_rank,  # source rank (global)
-            force_cpu_device=True,
+            force_cpu_device=use_cpu,  # Use CUDA for NCCL backend
         )
 
         if dist.get_rank() != self.comm.dit_master_rank:
@@ -305,6 +321,8 @@ class DisaggregatedExecutor(PipelineExecutor):
 
         # Step 2: Broadcast all tensors
         # Now all workers have the tensor objects, broadcast the data
+        logger.debug(f"[DiT Rank {dist.get_rank()}] Step 2: Broadcasting tensors...")
+
         if hasattr(batch, "__dict__"):
             for k, v in batch.__dict__.items():
                 if k.startswith("_recv_"):
@@ -312,20 +330,59 @@ class DisaggregatedExecutor(PipelineExecutor):
 
                 if isinstance(v, torch.Tensor):
                     # Ensure tensor is on CUDA before broadcast (NCCL requires CUDA)
+                    logger.debug(
+                        f"[DiT Rank {dist.get_rank()}] Broadcasting tensor {k}: device={v.device}, shape={v.shape}"
+                    )
                     if not v.is_cuda:
+                        logger.warning(
+                            f"[DiT Rank {dist.get_rank()}] Tensor {k} is on CPU, moving to CUDA"
+                        )
                         v = v.cuda()
                         setattr(batch, k, v)
+
+                    # Double check before broadcast
+                    if not v.is_cuda:
+                        raise RuntimeError(
+                            f"[Rank {dist.get_rank()}] Tensor {k} is still on CPU after cuda() call: {v.device}"
+                        )
+
                     # Broadcast single tensor
-                    self.comm.broadcast_in_group(v)
+                    try:
+                        self.comm.broadcast_in_group(v)
+                    except Exception as e:
+                        logger.error(
+                            f"[Rank {dist.get_rank()}] Failed to broadcast tensor {k}: device={v.device}, error={e}"
+                        )
+                        raise
+
                 elif isinstance(v, list) and v and len(v) > 0:
                     # Broadcast list of tensors
                     for idx, item in enumerate(v):
                         if isinstance(item, torch.Tensor):
+                            logger.debug(
+                                f"[DiT Rank {dist.get_rank()}] Broadcasting list tensor {k}[{idx}]: device={item.device}"
+                            )
                             # Ensure tensor is on CUDA
                             if not item.is_cuda:
+                                logger.warning(
+                                    f"[DiT Rank {dist.get_rank()}] List tensor {k}[{idx}] is on CPU, moving to CUDA"
+                                )
                                 item = item.cuda()
                                 v[idx] = item
-                            self.comm.broadcast_in_group(item)
+
+                            # Double check
+                            if not item.is_cuda:
+                                raise RuntimeError(
+                                    f"[Rank {dist.get_rank()}] List tensor {k}[{idx}] is still on CPU after cuda() call"
+                                )
+
+                            try:
+                                self.comm.broadcast_in_group(item)
+                            except Exception as e:
+                                logger.error(
+                                    f"[Rank {dist.get_rank()}] Failed to broadcast list tensor {k}[{idx}]: device={item.device}, error={e}"
+                                )
+                                raise
 
         logger.debug(f"[DiT Rank {dist.get_rank()}] Broadcasted batch within DiT group")
 

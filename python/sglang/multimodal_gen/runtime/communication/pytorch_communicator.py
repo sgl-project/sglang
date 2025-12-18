@@ -135,10 +135,12 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
             return
 
         # CRITICAL: Ensure tensor is on CUDA for NCCL backend
-        if dist.get_backend(group) == "nccl" and not tensor.is_cuda:
+        backend = dist.get_backend(group)
+        if backend == "nccl" and not tensor.is_cuda:
             raise RuntimeError(
                 f"[Rank {dist.get_rank()}] Cannot broadcast CPU tensor with NCCL backend. "
-                f"Tensor device: {tensor.device}, backend: {dist.get_backend(group)}"
+                f"Tensor device: {tensor.device}, backend: {backend}, "
+                f"tensor shape: {tensor.shape}, dtype: {tensor.dtype}"
             )
 
         # We need to translate group-relative src rank to global rank for dist.broadcast
@@ -153,7 +155,19 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         else:
             global_src = self.non_dit_master_rank
 
-        dist.broadcast(tensor, src=global_src, group=group)
+        logger.debug(
+            f"[Rank {dist.get_rank()}] broadcast_in_group: tensor device={tensor.device}, "
+            f"shape={tensor.shape}, backend={backend}, src={global_src}"
+        )
+
+        try:
+            dist.broadcast(tensor, src=global_src, group=group)
+        except Exception as e:
+            logger.error(
+                f"[Rank {dist.get_rank()}] broadcast failed: tensor device={tensor.device}, "
+                f"backend={backend}, error={e}"
+            )
+            raise
 
     # --- Async Communication Implementation ---
 
