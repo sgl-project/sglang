@@ -83,6 +83,7 @@ impl RouterManager {
                     manager.register_router(
                         RouterId::new("http-regular".to_string()),
                         Arc::from(http_regular),
+                        true,
                     );
                 }
                 Err(e) => {
@@ -100,8 +101,11 @@ impl RouterManager {
             {
                 Ok(http_pd) => {
                     info!("Created HTTP PD router");
-                    manager
-                        .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
+                    manager.register_router(
+                        RouterId::new("http-pd".to_string()),
+                        Arc::from(http_pd),
+                        true,
+                    );
                 }
                 Err(e) => {
                     warn!("Failed to create HTTP PD router: {e}");
@@ -117,15 +121,29 @@ impl RouterManager {
         } else {
             info!("Initializing RouterManager in single-router mode");
 
-            let single_router = Arc::from(RouterFactory::create_router(app_context).await?);
-            let router_id = Self::determine_router_id(
-                &config.router_config.mode,
-                &config.router_config.connection_mode,
-            );
+            for connection_mode in [ConnectionMode::Http, ConnectionMode::Grpc { port: None }] {
+                let router_id =
+                    Self::determine_router_id(&config.router_config.mode, &connection_mode);
+                let router = match RouterFactory::create_router_by_connection_mode(
+                    app_context,
+                    &connection_mode,
+                )
+                .await
+                {
+                    Ok(x) => Arc::from(x),
+                    Err(e) => {
+                        info!(
+                            "Skip creating router with id {} since error: {:?}",
+                            router_id.as_str(),
+                            e
+                        );
+                        continue;
+                    }
+                };
 
-            info!("Created single router with ID: {}", router_id.as_str());
-            manager.register_router(router_id.clone(), single_router);
-            manager.set_default_router(router_id);
+                info!("Created router with ID: {}", router_id.as_str());
+                manager.register_router(router_id.clone(), router, false);
+            }
         }
 
         if manager.router_count() == 0 {
@@ -161,13 +179,21 @@ impl RouterManager {
         }
     }
 
-    pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
+    pub fn register_router(
+        &self,
+        id: RouterId,
+        router: Arc<dyn RouterTrait>,
+        set_default_router: bool,
+    ) {
         self.routers.insert(id.clone(), router);
 
-        let mut default_router = self.default_router.write().unwrap();
-        if default_router.is_none() {
-            *default_router = Some(id.clone());
-            info!("Set default router to {}", id.as_str());
+        // TODO maybe we can remove default router
+        if set_default_router {
+            let mut default_router = self.default_router.write().unwrap();
+            if default_router.is_none() {
+                *default_router = Some(id.clone());
+                info!("Set default router to {}", id.as_str());
+            }
         }
     }
 
