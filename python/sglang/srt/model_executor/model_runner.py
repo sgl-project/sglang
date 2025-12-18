@@ -576,7 +576,7 @@ class ModelRunner:
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.value
+            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
         )
         self.remote_instance_transfer_engine_session_id = (
             f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
@@ -2783,7 +2783,7 @@ class ModelRunner:
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer
+            and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
