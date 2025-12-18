@@ -452,53 +452,23 @@ def download_weights_from_hf(
                     allow_patterns = [pattern]
                     break
 
-        log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
-
         # Only perform validation and retry in CI to avoid overhead for regular users
         if is_in_ci():
             from sglang.srt.model_loader.ci_weight_validation import (
-                ci_validate_weights_after_download,
+                ci_download_with_validation_and_retry,
             )
 
-            # Retry loop for handling corrupted downloads
-            for attempt in range(max_retries):
-                hf_folder = snapshot_download(
-                    model_name_or_path,
-                    allow_patterns=allow_patterns,
-                    ignore_patterns=ignore_patterns,
-                    cache_dir=cache_dir,
-                    tqdm_class=DisabledTqdm,
-                    revision=revision,
-                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                )
-
-                # Validate downloaded files to catch corruption early
-                is_valid = ci_validate_weights_after_download(
-                    hf_folder, allow_patterns, model_name_or_path
-                )
-
-                if is_valid:
-                    return hf_folder
-
-                # Validation failed, corrupted files were cleaned up
-                if attempt < max_retries - 1:
-                    log_info_on_rank0(
-                        logger,
-                        f"Retrying download for {model_name_or_path} "
-                        f"(attempt {attempt + 2}/{max_retries})...",
-                    )
-                else:
-                    raise RuntimeError(
-                        f"Downloaded model files are still corrupted for "
-                        f"{model_name_or_path} after {max_retries} attempts. "
-                        "This may indicate a persistent issue with the model files "
-                        "on Hugging Face Hub or network problems."
-                    )
-
-            # This should never be reached, but just in case
-            return hf_folder
+            return ci_download_with_validation_and_retry(
+                model_name_or_path=model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                revision=revision,
+                max_retries=max_retries,
+            )
         else:
             # Simple download without validation for non-CI environments
+            log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
             hf_folder = snapshot_download(
                 model_name_or_path,
                 allow_patterns=allow_patterns,

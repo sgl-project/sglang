@@ -420,13 +420,13 @@ def ci_validate_and_cleanup_local_snapshot(
     return True
 
 
-def ci_validate_weights_after_download(
+def _validate_weights_after_download(
     hf_folder: str,
     allow_patterns: List[str],
     model_name_or_path: str,
 ) -> bool:
     """
-    CI-specific validation of downloaded weight files.
+    Validate downloaded weight files to catch corruption early.
 
     This function validates safetensors files after download to catch
     corruption issues (truncated downloads, network errors, etc.) before
@@ -471,3 +471,82 @@ def ci_validate_weights_after_download(
         return False
 
     return True
+
+
+def ci_download_with_validation_and_retry(
+    model_name_or_path: str,
+    allow_patterns: List[str],
+    ignore_patterns,
+    cache_dir: Optional[str],
+    revision: Optional[str],
+    max_retries: int = 3,
+) -> str:
+    """
+    CI-specific download with validation and automatic retry on corruption.
+
+    This function handles the download of model weights in CI environments,
+    with automatic validation and retry logic for handling corrupted downloads.
+
+    Args:
+        model_name_or_path: The model name or path
+        allow_patterns: The allowed patterns for weight files
+        ignore_patterns: The patterns to filter out weight files
+        cache_dir: The cache directory to store model weights
+        revision: The revision of the model
+        max_retries: Maximum number of download retries if corruption is detected
+
+    Returns:
+        str: The path to the downloaded model weights
+
+    Raises:
+        RuntimeError: If download fails after max_retries attempts
+    """
+    # Lazy imports to avoid circular dependencies
+    import huggingface_hub.constants
+    from huggingface_hub import snapshot_download
+    from tqdm.auto import tqdm
+
+    class DisabledTqdm(tqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+
+    log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
+
+    # Retry loop for handling corrupted downloads
+    for attempt in range(max_retries):
+        hf_folder = snapshot_download(
+            model_name_or_path,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            cache_dir=cache_dir,
+            tqdm_class=DisabledTqdm,
+            revision=revision,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
+        # Validate downloaded files to catch corruption early
+        is_valid = _validate_weights_after_download(
+            hf_folder, allow_patterns, model_name_or_path
+        )
+
+        if is_valid:
+            return hf_folder
+
+        # Validation failed, corrupted files were cleaned up
+        if attempt < max_retries - 1:
+            log_info_on_rank0(
+                logger,
+                f"Retrying download for {model_name_or_path} "
+                f"(attempt {attempt + 2}/{max_retries})...",
+            )
+        else:
+            raise RuntimeError(
+                f"Downloaded model files are still corrupted for "
+                f"{model_name_or_path} after {max_retries} attempts. "
+                "This may indicate a persistent issue with the model files "
+                "on Hugging Face Hub or network problems."
+            )
+
+    # This should never be reached, but just in case
+    return hf_folder
