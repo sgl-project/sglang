@@ -1158,6 +1158,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
 
     def test_detect_and_parse_xml_format(self):
         """Test parsing standard XML format (DSML)"""
@@ -1235,12 +1238,16 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         text = """<｜DSML｜function_calls>
             <｜DSML｜invoke name="get_favorite_tourist_spot">
                 <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+                <｜DSML｜parameter name="second" string="true">London</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
-        accumulated_calls = []
         tool_calls_by_index = {}
 
         for chunk in chunks:
@@ -1282,7 +1289,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
@@ -1369,7 +1378,10 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.detector = DeepSeekV32Detector()
 
         # Simulate streaming by splitting into small chunks
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        # chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
