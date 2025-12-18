@@ -17,8 +17,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
-import torch
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
@@ -639,8 +637,7 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["mode"],
         )
 
-        # TODO support ETP (need to change expert_distribution.py at the same time)
-        if torch.distributed.get_rank() == 0:
+        if labels["moe_ep_rank"] == 0:
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
