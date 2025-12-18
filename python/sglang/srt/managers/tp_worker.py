@@ -482,6 +482,7 @@ class TpModelWorker(BaseTpWorker):
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
+            expert_distribution_metrics=out.expert_distribution_metrics,
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result
