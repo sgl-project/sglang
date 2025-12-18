@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -101,6 +102,9 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+
+    ## Part 5: Misc
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
 
 @dataclasses.dataclass
