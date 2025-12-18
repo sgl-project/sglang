@@ -32,6 +32,7 @@ static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 ///
 /// Uses HarmonyGptOss encoding which supports the gpt-oss model family.
 pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
+    println!("hi get_harmony_encoding backtrace={:?}", std::backtrace::Backtrace::force_capture());
     HARMONY_ENCODING.get_or_init(|| {
         openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
             .expect("Failed to load Harmony encoding")
