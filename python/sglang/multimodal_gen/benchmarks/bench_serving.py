@@ -6,7 +6,15 @@ Usage:
 
     t2v:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench  --task t2v --num-prompts 20 --port 9080
+         --backend sglang-image --dataset vbench --task t2v --num-prompts 20
+
+    i2v:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-image --dataset vbench --task i2v --num-prompts 20
+
+
+
+
 """
 
 import argparse
@@ -74,6 +82,7 @@ class VBenchDataset(BaseDataset):
     """
 
     T2V_PROMPT_URL = "https://raw.githubusercontent.com/Vchitect/VBench/master/prompts/prompts_per_dimension/subject_consistency.txt"
+
     # Placeholder for I2V, usually requires local file mapping
 
     def __init__(self, args, api_url: str, model: str):
@@ -126,15 +135,117 @@ class VBenchDataset(BaseDataset):
 
     def _load_i2v_data(self) -> List[Dict[str, Any]]:
         """
-        Load I2V data.
-        Expects dataset_path to be a directory containing images, or a JSON file with image paths.
-        If not provided, uses dummy data.
+        Load I2V data from VBench I2V dataset.
+        Expects dataset_path to be a directory containing the i2v-bench-info.json file, or a JSON file with image paths.
+        If not provided, auto-downloads the VBench I2V dataset.
         """
         path = self.args.dataset_path
+
+        # Auto-download VBench I2V dataset if path is not provided and task is i2v
+        if not path and self.args.task == "i2v":
+            cache_dir = os.path.join(
+                os.path.expanduser("~"), ".cache", "sglang", "vbench_i2v"
+            )
+            vbench_i2v_dir = os.path.join(cache_dir, "vbench2_beta_i2v")
+            info_json_path = os.path.join(vbench_i2v_dir, "data", "i2v-bench-info.json")
+
+            if not os.path.exists(info_json_path):
+                print(f"Downloading VBench I2V dataset to {cache_dir}...")
+                try:
+                    os.makedirs(cache_dir, exist_ok=True)
+
+                    # Download the download_data.sh script from GitHub raw URL
+                    script_url = "https://raw.githubusercontent.com/Vchitect/VBench/master/vbench2_beta_i2v/download_data.sh"
+                    script_path = os.path.join(cache_dir, "download_data.sh")
+
+                    print(f"Downloading download_data.sh from {script_url}...")
+                    resp = requests.get(script_url)
+                    resp.raise_for_status()
+
+                    with open(script_path, "w") as f:
+                        f.write(resp.text)
+
+                    # Make the script executable and run it
+                    import subprocess
+
+                    os.chmod(script_path, 0o755)
+
+                    print("Executing download_data.sh to fetch VBench I2V dataset...")
+                    print("This may take a while as it downloads image data...")
+
+                    # Run the script in the cache directory
+                    result = subprocess.run(
+                        ["bash", script_path],
+                        cwd=cache_dir,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    if result.returncode != 0:
+                        print(f"Download script failed: {result.stderr}")
+                        raise RuntimeError(f"Failed to download VBench I2V dataset")
+
+                    print(
+                        f"Successfully downloaded VBench I2V dataset to {vbench_i2v_dir}"
+                    )
+
+                except Exception as e:
+                    print(f"Failed to download VBench I2V dataset: {e}")
+                    print("Please manually download following instructions at:")
+                    print(
+                        "https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download"
+                    )
+
+            if os.path.exists(info_json_path):
+                path = vbench_i2v_dir
+
         data = []
 
+        # Load from i2v-bench-info.json if it exists
+        if path:
+            info_json = None
+            if os.path.isdir(path):
+                # Check for i2v-bench-info.json in the directory
+                possible_json = os.path.join(path, "data", "i2v-bench-info.json")
+                if os.path.exists(possible_json):
+                    info_json = possible_json
+            elif os.path.isfile(path) and path.endswith(".json"):
+                info_json = path
+
+            if info_json:
+                try:
+                    with open(info_json, "r") as f:
+                        items = json.load(f)
+
+                    # VBench I2V format: each item has file_name, caption, etc.
+                    base_dir = (
+                        os.path.dirname(info_json)
+                        if os.path.isfile(info_json)
+                        else path
+                    )
+                    origin_dir = (
+                        os.path.join(base_dir, "origin")
+                        if os.path.isdir(path)
+                        else os.path.join(os.path.dirname(base_dir), "origin")
+                    )
+
+                    for item in items:
+                        file_name = item.get("file_name", "")
+                        caption = item.get("caption", "")
+                        img_path = os.path.join(origin_dir, file_name)
+
+                        if os.path.exists(img_path):
+                            data.append({"prompt": caption, "image_path": img_path})
+                        else:
+                            print(f"Warning: Image not found: {img_path}")
+
+                    print(f"Loaded {len(data)} I2V samples from VBench I2V dataset")
+                    return self._resize_data(data)
+                except Exception as e:
+                    print(f"Failed to load i2v-bench-info.json: {e}")
+
+        # Fallback: scan directory for images
         if path and os.path.isdir(path):
-            # Treat all images in dir as input
             import glob
 
             exts = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
@@ -142,19 +253,16 @@ class VBenchDataset(BaseDataset):
             for ext in exts:
                 files.extend(glob.glob(os.path.join(path, ext)))
                 files.extend(glob.glob(os.path.join(path, ext.upper())))
+                # Also check in origin subdirectory
+                origin_dir = os.path.join(path, "data", "origin")
+                if os.path.exists(origin_dir):
+                    files.extend(glob.glob(os.path.join(origin_dir, ext)))
+                    files.extend(glob.glob(os.path.join(origin_dir, ext.upper())))
 
             for f in files:
                 # Use filename as prompt or empty
                 prompt = os.path.splitext(os.path.basename(f))[0]
                 data.append({"prompt": prompt, "image_path": f})
-
-        elif path and os.path.isfile(path) and path.endswith(".json"):
-            with open(path, "r") as f:
-                content = json.load(f)
-                if isinstance(content, list):
-                    data = (
-                        content  # Expect [{"prompt": "...", "image_path": "..."}, ...]
-                    )
 
         if not data:
             print(
@@ -241,30 +349,76 @@ async def async_request_image_sglang(
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
 
-    payload = {
-        "model": input.model,
-        "prompt": input.prompt,
-        "n": 1,
-        "response_format": "b64_json",
-    }
-    if input.width and input.height:
-        payload["size"] = f"{input.width}x{input.height}"
+    # Check if we need to use multipart (for image edits with input images)
+    if input.image_paths and len(input.image_paths) > 0:
+        # Use multipart/form-data for image edits
+        data = aiohttp.FormData()
+        data.add_field("model", input.model)
+        data.add_field("prompt", input.prompt)
+        data.add_field("response_format", "b64_json")
 
-    # Merge extra parameters
-    payload.update(input.extra_body)
+        if input.width and input.height:
+            data.add_field("size", f"{input.width}x{input.height}")
 
-    try:
-        async with session.post(input.api_url, json=payload) as response:
-            if response.status == 200:
-                resp_json = await response.json()
-                output.response_body = resp_json
-                output.success = True
+        # Merge extra parameters
+        for key, value in input.extra_body.items():
+            data.add_field(key, str(value))
+
+        # Add image file(s)
+        for idx, img_path in enumerate(input.image_paths):
+            if os.path.exists(img_path):
+                data.add_field(
+                    "image",
+                    open(img_path, "rb"),
+                    filename=os.path.basename(img_path),
+                    content_type="application/octet-stream",
+                )
             else:
-                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.error = f"Image file not found: {img_path}"
                 output.success = False
-    except Exception as e:
-        output.error = str(e)
-        output.success = False
+                if pbar:
+                    pbar.update(1)
+                return output
+
+        try:
+            async with session.post(input.api_url, data=data) as response:
+                if response.status == 200:
+                    resp_json = await response.json()
+                    output.response_body = resp_json
+                    output.success = True
+                else:
+                    output.error = f"HTTP {response.status}: {await response.text()}"
+                    output.success = False
+        except Exception as e:
+            output.error = str(e)
+            output.success = False
+    else:
+        # Use JSON for text-to-image generation
+        payload = {
+            "model": input.model,
+            "prompt": input.prompt,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+
+        if input.width and input.height:
+            payload["size"] = f"{input.width}x{input.height}"
+
+        # Merge extra parameters
+        payload.update(input.extra_body)
+
+        try:
+            async with session.post(input.api_url, json=payload) as response:
+                if response.status == 200:
+                    resp_json = await response.json()
+                    output.response_body = resp_json
+                    output.success = True
+                else:
+                    output.error = f"HTTP {response.status}: {await response.text()}"
+                    output.success = False
+        except Exception as e:
+            output.error = str(e)
+            output.success = False
 
     output.latency = time.perf_counter() - output.start_time
     if pbar:
@@ -475,7 +629,10 @@ async def benchmark(args):
 
     # Setup dataset
     if args.backend == "sglang-image":
-        api_url = f"{args.base_url}/v1/images/generations"
+        if args.task == "i2v":
+            api_url = f"{args.base_url}/v1/images/edits"
+        else:
+            api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
         api_url = f"{args.base_url}/v1/videos"
