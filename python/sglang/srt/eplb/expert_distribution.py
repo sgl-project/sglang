@@ -711,6 +711,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                     "metrics": ExpertDistributionMetrics(eplb_balancedness=TODO)
                 }
             else:
+                # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
                 self._history.append(utilization_rate_cpu)
 
