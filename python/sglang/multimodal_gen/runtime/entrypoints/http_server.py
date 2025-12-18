@@ -6,20 +6,16 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 
-import imageio
-import numpy as np
 import torch
-import torchvision
-from einops import rearrange
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request, post_process_sample
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    post_process_sample,
+    prepare_request,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.srt.managers.io_struct import VertexGenerateReqInput
