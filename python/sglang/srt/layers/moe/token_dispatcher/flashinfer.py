@@ -146,6 +146,27 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
+        # Preallocate dummy tensors (to overcome numLocalTokens > 0 restriction)
+        self.dummy_x = torch.empty(
+            (1, hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        # -1 will be ignored by flashinfer cutlass moe
+        self.dummy_topk_ids = torch.full(
+            (1, self.router_topk), -1, dtype=torch.int32, device="cuda"
+        )
+        # Hack for dispatch with dummy token - will route the dummy token to this rank so it doesn't require any transfer.
+        self.dummy_topk_ids_current_rank = torch.full(
+            (1, self.router_topk),
+            self.ep_rank * self.num_local_experts,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.dummy_topk_weights = torch.zeros(
+            (1, self.router_topk), dtype=torch.float32, device="cuda"
+        )
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> FlashinferDispatchOutput:
@@ -158,30 +179,12 @@ class FlashinferDispatcher(BaseDispatcher):
         # Handle case where there are no tokens on this DP worker
         # moe_a2a.dispatch requires at least one token
         self.has_dummy_token = False
-        topk_ids_current_rank = None
         if x.shape[0] == 0:
+            logger.warning("No tokens on this DP worker, using dummy token")
             self.has_dummy_token = True
-            x = torch.empty(
-                (1, x.shape[1]),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            # -1 will be ignored by flashinfer cutlass moe
-            topk_ids = torch.full(
-                (1, topk_ids.shape[1]), -1, dtype=topk_ids.dtype, device=topk_ids.device
-            )
-            # Dispatch doesn't handle -1 topk id properly. Hack for dispatch with dummy token - will route the dummy token to this rank and requires no transfer.
-            topk_ids_current_rank = torch.full(
-                (1, topk_ids.shape[1]),
-                self.ep_rank * self.num_local_experts,
-                dtype=topk_ids.dtype,
-                device=topk_ids.device,
-            )
-            topk_weights = torch.zeros(
-                (1, topk_weights.shape[1]),
-                dtype=topk_weights.dtype,
-                device=topk_weights.device,
-            )
+            x = self.dummy_x
+            topk_ids = self.dummy_topk_ids
+            topk_weights = self.dummy_topk_weights
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
@@ -203,7 +206,7 @@ class FlashinferDispatcher(BaseDispatcher):
             else x.shape[0]
         )
         recv_tensors = self.moe_a2a.dispatch(
-            topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             expert_id_payload_index=expert_id_payload_index,
@@ -245,12 +248,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
         # Remove dummy token if it was added in dispatch
         if self.has_dummy_token:
-            hidden_states = torch.empty(
-                0,
-                output_hidden_size,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
+            hidden_states = hidden_states[1:, :]
 
         del self.runtime_max_tokens_per_rank
         del self.has_dummy_token
