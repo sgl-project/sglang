@@ -23,6 +23,7 @@ def time_device_forward_pass(forward_mode: ForwardMode):
 
 
 class DeviceTimer:
+    # Delayed reporting to allow async cuda execution
     _DELAY_THRESHOLD = 2
 
     @dataclass
@@ -45,6 +46,9 @@ class DeviceTimer:
             self.end_event = end_event
             self.category = category
 
+        def elapsed_time(self) -> float:
+            return self.start_event.elapsed_time(self.end_event)
+
     def __init__(self, reporter: Callable[[str, float], None]):
         self._intervals: Deque[DeviceTimer.Interval] = deque()
         self._reporter = reporter
@@ -61,5 +65,4 @@ class DeviceTimer:
     def _report(self):
         while len(self._intervals) >= self._DELAY_THRESHOLD:
             interval = self._intervals.popleft()
-            interval.end
-            TODO
+            self._reporter(interval.category, interval.elapsed_time())
