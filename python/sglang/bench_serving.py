@@ -938,6 +938,16 @@ class TokenAuth(AuthBase):
         return request
 
 
+def get_hf_token():
+    """Get the Hugging Face token from the environment variables or the token file."""
+    token = os.getenv("HF_TOKEN", None)
+    token_path = os.getenv("HF_TOKEN_PATH", None)
+    if token_path and token is None:
+        with open(token_path, "r") as f:
+            token = f.read().strip()
+    return token
+
+
 def download_and_cache_file(
     url: str, filename: Optional[str] = None, token: Optional[str] = None
 ):
@@ -1186,14 +1196,7 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not is_file_valid_json(dataset_path) and dataset_path == "":
-        token = os.getenv("HF_TOKEN", None)
-        token_path = os.getenv("HF_TOKEN_PATH", None)
-
-        if token_path and token is None:
-            with open(token_path, "r") as f:
-                token = f.read().strip()
-
-        dataset_path = download_and_cache_file(SHAREGPT_URL, token=token)
+        dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -1305,7 +1308,7 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not is_file_valid_json(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = download_and_cache_file(SHAREGPT_URL, token=get_hf_token())
 
         # Load the dataset.
         with open(dataset_path) as f:
