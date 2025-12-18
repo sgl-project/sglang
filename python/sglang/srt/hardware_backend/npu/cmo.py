@@ -1,5 +1,7 @@
 import torch
 
+from sglang.srt.layers.parameter import ModelWeightParameter
+
 cmo_stream = None
 
 
@@ -16,6 +18,12 @@ def get_cmo_stream():
 def set_cmo_stream(stream):
     global cmo_stream
     cmo_stream = stream
+
+
+def get_weight_cache(layer):
+    if isinstance(layer.weight, ModelWeightParameter):
+        return layer.weight_data
+    return layer.weight
 
 
 def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):

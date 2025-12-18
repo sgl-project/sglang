@@ -231,6 +231,9 @@ class AscendAttnBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
+        self.enable_piecewise_npu_graph_decode = (
+            model_runner.server_args.enable_piecewise_npu_graph_decode
+        )
         self.forward_metadata = None
         self.device = model_runner.device
         self.page_size = model_runner.page_size
@@ -248,7 +251,6 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
@@ -263,6 +265,11 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+
+        self.enable_torchair_compile = model_runner.server_args.enable_torchair_compile
+        if self.enable_torchair_compile:
+            max_total_tokens = model_runner.max_total_num_tokens
+            self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -283,12 +290,29 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_max += self.speculative_num_draft_tokens
-        self.forward_metadata.block_tables = (
+
+        block_tables = (
             forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
             ][:, :: self.page_size]
             // self.page_size
         )
+
+        if (
+            self.enable_torchair_compile
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            bs = forward_batch.input_ids.size(0)
+            device = forward_batch.input_ids.device
+            self.forward_metadata.block_tables = torch.full(
+                (bs, self.max_seqlen_pad), -1, dtype=torch.int32, device=device
+            )
+            self.forward_metadata.block_tables[:, : block_tables.size(1)].copy_(
+                block_tables
+            )
+        else:
+            self.forward_metadata.block_tables = block_tables
+
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens_cpu_int = (
                 forward_batch.extend_seq_lens.cpu().int()
@@ -1145,6 +1169,17 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
 
+                if (
+                    self.enable_piecewise_npu_graph_decode
+                    and torch.compiler.is_dynamo_compiling()
+                ):
+                    # input args for submodule forward
+                    forward_batch.req_to_token_pool.req_to_token.add_(
+                        forward_batch.req_to_token_pool.req_to_token
+                    )
+                    forward_batch.req_pool_indices.add_(forward_batch.req_pool_indices)
+                    forward_batch.seq_lens.add_(forward_batch.seq_lens)
+
                 torch_npu._npu_paged_attention(
                     query=query,
                     key_cache=k_cache,
@@ -1256,7 +1291,7 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices,
             )
 
-        if self.graph_mode and (not self.enable_torch_compile):
+        if self.graph_mode and (not self.enable_torchair_compile):
             return self.forward_decode_graph(
                 q,
                 k,

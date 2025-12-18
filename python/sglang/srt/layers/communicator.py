@@ -73,8 +73,11 @@ if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
-elif _is_npu:
-    from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.cmo_custom_ops import (  # noqa
+        prepare_weight_cache,
+    )
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
@@ -793,7 +796,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
-                    _ = prepare_weight_cache(hidden_states, context.cache)
+                    _ = torch.ops.sglang.prepare_weight_cache(
+                        hidden_states, context.cache
+                    )
                 hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 

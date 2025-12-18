@@ -28,12 +28,14 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import orjson
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import supports_custom_op
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -529,6 +531,7 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_piecewise_npu_graph_decode: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -550,6 +553,7 @@ class ServerArgs:
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
+    enable_torchair_compile: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: int = 4096
@@ -608,6 +612,8 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+
+    compilation_config: Optional[CompilationConfig] = None
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -1529,6 +1535,7 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
+            self.enable_piecewise_npu_graph_decode = False
 
         if self.attention_backend == "flex_attention":
             logger.warning(
@@ -1816,6 +1823,7 @@ class ServerArgs:
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
+                self.enable_piecewise_npu_graph_decode = False
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -2167,6 +2175,10 @@ class ServerArgs:
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
+            if self.enable_piecewise_npu_graph_decode:
+                self.enable_piecewise_npu_graph_decode = False
+                logger.warning("NPU piecewise graph is disabled for decode server")
+
             if not self.enable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True
                 logger.warning(
@@ -2371,6 +2383,25 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
+
+        if is_npu() and not supports_custom_op():
+            if self.enable_torch_compile:
+                self.enable_torch_compile = False
+                logger.warning(
+                    "Torch compile is disabled because custom ops are not supported"
+                )
+
+            if self.enable_piecewise_npu_graph_decode:
+                self.enable_piecewise_npu_graph_decode = False
+                logger.warning(
+                    "Piecewise graph decode is disabled because custom ops are not supported"
+                )
+
+            if self.enable_torchair_compile:
+                self.enable_torchair_compile = False
+                logger.warning(
+                    "TorchAir compile is disabled because custom ops are not supported"
+                )
 
     def _handle_remote_instance_weight_loader_start_seed_via_transfer_engine(self):
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
@@ -3320,6 +3351,13 @@ class ServerArgs:
             help="Disable FlashInfer autotuning.",
         )
 
+        parser.add_argument(
+            "--compilation-config",
+            type=CompilationConfig.from_cli,
+            default=None,
+            help="Compilation config.",
+        )
+
         # Speculative decoding
         parser.add_argument(
             "--speculative-algorithm",
@@ -3853,6 +3891,11 @@ class ServerArgs:
             help="Disable cuda graph.",
         )
         parser.add_argument(
+            "--enable-piecewise-npu-graph-decode",
+            action="store_true",
+            help="Optimize the model with piecewise npu graph for decode.",
+        )
+        parser.add_argument(
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
@@ -3962,6 +4005,11 @@ class ServerArgs:
             "--enable-torch-compile-debug-mode",
             action="store_true",
             help="Enable debug mode for torch compile",
+        )
+        parser.add_argument(
+            "--enable-torchair-compile",
+            action="store_true",
+            help="Optimize the model with Torch Ascend Intermediate Representation compilation. Experimental feature.",
         )
         parser.add_argument(
             "--enable-piecewise-cuda-graph",
