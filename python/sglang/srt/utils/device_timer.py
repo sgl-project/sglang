@@ -5,14 +5,6 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-
-
-@contextmanager
-def time_device_forward_pass(forward_mode: ForwardMode):
-
 
 class DeviceTimer:
     # Delayed reporting to allow async cuda execution
