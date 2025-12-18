@@ -38,8 +38,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     g,
     gk,
     h,
-    h0,
-    ht,
+    initial_state,
+    initial_state_indices,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -90,10 +90,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_h = H * K * V
     stride_k = Hg * K
     stride_w = H * K
+
+    indice = tl.load(initial_state_indices + i_n).to(tl.int32)
+    h0 = initial_state + indice * stride_h
+    ht = initial_state + indice * stride_h
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K * V
+        h0 = h0 + i_h * K * V
     if STORE_FINAL_STATE:
-        ht = ht + i_nh * K * V
+        ht = ht + i_h * K * V
 
     # load initial state
     if USE_INITIAL_STATE:
@@ -274,6 +278,7 @@ def chunk_gated_delta_rule_fwd_h(
     g: Optional[torch.Tensor] = None,
     gk: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
@@ -299,9 +304,6 @@ def chunk_gated_delta_rule_fwd_h(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, K, V)
-    final_state = (
-        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
-    )
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -316,8 +318,8 @@ def chunk_gated_delta_rule_fwd_h(
         g=g,
         gk=gk,
         h=h,
-        h0=initial_state,
-        ht=final_state,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -330,10 +332,10 @@ def chunk_gated_delta_rule_fwd_h(
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
+        STORE_FINAL_STATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=2,
     )
-    return h, v_new, final_state
+    return h, v_new
