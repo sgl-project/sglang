@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 import logging
+from collections import defaultdict
 from typing import TypedDict
 
 import torch
@@ -204,20 +204,24 @@ class BaseLayerWithLoRA(nn.Module):
 
         if self.use_multi_lora and self.active_lora_indices is not None and not self.disable_lora:
             out, output_bias = self._apply_multi_lora(x, out, output_bias)
-        elif self.lora_A is not None and not self.merged and not self.disable_lora:
+            return out, output_bias
+
+        if self.lora_A is not None and not self.merged and not self.disable_lora:
             lora_A = self.lora_A
             lora_B = self.lora_B
-            if isinstance(self.lora_B, DTensor):
-                lora_B = self.lora_B.to_local()
-                lora_A = self.lora_A.to_local()
+            if isinstance(lora_B, DTensor):
+                lora_B = lora_B.to_local()
+                lora_A = lora_A.to_local()
 
             lora_A_sliced = self.slice_lora_a_weights(lora_A.to(x, non_blocking=True))
             lora_B_sliced = self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
             delta = x @ lora_A_sliced.T @ lora_B_sliced.T
-            if self.lora_alpha != self.lora_rank:
-                delta = delta * (
-                    self.lora_alpha / self.lora_rank  # type: ignore
-                )  # type: ignore
+            if (
+                self.lora_alpha is not None
+                and self.lora_rank is not None
+                and self.lora_alpha != self.lora_rank
+            ):
+                delta = delta * (self.lora_alpha / self.lora_rank)
             out = out + (self.strength * delta)
 
         return out, output_bias
