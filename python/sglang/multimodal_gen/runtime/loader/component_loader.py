@@ -40,7 +40,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
-    get_diffusers_component_config,
+    get_diffusers_component_config_dict,
     get_hf_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -108,8 +108,8 @@ class ComponentLoader(ABC):
             return get_local_torch_device()
 
     def load_config(self, component_model_path: str, server_args: ServerArgs):
-        config = get_diffusers_component_config(model_path=component_model_path)
-
+        config = get_diffusers_component_config_dict(model_path=component_model_path)
+        _clean_hf_config_inplace(config)
         logger.info("HF model config: %s", config)
         return config
 
@@ -412,9 +412,9 @@ class TextEncoderLoader(ComponentLoader):
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
-        model_config = get_diffusers_component_config(model_path=component_model_path)
-        _clean_hf_config_inplace(model_config)
-        logger.info("HF model config: %s", model_config)
+        model_config_dict = self.load_config(
+            component_model_path=component_model_path, server_args=server_args
+        )
 
         def is_not_first_encoder(module_name):
             return "2" in module_name
@@ -422,14 +422,14 @@ class TextEncoderLoader(ComponentLoader):
         # TODO(mick): had to throw an exception for different text-encoder arch
         if not is_not_first_encoder(module_name):
             encoder_config = server_args.pipeline_config.text_encoder_configs[0]
-            encoder_config.update_model_arch(model_config)
+            encoder_config.update_model_arch(model_config_dict)
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
         else:
             assert len(server_args.pipeline_config.text_encoder_configs) == 2
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
-            encoder_config.update_model_arch(model_config)
+            encoder_config.update_model_arch(model_config_dict)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
         # TODO(will): add support for other dtypes
         return self.load_model(
@@ -536,10 +536,7 @@ class ImageEncoderLoader(TextEncoderLoader):
         #     revision=server_args.revision,
         #     model_override_args=None,
         # )
-        with open(os.path.join(component_model_path, "config.json")) as f:
-            model_config = json.load(f)
-        _clean_hf_config_inplace(model_config)
-        logger.info("HF model config: %s", model_config)
+        model_config = self.load_config(component_model_path, server_args)
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
@@ -679,7 +676,9 @@ class TransformerLoader(ComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         process_group = kwargs.get("process_group", None)
-        config = get_diffusers_component_config(model_path=component_model_path)
+        config = self.load_config(
+            component_model_path=component_model_path, server_args=server_args
+        )
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
         if cls_name is None:
@@ -754,7 +753,9 @@ class SchedulerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, *args, **kwargs
     ):
         """Load the scheduler based on the model path, and inference args."""
-        config = get_diffusers_component_config(model_path=component_model_path)
+        config = self.load_config(
+            component_model_path=component_model_path, server_args=server_args
+        )
 
         class_name = config.pop("_class_name")
         assert (

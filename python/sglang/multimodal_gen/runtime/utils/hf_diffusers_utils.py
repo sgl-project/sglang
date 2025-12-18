@@ -127,7 +127,7 @@ def load_dict(file_path):
         ) from e
 
 
-def get_diffusers_component_config(
+def get_diffusers_component_config_dict(
     model_path: str,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model.

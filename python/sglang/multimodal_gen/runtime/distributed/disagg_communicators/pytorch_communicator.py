@@ -164,11 +164,6 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         else:
             global_src = self.non_dit_master_rank
 
-        logger.debug(
-            f"[Rank {dist.get_rank()}] broadcast_in_group: tensor device={tensor.device}, "
-            f"shape={tensor.shape}, backend={backend}, src={global_src}"
-        )
-
         try:
             dist.broadcast(tensor, src=global_src, group=group)
         except Exception as e:
