@@ -394,7 +394,7 @@ class SchedulerMetricsMixin:
             return
 
         if (m := result.expert_distribution_metrics) is not None:
-            TODO
+            self.metrics_collector.increment_eplb_balancedness(m.eplb_balancedness.item())
 
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:

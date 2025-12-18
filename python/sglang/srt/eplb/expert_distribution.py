@@ -46,10 +46,10 @@ _OutputMode = Literal["file", "object"]
 
 @dataclass
 class ExpertDistributionMetrics:
-    TODO: TODO
+    eplb_balancedness: torch.Tensor
 
     def copy_to_cpu(self):
-        TODO
+        self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
 
 
 class ExpertDistributionRecorder(ABC):
