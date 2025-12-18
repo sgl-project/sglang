@@ -72,9 +72,8 @@ class FastDiffuser(DllmAlgorithm):
                 break
 
             # Forward pass
-            logits_output, can_run_cuda_graph = model_runner.forward(
-                forward_batch, pp_proxy_tensors=None
-            )
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             # Get predictions with Gumbel noise
             logits_with_noise = add_gumbel_noise(logits_output.full_logits, self.temperature)
@@ -101,9 +100,8 @@ class FastDiffuser(DllmAlgorithm):
             forward_batch.input_ids[transfer_index] = x[transfer_index]
 
         # Final forward pass (like LLADA2)
-        logits_output, can_run_cuda_graph = model_runner.forward(
-            forward_batch, pp_proxy_tensors=None
-        )
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
         # Return generated tokens (like LLADA2)
         next_token_ids = forward_batch.input_ids[start:]

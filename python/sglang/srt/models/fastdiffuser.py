@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
