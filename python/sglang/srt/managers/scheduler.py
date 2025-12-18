@@ -2221,6 +2221,7 @@ class Scheduler(
                 if result.copy_done is not None:
                     result.copy_done.synchronize()
 
+        self.log_batch_result_stats(batch, result)
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):

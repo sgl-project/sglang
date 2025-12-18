@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -241,7 +242,7 @@ class SchedulerMetricsCollector:
         labels: Dict[str, str],
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import Counter, Gauge, Histogram, Summary
 
         self.labels = labels
         self.last_log_time = time.perf_counter()
@@ -641,6 +642,15 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["mode"],
         )
 
+        if (
+            labels["moe_ep_rank"] == 0
+        ) and envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
+            self.eplb_balancedness = Summary(
+                name="sglang:eplb_balancedness",
+                documentation="Balancedness of MoE in expert parallelism.",
+                labelnames=list(labels.keys()) + ["forward_mode"],
+            )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -697,6 +707,13 @@ class SchedulerMetricsCollector:
         # leave room for piecewise cuda graph, etc
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_eplb_balancedness(
+        self, forward_mode: str, balancedness: float
+    ) -> None:
+        self.eplb_balancedness.labels(**self.labels, forward_mode=forward_mode).observe(
+            balancedness
+        )
 
     def increment_realtime_tokens(
         self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0

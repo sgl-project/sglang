@@ -4,7 +4,7 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -12,12 +12,13 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +395,22 @@ class SchedulerMetricsMixin:
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+    def log_batch_result_stats(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ):
+        if not self.enable_metrics:
+            return
+        if not isinstance(result, GenerationBatchResult):
+            return
+
+        if (m := result.expert_distribution_metrics) is not None:
+            self.metrics_collector.increment_eplb_balancedness(
+                forward_mode=batch.forward_mode.name.lower(),
+                balancedness=m.eplb_balancedness.item(),
+            )
 
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:
