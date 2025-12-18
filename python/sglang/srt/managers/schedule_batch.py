@@ -2012,7 +2012,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_ids_logprobs = None
 
         self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(req.sampling_params.has_grammar_constraint for req in self.reqs)
+        self.has_grammar = any(
+            req.sampling_params.has_grammar_constraint for req in self.reqs
+        )
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         # NOTE: spec_info filtered before batch filtering only happens in:

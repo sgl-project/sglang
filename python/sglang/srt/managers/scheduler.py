@@ -1573,10 +1573,12 @@ class Scheduler(
                         req.grammar_key = key
                     else:
                         if value is INVALID_GRAMMAR_OBJ:
-                            error_msg = f"Invalid grammar request with cache hit: {key=}"
+                            error_msg = (
+                                f"Invalid grammar request with cache hit: {key=}"
+                            )
                             req.set_finish_with_abort(error_msg)
 
-                    # When TP > 1, always add to grammar_queue for synchronization across ranks                    
+                    # When TP > 1, always add to grammar_queue for synchronization across ranks
                     if self.tp_size > 1:
                         add_to_grammar_queue = True
                     elif not cache_hit:
@@ -2365,13 +2367,11 @@ class Scheduler(
                 # On non-rank-0, req.grammar is None
                 if req.grammar is None:
                     num_ready_reqs += 1
-                    num_skipped_compilation += 1
                     continue
 
                 # On rank 0 with cache hit, req.grammar is already compiled
-                if not isinstance(req.grammar, futures.Future):                    
+                if not isinstance(req.grammar, futures.Future):
                     num_ready_reqs += 1
-                    num_skipped_compilation += 1
                     continue
 
                 req.grammar = req.grammar.result(timeout=0.03)
@@ -2425,8 +2425,8 @@ class Scheduler(
 
         for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
             req = self.grammar_queue[i]
-            # On non-rank-0, req.grammar is None, skip timeout handling   
-            # Or if we have a cache hit, the grammar is already compiled.         
+            # On non-rank-0, req.grammar is None, skip timeout handling
+            # Or if we have a cache hit, the grammar is already compiled.
             if req.grammar is None or not isinstance(req.grammar, futures.Future):
                 continue
             req.grammar.cancel()
