@@ -39,15 +39,9 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         # Rank 0 is Non-DiT
         # Ranks 1..N are DiT
 
-        # Future-proof: Read from server_args if available
-        if hasattr(server_args, "non_dit_ranks") and server_args.non_dit_ranks:
-            non_dit_ranks = server_args.non_dit_ranks
-        else:
-            # Non-DiT ranks are the LAST ranks in the world
-            # E.g., if world_size=5 and num_non_dit_ranks=1, non_dit_ranks=[4]
-            non_dit_ranks = list(
-                range(world_size - server_args.num_non_dit_ranks, world_size)
-            )
+        non_dit_ranks = list(
+            range(world_size - server_args.num_non_dit_ranks, world_size)
+        )
         dit_ranks = [r for r in range(world_size) if r not in non_dit_ranks]
 
         self.non_dit_master_rank = non_dit_ranks[0]
