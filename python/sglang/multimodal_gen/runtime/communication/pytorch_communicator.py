@@ -2,10 +2,11 @@
 PyTorch Implementation of DisaggCommunicator.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+from torch.distributed import Work
 
 from sglang.multimodal_gen.runtime.communication.base_communicator import (
     DisaggCommunicator,
@@ -133,6 +134,13 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
         if group_size == 1:
             return
 
+        # CRITICAL: Ensure tensor is on CUDA for NCCL backend
+        if dist.get_backend(group) == "nccl" and not tensor.is_cuda:
+            raise RuntimeError(
+                f"[Rank {dist.get_rank()}] Cannot broadcast CPU tensor with NCCL backend. "
+                f"Tensor device: {tensor.device}, backend: {dist.get_backend(group)}"
+            )
+
         # We need to translate group-relative src rank to global rank for dist.broadcast
         # Wait, dist.broadcast(group=group) usually expects the `src` to be the GLOBAL rank
         # of the broadcaster.
@@ -146,3 +154,64 @@ class PyTorchDisaggCommunicator(DisaggCommunicator):
             global_src = self.non_dit_master_rank
 
         dist.broadcast(tensor, src=global_src, group=group)
+
+    # --- Async Communication Implementation ---
+
+    def isend_to_dit(
+        self, tensor: torch.Tensor, metadata: Optional[Dict] = None
+    ) -> Optional[Work]:
+        """Non-blocking send from Non-DiT to DiT group."""
+        if self.world_rank != self.non_dit_master_rank:
+            return None  # Only master sends cross-group
+
+        # P2P Non-blocking send to DiT Master
+        work = dist.isend(tensor, dst=self.dit_master_rank)
+        return work
+
+    def irecv_from_non_dit(
+        self, shape: torch.Size, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, Optional[Work]]:
+        """
+        Non-blocking receive from Non-DiT group at DiT group.
+        DiT Master receives, then will broadcast to workers.
+        """
+        tensor = torch.empty(shape, dtype=dtype, device="cuda")
+
+        work = None
+        if self.world_rank == self.dit_master_rank:
+            work = dist.irecv(tensor, src=self.non_dit_master_rank)
+
+        # Return tensor and work handle
+        # Note: broadcast to other DiT workers happens separately after wait
+        return tensor, work
+
+    def isend_to_non_dit(self, tensor: torch.Tensor) -> Optional[Work]:
+        """Non-blocking send from DiT to Non-DiT group."""
+        if self.world_rank != self.dit_master_rank:
+            return None
+
+        work = dist.isend(tensor, dst=self.non_dit_master_rank)
+        return work
+
+    def irecv_from_dit(
+        self, shape: torch.Size, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, Optional[Work]]:
+        """Non-blocking receive from DiT group at Non-DiT group."""
+        tensor = torch.empty(shape, dtype=dtype, device="cuda")
+
+        work = None
+        if self.world_rank == self.non_dit_master_rank:
+            work = dist.irecv(tensor, src=self.dit_master_rank)
+
+        return tensor, work
+
+    def wait_work(self, work: Optional[Work]) -> None:
+        """Wait for a Work handle to complete."""
+        if work is not None:
+            work.wait()
+
+    def wait_all_works(self, works: List[Optional[Work]]) -> None:
+        """Wait for multiple Work handles to complete."""
+        for work in works:
+            if work is not None:
+                work.wait()

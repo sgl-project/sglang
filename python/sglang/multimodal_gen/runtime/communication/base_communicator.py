@@ -6,10 +6,10 @@ This module defines the interface for communication between different components
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
-from torch.distributed import ProcessGroup
+from torch.distributed import ProcessGroup, Work
 
 
 class DisaggCommunicator(ABC):
@@ -89,5 +89,64 @@ class DisaggCommunicator(ABC):
     ) -> None:
         """
         Broadcast a tensor within the current group (e.g. from DiT Master to Workers).
+        """
+        pass
+
+    # --- Async Communication API ---
+
+    @abstractmethod
+    def isend_to_dit(
+        self, tensor: torch.Tensor, metadata: Optional[Dict] = None
+    ) -> Optional[Work]:
+        """
+        Non-blocking send from Non-DiT to DiT group.
+        Returns a Work handle that can be waited on later.
+        Returns None if this rank is not responsible for sending.
+        """
+        pass
+
+    @abstractmethod
+    def irecv_from_non_dit(
+        self, shape: torch.Size, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, Optional[Work]]:
+        """
+        Non-blocking receive from Non-DiT group at DiT group.
+        Returns (tensor, work_handle).
+        The tensor is pre-allocated, work_handle can be waited on later.
+        work_handle is None if this rank is not responsible for receiving.
+        """
+        pass
+
+    @abstractmethod
+    def isend_to_non_dit(self, tensor: torch.Tensor) -> Optional[Work]:
+        """
+        Non-blocking send from DiT to Non-DiT group.
+        Returns a Work handle or None.
+        """
+        pass
+
+    @abstractmethod
+    def irecv_from_dit(
+        self, shape: torch.Size, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, Optional[Work]]:
+        """
+        Non-blocking receive from DiT group at Non-DiT group.
+        Returns (tensor, work_handle).
+        """
+        pass
+
+    @abstractmethod
+    def wait_work(self, work: Optional[Work]) -> None:
+        """
+        Wait for a Work handle to complete.
+        Safe to call with None (no-op).
+        """
+        pass
+
+    @abstractmethod
+    def wait_all_works(self, works: List[Optional[Work]]) -> None:
+        """
+        Wait for multiple Work handles to complete.
+        Filters out None values automatically.
         """
         pass
