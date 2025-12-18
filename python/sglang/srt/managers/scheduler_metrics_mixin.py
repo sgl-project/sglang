@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
+ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
 class KvMetrics:
@@ -456,6 +457,11 @@ class SchedulerMetricsMixin:
         )
 
     @contextmanager
-    def record_metrics_around_forward(self, batch):
-        with time_device_forward_pass(batch.forward_mode):
-            TODO
+    def record_metrics_around_forward(self: Scheduler, batch):
+        if not self.enable_metrics or not ENABLE_METRICS_DEVICE_TIMER:
+            yield
+            return
+
+        category = "forward_" + batch.forward_mode.name.lower()
+        with TODO.wrap(category=category):
+            yield
