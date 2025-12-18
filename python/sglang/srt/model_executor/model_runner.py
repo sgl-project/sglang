@@ -2749,6 +2749,7 @@ class ModelRunner:
                 split_forward_count,
             )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        print(f"hi forward {recorder_outputs=}")
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
