@@ -335,12 +335,10 @@ class Scheduler(
         self.init_gemm_config()
 
         # Check whether overlap can be enabled
-        if not self.is_generation:
-            self.enable_overlap = (
-                self.server_args.enable_non_generation_schedule_overlap
-            )
+        if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+            self.enable_overlap = False
             logger.info(
-                f"Overlap scheduler is {'disabled' if not self.enable_overlap else 'enabled'} for non-generation models."
+                f"Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
         # Launch a tensor parallel worker

@@ -73,7 +73,6 @@ class TestEmbeddingModels(CustomTestCase):
         torch_dtype,
         prefill_tolerance,
         matryoshka_dim: Optional[int] = None,
-        enable_non_generation_schedule_overlap: bool = False,
     ) -> None:
         truncated_prompts = self._truncate_prompts(prompts, model_path)
 
@@ -95,7 +94,6 @@ class TestEmbeddingModels(CustomTestCase):
             json_model_override_args=(
                 {"matryoshka_dimensions": [matryoshka_dim]} if matryoshka_dim else None
             ),
-            enable_non_generation_schedule_overlap=enable_non_generation_schedule_overlap,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 truncated_prompts, dimensions=matryoshka_dim
@@ -142,22 +140,6 @@ class TestEmbeddingModels(CustomTestCase):
                     torch_dtype,
                     prefill_tolerance,
                     matryoshka_dim=128,
-                )
-
-    def test_embedding_schedule_overlap(self):
-        models_to_test = [
-            ("Qwen/Qwen3-Embedding-8B", *MODEL_TO_CONFIG["Qwen/Qwen3-Embedding-8B"])
-        ]
-
-        for model, tp_size, prefill_tolerance in models_to_test:
-            for torch_dtype in TORCH_DTYPES:
-                self.assert_close_prefill_logits(
-                    DEFAULT_PROMPTS,
-                    model,
-                    tp_size,
-                    torch_dtype,
-                    prefill_tolerance,
-                    enable_non_generation_schedule_overlap=True,
                 )
 
 
