@@ -70,7 +70,7 @@ from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
-    set_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder, ExpertDistributionMetrics,
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
@@ -272,6 +272,7 @@ class RankZeroFilter(logging.Filter):
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
 
 class ModelRunner:
@@ -2739,20 +2740,19 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ) as recorder_outputs:
-            ret, can_run_graph = self._forward_raw(
+            output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
             )
-        TODO_should_we_put_here
-        ret.expert_distribution_metrics = recorder_outputs.get("metrics")
+        output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
-        return ret, can_run_graph
+        return output
 
     def _forward_raw(
         self,
