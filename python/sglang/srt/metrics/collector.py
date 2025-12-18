@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
@@ -670,6 +674,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.gpu_execution_seconds_total = Counter(
+            name="sglang:gpu_execution_seconds_total",
+            documentation="Total time that GPU is busy executing a workload.",
+            labelnames=list(labels.keys()) + ["category"],
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -715,6 +725,10 @@ class SchedulerMetricsCollector:
             prefill_cache_tokens
         )
         self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
+
+    def increment_gpu_execution_seconds(self, category: str, t: float):
+        logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
+        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)

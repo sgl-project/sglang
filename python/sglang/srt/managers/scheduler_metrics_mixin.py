@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
@@ -14,6 +15,7 @@ from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.device_timer import DeviceTimer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
+ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
 class KvMetrics:
@@ -81,6 +84,11 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
+
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self.forward_pass_device_timer = DeviceTimer(
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds
+                )
 
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
@@ -473,3 +481,13 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
+
+    @contextmanager
+    def record_forward_metrics(self: Scheduler, batch):
+        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+            yield
+            return
+
+        category = "forward_" + batch.forward_mode.name.lower()
+        with self.forward_pass_device_timer.wrap(category=category):
+            yield
