@@ -871,10 +871,11 @@ class ServerArgs:
             self.sp_degree = num_gpus // num_gpus_per_group
 
         # In disagg mode, force recalculate ulysses/ring based on new sp_degree
-        if self.enable_disagg and self.sp_degree != 1:
-            self.ulysses_degree = self.sp_degree
-            self.ring_degree = 1
-        elif (
+        # if self.enable_disagg and self.sp_degree != 1:
+        #     self.ulysses_degree = self.sp_degree
+        #     self.ring_degree = 1
+        # el
+        if (
             self.ulysses_degree is None
             and self.ring_degree is None
             and self.sp_degree != 1
@@ -885,25 +886,27 @@ class ServerArgs:
             )
 
         if self.ulysses_degree is None:
-            if self.enable_disagg and self.sp_degree > 1:
-                # Already set above for disagg mode
-                pass
-            else:
-                self.ulysses_degree = 1
-                logger.info(
-                    f"Ulysses degree not set, using default value {self.ulysses_degree}"
-                )
+            # if self.enable_disagg and self.sp_degree > 1:
+            #     # Already set above for disagg mode
+            #     pass
+            # else:
+            self.ulysses_degree = 1
+            logger.info(
+                f"Ulysses degree not set, using default value {self.ulysses_degree}"
+            )
 
         if self.ring_degree is None:
-            if self.enable_disagg:
-                # Already set above for disagg mode
-                pass
-            else:
-                self.ring_degree = 1
-                logger.info(
-                    f"Ring degree not set, using default value {self.ring_degree}"
-                )
+            # if self.enable_disagg:
+            #     # Already set above for disagg mode
+            #     pass
+            # else:
+            self.ring_degree = 1
+            logger.info(
+                f"Ring degree not set, using default value {self.ring_degree}"
+            )
 
+
+        # at this point, ring_degree and ulysses_degree should be natural number
         if self.ring_degree > 1:
             if self.attention_backend is not None and self.attention_backend != "fa":
                 raise ValueError(
