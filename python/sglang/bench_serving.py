@@ -936,9 +936,7 @@ def download_and_cache_hf_file(
     """Download a file from Hugging Face and cache it locally."""
     from huggingface_hub import hf_hub_download
 
-    return hf_hub_download(
-        repo_id=repo_id, filename=filename, repo_type=repo_type
-    )
+    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
