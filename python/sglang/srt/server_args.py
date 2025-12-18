@@ -2385,7 +2385,7 @@ class ServerArgs:
         ):
             self.enable_npu_torchair_compile = False
             logger.warning(
-                "NPU TorchAir compile is disabled, the argument is appropriate for NPU only"
+                "The option --enable-npu-torchair-compile is ignored, this option is available for Ascend NPU only"
             )
 
         if is_npu() and not supports_custom_op():
@@ -4002,7 +4002,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-npu-torchair-compile",
             action="store_true",
-            help="Optimize the model with Torch Ascend Intermediate Representation compilation. Experimental feature.",
+            help="Optimize the model with Torch Ascend Intermediate Representation compilation. This is only available for Ascend NPU. Experimental feature.",
         )
         parser.add_argument(
             "--enable-piecewise-cuda-graph",
