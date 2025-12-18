@@ -430,14 +430,20 @@ class CustomAllreduce:
 def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
     
-    On AMD with deterministic inference, use sglang's CustomAllreduce
-    (has deterministic_all_reduce method). Otherwise use AiterCustomAllreduce if available.
+    On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
+    Otherwise use AiterCustomAllreduce if available.
     """
-    # On AMD with deterministic inference, use sglang's CustomAllreduce
+    # Check if 1-stage AR should be used
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        use_1stage = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+    else:
+        use_1stage = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+    
+    # On AMD with 1-stage AR, use sglang's CustomAllreduce
     # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
-    if is_hip() and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+    if is_hip() and use_1stage:
         logger.info(
-            "AMD/ROCm with deterministic inference: Using sglang CustomAllreduce"
+            "[AR] Using sglang CustomAllreduce (1-stage kernel)"
         )
         return CustomAllreduce
     
@@ -447,13 +453,14 @@ def dispatch_custom_allreduce():
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            logger.info("Using AiterCustomAllreduce for ROCm.")
+            logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             return AiterCustomAllreduce
         except ImportError as e:
             logger.warning(
-                "Aiter custom all-reduce not available (optional dependency missing); "
+                "[AR] Aiter custom all-reduce not available; "
                 "falling back to sglang CustomAllreduce. Details: %s",
                 e,
             )
             return CustomAllreduce
+    logger.info("[AR] Using sglang CustomAllreduce")
     return CustomAllreduce

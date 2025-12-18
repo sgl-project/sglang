@@ -376,6 +376,17 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                 )
+                # Log which all-reduce mode will be used
+                if is_hip():
+                    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+                        if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
+                            logger.info("[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)")
+                        else:
+                            logger.info("[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)")
+                    elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+                        logger.info("[AR] All-reduce: 1-stage kernel (deterministic inference enabled)")
+                    else:
+                        logger.info("[AR] All-reduce: default")
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
@@ -393,6 +404,8 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+        elif self.world_size > 1 and is_hip():
+            logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -560,8 +573,15 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        # On AMD with deterministic inference, use the deterministic 1-stage kernel
-        if is_hip() and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        # On AMD, use the deterministic 1-stage kernel when:
+        # - SGLANG_USE_1STAGE_ALLREDUCE=1 (explicitly enabled), OR
+        # - SGLANG_USE_1STAGE_ALLREDUCE not set AND --enable-deterministic-inference is on
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        use_deterministic_ar = is_hip() and use_1stage_ar
+        if use_deterministic_ar:
             if not input_.is_cpu and self.ca_comm is not None:
                 inp_size = input_.numel() * input_.element_size()
                 # Try unregistered mode first (faster for smaller tensors)
