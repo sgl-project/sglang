@@ -14,7 +14,7 @@ from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.device_timer import time_device_forward_pass
+from sglang.srt.utils.device_timer import time_device_forward_pass, DeviceTimer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -70,6 +70,9 @@ class SchedulerMetricsMixin:
         self.current_scheduler_metrics_enabled = (
             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
         )
+
+        if self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER:
+            self.forward_pass_device_timer = DeviceTimer(reporter=TODO)
 
         if self.enable_metrics:
             engine_type = "unified"
@@ -458,10 +461,10 @@ class SchedulerMetricsMixin:
 
     @contextmanager
     def record_metrics_around_forward(self: Scheduler, batch):
-        if not self.enable_metrics or not ENABLE_METRICS_DEVICE_TIMER:
+        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
             yield
             return
 
         category = "forward_" + batch.forward_mode.name.lower()
-        with TODO.wrap(category=category):
+        with self.forward_pass_device_timer.wrap(category=category):
             yield
