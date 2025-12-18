@@ -464,7 +464,6 @@ jobs:
     needs: [check-changes, accuracy-test-1-gpu-amd]
     # Temporarily disabled - uncomment when ready to re-enable (tracked here: https://github.com/sgl-project/sglang/issues/13107)
     if: |
-      false &&
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
@@ -497,7 +496,7 @@ jobs:
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
 
   pr-test-amd-finish:
     needs:
@@ -515,7 +514,7 @@ jobs:
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,
         accuracy-test-1-gpu-amd,
-        # accuracy-test-2-gpu-amd, # Temporarily disabled
+        accuracy-test-2-gpu-amd, # Temporarily disabled
       ]
     if: always()
     runs-on: ubuntu-latest
