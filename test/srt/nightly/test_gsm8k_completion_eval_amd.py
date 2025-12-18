@@ -106,24 +106,50 @@ AMD_BASE_MODELS_TP8 = [
         ],
         env_vars={"SGLANG_USE_AITER": "0"},
     ),
-    # GROK models - commented out until verified on upstream CI
-    # BaseModelConfig(
-    #     model_path="amd--grok-1-W4A8KV8",
-    #     tp_size=8,
-    #     accuracy_threshold=0.80,
-    #     tokenizer_path="Xenova--grok-1-tokenizer",
-    #     other_args=[
-    #         "--quantization", "fp8",
-    #         "--attention-backend", "aiter",
-    #         "--mem-fraction-static", "0.85",
-    #         "--trust-remote-code",
-    #     ],
-    #     env_vars={
-    #         "RCCL_MSCCL_ENABLE": "0",
-    #         "SGLANG_USE_AITER": "1",
-    #         "SGLANG_INT4_WEIGHT": "1",
-    #     },
-    # ),
+    # GROK1-FP8 - uses aiter backend, needs extended timeout for kernel compilation
+    BaseModelConfig(
+        model_path="lmzheng-grok-1",
+        tp_size=8,
+        accuracy_threshold=0.80,
+        timeout=600,  # 10 minutes for kernel compilation
+        tokenizer_path="Xenova--grok-1-tokenizer",
+        other_args=[
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_INT4_WEIGHT": "0",
+        },
+    ),
+    # GROK1-IN4 - INT4 quantized version
+    BaseModelConfig(
+        model_path="amd--grok-1-W4A8KV8",
+        tp_size=8,
+        accuracy_threshold=0.80,
+        timeout=600,  # 10 minutes for kernel compilation
+        tokenizer_path="Xenova--grok-1-tokenizer",
+        other_args=[
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_INT4_WEIGHT": "1",
+        },
+    ),
 ]
 
 # For 2-GPU testing (scaled down from TP=8)
