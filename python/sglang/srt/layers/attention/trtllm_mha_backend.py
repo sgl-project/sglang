@@ -428,36 +428,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
-        """Check if we should use the fused FP8 KV cache write path."""
-        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
-
-    def _fused_fp8_set_kv_buffer(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        **kwargs,
-    ):
-        """Fused FP8 quantization and KV cache write."""
-        cache_loc = forward_batch.out_cache_loc
-
-        # Get K/V cache buffers from token_to_kv_pool
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        fused_fp8_set_kv_buffer(
-            k=k,
-            v=v,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            cache_loc=cache_loc,
-            k_scale=layer.k_scale,  # May be None
-            v_scale=layer.v_scale,  # May be None
-            page_size=self.page_size,
-        )
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
@@ -576,23 +546,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        q_scale_float = 1.0
+        k_scale_float = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        v_scale_float = (
+            layer.v_scale_float
+            if getattr(layer, "v_scale_float", None) is not None
+            else 1.0
+        )
 
-        if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-            k = None
-            v = None
-        else:
-            # Use original set_kv_buffer path
-            if save_kv_cache and k is not None:
+        if save_kv_cache and k is not None:
+            if kwargs.get("cos_sin_cache") is not None:
+                raise NotImplementedError(
+                    "Fused RoPE + FP8 quantization + KV cache update is not implemented yet"
+                )
+            elif self.data_type == torch.float8_e4m3fn:
+                # Use fused FP8 quantization + KV cache update path
+                fused_fp8_set_kv_buffer(
+                    k=k,
+                    v=v,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    cache_loc=cache_loc,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                    page_size=self.page_size,
+                )
+            else:
+                # Use original set_kv_buffer path
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
@@ -600,32 +586,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.data_type == torch.float8_e4m3fn:
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # shape conversion:
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
+        k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
+        v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
         if layer.tp_v_head_num == 1:
             v_cache = canonicalize_stride(v_cache)
-
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale = q_scale_float * k_scale_float * layer.scaling
+        bmm2_scale = v_scale_float
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -644,6 +615,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
             out_dtype=self.q_data_type,  # model_runner.dtype
+            kv_layout="NHD",
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -655,27 +627,44 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache: bool = True,
         **kwargs,
-    ):
+    ) -> torch.Tensor:
+        """Run forward for extend using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        q_scale_float = 1.0
+        k_scale_float = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        v_scale_float = (
+            layer.v_scale_float
+            if getattr(layer, "v_scale_float", None) is not None
+            else 1.0
+        )
 
-        if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-            k = None
-            v = None
-        else:
-            # Use original set_kv_buffer path
-            if save_kv_cache and k is not None:
+        if save_kv_cache and k is not None:
+            if kwargs.get("cos_sin_cache") is not None:
+                raise NotImplementedError(
+                    "Fused RoPE + FP8 quantization + KV cache update is not implemented yet"
+                )
+            elif self.data_type == torch.float8_e4m3fn:
+                # Use fused FP8 quantization + KV cache update path
+                fused_fp8_set_kv_buffer(
+                    k=k,
+                    v=v,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    cache_loc=cache_loc,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                    page_size=self.page_size,
+                )
+            else:
+                # Use original set_kv_buffer path
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
@@ -683,33 +672,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.data_type == torch.float8_e4m3fn:
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
+        k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
+        v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
         if layer.tp_v_head_num == 1:
             v_cache = canonicalize_stride(v_cache)
-
         kv_cache = (k_cache, v_cache)
 
+        bmm1_scale = q_scale_float * k_scale_float * layer.scaling
+        bmm2_scale = v_scale_float
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
 
         if forward_batch.forward_mode.is_target_verify():
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -726,9 +701,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
+                kv_layout="NHD",
             )
         else:
-
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
@@ -746,6 +721,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # TODO: add attention_sink operation or nvfp4 scale factor if needed
                 sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
+                kv_layout="NHD",
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
