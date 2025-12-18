@@ -24,9 +24,6 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import (
@@ -39,6 +36,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -53,7 +51,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.models.utils import RotaryPosMixin, compute_cu_seqlens_from_grid_numpy
+from sglang.srt.models.utils import (
+    RotaryPosMixin,
+    WeightsMapper,
+    compute_cu_seqlens_from_grid_numpy,
+)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_int_env_var
@@ -184,14 +186,16 @@ class Qwen3_VisionBlock(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        position_embeddings: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -288,7 +292,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = get_rope(
+            head_size=head_dim,
+            rotary_dim=head_dim // 2,
+            max_position=8192,
+            base=10000.0,
+            is_neox_style=True,
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -339,17 +349,24 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def rot_pos_emb(self, grid_thw):
+    def rot_pos_emb(
+        self, grid_thw: list[list[int]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         pos_ids = []
         for t, h, w in grid_thw:
             base = self.rot_pos_ids(h, w, self.spatial_merge_size)
             pos_ids.append(base if t == 1 else base.repeat(t, 1))
 
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
-        return rotary_pos_emb
+        pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
+        max_grid_size = max(max(h, w) for _, h, w in grid_thw)
+
+        # Use pre-computed cos_sin_cache from RotaryEmbedding
+        cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
+
+        cos_combined = cos[pos_ids].flatten(1)
+        sin_combined = sin[pos_ids].flatten(1)
+
+        return cos_combined, sin_combined
 
     def fast_pos_embed_interpolate(self, grid_thw):
         num_grid_per_side = int(self.num_position_embeddings**0.5)
@@ -444,26 +461,34 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
+        if isinstance(grid_thw, list):
+            grid_thw_list = grid_thw
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+        else:
+            grid_thw_list = grid_thw.tolist()
+
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         x += pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        seq_len, _ = x.size()
-        rotary_pos_emb = rotary_pos_emb.to(x.device)
-
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
 
         x = x.unsqueeze(1)
+        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
+
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+            )
+
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
                     x
@@ -594,6 +619,21 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+        orig_to_new_prefix={
+            # mapping for new names in checkpoint saved after transformers v4.52
+            "model.language_model.": "language_model.model.",
+            "model.visual.": "visual.",
+            # mapping for original checkpoint
+            "lm_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
+        },
+    )
+
     def __init__(
         self,
         config: Qwen3VLConfig,
