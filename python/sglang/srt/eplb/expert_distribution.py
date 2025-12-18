@@ -682,7 +682,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         if self._enable:
             return self._append_utilization_rate(
-                forward_pass_id, single_pass_data["global_physical_count"]
+                forward_pass_id, single_pass_data["global_physical_count"], outputs
             )
 
     def reset(self):
@@ -691,7 +691,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._history.clear()
 
     def _append_utilization_rate(
-        self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor
+        self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor, outputs: Dict[str, Any],
     ):
         gpu_physical_count = compute_gpu_physical_count(
             single_pass_global_physical_count,
@@ -709,11 +709,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 compute_utilization_rate(gpu_physical_count)
             )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
-                return {
-                    "metrics": ExpertDistributionMetrics(
-                        eplb_balancedness=utilization_rate_gpu
-                    )
-                }
+                outputs["metrics"] = ExpertDistributionMetrics(
+                    eplb_balancedness=utilization_rate_gpu,
+                )
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
