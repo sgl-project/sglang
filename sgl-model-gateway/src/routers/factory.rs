@@ -22,42 +22,50 @@ impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
         match ctx.router_config.connection_mode {
-            ConnectionMode::Grpc { .. } => match &ctx.router_config.mode {
-                RoutingMode::Regular { .. } => Self::create_grpc_router(ctx).await,
-                RoutingMode::PrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    Self::create_grpc_pd_router(
-                        prefill_policy.as_ref(),
-                        decode_policy.as_ref(),
-                        &ctx.router_config.policy,
-                        ctx,
-                    )
-                    .await
-                }
-                RoutingMode::OpenAI { .. } => {
-                    Err("OpenAI mode requires HTTP connection_mode".to_string())
-                }
-            },
-            ConnectionMode::Http => match &ctx.router_config.mode {
-                RoutingMode::Regular { .. } => Self::create_regular_router(ctx).await,
-                RoutingMode::PrefillDecode {
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    Self::create_pd_router(
-                        prefill_policy.as_ref(),
-                        decode_policy.as_ref(),
-                        &ctx.router_config.policy,
-                        ctx,
-                    )
-                    .await
-                }
-                RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
-            },
+            ConnectionMode::Grpc { .. } => Self::create_grpc_router(&ctx).await,
+            ConnectionMode::Http => Self::create_http_router(&ctx).await,
+        }
+    }
+
+    async fn create_grpc_router(ctx: &&Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        match &ctx.router_config.mode {
+            RoutingMode::Regular { .. } => Self::create_grpc_regular_router(ctx).await,
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => {
+                Self::create_grpc_pd_router(
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &ctx.router_config.policy,
+                    ctx,
+                )
+                .await
+            }
+            RoutingMode::OpenAI { .. } => {
+                Err("OpenAI mode requires HTTP connection_mode".to_string())
+            }
+        }
+    }
+
+    async fn create_http_router(ctx: &&Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        match &ctx.router_config.mode {
+            RoutingMode::Regular { .. } => Self::create_regular_router(ctx).await,
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => {
+                Self::create_pd_router(
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &ctx.router_config.policy,
+                    ctx,
+                )
+                .await
+            }
+            RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
         }
     }
 
@@ -91,7 +99,9 @@ impl RouterFactory {
     }
 
     /// Create a gRPC router with injected policy
-    pub async fn create_grpc_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+    pub async fn create_grpc_regular_router(
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
         let router = GrpcRouter::new(ctx).await?;
 
         Ok(Box::new(router))
