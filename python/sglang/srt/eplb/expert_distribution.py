@@ -196,7 +196,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data, outputs)
+            self._accumulator.append(
+                forward_pass_id, gatherer_key, single_pass_data, outputs
+            )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
@@ -691,7 +693,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._history.clear()
 
     def _append_utilization_rate(
-        self, forward_pass_id: int, single_pass_global_physical_count: torch.Tensor, outputs: Dict[str, Any],
+        self,
+        forward_pass_id: int,
+        single_pass_global_physical_count: torch.Tensor,
+        outputs: Dict[str, Any],
     ):
         gpu_physical_count = compute_gpu_physical_count(
             single_pass_global_physical_count,

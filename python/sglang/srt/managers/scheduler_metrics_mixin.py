@@ -11,13 +11,12 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.managers.utils import GenerationBatchResult
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.managers.scheduler import EmbeddingBatchResult
+    from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
 
 logger = logging.getLogger(__name__)
 
