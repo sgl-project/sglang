@@ -44,8 +44,10 @@ class ModelTaskType(Enum):
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
+
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
+    TI2I = auto()  # Image to Image or Text-Image to Image
 
     def is_image_gen(self) -> bool:
         return self == ModelTaskType.T2I or self == ModelTaskType.I2I

@@ -405,7 +405,7 @@ def flux2_pack_latents(latents):
 class Flux2PipelineConfig(FluxPipelineConfig):
     embedded_cfg_scale: float = 4.0
 
-    task_type: ModelTaskType = ModelTaskType.I2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
