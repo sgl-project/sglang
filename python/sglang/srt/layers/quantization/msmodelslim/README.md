@@ -5,7 +5,7 @@ Quantization [msModelSlim](https://gitcode.com/Ascend/msit/tree/master/msmodelsl
 MsModelSlim was developed in the format of compressed_tensors and includes support for various quantization schemes, such as:
 - [x] W4A4 dynamic linear
 - [x] W8A8 static linear
-- [x] W8A8 dynamic linear 
+- [x] W8A8 dynamic linear
 - [x] W4A8 dynamic MOE
 - [x] W8A8 dynamic MOE
 

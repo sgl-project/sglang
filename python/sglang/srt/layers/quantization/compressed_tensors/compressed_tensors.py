@@ -451,7 +451,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel
-        ) -> bool:
+    ) -> bool:
         is_w4 = weight_quant.num_bits == 4
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
@@ -538,13 +538,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                         strategy=weight_quant.strategy,
                         is_static_input_scheme=True,
                         input_symmetric=input_quant.symmetric,
-                    )  
+                    )
                 elif _is_npu:
                     return NPUCompressedTensorsW8A8Int8(
-                            strategy=weight_quant.strategy,
-                            is_static_input_scheme=True,
-                            input_symmetric=input_quant.symmetric,
-                        )
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=True,
+                        input_symmetric=input_quant.symmetric,
+                    )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
                 if _is_cuda:
@@ -559,8 +559,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                         is_static_input_scheme=False,
                         input_symmetric=input_quant.symmetric,
                     )
-
-                    
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 

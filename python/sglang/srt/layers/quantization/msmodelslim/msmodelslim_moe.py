@@ -141,7 +141,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         )
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
-        
+
         # >>> special param for w4a8
         if not self.is_per_channel_weight:
             w13_weight_scale_second = torch.nn.Parameter(

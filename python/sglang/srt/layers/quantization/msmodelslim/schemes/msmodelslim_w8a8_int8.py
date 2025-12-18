@@ -25,7 +25,9 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
         prefix: str,
     ):
         self.quant_config = quant_config
-        self.is_dynamic = self.quant_config.get(prefix + ".weight", "") == "W8A8_DYNAMIC"
+        self.is_dynamic = (
+            self.quant_config.get(prefix + ".weight", "") == "W8A8_DYNAMIC"
+        )
 
     def create_weights(
         self,

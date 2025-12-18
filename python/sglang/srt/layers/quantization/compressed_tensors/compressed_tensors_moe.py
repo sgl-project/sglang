@@ -11,13 +11,13 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW8A8Int8DynamicMoEMethod,
-    NPUW4A16Int4DynamicMoEMethod,
-)
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
+)
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4DynamicMoEMethod,
+    NPUW8A8Int8DynamicMoEMethod,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -88,7 +88,7 @@ __all__ = [
     "CompressedTensorsW8A8Fp8MoEMethod",
     "NPUCompressedTensorsW8A8Int8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
-    "NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
+    "NPUCompressedTensorsW4A16Int4DynamicMoEMethod",
 ]
 
 
@@ -115,8 +115,13 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                 return CompressedTensorsWNA16MoEMethod(quant_config)
             elif _is_npu:
-                if quant_config._is_dynamic_token_w4(weight_quant, input_quant) and input_quant is None:
-                    logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod")
+                if (
+                    quant_config._is_dynamic_token_w4(weight_quant, input_quant)
+                    and input_quant is None
+                ):
+                    logger.info_once(
+                        "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
+                    )
                     return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoEMethod")
