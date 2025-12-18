@@ -25,10 +25,10 @@ MODEL_SCORE_THRESHOLDS = {
     "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.60,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.61,
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
     "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model from sanity_check.py - TP2 verified on MI300X
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.78,
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.8,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
@@ -83,13 +83,6 @@ TRITON_MOE_MODELS = {
 # AMD-specific models that need special launch config (matching in-house CI sanity_check.py)
 # AMD_SPECIAL_CONFIG_MODELS = {
 #     "Qwen/Qwen3-30B-A3B-Thinking-2507", # default config works
-# }
-# AMD TP=8 base models - NOT compatible with mgsm_en eval (no chat template)
-# These models work with gsm8k completion API but not chat completions
-# AMD_TP8_MODELS = {
-#     "lmsys/gpt-oss-120b-bf16",  # base model, gsm8k accuracy ~85%
-#     "lmsys/gpt-oss-20b-bf16",   # base model, gsm8k accuracy ~54%
-#     "amd--grok-1-W4A8KV8",      # base model, gsm8k accuracy ~82%
 # }
 
 
