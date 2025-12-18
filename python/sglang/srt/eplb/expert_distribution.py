@@ -710,6 +710,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 compute_utilization_rate(gpu_physical_count)
             )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
+                print(f"hi {self._rank=} {utilization_rate_gpu=}")
                 outputs["metrics"] = ExpertDistributionMetrics(
                     eplb_balancedness=utilization_rate_gpu,
                 )
