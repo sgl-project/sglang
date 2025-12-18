@@ -228,8 +228,8 @@ class TestEAGLERadixCache(CustomTestCase):
             # Chunked prefill & Page Size > 1
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
             {**self.BASE_CONFIG, "page_size": 4},
-            # Preferred by some kernels
-            {**self.BASE_CONFIG, "page_size": 64},
+            # Large page size tend to expose IMA bugs.
+            {**self.BASE_CONFIG, "page_size": 256},
             # Disable CUDA Graph
             {
                 **self.BASE_CONFIG,

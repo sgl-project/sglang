@@ -667,18 +667,16 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.cache_seqlens_int32 += (
                     expanded_last_page_lens
                 )
-                # NOTE: also consider the partial page at the end of decode_length
-                max_pages_expand = (
-                    int(decode_length + 2 * self.page_size - 1) // self.page_size
+                expand_page_table = update_draft_decode_set_expand_metadata_with_page_size(
+                    cache_seqlens_int32=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    last_page_lens=last_page_lens,
+                    decode_length=decode_length,
+                    cache_loc=forward_batch.out_cache_loc,
+                    topk=self.topk,
+                    page_size=self.page_size,
                 )
-                page_base = (cache_loc[:, 0] // self.page_size).to(torch.int32)
-                page_offsets = torch.arange(
-                    max_pages_expand, device=page_base.device, dtype=torch.int32
-                )
-                expand_page_table = page_base[:, None] + page_offsets[None, :]
-                self.forward_metadata_spec_decode_expand.page_table = (
-                    expand_page_table.contiguous()
-                )
+                self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
         self.forward_metadata = metadata
 
@@ -1377,22 +1375,11 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs * self.topk,
-                    decode_length,
+                    decode_length + 1, # Additional page for last partial page
                     dtype=torch.int32,
                     device=self.device,
                 ),
             }
-
-            if self.page_size > 1:
-                # Used for indicing expand page_table
-                self.draft_decode_metadata_topk_expand["strided_indices_expand"] = (
-                    torch.arange(
-                        0,
-                        self.speculative_num_steps,
-                        self.page_size,
-                        device=self.device,
-                    )
-                )
 
         if (
             self.speculative_num_draft_tokens is not None
@@ -1832,8 +1819,6 @@ class FlashAttentionBackend(AttentionBackend):
                         # First attention handles seq_lens - last_page_lens if page size > 1.
                         last_page_lens = seq_lens % self.page_size
                         seq_lens = seq_lens - last_page_lens
-                        # last_page_lens_cpu = last_page_lens.max().item()
-                        # seq_lens_cpu -= last_page_lens_cpu
                     metadata.cache_seqlens_int32.copy_(seq_lens)
                     # metadata.max_seq_len_q = self.topk, already set in capture
                     # metadata.cu_seqlens_q already set in capture
@@ -1859,22 +1844,14 @@ class FlashAttentionBackend(AttentionBackend):
                     # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
                     cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
                     if self.page_size > 1:
-                        # Second attention handles last_page_len + decode part.
-                        strided_indices_expand = (
-                            self.draft_decode_metadata_topk_expand.get(
-                                "strided_indices_expand"
-                            )
-                        )
                         update_draft_decode_set_expand_metadata_with_page_size(
-                            metadata_expand.cache_seqlens_int32,  # Modifies
-                            metadata_expand.page_table,  # Modifies
-                            cache_loc,
-                            last_page_lens,
-                            strided_indices_expand,
-                            decode_length,
-                            bs,
-                            self.topk,
-                            self.page_size,
+                            cache_seqlens_int32=metadata_expand.cache_seqlens_int32,
+                            page_table=metadata_expand.page_table,
+                            last_page_lens=last_page_lens,
+                            decode_length=decode_length,
+                            cache_loc=cache_loc,
+                            topk=self.topk,
+                            page_size=self.page_size,
                         )
                     else:
                         metadata_expand.page_table[: cache_loc.shape[0]].copy_(
@@ -2499,27 +2476,19 @@ def normal_decode_set_metadata(
 def update_draft_decode_set_expand_metadata_with_page_size(
     cache_seqlens_int32: torch.Tensor,  # Modifies
     page_table: torch.Tensor,  # Modifies
-    cache_loc: torch.Tensor,
     last_page_lens: torch.Tensor,
-    strided_indices_expand: torch.Tensor,
     decode_length: int,
-    bs: int,
+    cache_loc: torch.Tensor,
     topk: int,
     page_size: int,
 ):
     expanded_last_page_lens = last_page_lens.repeat_interleave(topk)
     cache_seqlens_int32.copy_(decode_length + expanded_last_page_lens)
-    expand_page_table = cache_loc[:, : decode_length + page_size].clone()
-    last_page_lens_broadcast = expanded_last_page_lens.unsqueeze(-1).expand(
-        -1, expand_page_table.shape[1]
-    )
-    expand_page_table -= last_page_lens_broadcast
-    expand_page_table = (
-        expand_page_table[
-            :,
-            strided_indices_expand[: (decode_length + 2 * page_size - 1) // page_size],
-        ]
-        // page_size
-    )
-    max_seq_pages_expand = (decode_length + 2 * page_size - 1) // page_size
-    page_table[:, :max_seq_pages_expand].copy_(expand_page_table)
+    cache_loc = cache_loc // page_size
+    # Vectorized torch.unique_consecutive: track value change points then scatter
+    mask = torch.ones_like(cache_loc, dtype=torch.bool)
+    mask[:, 1:] = cache_loc[:, 1:] != cache_loc[:, :-1]
+    positions = mask.cumsum(dim=1) - 1
+    packed = torch.zeros_like(cache_loc)
+    packed.scatter_(1, positions, cache_loc)
+    return packed
