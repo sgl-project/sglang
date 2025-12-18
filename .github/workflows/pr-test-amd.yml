@@ -229,11 +229,11 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: linux-mi300-gpu-8
+      RUNNER_LABELS: linux-mi325-gpu-8
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-8]
+        runner: [linux-mi325-gpu-8]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:

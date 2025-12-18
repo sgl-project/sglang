@@ -79,13 +79,3 @@ docker cp ./dummy-grok ci_sglang:/
 
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
-
-# Clear pre-built AITER kernels from Docker image to avoid segfaults
-# The Docker image may contain pre-compiled kernels incompatible with the current environment
-echo "Clearing pre-built AITER kernels from Docker image..."
-docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
-docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
-
-# Pre-build AITER kernels to avoid timeout during tests
-echo "Warming up AITER JIT kernels..."
-docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
