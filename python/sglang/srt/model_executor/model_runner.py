@@ -66,8 +66,10 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionMetrics,
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
@@ -136,9 +138,10 @@ from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
-from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    RemoteInstanceWeightLoaderBackend,
+    register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -158,6 +161,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    get_local_ip_auto,
     init_custom_process_group,
     is_cuda,
     is_float4_e2m1fn_x2,
@@ -235,14 +239,13 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
-# Use a small KV cache pool size for tests in CI
-SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
-
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
-# the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
+# the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +268,13 @@ class RankZeroFilter(logging.Filter):
         if record.levelno == logging.INFO:
             return self.is_rank_zero
         return True
+
+
+@dataclass
+class ModelRunnerOutput:
+    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
+    can_run_graph: bool
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
 
 class ModelRunner:
@@ -320,13 +330,16 @@ class ModelRunner:
         self.forward_pass_id = 0
         self.init_new_workspace = False
 
+        self.remote_instance_transfer_engine = None
+        self.remote_instance_transfer_engine_session_id = ""
+        self.remote_instance_transfer_engine_weight_info = None
+
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
 
         # Model-specific adjustment
         self.model_specific_adjustment()
-        self.check_quantized_moe_compatibility()
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -358,6 +371,7 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
+        self.check_quantized_moe_compatibility()
 
         # Temporary cached values
         self.support_pp = (
@@ -393,6 +407,9 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+            self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
@@ -433,6 +450,15 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        if (
+            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            and self.remote_instance_transfer_engine is not None
+            and self.remote_instance_transfer_engine_weight_info is None
+        ):
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                self.model, self.remote_instance_transfer_engine
+            )
 
         # Check if the model is using hybrid SWA
         if (
@@ -547,6 +573,23 @@ class ModelRunner:
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
+
+    def remote_instance_init_transfer_engine(self):
+        try:
+            from mooncake.engine import TransferEngine
+        except ImportError as e:
+            logger.warning(
+                "Please install mooncake for using remote instance transfer engine: pip install mooncake"
+            )
+            return
+        self.remote_instance_transfer_engine = TransferEngine()
+        local_ip = get_local_ip_auto()
+        self.remote_instance_transfer_engine.initialize(
+            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
+        )
+        self.remote_instance_transfer_engine_session_id = (
+            f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
+        )
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -766,6 +809,8 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
+            remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
         )
@@ -774,7 +819,11 @@ class ModelRunner:
                 self.model_config, self.load_config, self.tp_size
             )
 
-        if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
+        if (
+            self.server_args.load_format == LoadFormat.REMOTE_INSTANCE
+            and self.server_args.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.NCCL
+        ):
             if self.tp_rank == 0:
                 instance_ip = socket.gethostbyname(socket.gethostname())
                 t = threading.Thread(
@@ -799,11 +848,18 @@ class ModelRunner:
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
-            self.model = get_model(
-                model_config=self.model_config,
+            self.loader = get_model_loader(
                 load_config=self.load_config,
+                model_config=self.model_config,
+            )
+            self.model = self.loader.load_model(
+                model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
+                self.remote_instance_transfer_engine_weight_info = (
+                    self.loader.remote_instance_transfer_engine_weight_info
+                )
         monkey_patch_vllm_parallel_state(reverse=True)
 
         get_offloader().post_init()
@@ -955,7 +1011,7 @@ class ModelRunner:
             return iter
 
         def model_load_weights(model, iter):
-            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
+            loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -1450,14 +1506,9 @@ class ModelRunner:
         server_args = self.server_args
         assert config is not None
 
-        speculativa_ratio = (
-            0
-            if server_args.speculative_num_draft_tokens is None
-            else server_args.speculative_num_draft_tokens
-        )
         if (
             server_args.disable_radix_cache
-            or config.mamba2_cache_params.mamba_cache_per_req == 0
+            or server_args.max_mamba_cache_size is not None
         ):
             # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
             if server_args.max_mamba_cache_size is None:
@@ -1465,7 +1516,25 @@ class ModelRunner:
                     server_args.max_mamba_cache_size = server_args.max_running_requests
                 else:
                     server_args.max_mamba_cache_size = 512
+            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
         else:
+            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            # reserve the memory for the intermediate mamba states used for spec dec
+            if not self.spec_algorithm.is_none():
+                assert server_args.speculative_num_draft_tokens is not None
+                assert server_args.max_running_requests is not None
+
+                mamba_state_intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * server_args.max_running_requests
+                    * server_args.speculative_num_draft_tokens
+                )
+                total_rest_memory = total_rest_memory - (
+                    mamba_state_intermediate_size / (1 << 30)
+                )
+
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
             # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
@@ -1479,20 +1548,21 @@ class ModelRunner:
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
                 // config.mamba2_cache_params.mamba_cache_per_req
-                // (1 + speculativa_ratio)
             )
 
-        if self.hybrid_gdn_config is not None:
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
-            )
         mamba_state_memory = (
             server_args.max_mamba_cache_size
             * config.mamba2_cache_params.mamba_cache_per_req
-            * (1 + speculativa_ratio)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    @property
+    def qwen3_next_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, Qwen3NextConfig):
+            return config
+        return None
 
     @property
     def hybrid_gdn_config(self):
@@ -1668,8 +1738,12 @@ class ModelRunner:
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-        if SGLANG_CI_SMALL_KV_SIZE:
-            self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
+
+        if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
+            logger.info(
+                f"Use a small KV cache pool size ({small_kv_size}) for local tests"
+            )
+            self.max_total_num_tokens = small_kv_size
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -1683,11 +1757,18 @@ class ModelRunner:
             )
 
         if self.mambaish_config is not None:
-            ratio = (
-                MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
-                if not self.server_args.disable_radix_cache
-                else 1
-            )
+            additional_ratio = 0
+            if (
+                self.server_args.enable_mamba_extra_buffer()
+                and not self.spec_algorithm.is_none()
+            ):
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+            else:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            if self.server_args.disable_radix_cache:
+                ratio = 1
+            else:
+                ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
@@ -1774,6 +1855,7 @@ class ModelRunner:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         cache_params=config.mamba2_cache_params,
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                     )
                 else:
@@ -1789,11 +1871,13 @@ class ModelRunner:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
+                    mamba_spec_state_size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
+                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
@@ -2145,11 +2229,15 @@ class ModelRunner:
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
-        if not self.server_args.enable_flashinfer_autotune:
+        if self.server_args.disable_flashinfer_autotune:
             return False
 
-        backend_str = self.server_args.attention_backend
-        if backend_str not in ["flashinfer", "trtllm_mla", "trtllm_mha"]:
+        backend_str = self.server_args.moe_runner_backend
+        if backend_str not in [
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_mxfp4",
+        ]:
             return False
 
         major, _ = torch.cuda.get_device_capability()
@@ -2227,6 +2315,7 @@ class ModelRunner:
             encoder_len_fill_value=0,
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
         )
         buffers.num_token_non_padded[...] = num_tokens
 
@@ -2647,13 +2736,13 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+    ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
-        ):
+        ) as recorder_outputs:
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2661,6 +2750,7 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+        output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
@@ -2674,7 +2764,7 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+    ) -> ModelRunnerOutput:
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -2692,7 +2782,7 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ret, can_run_graph
+            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -2704,7 +2794,7 @@ class ModelRunner:
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer
+            and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
@@ -2740,7 +2830,7 @@ class ModelRunner:
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        return ret, can_run_graph
+        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
