@@ -257,7 +257,7 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
     def process_scale(cls, weight: torch.Tensor, scale, per_group_scale):
         scale = scale.transpose(1, 2).contiguous()
 
-        ### TODO fix group_size=0 behaivor
+        ### TODO fix group_size=0 behavior
         '''if cls.is_per_channel_weight:
             scale_np = scale.cpu().numpy()
             scale_np.dtype = np.uint32
