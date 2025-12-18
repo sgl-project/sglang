@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from prometheus_client import Summary
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
@@ -637,6 +639,12 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["mode"],
         )
 
+        self.eplb_balancedness = Summary(
+            name="sglang:eplb_balancedness",
+            documentation="Balancedness of MoE in expert parallelism.",
+            labelnames=list(labels.keys()),
+        )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -688,6 +696,8 @@ class SchedulerMetricsCollector:
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
+    def increment_eplb_balancedness(self, amount: float) -> None:
+        self.eplb_balancedness.labels(**self.labels).observe(amount)
     def increment_realtime_tokens(
         self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
     ):
