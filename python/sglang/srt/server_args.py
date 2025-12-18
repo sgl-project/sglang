@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 
 # Define constants
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -3205,7 +3206,7 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["flashinfer", "pytorch", "ascend"],
+            choices=SAMPLING_BACKEND_CHOICES,
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
