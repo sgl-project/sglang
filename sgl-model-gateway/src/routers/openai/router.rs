@@ -36,7 +36,7 @@ use crate::{
     app_context::AppContext,
     core::{model_type::Endpoint, ModelCard, ProviderType, RuntimeType, Worker, WorkerRegistry},
     data_connector::{ConversationId, ListParams, ResponseId, SortOrder},
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
         responses::{
@@ -589,7 +589,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             metrics_labels::CONNECTION_HTTP,
             model,
             metrics_labels::ENDPOINT_CHAT,
-            streaming,
+            bool_to_static_str(streaming),
         );
 
         let auth_header = extract_auth_header(headers, &None);
@@ -782,7 +782,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             metrics_labels::CONNECTION_HTTP,
             model,
             metrics_labels::ENDPOINT_RESPONSES,
-            streaming,
+            bool_to_static_str(streaming),
         );
 
         let auth_header = extract_auth_header(headers, &None);

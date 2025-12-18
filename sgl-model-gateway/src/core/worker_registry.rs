@@ -1,8 +1,12 @@
 //! Worker Registry for multi-router support
 //!
 //! Provides centralized registry for workers with model-based indexing
+//!
+//! # Performance Optimizations
+//! The model index uses immutable Arc snapshots instead of RwLock for lock-free reads.
+//! This is critical for high-concurrency scenarios where many requests query the same model.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use uuid::Uuid;
@@ -36,8 +40,10 @@ impl Default for WorkerId {
     }
 }
 
-/// Model index type for O(1) lookups (stores Arc<dyn Worker> directly)
-type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
+/// Model index using immutable snapshots for lock-free reads.
+/// Each model maps to an Arc'd slice of workers that can be read without locking.
+/// Updates create new snapshots (copy-on-write semantics).
+type ModelIndex = Arc<DashMap<String, Arc<[Arc<dyn Worker>]>>>;
 
 /// Worker registry with model-based indexing
 #[derive(Debug)]
@@ -45,8 +51,8 @@ pub struct WorkerRegistry {
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
-    /// Model index for O(1) lookups (stores Arc<dyn Worker> directly)
-    /// This replaces the previous dual-index approach for better memory efficiency
+    /// Model index for O(1) lookups using immutable snapshots.
+    /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
     model_index: ModelIndex,
 
     /// Workers indexed by worker type
@@ -87,14 +93,18 @@ impl WorkerRegistry {
         self.url_to_id
             .insert(worker.url().to_string(), worker_id.clone());
 
-        // Update model index for O(1) lookups
+        // Update model index for O(1) lookups using copy-on-write
+        // This creates a new immutable snapshot with the added worker
         let model_id = worker.model_id().to_string();
         self.model_index
             .entry(model_id)
-            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
-            .write()
-            .expect("RwLock for model_index is poisoned")
-            .push(worker.clone());
+            .and_modify(|existing| {
+                // Create new snapshot with the additional worker
+                let mut new_workers: Vec<Arc<dyn Worker>> = existing.iter().cloned().collect();
+                new_workers.push(worker.clone());
+                *existing = Arc::from(new_workers.into_boxed_slice());
+            })
+            .or_insert_with(|| Arc::from(vec![worker.clone()].into_boxed_slice()));
 
         // Update type index (clone needed for DashMap key ownership)
         self.type_workers
@@ -117,13 +127,16 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            // Remove from model index
-            if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
-                let worker_url = worker.url();
-                model_index_entry
-                    .write()
-                    .expect("RwLock for model_index is poisoned")
-                    .retain(|w| w.url() != worker_url);
+            // Remove from model index using copy-on-write
+            // Create new snapshot without the removed worker
+            let worker_url = worker.url();
+            if let Some(mut entry) = self.model_index.get_mut(worker.model_id()) {
+                let new_workers: Vec<Arc<dyn Worker>> = entry
+                    .iter()
+                    .filter(|w| w.url() != worker_url)
+                    .cloned()
+                    .collect();
+                *entry = Arc::from(new_workers.into_boxed_slice());
             }
 
             // Remove from type index
@@ -165,23 +178,22 @@ impl WorkerRegistry {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
-    /// Get all workers for a model (O(1) optimized)
-    /// Uses the pre-indexed model_index for fast lookups
-    pub fn get_by_model(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
+    /// Empty worker slice constant for returning when no workers found
+    const EMPTY_WORKERS: &'static [Arc<dyn Worker>] = &[];
+
+    /// Get all workers for a model (O(1) optimized, lock-free)
+    /// Returns an Arc to the immutable worker slice - just an atomic refcount bump.
+    /// This is the fastest possible read path with zero contention.
+    pub fn get_by_model(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
         self.model_index
             .get(model_id)
-            .map(|workers| {
-                workers
-                    .read()
-                    .expect("RwLock for model_index is poisoned")
-                    .clone()
-            })
-            .unwrap_or_default()
+            .map(|workers| Arc::clone(&workers))
+            .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
     }
 
     /// Alias for get_by_model for backwards compatibility
     #[inline]
-    pub fn get_by_model_fast(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
+    pub fn get_by_model_fast(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
         self.get_by_model(model_id)
     }
 
@@ -266,17 +278,11 @@ impl WorkerRegistry {
             .collect()
     }
 
-    /// Get all model IDs with workers
+    /// Get all model IDs with workers (lock-free)
     pub fn get_models(&self) -> Vec<String> {
         self.model_index
             .iter()
-            .filter(|entry| {
-                entry
-                    .value()
-                    .read()
-                    .map(|workers| !workers.is_empty())
-                    .unwrap_or(false)
-            })
+            .filter(|entry| !entry.value().is_empty())
             .map(|entry| entry.key().clone())
             .collect()
     }
@@ -299,8 +305,8 @@ impl WorkerRegistry {
     ) -> Vec<Arc<dyn Worker>> {
         // Start with the most efficient collection based on filters
         // Use model index when possible as it's O(1) lookup
-        let workers = if let Some(model) = model_id {
-            self.get_by_model_fast(model)
+        let workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
+            self.get_by_model_fast(model).to_vec()
         } else {
             self.get_all()
         };
@@ -340,20 +346,14 @@ impl WorkerRegistry {
             .collect()
     }
 
-    /// Get worker statistics
+    /// Get worker statistics (lock-free)
     pub fn stats(&self) -> WorkerRegistryStats {
         let total_workers = self.workers.len();
-        // Count models directly instead of allocating Vec via get_models()
+        // Count models directly instead of allocating Vec via get_models() (lock-free)
         let total_models = self
             .model_index
             .iter()
-            .filter(|entry| {
-                entry
-                    .value()
-                    .read()
-                    .map(|workers| !workers.is_empty())
-                    .unwrap_or(false)
-            })
+            .filter(|entry| !entry.value().is_empty())
             .count();
 
         let mut healthy_count = 0;

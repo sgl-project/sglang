@@ -20,7 +20,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
         # Define variant configurations
         cls.variants = [
             {
-                "name": "basic",
+                "name": "dp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
@@ -33,7 +33,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                 ],
             },
             {
-                "name": "mtp",
+                "name": "dp+mtp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
@@ -56,36 +56,31 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                 ],
             },
             {
-                "name": "nsa",
+                "name": "tp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
                     "8",
-                    "--dp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--attention-backend",
-                    "nsa",
-                    "--nsa-prefill-backend",
-                    "flashmla_sparse",
-                    "--nsa-decode-backend",
-                    "flashmla_kv",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
             },
             {
-                "name": "pure_tp",
+                "name": "tp+mtp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
                     "8",
-                    "--attention-backend",
-                    "nsa",
-                    "--nsa-prefill-backend",
-                    "flashmla_sparse",
-                    "--nsa-decode-backend",
-                    "flashmla_kv",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--mem-frac",
+                    "0.7",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],

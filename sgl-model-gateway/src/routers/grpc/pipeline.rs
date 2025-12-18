@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     core::WorkerRegistry,
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
@@ -215,7 +215,7 @@ impl RequestPipeline {
             metrics_labels::CONNECTION_GRPC,
             &request_for_metrics.model,
             metrics_labels::ENDPOINT_CHAT,
-            streaming,
+            bool_to_static_str(streaming),
         );
 
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
@@ -320,7 +320,7 @@ impl RequestPipeline {
             metrics_labels::CONNECTION_GRPC,
             model_for_metrics.as_deref().unwrap_or("unknown"),
             metrics_labels::ENDPOINT_GENERATE,
-            streaming,
+            bool_to_static_str(streaming),
         );
 
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
