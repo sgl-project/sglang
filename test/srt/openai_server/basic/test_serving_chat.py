@@ -36,7 +36,7 @@ class _MockTokenizerManager:
         # Mock hf_config for _use_dpsk_v32_encoding check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
-        self.server_args.get_hf_config.return_value = mock_hf_config
+        self.model_config.hf_config = mock_hf_config
 
         self.chat_template_name: Optional[str] = "llama-3"
 
@@ -603,9 +603,7 @@ class ServingChatTestCase(unittest.TestCase):
             mock_hf_config = Mock()
             mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
 
-            tokenizer_manager.server_args.get_hf_config = Mock(
-                return_value=mock_hf_config
-            )
+            tokenizer_manager.model_config.hf_config = mock_hf_config
 
             # Case 1: No chat template in tokenizer -> should use dpsk encoding
             tokenizer_manager.tokenizer = Mock()
