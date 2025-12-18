@@ -88,6 +88,9 @@ class SchedulerMetricsMixin:
                     reporter=self.metrics_collector.increment_gpu_execution_seconds
                 )
 
+        if self.enable_kv_cache_events:
+            self.init_kv_events(self.server_args.kv_events_config)
+
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
