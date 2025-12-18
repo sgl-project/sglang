@@ -1276,6 +1276,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             all_success = all([r.success for r in result])
             if all_success is True:
+                self.served_model_name = obj.model_path
                 self.server_args.model_path = obj.model_path
                 self.server_args.load_format = obj.load_format
                 self.model_path = obj.model_path
