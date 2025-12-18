@@ -84,7 +84,8 @@ class SchedulerMetricsMixin:
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
             if ENABLE_METRICS_DEVICE_TIMER:
-                self.forward_pass_device_timer = DeviceTimer(reporter=TODO)
+                self.forward_pass_device_timer = DeviceTimer(
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds)
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
