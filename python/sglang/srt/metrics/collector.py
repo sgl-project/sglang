@@ -64,6 +64,13 @@ class TimeStats:
     prefill_start_time_host: float = 0.0
     prefill_end_time_host: float = 0.0
 
+    # Timestamp when prefill phase finishes, obtained from `time.time()`.
+    # Note that this differs from the other `_time` fields tracked by the
+    # `TimeStats` class, which are obtained from `time.perf_counter()`.
+    # We use `time.time()` instead of `time.perf_counter()` here in order to
+    # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
+    prefill_finished_ts: float = 0.0
+
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
@@ -75,6 +82,11 @@ class TimeStats:
     def get_prefill_launch_latency(self) -> Optional[float]:
         if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
             return self.prefill_end_time_host - self.prefill_start_time_host
+        return None
+
+    def get_prefill_finished_ts(self) -> Optional[float]:
+        if self.prefill_finished_ts > 0.0:
+            return self.prefill_finished_ts
         return None
 
     def convert_to_duration(self) -> str:
@@ -178,6 +190,7 @@ class SchedulerStats:
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
+    decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     num_grammar_queue_reqs: int = 0
@@ -265,6 +278,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.decode_sum_seq_lens = Gauge(
+            name="sglang:decode_sum_seq_lens",
+            documentation="The sum of all sequence lengths in decode.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
             documentation="The generation throughput (token/s).",
@@ -318,9 +337,16 @@ class SchedulerMetricsCollector:
         )
 
         # Retract
+        # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
             name="sglang:num_retracted_reqs",
             documentation="The number of retracted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_retracted_reqs_total = Counter(
+            # The name is `requests` instead of `reqs` to avoid dup name error
+            name="sglang:num_retracted_requests_total",
+            documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
@@ -598,11 +624,17 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        # TODO maybe remove this old gauge in favor of the new counter
         self.is_cuda_graph = Gauge(
             name="sglang:is_cuda_graph",
             documentation="Whether the batch is using CUDA graph.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.cuda_graph_passes_total = Counter(
+            name="sglang:cuda_graph_passes_total",
+            documentation="Total number of forward passes categorized by CUDA graph.",
+            labelnames=list(labels.keys()) + ["mode"],
         )
 
         self.new_token_ratio = Gauge(
@@ -610,6 +642,22 @@ class SchedulerMetricsCollector:
             documentation="The new token ratio.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+
+        self.realtime_prefill_compute_tokens_total = Counter(
+            name="sglang:realtime_prefill_compute_tokens_total",
+            documentation="Total number of prefill compute tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_prefill_cache_tokens_total = Counter(
+            name="sglang:realtime_prefill_cache_tokens_total",
+            documentation="Total number of prefill cache tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
+        )
+        self.realtime_decode_tokens_total = Counter(
+            name="sglang:realtime_decode_tokens_total",
+            documentation="Total number of decode tokens processed (updated on each log interval).",
+            labelnames=labels.keys(),
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -632,6 +680,25 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
+    def increment_num_retracted_reqs(self, num: int) -> None:
+        self.num_retracted_reqs_total.labels(**self.labels).inc(num)
+
+    def increment_cuda_graph_pass(self, value: bool) -> None:
+        # leave room for piecewise cuda graph, etc
+        mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_realtime_tokens(
+        self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
+    ):
+        self.realtime_prefill_compute_tokens_total.labels(**self.labels).inc(
+            prefill_compute_tokens
+        )
+        self.realtime_prefill_cache_tokens_total.labels(**self.labels).inc(
+            prefill_cache_tokens
+        )
+        self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -641,6 +708,7 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
+        self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)

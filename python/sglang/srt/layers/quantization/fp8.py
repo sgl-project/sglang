@@ -69,6 +69,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -175,6 +176,7 @@ class Fp8Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
@@ -182,6 +184,8 @@ class Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
+        elif isinstance(layer, RadixAttention):
+            return Fp8KVCacheMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -1381,6 +1385,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                     use_shuffled_weight=False,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 )
             else:
                 routing_bias_cast = (
@@ -1412,6 +1417,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ),
                     use_routing_scales_on_input=False,
                     routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 )
 
     def maybe_apply_hip_fused_experts(

@@ -1,11 +1,13 @@
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3_eagle.py
+# SPDX-License-Identifier: Apache-2.0
 from typing import Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from python.sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
