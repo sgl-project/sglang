@@ -25,6 +25,8 @@ from sglang.srt.utils import get_bool_env_var
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
 
+logger = logging.getLogger(__name__)
+
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
     """
     Get the histogram configuration from the environment variable.
@@ -705,9 +707,10 @@ class SchedulerMetricsCollector:
         )
         self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
 
-    def increment_gpu_execution_seconds(self, category: str, delta: float):
+    def increment_gpu_execution_seconds(self, category: str, t: float):
+        logger.debug(f"GPU execution seconds: {category=} {t:.3f=}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(
-            delta
+            t
         )
 
     def log_stats(self, stats: SchedulerStats) -> None:
