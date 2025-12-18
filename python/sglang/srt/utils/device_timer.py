@@ -12,7 +12,8 @@ def time_device_forward_pass(forward_mode: ForwardMode):
         yield
         return
 
-    with TODO.wrap():
+    category = "forward_" + forward_mode.name.lower()
+    with TODO.wrap(category=category):
         yield
 
 
@@ -21,9 +22,15 @@ class DeviceTimer:
         TODO
 
     @contextmanager
-    def wrap(self):
-        TODO
+    def wrap(self, category: str):
+        self._start()
         try:
             yield
         finally:
-            TODO
+            self._end(category=category)
+
+    def _start(self):
+        TODO
+
+    def _end(self, category: str):
+        TODO
