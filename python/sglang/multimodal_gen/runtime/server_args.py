@@ -289,7 +289,7 @@ class ServerArgs:
 
     # Quantization / Nunchaku SVDQuant parameters
     # NOTE: Currently used to enable Nunchaku-based quantized models (e.g., FLUX).
-    enable_quantization: bool = False
+    enable_svdquant: bool = False
     # Path or HF repo ID of the quantized model weights (.safetensors) for the
     # main transformer (e.g., DiT / UNet). Example:
     #   - "nunchaku-tech/nunchaku-flux.1-dev/svdq-int4_r32-flux.1-dev.safetensors"
@@ -300,8 +300,6 @@ class ServerArgs:
     quantization_rank: int = 32
     # Whether to use unsigned activations for INT4.
     quantization_act_unsigned: bool = False
-    # Attention processor to use inside Nunchaku models.
-    quantization_processor: str = "flashattn2"  # "flashattn2" or "nunchaku-fp16"
     # Whether to enable CPU offloading inside Nunchaku models.
     quantization_enable_offloading: bool = False
 
@@ -612,9 +610,9 @@ class ServerArgs:
 
         # Quantization / Nunchaku SVDQuant parameters
         parser.add_argument(
-            "--enable-quantization",
+            "--enable-svdquant",
             action=StoreBoolean,
-            default=ServerArgs.enable_quantization,
+            default=ServerArgs.enable_svdquant,
             help=(
                 "Enable Nunchaku (SVDQuant) quantization for supported components "
                 "(e.g., FLUX / QwenImage transformer)."
@@ -648,17 +646,6 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.quantization_act_unsigned,
             help="Use unsigned activation quantization for INT4 (recommended for many models).",
-        )
-        parser.add_argument(
-            "--quantization-processor",
-            type=str,
-            default=ServerArgs.quantization_processor,
-            choices=["flashattn2", "nunchaku-fp16"],
-            help=(
-                "Attention processor for Nunchaku models. "
-                '"flashattn2" uses FlashAttention-2; '
-                '"nunchaku-fp16" enables FP16 attention for additional speedup.'
-            ),
         )
         parser.add_argument(
             "--quantization-enable-offloading",

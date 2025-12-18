@@ -338,15 +338,15 @@ class ComposedPipelineBase(ABC):
             # Always use the standard sglang transformer implementation and rely
             # on layer-wise quantization via quant_config where applicable.
             # Nunchaku full-transformer replacement is disabled for all models.
-            module = PipelineComponentLoader.load_module(
-                module_name=load_module_name,
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
-            )
-            logger.info(
-                "Loaded module %s from %s", module_name, component_model_path
-            )
+                module = PipelineComponentLoader.load_module(
+                    module_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    server_args=server_args,
+                )
+                logger.info(
+                    "Loaded module %s from %s", module_name, component_model_path
+                )
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
