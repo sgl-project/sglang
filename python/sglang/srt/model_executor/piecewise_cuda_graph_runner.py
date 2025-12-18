@@ -509,6 +509,8 @@ class PiecewiseCudaGraphRunner:
                 )
             return
 
+        # run twice for warmup at the first time and cuda graph capture at the second time
+        # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
