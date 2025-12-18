@@ -179,7 +179,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Decode token ids to strings
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-        if not self.disable_tokenizer_batch_decode:
+        skip_uniform = len(set(recv_obj.skip_special_tokens)) == 1
+        space_uniform = len(set(recv_obj.spaces_between_special_tokens)) == 1
+        if not self.disable_tokenizer_batch_decode or not (
+            skip_uniform and space_uniform
+        ):
             if not self.is_dummy:
                 # Run normal batch decode
                 surr_texts = self.tokenizer.batch_decode(
@@ -298,6 +302,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
+            prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
