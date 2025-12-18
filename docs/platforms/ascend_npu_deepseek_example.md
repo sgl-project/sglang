@@ -30,7 +30,6 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --watchdog-timeout 9000 \
     --host 127.0.0.1 \
     --port 6688 \
@@ -89,7 +88,6 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.6 \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --disaggregation-transfer-backend ascend \
     --max-running-requests 8 \
     --context-length 8192 \
@@ -145,7 +143,6 @@ python -m sglang.launch_server \
     --max-running-requests 352 \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --moe-a2a-backend deepep \
     --enable-dp-attention \
     --deepep-mode low_latency \
@@ -214,7 +211,6 @@ do
       --mem-fraction-static 0.81 \
       --attention-backend ascend \
       --device npu \
-      --quantization modelslim \
       --disaggregation-transfer-backend ascend \
       --max-running-requests 8 \
       --context-length 8192 \
@@ -275,7 +271,6 @@ do
       --max-running-requests 832 \
       --attention-backend ascend \
       --device npu \
-      --quantization modelslim \
       --moe-a2a-backend deepep \
       --enable-dp-attention \
       --deepep-mode low_latency \
