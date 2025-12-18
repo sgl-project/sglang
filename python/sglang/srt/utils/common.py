@@ -3508,8 +3508,8 @@ def numa_bind_to_node(node: int):
             logger.error(f"Error: {e}")
             libnuma = None
 
-        if libnuma is None or libnuma.numa_available() < 0:
-            raise SystemError("numa not available on this system")
+    if libnuma is None or libnuma.numa_available() < 0:
+        raise SystemError("numa not available on this system")
 
     libnuma.numa_run_on_node(ctypes.c_int(node))
     libnuma.numa_set_localalloc()
