@@ -1,9 +1,9 @@
-from typing import Deque, Optional, Callable
-
-import torch
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Callable, Deque, Optional
+
+import torch
 
 
 class DeviceTimer:

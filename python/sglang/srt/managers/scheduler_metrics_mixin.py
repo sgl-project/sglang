@@ -14,7 +14,7 @@ from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.device_timer import time_device_forward_pass, DeviceTimer
+from sglang.srt.utils.device_timer import DeviceTimer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -85,7 +85,8 @@ class SchedulerMetricsMixin:
 
             if ENABLE_METRICS_DEVICE_TIMER:
                 self.forward_pass_device_timer = DeviceTimer(
-                    reporter=self.metrics_collector.increment_gpu_execution_seconds)
+                    reporter=self.metrics_collector.increment_gpu_execution_seconds
+                )
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:

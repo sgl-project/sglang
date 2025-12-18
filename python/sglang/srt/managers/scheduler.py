@@ -189,7 +189,6 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.device_timer import time_device_forward_pass
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,

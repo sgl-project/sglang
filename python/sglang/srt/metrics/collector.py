@@ -706,7 +706,9 @@ class SchedulerMetricsCollector:
         self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
 
     def increment_gpu_execution_seconds(self, category: str, delta: float):
-        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(delta)
+        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(
+            delta
+        )
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
