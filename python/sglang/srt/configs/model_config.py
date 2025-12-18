@@ -1040,8 +1040,8 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
 ]
 
-if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
-    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
+if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
+    multimodal_model_archs.append(external_mm_model_arch)
 
 
 def is_multimodal_model(model_architectures: List[str]):
