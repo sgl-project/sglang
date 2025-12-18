@@ -137,6 +137,7 @@ class Fp8GemmRunnerBackend(Enum):
 
     AUTO = "auto"
     FLASHINFER = "flashinfer_trtllm"
+    FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
@@ -147,6 +148,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER
+
+    def is_flashinfer_deepgemm(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
 
     def is_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.CUTLASS
@@ -201,6 +205,15 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
                 "FlashInfer FP8 GEMM requires Blackwell GPUs and FlashInfer to be installed."
             )
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+
+    elif backend.is_flashinfer_deepgemm():
+        if not (is_sm90_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "FlashInfer DeepGEMM with swapAB requested via --fp8-gemm-backend=flashinfer_deepgemm, "
+                "but it's not available. This backend requires Hopper (SM90) GPUs and FlashInfer "
+                "to be installed."
+            )
+        return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_cutlass():
         if not _check_cutlass_block_fp8_hardware_support():
@@ -333,6 +346,57 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         output += bias
 
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    FlashInfer DeepGEMM backend for SM90 (Hopper) with swapAB optimization.
+
+    This backend uses FlashInfer's TensorRT-LLM DeepGEMM JIT compiler which includes
+    the swapAB optimization for small M dimensions (decoding/low batch sizes).
+
+    For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
+    """
+    assert input_scale is None
+
+    output_dtype = input.dtype
+    dtype_supported = output_dtype == torch.bfloat16
+
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+
+    if not (shape_supported and dtype_supported):
+        if weight_scale.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale, weight.shape, block_size
+            )
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        block_size[1],
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+    output = w8a8_block_fp8_matmul_deepgemm(
+        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
+    )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def cutlass_w8a8_block_fp8_linear_with_fallback(
