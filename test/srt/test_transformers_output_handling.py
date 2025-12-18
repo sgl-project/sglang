@@ -57,7 +57,10 @@ class TestTransformersOutputHandling(unittest.TestCase):
 
     def _extract_hidden_states(self, output):
         """Simulate the logic in TransformersForCausalLM.forward()."""
-        if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        if (
+            hasattr(output, "last_hidden_state")
+            and output.last_hidden_state is not None
+        ):
             return output.last_hidden_state[0, ...]
         elif hasattr(output, "hidden_states") and output.hidden_states is not None:
             return output.hidden_states[-1][0, ...]
@@ -77,9 +80,7 @@ class TestTransformersOutputHandling(unittest.TestCase):
 
     def test_output_with_hidden_states(self):
         """Test extraction from output with hidden_states tuple."""
-        hidden_states = tuple(
-            torch.randn(1, 10, 768) for _ in range(12)
-        )  # 12 layers
+        hidden_states = tuple(torch.randn(1, 10, 768) for _ in range(12))  # 12 layers
         output = MockModelOutputWithHiddenStates(hidden_states=hidden_states)
 
         result = self._extract_hidden_states(output)
