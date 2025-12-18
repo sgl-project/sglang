@@ -547,28 +547,23 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-    def _describe_layout(self) -> Optional[str]:
-        return None
-
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
         """
         kv_size_bytes = self.get_kv_size_bytes()
-        layout_info = self._describe_layout()
-        layout_suffix = f", layout={layout_info}" if layout_info else ""
         if isinstance(kv_size_bytes, tuple):
             k_size, v_size = kv_size_bytes
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB{layout_suffix}"
+                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB{layout_suffix}"
+                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
 
@@ -650,10 +645,6 @@ class MHATokenToKVPool(KVCache):
             self._kv_copy_config = None
 
         self._finalize_allocation_log(size)
-
-    def _describe_layout(self) -> Optional[str]:
-        total_slots = self.size + self.page_size
-        return f"({total_slots}, {self.head_num}, {self.head_dim}), page_size={self.page_size}"
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
@@ -1452,10 +1443,6 @@ class MLATokenToKVPool(KVCache):
         if not use_nsa:
             # NSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
-
-    def _describe_layout(self) -> Optional[str]:
-        total_slots = self.size + self.page_size
-        return f"({total_slots}, 1, {self.kv_cache_dim}), page_size={self.page_size}"
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
