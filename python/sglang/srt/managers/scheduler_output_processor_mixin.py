@@ -63,6 +63,14 @@ class SchedulerOutputProcessorMixin:
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
         self.stream_output(batch.reqs, batch.return_logprob)
 
+    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+        """Collect routed experts for a finished request."""
+        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -117,14 +125,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        req.routed_experts = (
-                            get_global_experts_capturer().get_routed_experts(
-                                req_pool_idx=req.req_pool_idx,
-                                seqlen=req.seqlen,
-                                req_to_token_pool=self.req_to_token_pool,
-                            )
-                        )
-
+                        self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -381,11 +382,7 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                req.routed_experts = get_global_experts_capturer().get_routed_experts(
-                    req_pool_idx=req.req_pool_idx,
-                    seqlen=req.seqlen,
-                    req_to_token_pool=self.req_to_token_pool,
-                )
+                self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
