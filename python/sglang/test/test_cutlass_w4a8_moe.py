@@ -225,6 +225,7 @@ def cutlass_moe(
         a1_scale,
         a2_scale,
         apply_router_weight_on_input,
+        None
     )
 
 
