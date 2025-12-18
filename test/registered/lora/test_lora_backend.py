@@ -14,16 +14,11 @@
 
 import multiprocessing as mp
 import os
-import sys
 import unittest
-from pathlib import Path
 from typing import List
 
-# Add test directory to path for lora_utils import
-# TODO: can be removed after migration
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from lora_utils import (
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     BACKENDS,
     CI_LORA_MODELS,
@@ -32,8 +27,9 @@ from lora_utils import (
     LoRAModelCase,
     run_lora_test_one_by_one,
 )
-
 from sglang.test.test_utils import CustomTestCase, is_in_ci
+
+register_cuda_ci(est_time=200, suite="stage-b-test-small-1-gpu")
 
 
 class TestLoRABackend(CustomTestCase):
