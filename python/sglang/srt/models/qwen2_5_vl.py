@@ -447,7 +447,10 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
-            if layer_num in self.fullatt_block_indexes:
+            fullatt_indexes = self.fullatt_block_indexes
+            if isinstance(fullatt_indexes, torch.Tensor):
+                fullatt_indexes = fullatt_indexes.tolist()
+            if layer_num in fullatt_indexes:
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
