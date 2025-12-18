@@ -264,6 +264,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
+        return output_strs
+
+    def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
         output_routed_experts = []
         if recv_obj.output_routed_experts is not None:
             output_routed_experts = [
@@ -274,12 +277,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
                 for output_routed_experts in recv_obj.output_routed_experts
             ]
-        return output_strs, output_routed_experts
+        return output_routed_experts
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        output_strs, output_routed_experts = self._decode_batch_token_id_output(
-            recv_obj
-        )
+        output_strs = self._decode_batch_token_id_output(recv_obj)
+        output_routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
