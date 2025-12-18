@@ -1,9 +1,16 @@
 """
-Benchmark latency comparison between all-reduce and reduce-scatter + all-gather
-for different batch sizes.
+Benchmark latency comparison between different all-reduce implementations.
+
+Compares:
+- NCCL all-reduce (may be non-deterministic)
+- Reduce-scatter + all-gather (RS+AG, deterministic but slower)
+- Deterministic 1-stage kernel (forces fixed accumulation order, deterministic)
+
+Note: The "deterministic kernel" is NOT RS+AG. It uses the 1-stage kernel where
+each GPU reads all data from all GPUs and reduces locally in a fixed order.
 
 Usage:
-    python benchmark_ar.py
+    python bench_amd_deterministic_allreduce.py
 """
 
 import multiprocessing as mp

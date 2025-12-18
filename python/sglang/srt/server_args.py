@@ -2299,9 +2299,10 @@ class ServerArgs:
             # Check TP size
             if self.tp_size > 1:
                 if is_hip():
-                    # AMD: use deterministic 1-stage kernel (keep custom all-reduce enabled)
+                    # AMD: use 1-stage all-reduce kernel which is inherently deterministic
+                    # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                     logger.info(
-                        "AMD/ROCm: Using deterministic 1-stage all-reduce kernel"
+                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
                     )
                 else:
                     # CUDA: use NCCL tree algorithm

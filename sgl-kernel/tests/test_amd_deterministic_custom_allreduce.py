@@ -1,15 +1,18 @@
 """
 Test deterministic custom all-reduce kernel behavior with batch size invariance.
 
-This test uses the deterministic custom all-reduce kernel instead of reduce-scatter+all-gather
-to achieve deterministic results with better performance (single-step communication).
+This test uses the 1-stage all-reduce kernel which is inherently deterministic
+due to fixed accumulation ordering (each GPU reads all data from all GPUs and
+reduces locally in a fixed order - no atomics, no race conditions).
+
+Note: This is NOT a reduce-scatter + all-gather (RS+AG) approach.
 
 This test compares:
 1. Deterministic kernel (same batch size)
 2. Deterministic kernel (different batch size)
 
 Usage:
-    python test_kernel_ar.py
+    python test_amd_deterministic_custom_allreduce.py
 """
 
 import multiprocessing as mp

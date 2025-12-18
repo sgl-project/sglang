@@ -1,7 +1,17 @@
-// Deterministic All-Reduce Implementation for ROCm/HIP
-// Uses fixed ordering to ensure deterministic results (no atomics)
-// NOTE: For ROCm, we use the existing 1-stage kernel which is already deterministic
-// This is a wrapper that ensures we always use the 1-stage kernel
+// Deterministic All-Reduce for ROCm/HIP
+//
+// This is a wrapper that forces the use of the existing 1-stage all-reduce kernel
+// (cross_device_reduce_1stage) which is inherently deterministic due to fixed
+// accumulation ordering (no atomics, no race conditions).
+//
+// How the 1-stage kernel works:
+//   - Each GPU reads ALL data from ALL other GPUs via direct memory access
+//   - Each GPU reduces the data locally in a fixed order
+//   - Result: every GPU has the complete reduced output
+//
+// This is NOT a reduce-scatter + all-gather (RS+AG) approach.
+// The 2-stage kernel (cross_device_reduce_2stage) implements RS+AG but may have
+// non-deterministic behavior, so we explicitly avoid it here.
 
 #include <ATen/hip/Exceptions.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
