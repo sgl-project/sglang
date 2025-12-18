@@ -681,7 +681,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
         if self._enable:
-            self._append_utilization_rate(
+            return self._append_utilization_rate(
                 forward_pass_id, single_pass_data["global_physical_count"]
             )
 
@@ -719,6 +719,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
+
+            return {
+                "metrics": ExpertDistributionMetrics(eplb_balancedness=TODO)
+            }
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
