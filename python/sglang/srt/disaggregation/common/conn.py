@@ -153,27 +153,34 @@ class CommonKVManager(BaseKVManager):
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
-        # pp is not supported on the decode side yet
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
-        dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-        dst_v_ptrs = dst_kv_ptrs[
-            dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
-        ]
+        if num_kv_layers == dst_num_total_layers:
+            dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
+            dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
+        else:
+            # Decode pp size should be equal to prefill pp size or 1
+            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            dst_v_ptrs = dst_kv_ptrs[
+                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+            ]
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
-        # pp is not supported on the decode side yet
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + len(src_kv_ptrs)
-        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        if len(src_kv_ptrs) == len(dst_kv_ptrs):
+            sliced_dst_kv_ptrs = dst_kv_ptrs
+        else:
+            # Decode pp size should be equal to prefill pp size or 1
+            sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
@@ -273,8 +280,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.bootstrap_addr
             ]
 
-        # Currently, we don't allow prefill instance and decode instance to
-        # have different TP sizes per DP rank, except for models using MLA.
+        # Handling for PD with different TP sizes per DP rank
         if self.kv_mgr.attn_tp_size == self.prefill_attn_tp_size:
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
@@ -335,8 +341,18 @@ class CommonKVReceiver(BaseKVReceiver):
         else:
             self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
 
-        # FIXME: alias here: target_dp_group -> prefill_dp_rank
         self.target_dp_group = self.prefill_dp_rank
+
+        # Decode pp size should be equal to prefill pp size or 1
+        assert (
+            self.kv_mgr.pp_size == self.prefill_pp_size or self.kv_mgr.pp_size == 1
+        ), (
+            f"Decode pp size ({self.kv_mgr.pp_size}) should be equal to prefill pp size ({self.prefill_pp_size}) or 1",
+        )
+        if self.prefill_pp_size == self.kv_mgr.pp_size:
+            self.target_pp_ranks = [self.kv_mgr.pp_rank]
+        else:
+            self.target_pp_ranks = [rank for rank in range(self.prefill_pp_size)]
 
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
@@ -349,7 +365,8 @@ class CommonKVReceiver(BaseKVReceiver):
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
             for target_tp_rank in self.target_tp_ranks:
-                for target_pp_rank in range(self.prefill_pp_size):
+                # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
+                for target_pp_rank in reversed(self.target_pp_ranks):
                     bootstrap_info = self._get_bootstrap_info_from_server(
                         target_tp_rank, self.target_dp_group, target_pp_rank
                     )

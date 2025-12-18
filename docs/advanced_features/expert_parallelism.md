@@ -1,4 +1,4 @@
-# Expert Parallelism in SGLang
+# Expert Parallelism
 
 Expert Parallelism (EP) in SGLang distributes expert weights across multiple devices in Mixture-of-Experts (MoE) models, addressing memory bottlenecks and enabling efficient scaling for high-performance inference. It is particularly vital for serving large-scale MoE models where tokens are dynamically routed to specialized experts across GPUs. By leveraging optimized all-to-all communication and grouped matrix multiplications (GEMMs), EP reduces latency, boosts throughput, and minimizes idle GPU time. SGLang's EP offers strong extensibility through its modular framework, allowing seamless integration of custom kernels, backends, and optimizations without refactoring core logic, supporting diverse hardware and quantization schemes.
 
@@ -25,13 +25,13 @@ Currently, DeepEP and Mooncake only support cases where `ep_size = tp_size`. For
 | Backend                  | Description                                                                 | Use Cases                          |
 |--------------------------|-----------------------------------------------------------------------------|------------------------------------|
 | **`auto` (default)**     | Automatically selects the optimal backend based on model architecture, hardware (e.g., NVIDIA architecture like Ampere, Hopper, Blackwell), quantization scheme (e.g., FP8, FP4), and runtime conditions. | General-purpose deployments; ensures compatibility and performance without user intervention. |
-| `triton`                 | Triton-based implementation for grouped GEMMs, providing flexible kernel fusion and custom optimizations. | Custom kernel development or scenarios requiring high extensibility with Torch compilation support. |
+| `triton`                 | Triton-based implementation for grouped GEMMs. To achieve higher performance, it's highly recommended to create [tuned configurations](https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/README.md). | Custom kernel development or scenarios requiring high extensibility with Torch compilation support. |
 | `deep_gemm`              | DeepGEMM backend optimized for MoE matrix multiplications, supporting contiguous layouts for prefill and masked layouts for decode; often JIT-compiled for performance. | Large-scale EP deployments with FP8 block-wise quantization. |
 | `cutlass`                | CUTLASS-based backend for efficient GEMMs. | NVIDIA architectures with CUTLASS support. |
-| `flashinfer_trtllm`      | FlashInfer integrated with TensorRT-LLM for accelerated MoE computations, supporting FP4 communication operators and high-performance GEMMs. | NVIDIA architectures with TRT-LLM. |
-| `flashinfer_cutlass`     | FlashInfer combined with CUTLASS for high-performance grouped GEMMs in MoE layers, handling FP4/FP8 quantization efficiently. | Optimized for Blackwell (e.g., B200) and FP4/FP8 models. |
+| `flashinfer_trtllm`      | FlashInfer integrated with TensorRT-LLM for accelerated MoE computations, supporting FP4 communication operators and high-performance GEMMs. | Blackwell with TRT-LLM. |
+| `flashinfer_cutlass`     | FlashInfer combined with CUTLASS for high-performance grouped GEMMs in MoE layers, handling FP4/FP8 quantization efficiently. | Blackwell with FP4/FP8 models. |
 | `flashinfer_mxfp4`       | FlashInfer variant optimized for MXFP4 (mixed FP4) quantization in MoE runners, focusing on memory-efficient low-precision inference. | Low-precision models with MXFP4. |
-| `flashinfer_cutedsl`     | FlashInfer with a custom DSL for flexible and efficient MoE kernel generation, integrated with modelopt quantization. | Low-precision models with NVFP4. |
+| `flashinfer_cutedsl`     | FlashInfer with a custom DSL for flexible and efficient MoE kernel generation, integrated with ModelOpt FP4 quantization. | Low-precision models with NVFP4. |
 
 ### Examples
 
