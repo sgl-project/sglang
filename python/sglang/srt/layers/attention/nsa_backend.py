@@ -389,7 +389,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
-        elif forward_batch.forward_mode.is_draft_extend():
+        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
@@ -422,9 +422,20 @@ class NativeSparseAttnBackend(AttentionBackend):
                     )
                 ]
             )
-            page_table = torch.repeat_interleave(
-                page_table, repeats=forward_batch.extend_seq_lens, dim=0
-            )
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
+                # tokens upfront. All requests extend by the same fixed
+                # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
+                page_table = torch.repeat_interleave(
+                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                )
+            else:
+                # DRAFT_EXTEND (v1): V1 worker extends by (accept_length + 1) per request
+                # after verification. Lengths vary per request based on how many tokens
+                # were accepted.
+                page_table = torch.repeat_interleave(
+                    page_table, repeats=extend_seq_lens_cpu, dim=0
+                )
 
         elif forward_batch.forward_mode.is_extend():
             assert (
@@ -632,7 +643,9 @@ class NativeSparseAttnBackend(AttentionBackend):
                 )
             else:
                 flashmla_metadata = None
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -796,7 +809,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 seqlens_expanded, self.nsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             max_seqlen_k = int(seq_lens_cpu.max().item())
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)

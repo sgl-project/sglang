@@ -128,5 +128,5 @@ def import_model_classes(package_name: str, strict: bool = False):
 ModelRegistry = _ModelRegistry()
 ModelRegistry.register("sglang.srt.models")
 
-if envs.SGLANG_EXTERNAL_MODEL_PACKAGE.value:
-    ModelRegistry.register(envs.SGLANG_EXTERNAL_MODEL_PACKAGE.value, overwrite=True)
+if external_pkg := envs.SGLANG_EXTERNAL_MODEL_PACKAGE.get():
+    ModelRegistry.register(external_pkg, overwrite=True)
