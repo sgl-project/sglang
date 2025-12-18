@@ -1572,7 +1572,15 @@ class Scheduler(
                     if not cache_hit:
                         req.grammar_key = key
                         add_to_grammar_queue = True
+                        logger.debug(
+                            f"[TP Rank {self.tp_rank}] Compiling grammar for req {req.rid}, "
+                            f"type={key[0]}"
+                        )
                     else:
+                        logger.debug(
+                            f"[TP Rank {self.tp_rank}] Grammar cache hit for req {req.rid}, "
+                            f"type={key[0]}"
+                        )
                         if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                             error_msg = f"Invalid grammar request with cache hit: {key=}"
                             req.set_finish_with_abort(error_msg)
@@ -1580,6 +1588,10 @@ class Scheduler(
                 # Non-rank-0 workers add to grammar queue for synchronization,
                 # but don't compile grammar (req.grammar stays None)
                 add_to_grammar_queue = True
+                logger.debug(
+                    f"[TP Rank {self.tp_rank}] Skipping grammar compilation for req {req.rid}. "
+                    f"Waiting for rank 0 to compile."
+                )
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -2351,6 +2363,7 @@ class Scheduler(
 
         num_ready_reqs = 0
         num_timeout_reqs = 0
+        num_skipped_compilation = 0  # Track requests that skip compilation (non-rank-0)
         for req in self.grammar_queue:
             try:
                 if req.finished():  # It is aborted by AbortReq
@@ -2360,6 +2373,7 @@ class Scheduler(
                 # On non-rank-0, req.grammar is None (no compilation needed)
                 if req.grammar is None:
                     num_ready_reqs += 1
+                    num_skipped_compilation += 1
                     continue
 
                 req.grammar = req.grammar.result(timeout=0.03)
@@ -2391,6 +2405,20 @@ class Scheduler(
                 tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
             )
             num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
+
+            # Log the synchronization result
+            if num_ready_reqs_max > 0:
+                if self.tp_rank == 0:
+                    logger.debug(
+                        f"[TP Rank {self.tp_rank}] Grammar queue sync: "
+                        f"{num_ready_reqs_max} requests ready (compiled on this rank)"
+                    )
+                else:
+                    logger.debug(
+                        f"[TP Rank {self.tp_rank}] Grammar queue sync: "
+                        f"{num_ready_reqs_max} requests ready "
+                        f"({num_skipped_compilation} skipped compilation, delegated to rank 0)"
+                    )
 
             for i in range(num_ready_reqs, num_ready_reqs_max):
                 req = self.grammar_queue[i]
