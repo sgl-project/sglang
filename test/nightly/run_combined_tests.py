@@ -25,6 +25,8 @@ Usage:
     )
 """
 
+import gc
+import time
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -32,6 +34,11 @@ from nightly_utils import NightlyBenchmarkRunner
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
+
+try:
+    import torch
+except ImportError:
+    torch = None
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -39,6 +46,38 @@ from sglang.test.test_utils import (
     _parse_int_list_env,
     popen_launch_server,
 )
+
+
+def cleanup_between_tests(delay_seconds: int = 10) -> None:
+    """Clean up resources between performance and accuracy tests.
+
+    This helps ensure GPU memory is freed and ports are released before
+    starting the next test. Addresses transient failures where the accuracy
+    test server fails to start after a performance test.
+
+    Args:
+        delay_seconds: Time to wait for resource cleanup (default: 10s)
+    """
+    print(f"\n{'='*60}")
+    print("Cleaning up resources between tests...")
+    print(f"{'='*60}")
+
+    # Force Python garbage collection
+    gc.collect()
+
+    # Clear CUDA cache if torch is available
+    if torch is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            print("  - Cleared CUDA cache")
+        except Exception as e:
+            print(f"  - Warning: Could not clear CUDA cache: {e}")
+
+    # Wait for resources to be released (port unbinding, GPU memory deallocation)
+    print(f"  - Waiting {delay_seconds}s for resources to release...")
+    time.sleep(delay_seconds)
+    print("  - Cleanup complete\n")
 
 
 def run_performance_for_model(
@@ -359,6 +398,11 @@ def run_metrics(
                 all_passed = False
                 model_result["errors"].append(perf_error)
 
+        # Clean up between performance and accuracy tests to ensure
+        # GPU memory is freed and port is released
+        if run_perf and run_accuracy:
+            cleanup_between_tests(delay_seconds=10)
+
         # Run accuracy test
         if run_accuracy:
             acc_success, acc_error, metrics = run_accuracy_for_model(
@@ -378,6 +422,9 @@ def run_metrics(
                 model_result["errors"].append(acc_error)
 
         all_results.append(model_result)
+
+        # Clean up between models to ensure resources are released
+        cleanup_between_tests(delay_seconds=10)
 
     # Write performance report if we ran perf tests
     if run_perf and perf_runner:
