@@ -64,7 +64,9 @@ def is_layer_skipped(
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
-            is_shard_skipped = shard_prefix in ignored_layers
+            is_shard_skipped = any(
+                ignored in shard_prefix for ignored in ignored_layers
+            )
 
             if is_skipped is None:
                 is_skipped = is_shard_skipped
@@ -75,7 +77,7 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = prefix in ignored_layers
+        is_skipped = any(ignored in prefix for ignored in ignored_layers)
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")

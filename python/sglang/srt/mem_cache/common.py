@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -460,6 +461,31 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     )
 
     return out_cache_loc
+
+
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    tree_cache.cache_finished_req(req, is_insert=is_insert)
+    start_p, end_p = req.pop_overallocated_kv_cache()
+
+    global_server_args = get_global_server_args()
+    page_size = global_server_args.page_size
+    spec_algo = global_server_args.speculative_algorithm
+
+    if spec_algo is None:
+        assert (
+            start_p == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+
+    if page_size > 1:
+        start_p = ceil_align(start_p, page_size)
+
+    if start_p >= end_p:
+        return
+
+    indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+        start_p:end_p
+    ]
+    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 
 
 def available_and_evictable_str(tree_cache) -> str:

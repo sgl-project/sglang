@@ -5,21 +5,9 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import (
-    get_moe_ep_group,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
-    get_pp_group,
+    get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
-from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.utils import is_flashinfer_available
-
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_flashinfer_available,
@@ -49,6 +37,7 @@ if is_flashinfer_available():
             gathered = [None] * self.Get_size()
             dist.all_gather_object(gathered, data, group=self._group)
             return gathered
+
         # def allgather(self, data: int | bytes):
         #     device = f"cuda:{torch.cuda.current_device()}"
         #     if isinstance(data, int):
@@ -93,16 +82,18 @@ if is_flashinfer_available():
 
 _allreduce_workspaces = None
 
-from flashinfer.comm.mnnvl import MnnvlConfig 
+
 # config = MnnvlConfig(
 #     comm_backend=TorchDistributedCommBackend(get_tp_group().cpu_group),
 #     fabric_page_size=-1,
 #     allocation_granularity=0,
 # )
-    
+
+
 def initialize_flashinfer_allreduce_metas(dtype: torch.dtype):
-    from flashinfer.comm import Mapping
     import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
+    from flashinfer.comm import Mapping
+
     # from flashinfer.comm.trtllm_alltoall import (
     #     Mapping,
     #     MnnvlConfig,
@@ -110,7 +101,7 @@ def initialize_flashinfer_allreduce_metas(dtype: torch.dtype):
     #     MnnvlMoe,
     # )
     # Initialize workspaces
-    # TODO(shuw): real size of 
+    # TODO(shuw): real size of
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
     # print(f"I am rank:{tp_rank}")
@@ -135,23 +126,26 @@ def initialize_flashinfer_allreduce_metas(dtype: torch.dtype):
         f"[Node {mapping.node_rank}] Rank {tp_rank} using GPU {torch.cuda.current_device()}"
     )
 
-    #TODO(shuw): make dtype configurable
-    comm = TorchDistributedCommBackend(get_tp_group().cpu_group)
-    # comm = TorchDistributedCommBackend(dist.group.WORLD)
-    _allreduce_workspaces = (
-        trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, dtype, comm)
-    )
+    # TODO(shuw): make dtype configurable
+    # comm = TorchDistributedCommBackend(get_tp_group().cpu_group)
+    comm = TorchDistributedCommBackend(dist.group.WORLD)
+    _allreduce_workspaces = trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(
+        mapping,
+        dtype,
+        comm_backend_for_handle_transfer=comm,
+        buffer_size_in_bytes=256 * 1024 * 1024,
+    )  # FLASHINFER_MNNVL_ALL_REDUCE_MAX_SIZES[10][tp_size])
+
     return _allreduce_workspaces, mapping
 
 
-
 def run_flashinfer_mnnvl_allreduce(input: torch.Tensor) -> torch.Tensor:
-    from flashinfer.comm.trtllm_alltoall import MnnvlMemory
     import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
+
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
-    (mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl), mapping = initialize_flashinfer_allreduce_metas(
-        input.dtype
+    (mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl), mapping = (
+        initialize_flashinfer_allreduce_metas(input.dtype)
     )
     try:
         multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr()
@@ -164,16 +158,21 @@ def run_flashinfer_mnnvl_allreduce(input: torch.Tensor) -> torch.Tensor:
         failure_message = f"FAILED[rank={tp_rank}]: failed: {e}"
         print(failure_message)
     hidden_size = input.size(-1)
-    assert max_num_elements_mnnvl % hidden_size == 0
+    # assert max_num_elements_mnnvl % hidden_size == 0
     # print(f"max_num_elements_mnnvl:{max_num_elements_mnnvl}")
     buffer_M = max_num_elements_mnnvl // hidden_size
-    
-
 
     # print(f"calling trtllm_mnnvl_all_reduce with hs:{hidden_size}")
     torch.cuda.set_device(mapping.local_rank)
     input = input.view(-1, input.shape[-1])
     output = torch.empty_like(input)
+    print("xx" * 100)
+    # trtllm_mnnvl_ar.trtllm_mnnvl_allreduce(
+    #     input,
+    #     workspace,
+    #     launch_with_pdl=use_pdl,
+    #     strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+    # )
     trtllm_mnnvl_ar.trtllm_mnnvl_all_reduce(
         input,
         multicast_ptr,
@@ -192,9 +191,11 @@ def run_flashinfer_mnnvl_allreduce(input: torch.Tensor) -> torch.Tensor:
     # _allreduce_workspaces = None
     return output
 
+
 def fake_run_flashinfer_mnnvl_allreduce(nput: torch.Tensor) -> torch.Tensor:
     output = torch.empty_like(input)
     return output
+
 
 if supports_custom_op():
     direct_register_custom_op(
@@ -204,3 +205,16 @@ if supports_custom_op():
         fake_impl=fake_run_flashinfer_mnnvl_allreduce,
     )
 
+# Decode 0. Batch size: 16, latency: 1.63637 s, throughput:      9.78 token/s
+# Decode 1. Batch size: 16, latency: 0.07373 s, throughput:    217.02 token/s
+# Decode 2. Batch size: 16, latency: 0.07036 s, throughput:    227.39 token/s
+# Decode 3. Batch size: 16, latency: 0.07010 s, throughput:    228.25 token/s
+# Decode 4. Batch size: 16, latency: 0.06987 s, throughput:    229.00 token/s
+# Decode.  median latency: 0.06974 s, median throughput:    229.42 token/s
+# Total. latency:  7.093 s, throughput:    649.64 token/s
+# Benchmark ...
+# Prefill. latency: 0.10123 s, throughput:  40461.14 token/s
+# Decode 0. Batch size: 16, latency: 0.09641 s, throughput:    165.96 token/s
+# Decode 1. Batch size: 16, latency: 0.09215 s, throughput:    173.63 token/s
+# Decode 2. Batch size: 16, latency: 0.09246 s, throughput:    173.04 token/s
+# Decode 3. Batch size: 16, latency: 0.09166 s, throughput:    174.56 token/s

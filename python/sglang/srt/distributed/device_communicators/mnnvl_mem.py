@@ -5,35 +5,18 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed import (
-    get_moe_ep_group,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_pp_group,
+from sglang.srt.distributed.device_communicators.all_reduce_utils import (
+    FLASHINFER_MNNVL_ALL_REDUCE_MAX_SIZES,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
-from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.utils import is_flashinfer_available
-
-from sglang.srt.utils import (
-    direct_register_custom_op,
-    is_flashinfer_available,
-    supports_custom_op,
-)
-from sglang.srt.utils import is_cuda
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.utils import is_cuda, is_flashinfer_available
+
 logger = logging.getLogger(__name__)
 
 if is_flashinfer_available():
     try:
-        from flashinfer.comm.mnnvl import CommBackend
         import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
+        from flashinfer.comm.mnnvl import CommBackend
 
         class TorchDistributedCommBackend(CommBackend):
             """
@@ -53,7 +36,6 @@ if is_flashinfer_available():
                 gathered = [None] * self.Get_size()
                 dist.all_gather_object(gathered, data, group=self._group)
                 return gathered
-
 
             def bcast(self, data, root: int = 0):
                 """
@@ -76,6 +58,7 @@ if is_flashinfer_available():
             def Split(self, color: int, key: int):
                 # No need to split, we already use the proper group
                 return self._group
+
         trtllm_mnnvl_available = True
     except ImportError:
         trtllm_mnnvl_available = False
@@ -83,13 +66,13 @@ if is_flashinfer_available():
 
 # _allreduce_workspaces = None
 
-# from flashinfer.comm.mnnvl import MnnvlConfig 
+# from flashinfer.comm.mnnvl import MnnvlConfig
 # # config = MnnvlConfig(
 # #     comm_backend=TorchDistributedCommBackend(get_tp_group().cpu_group),
 # #     fabric_page_size=-1,
 # #     allocation_granularity=0,
 # # )
-    
+
 # def initialize_flashinfer_allreduce_metas(dtype: torch.dtype):
 #     from flashinfer.comm import Mapping
 #     import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
@@ -100,7 +83,7 @@ if is_flashinfer_available():
 #     #     MnnvlMoe,
 #     # )
 #     # Initialize workspaces
-#     # TODO(shuw): real size of 
+#     # TODO(shuw): real size of
 #     tp_size = get_tensor_model_parallel_world_size()
 #     tp_rank = get_tensor_model_parallel_rank()
 #     # print(f"I am rank:{tp_rank}")
@@ -134,7 +117,6 @@ if is_flashinfer_available():
 #     return _allreduce_workspaces, mapping
 
 
-
 # def run_flashinfer_mnnvl_allreduce(input: torch.Tensor) -> torch.Tensor:
 #     from flashinfer.comm.trtllm_alltoall import MnnvlMemory
 #     import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
@@ -157,7 +139,6 @@ if is_flashinfer_available():
 #     assert max_num_elements_mnnvl % hidden_size == 0
 #     # print(f"max_num_elements_mnnvl:{max_num_elements_mnnvl}")
 #     buffer_M = max_num_elements_mnnvl // hidden_size
-    
 
 
 #     # print(f"calling trtllm_mnnvl_all_reduce with hs:{hidden_size}")
@@ -197,6 +178,8 @@ if is_flashinfer_available():
 
 # /////
 _is_cuda_ = is_cuda()
+
+
 class MnnvlAllReduce:
     def __init__(self, group: ProcessGroup, device: Union[int, str, torch.device]):
         """
@@ -239,6 +222,21 @@ class MnnvlAllReduce:
             )
             return
 
+        if (
+            self.world_size
+            not in FLASHINFER_MNNVL_ALL_REDUCE_MAX_SIZES[self.device_capability]
+        ):
+            logger.warning(
+                "MnnvlAllReduceCommunicator: World size %d not supported, "
+                "communicator is not available.",
+                self.world_size,
+            )
+            return
+
+        self.max_size = FLASHINFER_MNNVL_ALL_REDUCE_MAX_SIZES[self.device_capability][
+            self.world_size
+        ]
+
         self._initialize_workspace()
         self.disabled = False
 
@@ -263,7 +261,6 @@ class MnnvlAllReduce:
         fully_connected = True
 
         return fully_connected
-    
 
     def destroy(self):
         if not self.disabled:
@@ -274,9 +271,9 @@ class MnnvlAllReduce:
             except Exception as e:
                 logger.warning(f"Error during MNNVL cleanup: {e}")
 
-
     def _initialize_workspace(self):
         from flashinfer.comm import Mapping
+
         gpus_per_node = sum(in_the_same_node_as(self.group, source_rank=0))
 
         mapping = Mapping(
@@ -293,7 +290,9 @@ class MnnvlAllReduce:
             self.mcast_buffer_mnnvl,
             self.buffer_flags_mnnvl,
             self.max_num_elements_mnnvl,
-        ) = trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, torch.bfloat16, comm)
+        ) = trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(
+            mapping, torch.bfloat16, comm, self.max_size
+        )
 
     def should_use_trtllm_mnnvl_ar(self, input_tensor: torch.Tensor) -> bool:
         if self.disabled:
@@ -313,11 +312,11 @@ class MnnvlAllReduce:
             return False
 
         hidden_size = input_tensor.shape[-1]
-        if self.max_num_elements_mnnvl % hidden_size != 0:
-            return False
+        # Should we check hidden size alignment?
+        # if self.max_num_elements_mnnvl % hidden_size != 0:
+        #     return False
 
         return True
-    
 
     def all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         output = torch.empty_like(input)
@@ -328,14 +327,15 @@ class MnnvlAllReduce:
             # unicast_ptr = self.mcast_buffer_mnnvl.mcast_device_memory.get_unicast_ptr()
 
             hidden_size = input.size(-1)
-            assert self.max_num_elements_mnnvl % hidden_size == 0
+            # is that needed?
+            # assert self.max_num_elements_mnnvl % hidden_size == 0
             # print(f"max_num_elements_mnnvl:{max_num_elements_mnnvl}")
             buffer_M = self.max_num_elements_mnnvl // hidden_size
-            
 
             # print(f"calling trtllm_mnnvl_all_reduce with hs:{hidden_size}")
             # torch.cuda.set_device(mapping.local_rank)
             # input = input.view(-1, input.shape[-1])
+            # print("xx"*100)
             trtllm_mnnvl_ar.trtllm_mnnvl_all_reduce(
                 input,
                 multicast_ptr,
@@ -344,21 +344,19 @@ class MnnvlAllReduce:
                 self.buffer_flags_mnnvl,
                 self.world_size,
                 self.rank,
-                True,  # wait_for_results
-                False,  # launch_with_pdl
+                True,  # wait_for_results not enabled with legacy API
+                True,  # launch_with_pdl
                 output,  # Need to provide output tensor since we are writing them out.
-            )            
+            )
 
         except Exception as e:
             failure_message = f"FAILED[rank={self.rank}]: failed: {e}"
             print(failure_message)
 
-
         # print("end trtllm_mnnvl_all_reduce")
         # del mcast_buffer_mnnvl
         # _allreduce_workspaces = None
         return output
-
 
         # from flashinfer.comm import Mapping
         # import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
@@ -369,7 +367,7 @@ class MnnvlAllReduce:
         # #     MnnvlMoe,
         # # )
         # # Initialize workspaces
-        # # TODO(shuw): real size of 
+        # # TODO(shuw): real size of
         # tp_size = get_tensor_model_parallel_world_size()
         # tp_rank = get_tensor_model_parallel_rank()
         # # print(f"I am rank:{tp_rank}")

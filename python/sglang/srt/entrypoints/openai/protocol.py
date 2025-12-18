@@ -257,6 +257,9 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
@@ -388,7 +391,7 @@ class ToolCall(BaseModel):
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool", "function"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
+    content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
     tool_call_id: Optional[str] = None
@@ -529,6 +532,9 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {

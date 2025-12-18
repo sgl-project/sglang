@@ -23,13 +23,14 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
@@ -47,6 +48,7 @@ class DotsVLMForCausalLM(nn.Module):
         self.config = config
         self.image_token_id = config.im_span_id
         self.video_token_id = config.video_span_id
+        self.pp_group = get_pp_group()
 
         self.language_model = DeepseekV2ForCausalLM(
             config.language_config, quant_config
@@ -158,15 +160,25 @@ class DotsVLMForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        **kwargs: object,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            multimodal_model=self,
-            language_model=self.language_model,
-        )
+        if self.pp_group.is_first_rank:
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                multimodal_model=self,
+                language_model=self.language_model,
+            )
+
+        else:
+            hidden_states = self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
         return hidden_states
 
 

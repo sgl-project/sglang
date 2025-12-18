@@ -44,7 +44,7 @@ class TestDeepseekV32Basic(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=20,
             data_path=None,
             num_questions=1400,
             parallel=1400,
