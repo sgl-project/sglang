@@ -48,6 +48,9 @@ _OutputMode = Literal["file", "object"]
 class ExpertDistributionMetrics:
     TODO: TODO
 
+    def copy_to_cpu(self):
+        TODO
+
 
 class ExpertDistributionRecorder(ABC):
     """Global expert distribution recording"""
