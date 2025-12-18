@@ -444,6 +444,56 @@ class LoRAManager:
         lora_adapter.initialize_weights()
         self.loras[lora_ref.lora_id] = lora_adapter
 
+    def load_lora_weights_from_tensors(
+        self, lora_ref: LoRARef, tensors: Dict[str, torch.Tensor]
+    ):
+        """
+        Load the weights of a LoRA adapter from tensors to CPU memory.
+        """
+        lora_adapter = LoRAAdapter(
+            lora_ref.lora_id,
+            self.configs[lora_ref.lora_id],
+            self.base_hf_config,
+            self.load_config,
+            self.lora_backend,
+        )
+        lora_adapter.initialize_weights_from_tensors(tensors)
+        self.loras[lora_ref.lora_id] = lora_adapter
+
+    def load_lora_adapter_from_tensors(
+        self,
+        lora_ref: LoRARef,
+        tensors: Dict[str, torch.Tensor],
+        config_dict: Dict,
+        added_tokens_config: Optional[Dict] = None,
+    ) -> LoRAUpdateOutput:
+        """
+        Load a single LoRA adapter from tensors and config dict.
+        """
+        assert (
+            lora_ref.lora_name is not None and lora_ref.lora_path is not None
+        ), "LoRARef must have both lora_name and lora_path set for loading."
+        assert (
+            lora_ref.lora_id not in self.loras
+        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+
+        try:
+            new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
+            self.validate_new_adapter(new_adapter, lora_ref)
+            self.configs[lora_ref.lora_id] = new_adapter
+
+            self.load_lora_weights_from_tensors(lora_ref, tensors)
+
+            self.lora_refs[lora_ref.lora_id] = lora_ref
+            self.num_pinned_loras += int(lora_ref.pinned)
+        except Exception as e:
+            return self.create_lora_update_result(
+                success=False,
+                error_message=str(e),
+            )
+
+        return self.create_lora_update_result(success=True)
+
     def init_memory_pool(self):
         """(Re)initialize the LoRA memory pool based on the current configurations."""
         self.memory_pool = LoRAMemoryPool(
