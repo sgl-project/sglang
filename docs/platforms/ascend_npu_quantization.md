@@ -9,7 +9,7 @@ MsModelSlim on Ascend support:
 - [x] W4A8 dynamic MOE
 - [x] W8A8 dynamic MOE
 
-AWQ on Ascend support: 
+AWQ on Ascend support:
 - [x] W4A16 linear
 - [x] W8A16 linear # Test required
 - [x] W4A16 MOE # Test required
