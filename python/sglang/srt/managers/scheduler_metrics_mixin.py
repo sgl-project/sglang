@@ -78,6 +78,7 @@ class SchedulerMetricsMixin:
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,
                 "pp_rank": pp_rank,
+                "moe_ep_rank": self.moe_ep_rank,
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
