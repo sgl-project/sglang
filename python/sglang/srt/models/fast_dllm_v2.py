@@ -11,9 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Fast-dLLM v2 model for SGLang.
+NVIDIA Fast-dLLM v2 model for SGLang.
 
-This model wrapper registers the Fast_dLLM_QwenForCausalLM architecture
+This model wrapper registers the Fast_dLLM_V2_QwenForCausalLM architecture
 so SGLang can load Fast_dLLM_v2 models. The model inherits from Qwen2ForCausalLM
 since Fast_dLLM_v2 is based on Qwen2.5-7B-Instruct.
 
@@ -29,7 +29,7 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 logger = logging.getLogger(__name__)
 
 
-class FastDLLMForCausalLM(Qwen2ForCausalLM):
+class FastDLLMV2ForCausalLM(Qwen2ForCausalLM):
     """
     Fast-dLLM v2 model for SGLang.
 
@@ -56,6 +56,6 @@ class FastDLLMForCausalLM(Qwen2ForCausalLM):
 
 
 # Register with HuggingFace architecture name
-FastDLLMForCausalLM.__name__ = "Fast_dLLM_QwenForCausalLM"
+FastDLLMV2ForCausalLM.__name__ = "Fast_dLLM_QwenForCausalLM"
 
-EntryClass = FastDLLMForCausalLM
+EntryClass = FastDLLMV2ForCausalLM
