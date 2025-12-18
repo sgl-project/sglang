@@ -2746,6 +2746,7 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+        TODO_should_we_put_here
         ret.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         if self.eplb_manager is not None:
