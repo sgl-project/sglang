@@ -399,7 +399,6 @@ class SchedulerMetricsMixin:
         if not isinstance(result, GenerationBatchResult):
             return
 
-        print(f"hi log_batch_result_stats {result.expert_distribution_metrics=}")
         if (m := result.expert_distribution_metrics) is not None:
             self.metrics_collector.increment_eplb_balancedness(
                 forward_mode=batch.forward_mode.name.lower(),
