@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 
 
 class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):
-    """Test piecewise CUDA graph with Qwen3-Omni-30B-A3B-Instruct  model"""
+    """Test piecewise CUDA graph with Qwen3-Omni-30B-A3B-Instruct model"""
 
     @classmethod
     def setUpClass(cls):
@@ -27,7 +27,7 @@ class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--disable-radix-cache",
-                "--tp=4",
+                "--tp=2",
             ],
         )
 
@@ -69,9 +69,9 @@ class TestPiecewiseCudaGraphFusedMoE(CustomTestCase):
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--tp",
-                "4",
+                "2",
                 "--ep-size",
-                "4",
+                "2",
             ],
         )
 
