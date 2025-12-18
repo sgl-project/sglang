@@ -90,13 +90,13 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
             expected_victim="lora2",
         )
 
-    def test_lru_base_model_priority(self):
-        """Test LRU prioritizes base model for eviction."""
+    def test_lru_base_model_evicted_last(self):
+        """Test LRU evicts LoRA adapters before base model (None)."""
         self._test_eviction_policy(
             "lru",
             access_sequence=["lora1", "lora2", "lora3"],
             candidates={None, "lora1", "lora2", "lora3"},
-            expected_victim=None,
+            expected_victim="lora1",
         )
 
     def test_fifo_basic(self):
@@ -135,13 +135,13 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
             expected_victim="lora2",
         )
 
-    def test_fifo_base_model_priority(self):
-        """Test FIFO prioritizes base model for eviction."""
+    def test_fifo_base_model_evicted_last(self):
+        """Test FIFO evicts LoRA adapters before base model (None)."""
         self._test_eviction_policy(
             "fifo",
             access_sequence=["lora1", "lora2", "lora3"],
             candidates={None, "lora1", "lora2", "lora3"},
-            expected_victim=None,
+            expected_victim="lora1",
         )
 
     def test_policy_remove(self):
