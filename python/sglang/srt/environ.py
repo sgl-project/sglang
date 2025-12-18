@@ -365,6 +365,9 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
 
+    # Metrics
+    SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+
     # fmt: on
 
 
