@@ -10,7 +10,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.managers.scheduler import Req, ScheduleBatch, EmbeddingBatchResult
+from sglang.srt.managers.scheduler import EmbeddingBatchResult, Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
@@ -387,14 +387,18 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-    def log_batch_result_stats(self: Scheduler, result: Union[GenerationBatchResult, EmbeddingBatchResult]):
+    def log_batch_result_stats(
+        self: Scheduler, result: Union[GenerationBatchResult, EmbeddingBatchResult]
+    ):
         if not self.enable_metrics:
             return
         if not isinstance(result, GenerationBatchResult):
             return
 
         if (m := result.expert_distribution_metrics) is not None:
-            self.metrics_collector.increment_eplb_balancedness(m.eplb_balancedness.item())
+            self.metrics_collector.increment_eplb_balancedness(
+                m.eplb_balancedness.item()
+            )
 
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:

@@ -68,9 +68,10 @@ from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionMetrics,
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
-    set_global_expert_distribution_recorder, ExpertDistributionMetrics,
+    set_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,

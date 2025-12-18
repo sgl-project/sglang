@@ -698,6 +698,7 @@ class SchedulerMetricsCollector:
 
     def increment_eplb_balancedness(self, amount: float) -> None:
         self.eplb_balancedness.labels(**self.labels).observe(amount)
+
     def increment_realtime_tokens(
         self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0
     ):
