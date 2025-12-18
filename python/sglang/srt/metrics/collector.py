@@ -642,7 +642,7 @@ class SchedulerMetricsCollector:
         self.eplb_balancedness = Summary(
             name="sglang:eplb_balancedness",
             documentation="Balancedness of MoE in expert parallelism.",
-            labelnames=list(labels.keys()),
+            labelnames=list(labels.keys()) + ["forward_mode"],
         )
 
         self.new_token_ratio = Gauge(
@@ -696,8 +696,12 @@ class SchedulerMetricsCollector:
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
-    def increment_eplb_balancedness(self, amount: float) -> None:
-        self.eplb_balancedness.labels(**self.labels).observe(amount)
+    def increment_eplb_balancedness(
+        self, forward_mode: str, balancedness: float
+    ) -> None:
+        self.eplb_balancedness.labels(**self.labels, forward_mode=forward_mode).observe(
+            balancedness
+        )
 
     def increment_realtime_tokens(
         self, prefill_compute_tokens=0, prefill_cache_tokens=0, decode_tokens=0

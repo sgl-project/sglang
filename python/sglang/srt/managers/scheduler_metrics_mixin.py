@@ -388,7 +388,9 @@ class SchedulerMetricsMixin:
         self._publish_kv_events()
 
     def log_batch_result_stats(
-        self: Scheduler, result: Union[GenerationBatchResult, EmbeddingBatchResult]
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if not self.enable_metrics:
             return
@@ -397,7 +399,8 @@ class SchedulerMetricsMixin:
 
         if (m := result.expert_distribution_metrics) is not None:
             self.metrics_collector.increment_eplb_balancedness(
-                m.eplb_balancedness.item()
+                forward_mode=batch.forward_mode.name.lower(),
+                balancedness=m.eplb_balancedness.item(),
             )
 
     def _emit_kv_metrics(self: Scheduler):
