@@ -1,4 +1,4 @@
-from typing import Deque
+from typing import Deque, Optional
 
 import torch
 from collections import deque
@@ -26,7 +26,8 @@ class DeviceTimer:
     @dataclass
     class Interval:
         start: torch.cuda.Event
-        end: torch.cuda.Event
+        end: Optional[torch.cuda.Event] = None
+        category: Optional[str] = None
 
     def __init__(self):
         self._intervals: Deque[DeviceTimer.Interval] = deque()
@@ -40,7 +41,10 @@ class DeviceTimer:
             self._end(category=category)
 
     def _start(self):
-        TODO
+        self._intervals.append(DeviceTimer.Interval(start=torch.cuda.Event()))
 
     def _end(self, category: str):
-        TODO
+        interval = self._intervals[-1]
+        assert interval.end is None
+        interval.end = torch.cuda.Event()
+        interval.category = category
