@@ -242,28 +242,6 @@ class ComposedPipelineBase(ABC):
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
 
-        # Initialize communicator to determine role and groups
-        from sglang.multimodal_gen.runtime.distributed.dist_utils import (
-            get_disagg_communicator,
-            init_disaggregated_topology,
-        )
-
-        # Ensure it's initialized if enabled
-        if server_args.enable_disagg and get_disagg_communicator() is None:
-            init_disaggregated_topology(server_args)
-
-        comm = get_disagg_communicator()
-
-        # Debug: Log disagg status
-        if server_args.enable_disagg and comm is not None:
-            import torch.distributed as dist
-
-            logger.info(
-                f"[Disagg Module Loading] Rank {dist.get_rank()}: "
-                f"role={comm.role}, is_dit={comm.is_dit_rank()}, "
-                f"dit_master={comm.dit_master_rank}, non_dit_master={comm.non_dit_master_rank}"
-            )
-
         def should_load_module(module_name: str) -> bool:
             return True
             if not server_args.enable_disagg:
@@ -294,11 +272,11 @@ class ComposedPipelineBase(ABC):
                     f"module={module_name}, should_load={should_load}"
                 )
                 return should_load
-
-        def get_loading_process_group() -> Optional[dist.ProcessGroup]:
-            if not server_args.enable_disagg or comm is None:
-                return None
-            return comm.get_my_group()
+        #
+        # def get_loading_process_group() -> Optional[dist.ProcessGroup]:
+        #     if not server_args.enable_disagg or comm is None:
+        #         return None
+        #     return comm.get_my_group()
 
         model_index = self._load_config()
 
@@ -360,8 +338,8 @@ class ComposedPipelineBase(ABC):
 
         # load configs into server_args, in disagg mode
         for module_name, (
-            transformers_or_diffusers,
-            _,
+                transformers_or_diffusers,
+                _,
         ) in model_index.items():
             load_module_name, component_model_path = self.adjust_module_path(
                 module_name, server_args
@@ -386,8 +364,8 @@ class ComposedPipelineBase(ABC):
 
         components = {}
         for module_name, (
-            transformers_or_diffusers,
-            architecture,
+                transformers_or_diffusers,
+                architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -409,14 +387,14 @@ class ComposedPipelineBase(ABC):
                 module_name, server_args
             )
             # Determine process group for loading
-            loading_group = get_loading_process_group()
+            # loading_group = get_loading_process_group()
 
             module = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
-                process_group=loading_group,
+                # process_group=loading_group,
             )
 
             if module_name in components:
