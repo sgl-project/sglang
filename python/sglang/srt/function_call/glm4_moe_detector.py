@@ -490,7 +490,14 @@ class Glm4MoeDetector(BaseFormatDetector):
                         self._streamed_raw_length = current_raw_length
 
                     if is_tool_end == self.eot_token:
-                        if self._is_first_param:
+                        # Check if we have any actual parameters sent already
+                        # If not, and there are no argument pairs, send empty object
+                        pairs = self.func_arg_regex.findall(func_args_raw)
+                        if (
+                            not pairs
+                            and not self.streamed_args_for_tool[self.current_tool_id]
+                        ):
+                            # No arguments found and no parameters have been streamed yet, send empty object
                             empty_object = "{}"
                             calls.append(
                                 ToolCallItem(
@@ -500,6 +507,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += empty_object
                         elif not self._last_arguments.endswith("}"):
                             closing_brace = "}"
                             calls.append(
@@ -515,7 +525,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                             ] += closing_brace
 
                         try:
-                            pairs = self.func_arg_regex.findall(func_args_raw)
                             if pairs:
                                 arguments = self._parse_argument_pairs(
                                     pairs, func_name, tools
