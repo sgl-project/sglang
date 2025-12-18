@@ -21,7 +21,7 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
-        Self::create_router_by_connection_mode(ctx, &ctx.router_config.connection_mode)
+        Self::create_router_by_connection_mode(ctx, &ctx.router_config.connection_mode).await
     }
 
     pub async fn create_router_by_connection_mode(
