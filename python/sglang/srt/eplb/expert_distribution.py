@@ -196,7 +196,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            o = self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
+            o = self._accumulator.append(
+                forward_pass_id, gatherer_key, single_pass_data
+            )
             if o is not None:
                 outputs |= o
 
@@ -705,10 +707,14 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_gpu = torch.mean(compute_utilization_rate(gpu_physical_count))
+            utilization_rate_gpu = torch.mean(
+                compute_utilization_rate(gpu_physical_count)
+            )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
                 return {
-                    "metrics": ExpertDistributionMetrics(eplb_balancedness=utilization_rate_gpu)
+                    "metrics": ExpertDistributionMetrics(
+                        eplb_balancedness=utilization_rate_gpu
+                    )
                 }
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
