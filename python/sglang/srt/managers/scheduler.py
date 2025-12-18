@@ -454,16 +454,16 @@ class Scheduler(
             moe_ep_rank=self.moe_ep_rank,
             pp_rank=self.pp_rank,
             dp_rank=self.dp_rank,
-            nccl_port=self.port_args.nccl_port,
+            nccl_port=self.nccl_port,
         )
 
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
+            server_args=self.server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
             moe_ep_rank=self.moe_ep_rank,
-            server_args=self.server_args,
-            nccl_port=self.port_args.nccl_port,
+            nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
             dp_rank=self.dp_rank,
         )
@@ -534,7 +534,7 @@ class Scheduler(
         ) = self.tp_worker.get_worker_info()
         if get_global_server_args().pp_max_micro_batch_size is None:
             get_global_server_args().pp_max_micro_batch_size = max(
-                self.max_running_requests // self.server_args.pp_size, 1
+                self.max_running_requests // self.pp_size, 1
             )
 
         self.tp_group = self.tp_worker.get_tp_group()
