@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import asyncio
+import glob
 import json
 import os
 import time
@@ -82,46 +83,40 @@ class VBenchDataset(BaseDataset):
     """
 
     T2V_PROMPT_URL = "https://raw.githubusercontent.com/Vchitect/VBench/master/prompts/prompts_per_dimension/subject_consistency.txt"
-
-    # Placeholder for I2V, usually requires local file mapping
+    I2V_DOWNLOAD_SCRIPT_URL = "https://raw.githubusercontent.com/Vchitect/VBench/master/vbench2_beta_i2v/download_data.sh"
 
     def __init__(self, args, api_url: str, model: str):
         super().__init__(args, api_url, model)
+        self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "sglang")
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
         if self.args.task == "t2v":
             return self._load_t2v_prompts()
-        elif self.args.task == "i2v":
+        elif self.args.task in ["i2v", "ti2v", "ti2i"]:
             return self._load_i2v_data()
-        elif self.args.task in ["ti2v", "ti2i"]:
-            return self._load_i2v_data()  # Reuse logic for now
         else:
-            # Default to T2V if task not specified or unknown
             return self._load_t2v_prompts()
+
+    def _download_file(self, url: str, dest_path: str) -> None:
+        """Download a file from URL to destination path."""
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        resp = requests.get(url)
+        resp.raise_for_status()
+        with open(dest_path, "w") as f:
+            f.write(resp.text)
 
     def _load_t2v_prompts(self) -> List[Dict[str, Any]]:
         path = self.args.dataset_path
 
-        # If no path provided, try to use default VBench prompt file
         if not path:
-            path = os.path.join(
-                os.path.expanduser("~"),
-                ".cache",
-                "sglang",
-                "vbench_subject_consistency.txt",
-            )
+            path = os.path.join(self.cache_dir, "vbench_subject_consistency.txt")
             if not os.path.exists(path):
-                print(f"Downloading VBench prompts to {path}...")
-                os.makedirs(os.path.dirname(path), exist_ok=True)
+                print(f"Downloading VBench T2V prompts to {path}...")
                 try:
-                    response = requests.get(self.T2V_PROMPT_URL)
-                    response.raise_for_status()
-                    with open(path, "w") as f:
-                        f.write(response.text)
+                    self._download_file(self.T2V_PROMPT_URL, path)
                 except Exception as e:
                     print(f"Failed to download VBench prompts: {e}")
-                    # Fallback to dummy prompts if download fails
                     return [{"prompt": "A cat sitting on a bench"}] * 50
 
         prompts = []
@@ -133,166 +128,148 @@ class VBenchDataset(BaseDataset):
 
         return self._resize_data(prompts)
 
-    def _load_i2v_data(self) -> List[Dict[str, Any]]:
-        """
-        Load I2V data from VBench I2V dataset.
-        Expects dataset_path to be a directory containing the i2v-bench-info.json file, or a JSON file with image paths.
-        If not provided, auto-downloads the VBench I2V dataset.
-        """
-        path = self.args.dataset_path
+    def _auto_download_i2v_dataset(self) -> str:
+        """Auto-download VBench I2V dataset and return the dataset directory."""
+        vbench_i2v_dir = os.path.join(self.cache_dir, "vbench_i2v", "vbench2_beta_i2v")
+        info_json_path = os.path.join(vbench_i2v_dir, "data", "i2v-bench-info.json")
 
-        # Auto-download VBench I2V dataset if path is not provided and task is i2v
-        if not path and self.args.task == "i2v":
-            cache_dir = os.path.join(
-                os.path.expanduser("~"), ".cache", "sglang", "vbench_i2v"
+        if os.path.exists(info_json_path):
+            return vbench_i2v_dir
+
+        print(f"Downloading VBench I2V dataset to {vbench_i2v_dir}...")
+        try:
+            cache_root = os.path.join(self.cache_dir, "vbench_i2v")
+            script_path = os.path.join(cache_root, "download_data.sh")
+
+            self._download_file(self.I2V_DOWNLOAD_SCRIPT_URL, script_path)
+            os.chmod(script_path, 0o755)
+
+            print("Executing download_data.sh (this may take a while)...")
+            import subprocess
+
+            result = subprocess.run(
+                ["bash", script_path],
+                cwd=cache_root,
+                capture_output=True,
+                text=True,
             )
-            vbench_i2v_dir = os.path.join(cache_dir, "vbench2_beta_i2v")
-            info_json_path = os.path.join(vbench_i2v_dir, "data", "i2v-bench-info.json")
 
-            if not os.path.exists(info_json_path):
-                print(f"Downloading VBench I2V dataset to {cache_dir}...")
-                try:
-                    os.makedirs(cache_dir, exist_ok=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"Download script failed: {result.stderr}")
 
-                    # Download the download_data.sh script from GitHub raw URL
-                    script_url = "https://raw.githubusercontent.com/Vchitect/VBench/master/vbench2_beta_i2v/download_data.sh"
-                    script_path = os.path.join(cache_dir, "download_data.sh")
+            print(f"Successfully downloaded VBench I2V dataset to {vbench_i2v_dir}")
+        except Exception as e:
+            print(f"Failed to download VBench I2V dataset: {e}")
+            print("Please manually download following instructions at:")
+            print(
+                "https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download"
+            )
+            return None
 
-                    print(f"Downloading download_data.sh from {script_url}...")
-                    resp = requests.get(script_url)
-                    resp.raise_for_status()
+        return vbench_i2v_dir if os.path.exists(info_json_path) else None
 
-                    with open(script_path, "w") as f:
-                        f.write(resp.text)
+    def _load_from_i2v_json(self, json_path: str) -> List[Dict[str, Any]]:
+        """Load I2V data from i2v-bench-info.json format."""
+        with open(json_path, "r") as f:
+            items = json.load(f)
 
-                    # Make the script executable and run it
-                    import subprocess
-
-                    os.chmod(script_path, 0o755)
-
-                    print("Executing download_data.sh to fetch VBench I2V dataset...")
-                    print("This may take a while as it downloads image data...")
-
-                    # Run the script in the cache directory
-                    result = subprocess.run(
-                        ["bash", script_path],
-                        cwd=cache_dir,
-                        capture_output=True,
-                        text=True,
-                    )
-
-                    if result.returncode != 0:
-                        print(f"Download script failed: {result.stderr}")
-                        raise RuntimeError(f"Failed to download VBench I2V dataset")
-
-                    print(
-                        f"Successfully downloaded VBench I2V dataset to {vbench_i2v_dir}"
-                    )
-
-                except Exception as e:
-                    print(f"Failed to download VBench I2V dataset: {e}")
-                    print("Please manually download following instructions at:")
-                    print(
-                        "https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download"
-                    )
-
-            if os.path.exists(info_json_path):
-                path = vbench_i2v_dir
+        base_dir = os.path.dirname(
+            os.path.dirname(json_path)
+        )  # Go up to vbench2_beta_i2v
+        origin_dir = os.path.join(base_dir, "data", "origin")
 
         data = []
+        for item in items:
+            img_path = os.path.join(origin_dir, item.get("file_name", ""))
+            if os.path.exists(img_path):
+                data.append({"prompt": item.get("caption", ""), "image_path": img_path})
+            else:
+                print(f"Warning: Image not found: {img_path}")
 
-        # Load from i2v-bench-info.json if it exists
-        if path:
-            info_json = None
-            if os.path.isdir(path):
-                # Check for i2v-bench-info.json in the directory
-                possible_json = os.path.join(path, "data", "i2v-bench-info.json")
-                if os.path.exists(possible_json):
-                    info_json = possible_json
-            elif os.path.isfile(path) and path.endswith(".json"):
-                info_json = path
+        print(f"Loaded {len(data)} I2V samples from VBench I2V dataset")
+        return data
 
-            if info_json:
+    def _scan_directory_for_images(self, path: str) -> List[Dict[str, Any]]:
+        """Scan directory for image files."""
+        exts = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
+        files = []
+
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(path, ext)))
+            files.extend(glob.glob(os.path.join(path, ext.upper())))
+
+            # Also check in data/origin subdirectory
+            origin_dir = os.path.join(path, "data", "origin")
+            if os.path.exists(origin_dir):
+                files.extend(glob.glob(os.path.join(origin_dir, ext)))
+                files.extend(glob.glob(os.path.join(origin_dir, ext.upper())))
+
+        return [
+            {"prompt": os.path.splitext(os.path.basename(f))[0], "image_path": f}
+            for f in files
+        ]
+
+    def _create_dummy_data(self) -> List[Dict[str, Any]]:
+        """Create dummy data with a placeholder image in cache directory."""
+        print("No I2V data found. Using dummy placeholders.")
+
+        dummy_image = os.path.join(self.cache_dir, "dummy_image.jpg")
+        if not os.path.exists(dummy_image):
+            try:
+                from PIL import Image
+
+                os.makedirs(self.cache_dir, exist_ok=True)
+                img = Image.new("RGB", (100, 100), color="red")
+                img.save(dummy_image)
+                print(f"Created dummy image at {dummy_image}")
+            except ImportError:
+                print("PIL not installed, cannot create dummy image.")
+                return []
+
+        return [{"prompt": "A moving cat", "image_path": dummy_image}] * 10
+
+    def _load_i2v_data(self) -> List[Dict[str, Any]]:
+        """Load I2V data from VBench I2V dataset or user-provided path."""
+        path = self.args.dataset_path
+
+        # Auto-download if no path provided
+        if not path:
+            path = self._auto_download_i2v_dataset()
+            if not path:
+                return self._resize_data(self._create_dummy_data())
+
+        # Try to load from i2v-bench-info.json
+        info_json_candidates = [
+            os.path.join(path, "data", "i2v-bench-info.json"),
+            path if path.endswith(".json") else None,
+        ]
+
+        for json_path in info_json_candidates:
+            if json_path and os.path.exists(json_path):
                 try:
-                    with open(info_json, "r") as f:
-                        items = json.load(f)
-
-                    # VBench I2V format: each item has file_name, caption, etc.
-                    base_dir = (
-                        os.path.dirname(info_json)
-                        if os.path.isfile(info_json)
-                        else path
-                    )
-                    origin_dir = (
-                        os.path.join(base_dir, "origin")
-                        if os.path.isdir(path)
-                        else os.path.join(os.path.dirname(base_dir), "origin")
-                    )
-
-                    for item in items:
-                        file_name = item.get("file_name", "")
-                        caption = item.get("caption", "")
-                        img_path = os.path.join(origin_dir, file_name)
-
-                        if os.path.exists(img_path):
-                            data.append({"prompt": caption, "image_path": img_path})
-                        else:
-                            print(f"Warning: Image not found: {img_path}")
-
-                    print(f"Loaded {len(data)} I2V samples from VBench I2V dataset")
-                    return self._resize_data(data)
+                    return self._resize_data(self._load_from_i2v_json(json_path))
                 except Exception as e:
-                    print(f"Failed to load i2v-bench-info.json: {e}")
+                    print(f"Failed to load {json_path}: {e}")
 
         # Fallback: scan directory for images
-        if path and os.path.isdir(path):
-            import glob
+        if os.path.isdir(path):
+            data = self._scan_directory_for_images(path)
+            if data:
+                return self._resize_data(data)
 
-            exts = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
-            files = []
-            for ext in exts:
-                files.extend(glob.glob(os.path.join(path, ext)))
-                files.extend(glob.glob(os.path.join(path, ext.upper())))
-                # Also check in origin subdirectory
-                origin_dir = os.path.join(path, "data", "origin")
-                if os.path.exists(origin_dir):
-                    files.extend(glob.glob(os.path.join(origin_dir, ext)))
-                    files.extend(glob.glob(os.path.join(origin_dir, ext.upper())))
+        # Last resort: dummy data
+        return self._resize_data(self._create_dummy_data())
 
-            for f in files:
-                # Use filename as prompt or empty
-                prompt = os.path.splitext(os.path.basename(f))[0]
-                data.append({"prompt": prompt, "image_path": f})
+    def _resize_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Resize data to match num_prompts."""
+        if not self.args.num_prompts:
+            return data
 
-        if not data:
-            print(
-                "No I2V data found or provided. Using dummy placeholders (requires manual image path setup)."
-            )
-            # Dummy data - this will likely fail if the image file doesn't exist
-            # User must provide a valid image path for I2V to work
-            dummy_image = "dummy_image.jpg"
-            if not os.path.exists(dummy_image):
-                # Create a blank dummy image for testing
-                try:
-                    from PIL import Image
+        if len(data) < self.args.num_prompts:
+            factor = (self.args.num_prompts // len(data)) + 1
+            data = data * factor
 
-                    img = Image.new("RGB", (100, 100), color="red")
-                    img.save(dummy_image)
-                    print(f"Created dummy image at {dummy_image}")
-                except ImportError:
-                    print("PIL not installed, cannot create dummy image.")
-
-            data = [{"prompt": "A moving cat", "image_path": dummy_image}] * 10
-
-        return self._resize_data(data)
-
-    def _resize_data(self, data):
-        if self.args.num_prompts:
-            if len(data) < self.args.num_prompts:
-                factor = (self.args.num_prompts // len(data)) + 1
-                data = data * factor
-            data = data[: self.args.num_prompts]
-        return data
+        return data[: self.args.num_prompts]
 
     def __len__(self) -> int:
         return len(self.items)
