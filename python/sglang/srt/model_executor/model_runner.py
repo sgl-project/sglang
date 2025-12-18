@@ -536,6 +536,17 @@ class ModelRunner:
             server_args.max_total_tokens,
         )
 
+        # Init max running requests
+        self.max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if server_args.max_running_requests is None
+                else server_args.max_running_requests
+                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+            ),
+            self.req_to_token_pool.size,
+        )
+
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
