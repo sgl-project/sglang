@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+from __future__ import annotations
+
 import logging
 from typing import Any, Iterable, Optional, Tuple
 
@@ -303,3 +305,9 @@ class MindSporeForCausalLM(torch.nn.Module):
 
 
 EntryClass = [MindSporeForCausalLM]
+
+# NOTE: `sglang.srt.models.registry` eagerly imports every module under
+# `sglang.srt.models.*` to discover `EntryClass`. Keep this otherwise it will
+# Keep on raising an import error.
+if not _is_npu:
+    EntryClass = []
