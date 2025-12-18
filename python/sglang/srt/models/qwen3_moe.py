@@ -431,6 +431,7 @@ class Qwen3MoeAttention(nn.Module):
                 cache_loc = forward_batch.out_cache_loc,
                 k_scale = self.attn.k_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
                 v_scale = self.attn.v_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
+                return_kv = True, 
             )
             if aiter_fused_set_kv_buffer_arg.k_scale is None:
                 aiter_fused_set_kv_buffer_arg.k_scale = 1.0

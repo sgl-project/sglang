@@ -803,21 +803,22 @@ class AiterAttnBackend(AttentionBackend):
 
         self.logits_soft_cap = layer.logit_cap
 
-        if k is not None:
+            
+        if save_kv_cache:
+            assert k is not None
             assert v is not None
-            if save_kv_cache:
-                if self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if self.use_mla:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            else:
+                if USING_PRESHUFFLE_LAYOUT:
+                    k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    self.set_kv_buffer_with_layout_shuffle(cache_loc, k, v, k_buffer, v_buffer, layer.k_scale, layer.v_scale, self.page_size)
                 else:
-                    if USING_PRESHUFFLE_LAYOUT:
-                        k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
-                            layer.layer_id
-                        )
-                        self.set_kv_buffer_with_layout_shuffle(cache_loc, k, v, k_buffer, v_buffer, layer.k_scale, layer.v_scale, self.page_size)
-                    else:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                        )
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -1005,13 +1006,26 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # Convert q, k, v to FP8 format
-            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            # FP8 dtype set for checking
+            FP8_DTYPES = (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.float8_e5m2,
+                torch.float8_e5m2fnuz,
+            )
+            FP8_SCALE = torch.tensor(1.0)
             
-            # Quantize to FP8
-            q_fp8, _ = per_tensor_quant(q_reshaped, scale=torch.tensor(1.0), quant_dtype=dtypes.fp8)
-            k_fp8, _ = per_tensor_quant(k, scale=torch.tensor(1.0), quant_dtype=dtypes.fp8)
-            v_fp8, _ = per_tensor_quant(v, scale=torch.tensor(1.0), quant_dtype=dtypes.fp8)
+            # Helper function to quantize tensor to FP8 if not already FP8
+            def quantize_to_fp8_if_needed(tensor):
+                return tensor if tensor.dtype in FP8_DTYPES else per_tensor_quant(
+                    tensor, scale=FP8_SCALE, quant_dtype=dtypes.fp8
+                )[0]
+            
+            # Convert q, k, v to FP8 format
+            q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_fp8, _ = per_tensor_quant(q_reshaped, scale=FP8_SCALE, quant_dtype=dtypes.fp8)
+            k_fp8 = quantize_to_fp8_if_needed(k)
+            v_fp8 = quantize_to_fp8_if_needed(v)
 
             o = flash_attn_varlen_fp8_pertensor_func(
                 q=q_fp8,
