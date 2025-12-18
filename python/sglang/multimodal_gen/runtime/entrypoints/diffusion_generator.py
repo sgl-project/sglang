@@ -386,11 +386,30 @@ class DiffGenerator:
         self._ensure_lora_state(
             lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
         )
-        return self.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            **kwargs,
-        )
+        # NOTE: Preserve the public signature from upstream (`prompt`, `sampling_params`)
+        # while adapting to the newer `generate(sampling_params_kwargs=...)` API.
+        #
+        # Callers may also pass `sampling_params_kwargs` via **kwargs; handle it explicitly.
+        sampling_params_kwargs = kwargs.pop("sampling_params_kwargs", None)
+
+        # `generate()` only accepts `sampling_params_kwargs`. Merge legacy + new inputs.
+        merged_kwargs: dict = {}
+        if sampling_params is not None:
+            from dataclasses import asdict, is_dataclass
+
+            if is_dataclass(sampling_params):
+                # Avoid overriding defaults with None (None often means "use model default").
+                merged_kwargs.update(
+                    {k: v for k, v in asdict(sampling_params).items() if v is not None}
+                )
+        if sampling_params_kwargs:
+            merged_kwargs.update(sampling_params_kwargs)
+        if prompt is not None:
+            merged_kwargs["prompt"] = prompt
+        if kwargs:
+            merged_kwargs.update(kwargs)
+
+        return self.generate(sampling_params_kwargs=merged_kwargs)
 
     def shutdown(self):
         """
@@ -420,13 +439,14 @@ class DiffGenerator:
         self.shutdown()
 
     def __del__(self):
-        if self.owns_scheduler_client:
+        # This can be triggered for partially-initialized objects (e.g., in unit tests).
+        if getattr(self, "owns_scheduler_client", False):
             logger.warning(
                 "Generator was garbage collected without being shut down. "
                 "Attempting to shut down the local server and client."
             )
             self.shutdown()
-        elif self.local_scheduler_process:
+        elif getattr(self, "local_scheduler_process", None):
             logger.warning(
                 "Generator was garbage collected without being shut down. "
                 "Attempting to shut down the local server."

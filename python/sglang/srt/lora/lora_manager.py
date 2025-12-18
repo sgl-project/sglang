@@ -189,17 +189,18 @@ class LoRAManager:
         delete the corresponding LoRA modules.
         """
 
-        adapter = self.configs.get(lora_ref.lora_id)
-        lora_ref = self.lora_refs.get(lora_ref.lora_id)
+        lora_id = lora_ref.lora_id
+        adapter = self.configs.get(lora_id)
+        existing_lora_ref = self.lora_refs.get(lora_id)
         assert (
-            adapter is not None and lora_ref is not None
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+            adapter is not None and existing_lora_ref is not None
+        ), f"LoRA adapter with ID {lora_id} is not loaded. This should have been verified before request is sent to the backend."
 
         try:
-            del self.configs[lora_ref.lora_id]
-            del self.loras[lora_ref.lora_id]
-            del self.lora_refs[lora_ref.lora_id]
-            self.num_pinned_loras -= int(lora_ref.pinned)
+            del self.configs[lora_id]
+            del self.loras[lora_id]
+            del self.lora_refs[lora_id]
+            self.num_pinned_loras -= int(existing_lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -208,11 +209,16 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
-    def validate_lora_batch(self, lora_ids: set[str]) -> bool:
+    def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
+
+        Args:
+            lora_ids: Set of LoRA IDs, which may contain None values (for requests without LoRA).
         """
-        if len(lora_ids) > self.max_loras_per_batch:
+        # Filter out None values for active LoRA count
+        active_lora_ids = {uid for uid in lora_ids if uid is not None}
+        if len(active_lora_ids) > self.max_loras_per_batch:
             return False
 
         # skip pinned LoRA check if no pinned LoRA adapters are loaded.
@@ -221,8 +227,7 @@ class LoRAManager:
 
         # counting the number of pinned LoRA adapters in the batch.
         pinned_loras_in_batch = 0
-        for lora_id in lora_ids:
-            if lora_id is not None:
+        for lora_id in active_lora_ids:
                 lora_ref = self.lora_refs.get(lora_id)
                 assert (
                     lora_ref is not None
@@ -234,7 +239,7 @@ class LoRAManager:
             f"({self.num_pinned_loras}). This indicates a bug in the LoRA loading logic."
         )
 
-        required_slots = len(lora_ids) - pinned_loras_in_batch
+        required_slots = len(active_lora_ids) - pinned_loras_in_batch
         mem_pool_vacancy = self.memory_pool.max_loras_per_batch - self.num_pinned_loras
 
         return required_slots <= mem_pool_vacancy

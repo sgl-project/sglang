@@ -254,6 +254,7 @@ class ServerArgs:
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+    max_loras_per_batch: int = 8  # Maximum number of LoRAs in a single batch (multi-LoRA support)
 
     # VAE parameters
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)

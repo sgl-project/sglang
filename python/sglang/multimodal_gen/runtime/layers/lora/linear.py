@@ -4,6 +4,12 @@
 # Code adapted from SGLang https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/layers.py
 
 
+from __future__ import annotations
+
+from collections import defaultdict
+import logging
+from typing import TypedDict
+
 import torch
 from torch import nn
 from torch.distributed._composable.fsdp import (
@@ -35,6 +41,13 @@ from sglang.multimodal_gen.utils import get_mixed_precision_state
 
 torch._dynamo.config.recompile_limit = 16
 
+logger = logging.getLogger(__name__)
+
+
+class LoRAAdapterConfig(TypedDict):
+    alpha: float
+    rank: int
+
 
 class BaseLayerWithLoRA(nn.Module):
 
@@ -51,14 +64,26 @@ class BaseLayerWithLoRA(nn.Module):
         self.cpu_weight = base_layer.weight.to("cpu")
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
-        # Default to True to prevent using uninitialized weights; set to False when weights are loaded
+        # Default to True to prevent using uninitialized LoRA weights.
+        # This will be set to False once LoRA weights are actually loaded for this layer.
         self.disable_lora: bool = True
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_path: str | None = None
+        # Optional: set by the pipeline when wrapping, used for more helpful warnings.
+        self.layer_name: str | None = None
 
+        # Legacy single-LoRA support
         self.lora_A = None
         self.lora_B = None
+
+        # Multi-LoRA support
+        self.lora_weights_pool: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}  # nickname -> (lora_A, lora_B)
+        self.lora_adapter_configs: dict[str, LoRAAdapterConfig] = {}  # nickname -> {alpha, rank} for per-adapter config
+        self.active_lora_indices: torch.Tensor | None = None  # Per-sample LoRA index
+        self.lora_nickname_to_index: dict[str, int] = {}  # Mapping nickname to index
+        self.max_loras: int = 8
+        self.use_multi_lora: bool = False
 
     @property
     def weight(self):
@@ -68,15 +93,123 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
+    def prepare_multi_lora_batch(
+        self,
+        lora_weights_pool: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        lora_nickname_to_index: dict[str, int],
+        lora_adapter_configs: dict[str, LoRAAdapterConfig] | None = None,
+    ):
+        """
+        Prepare LoRA weights for multi-LoRA batch.
+
+        Args:
+            lora_weights_pool: Dict mapping lora_nickname -> (lora_A, lora_B)
+            lora_nickname_to_index: Dict mapping lora_nickname -> index
+            lora_adapter_configs: Dict mapping lora_nickname -> {alpha, rank} for per-adapter config
+        """
+        self.lora_weights_pool = lora_weights_pool
+        self.lora_nickname_to_index = lora_nickname_to_index
+        self.lora_adapter_configs = lora_adapter_configs or {}
+        self.use_multi_lora = len(lora_weights_pool) > 0
+
+    def set_multi_lora_indices(self, indices: torch.Tensor | list[int] | None):
+        """
+        Set LoRA indices for each sample in the batch.
+
+        Args:
+            indices: Tensor or list of LoRA indices for each sample (-1 for no LoRA)
+        """
+        if indices is None:
+            self.active_lora_indices = None
+            self.use_multi_lora = False
+        else:
+            if isinstance(indices, list):
+                indices = torch.tensor(
+                    indices,
+                    device=self.base_layer.weight.device,
+                    dtype=torch.int32,
+                )
+            self.active_lora_indices = indices
+            self.use_multi_lora = True
+
+    def _index_to_nickname(self, index: int) -> str | None:
+        """Convert LoRA index to nickname."""
+        for nickname, idx in self.lora_nickname_to_index.items():
+            if idx == index:
+                return nickname
+        return None
+
+    def _apply_multi_lora(
+        self, x: torch.Tensor, base_out: torch.Tensor, output_bias
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply LoRA adaptively per sample in batch."""
+
+        if self.active_lora_indices is None or len(self.lora_weights_pool) == 0:
+            return base_out, output_bias
+
+        device = x.device
+
+        # Group requests by LoRA to minimize computation
+        lora_groups: dict[int, list[int]] = defaultdict(list)
+        for i, lora_idx in enumerate(self.active_lora_indices.cpu().tolist()):
+            lora_groups[lora_idx].append(i)
+
+        delta = torch.zeros_like(base_out)
+
+        for lora_idx, sample_indices in lora_groups.items():
+            if lora_idx < 0:
+                continue
+
+            lora_nickname = self._index_to_nickname(lora_idx)
+            if lora_nickname is None:
+                logger.warning(
+                    "LoRA index %d not found in nickname mapping for layer %s",
+                    lora_idx,
+                    self.layer_name or self.__class__.__name__,
+                )
+                continue
+            if lora_nickname not in self.lora_weights_pool:
+                logger.warning(
+                    "LoRA adapter '%s' not found in weights pool for layer %s",
+                    lora_nickname,
+                    self.layer_name or self.__class__.__name__,
+                )
+                continue
+
+            lora_A, lora_B = self.lora_weights_pool[lora_nickname]
+            lora_A = lora_A.to(device, non_blocking=True)
+            lora_B = lora_B.to(device, non_blocking=True)
+
+            # Slice for tensor parallelism if needed
+            lora_A_sliced = self.slice_lora_a_weights(lora_A)
+            lora_B_sliced = self.slice_lora_b_weights(lora_B)
+
+            x_group = x[sample_indices]
+            delta_group = x_group @ lora_A_sliced.T @ lora_B_sliced.T
+
+            adapter_config = self.lora_adapter_configs.get(lora_nickname, {})
+            alpha = adapter_config.get("alpha", self.lora_alpha or 16.0)
+            rank = adapter_config.get("rank", self.lora_rank or 16)
+            if alpha != rank:
+                delta_group = delta_group * (alpha / rank)
+
+            delta[sample_indices] = delta_group
+
+        return base_out + delta, output_bias
+
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lora_A = self.lora_A
-        lora_B = self.lora_B
-        if isinstance(self.lora_B, DTensor):
-            lora_B = self.lora_B.to_local()
-            lora_A = self.lora_A.to_local()
+        out, output_bias = self.base_layer(x)
 
-        if not self.merged and not self.disable_lora:
+        if self.use_multi_lora and self.active_lora_indices is not None and not self.disable_lora:
+            out, output_bias = self._apply_multi_lora(x, out, output_bias)
+        elif self.lora_A is not None and not self.merged and not self.disable_lora:
+            lora_A = self.lora_A
+            lora_B = self.lora_B
+            if isinstance(self.lora_B, DTensor):
+                lora_B = self.lora_B.to_local()
+                lora_A = self.lora_A.to_local()
+
             lora_A_sliced = self.slice_lora_a_weights(lora_A.to(x, non_blocking=True))
             lora_B_sliced = self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
             delta = x @ lora_A_sliced.T @ lora_B_sliced.T
@@ -84,11 +217,9 @@ class BaseLayerWithLoRA(nn.Module):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            out, output_bias = self.base_layer(x)
-            return out + delta, output_bias
-        else:
-            out, output_bias = self.base_layer(x)
-            return out, output_bias
+            out = out + delta
+
+        return out, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A

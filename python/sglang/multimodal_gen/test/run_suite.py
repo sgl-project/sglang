@@ -23,6 +23,7 @@ SUITES = {
         "test_server_a.py",
         "test_server_b.py",
         "test_lora_format_adapter.py",
+        "test_multi_lora_batching_unit.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [

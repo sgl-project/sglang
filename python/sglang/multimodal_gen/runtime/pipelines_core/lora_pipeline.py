@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.lora.lora_manager import DiffusionLoRAManager
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -59,6 +60,8 @@ class LoRAPipeline(ComposedPipelineBase):
     lora_rank: int | None
     lora_alpha: int | None
     lora_initialized: bool
+    # Multi-LoRA manager for per-request adapter selection within a batch
+    lora_manager: DiffusionLoRAManager
     # Track merge status per module: {"transformer": True, "transformer_2": False}
     is_lora_merged: dict[str, bool]
     # Valid target values for set_lora (class constant, immutable)
@@ -89,6 +92,16 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_target_modules = self.server_args.lora_target_modules
         self.lora_path = self.server_args.lora_path
         self.lora_nickname = self.server_args.lora_nickname
+
+        # Initialize multi-LoRA manager
+        max_loras = getattr(self.server_args, "max_loras_per_batch", 8)
+        self.lora_manager = DiffusionLoRAManager(
+            max_loras_per_batch=max_loras,
+            device=self.device,
+            server_args=self.server_args,
+            modules=self.modules,
+        )
+
         if self.lora_path is not None:
             self.convert_to_lora_layers()
             self.set_lora(
@@ -178,6 +191,11 @@ class LoRAPipeline(ComposedPipelineBase):
                 lora_alpha=self.lora_alpha,
             )
             if lora_layer is not None:
+                # Attach the module name for better warnings/debugging in LoRA layers.
+                try:
+                    lora_layer.layer_name = name  # type: ignore[attr-defined]
+                except Exception:
+                    pass
                 target_lora_layers[name] = lora_layer
                 replace_submodule(self.modules[module_name], name, lora_layer)
                 converted_count += 1
@@ -520,3 +538,57 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
             self.is_lora_merged[module_name] = False
             logger.info("LoRA weights unmerged for %s", module_name)
+
+    def prepare_batch_with_loras(
+        self,
+        requests: list["Req"],
+    ) -> dict[str, Any]:
+        """
+        Prepare a batch of requests with their LoRA assignments.
+
+        This prepares LoRA weights for multi-LoRA batching, allowing different
+        requests in a batch to use different LoRA adapters.
+
+        Returns a dict that includes per-request LoRA indices and the pooled
+        LoRA weights to be consumed by LoRA-wrapped layers.
+        """
+        if not self.lora_initialized:
+            self.convert_to_lora_layers()
+
+        # Fix Bug 3: include all LoRA layers (transformer, transformer_2, critic)
+        all_lora_layers: dict[str, BaseLayerWithLoRA] = {
+            **self.lora_layers,
+            **self.lora_layers_transformer_2,
+            **self.lora_layers_critic,
+        }
+
+        batch_lora_weights, lora_nickname_to_index, lora_adapter_configs = (
+            self.lora_manager.prepare_lora_batch(
+                requests=requests,
+                lora_layers=all_lora_layers,
+            )
+        )
+
+        request_lora_indices: list[int] = []
+        for req in requests:
+            lora_nickname = getattr(req, "lora_nickname", None)
+            if lora_nickname and lora_nickname in lora_nickname_to_index:
+                request_lora_indices.append(lora_nickname_to_index[lora_nickname])
+            else:
+                request_lora_indices.append(-1)  # No LoRA
+
+        # Prepare layers for multi-LoRA batch
+        for layer_name, layer in all_lora_layers.items():
+            layer_weights = batch_lora_weights.get(layer_name, {})
+            layer.prepare_multi_lora_batch(
+                lora_weights_pool=layer_weights,
+                lora_nickname_to_index=lora_nickname_to_index,
+                lora_adapter_configs=lora_adapter_configs,  # Fix Bug 1: per-adapter alpha/rank
+            )
+            layer.set_multi_lora_indices(request_lora_indices)
+
+        return {
+            "request_lora_indices": request_lora_indices,
+            "lora_nickname_to_index": lora_nickname_to_index,
+            "batch_lora_weights": batch_lora_weights,
+        }
