@@ -370,16 +370,12 @@ impl AppContextBuilder {
 
     /// Create tokenizer for gRPC mode
     fn maybe_tokenizer(mut self, config: &RouterConfig) -> Result<Self, String> {
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. }) {
-            let tokenizer_path = config
-                .tokenizer_path
-                .clone()
-                .or_else(|| config.model_path.clone())
-                .ok_or_else(|| {
-                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                        .to_string()
-                })?;
+        let tokenizer_path = config
+            .tokenizer_path
+            .clone()
+            .or_else(|| config.model_path.clone());
 
+        if let Some(tokenizer_path) = tokenizer_path {
             let base_tokenizer = tokenizer_factory::create_tokenizer_with_chat_template_blocking(
                 &tokenizer_path,
                 config.chat_template.as_deref(),
