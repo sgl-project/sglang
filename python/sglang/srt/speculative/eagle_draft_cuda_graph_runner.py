@@ -60,6 +60,8 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        server_args = model_runner.server_args
+        self.device = model_runner.device
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -84,7 +86,7 @@ class EAGLEDraftCudaGraphRunner:
             set_torch_compile_config()
 
         # Graph inputs
-        with torch.device(model_runner.device):
+        with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros(
@@ -180,7 +182,12 @@ class EAGLEDraftCudaGraphRunner:
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
     ):
-        graph = self._create_graph()
+        if self.device in ["cuda", "xpu"]:
+            graph = torch.cuda.CUDAGraph()
+        else:
+            raise NotImplementedError(
+                f"Graph capture not supported for device: {self.device}"
+            )
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
 
@@ -301,13 +308,25 @@ class EAGLEDraftCudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        self._capture_init(run_once)
+        for _ in range(2):
+            if self.device == "cuda":
+                torch.cuda.synchronize()
+            elif self.device == "xpu":
+                torch.xpu.synchronize()
+            self.model_runner.tp_group.barrier()
 
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+            run_once()
 
-        set_global_graph_memory_pool(graph.pool())
+        if self.device in ["cuda", "xpu"]:
+            with torch.cuda.graph(
+                graph, pool=get_global_graph_memory_pool(), stream=stream
+            ):
+                out = run_once()
+            set_global_graph_memory_pool(graph.pool())
+        else:
+            raise NotImplementedError(
+                f"Graph capture not supported for device: {self.device}"
+            )
         return graph, out
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):

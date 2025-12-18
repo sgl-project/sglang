@@ -88,7 +88,12 @@ class TestBenchServing(CustomTestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=500,
             request_rate=float("inf"),
-            other_server_args=["--chunked-prefill-size", "-1"],
+            other_server_args=[
+                "--chunked-prefill-size",
+                "-1",
+                "--mem-fraction-static",
+                "0.8",
+            ],
         )
 
         if is_in_ci():
@@ -346,7 +351,7 @@ class TestBenchServing(CustomTestCase):
                 "--speculative-num-draft-tokens",
                 "16",
                 "--mem-fraction-static",
-                "0.7",
+                "0.55",
             ],
             need_warmup=True,
             seed=42,

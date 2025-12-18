@@ -31,7 +31,10 @@ from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_int_env_var
+from sglang.srt.utils import Withable, get_int_env_var, is_npu, is_xpu
+
+_is_npu = is_npu()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -463,6 +466,12 @@ def _list_sum(a: List, b: List) -> List:
 class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, *args, enable_global_physical_experts: bool, **kwargs):
         super().__init__(*args, **kwargs)
+        if _is_xpu:
+            device = "xpu"
+        elif _is_npu:
+            device = "npu"
+        else:
+            device = "cuda"
         self._enable_global_physical_experts = enable_global_physical_experts
         self._data = torch.zeros(
             (
@@ -474,7 +483,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 ),
             ),
             dtype=torch.int,
-            device="cuda",
+            device=device,
         )
 
     def reset(self):
@@ -883,10 +892,10 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=self._server_args.device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device=self._server_args.device)
         torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 

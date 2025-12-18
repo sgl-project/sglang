@@ -290,7 +290,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
-        capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
+        capability_tuple = None
+
+        # Try CUDA first
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
+        # Fallback to XPU
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            # XPU doesn't provide traditional capability info like CUDA
+            # Assume XPU supports all quantization schemes for now
+            return True
 
         if capability_tuple is not None:
             capability = capability_tuple.to_int()
