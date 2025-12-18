@@ -1988,9 +1988,6 @@ class GemmARLayer:
         c_torch_cpu = cutlass_torch.matrix(
             l, self.max_M, self.N, c_major == "m", self.output_dtype
         )
-        # print(f"a_torch_cpu: {a_torch_cpu.shape, a_torch_cpu.stride(), a_torch_cpu.dtype}, ")
-        # print(f"b_torch_cpu: {b_torch_cpu.shape, b_torch_cpu.stride(), b_torch_cpu.dtype}, ")
-        # print(f"c_torch_cpu: {c_torch_cpu.shape, c_torch_cpu.stride(), c_torch_cpu.dtype}, ")
 
         a_tensor, _ = cutlass_torch.cute_tensor_like(
             a_torch_cpu, self.input_dtype, is_dynamic_layout=True, assumed_align=16
@@ -2001,13 +1998,8 @@ class GemmARLayer:
         c_tensor, c_torch_gpu = cutlass_torch.cute_tensor_like(
             c_torch_cpu, self.output_dtype, is_dynamic_layout=True, assumed_align=16
         )
-        # print(f"a_tensor: {a_tensor.shape, a_tensor._dtype}")
-        # print(f"b_tensor: {b_tensor.shape, b_tensor._dtype}")
-        # print(f"c_tensor: {c_tensor.shape, c_tensor._dtype}")
+
         if self.all_reduce != "none":
-            # c_tensor, c_tensor_mc, c_torch_gpu = create_mc_tensor(
-            #     c_torch_cpu, self.output_dtype, (1 if c_major == "n" else 0), is_dynamic_layout=True
-            # )
             torch_tensor_gpu = self.torch_symm_tensor
             cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
             cute_tensor.element_type = self.output_dtype
@@ -2039,8 +2031,6 @@ class GemmARLayer:
             raise RuntimeError(f"GEMM kernel cannot implement configuration")
 
         if self.all_reduce == "none":
-            # print("[GEMM_ALLREDUCE] Starting compilation (all_reduce=none)...")
-            # compile_start_time = time.time()
             self.compiled_gemm = cute.compile(
                 self.gemm_kernel,
                 a_tensor,
@@ -2049,15 +2039,10 @@ class GemmARLayer:
                 self.max_active_clusters,
                 current_stream,
             )
-            # compile_end_time = time.time()
-            # compile_duration = compile_end_time - compile_start_time
-            # print(f"[GEMM_ALLREDUCE] Compilation completed in {compile_duration:.4f} seconds")
         else:
             self.barrier_flag_memref, self.barrier_flag_mc_memref = (
                 self._create_barrier_flags(self.max_M)
             )
-            # print(f"[GEMM_ALLREDUCE] Starting compilation (all_reduce={self.all_reduce})...")
-            # compile_start_time = time.time()
             self.compiled_gemm = cute.compile(
                 self.gemm_kernel,
                 a_tensor,
@@ -2069,9 +2054,6 @@ class GemmARLayer:
                 self.max_active_clusters,
                 current_stream,
             )
-            # compile_end_time = time.time()
-            # compile_duration = compile_end_time - compile_start_time
-            # print(f"[GEMM_ALLREDUCE] Compilation completed in {compile_duration:.4f} seconds")
 
     def _create_barrier_flags(self, m: int):
         """Create barrier flags for synchronization in all-reduce."""
@@ -2152,12 +2134,6 @@ class GemmARLayer:
         input_tensor_3d = input_tensor.unsqueeze(-1)
         weight_3d = weight.unsqueeze(-1)
 
-        # a_tensor, _ = cutlass_torch.cute_tensor_like(
-        #     input_tensor_3d, self.input_dtype, is_dynamic_layout=True, assumed_align=16
-        # )
-        # b_tensor, _ = cutlass_torch.cute_tensor_like(
-        #     weight_3d, self.input_dtype, is_dynamic_layout=True, assumed_align=16
-        # )
         a_tensor = from_dlpack(input_tensor_3d, assumed_align=16)
         a_tensor.element_type = self.input_dtype
         a_tensor = a_tensor.mark_layout_dynamic(leading_dim=1)
@@ -2169,9 +2145,6 @@ class GemmARLayer:
         c_tensor.element_type = self.output_dtype
         c_tensor = c_tensor.mark_layout_dynamic(leading_dim=1)
 
-        # print(f"a_tensor: {a_tensor.shape, a_tensor._dtype}")
-        # print(f"b_tensor: {b_tensor.shape, b_tensor._dtype}")
-        # print(f"c_tensor: {c_tensor.shape, c_tensor._dtype}, actual_m: {actual_m}")
         # dist.barrier(group=self.tp_group)
         if self.all_reduce == "none":
             self.compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
@@ -2187,5 +2160,4 @@ class GemmARLayer:
             )
 
         result = self.c_torch_gpu.squeeze(-1)
-        # print(f"result: {result.shape}")
         return result[:actual_m, :]

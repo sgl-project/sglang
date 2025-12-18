@@ -1404,13 +1404,8 @@ class RowParallelLinear(LinearBase):
         if input_.shape[0] >= 128 and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
             if self.gemm_ar_attn_op:
                 output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
-                # print(f"gemm_ar_attn_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
-                # input_.shape: torch.Size([256, 2048]), input_.stride(): (2048, 1)
-                # self.weight.shape: torch.Size([8192, 2048]), self.weight.stride(): (2048, 1)
-                # self.bias: None
             else:
                 output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
-                # print(f"gemm_ar_mlp_op: input_.shape: {input_.shape}; self.weight.shape: {self.weight.shape}; output.shape: {output.shape}")
 
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
@@ -1438,15 +1433,6 @@ class RowParallelLinear(LinearBase):
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
-        # end_event.record()
-        # end_event.synchronize()
-        # execution_time = start_event.elapsed_time(end_event)
-        # if self.tp_rank == 0:
-        #     m = input_parallel.shape[0]
-        #     k = input_parallel.shape[1]
-        #     n = output_parallel.shape[1]
-        #     print(f"SGLang original gemm_ar_op: m={m}, n={n}, k={k}, forward execution time: {execution_time:.3f} ms")
-        #     # print(f"input_parallel shape: {input_parallel.shape}, output_parallel shape: {output_parallel.shape}, output shape: {output.shape}, forward execution time: {execution_time:.3f} ms")
 
         output_bias = self.bias if self.skip_bias_add else None
 

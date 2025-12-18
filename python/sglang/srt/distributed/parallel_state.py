@@ -244,7 +244,6 @@ class GroupCoordinator:
         bool  # a hint of whether to use TorchSymmMemAllReduce
     )
 
-    use_torch_symm_mem: bool  # a hint of whether to use SymmMemAllReduce
     use_nvshmem_mem: (
         bool  # a hint of whether to use NvshmemMem for symmetric memory operations
     )
