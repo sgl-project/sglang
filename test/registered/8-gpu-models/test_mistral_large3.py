@@ -18,8 +18,7 @@ from run_combined_tests import run_metrics
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# Registered to nightly-8-gpu-b200-basic suite (B200 only - requires trtllm_mla backend)
-# This suite should be run with --timeout-per-file=12000 (200 minutes)
+# B200 only - requires trtllm_mla backend
 register_cuda_ci(est_time=12000, suite="nightly-8-gpu-b200-basic", nightly=True)
 
 MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"

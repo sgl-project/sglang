@@ -108,7 +108,7 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run standard model tests
+      - name: Run H200-specific model tests
         if: always()
         timeout-minutes: 200
         env:
@@ -119,6 +119,17 @@ jobs:
           rm -rf test/performance_profiles_deepseek_v32/
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200-basic --nightly --timeout-per-file=12000 --continue-on-error
+
+      - name: Run common 8-GPU model tests
+        if: always()
+        timeout-minutes: 200
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-h200"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
 
       - name: Run test
         timeout-minutes: 30
@@ -382,7 +393,7 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run standard model tests
+      - name: Run B200-specific model tests
         if: always()
         timeout-minutes: 200
         env:
@@ -394,6 +405,18 @@ jobs:
           rm -rf test/performance_profiles_mistral_large3/
           cd test
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200-basic --nightly --timeout-per-file=12000 --continue-on-error
+
+      - name: Run common 8-GPU model tests
+        if: always()
+        timeout-minutes: 200
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-b200"
+          SGLANG_ENABLE_JIT_DEEPGEMM: "0"
+        run: |
+          cd test
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
 
   # Final check job
   check-all-jobs:

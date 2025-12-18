@@ -20,12 +20,10 @@ from run_combined_tests import run_metrics
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# Registered to nightly-8-gpu-h200-basic suite
-# This suite should be run with --timeout-per-file=8000 (133 minutes)
-# because each test runs 4 variants with both perf + accuracy
+# H200 only - DeepSeek V3.2 requires H200 for dp-attention configs
 register_cuda_ci(est_time=8000, suite="nightly-8-gpu-h200-basic", nightly=True)
 
-DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32Unified(unittest.TestCase):

@@ -17,10 +17,8 @@ from run_combined_tests import run_metrics
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# Registered to nightly-8-gpu-h200-basic suite
-# This suite should be run with --timeout-per-file=12000 (200 minutes)
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-h200-basic", nightly=True)
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-b200-basic", nightly=True)
+# Runs on both H200 and B200 via nightly-8-gpu-common suite
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 
 MINIMAX_M2_MODEL_PATH = "MiniMaxAI/MiniMax-M2"
 

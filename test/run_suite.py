@@ -38,8 +38,9 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200",
         "nightly-8-gpu-h20",
         "nightly-8-gpu-b200",
-        "nightly-8-gpu-h200-basic",  # Basic perf+accuracy tests for large models on H200
-        "nightly-8-gpu-b200-basic",  # Basic perf+accuracy tests for large models on B200
+        "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
+        "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
+        "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
     ],
     HWBackend.AMD: ["nightly-amd"],
     HWBackend.CPU: [],

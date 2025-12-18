@@ -16,7 +16,7 @@ from run_combined_tests import run_metrics
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
-# Registered to nightly-8-gpu-b200-basic suite (B200 only)
+# B200 only - requires specific hardware capabilities
 register_cuda_ci(est_time=12000, suite="nightly-8-gpu-b200-basic", nightly=True)
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
