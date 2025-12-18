@@ -1933,16 +1933,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
-def get_npu_compiler_config():
-    config = {
-        "frozen_parameter": True,
-        "tiling_schedule_optimize": True,
-        "topology_sorting_strategy": "StableRDFS",
-    }
-    return config
-
-
-def get_compiler_backend() -> str:
+def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
@@ -1957,10 +1948,10 @@ def get_compiler_backend() -> str:
                 "Please install torchair for torch.compile support on NPU."
             )
         compiler_config = CompilerConfig()
-        predefined_config = get_npu_compiler_config()
-        for k, v in predefined_config.items():
-            setattr(compiler_config.experimental_config, k, v)
-
+        compiler_config.mode = "max-autotune"
+        if mode == "npugraph_ex":
+            compiler_config.mode = "reduce-overhead"
+            compiler_config.debug.run_eagerly = True
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
@@ -2299,7 +2290,7 @@ def pyspy_dump_schedulers():
     try:
         pid = psutil.Process().pid
         # Command to run py-spy with the PID
-        cmd = f"py-spy dump --pid {pid}"
+        cmd = f"py-spy dump --native --pid {pid}"
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
@@ -3727,9 +3718,9 @@ def reserve_rope_cache_for_long_sequences(
     """Pre-expand RoPE cache for long sequences and speculative decoding."""
     from sglang.srt.environ import envs
 
-    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
-    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
-    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.get()
 
     # 1) Estimate base context upper bound
     base_ctx = (

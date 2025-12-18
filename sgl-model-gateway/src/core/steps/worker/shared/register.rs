@@ -8,7 +8,7 @@ use tracing::debug;
 use crate::{
     app_context::AppContext,
     core::Worker,
-    observability::metrics::{RouterMetrics, SmgMetrics},
+    observability::metrics::Metrics,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowResult},
 };
 
@@ -36,9 +36,6 @@ impl StepExecutor for RegisterWorkersStep {
             );
             worker_ids.push(worker_id);
         }
-
-        // Update active workers metric (legacy)
-        RouterMetrics::set_active_workers(app_context.worker_registry.len());
 
         // Collect unique worker configurations to avoid redundant metric updates
         let unique_configs: HashSet<_> = workers
@@ -70,7 +67,7 @@ impl StepExecutor for RegisterWorkersStep {
                 )
                 .len();
 
-            SmgMetrics::set_worker_pool_size(
+            Metrics::set_worker_pool_size(
                 worker_type_label,
                 connection_mode_label,
                 &model_id,
