@@ -1235,19 +1235,6 @@ class DenoisingStage(PipelineStage):
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ):
-                print(f"image_kwargs: {len(image_kwargs)}")
-                for k, v in image_kwargs.items():
-                    print(
-                        f"  {k}: {getattr(v, 'shape', type(v))}, {len(v)}, {v[0] if isinstance(v[0], int) else len(v[0]), v[0][0].shape}"
-                    )
-                print(f"pos_cond_kwargs: {len(pos_cond_kwargs)}")
-                for k, v in pos_cond_kwargs.items():
-                    print(
-                        f"  {k}: {getattr(v, 'shape', type(v))}, {len(v)}, {v[0] if isinstance(v[0], int) else (len(v[0]), v[0][0] if isinstance(v[0][0], int) else getattr(v[0][0], 'shape', type(v[0][0])))}"
-                    )
-                print(f"neg_cond_kwargs: {len(neg_cond_kwargs)}")
-                for k, v in neg_cond_kwargs.items():
-                    print(f"  {k}: {getattr(v, 'shape', type(v))}")
                 noise_pred_cond = self._predict_noise(
                     current_model=current_model,
                     latent_model_input=latent_model_input,
@@ -1328,13 +1315,6 @@ class DenoisingStage(PipelineStage):
         else:
             # Serial CFG: both cond and uncond are available locally
             assert noise_pred_cond is not None and noise_pred_uncond is not None
-            print(f"CFG scale: {current_guidance_scale}")
-            print(
-                f"noise_pred_cond stats: mean={noise_pred_cond.float().mean():.6f}, std={noise_pred_cond.float().std():.6f}"
-            )
-            print(
-                f"noise_pred_uncond stats: mean={noise_pred_uncond.float().mean():.6f}, std={noise_pred_uncond.float().std():.6f}"
-            )
 
             noise_pred = noise_pred_uncond + current_guidance_scale * (
                 noise_pred_cond - noise_pred_uncond
