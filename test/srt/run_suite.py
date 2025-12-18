@@ -220,22 +220,14 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
-        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
-        TestFile("hicache/test_hicache_storage.py", 127),
-        TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
-        TestFile("layers/attention/mamba/test_mamba_ssm.py", 50),
-        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 20),
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
-        TestFile("lora/test_lora.py", 665),
+        # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
+        # LoRA tests moved to test/registered/lora/ - AMD entries need to be re-added there
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("lora/test_lora_eviction.py", 240),
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_cross_encoder_models.py", 100),
-        TestFile("models/test_embedding_models.py", 73),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
@@ -259,8 +251,6 @@ suite_amd = {
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
-        TestFile("quant/test_triton_scaled_mm.py", 8),
-        TestFile("rl/test_fp32_lm_head.py", 30),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
@@ -274,12 +264,9 @@ suite_amd = {
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
-        TestFile("test_model_hooks.py", 3),
         # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
-        TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_no_overlap_scheduler.py", 234),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 180),
         TestFile("test_pytorch_sampling_backend.py", 66),
