@@ -3,11 +3,10 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, prepare_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 @asynccontextmanager
@@ -41,6 +40,30 @@ async def health():
     return {"status": "ok"}
 
 
+@health_router.get("/models")
+async def get_models(request: Request):
+    """Get information about the model served by this server."""
+    from sglang.multimodal_gen.registry import get_model_info
+
+    server_args: ServerArgs = request.app.state.server_args
+    model_info = get_model_info(server_args.model_path)
+
+    response = {
+        "model_path": server_args.model_path,
+        "num_gpus": server_args.num_gpus,
+        "task_type": server_args.pipeline_config.task_type.name,
+        "dit_precision": server_args.pipeline_config.dit_precision,
+        "vae_precision": server_args.pipeline_config.vae_precision,
+        "workload_type": server_args.workload_type.value,
+    }
+
+    if model_info:
+        response["pipeline_name"] = model_info.pipeline_cls.pipeline_name
+        response["pipeline_class"] = model_info.pipeline_cls.__name__
+
+    return response
+
+
 @health_router.get("/health_generate")
 async def health_generate():
     # TODO : health generate endpoint
@@ -63,18 +86,3 @@ def create_app(server_args: ServerArgs):
 
     app.state.server_args = server_args
     return app
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    server_args = prepare_server_args([])
-    configure_logger(server_args)
-    app = create_app(server_args)
-    uvicorn.run(
-        app,
-        host=server_args.host,
-        port=server_args.port,
-        log_config=None,
-        reload=False,  # Set to True during development for auto-reloading
-    )

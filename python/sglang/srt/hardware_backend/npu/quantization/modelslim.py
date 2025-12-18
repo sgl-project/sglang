@@ -159,8 +159,10 @@ class ModelSlimConfig(QuantizationConfig):
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
             self.is_dynamic = (
-                self.quant_description[prefix_in_quant_config + ".weight"]
+                self.quant_description.get(prefix_in_quant_config + ".weight", "")
                 == "W8A8_DYNAMIC"
+                or self.quant_description.get("quant_method", "")
+                == "modelslim"  # TODO: This path is for compress-tensor config，needs refactor @zhengdqin
             )
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
@@ -199,7 +201,7 @@ class ModelSlimConfig(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -211,7 +213,7 @@ class ModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
 
         assert is_skipped is not None
         return is_skipped

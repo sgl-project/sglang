@@ -29,6 +29,10 @@ class ImageGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     user: Optional[str] = None
+    negative_prompt: Optional[str] = None
+    guidance_scale: Optional[float] = None
+    num_inference_steps: Optional[int] = None
+    enable_teacache: Optional[bool] = False
 
 
 # Video API protocol models
@@ -39,7 +43,7 @@ class VideoResponse(BaseModel):
     status: str = "queued"
     progress: int = 0
     created_at: int = Field(default_factory=lambda: int(time.time()))
-    size: str = "720x1280"
+    size: str = ""
     seconds: str = "4"
     quality: str = "standard"
     remixed_from_video_id: Optional[str] = None
@@ -53,11 +57,16 @@ class VideoGenerationsRequest(BaseModel):
     input_reference: Optional[str] = None
     model: Optional[str] = None
     seconds: Optional[int] = 4
-    size: Optional[str] = "720x1280"
+    size: Optional[str] = ""
     fps: Optional[int] = None
     num_frames: Optional[int] = None
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    guidance_scale_2: Optional[float] = None
+    negative_prompt: Optional[str] = None
+    enable_teacache: Optional[bool] = False
 
 
 class VideoListResponse(BaseModel):

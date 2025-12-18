@@ -330,8 +330,31 @@ jobs:
           docker rm oracle-db || true
 
 
+  docker-build-test:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/gateway.Dockerfile
+          push: false
+          tags: sglang-router:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   finish:
-    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests]
+    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests, docker-build-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

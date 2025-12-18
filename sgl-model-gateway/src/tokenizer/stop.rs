@@ -95,11 +95,11 @@ impl StopSequenceDecoder {
         if self.config.stop_tokens.contains(&token_id) {
             self.stopped = true;
 
-            // Flush any jailed text before stopping
+            // Flush any jailed text before stopping - use mem::take to avoid clone
             if !self.jail_buffer.is_empty() {
-                let output = self.jail_buffer.clone();
-                self.jail_buffer.clear();
-                return Ok(SequenceDecoderOutput::StoppedWithText(output));
+                return Ok(SequenceDecoderOutput::StoppedWithText(std::mem::take(
+                    &mut self.jail_buffer,
+                )));
             }
             return Ok(SequenceDecoderOutput::Stopped);
         }
@@ -186,8 +186,10 @@ impl StopSequenceDecoder {
 
         if let Some(split_pos) = best_split_pos {
             // Hold the partial match, flush the rest
-            // Drain [0..split_pos] as output, keep [split_pos..] in jail_buffer
-            let to_output = self.jail_buffer.drain(..split_pos).collect::<String>();
+            // Use split_off for zero-copy: keeps [0..split_pos] in place, returns [split_pos..]
+            // Then swap so we output the prefix and keep the suffix
+            let suffix = self.jail_buffer.split_off(split_pos);
+            let to_output = std::mem::replace(&mut self.jail_buffer, suffix);
 
             if to_output.is_empty() {
                 Ok(SequenceDecoderOutput::Held)
@@ -210,7 +212,8 @@ impl StopSequenceDecoder {
         &mut self,
         token_ids: &[TokenIdType],
     ) -> Result<Vec<SequenceDecoderOutput>> {
-        let mut outputs = Vec::new();
+        // Pre-allocate with exact capacity to avoid reallocations
+        let mut outputs = Vec::with_capacity(token_ids.len());
         for &token_id in token_ids {
             outputs.push(self.process_token(token_id)?);
         }
@@ -220,9 +223,8 @@ impl StopSequenceDecoder {
     /// Flush any held text
     pub fn flush(&mut self) -> SequenceDecoderOutput {
         if !self.jail_buffer.is_empty() {
-            let output = self.jail_buffer.clone();
-            self.jail_buffer.clear();
-            SequenceDecoderOutput::Text(output)
+            // Use mem::take to avoid clone - transfers ownership and leaves empty string
+            SequenceDecoderOutput::Text(std::mem::take(&mut self.jail_buffer))
         } else {
             SequenceDecoderOutput::Text(String::new())
         }

@@ -92,7 +92,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         with torch.device(model_runner.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
+            self.out_cache_loc = torch.ones(
+                (self.max_num_token,), dtype=self._cache_loc_dtype()
+            )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
@@ -203,6 +205,9 @@ class EAGLEDraftExtendCudaGraphRunner:
 
     def _create_graph(self):
         return torch.cuda.CUDAGraph()
+
+    def _cache_loc_dtype(self):
+        return torch.int64
 
     def _capture_init(self, run_once_fn):
         for _ in range(2):
