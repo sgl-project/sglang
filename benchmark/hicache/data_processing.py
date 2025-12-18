@@ -104,7 +104,8 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path):
-        dataset_path = download_and_cache_file(SHAREGPT_URL)
+        token = os.getenv("HF_TOKEN", None)
+        dataset_path = download_and_cache_file(SHAREGPT_URL, token=token)
 
     # Load the dataset.
     with open(dataset_path) as f:
