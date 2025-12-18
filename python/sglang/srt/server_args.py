@@ -316,9 +316,7 @@ def parse_kv_cache_per_layer_dtype(spec: str, num_layers: int) -> Dict[int, str]
                     f"Invalid range '{range_part}': layer indices must be non-negative"
                 )
             if start > end:
-                raise ValueError(
-                    f"Invalid range '{range_part}': start must be <= end"
-                )
+                raise ValueError(f"Invalid range '{range_part}': start must be <= end")
             if end >= num_layers:
                 raise ValueError(
                     f"Invalid range '{range_part}': end index {end} >= num_layers {num_layers}"

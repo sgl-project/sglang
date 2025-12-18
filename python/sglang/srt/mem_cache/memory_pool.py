@@ -793,14 +793,22 @@ class MHATokenToKVPool(KVCache):
                         # Full-size buffer for int8
                         self.k_buffer.append(
                             torch.zeros(
-                                (self.size + self.page_size, self.head_num, self.head_dim),
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
                                 dtype=store_dtype,
                                 device=self.device,
                             )
                         )
                         self.v_buffer.append(
                             torch.zeros(
-                                (self.size + self.page_size, self.head_num, self.head_dim),
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
                                 dtype=store_dtype,
                                 device=self.device,
                             )
@@ -824,14 +832,22 @@ class MHATokenToKVPool(KVCache):
                         # Standard buffer (bf16, fp8, etc.)
                         self.k_buffer.append(
                             torch.zeros(
-                                (self.size + self.page_size, self.head_num, self.head_dim),
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
                                 dtype=store_dtype,
                                 device=self.device,
                             )
                         )
                         self.v_buffer.append(
                             torch.zeros(
-                                (self.size + self.page_size, self.head_num, self.head_dim),
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
                                 dtype=store_dtype,
                                 device=self.device,
                             )

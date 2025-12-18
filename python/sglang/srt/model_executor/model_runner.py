@@ -1510,10 +1510,7 @@ class ModelRunner:
             elif layer_dtype == "int8":
                 # int8: full head_dim, 1 byte per value
                 layer_cell_size = (
-                    num_kv_heads
-                    * head_dim
-                    * 2  # key and value
-                    * 1  # int8 is one byte
+                    num_kv_heads * head_dim * 2 * 1  # key and value  # int8 is one byte
                 )
                 # Add scale and zero buffers (float32)
                 layer_cell_size += (
@@ -1532,7 +1529,12 @@ class ModelRunner:
                     * torch._utils._element_size(layer_dtype)
                 )
                 layer_cell_size = (layer_cell_size // 2) + (
-                    (num_kv_heads * head_dim * 2 * torch._utils._element_size(layer_dtype))
+                    (
+                        num_kv_heads
+                        * head_dim
+                        * 2
+                        * torch._utils._element_size(layer_dtype)
+                    )
                     // scale_block_size
                 )
             else:
@@ -2260,7 +2262,8 @@ class ModelRunner:
             return None
 
         log_info_on_rank0(
-            logger, f"Using per-layer KV cache dtypes: {len(overrides)} layers overridden"
+            logger,
+            f"Using per-layer KV cache dtypes: {len(overrides)} layers overridden",
         )
 
         return dtype_per_layer
