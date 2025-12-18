@@ -31,28 +31,18 @@ def compute_cos_sin_cache_half(
 
 
 def _expand_neox_full_repeat(half: torch.Tensor) -> torch.Tensor:
-    """Expand [T, D] -> [T, 2D] by repeating each element twice: [a0,a0,a1,a1,...].
-
-    This matches some NeoX caches expanded to head_size for interleaved layout.
-    The CUDA kernel has a fast path that downsamples such 'full' caches to half.
-    """
-    # half: [T, D]
-    out = torch.empty((half.shape[0], half.shape[1] * 2), dtype=half.dtype, device=half.device)
+    out = torch.empty(
+        (half.shape[0], half.shape[1] * 2), dtype=half.dtype, device=half.device
+    )
     out[:, 0::2] = half
     out[:, 1::2] = half
     return out
 
-
 def _expand_llama_full_cat(half: torch.Tensor) -> torch.Tensor:
-    """Expand [T, D] -> [T, 2D] by concatenation: [a0,a1,..., a0,a1,...]."""
     return torch.cat([half, half], dim=-1)
 
-
 def _make_misaligned_contiguous_like(t: torch.Tensor, offset_elems: int = 1) -> torch.Tensor:
-    """Create a contiguous tensor with same shape/dtype/device but misaligned base pointer.
-
-    Achieved via a 1D buffer and a view with a storage offset.
-    """
+    # Create a contiguous tensor with same shape/dtype/device but misaligned base pointer.
     numel = t.numel()
     buf = torch.empty((numel + offset_elems,), device=t.device, dtype=t.dtype)
     out = buf[offset_elems : offset_elems + numel].view_as(t)
@@ -65,7 +55,6 @@ def _make_tensor(shape: Tuple[int, ...], *, dtype: torch.dtype, device: str, mis
     numel = int(np.prod(shape))
     if not misalign:
         return torch.randn(*shape, dtype=dtype, device=device)
-    # Misaligned but contiguous
     buf = torch.randn((numel + 1,), dtype=dtype, device=device)
     return buf[1 : 1 + numel].view(shape)
 
@@ -81,24 +70,13 @@ def _torch_naive_rope_inplace(
     head_size: int,
     interleaved: bool,
 ) -> None:
-    """Naive RoPE on GPU using PyTorch tensor ops (in-place on q/k).
-
-    Supports:
-      - interleaved=True  (NeoX-style [x0,y0,x1,y1,...])
-      - interleaved=False (LLaMA/GPT-J-style [x...][y...])
-      - q/k in 2D ([T, H*D]) or 3D ([T, H, D]) layouts
-      - k can be None (Q-only)
-    """
+    """Naive RoPE on GPU using PyTorch tensor ops (in-place on q/k)."""
 
     def _as_3d(x: torch.Tensor, h: int) -> torch.Tensor:
         if x.dim() == 3:
             return x
-        # 2D flattened
         return x.view(x.shape[0], h, head_size)
 
-    # Normalize cos/sin for interleaved fast-path compat:
-    # - interleaved expects cos/sin: [T, embed_dim] where embed_dim = rotary_dim/2
-    # - if provided as full head_size (repeat format), downsample like the CUDA kernel does
     if interleaved and cos.shape[1] == head_size:
         half = head_size // 2
         cos = cos.view(cos.shape[0], half, 2).select(2, 0).contiguous()
@@ -116,10 +94,8 @@ def _torch_naive_rope_inplace(
 
     def _apply(x: torch.Tensor, h: int) -> None:
         x3 = _as_3d(x, h)
-        # Only rotate the first rot_dim elements; leave tail intact.
         xr = x3[..., :rot_dim]
         if interleaved:
-            # [T,H,embed_dim,2]
             xr2 = xr.view(xr.shape[0], xr.shape[1], embed_dim, 2)
             x0 = xr2[..., 0]
             x1 = xr2[..., 1]
@@ -144,7 +120,7 @@ def _torch_naive_rope_inplace(
         _apply(k, num_kv_heads)
 
 
-def _predict_can_vectorize_all(
+def _predict_vec_flags(
     *,
     dtype: torch.dtype,
     interleaved: bool,
@@ -157,34 +133,49 @@ def _predict_can_vectorize_all(
     key_token_stride_elems: int,
     head_stride_query_elems: int,
     head_stride_key_elems: int,
-) -> bool:
+) -> Tuple[bool, bool]:
+    """Predict flags for the *optimized* kernel dispatch:
+    - use_vec_compute: vectorized compute loop (pairs_per_step) is allowed
+    - qk_aligned16: Q/K supports 16B vec load/store (otherwise use unaligned Q/K path)
+    """
     kVecBytes = 16
     elem_bytes = torch.tensor([], dtype=dtype).element_size()
     kElePerVec = kVecBytes // elem_bytes
     pairs_per_step = (kElePerVec // 2) if interleaved else kElePerVec
 
-    can = True
+    # A) vectorized compute viability (cos/sin alignment + embed_dim multiple)
+    use_vec_compute = True
     if embed_dim_for_rotation % pairs_per_step != 0:
-        can = False
-    if (query.data_ptr() % kVecBytes) != 0:
-        can = False
-    if (cos.data_ptr() % kVecBytes) != 0:
-        can = False
-    if (sin.data_ptr() % kVecBytes) != 0:
-        can = False
-    if key is not None and (key.data_ptr() % kVecBytes) != 0:
-        can = False
+        use_vec_compute = False
 
+    # cos/sin alignment & row stride for vector loads (float2/float4 reinterprets)
+    if (cos.data_ptr() % kVecBytes) != 0:
+        use_vec_compute = False
+    if (sin.data_ptr() % kVecBytes) != 0:
+        use_vec_compute = False
+    if ((cos.shape[1] * elem_bytes) % kVecBytes) != 0:
+        use_vec_compute = False
+    if ((sin.shape[1] * elem_bytes) % kVecBytes) != 0:
+        use_vec_compute = False
+
+    # B) Q/K 16B alignment (only affects aligned_qk template)
+    qk_aligned16 = True
+    if (query.data_ptr() % kVecBytes) != 0:
+        qk_aligned16 = False
     if (query_token_stride_elems * elem_bytes) % kVecBytes != 0:
-        can = False
+        qk_aligned16 = False
     if (head_stride_query_elems * elem_bytes) % kVecBytes != 0:
-        can = False
+        qk_aligned16 = False
+
     if key is not None:
+        if (key.data_ptr() % kVecBytes) != 0:
+            qk_aligned16 = False
         if (key_token_stride_elems * elem_bytes) % kVecBytes != 0:
-            can = False
+            qk_aligned16 = False
         if (head_stride_key_elems * elem_bytes) % kVecBytes != 0:
-            can = False
-    return can
+            qk_aligned16 = False
+
+    return use_vec_compute, qk_aligned16
 
 
 def _predict_use_grid_2d(
@@ -193,20 +184,23 @@ def _predict_use_grid_2d(
     num_heads: int,
     num_kv_heads: int,
     embed_dim_for_rotation: int,
-    can_vectorize_all: bool,
+    use_vec_compute: bool,
     dtype: torch.dtype,
     interleaved: bool,
 ) -> Tuple[bool, int]:
-    # Mirror the C++ launch config logic in rotary_embedding.cu (approx).
     kVecBytes = 16
     elem_bytes = torch.tensor([], dtype=dtype).element_size()
     kElePerVec = kVecBytes // elem_bytes
     pairs_per_step = (kElePerVec // 2) if interleaved else kElePerVec
-    launch_pairs_per_thread = pairs_per_step if can_vectorize_all else 1
+    launch_pairs_per_thread = pairs_per_step if use_vec_compute else 1
 
     max_pairs = max(num_heads * embed_dim_for_rotation, num_kv_heads * embed_dim_for_rotation)
     total_threads_needed = (max_pairs + launch_pairs_per_thread - 1) // launch_pairs_per_thread
-    threads_per_block_2d = min(256, max(128, embed_dim_for_rotation))
+
+    def _round_up32(x: int) -> int:
+        return ((x + 31) // 32) * 32
+
+    threads_per_block_2d = min(512, max(128, _round_up32(min(total_threads_needed, 512))))
     blocks_per_token_2d = (total_threads_needed + threads_per_block_2d - 1) // threads_per_block_2d
     use_grid_2d = (num_tokens <= 4) and (blocks_per_token_2d > 1)
     return use_grid_2d, blocks_per_token_2d
@@ -256,13 +250,12 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
 
     print(
         "Legend:\n"
-        "  - vec: vec16 => predicted to take the 16B vectorized path; scalar => predicted scalar/fallback path\n"
+        "  - vec: vec16 => predicted 16B-aligned vector path; vec16u => vectorized compute but unaligned Q/K load/store; scalar => scalar/fallback\n"
         "  - grid: 1D => one block per token; 2D => split one token across multiple blocks (only when num_tokens<=4)\n"
         "  - bpt2d: estimated blocks-per-token if 2D were used (useful to judge 'small grid but many blocks per token')\n"
     )
 
     cases: List[BenchCase] = [
-        # Baseline (vectorized, interleaved)
         BenchCase(
             name="base_bf16_int2d_k_halfcache",
             batch_size=1,
@@ -279,7 +272,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 2, 4, 32, 256, 3015, 8192],
             bench_native=True,
         ),
-        # Non-interleaved (GPT-J/LLaMA-style)
         BenchCase(
             name="base_bf16_nonint2d_k_llamacache",
             batch_size=1,
@@ -296,7 +288,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 4, 256, 8192],
             bench_native=False,
         ),
-        # Force non-vectorized path via misaligned Q pointer
         BenchCase(
             name="base_bf16_int2d_k_halfcache_misalignQ",
             batch_size=1,
@@ -313,7 +304,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 4, 256, 8192],
             bench_native=False,
         ),
-        # Key is optional (Q-only)
         BenchCase(
             name="base_bf16_int2d_noK_halfcache",
             batch_size=1,
@@ -330,7 +320,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 4, 256, 8192],
             bench_native=False,
         ),
-        # 3D layout path ([T, H, D])
         BenchCase(
             name="base_bf16_int3d_k_halfcache",
             batch_size=1,
@@ -347,7 +336,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 4, 256, 8192],
             bench_native=False,
         ),
-        # fp16 dtype
         BenchCase(
             name="base_fp16_int2d_k_halfcache",
             batch_size=1,
@@ -364,7 +352,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 4, 256, 8192],
             bench_native=False,
         ),
-        # Qwen-image observed config
         BenchCase(
             name="qwen_image_bf16_int2d_k_halfcache",
             batch_size=1,
@@ -381,7 +368,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 4, 3015],
             bench_native=False,
         ),
-        # Grid-2D stress (num_tokens<=4 and blocks_per_token>1)
         BenchCase(
             name="grid2d_stress_bf16_int2d_k_neoxfullrepeat",
             batch_size=1,
@@ -398,7 +384,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             seq_lens=[1, 2, 4],
             bench_native=False,
         ),
-        # Large batch representative
         BenchCase(
             name="batch32_bf16_int2d_k_halfcache",
             batch_size=32,
@@ -470,9 +455,7 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             )
             print("-" * 100)
         except Exception as e:
-            print(
-                f"\nSkipping case {case.name}: {e}"
-            )
+            print(f"\nSkipping case {case.name}: {e}")
             continue
 
         header = f"{'seq_len':>8}"
@@ -504,13 +487,14 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 else:
                     raise ValueError(f"Unknown layout={case.layout}")
 
-                query = _make_tensor(query_shape, dtype=case.dtype, device=device, misalign=(case.misalign == "q"))
+                query = _make_tensor(
+                    query_shape, dtype=case.dtype, device=device, misalign=(case.misalign == "q")
+                )
                 key = _make_tensor(key_shape, dtype=case.dtype, device=device, misalign=False)
                 if case.key_mode == "no_k":
                     key = None
-                positions = torch.arange(
-                    seq_len, device=device, dtype=torch.int64
-                ).repeat(case.batch_size)
+
+                positions = torch.arange(seq_len, device=device, dtype=torch.int64).repeat(case.batch_size)
                 cos = cos_cache[positions]
                 sin = sin_cache[positions]
 
@@ -525,7 +509,7 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 sgl_pos_time = None
                 vllm_time = None
                 fa_time = None
-            except (RuntimeError, torch.AcceleratorError) as e:
+            except (RuntimeError, torch.AcceleratorError):
                 print(f"{seq_len:8d} | SKIP (CUDA error from previous iteration)")
                 torch.cuda.synchronize()
                 continue
@@ -533,7 +517,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             def fn_native() -> None:
                 q = query.clone()
                 if key is None:
-                    # Native reference expects both q and k; skip in this mode.
                     raise RuntimeError("native requires key")
                 k = key.clone()
                 native_rope.forward_native(positions, q, k)
@@ -545,7 +528,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
             elif case.bench_native:
                 row_str += f" | {'N/A':>12}"
 
-            # Torch naive baseline (works for key=None / interleaved=False / 2D/3D layouts).
             @torch.no_grad()
             def fn_naive() -> None:
                 qn = query.clone()
@@ -570,9 +552,7 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 k = None if key is None else key.clone()
                 sgl_rotary_cos_sin(cos, sin, q, k, case.head_size, case.interleaved)
 
-            ms, _, _ = triton.testing.do_bench(
-                fn_sgl_cos_sin, quantiles=[0.5, 0.2, 0.8]
-            )
+            ms, _, _ = triton.testing.do_bench(fn_sgl_cos_sin, quantiles=[0.5, 0.2, 0.8])
             sgl_cos_sin_time = 1000 * ms
             row_str += f" | {sgl_cos_sin_time:16.4f}"
 
@@ -596,8 +576,7 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 row_str += f" | {'ERROR':>12}"
                 sgl_pos_time = None
 
-            # Flags: predicted vectorization + whether C++ would pick grid2d (approx)
-            # Compute embed_dim_for_rotation consistent with C++ checks:
+            # Prediction flags (updated for optimized kernel)
             rot_dim_from_cache = int(cos.shape[1])
             embed_dim_for_rotation = rot_dim_from_cache if case.interleaved else (rot_dim_from_cache // 2)
 
@@ -623,7 +602,7 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                     key_token_stride = key_hidden
                     head_stride_key = int(key.stride(1))
 
-            can_vec = _predict_can_vectorize_all(
+            use_vec_compute, qk_aligned16 = _predict_vec_flags(
                 dtype=case.dtype,
                 interleaved=case.interleaved,
                 embed_dim_for_rotation=embed_dim_for_rotation,
@@ -642,15 +621,18 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 num_heads=case.num_heads,
                 num_kv_heads=(0 if key is None else case.num_kv_heads),
                 embed_dim_for_rotation=embed_dim_for_rotation,
-                can_vectorize_all=can_vec,
+                use_vec_compute=use_vec_compute,
                 dtype=case.dtype,
                 interleaved=case.interleaved,
             )
 
-            vec_str = "vec16" if can_vec else "scalar"
+            if use_vec_compute:
+                vec_str = "vec16" if qk_aligned16 else "vec16u"
+            else:
+                vec_str = "scalar"
+
             grid_str = "2D" if use_grid2d else "1D"
-            bpt2d_str = str(bpt2d)
-            row_str += f" | {vec_str:>6} | {grid_str:>4} | {bpt2d_str:>5}"
+            row_str += f" | {vec_str:>6} | {grid_str:>4} | {str(bpt2d):>5}"
 
             if HAS_VLLM:
                 vllm_rope = vLLMRotaryEmbedding(
@@ -679,6 +661,8 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
 
             if HAS_FLASH_ATTN:
                 try:
+                    from flash_attn.layers.rotary import RotaryEmbedding as FlashRotaryEmbedding  # noqa
+
                     flash_rotary = FlashRotaryEmbedding(case.rotary_dim, device=device)
                     qkv = torch.randn(
                         case.batch_size,
@@ -694,9 +678,7 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                         qkv_fa = qkv.clone()
                         flash_rotary(qkv_fa, seqlen_offset=0)
 
-                    ms, _, _ = triton.testing.do_bench(
-                        fn_flash_attn, quantiles=[0.5, 0.2, 0.8]
-                    )
+                    ms, _, _ = triton.testing.do_bench(fn_flash_attn, quantiles=[0.5, 0.2, 0.8])
                     fa_time = 1000 * ms
                     row_str += f" | {fa_time:14.4f}"
                 except Exception:
@@ -722,7 +704,6 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 }
             )
 
-        # Print averages as the last row of the table (instead of a multi-line block).
         native_vals = [r["native"] for r in results if r["native"] is not None]
         naive_vals = [r["naive"] for r in results if r["naive"] is not None]
         sgl_cos_sin_vals = [r["sgl_cos_sin"] for r in results if r["sgl_cos_sin"] is not None]
