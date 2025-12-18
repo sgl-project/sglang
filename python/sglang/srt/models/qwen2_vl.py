@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    patch_conv3d,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -196,7 +197,8 @@ class Qwen2VisionPatchEmbed(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         L, C = x.shape
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.embed_dim)
+        # x = self.proj(x).view(L, self.embed_dim)
+        x = patch_conv3d(self.proj, x).view(L, self.embed_dim)
         return x
 
 
