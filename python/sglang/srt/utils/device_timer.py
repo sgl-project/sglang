@@ -7,9 +7,6 @@ import torch
 
 
 class DeviceTimer:
-    # Delayed reporting to allow async cuda execution
-    _DELAY_THRESHOLD = 2
-
     def __init__(self, reporter: Callable[[str, float], None]):
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporter = reporter
@@ -24,8 +21,12 @@ class DeviceTimer:
             self._report()
 
     def _report(self):
-        while len(self._intervals) >= self._DELAY_THRESHOLD:
-            interval = self._intervals.popleft()
+        while True:
+            interval = self._intervals[0]
+            if not interval.end_event.query():
+                break
+
+            self._intervals.popleft()
             self._reporter(interval.category, interval.elapsed_time() / 1000.0)
 
 
