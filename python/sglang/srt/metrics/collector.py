@@ -638,7 +638,6 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["mode"],
         )
 
-        print(f"hi {labels=} {envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get()=}")
         if (labels["moe_ep_rank"] == 0) and envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
