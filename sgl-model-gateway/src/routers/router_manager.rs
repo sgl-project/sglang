@@ -217,10 +217,15 @@ impl RouterManager {
                 )
             });
 
+            // TODO refactor all RouterId constructions
+            let connection_mode_str = match workers.first().unwrap().connection_mode() {
+                ConnectionMode::Http => "http",
+                ConnectionMode::Grpc { .. } => "grpc",
+            };
             let router_id = if has_pd_workers {
-                RouterId::new("http-pd".to_string())
+                RouterId::new(format!("{connection_mode_str}-pd"))
             } else {
-                RouterId::new("http-regular".to_string())
+                RouterId::new(format!("{connection_mode_str}-regular"))
             };
 
             if let Some(router) = self.routers.get(&router_id) {
