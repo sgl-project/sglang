@@ -270,8 +270,41 @@ class MultimodalDataItem:
         return self.is_image() or self.is_video() or self.is_audio()
 
     def validate(self):
-        ...
-        # TODO
+        """Validate the multimodal data item for correctness."""
+        # Validate modality
+        if not self.is_valid():
+            raise ValueError(
+                f"Invalid modality: {self.modality}. "
+                f"Must be one of IMAGE, MULTI_IMAGES, VIDEO, or AUDIO."
+            )
+
+        # Validate that exactly one of feature or precomputed_embeddings is set
+        has_feature = self.feature is not None and not self.is_empty_list(self.feature)
+        has_embeddings = self.precomputed_embeddings is not None and not self.is_empty_list(
+            self.precomputed_embeddings
+        )
+
+        if not has_feature and not has_embeddings:
+            raise ValueError(
+                "MultimodalDataItem must have either 'feature' or "
+                "'precomputed_embeddings' set."
+            )
+
+        # Validate tensor types if feature is set
+        if has_feature and not isinstance(self.feature, (torch.Tensor, np.ndarray, list)):
+            raise TypeError(
+                f"'feature' must be a torch.Tensor, np.ndarray, or list, "
+                f"got {type(self.feature).__name__}"
+            )
+
+        # Validate tensor types if precomputed_embeddings is set
+        if has_embeddings and not isinstance(
+            self.precomputed_embeddings, (torch.Tensor, np.ndarray, list)
+        ):
+            raise TypeError(
+                f"'precomputed_embeddings' must be a torch.Tensor, np.ndarray, or list, "
+                f"got {type(self.precomputed_embeddings).__name__}"
+            )
 
     @staticmethod
     def from_dict(obj: dict):
