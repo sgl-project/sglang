@@ -243,6 +243,11 @@ class CudaPlatformBase(Platform):
                 "torch.float16 or torch.bfloat16."
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
+        elif cls.has_device_capability(120):
+            logger.info(
+                "FlashAttention not supported for SM120"
+            )
+            target_backend = AttentionBackendEnum.TORCH_SDPA
 
         # FlashAttn is valid for the model, checking if the package is
         # installed.
