@@ -20,60 +20,16 @@ pip3 install sgl-kernel --upgrade
 ```
 
 ## Building from Source
-
-### CUDA (NVIDIA GPUs)
 Requires
 - CMake ≥3.31,
 - Python ≥3.10
 - scikit-build-core
 - ninja(optional)
 
+### Use Makefile to build sgl-kernel
+
 ```bash
 make build
-```
-
-### ROCm (AMD GPUs)
-
-For AMD GPUs with ROCm, use the dedicated setup script:
-
-```bash
-cd sgl-kernel
-
-# Install in development mode
-python setup_rocm.py develop
-
-# Or build a wheel
-python setup_rocm.py bdist_wheel
-```
-
-**Supported GPU architectures:** gfx942 (MI300), gfx950 (MI350)
-
-The build automatically detects your GPU architecture. To manually specify:
-
-```bash
-AMDGPU_TARGET=gfx942 python setup_rocm.py develop
-```
-
-#### Important: MI350 (gfx950) Installation
-
-If you have a pre-built `sgl-kernel` package installed (e.g., from PyPI), you **must uninstall it first** before using the source build. The pre-built package may not include MI350-specific kernels like the deterministic all-reduce:
-
-```bash
-# Uninstall any pre-built sgl-kernel package
-pip uninstall sgl-kernel -y
-
-# Then build from source
-cd sgl-kernel
-python setup_rocm.py develop
-```
-
-To verify the deterministic all-reduce kernel is available:
-
-```python
-import sgl_kernel
-# These functions should be available:
-print(sgl_kernel.deterministic_all_reduce_reg)
-print(sgl_kernel.deterministic_all_reduce_unreg)
 ```
 
 ## Contribution
@@ -144,92 +100,7 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
    - Incorporation of PDL (Programmatic Dependent Launch) effects into individual kernel results
    - More realistic performance data on PDL-supported architectures (SM >= 90)
 
-3. Run test suite:
-
-```bash
-# Run all tests
-cd sgl-kernel
-pytest tests/ -v
-
-# Run specific test
-pytest tests/test_activation.py -v
-```
-
-### ROCm/AMD Deterministic Inference
-
-For AMD GPUs (MI300/MI350), SGLang supports deterministic inference using a custom all-reduce kernel.
-
-#### Setup
-
-1. **Uninstall pre-built sgl-kernel** (if installed):
-   ```bash
-   pip uninstall sgl-kernel -y
-   ```
-
-2. **Build from source** (ensures deterministic kernel is included):
-   ```bash
-   cd sgl-kernel
-   python setup_rocm.py develop
-   ```
-
-3. **Pre-compile aiter modules** (required before multi-GPU server launch to avoid deadlock):
-   ```bash
-   # Clean any stale lock files
-   rm -f /path/to/aiter/aiter/jit/build/*/build/.ninja_lock
-   rm -f /path/to/aiter/aiter/jit/build/lock_*
-
-   # Pre-compile aiter modules with single GPU
-   python3 -c "
-   import torch
-   torch.cuda.set_device(0)
-   from aiter.ops.triton.rmsnorm import rms_norm
-   x = torch.randn(1, 4096, dtype=torch.bfloat16, device='cuda:0')
-   weight = torch.randn(4096, dtype=torch.bfloat16, device='cuda:0')
-   rms_norm(x, weight, 1e-6)
-   torch.cuda.synchronize()
-   print('aiter pre-compiled successfully')
-   "
-   ```
-
-#### Running Deterministic Inference
-
-1. **Launch the server**:
-   ```bash
-   source scripts/killall_sglang.sh rocm && \
-   SGLANG_PREFER_CUSTOM_ALLREDUCE_FOR_DETERMINISM=1 \
-   python -m sglang.launch_server \
-       --model-path Qwen/Qwen3-8B \
-       --tp 8 \
-       --attention-backend triton \
-       --enable-deterministic-inference \
-       --host 127.0.0.1 \
-       --port 30000
-   ```
-
-2. **Test determinism**:
-   ```bash
-   python3 -m sglang.test.test_deterministic --n-trials 50
-   ```
-
-#### ROCm/AMD-specific Kernel Tests
-
-For testing the deterministic all-reduce kernel directly:
-
-```bash
-# Test deterministic custom all-reduce kernel (requires 2+ GPUs)
-python tests/test_amd_deterministic_custom_allreduce.py
-
-# Test NCCL all-reduce determinism behavior (requires 2+ GPUs)
-python tests/test_amd_nccl_allreduce_determinism.py
-
-# Benchmark deterministic all-reduce vs standard all-reduce
-python benchmark/bench_amd_deterministic_allreduce.py
-```
-
-These tests verify:
-- **test_amd_deterministic_custom_allreduce.py**: Tests that the deterministic custom all-reduce kernel produces consistent results across different batch sizes
-- **test_amd_nccl_allreduce_determinism.py**: Tests NCCL all-reduce behavior to demonstrate non-determinism with varying batch sizes
-- **bench_amd_deterministic_allreduce.py**: Benchmarks latency comparison between all-reduce methods
+3. Run test suite
 
 ## Kernel Size Analysis
 

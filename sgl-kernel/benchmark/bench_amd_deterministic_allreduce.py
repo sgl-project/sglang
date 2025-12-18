@@ -2,16 +2,8 @@
 Benchmark latency comparison between all-reduce and reduce-scatter + all-gather
 for different batch sizes.
 
-Setup (Important for MI350/gfx950):
-    If a pre-built sgl-kernel package is installed, uninstall it first:
-        pip uninstall sgl-kernel -y
-    
-    Then build from source:
-        cd sgl-kernel
-        python setup_rocm.py develop
-
 Usage:
-    python bench_amd_deterministic_allreduce.py
+    python benchmark_ar.py
 """
 
 import multiprocessing as mp
