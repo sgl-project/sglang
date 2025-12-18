@@ -501,6 +501,8 @@ class Req:
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        # For diffusion LLM: dllm_ids tracks the ids with mask tokens
+        self.dllm_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -796,14 +798,15 @@ class Req:
         return self.dllm_config is not None
 
     def _init_fill_ids_for_dllm(self):
-        if not self.fill_ids:
-            self.fill_ids = (
+        if not self.dllm_ids:
+            self.dllm_ids = (
                 self.origin_input_ids
                 + [self.dllm_config.mask_id] * self.dllm_config.block_size
             )
         else:
             self.dllm_block_offset += self.dllm_config.block_size
-            self.fill_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+        self.fill_ids = self.dllm_ids
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():

@@ -1835,7 +1835,6 @@ class Scheduler(
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
             if self.enable_dynamic_chunking:
                 history_len = len(self.chunked_req.prefix_indices)
                 dynamic_size = self.predict_next_chunk_size(history_len)
