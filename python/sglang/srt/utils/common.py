@@ -1506,7 +1506,11 @@ def add_prometheus_track_response_middleware(app):
         response = await call_next(request)
 
         route = request.scope.get("route")
-        endpoint = route.path if route else "Unknown"
+        endpoint = (
+            route.path
+            if route
+            else ("unknown_route" if response.status_code == 404 else request.url.path)
+        )
 
         http_response_status_counter.labels(
             endpoint=endpoint,

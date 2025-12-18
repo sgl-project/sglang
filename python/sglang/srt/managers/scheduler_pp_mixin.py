@@ -614,7 +614,7 @@ class SchedulerPPMixin:
                 forward_batch = ForwardBatch.init_new(
                     model_worker_batch, self.tp_worker.model_runner
                 )
-                _, _ = self.tp_worker.model_runner.forward(
+                _ = self.tp_worker.model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
 
