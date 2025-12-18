@@ -153,6 +153,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    configure_ipv6,
     cpu_has_amx_support,
     dynamic_import,
     enable_show_time_cost,
@@ -682,7 +683,14 @@ class ModelRunner:
             monkey_patch_p2p_access_check()
 
         if self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
+            # Extract host from dist_init_addr and use self.dist_port to avoid
+            # port conflicts when data-parallel-size > 1 in multi-node mode
+            if self.server_args.dist_init_addr.startswith("["):  # IPv6 address
+                _, host = configure_ipv6(self.server_args.dist_init_addr)
+                dist_init_method = f"tcp://{host}:{self.dist_port}"
+            else:  # IPv4 address
+                host = self.server_args.dist_init_addr.split(":")[0]
+                dist_init_method = f"tcp://{host}:{self.dist_port}"
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
