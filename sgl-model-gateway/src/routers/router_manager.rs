@@ -118,12 +118,24 @@ impl RouterManager {
             info!("Initializing RouterManager in single-router mode");
 
             for connection_mode in [ConnectionMode::Http, ConnectionMode::Grpc { port: None }] {
-                let router = Arc::from(
-                    RouterFactory::create_router_by_connection_mode(app_context, &connection_mode)
-                        .await?,
-                );
                 let router_id =
                     Self::determine_router_id(&config.router_config.mode, &connection_mode);
+                let router = match RouterFactory::create_router_by_connection_mode(
+                    app_context,
+                    &connection_mode,
+                )
+                .await
+                {
+                    Ok(x) => Arc::from(x),
+                    Err(e) => {
+                        info!(
+                            "Skip creating router with id {} since error: {:?}",
+                            router_id.as_str(),
+                            e
+                        );
+                        continue;
+                    }
+                };
 
                 info!("Created router with ID: {}", router_id.as_str());
                 manager.register_router(router_id.clone(), router);
