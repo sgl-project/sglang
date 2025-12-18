@@ -5,11 +5,22 @@ from typing import Any, List, Optional
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _in_piecewise_cuda_graph = False
+_in_torch_compile = False
 
 
 def is_in_piecewise_cuda_graph():
     return _in_piecewise_cuda_graph
 
+def is_in_torch_compile():
+    return _in_torch_compile
+
+
+@contextmanager
+def enable_piecewise_cuda_graph_compile():
+    global _in_torch_compile
+    _in_torch_compile = True
+    yield
+    _in_torch_compile = False
 
 @contextmanager
 def enable_piecewise_cuda_graph():

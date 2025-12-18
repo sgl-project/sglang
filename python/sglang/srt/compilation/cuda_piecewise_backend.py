@@ -12,7 +12,7 @@ import torch.fx as fx
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
-
+from sglang.srt.compilation.piecewise_context_manager import is_in_torch_compile
 logger = logging.getLogger(__name__)
 
 
@@ -137,6 +137,8 @@ class CUDAPiecewiseBackend:
         # skip_cuda_graphs = get_forward_context().skip_cuda_graphs
         # if not entry.use_cudagraph or skip_cuda_graphs:
         #     return entry.runnable(*args)
+        if is_in_torch_compile():
+            return entry.runnable(*args)
 
         if entry.cudagraph is None:
             if entry.num_finished_warmup < 1:  # noqa
@@ -160,7 +162,6 @@ class CUDAPiecewiseBackend:
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
-
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's cudagraph pool
@@ -194,6 +195,5 @@ class CUDAPiecewiseBackend:
                 "Input addresses for cudagraphs are different during replay."
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
-
         entry.cudagraph.replay()
         return entry.output
