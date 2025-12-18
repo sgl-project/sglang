@@ -135,7 +135,7 @@ class LowerTriangularMask:
     def gen_attention_mask(
         self,
         is_prefill: bool,
-        position_ids: Tensor,
+        position_ids: "ms.Tensor",
         query_lens_np: np.ndarray,
         seq_lens_np: np.ndarray,
     ):
