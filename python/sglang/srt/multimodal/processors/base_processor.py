@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
+
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -34,7 +35,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 
 _is_npu = is_npu()
 
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
 
 @dataclasses.dataclass
