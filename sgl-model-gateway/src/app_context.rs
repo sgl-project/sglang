@@ -273,8 +273,8 @@ impl AppContextBuilder {
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .maybe_tokenizer(&router_config)?
-            .maybe_reasoning_parser_factory(&router_config)
-            .maybe_tool_parser_factory(&router_config)
+            .with_reasoning_parser_factory(&router_config)
+            .with_tool_parser_factory(&router_config)
             .with_worker_registry()
             .with_policy_registry(&router_config)
             .with_storage(&router_config)?
@@ -410,15 +410,13 @@ impl AppContextBuilder {
     }
 
     /// Create reasoning parser factory for gRPC mode
-    fn maybe_reasoning_parser_factory(mut self, _config: &RouterConfig) -> Self {
-        // Unconditionally register because we initialize both HTTP and gRPC router
+    fn with_reasoning_parser_factory(mut self, _config: &RouterConfig) -> Self {
         self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
         self
     }
 
     /// Create tool parser factory for gRPC mode
-    fn maybe_tool_parser_factory(mut self, _config: &RouterConfig) -> Self {
-        // Unconditionally register because we initialize both HTTP and gRPC router
+    fn with_tool_parser_factory(mut self, _config: &RouterConfig) -> Self {
         self.tool_parser_factory = Some(ToolParserFactory::new());
         self
     }
