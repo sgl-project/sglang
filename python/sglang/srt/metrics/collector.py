@@ -709,7 +709,7 @@ class SchedulerMetricsCollector:
         self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
 
     def increment_gpu_execution_seconds(self, category: str, t: float):
-        logger.debug(f"GPU execution seconds: {category=} {t:.3f=}")
+        logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(
             t
         )
