@@ -83,6 +83,7 @@ impl RouterManager {
                     manager.register_router(
                         RouterId::new("http-regular".to_string()),
                         Arc::from(http_regular),
+                        true,
                     );
                 }
                 Err(e) => {
@@ -100,8 +101,11 @@ impl RouterManager {
             {
                 Ok(http_pd) => {
                     info!("Created HTTP PD router");
-                    manager
-                        .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
+                    manager.register_router(
+                        RouterId::new("http-pd".to_string()),
+                        Arc::from(http_pd),
+                        true,
+                    );
                 }
                 Err(e) => {
                     warn!("Failed to create HTTP PD router: {e}");
@@ -138,7 +142,7 @@ impl RouterManager {
                 };
 
                 info!("Created router with ID: {}", router_id.as_str());
-                manager.register_router(router_id.clone(), router);
+                manager.register_router(router_id.clone(), router, false);
             }
         }
 
@@ -175,13 +179,21 @@ impl RouterManager {
         }
     }
 
-    pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
+    pub fn register_router(
+        &self,
+        id: RouterId,
+        router: Arc<dyn RouterTrait>,
+        set_default_router: bool,
+    ) {
         self.routers.insert(id.clone(), router);
 
-        let mut default_router = self.default_router.write().unwrap();
-        if default_router.is_none() {
-            *default_router = Some(id.clone());
-            info!("Set default router to {}", id.as_str());
+        // TODO maybe we can remove default router
+        if set_default_router {
+            let mut default_router = self.default_router.write().unwrap();
+            if default_router.is_none() {
+                *default_router = Some(id.clone());
+                info!("Set default router to {}", id.as_str());
+            }
         }
     }
 
