@@ -129,6 +129,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
+                AttentionBackendEnum.SAGE_ATTN_3
             },
         )
 
