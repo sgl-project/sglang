@@ -761,13 +761,10 @@ class GroupCoordinator:
             stream is not None
         ), f"Invalid params stream ({stream}, Please specify the stream to use when calling cp_all_gather_into_tensor_async.)"
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None:
-            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
+        if pynccl_comm is None or pynccl_comm.disabled:
+            self.all_gather_into_tensor(output, input)
         else:
-            logger.warning("not all_gather_into_tensor_async")
-            torch.ops.sglang.reg_all_gather_into_tensor(
-                output, input, group_name=self.unique_name
-            )
+            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
 
     def all_gather(
         self,

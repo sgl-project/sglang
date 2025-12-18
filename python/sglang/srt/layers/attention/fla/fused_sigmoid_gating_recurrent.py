@@ -7,12 +7,6 @@ import triton.language as tl
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -224,7 +218,9 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         BV=BV,
+        USE_INITIAL_STATE=initial_state_source is not None,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
