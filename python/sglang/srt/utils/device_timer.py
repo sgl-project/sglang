@@ -1,4 +1,4 @@
-from typing import Deque, Optional
+from typing import Deque, Optional, Callable
 
 import torch
 from collections import deque
@@ -29,8 +29,9 @@ class DeviceTimer:
         end: Optional[torch.cuda.Event] = None
         category: Optional[str] = None
 
-    def __init__(self):
+    def __init__(self, reporter: Callable[[str, float], None]):
         self._intervals: Deque[DeviceTimer.Interval] = deque()
+        self._reporter = reporter
 
     @contextmanager
     def wrap(self, category: str):
@@ -39,6 +40,7 @@ class DeviceTimer:
             yield
         finally:
             self._end(category=category)
+            self._report()
 
     def _start(self):
         start = torch.cuda.Event(enable_timing=True)
@@ -53,3 +55,6 @@ class DeviceTimer:
         assert interval.end is None
         interval.end = end
         interval.category = category
+
+    def _report(self):
+        TODO
