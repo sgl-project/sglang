@@ -147,14 +147,16 @@ class Molmo2PoolingCrossAttention(nn.Module):
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
         attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=False
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=False,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, -1)
-        attn_output = self.wo(attn_output)
-
-        return attn_output
+        return self.wo(attn_output)
 
 
 class Molmo2VisionBlock(nn.Module):
@@ -199,8 +201,7 @@ class Molmo2VisionBlock(nn.Module):
         normed = self.attention_norm(x)
         attn_out = self.attention(normed, cu_seqlens=cu_seqlens)
         x = x + attn_out
-        x = x + self.feed_forward(self.ffn_norm(x))
-        return x
+        return x + self.feed_forward(self.ffn_norm(x))
 
 
 class Molmo2VisionTransformer(nn.Module):
@@ -230,7 +231,7 @@ class Molmo2VisionTransformer(nn.Module):
         )
 
         self.positional_embedding = nn.Parameter(
-            torch.zeros(image_num_pos, hidden_size)
+            torch.zeros(image_num_pos, hidden_size),
         )
 
         self.resblocks = nn.ModuleList(
@@ -244,7 +245,7 @@ class Molmo2VisionTransformer(nn.Module):
                     prefix=add_prefix(f"resblocks.{i}", prefix),
                 )
                 for i in range(num_hidden_layers)
-            ]
+            ],
         )
 
     def add_pos_emb(self, x: torch.Tensor, patch_num: Tuple[int, int]) -> torch.Tensor:
@@ -266,8 +267,7 @@ class Molmo2VisionTransformer(nn.Module):
             pos_emb = pos_emb.permute(0, 2, 3, 1).squeeze(0)
 
         pos_emb = pos_emb.reshape(-1, pos_emb.shape[-1])
-        x = x + pos_emb[None, :, :].to(x.dtype)
-        return x
+        return x + pos_emb[None, :, :].to(x.dtype)
 
     def forward(
         self,
@@ -279,7 +279,7 @@ class Molmo2VisionTransformer(nn.Module):
             x: (batch_size, num_patch, n_pixels)
             patch_num: (patch_h, patch_w) for positional embedding interpolation
         Returns:
-            List of hidden states from each transformer block
+            List of hidden states from each transformer block.
         """
         if patch_num is None:
             patch_num_side = int(math.sqrt(self.image_num_pos))
@@ -398,20 +398,17 @@ class Molmo2VisionBackbone(nn.Module):
         Args:
             images: (batch_size, num_crops, num_patch, n_pixels)
         Returns:
-            (batch_size, num_crops, num_patch, concat_hidden_size)
+            (batch_size, num_crops, num_patch, concat_hidden_size).
         """
         B, T, N, D = images.shape
         images = images.view(B * T, N, D)
         image_features = self.image_vit(images)
 
         # Concatenate selected layer features
-        features = []
-        for layer in self.vit_layers:
-            features.append(image_features[layer])
+        features = [image_features[layer] for layer in self.vit_layers]
         image_features = torch.cat(features, dim=-1)
 
-        image_features = image_features.view(B, T, N, -1)
-        return image_features
+        return image_features.view(B, T, N, -1)
 
     def forward(
         self,
@@ -423,7 +420,7 @@ class Molmo2VisionBackbone(nn.Module):
             images: (batch_size, num_crops, num_patch, n_pixels)
             pooled_patches_idx: (batch_size, num_pooled_patches, pool_dim)
         Returns:
-            Pooled and projected features for valid tokens
+            Pooled and projected features for valid tokens.
         """
         batch_size, num_image = images.shape[:2]
         images = images.to(device=self.device, dtype=self.dtype)
@@ -445,7 +442,8 @@ class Molmo2VisionBackbone(nn.Module):
         )
 
         to_pool = image_features.reshape(batch_size, -1, dim)[
-            batch_idx, torch.clamp(pooled_patches_idx, min=0)
+            batch_idx,
+            torch.clamp(pooled_patches_idx, min=0),
         ]
         to_pool = to_pool * valid.to(self.dtype)[:, :, :, None]
         to_pool = to_pool.reshape(-1, pooled_patches_idx.shape[-1], dim)
@@ -458,7 +456,7 @@ class Molmo2VisionBackbone(nn.Module):
             denom = valid.view(-1, to_pool.shape[-2]).float().sum(-1)
             denom = torch.where(denom == 0, 1, denom)
             query = to_pool.sum(-2, keepdim=True) / denom[:, None, None].to(
-                to_pool.dtype
+                to_pool.dtype,
             )
         else:
             attn_mask = None
@@ -466,7 +464,9 @@ class Molmo2VisionBackbone(nn.Module):
 
         pooled_features = self.image_pooling_2d(query, to_pool, attn_mask=attn_mask)
         pooled_features = pooled_features.reshape(
-            batch_size, -1, pooled_features.shape[-1]
+            batch_size,
+            -1,
+            pooled_features.shape[-1],
         )
 
         pooled_features = self.image_projector(pooled_features)
@@ -530,7 +530,8 @@ class Molmo2Attention(nn.Module):
         # QK normalization - OLMo2 style full-tensor normalization (requires TP gather/split)
         self.q_norm = RMSNorm(self.hidden_size, eps=config.layer_norm_eps)
         self.k_norm = RMSNorm(
-            self.total_num_kv_heads * self.head_dim, eps=config.layer_norm_eps
+            self.total_num_kv_heads * self.head_dim,
+            eps=config.layer_norm_eps,
         )
 
         # Per-layer rope scaling support
@@ -569,7 +570,9 @@ class Molmo2Attention(nn.Module):
         )
 
     def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply QK normalization (OLMo2 style with tensor parallelism support)."""
         if self.tp_size > 1:
@@ -611,7 +614,10 @@ class Molmo2DecoderLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.self_attn = Molmo2Attention(
-            config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
+            config,
+            layer_id,
+            quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen2MLP(
             hidden_size=config.hidden_size,
@@ -640,9 +646,7 @@ class Molmo2DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.ff_norm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        return residual + hidden_states
 
 
 class Molmo2TextModel(nn.Module):
@@ -717,8 +721,7 @@ class Molmo2TextModel(nn.Module):
         if not self.pp_group.is_last_rank:
             return PPProxyTensors({"hidden_states": hidden_states})
 
-        hidden_states = self.ln_f(hidden_states)
-        return hidden_states
+        return self.ln_f(hidden_states)
 
 
 # ==============================================================================
@@ -779,7 +782,9 @@ class Molmo2ForConditionalGeneration(nn.Module):
         return self.transformer.wte
 
     def pad_input_ids(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
+        self,
+        input_ids: List[int],
+        mm_inputs: MultimodalInputs,
     ) -> List[int]:
         """Replace image patch tokens with pad values for radix attention."""
         if not mm_inputs or not mm_inputs.mm_items:
@@ -854,7 +859,10 @@ class Molmo2ForConditionalGeneration(nn.Module):
             positions=positions,
         )
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
         )
 
     def __call__(
@@ -868,16 +876,14 @@ class Molmo2ForConditionalGeneration(nn.Module):
         # This is called by general_mm_embed_routine as the language_model
         if input_embeds is not None:
             # Called with embeddings (after mm processing)
-            hidden_states = self.transformer(
+            return self.transformer(
                 input_ids=None,
                 positions=positions,
                 forward_batch=forward_batch,
                 input_embeds=input_embeds,
             )
-            return hidden_states
-        else:
-            # Standard forward
-            return self.forward(input_ids, positions, forward_batch, input_embeds)
+        # Standard forward
+        return self.forward(input_ids, positions, forward_batch, input_embeds)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Weight name mappings from checkpoint to our module names
@@ -925,7 +931,8 @@ class Molmo2ForConditionalGeneration(nn.Module):
             if is_mlp_fused and "gate_up_proj" in name:
                 mid = loaded_weight.shape[0] // 2
                 loaded_weight = torch.cat(
-                    [loaded_weight[mid:], loaded_weight[:mid]], dim=0
+                    [loaded_weight[mid:], loaded_weight[:mid]],
+                    dim=0,
                 )
 
             # Handle split embedding (wte.embedding + wte.new_embedding)
@@ -936,19 +943,22 @@ class Molmo2ForConditionalGeneration(nn.Module):
                     param = params_dict[name]
                     # Store for later concatenation or load directly if vocab size matches
                     weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+                        param,
+                        "weight_loader",
+                        default_weight_loader,
                     )
                     # Load only the first vocab_size rows
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
                 continue
-            elif "wte.new_embedding" in name:
+            if "wte.new_embedding" in name:
                 # Additional vocab embedding - skip as processor doesn't generate tokens beyond vocab_size
                 continue
 
             name = name.replace("model.vision_backbone.", "vision_backbone.")
             name = name.replace(
-                "image_vit.transformer.resblocks", "image_vit.resblocks"
+                "image_vit.transformer.resblocks",
+                "image_vit.resblocks",
             )
 
             # Vision MLP weight mapping: w1 -> fc1, w2 -> fc2

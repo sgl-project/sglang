@@ -196,7 +196,7 @@ class Molmo2MultimodalProcessor(BaseMultimodalProcessor):
                     all_offsets=all_offsets,
                     modality=Modality.IMAGE,
                     is_video=False,
-                )
+                ),
             )
 
         if "pixel_values_videos" in result:
@@ -209,7 +209,7 @@ class Molmo2MultimodalProcessor(BaseMultimodalProcessor):
                     all_offsets=all_offsets,
                     modality=Modality.VIDEO,
                     is_video=True,
-                )
+                ),
             )
 
         return {
