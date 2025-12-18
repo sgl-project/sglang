@@ -23,11 +23,27 @@ def time_device_forward_pass(forward_mode: ForwardMode):
 
 
 class DeviceTimer:
+    _DELAY_THRESHOLD = 2
+
     @dataclass
     class Interval:
-        start: torch.cuda.Event
-        end: Optional[torch.cuda.Event] = None
+        start_event: torch.cuda.Event
+        end_event: Optional[torch.cuda.Event] = None
         category: Optional[str] = None
+
+        @staticmethod
+        def create():
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            return DeviceTimer.Interval(start_event=start_event)
+
+        def end(self, category: str):
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+
+            assert self.end_event is None
+            self.end_event = end_event
+            self.category = category
 
     def __init__(self, reporter: Callable[[str, float], None]):
         self._intervals: Deque[DeviceTimer.Interval] = deque()
@@ -35,26 +51,15 @@ class DeviceTimer:
 
     @contextmanager
     def wrap(self, category: str):
-        self._start()
+        self._intervals.append(DeviceTimer.Interval.create())
         try:
             yield
         finally:
-            self._end(category=category)
+            self._intervals[-1].end(category=category)
             self._report()
 
-    def _start(self):
-        start = torch.cuda.Event(enable_timing=True)
-        start.record()
-        self._intervals.append(DeviceTimer.Interval(start=start))
-
-    def _end(self, category: str):
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-
-        interval = self._intervals[-1]
-        assert interval.end is None
-        interval.end = end
-        interval.category = category
-
     def _report(self):
-        TODO
+        while len(self._intervals) >= self._DELAY_THRESHOLD:
+            interval = self._intervals.popleft()
+            interval.end
+            TODO
