@@ -271,6 +271,8 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
+        if target_param_name == "proj_out.weight_scale_inv":
+            sharded_tensor = sharded_tensor.unsqueeze(0)
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
