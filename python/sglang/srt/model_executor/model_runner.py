@@ -2796,7 +2796,7 @@ class ModelRunner:
         # Copy cached routing experts' buffers back to CPU cache
         get_global_experts_capturer().on_forward_end(
             forward_batch=forward_batch,
-            can_run_graph=output[1],
+            can_run_graph=output.can_run_graph,
             cuda_graph_batch=getattr(self.graph_runner, "bs", None),
         )
 

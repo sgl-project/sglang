@@ -198,11 +198,11 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             local_start_pos = 0
             local_end_pos = forward_batch.out_cache_loc.shape[0]
 
-        self.host_cache.buffer[forward_batch.out_cache_loc_cpu] = (
-            self.device_cache.buffer[
-                local_start_pos:local_end_pos, :, : self.num_experts_per_tok
-            ].cpu()
-        )
+        # FIXME: sync explicitly here, overlap scheduler breaks here.
+        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+        self.host_cache.buffer[out_cache_loc_cpu] = self.device_cache.buffer[
+            local_start_pos:local_end_pos, :, : self.num_experts_per_tok
+        ].cpu()
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
