@@ -305,9 +305,3 @@ class MindSporeForCausalLM(torch.nn.Module):
 
 
 EntryClass = [MindSporeForCausalLM]
-
-# NOTE: `sglang.srt.models.registry` eagerly imports every module under
-# `sglang.srt.models.*` to discover `EntryClass`. Keep this otherwise it will
-# Keep on raising an import error.
-if not _is_npu:
-    EntryClass = []
