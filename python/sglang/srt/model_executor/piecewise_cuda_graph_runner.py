@@ -267,9 +267,7 @@ class PiecewiseCudaGraphRunner:
                     compile_config=self.compile_config,
                     graph_pool=get_global_graph_memory_pool(),
                 )
-                with freeze_gc(
-                    self.model_runner.server_args.enable_cudagraph_gc
-                ):
+                with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
                     with set_compiled(True):
                         self.warmup_torch_compile()
                 # Capture
@@ -371,9 +369,7 @@ class PiecewiseCudaGraphRunner:
         # can reuse the memory pool allocated for the large shapes.
         # ca_comm = self.model_runner.tp_group.ca_comm
         # maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ):
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
