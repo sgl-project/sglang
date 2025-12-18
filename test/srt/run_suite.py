@@ -147,7 +147,7 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_piecewise_cuda_graph.py", 1260),
-        TestFile("test_epd_disaggregation.py", 400),
+        TestFile("test_epd_disaggregation.py", 150),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
