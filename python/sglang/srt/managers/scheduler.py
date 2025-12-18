@@ -177,7 +177,7 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     freeze_gc,
-    get_available_gpu_memory,
+    get_available_device_memory,
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
@@ -421,7 +421,7 @@ class Scheduler(
 
         # Print debug info
         if tp_rank == 0:
-            avail_mem = get_available_gpu_memory(
+            avail_mem = get_available_device_memory(
                 self.device, self.gpu_id, empty_cache=False
             )
             logger.info(
