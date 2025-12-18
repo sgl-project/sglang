@@ -13,8 +13,11 @@ from transformers import PreTrainedTokenizerBase
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-from python.sglang.bench_serving import download_and_cache_hf_file
-from sglang.bench_serving import gen_prompt, get_gen_prefix_cache_path
+from sglang.bench_serving import (
+    download_and_cache_hf_file,
+    gen_prompt,
+    get_gen_prefix_cache_path,
+)
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64
