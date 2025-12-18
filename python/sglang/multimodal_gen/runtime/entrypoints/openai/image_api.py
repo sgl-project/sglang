@@ -53,8 +53,17 @@ def _build_sampling_params_from_request(
     output_format: Optional[str],
     background: Optional[str],
     image_path: Optional[str] = None,
+    seed: Optional[int] = None,
+    generator_device: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    guidance_scale: Optional[float] = None,
+    num_inference_steps: Optional[int] = None,
+    enable_teacache: Optional[bool] = None,
 ) -> SamplingParams:
-    width, height = _parse_size(size)
+    if size is None:
+        width, height = None, None
+    else:
+        width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
     server_args = get_global_server_args()
     # Build user params
@@ -70,21 +79,32 @@ def _build_sampling_params_from_request(
         save_output=True,
         server_args=server_args,
         output_file_name=f"{request_id}.{ext}",
+        seed=seed,
+        generator_device=generator_device,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
+        **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
     )
     return sampling_params
 
 
 def _build_req_from_sampling(s: SamplingParams) -> Req:
+    # TODO: refactor this! this is so dangerous because we could forget to add a new field here!
     return Req(
         request_id=s.request_id,
         data_type=s.data_type,
         prompt=s.prompt,
+        negative_prompt=s.negative_prompt,
         image_path=s.image_path,
         height=s.height,
         width=s.width,
         fps=1,
+        guidance_scale=s.guidance_scale,
+        num_inference_steps=s.num_inference_steps,
         num_frames=s.num_frames,
         seed=s.seed,
+        generator_device=s.generator_device,
         output_path=s.output_path,
         output_file_name=s.output_file_name,
         num_outputs_per_prompt=s.num_outputs_per_prompt,
@@ -104,6 +124,12 @@ async def generations(
         size=request.size,
         output_format=request.output_format,
         background=request.background,
+        seed=request.seed,
+        generator_device=request.generator_device,
+        negative_prompt=request.negative_prompt,
+        guidance_scale=request.guidance_scale,
+        num_inference_steps=request.num_inference_steps,
+        enable_teacache=request.enable_teacache,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
@@ -149,10 +175,16 @@ async def edits(
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
-    size: Optional[str] = Form("1024x1024"),
+    size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
+    seed: Optional[int] = Form(1024),
+    generator_device: Optional[str] = Form("cuda"),
     user: Optional[str] = Form(None),
+    negative_prompt: Optional[str] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    enable_teacache: Optional[bool] = Form(False),
 ):
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
@@ -160,12 +192,17 @@ async def edits(
     if not images or len(images) == 0:
         raise HTTPException(status_code=422, detail="Field 'image' is required")
 
-    # Save first input image; additional images or mask are not yet used by the pipeline
+    # Save all input images; additional images beyond the first are saved for potential future use
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    first_image = images[0]
-    input_path = os.path.join(uploads_dir, f"{request_id}_{first_image.filename}")
-    await _save_upload_to_path(first_image, input_path)
+    if images is not None and not isinstance(images, list):
+        images = [images]
+    input_paths = []
+    for idx, img in enumerate(images):
+        filename = img.filename or f"image_{idx}"
+        input_path = os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
+        await _save_upload_to_path(img, input_path)
+        input_paths.append(input_path)
 
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
@@ -174,7 +211,13 @@ async def edits(
         size=size,
         output_format=output_format,
         background=background,
-        image_path=input_path,
+        image_path=input_paths,
+        seed=seed,
+        generator_device=generator_device,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
     )
     batch = _build_req_from_sampling(sampling)
 
@@ -186,6 +229,8 @@ async def edits(
             "id": request_id,
             "created_at": int(time.time()),
             "file_path": save_file_path,
+            "input_image_paths": input_paths,  # Store all input image paths
+            "num_input_images": len(input_paths),
         },
     )
 

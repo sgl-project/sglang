@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
@@ -44,19 +45,13 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.model_executor.cuda_graph_runner import (
-    get_global_graph_memory_pool,
-    set_global_graph_memory_pool,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +140,19 @@ def patch_model(model: torch.nn.Module, compiler: str):
         yield model
     finally:
         _to_torch(model, reverse=True, num_tokens=16)
+
+
+# Reuse this memory pool across all cuda graph runners.
+global_graph_memory_pool = None
+
+
+def get_global_graph_memory_pool():
+    return global_graph_memory_pool
+
+
+def set_global_graph_memory_pool(val):
+    global global_graph_memory_pool
+    global_graph_memory_pool = val
 
 
 def set_torch_compile_config():
@@ -295,7 +303,7 @@ class PiecewiseCudaGraphRunner:
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
                 orig_seq_lens=torch.tensor([num_tokens], device=self.device),
-                seq_lens_cpu=torch.tensor([num_tokens]),
+                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
@@ -308,9 +316,9 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens]),
-                extend_seq_lens_cpu=torch.tensor([num_tokens]),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens]),
+                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=torch.arange(num_tokens, device=self.device),
                 global_num_tokens_gpu=None,
                 global_num_tokens_for_logprob_gpu=None,
@@ -339,7 +347,7 @@ class PiecewiseCudaGraphRunner:
             )
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
@@ -387,9 +395,6 @@ class PiecewiseCudaGraphRunner:
                 with set_compiled(True):
                     self.capture_one_batch_size(num_tokens)
 
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
-
     def capture_one_batch_size(self, num_tokens: int):
         bs = 1
 
@@ -427,7 +432,7 @@ class PiecewiseCudaGraphRunner:
                 seq_lens=torch.tensor([num_tokens], device=self.device),
                 next_token_logits_buffer=None,
                 orig_seq_lens=torch.tensor([num_tokens], device=self.device),
-                seq_lens_cpu=torch.tensor([num_tokens]),
+                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
@@ -440,9 +445,9 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens]),
-                extend_seq_lens_cpu=torch.tensor([num_tokens]),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens]),
+                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
                 global_num_tokens_gpu=None,
                 global_num_tokens_for_logprob_gpu=None,

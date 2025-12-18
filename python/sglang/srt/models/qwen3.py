@@ -30,13 +30,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    add_prefix,
-    get_cmo_stream,
-    is_cuda,
-    is_npu,
-    wait_cmo_stream,
-)
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 Qwen3Config = None
 
@@ -46,6 +40,8 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+    from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
 
 class Qwen3Attention(nn.Module):
@@ -280,6 +276,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=False,
             is_previous_layer_sparse=False,
+            is_next_layer_sparse=False,
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -395,13 +392,13 @@ class Qwen3ForCausalLM(nn.Module):
         if self.pp_group.world_size > 1 and config.tie_word_embeddings:
             if self.pp_group.is_first_rank:
                 self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
+                    self.model.embed_tokens.weight, dst=self.pp_group.world_size - 1
                 )
             elif self.pp_group.is_last_rank:
                 emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
+                    size=self.lm_head.weight.shape,
                     dtype=next(self.model.parameters()).dtype,
-                    src=self.pp_group.first_rank,
+                    src=0,
                 )
                 self.lm_head.weight.copy_(emb_token_weight)
 

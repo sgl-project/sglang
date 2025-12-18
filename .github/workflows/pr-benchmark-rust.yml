@@ -4,11 +4,11 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "sgl-router/**"
+      - "sgl-model-gateway/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "sgl-router/**"
+      - "sgl-model-gateway/**"
   workflow_dispatch:
 
 concurrency:
@@ -45,7 +45,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sgl-router
+          workspaces: sgl-model-gateway
           # Share cache across all benchmark jobs
           shared-key: "rust-cache"
           # Save cache even on failure
@@ -56,7 +56,7 @@ jobs:
       - name: Check benchmarks compile
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           cargo check --benches
 
       - name: Show sccache stats
@@ -92,7 +92,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sgl-router
+          workspaces: sgl-model-gateway
           # Share cache across all benchmark jobs
           shared-key: "rust-cache"
           cache-all-crates: true
@@ -104,7 +104,7 @@ jobs:
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           # Try to use sccache, but disable if it fails
           if command -v sccache &> /dev/null; then
             echo "Testing sccache availability..."
@@ -130,7 +130,7 @@ jobs:
         with:
           name: request-processing-results-${{ github.sha }}
           path: |
-            sgl-router/target/criterion/benchmark_summary/
+            sgl-model-gateway/target/criterion/benchmark_summary/
           retention-days: 30
 
       - name: Show sccache stats
@@ -164,7 +164,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sgl-router
+          workspaces: sgl-model-gateway
           # Share cache across all benchmark jobs
           shared-key: "rust-cache"
           cache-all-crates: true
@@ -176,7 +176,7 @@ jobs:
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           # Try to use sccache, but disable if it fails
           if command -v sccache &> /dev/null; then
             echo "Testing sccache availability..."
@@ -201,7 +201,7 @@ jobs:
         with:
           name: tokenizer-results-${{ github.sha }}
           path: |
-            sgl-router/target/criterion/tokenizer*/
+            sgl-model-gateway/target/criterion/tokenizer*/
           retention-days: 30
 
   benchmark-tool-parser:
@@ -231,7 +231,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: sgl-router
+          workspaces: sgl-model-gateway
           # Share cache across all benchmark jobs
           shared-key: "rust-cache"
           cache-all-crates: true
@@ -243,7 +243,7 @@ jobs:
         timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
-          cd sgl-router/
+          cd sgl-model-gateway/
           # Try to use sccache, but disable if it fails
           if command -v sccache &> /dev/null; then
             echo "Testing sccache availability..."
@@ -268,7 +268,7 @@ jobs:
         with:
           name: tool-parser-results-${{ github.sha }}
           path: |
-            sgl-router/target/criterion/tool_parser*/
+            sgl-model-gateway/target/criterion/tool_parser*/
           retention-days: 30
 
       - name: Show sccache stats
