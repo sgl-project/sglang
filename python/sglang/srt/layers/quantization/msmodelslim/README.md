@@ -1,5 +1,7 @@
 Quantization [msModelSlim](https://gitcode.com/Ascend/msit/tree/master/msmodelslim) module.
 
+`--quantization modelslim` flag introduced. To load already quantized models, simply load the model weights and config. Again, if the model has been quantized offline, there's no need to add `--quantization modelslim` argument when starting the engine. The quantization method will be parsed from the downloaded `quant_model_description.json` config.
+
 MsModelSlim was developed in the format of compressed_tensors and includes support for various quantization schemes, such as:
 - [x] W4A4 dynamic linear
 - [x] W8A8 static linear
