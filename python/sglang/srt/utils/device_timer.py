@@ -41,10 +41,15 @@ class DeviceTimer:
             self._end(category=category)
 
     def _start(self):
-        self._intervals.append(DeviceTimer.Interval(start=torch.cuda.Event()))
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        self._intervals.append(DeviceTimer.Interval(start=start))
 
     def _end(self, category: str):
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+
         interval = self._intervals[-1]
         assert interval.end is None
-        interval.end = torch.cuda.Event()
+        interval.end = end
         interval.category = category
