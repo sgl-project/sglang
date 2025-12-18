@@ -918,7 +918,8 @@ class BenchmarkMetrics:
     max_concurrent_requests: int = 0
 
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 MOONCAKE_DATASET_URL = {
     "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
     "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
@@ -1185,8 +1186,8 @@ def sample_sharegpt_requests(
     # Download sharegpt if necessary
     if not is_file_valid_json(dataset_path) and dataset_path == "":
         dataset_path = download_and_cache_hf_file(
-            repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-            filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
         )
 
     # Load the dataset.
@@ -1300,8 +1301,8 @@ def sample_random_requests(
         # Download sharegpt if necessary
         if not is_file_valid_json(dataset_path):
             dataset_path = download_and_cache_hf_file(
-                repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-                filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+                repo_id=SHAREGPT_REPO_ID,
+                filename=SHAREGPT_FILENAME,
             )
 
         # Load the dataset.

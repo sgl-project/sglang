@@ -11,9 +11,9 @@ from nextqa import NExTQALoader
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-
 from sglang.bench_serving import (
+    SHAREGPT_FILENAME,
+    SHAREGPT_REPO_ID,
     download_and_cache_hf_file,
     gen_prompt,
     get_gen_prefix_cache_path,
@@ -105,8 +105,8 @@ def sample_sharegpt_requests(
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path):
         dataset_path = download_and_cache_hf_file(
-            repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-            filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
         )
 
     # Load the dataset.
@@ -371,8 +371,8 @@ def sample_random_requests(
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
             dataset_path = download_and_cache_hf_file(
-                repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-                filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+                repo_id=SHAREGPT_REPO_ID,
+                filename=SHAREGPT_FILENAME,
             )
 
         # Load the dataset.
