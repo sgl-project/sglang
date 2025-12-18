@@ -660,6 +660,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.gpu_execution_seconds_total = Counter(
+            name="sglang:gpu_execution_seconds_total",
+            documentation="Total time that GPU is busy executing a workload.",
+            labelnames=list(labels.keys()) + ["category"],
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -699,8 +705,8 @@ class SchedulerMetricsCollector:
         )
         self.realtime_decode_tokens_total.labels(**self.labels).inc(decode_tokens)
 
-    def increment_gpu_execution_seconds_total(self):
-        TODO
+    def increment_gpu_execution_seconds(self, category: str, delta: float):
+        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(delta)
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
