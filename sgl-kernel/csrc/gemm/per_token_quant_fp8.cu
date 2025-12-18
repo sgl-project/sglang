@@ -320,6 +320,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
         }
         return true;
       });
+      return true;
     });
+    return true;
   });
 }
