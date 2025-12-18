@@ -1546,7 +1546,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Init grammar cache for this request (only on TP rank 0 to avoid redundant compilation)
+        # Init grammar cache for this request on TP rank 0 only.
         add_to_grammar_queue = False
         if req.sampling_params.has_grammar_constraint:
             if self.tp_rank == 0:
@@ -1572,7 +1572,7 @@ class Scheduler(
                     if not cache_hit:
                         req.grammar_key = key
                     else:
-                        if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                        if value is INVALID_GRAMMAR_OBJ:
                             error_msg = f"Invalid grammar request with cache hit: {key=}"
                             req.set_finish_with_abort(error_msg)
 
@@ -2355,22 +2355,21 @@ class Scheduler(
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
         num_ready_reqs = 0
-        num_timeout_reqs = 0        
+        num_timeout_reqs = 0
         for req in self.grammar_queue:
             try:
                 if req.finished():  # It is aborted by AbortReq
                     num_ready_reqs += 1
                     continue
 
-                # On non-rank-0, req.grammar is None (no compilation needed)
+                # On non-rank-0, req.grammar is None
                 if req.grammar is None:
                     num_ready_reqs += 1
                     num_skipped_compilation += 1
                     continue
 
-                # On rank 0 with cache hit, req.grammar is already compiled (not a Future)
-                if not isinstance(req.grammar, futures.Future):
-                    # Grammar already compiled (cache hit), immediately ready
+                # On rank 0 with cache hit, req.grammar is already compiled
+                if not isinstance(req.grammar, futures.Future):                    
                     num_ready_reqs += 1
                     num_skipped_compilation += 1
                     continue
@@ -2409,10 +2408,10 @@ class Scheduler(
                 req = self.grammar_queue[i]
                 if req.finished():  # It is aborted by AbortReq
                     continue
-                # On non-rank-0, req.grammar is None (no compilation needed)
+                # On non-rank-0, req.grammar is None
                 if req.grammar is None:
                     continue
-                # On rank 0 with cache hit, req.grammar is already compiled (not a Future)
+                # On rank 0 with cache hit, req.grammar is already compiled
                 if not isinstance(req.grammar, futures.Future):
                     continue
                 req.grammar = req.grammar.result()
