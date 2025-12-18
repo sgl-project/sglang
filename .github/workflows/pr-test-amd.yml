@@ -218,13 +218,11 @@ jobs:
 
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    # Temporarily disabled - uncomment when ready to re-enable
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-amd') ||
         (
-          false &&
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
