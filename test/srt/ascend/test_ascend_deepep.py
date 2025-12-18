@@ -34,8 +34,6 @@ class TestAscendDeepEP(CustomTestCase):
             "--trust-remote-code",
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "modelslim",
             "--mem-fraction-static",
             0.8,
             "--disable-radix-cache",
