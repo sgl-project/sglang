@@ -2068,7 +2068,7 @@ class ModelRunner:
         draft_attn_backend = self.server_args.speculative_draft_attention_backend
         if self.is_draft_worker and draft_attn_backend:
             logger.warning(
-                f"Overriding drafter attention backend to {draft_attn_backend}."
+                f"Overriding draft attention backend to {draft_attn_backend}."
             )
             return self._get_attention_backend_from_str(
                 draft_attn_backend,
