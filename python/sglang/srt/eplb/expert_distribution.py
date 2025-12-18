@@ -172,8 +172,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             try:
                 yield outputs
             finally:
-                self._on_forward_pass_end(forward_pass_id)
-                outputs["metrics"] = TODO
+                self._on_forward_pass_end(forward_pass_id, outputs)
 
     @contextmanager
     def disable_this_region(self):
@@ -192,12 +191,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
 
-    def _on_forward_pass_end(self, forward_pass_id: int):
+    def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
-            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
+            o = self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
+            if o is not None:
+                outputs |= o
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
