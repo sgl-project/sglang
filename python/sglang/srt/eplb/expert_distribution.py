@@ -708,7 +708,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             utilization_rate_gpu = torch.mean(compute_utilization_rate(gpu_physical_count))
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
                 return {
-                    "metrics": ExpertDistributionMetrics(eplb_balancedness=TODO)
+                    "metrics": ExpertDistributionMetrics(eplb_balancedness=utilization_rate_gpu)
                 }
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
