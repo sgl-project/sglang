@@ -35,6 +35,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
+    compact_data_tensors_func,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
 )
@@ -680,6 +681,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
+        """Run target model verification and handle tree mode compaction."""
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -772,30 +774,114 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
+
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
                 accept_length,
                 verified_id,
-                self.speculative_num_draft_tokens,
+                self.speculative_num_steps + 1,
             )
+
+            tree_size = self.speculative_num_draft_tokens
+            is_tree_mode = self.topk > 1
+
+            if is_tree_mode:
+                # Tree mode: compact scattered acceptance to prefix
+                (
+                    padded_predict,
+                    packed_hidden,
+                    packed_cache,
+                ) = compact_data_tensors_func(
+                    accept_index,
+                    accept_length,
+                    tree_size,
+                    predict,
+                    logits_output.hidden_states,
+                    batch.out_cache_loc,
+                )
+
+                logits_output.hidden_states = packed_hidden
+                batch.out_cache_loc = packed_cache
+                output_predict = padded_predict
+
+                per_req_perm = self._build_compaction_perm(
+                    accept_index, accept_length, tree_size
+                )
+                self._compact_req_to_token_with_perm(batch, per_req_perm, tree_size)
+            else:
+                # Chain mode: no compaction needed
+                output_predict = predict
+
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            output_predict = predict
 
-        # Construct the next draft input
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            hidden_states=None,
         )
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=output_predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _build_compaction_perm(
+        self,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        tree_size: int,
+    ) -> torch.Tensor:
+        """Build per-request permutation to compact req_to_token window."""
+        bs = accept_index.shape[0]
+        max_accept = accept_index.shape[1]
+        flat_size = bs * tree_size
+
+        priorities = torch.zeros(flat_size, dtype=torch.int64, device=self.device)
+        BASE = flat_size + 1
+
+        col_ids = torch.arange(max_accept, device=self.device)
+        valid_mask = col_ids < accept_length.unsqueeze(1)
+
+        flat_accept = accept_index.flatten()
+        flat_valid = valid_mask.flatten()
+        flat_seq_ids = torch.arange(bs * max_accept, device=self.device)
+        flat_priorities = (BASE - flat_seq_ids) * flat_valid.long()
+
+        priorities.scatter_reduce_(
+            0,
+            flat_accept.clamp(min=0),
+            flat_priorities,
+            reduce="amax",
+            include_self=True,
+        )
+
+        priorities_2d = priorities.view(bs, tree_size)
+        return torch.argsort(priorities_2d, dim=1, descending=True, stable=True)
+
+    def _compact_req_to_token_with_perm(
+        self,
+        batch: ModelWorkerBatch,
+        per_req_perm: torch.Tensor,
+        tree_size: int,
+    ):
+        """Apply permutation to compact req_to_token verify window."""
+        bs = len(batch.seq_lens)
+        req_to_token = self.req_to_token_pool.req_to_token
+
+        req_rows = batch.req_pool_indices.unsqueeze(1).expand(bs, tree_size)
+        offsets = torch.arange(tree_size, device=self.device).unsqueeze(0)
+        window_cols = batch.seq_lens.unsqueeze(1) + offsets
+
+        old_slots = req_to_token[req_rows, window_cols]
+        new_slots = torch.gather(old_slots, 1, per_req_perm.long())
+        req_to_token.index_put_((req_rows, window_cols), new_slots)
 
     def move_accepted_tokens_to_target_kvcache(
         self,

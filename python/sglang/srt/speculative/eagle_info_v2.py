@@ -372,6 +372,7 @@ class EagleVerifyInputV2Mixin:
 
         # Include the bonus token
         accept_length.add_(1)
+
         return predict, accept_length, accept_index
 
 
@@ -408,6 +409,55 @@ def fill_accepted_out_cache_loc(
     if src > -1:
         value = tl.load(out_cache_loc + src)
         tl.store(accepted_out_cache_loc + dst, value)
+
+
+@triton.jit
+def compact_data_tensors_kernel(
+    accept_index,
+    accept_length,
+    predict,
+    hidden_states,
+    out_cache_loc,
+    out_predict,
+    out_hidden,
+    out_cache,
+    stride: tl.constexpr,
+    max_accept: tl.constexpr,
+    hidden_dim: tl.constexpr,
+):
+    """Compact predict, hidden_states, and out_cache_loc into fixed-stride buffers."""
+    BLOCK_H: tl.constexpr = 128
+    pid = tl.program_id(axis=0)
+    acc_len = tl.load(accept_length + pid)
+
+    accept_row = accept_index + pid * max_accept
+    out_base = pid * stride
+
+    for col in tl.static_range(max_accept):
+        if col < acc_len:
+            src_idx = tl.load(accept_row + col)
+            # Skip -1 padding to avoid OOB access
+            if src_idx >= 0:
+                dst_idx = out_base + col
+
+                tok = tl.load(predict + src_idx)
+                tl.store(out_predict + dst_idx, tok)
+
+                cache_loc = tl.load(out_cache_loc + src_idx)
+                tl.store(out_cache + dst_idx, cache_loc)
+
+                # Blocked copy over hidden dimension
+                for h_start in tl.static_range(0, hidden_dim, BLOCK_H):
+                    h_offsets = h_start + tl.arange(0, BLOCK_H)
+                    h_mask = h_offsets < hidden_dim
+                    h_vals = tl.load(
+                        hidden_states + src_idx * hidden_dim + h_offsets, mask=h_mask
+                    )
+                    tl.store(
+                        out_hidden + dst_idx * hidden_dim + h_offsets,
+                        h_vals,
+                        mask=h_mask,
+                    )
 
 
 @triton.jit
@@ -487,3 +537,48 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+
+def compact_data_tensors_func(
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    tree_size: int,
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+):
+    """Compact scattered acceptance into prefix form using fused Triton kernel."""
+    bs = accept_index.shape[0]
+    max_accept = accept_index.shape[1]
+    stride = tree_size
+    hidden_dim = hidden_states.shape[-1]
+
+    assert stride >= max_accept, "tree_size must be >= max accepted tokens"
+
+    packed_predict = torch.zeros(
+        (bs * stride,), device=predict.device, dtype=predict.dtype
+    )
+    packed_hidden = torch.zeros(
+        (bs * stride, hidden_dim),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    packed_cache = torch.zeros(
+        (bs * stride,), device=out_cache_loc.device, dtype=out_cache_loc.dtype
+    )
+
+    compact_data_tensors_kernel[(bs,)](
+        accept_index,
+        accept_length,
+        predict,
+        hidden_states,
+        out_cache_loc,
+        packed_predict,
+        packed_hidden,
+        packed_cache,
+        stride=stride,
+        max_accept=max_accept,
+        hidden_dim=hidden_dim,
+    )
+
+    return packed_predict, packed_hidden, packed_cache
