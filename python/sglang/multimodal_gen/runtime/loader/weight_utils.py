@@ -196,7 +196,6 @@ def safetensors_weights_iterator(
             "Please retry - the files will be re-downloaded automatically."
         )
 
-    print(f"{use_runai_model_streamer=}")
     if use_runai_model_streamer:
         with SafetensorsStreamer() as streamer:
             streamer.stream_files(hf_weights_files)

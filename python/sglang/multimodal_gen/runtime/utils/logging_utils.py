@@ -144,6 +144,34 @@ def get_is_local_main_process():
     return rank == 0
 
 
+def get_is_group_master():
+    """
+    Check if current process is the master of its group (DiT or Non-DiT).
+    In disaggregated mode, only the master of each group should log.
+    Returns True if:
+    - Not in disagg mode and is main process (rank 0)
+    - In disagg mode and is dit_master or non_dit_master
+    """
+    try:
+        # Check if disagg communicator is available
+        from sglang.multimodal_gen.runtime.distributed.dist_utils import (
+            get_disagg_communicator,
+        )
+
+        comm = get_disagg_communicator()
+        if comm is not None:
+            # In disagg mode, check if we're a group master
+            world_rank = int(os.environ.get("RANK", 0))
+            is_dit_master = world_rank == comm.dit_master_rank
+            is_non_dit_master = world_rank == comm.non_dit_master_rank
+            return is_dit_master or is_non_dit_master
+    except (ImportError, AttributeError, ValueError):
+        pass
+
+    # Fallback to standard main process check
+    return get_is_main_process()
+
+
 def _log_process_aware(
     level: int,
     logger_self: Logger,
@@ -151,17 +179,30 @@ def _log_process_aware(
     *args: Any,
     main_process_only: bool,
     local_main_process_only: bool,
+    group_master_only: bool = False,
     **kwargs: Any,
 ) -> None:
-    """Helper function to log a message if the process rank matches the criteria."""
+    """Helper function to log a message if the process rank matches the criteria.
+
+    Args:
+        level: Logging level
+        logger_self: Logger instance
+        msg: Message to log
+        main_process_only: Only log on global rank 0
+        local_main_process_only: Only log on local rank 0
+        group_master_only: Only log on group master (dit_master or non_dit_master in disagg mode)
+    """
     is_main_process = get_is_main_process()
     is_local_main_process = get_is_local_main_process()
+    is_group_master = get_is_group_master()
 
     should_log = (
         not main_process_only
         and not local_main_process_only
+        and not group_master_only
         or (main_process_only and is_main_process)
         or (local_main_process_only and is_local_main_process)
+        or (group_master_only and is_group_master)
     )
 
     if should_log:
@@ -199,6 +240,7 @@ class _SGLDiffusionLogger(Logger):
         *args: Any,
         main_process_only: bool = True,
         local_main_process_only: bool = True,
+        group_master_only: bool = False,
         **kwargs: Any,
     ) -> None: ...
 
@@ -208,6 +250,7 @@ class _SGLDiffusionLogger(Logger):
         *args: Any,
         main_process_only: bool = True,
         local_main_process_only: bool = True,
+        group_master_only: bool = False,
         **kwargs: Any,
     ) -> None: ...
 
@@ -217,6 +260,7 @@ class _SGLDiffusionLogger(Logger):
         *args: Any,
         main_process_only: bool = False,
         local_main_process_only: bool = True,
+        group_master_only: bool = False,
         **kwargs: Any,
     ) -> None: ...
 
@@ -226,6 +270,7 @@ class _SGLDiffusionLogger(Logger):
         *args: Any,
         main_process_only: bool = False,
         local_main_process_only: bool = True,
+        group_master_only: bool = False,
         **kwargs: Any,
     ) -> None: ...
 
@@ -245,6 +290,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
         level: int,
         main_process_only_default: bool,
         local_main_process_only_default: bool,
+        group_master_only_default: bool = False,
     ):
         def _method(
             self: Logger,
@@ -252,6 +298,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             *args: Any,
             main_process_only: bool = main_process_only_default,
             local_main_process_only: bool = local_main_process_only_default,
+            group_master_only: bool = group_master_only_default,
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
@@ -261,6 +308,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
                 *args,
                 main_process_only=main_process_only,
                 local_main_process_only=local_main_process_only,
+                group_master_only=group_master_only,
                 **kwargs,
             )
 
@@ -269,22 +317,22 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     setattr(
         logger,
         "info",
-        MethodType(_create_patched_method(logging.INFO, True, True), logger),
+        MethodType(_create_patched_method(logging.INFO, True, True, False), logger),
     )
     setattr(
         logger,
         "debug",
-        MethodType(_create_patched_method(logging.DEBUG, True, True), logger),
+        MethodType(_create_patched_method(logging.DEBUG, True, True, False), logger),
     )
     setattr(
         logger,
         "warning",
-        MethodType(_create_patched_method(logging.WARNING, False, True), logger),
+        MethodType(_create_patched_method(logging.WARNING, False, True, False), logger),
     )
     setattr(
         logger,
         "error",
-        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
+        MethodType(_create_patched_method(logging.ERROR, False, True, False), logger),
     )
 
     return cast(_SGLDiffusionLogger, logger)

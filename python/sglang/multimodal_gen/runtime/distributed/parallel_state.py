@@ -46,7 +46,10 @@ from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    suppress_stdout,
+)
 
 from ..utils.distributed import RankGenerator
 from .dist_utils import init_disaggregated_topology
@@ -363,7 +366,8 @@ def _setup_sequence_parallel_for_disagg(
 
     using the original set_seq_parallel_pg from xdit could introduce new problems, as it doesn't take of non-dit ranks
     """
-    from yunchang.globals import PROCESS_GROUP
+    with suppress_stdout():
+        from yunchang.globals import PROCESS_GROUP
 
     current_rank = torch.distributed.get_rank()
     non_dit_start = world_size - num_non_dit_ranks
@@ -548,7 +552,9 @@ def initialize_model_parallel(
 
     # Setup sequence parallel groups (requires special handling for disagg)
     from yunchang import set_seq_parallel_pg
-    from yunchang.globals import PROCESS_GROUP
+
+    with suppress_stdout():
+        from yunchang.globals import PROCESS_GROUP
 
     if enable_disagg:
         _setup_sequence_parallel_for_disagg(

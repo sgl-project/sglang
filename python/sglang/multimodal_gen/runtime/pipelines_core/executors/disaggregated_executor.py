@@ -73,11 +73,6 @@ class DisaggregatedExecutor(PipelineExecutor):
         # Max in-flight transfers to prevent memory explosion
         self.max_pending_transfers = 2
 
-        logger.info(
-            f"DisaggregatedExecutor initialized on rank {dist.get_rank()} "
-            f"with role {self.comm.role}, max_pending={self.max_pending_transfers}"
-        )
-
     def execute(
         self,
         stages: List["PipelineStage"],
@@ -239,10 +234,6 @@ class DisaggregatedExecutor(PipelineExecutor):
         world_rank = dist.get_rank()
         backend = dist.get_backend(group=dit_group)
         use_cpu = backend != "nccl"  # Only use CPU if not NCCL
-
-        logger.debug(
-            f"[DiT Rank {dist.get_rank()}] Broadcasting metadata with backend={backend}, use_cpu={use_cpu}"
-        )
 
         metadata_pkg = broadcast_pyobj(
             (metadata, tensor_infos, list_tensor_infos),
