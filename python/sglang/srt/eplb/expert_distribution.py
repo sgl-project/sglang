@@ -87,7 +87,7 @@ class ExpertDistributionRecorder(ABC):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
-        return {}
+        yield {}
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
