@@ -1936,19 +1936,17 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm == "EAGLE"
+                self.speculative_algorithm in ["EAGLE", "EAGLE3"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
                 logger.warning(
                     "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
                 )
-
-            if not envs.SGLANG_ENABLE_SPEC_V2.get():
-                self.disable_overlap_schedule = True
+            else:
                 logger.warning(
-                    "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
+                    "Overlap scheduler is disabled and current beta overlap-spec is supported only for eagle speculative decoding. "
+                    "You can set environment variable SGLANG_ENABLE_SPEC_V2=1 to enable beta spec."
                 )
 
             if self.enable_mixed_chunk:
