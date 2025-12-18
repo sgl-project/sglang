@@ -670,7 +670,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._expert_dispatch_collector = ExpertDispatchCollector(
                 self._expert_location_metadata.ep_size
             )
-            self._collection_counter = 0
+            self._metric_heatmap_collection_counter = 0
 
     def append(
         self,
@@ -702,7 +702,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
 
         if self._rank == 0:
-            self._collect_metrics_if_needed(gpu_physical_count)
+            self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
@@ -719,10 +719,11 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
 
-    def _collect_metrics_if_needed(self, gpu_physical_count: torch.Tensor):
+    # TODO refactor
+    def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
         # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
         interval = get_int_env_var("SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
-        if interval > 0 and self._collection_counter % interval == 0:
+        if interval > 0 and self._metric_heatmap_collection_counter % interval == 0:
             for layer_idx in range(self._expert_location_metadata.num_layers):
                 count_of_layer = (
                     self._expert_dispatch_collector.eplb_gpu_physical_count.labels(
@@ -739,7 +740,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                     if count > 0:
                         count_of_layer._sum.inc(count * gpu_rank)
                         count_of_layer._buckets[gpu_rank].inc(count)
-        self._collection_counter += 1
+        self._metric_heatmap_collection_counter += 1
 
 
 class _DequeCollection:
