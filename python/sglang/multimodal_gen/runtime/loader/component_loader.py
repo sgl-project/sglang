@@ -5,11 +5,11 @@
 import dataclasses
 import glob
 import importlib.util
+import inspect
 import json
 import os
 import time
 import traceback
-import inspect
 from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
@@ -629,7 +629,10 @@ class TransformerLoader(ComponentLoader):
         """
 
         # Only patch for Nunchaku SVDQuant configs.
-        if not hasattr(quant_config, "get_name") or quant_config.get_name() != "svdquant":
+        if (
+            not hasattr(quant_config, "get_name")
+            or quant_config.get_name() != "svdquant"
+        ):
             return
 
         if not safetensors_list:
@@ -647,16 +650,13 @@ class TransformerLoader(ComponentLoader):
 
         try:
             # Optional dependency: only patch if Nunchaku is installed.
-            from nunchaku.models.linear import (  # type: ignore[import]
-                SVDQW4A4Linear,
-            )
+            from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
+
             from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (  # type: ignore[import]
                 NunchakuSVDQLinearMethod,
             )
         except Exception:
-            logger.warning(
-                "Nunchaku is not available; skipping SVDQ wtscale patch."
-            )
+            logger.warning("Nunchaku is not available; skipping SVDQ wtscale patch.")
             return
 
         weights_path = safetensors_list[0]
@@ -678,7 +678,10 @@ class TransformerLoader(ComponentLoader):
                 continue
 
             # Case 1: native Nunchaku SVDQW4A4Linear (used in NunchakuFeedForward).
-            if isinstance(module, SVDQW4A4Linear) and getattr(module, "wtscale", None) is not None:
+            if (
+                isinstance(module, SVDQW4A4Linear)
+                and getattr(module, "wtscale", None) is not None
+            ):
                 module.wtscale = tensor
                 num_patched += 1
                 continue
@@ -715,6 +718,7 @@ class TransformerLoader(ComponentLoader):
         from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
             create_nunchaku_config_from_server_args,
         )
+
         return create_nunchaku_config_from_server_args(server_args)
 
     def load_customized(
@@ -759,9 +763,7 @@ class TransformerLoader(ComponentLoader):
         # for loading weights (Nunchaku quantized weights have different parameter names)
         if quant_config is not None and quant_config.quantized_model_path:
             weights_path = quant_config.quantized_model_path
-            logger.info(
-                "Using quantized model weights from: %s", weights_path
-            )
+            logger.info("Using quantized model weights from: %s", weights_path)
             # quantized_model_path can be a single .safetensors file or a directory
             if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
                 safetensors_list = [weights_path]
@@ -811,8 +813,7 @@ class TransformerLoader(ComponentLoader):
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
         if (
             quant_config is not None
-            and "quant_config"
-            in inspect.signature(model_cls.__init__).parameters
+            and "quant_config" in inspect.signature(model_cls.__init__).parameters
         ):
             init_params["quant_config"] = quant_config
 

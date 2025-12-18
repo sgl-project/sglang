@@ -295,7 +295,11 @@ def load_model_from_full_model_state_dict(
     # parameters even if they are not present in the checkpoint. This is used
     # for newly introduced parameters that have reasonable defaults, such as
     # gate compressors or FP4 per-channel scales (wcscales).
-    ALLOWED_NEW_PARAM_PATTERNS = ["gate_compress", "wcscales", "wtscale"]  # Can be extended as needed
+    ALLOWED_NEW_PARAM_PATTERNS = [
+        "gate_compress",
+        "wcscales",
+        "wtscale",
+    ]  # Can be extended as needed
     for new_param_name in unused_keys:
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
             logger.error(

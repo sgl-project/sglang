@@ -7,7 +7,7 @@ quantized linear layers, following the SGLang AWQ pattern of using quantization
 methods instead of direct layer replacement.
 """
 
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,7 @@ def _check_nunchaku_available() -> bool:
     """Check if nunchaku is installed."""
     try:
         import nunchaku
+
         return True
     except ImportError:
         return False
@@ -178,7 +179,10 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
         layer.wscales = Parameter(layer.wscales.data, requires_grad=False)
         layer.smooth_factor = Parameter(layer.smooth_factor.data, requires_grad=False)
-        if hasattr(layer, "smooth_factor_orig") and layer.smooth_factor_orig is not None:
+        if (
+            hasattr(layer, "smooth_factor_orig")
+            and layer.smooth_factor_orig is not None
+        ):
             layer.smooth_factor_orig = Parameter(
                 layer.smooth_factor_orig.data, requires_grad=False
             )
@@ -421,4 +425,3 @@ class NunchakuTransformerMethod:
             "rank": self.rank,
             "processor": self.processor,
         }
-

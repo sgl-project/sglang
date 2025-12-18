@@ -82,16 +82,19 @@ class LatentPreparationStage(PipelineStage):
         # Generate or use provided latents
         if latents is None:
             import torch
+
             generator = torch.Generator(device="cpu").manual_seed(42)
             logger.info(f"Fixed generator seed to 42")
-            
+
             shape = server_args.pipeline_config.prepare_latent_shape(
                 batch, batch_size, num_frames
             )
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
-            print(f"Latents mean: {latents.mean()}, std: {latents.std()}, slice: {latents.flatten()[:5]}")
+            print(
+                f"Latents mean: {latents.mean()}, std: {latents.std()}, slice: {latents.flatten()[:5]}"
+            )
 
             latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
 

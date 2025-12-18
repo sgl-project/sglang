@@ -351,9 +351,13 @@ class QwenImageCrossAttention(nn.Module):
         )
 
         if "transformer_blocks.0" in self.prefix:
-             # img_query is already chunked here, so we reconstruct full QKV for mean check or just check parts
-             print(f"{self.prefix} img_query (pre-norm) mean: {img_query.float().mean():.6f}")
-             print(f"{self.prefix} txt_query (pre-norm) mean: {txt_query.float().mean():.6f}")
+            # img_query is already chunked here, so we reconstruct full QKV for mean check or just check parts
+            print(
+                f"{self.prefix} img_query (pre-norm) mean: {img_query.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} txt_query (pre-norm) mean: {txt_query.float().mean():.6f}"
+            )
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -375,8 +379,12 @@ class QwenImageCrossAttention(nn.Module):
             txt_key = self.norm_added_k(txt_key)
 
         if "transformer_blocks.0" in self.prefix:
-             print(f"{self.prefix} img_query (post-norm, pre-rope) mean: {img_query.float().mean():.6f}")
-             print(f"{self.prefix} img_key (post-norm, pre-rope) mean: {img_key.float().mean():.6f}")
+            print(
+                f"{self.prefix} img_query (post-norm, pre-rope) mean: {img_query.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} img_key (post-norm, pre-rope) mean: {img_key.float().mean():.6f}"
+            )
 
         # Apply RoPE
         if image_rotary_emb is not None:
@@ -395,8 +403,12 @@ class QwenImageCrossAttention(nn.Module):
             )
 
         if "transformer_blocks.0" in self.prefix:
-             print(f"{self.prefix} img_query (post-rope) mean: {img_query.float().mean():.6f}")
-             print(f"{self.prefix} img_key (post-rope) mean: {img_key.float().mean():.6f}")
+            print(
+                f"{self.prefix} img_query (post-rope) mean: {img_query.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} img_key (post-rope) mean: {img_key.float().mean():.6f}"
+            )
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -553,12 +565,16 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if "transformer_blocks.0" in self.prefix:
-             print(f"Printing weights for {self.prefix}")
-             for name, param in self.named_parameters():
-                 print(f"Weight {name}: shape={param.shape}, mean={param.data.float().mean().item():.6f}")
-                 print(f"Weight {name} data[:5]: {param.data.view(-1)[:5]}")
-             print(f"{self.prefix} input hidden_states mean: {hidden_states.float().mean():.6f}")
-             print(f"{self.prefix} input temb mean: {temb.float().mean():.6f}")
+            print(f"Printing weights for {self.prefix}")
+            for name, param in self.named_parameters():
+                print(
+                    f"Weight {name}: shape={param.shape}, mean={param.data.float().mean().item():.6f}"
+                )
+                print(f"Weight {name} data[:5]: {param.data.view(-1)[:5]}")
+            print(
+                f"{self.prefix} input hidden_states mean: {hidden_states.float().mean():.6f}"
+            )
+            print(f"{self.prefix} input temb mean: {temb.float().mean():.6f}")
 
         # Get modulation parameters for both streams
         # print(f"hidden_states shape: {hidden_states.shape}")
@@ -575,17 +591,25 @@ class QwenImageTransformerBlock(nn.Module):
             and hasattr(self.quant_config, "get_name")
             and self.quant_config.get_name() == "svdquant"
         ):
-             # nunchaku's mod_params is [B, 6*dim] instead of [B, dim*6]
-             img_mod_params = (
-                img_mod_params.view(img_mod_params.shape[0], -1, 6).transpose(1, 2).reshape(img_mod_params.shape[0], -1)
+            # nunchaku's mod_params is [B, 6*dim] instead of [B, dim*6]
+            img_mod_params = (
+                img_mod_params.view(img_mod_params.shape[0], -1, 6)
+                .transpose(1, 2)
+                .reshape(img_mod_params.shape[0], -1)
             )
-             txt_mod_params = (
-                txt_mod_params.view(txt_mod_params.shape[0], -1, 6).transpose(1, 2).reshape(txt_mod_params.shape[0], -1)
+            txt_mod_params = (
+                txt_mod_params.view(txt_mod_params.shape[0], -1, 6)
+                .transpose(1, 2)
+                .reshape(txt_mod_params.shape[0], -1)
             )
 
         if "transformer_blocks.0" in self.prefix:
-            print(f"{self.prefix} img_mod_params mean: {img_mod_params.float().mean():.6f}")
-            print(f"{self.prefix} txt_mod_params mean: {txt_mod_params.float().mean():.6f}")
+            print(
+                f"{self.prefix} img_mod_params mean: {img_mod_params.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} txt_mod_params mean: {txt_mod_params.float().mean():.6f}"
+            )
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
@@ -612,23 +636,37 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         if "transformer_blocks.0" in self.prefix:
-            print(f"{self.prefix} attn input joint_attention_kwargs: {joint_attention_kwargs}")
-            print(f"{self.prefix} attn input img_modulated mean: {img_modulated.float().mean():.6f}")
-            print(f"{self.prefix} attn input txt_modulated mean: {txt_modulated.float().mean():.6f}")
+            print(
+                f"{self.prefix} attn input joint_attention_kwargs: {joint_attention_kwargs}"
+            )
+            print(
+                f"{self.prefix} attn input img_modulated mean: {img_modulated.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} attn input txt_modulated mean: {txt_modulated.float().mean():.6f}"
+            )
             if encoder_hidden_states_mask is not None:
-                print(f"{self.prefix} attn input encoder_hidden_states_mask mean: {encoder_hidden_states_mask.float().mean():.6f}")
+                print(
+                    f"{self.prefix} attn input encoder_hidden_states_mask mean: {encoder_hidden_states_mask.float().mean():.6f}"
+                )
             else:
                 print(f"{self.prefix} attn input encoder_hidden_states_mask: None")
-            
+
             if image_rotary_emb is not None:
                 # print("len(image_rotary_emb):", len(image_rotary_emb)) # 2
                 if isinstance(image_rotary_emb, tuple):
                     for i, item in enumerate(image_rotary_emb):
-                         print(f"{self.prefix} attn input image_rotary_emb[{i}][0] mean: {item[0].float().mean():.6f}")
+                        print(
+                            f"{self.prefix} attn input image_rotary_emb[{i}][0] mean: {item[0].float().mean():.6f}"
+                        )
                 elif hasattr(image_rotary_emb, "float"):
-                    print(f"{self.prefix} attn input image_rotary_emb mean: {image_rotary_emb.float().mean():.6f}")
+                    print(
+                        f"{self.prefix} attn input image_rotary_emb mean: {image_rotary_emb.float().mean():.6f}"
+                    )
                 else:
-                    print(f"{self.prefix} attn input image_rotary_emb type: {type(image_rotary_emb)}")
+                    print(
+                        f"{self.prefix} attn input image_rotary_emb type: {type(image_rotary_emb)}"
+                    )
             else:
                 print(f"{self.prefix} attn input image_rotary_emb: None")
 
@@ -644,8 +682,12 @@ class QwenImageTransformerBlock(nn.Module):
         img_attn_output, txt_attn_output = attn_output
 
         if "transformer_blocks.0" in self.prefix:
-            print(f"{self.prefix} img_attn_output mean: {img_attn_output.float().mean():.6f}")
-            print(f"{self.prefix} txt_attn_output mean: {txt_attn_output.float().mean():.6f}")
+            print(
+                f"{self.prefix} img_attn_output mean: {img_attn_output.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} txt_attn_output mean: {txt_attn_output.float().mean():.6f}"
+            )
 
         # Apply attention gates and add residual (like in Megatron)
         hidden_states = hidden_states + img_gate1 * img_attn_output
@@ -653,8 +695,12 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         if "transformer_blocks.0" in self.prefix:
-            print(f"{self.prefix} attn_out hidden_states mean: {hidden_states.float().mean():.6f}")
-            print(f"{self.prefix} attn_out encoder_hidden_states mean: {encoder_hidden_states.float().mean():.6f}")
+            print(
+                f"{self.prefix} attn_out hidden_states mean: {hidden_states.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} attn_out encoder_hidden_states mean: {encoder_hidden_states.float().mean():.6f}"
+            )
 
         # Process image stream - norm2 + MLP
         img_normed2 = self.img_norm2(hidden_states)
@@ -667,14 +713,22 @@ class QwenImageTransformerBlock(nn.Module):
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
 
         if "transformer_blocks.0" in self.prefix:
-            print(f"{self.prefix} mod2 img_modulated mean: {img_modulated2.float().mean():.6f}")
-            print(f"{self.prefix} mod2 txt_modulated mean: {txt_modulated2.float().mean():.6f}")
+            print(
+                f"{self.prefix} mod2 img_modulated mean: {img_modulated2.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} mod2 txt_modulated mean: {txt_modulated2.float().mean():.6f}"
+            )
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
         if "transformer_blocks.0" in self.prefix:
-            print(f"{self.prefix} mlp_out hidden_states mean: {hidden_states.float().mean():.6f}")
-            print(f"{self.prefix} mlp_out encoder_hidden_states mean: {encoder_hidden_states.float().mean():.6f}")
+            print(
+                f"{self.prefix} mlp_out hidden_states mean: {hidden_states.float().mean():.6f}"
+            )
+            print(
+                f"{self.prefix} mlp_out encoder_hidden_states mean: {encoder_hidden_states.float().mean():.6f}"
+            )
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -796,10 +850,16 @@ class QwenImageTransformer2DModel(CachableDiT):
         # print(f"Model input controlnet_block_samples shape: {controlnet_block_samples.shape if controlnet_block_samples is not None else None}")
         # print(f"Model input return_dict: {return_dict}")
 
-        print(f"Model input hidden_states: {hidden_states.shape}, {hidden_states[0][:2, :2]}")
-        print(f"Model input hidden_states stats: mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}")
+        print(
+            f"Model input hidden_states: {hidden_states.shape}, {hidden_states[0][:2, :2]}"
+        )
+        print(
+            f"Model input hidden_states stats: mean={hidden_states.float().mean():.6f}, std={hidden_states.float().std():.6f}"
+        )
         print(f"Model input hidden_states slice: {hidden_states.flatten()[:10]}")
-        print(f"Model input encoder_hidden_states: {encoder_hidden_states[0][0, :2, :2]}")
+        print(
+            f"Model input encoder_hidden_states: {encoder_hidden_states[0][0, :2, :2]}"
+        )
         print(f"Model input encoder_hidden_states_mask: {encoder_hidden_states_mask}")
         print(f"Model input timestep: {timestep}")
         print(f"Model input txt_seq_lens: {txt_seq_lens}")

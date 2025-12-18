@@ -188,7 +188,9 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
                 "txt_seq_lens": txt_seq_lens,
             }
 
-        print(f"img_shapes: {img_shapes}, txt_seq_lens: {txt_seq_lens}, rotary_emb: {rotary_emb}")
+        print(
+            f"img_shapes: {img_shapes}, txt_seq_lens: {txt_seq_lens}, rotary_emb: {rotary_emb}"
+        )
 
         # For SGLang native models, compute freqs_cis externally and pass it in.
         (img_cos, img_sin), (txt_cos, txt_sin) = self.get_freqs_cis(
