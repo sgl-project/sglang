@@ -12,7 +12,11 @@ SGLang Diffusion has the following features:
   - Broad model support: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux
   - Fast inference speed: enpowered by highly optimized kernel from sgl-kernel and efficient scheduler loop
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
-  - Diverse hardware support: H100, H200, A100, B200, 4090
+  - Multi-platform support: NVIDIA GPUs (H100, H200, A100, B200, 4090) and AMD GPUs (MI300X, MI325X)
+
+### AMD/ROCm Support
+
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [ROCm installation guide](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) for setup instructions.
 
 ## Getting Started
 
