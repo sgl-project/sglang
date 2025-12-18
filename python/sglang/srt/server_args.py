@@ -2298,9 +2298,7 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                # Check if running on AMD/ROCm
-                import torch
-                if torch.version.hip is not None:
+                if is_hip():
                     # AMD: use deterministic 1-stage kernel (keep custom all-reduce enabled)
                     logger.info(
                         "AMD/ROCm: Using deterministic 1-stage all-reduce kernel"
