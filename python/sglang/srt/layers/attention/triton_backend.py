@@ -106,11 +106,18 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
-        if (
-            hasattr(model_runner.token_to_kv_pool, "dtype")
-            and model_runner.token_to_kv_pool.dtype == "int4"
-        ):
-            self.v_head_dim = self.v_head_dim * 2
+            # For int4, the stored buffer has half the head_dim, so we need to double it
+            # Since we get v_head_dim from layer 0's buffer, only check layer 0's dtype
+            pool = model_runner.token_to_kv_pool
+            if hasattr(pool, "get_layer_dtype"):
+                layer_0_dtype = pool.get_layer_dtype(0)
+            elif hasattr(pool, "dtype"):
+                layer_0_dtype = pool.dtype
+            else:
+                layer_0_dtype = None
+
+            if layer_0_dtype == "int4":
+                self.v_head_dim = self.v_head_dim * 2
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
@@ -1023,8 +1030,16 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
 
         # Check if KV cache is quantized (INT4/INT8) for optimized attention
+        # Use per-layer dtype if available, otherwise fall back to pool-level dtype
         kv_pool = forward_batch.token_to_kv_pool
-        if hasattr(kv_pool, "dtype") and kv_pool.dtype in ("int4", "int8"):
+        if hasattr(kv_pool, "get_layer_dtype"):
+            layer_dtype = kv_pool.get_layer_dtype(layer.layer_id)
+        elif hasattr(kv_pool, "dtype"):
+            layer_dtype = kv_pool.dtype
+        else:
+            layer_dtype = None
+
+        if layer_dtype in ("int4", "int8"):
             # Use optimized quantized attention kernel
             # This dequantizes KV cache on-the-fly inside the kernel, avoiding global memory writes
             self.decode_attention_fwd_quantized(
@@ -1041,7 +1056,7 @@ class TritonAttnBackend(AttentionBackend):
                 self.forward_metadata.num_kv_splits,
                 self.max_kv_splits,
                 layer.scaling,
-                kv_pool.dtype,  # Pass dtype to select INT4 or INT8 kernel
+                layer_dtype,  # Pass layer-specific dtype to select INT4 or INT8 kernel
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,

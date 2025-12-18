@@ -242,6 +242,113 @@ def add_mamba_ssm_dtype_choices(choices):
     MAMBA_SSM_DTYPE_CHOICES.extend(choices)
 
 
+# Valid KV cache dtype choices for per-layer configuration
+KV_CACHE_DTYPE_CHOICES = [
+    "auto",
+    "fp8_e5m2",
+    "fp8_e4m3",
+    "bf16",
+    "bfloat16",
+    "int4",
+    "int8",
+]
+
+
+def parse_kv_cache_per_layer_dtype(spec: str, num_layers: int) -> Dict[int, str]:
+    """
+    Parse per-layer KV cache dtype specification string.
+
+    Args:
+        spec: Format "start-end:dtype,..." e.g., "0-1:int8,60-61:bf16"
+        num_layers: Total number of layers in the model
+
+    Returns:
+        Dict mapping layer index to dtype string
+
+    Raises:
+        ValueError: If the spec format is invalid or layer indices are out of range
+    """
+    result = {}
+    if not spec or not spec.strip():
+        return result
+
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        if ":" not in part:
+            raise ValueError(
+                f"Invalid per-layer dtype spec '{part}': expected format 'start-end:dtype' or 'layer:dtype'"
+            )
+
+        range_part, dtype = part.rsplit(":", 1)
+        dtype = dtype.strip().lower()
+
+        # Normalize dtype aliases
+        if dtype == "bfloat16":
+            dtype = "bf16"
+
+        if dtype not in KV_CACHE_DTYPE_CHOICES:
+            raise ValueError(
+                f"Invalid dtype '{dtype}' in per-layer spec. "
+                f"Valid choices: {KV_CACHE_DTYPE_CHOICES}"
+            )
+
+        # Parse layer range
+        range_part = range_part.strip()
+        if "-" in range_part:
+            parts = range_part.split("-")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Invalid range '{range_part}': expected format 'start-end'"
+                )
+            try:
+                start = int(parts[0].strip())
+                end = int(parts[1].strip())
+            except ValueError:
+                raise ValueError(
+                    f"Invalid range '{range_part}': start and end must be integers"
+                )
+
+            if start < 0 or end < 0:
+                raise ValueError(
+                    f"Invalid range '{range_part}': layer indices must be non-negative"
+                )
+            if start > end:
+                raise ValueError(
+                    f"Invalid range '{range_part}': start must be <= end"
+                )
+            if end >= num_layers:
+                raise ValueError(
+                    f"Invalid range '{range_part}': end index {end} >= num_layers {num_layers}"
+                )
+
+            for layer_id in range(start, end + 1):
+                result[layer_id] = dtype
+        else:
+            # Single layer
+            try:
+                layer_id = int(range_part)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid layer index '{range_part}': must be an integer"
+                )
+
+            if layer_id < 0:
+                raise ValueError(
+                    f"Invalid layer index '{range_part}': must be non-negative"
+                )
+            if layer_id >= num_layers:
+                raise ValueError(
+                    f"Invalid layer index '{range_part}': {layer_id} >= num_layers {num_layers}"
+                )
+
+            result[layer_id] = dtype
+
+    return result
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """
@@ -289,6 +396,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    kv_cache_per_layer_dtype: Optional[str] = None
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -2628,6 +2736,15 @@ class ServerArgs:
                 "int8",
             ],
             help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+        )
+        parser.add_argument(
+            "--kv-cache-per-layer-dtype",
+            type=str,
+            default=ServerArgs.kv_cache_per_layer_dtype,
+            help='Per-layer KV cache dtype overrides. Format: "start-end:dtype,..." '
+            'Example: "0-1:int8,60-61:bf16" sets layers 0-1 to int8, 60-61 to bf16. '
+            "Layers not specified use --kv-cache-dtype. "
+            "Supported dtypes: auto, fp8_e5m2, fp8_e4m3, bf16, bfloat16, int4, int8.",
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -739,12 +740,17 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
-        k_descale, v_descale = None, None
-        if self.kv_cache_dtype_str in ("int4", "int8"):
-            pass
 
-        elif (
-            self.kv_cache_dtype_str != "auto"
+        # Get per-layer dtype if available
+        kv_pool = forward_batch.token_to_kv_pool
+        if hasattr(kv_pool, "get_layer_dtype"):
+            layer_dtype = kv_pool.get_layer_dtype(layer.layer_id)
+        else:
+            layer_dtype = self.kv_cache_dtype_str
+
+        k_descale, v_descale = None, None
+        if (
+            layer_dtype in (torch.float8_e4m3fn, torch.float8_e5m2, fp8_dtype)
             and layer.head_dim <= 256
             and self.fa_impl_ver != 4
         ):
@@ -756,9 +762,9 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            q = q.to(layer_dtype)
+            q_rope = q_rope.to(layer_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(layer_dtype) if k_rope is not None else None
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -813,7 +819,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
-            if self.kv_cache_dtype_str in ("int4", "int8"):
+            if layer_dtype in ("int4", "int8"):
                 kv_data = forward_batch.token_to_kv_pool.get_raw_kv_buffer(
                     layer.layer_id
                 )
@@ -831,7 +837,7 @@ class FlashAttentionBackend(AttentionBackend):
                     num_heads=layer.tp_k_head_num,
                     head_dim_k=layer.head_dim,
                     head_dim_v=layer.head_dim,  # Assuming same for simplicity
-                    quant_policy=4 if self.kv_cache_dtype_str == "int4" else 8,
+                    quant_policy=4 if layer_dtype == "int4" else 8,
                     output_dtype=q.dtype,
                     max_seq_len_k=max_seq_len_k,
                     out_size=out_size,
