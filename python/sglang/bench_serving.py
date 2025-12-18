@@ -937,7 +937,7 @@ def download_and_cache_hf_file(
     from huggingface_hub import hf_hub_download
 
     return hf_hub_download(
-        repo_id=repo_id, filename=filename, local_dir="/tmp", repo_type=repo_type
+        repo_id=repo_id, filename=filename, repo_type=repo_type
     )
 
 
