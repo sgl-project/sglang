@@ -250,8 +250,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_entropy: bool = False
 
     need_wait_for_image: Optional[bool] = None
-    num_items_assigned: Optional[List] = None
-    embedding_ports: Optional[List] = None
+    num_items_assigned: Optional[List[Any]] = None
+    embedding_ports: Optional[List[Any]] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -733,8 +733,8 @@ class TokenizedGenerateReqInput(BaseReq):
     return_entropy: bool = False
 
     need_wait_for_image: bool = False
-    num_items_assigned: Optional[List] = None
-    embedding_ports: Optional[List] = None
+    num_items_assigned: Optional[List[Any]] = None
+    embedding_ports: Optional[List[Any]] = None
 
 
 @dataclass
@@ -963,7 +963,7 @@ class BatchTokenIDOutput(
     retraction_counts: List[int]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
+    token_steps: Optional[List[List[int]]] = None
 
 
 @dataclass
@@ -995,7 +995,7 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     return_bytes: List[bool]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
+    token_steps: Optional[List[List[int]]] = None
 
 
 @dataclass
@@ -1042,7 +1042,7 @@ class BatchStrOutput(
     retraction_counts: List[int]
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
+    token_steps: Optional[List[List[int]]] = None
 
 
 @dataclass

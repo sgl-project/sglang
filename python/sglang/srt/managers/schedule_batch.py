@@ -510,7 +510,7 @@ class Req:
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
-        # for corss-endoder model
+        # for cross-encoder model
         self.token_type_ids = token_type_ids
 
         # The length of KV that have been removed in local attention chunked prefill
@@ -1784,7 +1784,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, []
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(self, idx: int, remaining_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
         if server_args.disaggregation_mode == "decode":
@@ -1794,7 +1794,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
-        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        num_tokens = remaining_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()
