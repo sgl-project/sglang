@@ -66,15 +66,7 @@ class BaseModelConfig:
 
 # AMD TP=8 base models for gsm8k completion benchmark
 # These models work with completion API but not chat completions
-#
-# NOTE: These models require in-house CI resources (not public HuggingFace models)
-# The upstream CI runner (linux-mi325-gpu-8) may not have access to these models.
-# If models are not available, the test will be skipped.
-#
-# Model path mapping for different platforms:
-# - MI300X (in-house): lmsys/gpt-oss-*-bf16
-# - MI325X (in-house): openai/gpt-oss-*
-# GPT-OSS models - available on upstream CI (cached at /sgl-data/hf-cache/hub/)
+# GPT-OSS models are cached on upstream CI at /sgl-data/hf-cache/hub/
 AMD_BASE_MODELS_TP8 = [
     # GPT-OSS-20B - smaller model, run first for faster feedback
     BaseModelConfig(
@@ -188,26 +180,6 @@ def check_model_available(model_path: str) -> bool:
         return False
 
 
-# For 2-GPU testing (scaled down from TP=8)
-AMD_BASE_MODELS_TP2 = [
-    BaseModelConfig(
-        model_path="lmsys/gpt-oss-20b-bf16",
-        tp_size=2,
-        accuracy_threshold=0.50,
-        other_args=[
-            "--chunked-prefill-size",
-            "32543",  # Scaled from 130172 / 4
-            "--max-running-requests",
-            "32",  # Scaled from 128 / 4
-            "--mem-fraction-static",
-            "0.85",
-            "--attention-backend",
-            "triton",
-            "--trust-remote-code",
-        ],
-        env_vars={"SGLANG_USE_AITER": "0"},
-    ),
-]
 
 
 def get_one_example(lines, i, include_answer):
@@ -345,15 +317,9 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # Select models based on available GPUs
-        # For now, default to TP=8 models (8-GPU runner)
-        # Can be overridden by environment variable
-        gpu_count = int(os.environ.get("AMD_GPU_COUNT", "8"))
-        if gpu_count >= 8:
-            cls.models = AMD_BASE_MODELS_TP8
-        else:
-            cls.models = AMD_BASE_MODELS_TP2
-
+        # This test is for 8-GPU runner (nightly-amd-8-gpu suite)
+        # All models use TP=8
+        cls.models = AMD_BASE_MODELS_TP8
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
 
