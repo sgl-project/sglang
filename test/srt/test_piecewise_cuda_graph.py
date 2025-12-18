@@ -214,6 +214,41 @@ class TestPiecewiseCudaGraphAWQ(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.65)
 
 
+class TestPiecewiseCudaGraphGPTQ(CustomTestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-30B-A3B-GPTQ-Int4"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--enable-piecewise-cuda-graph"],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mgsm_accuracy(self):
+        num_examples = 1319
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=num_examples,
+            num_threads=min(num_examples, 1024),
+        )
+
+        metrics = run_eval(args)
+        print(f"MGSM Accuracy: {metrics['score']:.3f}")
+
+        # Expected accuracy: 0.948, allow some variance
+        self.assertGreaterEqual(metrics["score"], 0.92)
+
+
 class TestPiecewiseCudaGraphFP8(CustomTestCase):
     """Test piecewise CUDA graph with FP8 quantized model"""
 
@@ -251,6 +286,43 @@ class TestPiecewiseCudaGraphFP8(CustomTestCase):
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.85)
         print(f"MGSM Accuracy: {metrics['score']:.3f}")
+
+
+class TestPiecewiseCudaGraphW8A8Int8(CustomTestCase):
+    """Test piecewise CUDA graph with W8A8 INT8 quantized model"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "RedHatAI/Llama-3.2-1B-Instruct-quantized.w8a8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-piecewise-cuda-graph",
+                "--quantization",
+                "w8a8_int8",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mgsm_accuracy(self):
+        """Test MGSM accuracy with W8A8 INT8 model"""
+        num_examples = 1319
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=num_examples,
+            num_threads=min(num_examples, 1024),
+        )
+        metrics = run_eval(args)
+        print(f"MGSM Accuracy: {metrics['score']:.3f}")
+        self.assertGreaterEqual(metrics["score"], 0.40)
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):

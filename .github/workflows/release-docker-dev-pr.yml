@@ -78,7 +78,7 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
-            --build-arg USE_LATEST_SGLANG=1 \
+            --build-arg BRANCH_TYPE=local \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
