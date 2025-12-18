@@ -639,7 +639,7 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["mode"],
         )
 
-        # TODO support ETP
+        # TODO support ETP (need to change expert_distribution.py at the same time)
         if torch.distributed.get_rank() == 0:
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
