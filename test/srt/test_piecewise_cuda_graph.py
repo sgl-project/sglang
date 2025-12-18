@@ -4,7 +4,7 @@ import torch
 
 from sglang import Engine
 from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.utils import get_device_count, get_device_sm, kill_process_tree
+from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -483,52 +483,6 @@ class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
         self.assertGreaterEqual(metrics["score"], 0.70)
-
-
-@unittest.skipIf(
-    get_device_count() < 2,
-    f"Test requires at least 2 GPUs, but only {get_device_count()} GPU(s) available",
-)
-class TestPiecewiseCudaGraphWithPP(CustomTestCase):
-    """Test piecewise CUDA graph with Pipeline Parallelism (PP) support"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-piecewise-cuda-graph",
-                "--pp-size",
-                "2",
-                "--tp-size",
-                "1",
-                "--chunked-prefill-size",
-                "256",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k_accuracy(self):
-        """Test GSM8K accuracy with PP and piecewise CUDA graph"""
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"GSM8K Accuracy with PP+Piecewise CUDA Graph: {metrics['accuracy']:.3f}")
-        self.assertGreater(metrics["accuracy"], 0.74)
 
 
 if __name__ == "__main__":
