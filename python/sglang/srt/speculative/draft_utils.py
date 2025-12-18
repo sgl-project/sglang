@@ -1,5 +1,4 @@
 import logging
-import os
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.common import is_blackwell
@@ -26,13 +25,10 @@ class DraftBackendFactory:
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
     ):
-        draft_attn_backend_override = (
-            os.environ.get("SGLANG_SPEC_DRAFT_ATTN_BACKEND", None)
-            or self.speculative_draft_attention_backend
-        )
+        draft_attn_backend = self.speculative_draft_attention_backend
         backend_type = (
-            draft_attn_backend_override
-            if draft_attn_backend_override
+            draft_attn_backend
+            if draft_attn_backend
             else getattr(self.server_args, backend_name)
         )
         if backend_type is None:
