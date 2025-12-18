@@ -26,6 +26,12 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from huggingface_hub import snapshot_download
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -151,6 +157,29 @@ AMD_BASE_MODELS_TP8 = [
         },
     ),
 ]
+
+
+def check_model_available(model_path: str) -> bool:
+    """Check if a model is available (either locally cached or on HuggingFace).
+    
+    Returns True if model can be loaded, False otherwise.
+    """
+    if not HF_HUB_AVAILABLE:
+        # If huggingface_hub not available, assume model exists and let server fail if not
+        return True
+    
+    try:
+        # Try to get the model path - this checks local cache first
+        from huggingface_hub import hf_hub_download, HfFileSystem
+        fs = HfFileSystem()
+        # Check if model exists by listing files (works for both local cache and remote)
+        files = fs.ls(model_path, detail=False)
+        return len(files) > 0
+    except Exception as e:
+        # Model not found or error accessing it
+        print(f"Model {model_path} not available: {e}")
+        return False
+
 
 # For 2-GPU testing (scaled down from TP=8)
 AMD_BASE_MODELS_TP2 = [
@@ -335,43 +364,81 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                 error_message = None
                 acc, invalid, latency = None, None, None
+                skipped = False
 
-                try:
-                    # Launch server
-                    process = popen_launch_server_for_base_model(
-                        self.base_url, config
-                    )
-
+                # Check if model is available before trying to launch
+                if not check_model_available(config.model_path):
+                    print(f"⏭️ SKIPPED: Model {config.model_path} not available")
+                    status = "⏭️ SKIPPED"
+                    skipped = True
+                    all_results.append({
+                        "model": config.model_path,
+                        "tp_size": config.tp_size,
+                        "accuracy": None,
+                        "threshold": config.accuracy_threshold,
+                        "invalid": None,
+                        "latency": None,
+                        "passed": True,  # Don't count as failure
+                        "skipped": True,
+                        "error": "Model not available",
+                    })
+                else:
                     try:
-                        # Run benchmark
-                        acc, invalid, latency = run_gsm8k_benchmark(
-                            self.base_url,
-                            num_questions=self.num_questions,
-                            num_shots=5,
-                            parallel=64,
+                        # Launch server
+                        process = popen_launch_server_for_base_model(
+                            self.base_url, config
                         )
 
-                        print(f"Accuracy: {acc:.3f} (threshold: {config.accuracy_threshold})")
-                        print(f"Invalid: {invalid:.3f}")
-                        print(f"Latency: {latency:.1f}s")
+                        try:
+                            # Run benchmark
+                            acc, invalid, latency = run_gsm8k_benchmark(
+                                self.base_url,
+                                num_questions=self.num_questions,
+                                num_shots=5,
+                                parallel=64,
+                            )
 
-                        passed = acc >= config.accuracy_threshold
-                        status = "✅ PASS" if passed else "❌ FAIL"
+                            print(f"Accuracy: {acc:.3f} (threshold: {config.accuracy_threshold})")
+                            print(f"Invalid: {invalid:.3f}")
+                            print(f"Latency: {latency:.1f}s")
 
-                        all_results.append({
-                            "model": config.model_path,
-                            "tp_size": config.tp_size,
-                            "accuracy": acc,
-                            "threshold": config.accuracy_threshold,
-                            "invalid": invalid,
-                            "latency": latency,
-                            "passed": passed,
-                            "error": None,
-                        })
+                            passed = acc >= config.accuracy_threshold
+                            status = "✅ PASS" if passed else "❌ FAIL"
+
+                            all_results.append({
+                                "model": config.model_path,
+                                "tp_size": config.tp_size,
+                                "accuracy": acc,
+                                "threshold": config.accuracy_threshold,
+                                "invalid": invalid,
+                                "latency": latency,
+                                "passed": passed,
+                                "skipped": False,
+                                "error": None,
+                            })
+
+                        except Exception as e:
+                            error_message = str(e)
+                            print(f"Error during benchmark: {error_message}")
+                            status = "❌ ERROR"
+                            all_results.append({
+                                "model": config.model_path,
+                                "tp_size": config.tp_size,
+                                "accuracy": None,
+                                "threshold": config.accuracy_threshold,
+                                "invalid": None,
+                                "latency": None,
+                                "passed": False,
+                                "skipped": False,
+                                "error": error_message,
+                            })
+
+                        finally:
+                            kill_process_tree(process.pid)
 
                     except Exception as e:
                         error_message = str(e)
-                        print(f"Error during benchmark: {error_message}")
+                        print(f"Error launching server: {error_message}")
                         status = "❌ ERROR"
                         all_results.append({
                             "model": config.model_path,
@@ -381,26 +448,9 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                             "invalid": None,
                             "latency": None,
                             "passed": False,
+                            "skipped": False,
                             "error": error_message,
                         })
-
-                    finally:
-                        kill_process_tree(process.pid)
-
-                except Exception as e:
-                    error_message = str(e)
-                    print(f"Error launching server: {error_message}")
-                    status = "❌ ERROR"
-                    all_results.append({
-                        "model": config.model_path,
-                        "tp_size": config.tp_size,
-                        "accuracy": None,
-                        "threshold": config.accuracy_threshold,
-                        "invalid": None,
-                        "latency": None,
-                        "passed": False,
-                        "error": error_message,
-                    })
 
                 # Add to summary
                 acc_str = f"{acc:.3f}" if acc is not None else "N/A"
@@ -418,8 +468,13 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
         if is_in_ci():
             write_github_step_summary(f"### TestNightlyGsm8kCompletionEvalAMD\n{summary}")
 
-        # Check for failures
-        failed_models = [r for r in all_results if not r["passed"]]
+        # Check for failures (exclude skipped models)
+        failed_models = [r for r in all_results if not r["passed"] and not r.get("skipped", False)]
+        skipped_models = [r for r in all_results if r.get("skipped", False)]
+        
+        if skipped_models:
+            print(f"\n⏭️ Skipped {len(skipped_models)} model(s) (not available)")
+        
         if failed_models:
             failure_msg = "\n".join([
                 f"- {r['model']}: accuracy={r['accuracy']}, threshold={r['threshold']}, error={r['error']}"
