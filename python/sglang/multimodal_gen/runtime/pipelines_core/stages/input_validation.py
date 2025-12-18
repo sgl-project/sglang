@@ -11,6 +11,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -296,10 +297,12 @@ class InputValidationStage(PipelineStage):
         result.add_check("width", batch.width, V.positive_int)
 
         # Validate height and width
+        sp_world_size = get_sp_world_size()
+
         def check_size(value: int, name: str):
-            if value % (8 * server_args.num_gpus) != 0:
+            if value % (8 * sp_world_size) != 0:
                 raise ValueError(
-                    f"{name} must be divisible by (8 x num_gpus) but {value} % (8 * {server_args.num_gpus}) != 0."
+                    f"{name} must be divisible by (8 x sp_world_size) but {value} % (8 * {sp_world_size}) != 0."
                 )
 
         check_size(batch.height, "Height")

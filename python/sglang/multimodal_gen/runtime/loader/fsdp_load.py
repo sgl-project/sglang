@@ -79,18 +79,11 @@ def maybe_load_fsdp_model(
     fsdp_inference: bool = False,
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
-    use_runai_model_streamer: bool | None = None,
     process_group: torch.distributed.ProcessGroup | None = None,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
     """
-    if use_runai_model_streamer is None:
-        from sglang.multimodal_gen.runtime.loader.weight_utils import (
-            HAS_RUNAI_MODEL_STREAMER,
-        )
-
-        use_runai_model_streamer = HAS_RUNAI_MODEL_STREAMER
 
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -201,9 +194,7 @@ def maybe_load_fsdp_model(
             process_group=process_group,
         )
 
-    weight_iterator = safetensors_weights_iterator(
-        weight_dir_list, use_runai_model_streamer=use_runai_model_streamer
-    )
+    weight_iterator = safetensors_weights_iterator(weight_dir_list)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
 
     # Count loaded parameters for debugging

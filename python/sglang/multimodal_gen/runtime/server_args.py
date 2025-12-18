@@ -901,10 +901,7 @@ class ServerArgs:
             #     pass
             # else:
             self.ring_degree = 1
-            logger.info(
-                f"Ring degree not set, using default value {self.ring_degree}"
-            )
-
+            logger.info(f"Ring degree not set, using default value {self.ring_degree}")
 
         # at this point, ring_degree and ulysses_degree should be natural number
         if self.ring_degree > 1:
