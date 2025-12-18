@@ -22,12 +22,12 @@ impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
         match ctx.router_config.connection_mode {
-            ConnectionMode::Grpc { .. } => Self::create_grpc_router(&ctx).await,
-            ConnectionMode::Http => Self::create_http_router(&ctx).await,
+            ConnectionMode::Grpc { .. } => Self::create_grpc_router(ctx).await,
+            ConnectionMode::Http => Self::create_http_router(ctx).await,
         }
     }
 
-    async fn create_grpc_router(ctx: &&Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+    async fn create_grpc_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
         match &ctx.router_config.mode {
             RoutingMode::Regular { .. } => Self::create_grpc_regular_router(ctx).await,
             RoutingMode::PrefillDecode {
