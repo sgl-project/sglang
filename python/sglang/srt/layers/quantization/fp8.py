@@ -69,6 +69,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -1384,6 +1385,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                     use_shuffled_weight=False,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 )
             else:
                 routing_bias_cast = (
@@ -1415,6 +1417,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ),
                     use_routing_scales_on_input=False,
                     routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 )
 
     def maybe_apply_hip_fused_experts(

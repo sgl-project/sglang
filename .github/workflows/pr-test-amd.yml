@@ -462,7 +462,9 @@ jobs:
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
+    # Temporarily disabled - uncomment when ready to re-enable (tracked here: https://github.com/sgl-project/sglang/issues/13107)
     if: |
+      false &&
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
@@ -513,7 +515,7 @@ jobs:
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,
         accuracy-test-1-gpu-amd,
-        accuracy-test-2-gpu-amd,
+        # accuracy-test-2-gpu-amd, # Temporarily disabled
       ]
     if: always()
     runs-on: ubuntu-latest

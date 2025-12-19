@@ -33,9 +33,6 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 
 logger = init_logger(__name__)
 
-CYAN = "\033[1;36m"
-RESET = "\033[0;0m"
-
 
 class GPUWorker:
     """

@@ -468,8 +468,6 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_npu:
-        import sgl_kernel_npu  # noqa: F401
-
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int32,
@@ -482,6 +480,5 @@ def assign_extend_cache_locs_func(
             end_offset,
             out_cache_loc,
         )
-        out_cache_loc = out_cache_loc.to(dtype=torch.int64)
 
         return out_cache_loc

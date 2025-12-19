@@ -54,6 +54,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
+    if server_args.tp_size is not None:
+        extra_args += f" --tp-size {server_args.tp_size}"
+
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
@@ -90,15 +93,25 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             and sampling_params.image_path
         ):
             # Handle URL or local path
-            if is_image_url(sampling_params.image_path):
-                image_path = download_image_from_url(str(sampling_params.image_path))
-            else:
-                image_path = Path(sampling_params.image_path)
+            image_path_list = sampling_params.image_path
+            if not isinstance(image_path_list, list):
+                image_path_list = [image_path_list]
+
+            new_image_path_list = []
+            for image_path in image_path_list:
+                if is_image_url(image_path):
+                    new_image_path_list.append(download_image_from_url(str(image_path)))
+                else:
+                    new_image_path_list.append(Path(image_path))
+                    if not image_path.exists():
+                        pytest.skip(f"{case.id}: file missing: {image_path}")
+
+            image_path_list = new_image_path_list
 
             warmup.run_edit_warmups(
                 count=server_args.warmup_edit,
                 edit_prompt=sampling_params.prompt,
-                image_path=image_path,
+                image_path=image_path_list,
             )
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
