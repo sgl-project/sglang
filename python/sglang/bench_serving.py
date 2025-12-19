@@ -129,7 +129,7 @@ def get_auth_headers() -> Dict[str, str]:
         return {}
 
 
-def wait_for_server(url: str, timeout_sec: int = 60) -> bool:
+def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     """
     Wait for the server to become ready by polling the specified URL.
     
@@ -142,25 +142,18 @@ def wait_for_server(url: str, timeout_sec: int = 60) -> bool:
     """
     start_time = time.perf_counter()
     headers = get_auth_headers()
-    
-    print(f"Waiting for server at {url} (timeout: {timeout_sec}s)...")
-    
     while True:
         try:
             response = requests.get(url, headers=headers, timeout=5)
             if response.status_code == 200:
-                elapsed = time.perf_counter() - start_time
-                print(f"Server is ready! (took {elapsed:.2f}s)")
                 return True
         except requests.exceptions.RequestException:
             pass
-        
         elapsed = time.perf_counter() - start_time
         if elapsed >= timeout_sec:
             print(f"Server did not become ready within {timeout_sec}s timeout")
             return False
-        
-        # Wait a bit before retrying
+        # Wait before retrying
         time.sleep(1)
 
 
@@ -2559,7 +2552,7 @@ def run_benchmark(args_: argparse.Namespace):
     # Wait for server to be ready
     ready_check_timeout = getattr(args, "ready_check_timeout_sec", 60)
     if ready_check_timeout > 0:
-        if not wait_for_server(model_url, ready_check_timeout):
+        if not wait_for_endpoint(model_url, ready_check_timeout):
             print(f"Server at {model_url} is not ready. Exiting.")
             sys.exit(1)
 
