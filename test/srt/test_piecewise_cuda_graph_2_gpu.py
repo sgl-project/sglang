@@ -28,8 +28,6 @@ class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):
                 "eager",
                 "--disable-radix-cache",
                 "--tp=2",
-                "--load-format",
-                "dummy",
             ],
         )
 
@@ -74,8 +72,6 @@ class TestPiecewiseCudaGraphFusedMoE(CustomTestCase):
                 "2",
                 "--ep-size",
                 "2",
-                "--load-format",
-                "dummy",
             ],
         )
 
