@@ -80,7 +80,9 @@ class ComposedPipelineBase(ABC):
         self._stage_name_mapping: dict[str, PipelineStage] = {}
 
         # NOTE: holding an executor inside Pipeline is unnatural. Consider let the gpu worker hold it
-        self.executor: PipelineExecutor = executor or self.build_executor(server_args=server_args)
+        self.executor: PipelineExecutor = executor or self.build_executor(
+            server_args=server_args
+        )
 
         if required_config_modules is not None:
             self._required_config_modules = required_config_modules
@@ -277,8 +279,8 @@ class ComposedPipelineBase(ABC):
 
         components = {}
         for module_name, (
-                transformers_or_diffusers,
-                architecture,
+            transformers_or_diffusers,
+            architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(

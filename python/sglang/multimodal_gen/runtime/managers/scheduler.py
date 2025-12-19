@@ -188,7 +188,8 @@ class Scheduler:
                 reqs = self.get_next_batch_to_run()
 
                 if reqs:
-                    handler = self.request_handlers.get(type(reqs[0]))
+                    first_req = reqs[0]
+                    handler = self.request_handlers.get(type(first_req))
                     if handler:
                         output_batch = handler(reqs)
                     else:
