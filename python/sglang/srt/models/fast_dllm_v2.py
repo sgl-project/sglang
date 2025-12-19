@@ -43,6 +43,10 @@ class FastDLLMV2(Qwen2ForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config=quant_config, prefix=prefix)
+        # dLLM algorithms require full vocabulary logits in
+        # dllm_extend mode. Qwen2ForCausalLM constructs LogitsProcessor with
+        # return_full_logits=False by default, so enable it for Fast_dLLM_v2.
+        self.logits_processor.return_full_logits = True
 
 
 # Register with HuggingFace architecture name

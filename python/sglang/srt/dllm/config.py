@@ -33,7 +33,7 @@ class DllmConfig:
         if model_config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
             block_size = 32
             mask_id = 156895
-        elif model_config.hf_config.architectures[0] == "FastDLLMV2":
+        elif model_config.hf_config.architectures[0] == "Fast_dLLM_QwenForCausalLM":
             block_size = 32
             mask_id = 151665
         else:
