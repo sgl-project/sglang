@@ -125,9 +125,8 @@ class RMSNorm(CustomOp):
             # but right now we can only have hidden_states+(residual+post_residual_addition).
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
             # we probably need to add another parameter to fused_add_rmsnorm
-            post_residual_addition = kwargs.get("post_residual_addition")
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+            post_residual_addition = kwargs.get("post_residual_addition", 0.0)
+            residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
@@ -195,17 +194,13 @@ class RMSNorm(CustomOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
-        post_residual_addition = kwargs.get("post_residual_addition")
+        post_residual_addition = kwargs.get("post_residual_addition", 0.0)
         x = x.to(torch.float32)
         if residual is not None:
             x = (
                 x
                 + residual.to(torch.float32)
-                + (
-                    post_residual_addition.to(torch.float32)
-                    if post_residual_addition is not None
-                    else 0.0
-                )
+                + (post_residual_addition.to(torch.float32))
             )
             if self.fp32_residual:
                 residual = x.clone()
