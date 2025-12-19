@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import base64
+import dataclasses
 import os
 import time
 from typing import List, Optional
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import shallow_asdict
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -90,26 +92,8 @@ def _build_sampling_params_from_request(
 
 
 def _build_req_from_sampling(s: SamplingParams) -> Req:
-    # TODO: refactor this! this is so dangerous because we could forget to add a new field here!
-    return Req(
-        request_id=s.request_id,
-        data_type=s.data_type,
-        prompt=s.prompt,
-        negative_prompt=s.negative_prompt,
-        image_path=s.image_path,
-        height=s.height,
-        width=s.width,
-        fps=1,
-        guidance_scale=s.guidance_scale,
-        num_inference_steps=s.num_inference_steps,
-        num_frames=s.num_frames,
-        seed=s.seed,
-        generator_device=s.generator_device,
-        output_path=s.output_path,
-        output_file_name=s.output_file_name,
-        num_outputs_per_prompt=s.num_outputs_per_prompt,
-        save_output=s.save_output,
-    )
+    req_fields = {f.name for f in dataclasses.fields(Req)}
+    return Req(**{k: v for k, v in shallow_asdict(s).items() if k in req_fields})
 
 
 @router.post("/generations", response_model=ImageResponse)
