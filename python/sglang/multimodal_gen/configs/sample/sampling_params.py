@@ -258,7 +258,7 @@ class SamplingParams:
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
-            logger.debug(f"Setting num_frames to 1 because this is an image-gen model")
+            logger.debug(f"num_frames set to 1 for image generation model")
             self.num_frames = 1
             self.data_type = DataType.IMAGE
         elif self.adjust_frames:
