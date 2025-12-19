@@ -412,7 +412,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         try:
             # Try to match a partial or complete tool call
             partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
+                pattern=r"<tool_call>(.*?)(<arg_key>.*?)?(</tool_call>|$)",
                 string=current_text,
                 flags=re.DOTALL,
             )
