@@ -61,6 +61,26 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
 
     for index_file in index_files:
         index_path = os.path.join(snapshot_dir, index_file)
+
+        # Check if index file is a broken symlink (exists in listing but blob missing)
+        if os.path.islink(index_path) and not os.path.exists(index_path):
+            # Broken symlink - clean it up so download can proceed
+            try:
+                blob_path = os.path.realpath(index_path)
+                os.remove(index_path)
+                logger.warning(
+                    "Removed broken index symlink: %s (blob missing)", index_file
+                )
+                # Also try to remove dangling blob reference if it somehow exists
+                if os.path.exists(blob_path):
+                    os.remove(blob_path)
+            except Exception as e:
+                logger.error("Failed to remove broken symlink %s: %s", index_file, e)
+            return (
+                False,
+                f"Broken index file symlink: {index_file} (cleaned up, will re-download)",
+            )
+
         try:
             with open(index_path) as f:
                 index_data = json.load(f)
@@ -85,6 +105,13 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
                     f"Missing {len(missing_files)} file(s) from index {index_file}: {missing_files[:3]}{'...' if len(missing_files) > 3 else ''}",
                 )
 
+        except FileNotFoundError as e:
+            # Index file was listed but can't be read - could be race condition or broken state
+            logger.warning("Failed to read index file %s: %s", index_file, e)
+            return (
+                False,
+                f"Index file {index_file} unreadable (will re-download)",
+            )
         except Exception as e:
             logger.warning("Failed to read index file %s: %s", index_file, e)
             continue

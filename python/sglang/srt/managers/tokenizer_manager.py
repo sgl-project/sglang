@@ -38,6 +38,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -72,7 +73,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import RequestStage
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -214,10 +215,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
-            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
-                import_processors(
-                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
-                )
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
             _processor = _get_processor_wrapper(server_args)
             transport_mode = _determine_tensor_transport_mode(self.server_args)
 
@@ -286,6 +285,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+
+        # E Disaggregation
+        if self.server_args.language_only:
+            self.mm_receiver = MMReceiver(
+                server_args,
+                dtype=self.model_config.dtype,
+            )
 
         # Request states
         self._chosen_loop = None
@@ -411,6 +417,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+        if (
+            self.server_args.language_only
+            and isinstance(obj, GenerateReqInput)
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and obj.contains_mm_input()
+        ):
+            self.mm_receiver.send_encode_request(obj)
 
         if self.enable_trace:
             self._trace_request_start(obj, created_time, request)
@@ -615,15 +628,39 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            mm_inputs: Dict = await self.mm_data_processor.process(
-                image_data=obj.image_data,
-                audio_data=obj.audio_data,
-                input_text_or_ids=(input_text or input_ids),
-                request_obj=obj,
-                max_req_input_len=self.max_req_input_len,
-            )
+
+            mm_inputs = None
+
+            if (
+                not self.server_args.language_only
+                or self.server_args.encoder_transfer_backend
+                in ["zmq_to_tokenizer", "mooncake"]
+            ):
+                if self.server_args.language_only:
+                    mm_inputs = await self.mm_receiver.recv_mm_data(
+                        img_data=obj.image_data,
+                        mm_processor=self.mm_processor,
+                        prompt=(input_text or input_ids),
+                    )
+                if mm_inputs is None:
+                    mm_inputs: Dict = await self.mm_data_processor.process(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text_or_ids=(input_text or input_ids),
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
+
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            if (
+                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                and mm_inputs
+                and "mm_items" in mm_inputs
+            ):
+                for item in mm_inputs["mm_items"]:
+                    if isinstance(item, MultimodalDataItem):
+                        item.set_pad_value()
         else:
             mm_inputs = None
 
@@ -796,11 +833,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
-                reasoning=obj.reasoning,
+                require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                need_wait_for_image=obj.need_wait_for_image,
+                num_items_assigned=obj.num_items_assigned,
+                embedding_ports=obj.embedding_ports,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1506,6 +1546,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self._add_metric_if_present(
                     recv_obj, "prefill_launch_latency", meta_info, i
                 )
+                self._add_metric_if_present(
+                    recv_obj, "prefill_finished_ts", meta_info, i
+                )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -1804,12 +1847,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             meta_info["request_sent_to_scheduler_ts"] = (
                 state.request_sent_to_scheduler_ts
             )
-        # For embeddings, there's no separate prefill phase, so omit `prefill_finished_ts`.
-        if (
-            not isinstance(recv_obj, BatchEmbeddingOutput)
-            and state.first_token_time > 0
-        ):
-            meta_info["prefill_finished_ts"] = state.first_token_time
         if state.response_sent_to_client_ts > 0:
             meta_info["response_sent_to_client_ts"] = state.response_sent_to_client_ts
         if state.finished_time > 0:

@@ -217,14 +217,16 @@ class _LayerModeComputationContext:
     layer_id: int
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
+    is_next_layer_sparse: Optional[bool]
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
         return _LayerModeComputationContext(
+            num_layers=self.num_layers,
             layer_id=self.layer_id - 1,
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
-            num_layers=self.num_layers,
+            is_next_layer_sparse=self.is_layer_sparse,
         )
 
 
@@ -274,6 +276,15 @@ class LayerScatterModes:
             )
 
     @classmethod
+    def _should_gather_for_tbo(cls, context: _LayerModeComputationContext):
+        return (
+            not context.is_layer_sparse
+            and context.is_next_layer_sparse
+            and enable_moe_dense_fully_dp()
+            and get_global_server_args().enable_two_batch_overlap
+        )
+
+    @classmethod
     def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
         mlp_mode = cls._compute_mlp_mode(context)
         if mlp_mode == ScatterMode.SCATTERED:
@@ -288,6 +299,8 @@ class LayerScatterModes:
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.model_input_output()
         if mlp_mode == ScatterMode.SCATTERED:
+            if cls._should_gather_for_tbo(context):
+                return ScatterMode.TP_ATTN_FULL
             return ScatterMode.SCATTERED
         if mlp_mode == ScatterMode.FULL:
             return ScatterMode.TP_ATTN_FULL
