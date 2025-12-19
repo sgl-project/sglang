@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.models import (
     VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -50,10 +51,20 @@ class ModelTaskType(Enum):
     TI2I = auto()  # Image to Image or Text-Image to Image
 
     def is_image_gen(self) -> bool:
-        return self == ModelTaskType.T2I or self == ModelTaskType.I2I
+        return (
+            self == ModelTaskType.T2I
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.TI2I
+        )
 
     def requires_image_input(self) -> bool:
         return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+
+    def data_type(self) -> DataType:
+        if self.is_image_gen():
+            return DataType.IMAGE
+        else:
+            return DataType.VIDEO
 
 
 class STA_Mode(str, Enum):
@@ -127,6 +138,9 @@ class PipelineConfig:
 
     model_path: str = ""
     pipeline_config_path: str | None = None
+
+    # precision and autocast
+    enable_autocast: bool = True
 
     # generation parameters
     # controls the timestep embedding generation

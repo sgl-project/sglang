@@ -17,12 +17,7 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
-    QwenImagePipelineConfig,
-)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -880,13 +875,7 @@ class ServerArgs:
             self.use_fsdp_inference = False
 
         # autocast
-        is_flux = (
-            isinstance(self.pipeline_config, FluxPipelineConfig)
-            or isinstance(self.pipeline_config, QwenImagePipelineConfig)
-            or isinstance(self.pipeline_config, QwenImageEditPipelineConfig)
-        )
-        if is_flux:
-            self.disable_autocast = True
+        self.disable_autocast = self.pipeline_config.enable_autocast
 
         # Validate mode consistency
         assert isinstance(

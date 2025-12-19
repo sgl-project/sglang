@@ -777,10 +777,11 @@ class DenoisingStage(PipelineStage):
         else:
             batch.did_sp_shard_latents = False
 
-        # For I2I tasks like QwenImageEdit, the image_latent (input image) should be
+        # For I2I tasks like QwenImageEdit, where the image latents is provided as condition, the image_latent (input image) should be
         # replicated on all SP ranks, not sharded, as it provides global context.
+        # For Wan2_2_TI2V_5B_Config, it has very special settings
         if (
-            server_args.pipeline_config.task_type != ModelTaskType.I2I
+            type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
             and batch.image_latent is not None
         ):
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
