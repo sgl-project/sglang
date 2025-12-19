@@ -667,12 +667,20 @@ class FlashAttentionBackend(AttentionBackend):
                 self.forward_metadata_spec_decode_expand.cache_seqlens_int32 += (
                     expanded_last_page_lens
                 )
-                expand_page_table = update_draft_decode_set_expand_metadata_with_page_size(
+                expand_page_table = torch.zeros(
+                    forward_batch.batch_size * self.topk,
+                    self.speculative_num_steps,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
+                cache_loc = forward_batch.out_cache_loc.view(-1, self.speculative_num_steps)
+                draft_decode_set_expand_metadata(
                     cache_seqlens_int32=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    page_table=expand_page_table,
                     last_page_lens=last_page_lens,
                     decode_length=decode_length,
-                    cache_loc=forward_batch.out_cache_loc,
+                    cache_loc=cache_loc,
                     topk=self.topk,
                     page_size=self.page_size,
                 )
@@ -1844,7 +1852,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
                     cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
                     if self.page_size > 1:
-                        update_draft_decode_set_expand_metadata_with_page_size(
+                        draft_decode_set_expand_metadata(
                             cache_seqlens_int32=metadata_expand.cache_seqlens_int32,
                             page_table=metadata_expand.page_table,
                             last_page_lens=last_page_lens,
@@ -2472,10 +2480,10 @@ def normal_decode_set_metadata(
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def update_draft_decode_set_expand_metadata_with_page_size(
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
+def draft_decode_set_expand_metadata(
     cache_seqlens_int32: torch.Tensor,  # Modifies
-    page_table: torch.Tensor,  # Modifies
+    page_table: torch.Tensor, # Modifies
     last_page_lens: torch.Tensor,
     decode_length: int,
     cache_loc: torch.Tensor,
@@ -2484,12 +2492,12 @@ def update_draft_decode_set_expand_metadata_with_page_size(
 ):
     expanded_last_page_lens = last_page_lens.repeat_interleave(topk)
     cache_seqlens_int32.copy_(decode_length + expanded_last_page_lens)
-    cache_loc = cache_loc // page_size
+    cache_loc = (cache_loc // page_size).to(torch.int32)
+    if cache_loc.dim() == 1:
+        cache_loc = cache_loc.unsqueeze(0)
     # Vectorized torch.unique_consecutive: track value change points then scatter
     mask = torch.ones_like(cache_loc, dtype=torch.bool)
     mask[:, 1:] = cache_loc[:, 1:] != cache_loc[:, :-1]
     positions = mask.cumsum(dim=1) - 1
-    packed = torch.zeros_like(cache_loc)
-    packed.scatter_(1, positions, cache_loc)
-    return packed
-
+    num_seqs = cache_loc.shape[0]
+    page_table[:num_seqs, :].scatter_(1, positions, cache_loc)

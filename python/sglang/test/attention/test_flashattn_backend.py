@@ -5,7 +5,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
-    update_draft_decode_set_expand_metadata_with_page_size,
+    draft_decode_set_expand_metadata,
 )
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -355,7 +355,7 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
     This is to align with the current allocation logic. It does not affect the correctness.
     """
 
-    def test_update_draft_decode_set_expand_metadata_with_page_size(self):
+    def test_draft_decode_set_expand_metadata(self):
         bs, topk, page_size = 1, 2, 4
 
         cases = [
@@ -402,8 +402,8 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
         last_page_lens = torch.tensor([3], dtype=torch.int32)
         for cache_loc, expected_page_table, decode_length in cases:
             cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
-            page_table = torch.zeros(bs * topk, decode_length + 1, dtype=torch.int32)
-            update_draft_decode_set_expand_metadata_with_page_size(
+            page_table = torch.zeros_like(cache_loc, dtype=torch.int32)
+            draft_decode_set_expand_metadata(
                 cache_seqlens_int32=cache_seqlens_int32,
                 page_table=page_table,
                 last_page_lens=last_page_lens,
@@ -438,10 +438,9 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
             dtype=torch.int32,
         )
         cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
-        page_table = torch.zeros(bs * topk, decode_length + 1, dtype=torch.int32)
         last_page_lens = torch.tensor([1, 3, 0], dtype=torch.int32)
-
-        update_draft_decode_set_expand_metadata_with_page_size(
+        page_table = torch.zeros_like(cache_loc, dtype=torch.int32)
+        draft_decode_set_expand_metadata(
             cache_seqlens_int32=cache_seqlens_int32,
             page_table=page_table,
             last_page_lens=last_page_lens,
