@@ -100,17 +100,11 @@ class TestEagleLogprobCorrectness(CustomTestCase):
         print("\nChecking consistency...")
         self.assertEqual(out_base["text"], out_eagle["text"])
 
-        meta_base = out_base["meta_info"]
-        meta_eagle = out_eagle["meta_info"]
+        logprob_base = out_base["meta_info"]["output_token_logprobs"]
+        logprob_eagle = out_eagle["meta_info"]["logprob"]
+        self.assertEqual(len(logprob_base), len(logprob_eagle))
 
-        self.assertEqual(
-            len(meta_base["output_token_logprobs"]),
-            len(meta_eagle["output_token_logprobs"]),
-        )
-
-        for i, (lp_base, lp_eagle) in enumerate(
-            zip(meta_base["output_token_logprobs"], meta_eagle["output_token_logprobs"])
-        ):
+        for i, (lp_base, lp_eagle) in enumerate(zip(logprob_base, logprob_eagle)):
             # lp structure: (logprob, token_id, token_text)
             self.assertEqual(lp_base[1], lp_eagle[1], f"Token ID mismatch at index {i}")
             # we ignore the logprob difference for now, it exists naturally diff for the decoding calculation and draft+verify calculation
