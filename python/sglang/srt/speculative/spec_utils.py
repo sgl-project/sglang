@@ -38,6 +38,11 @@ elif _is_hip:
 else:
     from sglang.srt.utils.common import fast_topk
 
+try:
+    from xgrammar.testing import _traverse_draft_tree as _traverse_draft_tree_native
+except ImportError:
+    _traverse_draft_tree_native = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -567,7 +572,7 @@ def generate_simulated_accept_index(
     return sim_accept_index
 
 
-def traverse_tree(
+def traverse_tree_fallback(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -576,10 +581,8 @@ def traverse_tree(
 ):
     """
     Traverse the tree constructed by the draft model to generate the logits mask.
+    Pure Python implementation as fallback for non-xgrammar backends.
     """
-    assert (
-        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
-    )
 
     def dfs(
         curr: int,
@@ -629,6 +632,42 @@ def traverse_tree(
             )
 
     dfs(0, retrieve_next_token, retrieve_next_sibling, -1)
+
+
+def traverse_tree(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    grammar: BaseGrammarObject,
+    allocate_token_bitmask: torch.Tensor,
+):
+    """
+    Traverse the tree constructed by the draft model to generate the logits mask.
+    Dispatches to C++ implementation for xgrammar backend, otherwise uses Python fallback.
+    """
+    assert (
+        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
+    )
+
+    # Use C++ implementation for xgrammar backend
+    if _traverse_draft_tree_native is not None and hasattr(grammar, "matcher"):
+        _traverse_draft_tree_native(
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+            grammar.matcher,
+            allocate_token_bitmask,
+        )
+        return
+
+    # Fallback to Python implementation for other backends
+    traverse_tree_fallback(
+        retrieve_next_token,
+        retrieve_next_sibling,
+        draft_tokens,
+        grammar,
+        allocate_token_bitmask,
+    )
 
 
 def generate_token_bitmask(

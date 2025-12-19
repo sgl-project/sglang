@@ -1,11 +1,20 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
+import xgrammar as xgr
+from sglang.srt.constrained.xgrammar_backend import XGrammarGrammar
 from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
-from sglang.srt.speculative.spec_utils import assign_draft_cache_locs
+from sglang.srt.speculative import spec_utils
+from sglang.srt.speculative.spec_utils import (
+    assign_draft_cache_locs,
+    traverse_tree,
+    traverse_tree_fallback,
+)
 from sglang.srt.utils import next_power_of_2
+from xgrammar.matcher import allocate_token_bitmask
 
 BYTES_PER_TILE = 128
 
@@ -342,6 +351,63 @@ class TestSpecUtils(unittest.TestCase):
             )
         expected_out_cache_loc = torch.cat(expected)
         assert torch.allclose(trimmed, expected_out_cache_loc)
+
+
+class TestTraverseTree(unittest.TestCase):
+    """Test traverse_tree dispatches to native implementation and matches fallback."""
+
+    def test_traverse_tree_uses_native_and_matches_fallback(self):
+        """Test that native is called and produces same results as fallback."""
+        vocab = ["a", "b", "c", "{", "}", '"', ":", ",", " ", "true", "false", "null"]
+
+        def create_grammar():
+            grammar = xgr.Grammar.builtin_json_grammar()
+            tokenizer_info = xgr.TokenizerInfo(
+                vocab, vocab_size=len(vocab), stop_token_ids=[]
+            )
+            compiled = xgr.GrammarCompiler(tokenizer_info).compile_grammar(grammar)
+            matcher = xgr.GrammarMatcher(compiled)
+            return XGrammarGrammar(matcher, len(vocab), None, None)
+
+        retrieve_next_token = torch.tensor([1, 2, -1], dtype=torch.int64)
+        retrieve_next_sibling = torch.tensor([-1, -1, -1], dtype=torch.int64)
+        draft_tokens = torch.tensor([3, 6, 4], dtype=torch.int64)
+
+        # Verify native is available
+        original_native = spec_utils._traverse_draft_tree_native
+        self.assertIsNotNone(
+            original_native, "Native implementation should be available"
+        )
+
+        # Test native is called via patch
+        bitmask1 = allocate_token_bitmask(3, len(vocab))
+        with patch.object(
+            spec_utils, "_traverse_draft_tree_native", wraps=original_native
+        ) as mock_native:
+            traverse_tree(
+                retrieve_next_token,
+                retrieve_next_sibling,
+                draft_tokens,
+                create_grammar(),
+                bitmask1,
+            )
+            self.assertTrue(
+                mock_native.called, "Native implementation should be called"
+            )
+
+        # Test fallback produces same result
+        bitmask2 = allocate_token_bitmask(3, len(vocab))
+        traverse_tree_fallback(
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+            create_grammar(),
+            bitmask2,
+        )
+
+        self.assertTrue(
+            torch.equal(bitmask1, bitmask2), "Native and fallback should match"
+        )
 
 
 if __name__ == "__main__":
