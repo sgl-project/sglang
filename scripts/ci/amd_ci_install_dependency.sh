@@ -138,8 +138,7 @@ echo "[CI] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 NEED_REBUILD="false"
 
 if [[ "${IMAGE_AITER_VERSION}" == "none" ]]; then
-    echo "[CI] No AITER found in image → rebuild required."
-    NEED_REBUILD="true"
+    echo "[CI] No AITER found in image"
 elif [[ "${IMAGE_AITER_VERSION}" != "${REPO_AITER_COMMIT}" ]]; then
     echo "[CI] Version mismatch:"
     echo "     Image: ${IMAGE_AITER_VERSION}"
