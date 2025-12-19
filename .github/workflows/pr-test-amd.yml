@@ -72,7 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-gpu-1.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -117,7 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-gpu-1.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -155,7 +155,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-gpu-1.test]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{matrix.runner}}
     steps:
@@ -193,7 +193,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-2]
+        runner: [linux-mi325-gpu-2.test]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -279,7 +279,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-gpu-1.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -332,7 +332,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-gpu-1.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -379,7 +379,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-2]
+        runner: [linux-mi325-gpu-2.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -436,7 +436,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi325-gpu-1.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -477,7 +477,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-2]
+        runner: [linux-mi325-gpu-2.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
