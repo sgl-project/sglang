@@ -35,7 +35,7 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
-            "FastDLLMV2": {"block_size": 32, "mask_id": 151665},
+            "Fast_dLLM_QwenForCausalLM": {"block_size": 32, "mask_id": 151665},
         }
 
         arch = model_config.hf_config.architectures[0]
