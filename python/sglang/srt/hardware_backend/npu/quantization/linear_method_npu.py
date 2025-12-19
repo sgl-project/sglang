@@ -134,7 +134,6 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(layer):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
         layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
             layer.weight.data.to(torch.int32)
