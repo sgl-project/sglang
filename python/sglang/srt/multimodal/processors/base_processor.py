@@ -253,6 +253,7 @@ class BaseMultimodalProcessor(ABC):
                 vision_start_indices.append((i, Modality.IMAGE))
             elif prompt[i + 1] == video_token_id:
                 vision_start_indices.append((i, Modality.VIDEO))
+        # get modality list with order preserved
         modality_list = [modality for _, modality in vision_start_indices]
 
         img_idx = 0
@@ -275,11 +276,10 @@ class BaseMultimodalProcessor(ABC):
             input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
             mm_offset_start = len(input_ids)
             input_ids.extend([mm_token_id] * mm_token_num)
-            cur_idx = mm_start_idx + 2
+            cur_idx = mm_start_idx + 2  # jump to img_end_id or video_end_id
             offsets.append((mm_offset_start, len(input_ids) - 1))
         else:
             input_ids.extend(prompt[cur_idx:])
-            offsets.append((len(input_ids), len(input_ids)))
 
         return input_ids, offsets, modality_list
 

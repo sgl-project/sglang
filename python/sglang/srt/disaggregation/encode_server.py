@@ -30,13 +30,14 @@ from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_loader import get_model
+from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
-from transformers import AutoImageProcessor
+from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, load_video, random_uuid
+from transformers import AutoProcessor
 from transformers.image_utils import load_images
 
 logger = logging.getLogger(__name__)
@@ -82,15 +83,18 @@ def _convert(data):
         return data
 
 
-_image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
+_vision_grid_attrs = {
+    Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
+    Modality.VIDEO: ["video_grid_thw"],
+}
 
 
-def _get_image_grid_dim(images_input):
-    for attr in _image_grid_attrs:
-        if attr in images_input:
-            return images_input[attr]
+def _get_vision_grid_dim(mm_inputs, modality):
+    for attr in _vision_grid_attrs[modality]:
+        if attr in mm_inputs:
+            return mm_inputs[attr]
     raise ValueError(
-        f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
+        f"Vision grid dim ({_vision_grid_attrs[modality]}) not found in {mm_inputs}"
     )
 
 
@@ -107,15 +111,33 @@ class MMEncoder:
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
 
-        self.image_processor = AutoImageProcessor.from_pretrained(
-            server_args.model_path,
+        processor_path = server_args.tokenizer_path or server_args.model_path
+        self.mm_processor = AutoProcessor.from_pretrained(
+            processor_path,
             trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
             use_fast=True,
         )
 
         self.model_config = ModelConfig.from_server_args(
             server_args,
         )
+        vision_config = (
+            server_args.mm_process_config.get("vision_config", {})
+            if server_args.mm_process_config is not None
+            else {}
+        )
+        if not vision_config:
+            # keep default values as qwen_vl.py
+            self.video_config = {
+                "fps": 2.0,
+                "max_frames": 768,
+                "min_frames": 4,
+            }
+        else:
+            self.video_config = vision_config
+        # default support cuda
+        self.video_config["device"] = "cuda"
 
         self.load_config = LoadConfig(
             load_format=server_args.load_format,
@@ -180,21 +202,56 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
-    async def _encode(self, mm_items) -> torch.Tensor:
-        images = load_images(mm_items)
+    async def _process_mm_items(self, mm_items, modality):
+        if modality == Modality.IMAGE:
+            images = load_images(mm_items)
+            processor_input = self.mm_processor.image_processor(images=images)
+            feature = processor_input["pixel_values"]
+            modality = Modality.IMAGE
+            get_feature_method = self.model.get_image_feature
+        elif modality == Modality.VIDEO:
+            # mainly follows qwen_vl.py
+            video_items = [load_video(video_item) for video_item in mm_items]
+            videos_processed = [
+                await preprocess_video(video, video_config=self.video_config)
+                for video in video_items
+            ]
+            videos, video_metadata = map(list, zip(*videos_processed))
 
-        images_input = self.image_processor(images=images)
-        feature = images_input["pixel_values"]
+            # pass preprocessed videos to processor with do_sample_frames=False
+            video_processor_kwargs = {}
+            video_processor_kwargs["do_sample_frames"] = False
+            for key in self.video_config:
+                video_processor_kwargs[key] = self.video_config[key]
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            processor_input = self.mm_processor.video_processor(
+                videos=videos, **video_processor_kwargs
+            )
+            feature = processor_input["pixel_values_videos"]
+            modality = Modality.VIDEO
+            get_feature_method = self.model.get_video_feature
+        else:
+            raise ValueError(
+                f"Currently only support image and video modalities, but got {modality}"
+            )
+
         mm_item = MultimodalDataItem.from_dict(
             {
-                "modality": Modality.IMAGE,
+                "modality": modality,
                 "feature": _convert(feature),
             }
         )
-        for k, v in images_input.items():
-            if k == "pixel_values":
+        for k, v in processor_input.items():
+            if k in ["pixel_values", "pixel_values_videos"]:
                 continue
             mm_item.set(k, _convert(v))
+        return processor_input, mm_item, get_feature_method
+
+    async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
+        mm_inputs, mm_item, get_feature_fn = await self._process_mm_items(
+            mm_items, modality
+        )
 
         # support mm_cache
         mm_embedding = None
@@ -211,7 +268,7 @@ class MMEncoder:
 
         if mm_embedding is None:
             with torch.inference_mode():
-                mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+                mm_embedding: torch.Tensor = get_feature_fn([mm_item])
                 mm_embedding = mm_embedding.cpu()
             if len(mm_embedding.shape) != 2:
                 mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
@@ -224,7 +281,7 @@ class MMEncoder:
             f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
         )
 
-        return _get_image_grid_dim(images_input), mm_embedding
+        return _get_vision_grid_dim(mm_inputs, modality), mm_embedding
 
     async def _send(
         self,
@@ -244,7 +301,6 @@ class MMEncoder:
             self.engine.deregister(embedding.data_ptr())
 
             mm_data.embedding = None
-            mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
         endpoint = (
@@ -269,9 +325,9 @@ class MMEncoder:
                 [pickle.dumps(new_mm_data), embedding_tensor.__buffer__()]
             )
 
-    async def encode(self, mm_items, req_id, num_parts, part_idx):
+    async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
         start_time = time.time()
-        image_grid_dim, mm_embedding = await self._encode(mm_items)
+        grid_dim, mm_embedding = await self._encode(mm_items, modality)
         end_time = time.time()
         logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
         if self.rank == 0:
@@ -279,8 +335,8 @@ class MMEncoder:
                 req_id,
                 num_parts,
                 part_idx,
-                image_grid_dim,
-                Modality.IMAGE,
+                grid_dim,
+                modality,
                 mm_embedding,
             )
             self.embedding_to_send[mm_data.req_id] = mm_data
@@ -398,6 +454,7 @@ async def run_encoder(
         request = await encoder.schedule_socket.recv_pyobj()
         await encoder.encode(
             mm_items=request["mm_items"],
+            modality=Modality.from_str(request["modality"]),
             req_id=request["req_id"],
             num_parts=request["num_parts"],
             part_idx=request["part_idx"],
@@ -446,6 +503,7 @@ async def handle_encode_request(request: dict):
 
     nbytes, embedding_len, embedding_dim = await encoder.encode(
         mm_items=request["mm_items"],
+        modality=Modality.from_str(request["modality"]),
         req_id=request["req_id"],
         num_parts=request["num_parts"],
         part_idx=request["part_idx"],

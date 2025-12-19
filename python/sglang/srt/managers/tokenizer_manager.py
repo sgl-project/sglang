@@ -638,7 +638,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ):
                 if self.server_args.language_only:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
-                        img_data=obj.image_data,
+                        request_obj=obj,
                         mm_processor=self.mm_processor,
                         prompt=(input_text or input_ids),
                     )
@@ -830,7 +830,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
-                need_wait_for_image=obj.need_wait_for_image,
+                need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 embedding_ports=obj.embedding_ports,
             )

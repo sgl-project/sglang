@@ -249,8 +249,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Whether to return entropy
     return_entropy: bool = False
 
-    need_wait_for_image: Optional[bool] = None
-    num_items_assigned: Optional[List] = None
+    need_wait_for_mm_inputs: Optional[bool] = None
+    num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
     embedding_ports: Optional[List] = None
 
     def contains_mm_input(self) -> bool:
@@ -732,8 +732,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
-    need_wait_for_image: bool = False
-    num_items_assigned: Optional[List] = None
+    need_wait_for_mm_inputs: bool = False
+    num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
     embedding_ports: Optional[List] = None
 
 

@@ -273,6 +273,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             model_type=self.model_type,
             input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
             image_grid_thw=img_grid_thw,
+            video_grid_thw=video_grid_thw,
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),

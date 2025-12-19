@@ -4,7 +4,7 @@ import pickle
 import random
 import threading
 import uuid
-from typing import List
+from typing import Dict, List
 
 import aiohttp
 import torch
@@ -17,6 +17,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils.common import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -185,21 +186,22 @@ class WaitingImageRequest:
             ) as session:
                 tasks = []
                 logger.info(f"{self.num_items_assigned = } ")
-                for idx, assigned_num in enumerate(self.num_items_assigned):
-                    if assigned_num == 0:
-                        continue
-                    encoder_url = self.encoder_urls[idx]
-                    target_url = f"{encoder_url}/scheduler_receive_url"
-                    payload = {
-                        "req_id": req_id,
-                        "receive_count": receive_count,
-                        "receive_url": f"{host_name}:{embedding_port}",
-                    }
 
-                    logger.info(f"Preparing to send  to {target_url}")
-
-                    task = _send_single_request(session, target_url, payload)
-                    tasks.append(task)
+                for modality, assigned_nums in self.num_items_assigned.items():
+                    for idx, assigned_num in enumerate(assigned_nums):
+                        if assigned_num == 0:
+                            continue
+                        encoder_url = self.encoder_urls[idx]
+                        target_url = f"{encoder_url}/scheduler_receive_url"
+                        payload = {
+                            "req_id": req_id,
+                            "receive_count": receive_count,
+                            "receive_url": f"{host_name}:{embedding_port}",
+                            "modality": modality.name,
+                        }
+                        logger.info(f"Preparing to send to {target_url}")
+                        task = _send_single_request(session, target_url, payload)
+                        tasks.append(task)
 
                 if not tasks:
                     logger.info("No tasks to send.")
@@ -337,7 +339,7 @@ class MMReceiver:
             # E Disaggregation
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
-                and recv_req.need_wait_for_image is True
+                and recv_req.need_wait_for_mm_inputs is True
             ):
                 embedding_port = None
                 if recv_req.embedding_ports is not None:
@@ -383,13 +385,13 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def _run_encode_in_thread(
-        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
+        self, req_id, mm_data, endpoint_encode, num_items_assigned, embedding_port
     ):
         try:
             asyncio.run(
                 self.encode(
                     req_id=req_id,
-                    img_data=img_data,
+                    mm_data=mm_data,
                     embedding_port=embedding_port,
                     endpoint_encode=endpoint_encode,
                     endpoint_send=None,
@@ -399,45 +401,117 @@ class MMReceiver:
         except Exception as e:
             logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
 
+    def _assign_items_by_modality(
+        self, mm_data, encoder_num, random_shuffle=True
+    ) -> Dict:
+        """
+        Assign multimodal items across encoders by modality with cross-modality load balancing.
+
+        Args:
+            mm_data: List of multimodal data items, each with a "modality" key
+            encoder_num: Number of encoders
+            random_shuffle: Whether to shuffle the encoder indices
+
+        Returns:
+            Dictionary mapping modality to list of assignment counts per encoder
+            Format: {modality: [count_for_encoder_0, count_for_encoder_1, ...]}
+        """
+        encode_idx = list(range(encoder_num))
+        if random_shuffle:
+            random.shuffle(encode_idx)
+        # Get unique modalities
+        modalities = list(dict.fromkeys(mm_item.get("modality") for mm_item in mm_data))
+        num_items_assigned = {}
+        current_offset = 0
+
+        for modality in modalities:
+            mm_data_modality = [
+                mm_item for mm_item in mm_data if mm_item.get("modality") == modality
+            ]
+            num_items = len(mm_data_modality)
+            if num_items == 0:
+                continue
+
+            base = num_items // len(encode_idx)
+            remainder = num_items % len(encode_idx)
+            # Rotate assignments based on current_offset to balance load across modalities
+            assignments = [0] * len(encode_idx)
+            for i in range(len(encode_idx)):
+                # keep shuffle order when assigning items to encoders
+                pos_in_shuffled = (current_offset + i) % len(encode_idx)
+                actual_encoder_idx = encode_idx[pos_in_shuffled]
+                assignments[actual_encoder_idx] = base + (1 if i < remainder else 0)
+            num_items_assigned[modality] = assignments
+            current_offset = (current_offset + remainder) % len(encode_idx)
+
+        return num_items_assigned
+
     async def encode(
         self,
         req_id,
-        img_data,
+        mm_data,
         embedding_port,
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
     ):
-        if len(img_data) == 0:
+        if len(mm_data) == 0:
             return
 
-        # Split mm_items
+        # get unique modalities with order preserved
+        modalities = [mm_item.get("modality") for mm_item in mm_data]
+        modalities = list(dict.fromkeys(modalities))
         encode_requests = []
+
         if num_items_assigned is None:
-            random.shuffle(self.encode_idx)
-            num_items_assigned = [
-                (idx + len(img_data)) // len(self.encode_urls)
-                for idx in self.encode_idx
-            ]
-        num_parts = sum(1 for x in num_items_assigned if x != 0)
-        cum_num_items = 0
-        cum_idx = 0
-        for idx, assigned_num in enumerate(num_items_assigned):
-            if assigned_num == 0:
-                continue
-            encode_requests.append(
-                {
-                    "encoder_idx": idx,
-                    "mm_items": img_data[cum_num_items : cum_num_items + assigned_num],
-                    "num_parts": num_parts,
-                    "part_idx": cum_idx,
-                    "req_id": req_id,
-                    "prefill_host": self.host,
-                    "embedding_port": embedding_port,
-                }
+            num_items_assigned = self._assign_items_by_modality(
+                mm_data, len(self.encode_urls)
             )
-            cum_idx += 1
-            cum_num_items += assigned_num
+
+        # Calculate total num_parts across all modalities
+        total_num_parts = 0
+        modality_num_parts = {}
+        for modality in modalities:
+            num_items_assigned_modality = num_items_assigned.get(modality)
+            num_parts = sum(1 for x in num_items_assigned_modality if x != 0)
+            modality_num_parts[modality] = num_parts
+            total_num_parts += num_parts
+
+        part_idx_offset = 0
+        for modality in modalities:
+            num_items_assigned_modality = num_items_assigned.get(modality)
+            mm_data_modality = [
+                mm_item for mm_item in mm_data if mm_item.get("modality") == modality
+            ]
+
+            num_parts = modality_num_parts[modality]
+            cum_num_items = 0
+            cum_idx = 0
+            for idx, assigned_num in enumerate(num_items_assigned_modality):
+                if assigned_num == 0:
+                    continue
+                encode_requests.append(
+                    {
+                        "encoder_idx": self.encode_idx[
+                            idx
+                        ],  # use shuffle-idx to load-balance
+                        "mm_items": [
+                            mm_item.get("url")
+                            for mm_item in mm_data_modality[
+                                cum_num_items : cum_num_items + assigned_num
+                            ]
+                        ],
+                        "num_parts": total_num_parts,
+                        "part_idx": part_idx_offset + cum_idx,
+                        "req_id": req_id,
+                        "modality": modality.name,  # convert enum to string for json serialization
+                        "prefill_host": self.host,
+                        "embedding_port": embedding_port,
+                    }
+                )
+                cum_idx += 1
+                cum_num_items += assigned_num
+            part_idx_offset += num_parts
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -465,9 +539,9 @@ class MMReceiver:
 
             # mooncake backend: send bootstrap info
 
-            embedding_size_list_sort = [None for _ in range(num_parts)]
+            embedding_size_list_sort = [None for _ in range(total_num_parts)]
             embedding_length_tot = 0
-            response_json_list_sort = [None for _ in range(num_parts)]
+            response_json_list_sort = [None for _ in range(total_num_parts)]
             for response_json in response_json_list_unsort:
                 idx = response_json["part_idx"]
                 embedding_size_list_sort[idx] = response_json["embedding_size"]
@@ -514,27 +588,22 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def send_encode_request(self, obj):
-        if type(obj.image_data) != list:
-            image_urls = [obj.image_data.url]
-        else:
-            image_urls = [img.url for img in obj.image_data]
+        mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
-        if image_urls and len(image_urls) > 0:
-            logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
-            obj.need_wait_for_image = True
 
-            encode_idx = list(range(len(self.encode_urls)))
-            random.shuffle(encode_idx)
-            obj.num_items_assigned = [
-                (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
-            ]
+        if mm_data and len(mm_data) > 0:
+            logger.info(f"Processing {len(mm_data)} mm_items for request {obj.rid}")
+            obj.need_wait_for_mm_inputs = True
+            obj.num_items_assigned = self._assign_items_by_modality(
+                mm_data, len(self.encode_urls)
+            )
             obj.embedding_ports = None
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
                 args=(
                     obj.rid,
-                    image_urls,
+                    mm_data,
                     "encode",
                     obj.num_items_assigned,
                     obj.embedding_ports,
@@ -543,19 +612,42 @@ class MMReceiver:
             )
             encode_thread.start()
 
+    def _extract_url_data(self, request_obj) -> List[Dict]:
+        mm_data = []
+
+        def _load_url(mm_items, modality):
+            for mm_item in mm_items:
+                mm_data.append(
+                    {
+                        "url": (
+                            mm_item.url if isinstance(mm_item, ImageData) else mm_item
+                        ),
+                        "modality": modality,
+                    }
+                )
+
+        if request_obj.image_data:
+            if not isinstance(request_obj.image_data, List):
+                _load_url([request_obj.image_data], Modality.IMAGE)
+            else:
+                _load_url(request_obj.image_data, Modality.IMAGE)
+        if request_obj.video_data:
+            if not isinstance(request_obj.video_data, List):
+                _load_url([request_obj.video_data], Modality.VIDEO)
+            else:
+                _load_url(request_obj.video_data, Modality.VIDEO)
+        return mm_data
+
     # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
+    async def recv_mm_data(self, request_obj, mm_processor, prompt):
         try:
             if len(self.encode_urls) == 0:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
-            if type(img_data) != list:
-                img_data = [img_data.url]
-            else:
-                img_data = [img.url for img in img_data]
+            mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
-                self.encode(req_id, img_data, embedding_port, "encode", "send")
+                self.encode(req_id, mm_data, embedding_port, "encode", "send")
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
