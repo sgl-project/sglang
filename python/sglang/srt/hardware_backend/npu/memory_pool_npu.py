@@ -9,12 +9,44 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     get_tensor_size_bytes,
 )
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
 
 
 class NPUMHATokenToKVPool(MHATokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            head_num,
+            head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+            enable_alt_stream,
+            enable_kv_cache_copy,
+        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -36,6 +68,19 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             )
             self.k_buffer = self.kv_buffer[0]
             self.v_buffer = self.kv_buffer[1]
+
+            if self.use_fia:
+                self.k_buffer = []
+                self.v_buffer = []
+                for i in range(self.layer_num):
+                    k_buffer_layer = self.kv_buffer[0][i].view(
+                        -1, 1, self.head_num, self.head_dim
+                    )
+                    v_buffer_layer = self.kv_buffer[1][i].view(
+                        -1, 1, self.head_num, self.head_dim
+                    )
+                    self.k_buffer.append(k_buffer_layer)
+                    self.v_buffer.append(v_buffer_layer)
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -90,17 +135,33 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        torch_npu._npu_reshape_and_cache(
-            key=cache_k,
-            value=cache_v,
-            key_cache=self.k_buffer[layer_id - self.start_layer].view(
-                -1, self.page_size, self.head_num, self.head_dim
-            ),
-            value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                -1, self.page_size, self.head_num, self.head_dim
-            ),
-            slot_indices=loc,
-        )
+        if self.use_fia:
+            k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
+
+            torch_npu.npu_scatter_nd_update_(
+                k_buffer_layer,
+                loc.view(-1, 1),
+                cache_k.view(-1, 1, self.head_num, self.head_dim),
+            )
+            torch_npu.npu_scatter_nd_update_(
+                v_buffer_layer,
+                loc.view(-1, 1),
+                cache_v.view(-1, 1, self.head_num, self.head_dim),
+            )
+        else:
+            loc = loc.to(torch.int32)
+            torch_npu._npu_reshape_and_cache(
+                key=cache_k,
+                value=cache_v,
+                key_cache=self.k_buffer[layer_id - self.start_layer].view(
+                    -1, self.page_size, self.head_num, self.head_dim
+                ),
+                value_cache=self.v_buffer[layer_id - self.start_layer].view(
+                    -1, self.page_size, self.head_num, self.head_dim
+                ),
+                slot_indices=loc,
+            )
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
