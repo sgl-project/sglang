@@ -233,8 +233,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-eviction-policy` | LoRA adapter eviction policy when the GPU memory pool is full. | `lru` | `lru`, `fifo` |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `triton` | `triton`, `csgmv` |
 | `--max-lora-chunk-size` | Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when `--lora-backend` is `csgmv`. Larger values may improve performance. | `16` | `16`, `32`, `64`, `128` |
-| `--lora-cache-dir` | Root directory for LoRA adapters. When a request specifies an adapter that isn't loaded, the system will automatically check this directory and load it if found. Similar to vLLM's `lora_filesystem_resolver`. Can also be set via `SGLANG_LORA_CACHE_DIR` environment variable. | `None` | Type: str |
-| `--allow-runtime-lora-updating` | Allow automatic discovery and loading of LoRA adapters from `--lora-cache-dir` at runtime. Similar to `VLLM_ALLOW_RUNTIME_LORA_UPDATING` in vLLM. When enabled, adapters will be automatically reloaded if their weights are updated (useful for RL training scenarios). Can also be set via `SGLANG_ALLOW_RUNTIME_LORA_UPDATING` environment variable. | `False` | Bool flag (set to enable) |
+| `--runtime-lora-cache-dir` | Root directory for LoRA adapters. When set, enables automatic discovery and loading of adapters from this directory at runtime. When a request specifies an adapter that isn't loaded, the system will automatically check this directory and load it if found. Adapters will also be automatically reloaded if their weights are updated (useful for RL training scenarios). Can also be set via `SGLANG_RUNTIME_LORA_CACHE_DIR` environment variable. | `None` | Type: str |
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
 | Argument | Description | Defaults | Options |

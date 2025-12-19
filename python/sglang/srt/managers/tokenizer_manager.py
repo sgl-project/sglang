@@ -2091,12 +2091,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if lora_path not in self.lora_ref_cache:
                 # Try auto-discovery from filesystem
-                if (
-                    self.server_args.allow_runtime_lora_updating
-                    and self.server_args.lora_cache_dir
-                ):
+                if self.server_args.runtime_lora_cache_dir:
                     adapter_path = os.path.normpath(
-                        os.path.join(self.server_args.lora_cache_dir, lora_path)
+                        os.path.join(self.server_args.runtime_lora_cache_dir, lora_path)
                     )
                     if is_valid_lora_adapter_path(adapter_path):
                         logger.info(
@@ -2122,10 +2119,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             # Adapter is in cache, reload it
             cached_ref = self.lora_ref_cache[lora_path]
-            # If adapter is still in registry and allow_runtime_lora_updating is enabled,
+            # If adapter is still in registry and runtime_lora_cache_dir is set,
             # unload it first to pick up updated weights (for RL training scenario)
             if (
-                self.server_args.allow_runtime_lora_updating
+                self.server_args.runtime_lora_cache_dir
                 and lora_path in self.lora_registry._registry
             ):
                 logger.info(
