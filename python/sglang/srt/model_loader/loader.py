@@ -279,23 +279,17 @@ def _initialize_model(
         kwargs["model_path"] = model_config.model_path
 
     mdl = model_class(**kwargs)
+    weight_names = ['gate_up_proj', 'gate_proj', 'up_proj', 'down_proj']
+    moe_weight_names = ["gate", 'gate_up_proj', 'gate_proj', 'up_proj', 'down_proj']
     if _is_npu:
         for layer in mdl.model.layers:
             if hasattr(layer, 'layer_communicator') and hasattr(layer, 'mlp'):
                 lmlp = layer.mlp
-                cachelist = [getattr(lmlp, name).weight for name in ['gate_up_proj', 'gate_proj', 'up_proj', 'down_proj'] if hasattr(lmlp, name)]
-#                 for tname, tensor in lmlp.named_parameters():
-#                     if (
-#                         tname.endswith(".weight") and
-#                         (
-#                             "gate" in tname
-#                             or "gate_up_proj" in tname
-#                             or "gate_proj" in tname
-#                             or "up_proj" in tname
-#                             or "down_proj" in tname
-#                         )
-#                     ):
-#                         cachelist.append(tensor)
+                cachelist = [getattr(lmlp, name).weight for name in weight_names if hasattr(lmlp, name)]
+                if get_global_server_args().enable_moe_weights_prefetching:
+                    cachelist += [tensor for tname, tensor in lmlp.named_parameters() if (
+                            tname.endswith(".weight") and any(wname in tname for wname in moe_weight_names)
+                        )]
                 if get_global_server_args().enable_weights_prefetching and len(cachelist):
                     layer.layer_communicator._context.cache = cachelist
                     def mlpwrap(fwd):
