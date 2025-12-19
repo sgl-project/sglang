@@ -875,7 +875,7 @@ class ServerArgs:
             self.use_fsdp_inference = False
 
         # autocast
-        self.disable_autocast = self.pipeline_config.enable_autocast
+        self.disable_autocast = not self.pipeline_config.enable_autocast
 
         # Validate mode consistency
         assert isinstance(
