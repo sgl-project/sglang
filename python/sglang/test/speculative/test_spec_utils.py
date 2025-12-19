@@ -3,8 +3,9 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-
 import xgrammar as xgr
+from xgrammar.matcher import allocate_token_bitmask
+
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammar
 from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
 from sglang.srt.speculative import spec_utils
@@ -14,7 +15,6 @@ from sglang.srt.speculative.spec_utils import (
     traverse_tree_fallback,
 )
 from sglang.srt.utils import next_power_of_2
-from xgrammar.matcher import allocate_token_bitmask
 
 BYTES_PER_TILE = 128
 
