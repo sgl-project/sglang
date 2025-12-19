@@ -531,13 +531,13 @@ def _yarn_find_correction_range(
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
+    truncate: bool = True,
 ) -> Tuple[int, int]:
-    low = math.floor(
-        _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
-    )
-    high = math.ceil(
-        _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
-    )
+    low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
@@ -578,12 +578,14 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         attn_factor: float = 1,
         beta_fast: int = 32,
         beta_slow: int = 1,
+        truncate: bool = True,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        self.truncate = truncate
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
@@ -603,6 +605,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             self.rotary_dim,
             self.base,
             self.max_position_embeddings,
+            self.truncate,
         )
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
@@ -2648,6 +2651,7 @@ def get_rope(
                 if k
                 in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
             }
+            extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
             rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size,
                 rotary_dim,
