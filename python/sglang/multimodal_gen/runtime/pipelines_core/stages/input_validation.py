@@ -79,9 +79,9 @@ class InputValidationStage(PipelineStage):
         preprocess condition image
         NOTE: condition image resizing is only allowed in InputValidationStage
         """
-        if (
-            batch.condition_image is not None
-            and server_args.pipeline_config.task_type.accepts_image_input()
+        if batch.condition_image is not None and (
+            server_args.pipeline_config.task_type == ModelTaskType.I2I
+            or server_args.pipeline_config.task_type == ModelTaskType.TI2I
         ):
             # calculate new condition image size
             if not isinstance(batch.condition_image, list):
