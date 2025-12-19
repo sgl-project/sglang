@@ -158,6 +158,7 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
+        self.sliding_window_size = getattr(self.hf_text_config, "sliding_window", -1)
         self.is_hybrid_swa = is_hybrid_model(
             self.hf_config.architectures,
             hybrid_kvcache_ratio=hybrid_kvcache_ratio,
