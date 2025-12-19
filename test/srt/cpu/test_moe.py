@@ -84,7 +84,9 @@ class TestFusedExperts(CustomTestCase):
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
 
-    @parametrize(m=[1, 32], n=[128, 64], k=[128, 64], e=[4], topk=[2], renormalize=[False])
+    @parametrize(
+        m=[1, 32], n=[128, 64], k=[128, 64], e=[4], topk=[2], renormalize=[False]
+    )
     def test_bf16_moe_bias(self, m, n, k, e, topk, renormalize):
         dtype = torch.bfloat16
 
@@ -291,6 +293,10 @@ class TestFusedExperts(CustomTestCase):
             True,
             w1s,
             w2s,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
