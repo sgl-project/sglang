@@ -36,6 +36,7 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -46,6 +47,10 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.kv_quant_kernels import (
+    quantized_set_kv_int4_triton,
+    quantized_set_kv_int8_triton,
+)
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -70,6 +75,11 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
+
+
+KV_CACHE_QUANTIZATION_DEBUG_MODE = (
+    os.getenv("KV_CACHE_QUANTIZATION_DEBUG_MODE", "False").lower() == "true"
+)
 
 
 class ReqToTokenPool:
@@ -512,18 +522,26 @@ class KVCache(abc.ABC):
         self,
         size: int,
         page_size: int,
-        dtype: torch.dtype,
+        dtype: Union[torch.dtype, str],
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        model_dtype: Optional[
+            torch.dtype
+        ] = None,  # to dequantize the kv cache to model_dtype
     ):
         self.size = size
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+        if model_dtype is not None:
+            self.model_dtype = model_dtype
+        elif dtype in ("int4", "int8"):
+            raise ValueError(f"model_dtype is required for int4 or int8 kv cache")
+
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, "int4", "int8"):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -618,6 +636,8 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        model_dtype: Optional[torch.dtype] = None,
+        dtype_per_layer: Optional[List] = None,
     ):
         super().__init__(
             size,
@@ -628,10 +648,15 @@ class MHATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            model_dtype,
         )
         self.head_num = head_num
         self.head_dim = head_dim
 
+        # Per-layer dtype support
+        self.dtype_per_layer = dtype_per_layer
+        if dtype_per_layer is not None:
+            logger.info(f"dtype_per_layer={dtype_per_layer}")
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -689,31 +714,147 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
+    def _get_store_dtype_for_layer_dtype(self, layer_dtype):
+        """Get the storage dtype for a given layer dtype."""
+        if layer_dtype in (torch.float8_e5m2, torch.float8_e4m3fn, "int4", "int8"):
+            return torch.uint8
+        return layer_dtype
+
     def _create_buffers(self):
+        """Create KV cache buffers for all layers.
+
+        Handles both homogeneous (all layers same dtype) and heterogeneous
+        (per-layer dtype) cases with unified logic.
+        """
+        # Build effective dtype list - use per-layer if provided, otherwise use global dtype
+        if self.dtype_per_layer is not None:
+            dtype_list = self.dtype_per_layer
+        else:
+            dtype_list = [self.dtype] * self.layer_num
+
+        self.k_buffer = []
+        self.v_buffer = []
+        self.k_scales_zeros = []
+        self.v_scales_zeros = []
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                for layer_idx in range(self.layer_num):
+                    layer_dtype = dtype_list[layer_idx]
+                    store_dtype = self._get_store_dtype_for_layer_dtype(layer_dtype)
+
+                    if layer_dtype == "int4":
+                        assert (
+                            self.head_dim % 2 == 0
+                        ), f"head_dim: {self.head_dim}, kv cache dtype: int4"
+                        # Half-size buffer for int4
+                        self.k_buffer.append(
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim // 2,
+                                ),
+                                dtype=store_dtype,
+                                device=self.device,
+                            )
+                        )
+                        self.v_buffer.append(
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim // 2,
+                                ),
+                                dtype=store_dtype,
+                                device=self.device,
+                            )
+                        )
+                        # Scales and zeros for int4
+                        self.k_scales_zeros.append(
+                            torch.zeros(
+                                (self.size + self.page_size, self.head_num, 2),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                        )
+                        self.v_scales_zeros.append(
+                            torch.zeros(
+                                (self.size + self.page_size, self.head_num, 2),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                        )
+                    elif layer_dtype == "int8":
+                        # Full-size buffer for int8
+                        self.k_buffer.append(
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
+                                dtype=store_dtype,
+                                device=self.device,
+                            )
+                        )
+                        self.v_buffer.append(
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
+                                dtype=store_dtype,
+                                device=self.device,
+                            )
+                        )
+                        # Scales and zeros for int8
+                        self.k_scales_zeros.append(
+                            torch.zeros(
+                                (self.size + self.page_size, self.head_num, 2),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                        )
+                        self.v_scales_zeros.append(
+                            torch.zeros(
+                                (self.size + self.page_size, self.head_num, 2),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                        )
+                    else:
+                        # Standard buffer (bf16, fp8, etc.)
+                        self.k_buffer.append(
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
+                                dtype=store_dtype,
+                                device=self.device,
+                            )
+                        )
+                        self.v_buffer.append(
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
+                                dtype=store_dtype,
+                                device=self.device,
+                            )
+                        )
+                        # No scales_zeros for non-quantized layers - append None as placeholder
+                        self.k_scales_zeros.append(None)
+                        self.v_scales_zeros.append(None)
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -737,6 +878,22 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+
+    def get_layer_dtype(self, layer_id: int):
+        """Get the dtype for a specific layer.
+
+        Args:
+            layer_id: Global layer ID
+
+        Returns:
+            The dtype for this layer (torch.dtype or str like "int4"/"int8")
+        """
+        if self.dtype_per_layer is None:
+            return self.dtype
+        local_layer_id = layer_id - self.start_layer
+        if 0 <= local_layer_id < len(self.dtype_per_layer):
+            return self.dtype_per_layer[local_layer_id]
+        return self.dtype
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -813,8 +970,13 @@ class MHATokenToKVPool(KVCache):
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        layer_dtype = self.get_layer_dtype(layer_id)
+        if layer_dtype in ("int4", "int8"):
+            return self.k_buffer[layer_id - self.start_layer]
+        store_dtype = self._get_store_dtype_for_layer_dtype(layer_dtype)
+        if store_dtype != layer_dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(layer_dtype)
+
         return self.k_buffer[layer_id - self.start_layer]
 
     def get_key_buffer(self, layer_id: int):
@@ -827,8 +989,12 @@ class MHATokenToKVPool(KVCache):
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        layer_dtype = self.get_layer_dtype(layer_id)
+        if layer_dtype in ("int4", "int8"):
+            return self.v_buffer[layer_id - self.start_layer]
+        store_dtype = self._get_store_dtype_for_layer_dtype(layer_dtype)
+        if store_dtype != layer_dtype:
+            return self.v_buffer[layer_id - self.start_layer].view(layer_dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
@@ -838,6 +1004,62 @@ class MHATokenToKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_raw_key_buffer(self, layer_id: int):
+        """Get raw quantized K buffer without dequantization (for INT4/INT8)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_raw_value_buffer(self, layer_id: int):
+        """Get raw quantized V buffer without dequantization (for INT4/INT8)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_key_scales_zeros(self, layer_id: int):
+        """Get scales and zeros for K (for INT4/INT8 quantization)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.k_scales_zeros[layer_id - self.start_layer]
+
+    def get_value_scales_zeros(self, layer_id: int):
+        """Get scales and zeros for V (for INT4/INT8 quantization)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.v_scales_zeros[layer_id - self.start_layer]
+
+    def get_raw_kv_buffer(self, layer_id: int):
+        """
+        Get raw quantized KV buffer with scales/zeros for efficient dequantization.
+
+        Returns a dict containing:
+        - k_buffer: Raw quantized K buffer
+        - v_buffer: Raw quantized V buffer
+        - k_scales_zeros: Scales and zeros for K (if quantized)
+        - v_scales_zeros: Scales and zeros for V (if quantized)
+        - dtype: KV cache dtype for this layer
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        layer_dtype = self.get_layer_dtype(layer_id)
+        local_layer_id = layer_id - self.start_layer
+
+        result = {
+            "k_buffer": self.k_buffer[local_layer_id],
+            "v_buffer": self.v_buffer[local_layer_id],
+            "dtype": layer_dtype,
+        }
+
+        if layer_dtype in ("int4", "int8"):
+            result["k_scales_zeros"] = self.k_scales_zeros[local_layer_id]
+            result["v_scales_zeros"] = self.v_scales_zeros[local_layer_id]
+        else:
+            result["k_scales_zeros"] = None
+            result["v_scales_zeros"] = None
+
+        return result
 
     def set_kv_buffer(
         self,
@@ -855,29 +1077,161 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
+
+        # Get per-layer dtype
+        layer_dtype = self.get_layer_dtype(layer_id)
+        local_layer_id = layer_id - self.start_layer
+
+        if layer_dtype in ("int4", "int8") and KV_CACHE_QUANTIZATION_DEBUG_MODE is True:
+            cache_k_original = cache_k.clone()
+            cache_v_original = cache_v.clone()
+
+        if layer_dtype in ("int4", "int8"):
+            # Use Triton kernels for efficient quantization and direct cache write
+            if layer_dtype == "int4":
+
+                # Quantize and write directly to cache buffers using Triton kernel
+                quantized_set_kv_int4_triton(
+                    cache_k,
+                    cache_v,
+                    loc,
+                    self.k_buffer[local_layer_id],
+                    self.v_buffer[local_layer_id],
+                    self.k_scales_zeros[local_layer_id],
+                    self.v_scales_zeros[local_layer_id],
+                )
+
+            elif layer_dtype == "int8":
+
+                # Quantize and write directly to cache buffers using Triton kernel
+                quantized_set_kv_int8_triton(
+                    cache_k,
+                    cache_v,
+                    loc,
+                    self.k_buffer[local_layer_id],
+                    self.v_buffer[local_layer_id],
+                    self.k_scales_zeros[local_layer_id],
+                    self.v_scales_zeros[local_layer_id],
+                )
+
+            # Quantized values and scales/zeros have been written directly to buffers by the kernel
+            # No need for additional copies!
+            if (
+                layer_dtype in ("int4", "int8")
+                and KV_CACHE_QUANTIZATION_DEBUG_MODE is True
+            ):
+
+                # ===== DEBUG: Verify quantization accuracy =====
+                # Read back and dequantize to check error
+                quantized_k = self.k_buffer[local_layer_id][loc]
+                quantized_v = self.v_buffer[local_layer_id][loc]
+                scales_zeros_k = self.k_scales_zeros[local_layer_id][loc]
+                scales_zeros_v = self.v_scales_zeros[local_layer_id][loc]
+
+                scale_k = scales_zeros_k[..., 0]
+                zero_k = scales_zeros_k[..., 1]
+                scale_v = scales_zeros_v[..., 0]
+                zero_v = scales_zeros_v[..., 1]
+
+                if layer_dtype == "int4":
+                    # Unpack INT4: lower nibble and upper nibble
+                    q_k1 = (quantized_k & 0x0F).to(cache_k_original.dtype)
+                    q_k2 = ((quantized_k >> 4) & 0x0F).to(cache_k_original.dtype)
+                    # Dequantize: x = (q - zeros) * scales
+                    dequant_k1 = (q_k1 - zero_k.unsqueeze(-1)) * scale_k.unsqueeze(-1)
+                    dequant_k2 = (q_k2 - zero_k.unsqueeze(-1)) * scale_k.unsqueeze(-1)
+                    dequant_k = torch.cat([dequant_k1, dequant_k2], dim=-1)
+
+                    q_v1 = (quantized_v & 0x0F).to(cache_v_original.dtype)
+                    q_v2 = ((quantized_v >> 4) & 0x0F).to(cache_v_original.dtype)
+                    dequant_v1 = (q_v1 - zero_v.unsqueeze(-1)) * scale_v.unsqueeze(-1)
+                    dequant_v2 = (q_v2 - zero_v.unsqueeze(-1)) * scale_v.unsqueeze(-1)
+                    dequant_v = torch.cat([dequant_v1, dequant_v2], dim=-1)
+
+                elif layer_dtype == "int8":
+                    # Dequantize INT8: x = (q - zeros) * scales
+                    dequant_k = (
+                        quantized_k.to(cache_k_original.dtype) - zero_k.unsqueeze(-1)
+                    ) * scale_k.unsqueeze(-1)
+                    dequant_v = (
+                        quantized_v.to(cache_v_original.dtype) - zero_v.unsqueeze(-1)
+                    ) * scale_v.unsqueeze(-1)
+
+                # Compute errors
+                k_abs_error = torch.abs(dequant_k - cache_k_original)
+                v_abs_error = torch.abs(dequant_v - cache_v_original)
+
+                k_rel_error = torch.norm(k_abs_error, p=2) / (
+                    torch.norm(cache_k_original, p=2) + 1e-8
+                )
+                v_rel_error = torch.norm(v_abs_error, p=2) / (
+                    torch.norm(cache_v_original, p=2) + 1e-8
+                )
+
+                print(f"\n{'='*80}")
+                print(
+                    f"KV CACHE QUANTIZATION DEBUG - Layer {layer_id}, dtype={layer_dtype}"
+                )
+                print(f"{'='*80}")
+                print(
+                    f"Original K range: [{cache_k_original.min():.6f}, {cache_k_original.max():.6f}]"
+                )
+                print(
+                    f"Original V range: [{cache_v_original.min():.6f}, {cache_v_original.max():.6f}]"
+                )
+                print(f"\nK Quantization Error:")
+                print(
+                    f"  Abs Error - Mean: {k_abs_error.mean():.6f}, Max: {k_abs_error.max():.6f}, Std: {k_abs_error.std():.6f}"
+                )
+                print(f"  Rel Error - {k_rel_error:.6f}")
+                print(f"  Scale range: [{scale_k.min():.6f}, {scale_k.max():.6f}]")
+                print(f"\nV Quantization Error:")
+                print(
+                    f"  Abs Error - Mean: {v_abs_error.mean():.6f}, Max: {v_abs_error.max():.6f}, Std: {v_abs_error.std():.6f}"
+                )
+                print(f"  Rel Error - {v_rel_error:.6f}")
+                print(f"  Scale range: [{scale_v.min():.6f}, {scale_v.max():.6f}]")
+                print(f"{'='*80}\n")
+
+                # Optional: Assert reasonable error bounds
+                if k_rel_error > 0.3:
+                    logger.warning(
+                        f"K quantization error high: rel_error={k_rel_error:.6f}"
+                    )
+                if v_rel_error > 0.3:
+                    logger.warning(
+                        f"V quantization error high: rel_error={v_rel_error:.6f}"
+                    )
+                # ===== END DEBUG =====
+
+            # Early return - INT4/INT8 quantization is complete
+            return
+
+        # Non-quantized path (fp8, int4, int8, bf16, etc.)
+        store_dtype = self._get_store_dtype_for_layer_dtype(layer_dtype)
+        if cache_k.dtype != layer_dtype:  # fp8, fp4 kv cache
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+            cache_k = cache_k.to(layer_dtype)
+            cache_v = cache_v.to(layer_dtype)
 
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
+        if store_dtype != layer_dtype:
+            cache_k = cache_k.view(store_dtype)
+            cache_v = cache_v.view(store_dtype)
 
         if get_is_capture_mode() and self.alt_stream is not None:
             # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.k_buffer[local_layer_id][loc] = cache_k
             with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                self.v_buffer[local_layer_id][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            self.k_buffer[local_layer_id][loc] = cache_k
+            self.v_buffer[local_layer_id][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():

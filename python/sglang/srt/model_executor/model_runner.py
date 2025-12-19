@@ -18,6 +18,7 @@ import gc
 import inspect
 import json
 import logging
+import math
 import os
 import socket
 import threading
@@ -149,6 +150,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
+    parse_kv_cache_per_layer_dtype,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1434,6 +1436,7 @@ class ModelRunner:
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
+            # TODO: need do test for int4 and int8 for MLA
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
@@ -1466,31 +1469,8 @@ class ModelRunner:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
-                * num_layers
-                * 2
-                * torch._utils._element_size(self.kv_cache_dtype)
-            )
-
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-
-                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
-                k = self.model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (
-                        n
-                        * k
-                        * num_layers
-                        * 2
-                        * torch._utils._element_size(self.kv_cache_dtype)
-                    )
-                    // scale_block_size
-                )
-
+            # Calculate cell_size per layer and sum up
+            cell_size = self._calculate_mha_cell_size(num_layers)
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -1498,6 +1478,85 @@ class ModelRunner:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
+
+    def _calculate_mha_cell_size(self, num_layers: int) -> int:
+        """Calculate cell size for MHA KV cache, handling per-layer dtypes.
+
+        Args:
+            num_layers: Number of layers (used when kv_cache_dtype_per_layer is None)
+
+        Returns:
+            Total cell size in bytes per token
+        """
+        num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+        head_dim = self.model_config.head_dim
+
+        # Build effective dtype list for calculation
+        # If per-layer dtype is set, use the full list; otherwise use default dtype for num_layers
+        if self.kv_cache_dtype_per_layer is not None:
+            dtype_list = self.kv_cache_dtype_per_layer
+        else:
+            dtype_list = [self.kv_cache_dtype] * num_layers
+
+        cell_size = 0
+        for layer_dtype in dtype_list:
+            if layer_dtype == "int4":
+                # int4: half head_dim (packed), 1 byte per 2 values
+                layer_cell_size = (
+                    num_kv_heads
+                    * math.ceil(head_dim / 2)
+                    * 2  # key and value
+                    * 1  # two int4 pack to one byte
+                )
+                # Add scale and zero buffers (float32)
+                layer_cell_size += (
+                    num_kv_heads
+                    * 2  # key and value
+                    * 2  # scale and zero
+                    * torch._utils._element_size(torch.float32)
+                )
+            elif layer_dtype == "int8":
+                # int8: full head_dim, 1 byte per value
+                layer_cell_size = (
+                    num_kv_heads * head_dim * 2 * 1  # key and value  # int8 is one byte
+                )
+                # Add scale and zero buffers (float32)
+                layer_cell_size += (
+                    num_kv_heads
+                    * 2  # key and value
+                    * 2  # scale and zero
+                    * torch._utils._element_size(torch.float32)
+                )
+            elif is_float4_e2m1fn_x2(layer_dtype):
+                # fp4: half size + scale buffer
+                scale_block_size = 16
+                layer_cell_size = (
+                    num_kv_heads
+                    * head_dim
+                    * 2  # key and value
+                    * torch._utils._element_size(layer_dtype)
+                )
+                layer_cell_size = (layer_cell_size // 2) + (
+                    (
+                        num_kv_heads
+                        * head_dim
+                        * 2
+                        * torch._utils._element_size(layer_dtype)
+                    )
+                    // scale_block_size
+                )
+            else:
+                # Standard dtype (bf16, fp8, etc.)
+                layer_cell_size = (
+                    num_kv_heads
+                    * head_dim
+                    * 2  # key and value
+                    * torch._utils._element_size(layer_dtype)
+                )
+
+            cell_size += layer_cell_size
+
+        return cell_size
 
     def handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
@@ -1719,6 +1778,20 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype in ("int4", "int8"):
+            assert (
+                self.spec_algorithm.is_none()
+            ), "int4 and int8 kv cache is not supported for speculative decoding"
+            assert (
+                self.use_mla_backend is False
+            ), "int4 and int8 kv cache is not supported for MLA backend"
+            assert (
+                self.server_args.decode_attention_backend == "triton"
+            ), "int4 and int8 kv cache is only supported for triton attention backend"
+            assert (
+                self.server_args.prefill_attention_backend == "fa3"
+            ), "int4 and int8 kv cache is only supported for triton attention backend"
+            self.kv_cache_dtype = self.server_args.kv_cache_dtype
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
@@ -1734,6 +1807,9 @@ class ModelRunner:
             )
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
+
+        # Build per-layer KV cache dtype list
+        self.kv_cache_dtype_per_layer = self._build_kv_cache_dtype_per_layer()
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
@@ -2065,6 +2141,8 @@ class ModelRunner:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        model_dtype=self.dtype,
+                        dtype_per_layer=self.kv_cache_dtype_per_layer,
                     )
 
         # Initialize token_to_kv_pool_allocator
@@ -2122,6 +2200,116 @@ class ModelRunner:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+
+    def _build_kv_cache_dtype_per_layer(self) -> Optional[List]:
+        """
+        Build per-layer KV cache dtype list based on server args.
+
+        Returns:
+            List of dtype for each layer, or None if all layers use the same dtype.
+        """
+        if not self.server_args.kv_cache_per_layer_dtype:
+            return None
+
+        # Validate constraints for per-layer KV cache dtype
+        self._validate_per_layer_dtype_constraints()
+
+        # Parse the per-layer dtype specification
+        overrides = parse_kv_cache_per_layer_dtype(
+            self.server_args.kv_cache_per_layer_dtype,
+            self.model_config.num_hidden_layers,
+        )
+
+        if not overrides:
+            return None
+
+        # Build the per-layer dtype list
+        dtype_per_layer = [self.kv_cache_dtype] * self.num_effective_layers
+
+        # Helper to resolve dtype string to torch dtype or keep as string for int4/int8
+        def resolve_dtype(dtype_str: str):
+            if dtype_str in ("int4", "int8"):
+                return dtype_str
+            elif dtype_str == "auto":
+                quant_config = getattr(self.model, "quant_config", None)
+                kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+                if (
+                    isinstance(kv_cache_quant_algo, str)
+                    and kv_cache_quant_algo.upper() == "FP8"
+                ):
+                    if _is_hip:
+                        return fp8_dtype
+                    else:
+                        return torch.float8_e4m3fn
+                else:
+                    return self.dtype
+            elif dtype_str == "fp8_e5m2":
+                if _is_hip:
+                    return fp8_dtype
+                return torch.float8_e5m2
+            elif dtype_str == "fp8_e4m3":
+                if _is_hip:
+                    return fp8_dtype
+                return torch.float8_e4m3fn
+            elif dtype_str in ("bf16", "bfloat16"):
+                return torch.bfloat16
+            else:
+                raise ValueError(f"Unsupported per-layer dtype: {dtype_str}")
+
+        # Apply overrides (adjust for start_layer offset in pipeline parallelism)
+        for layer_id, dtype_str in overrides.items():
+            # Convert global layer id to local layer id
+            local_layer_id = layer_id - self.start_layer
+            if 0 <= local_layer_id < self.num_effective_layers:
+                dtype_per_layer[local_layer_id] = resolve_dtype(dtype_str)
+
+        # Check if we actually have heterogeneous dtypes
+        first_dtype = dtype_per_layer[0]
+        if all(d == first_dtype for d in dtype_per_layer):
+            # All layers have the same dtype, no need for per-layer list
+            return None
+
+        log_info_on_rank0(
+            logger,
+            f"Using per-layer KV cache dtypes: {len(overrides)} layers overridden",
+        )
+
+        return dtype_per_layer
+
+    def _validate_per_layer_dtype_constraints(self):
+        """Validate constraints for per-layer KV cache dtype feature."""
+        # Get attention backends
+        prefill_backend, decode_backend = self.server_args.get_attention_backends()
+
+        # Check decode attention backend is triton
+        if decode_backend != "triton":
+            raise ValueError(
+                f"Per-layer KV cache dtype requires --decode-attention-backend triton, "
+                f"but got '{decode_backend}'. "
+                "Per-layer dtype with int4/int8 is only supported with triton attention backend."
+            )
+
+        # Check prefill attention backend is fa3
+        if prefill_backend != "fa3":
+            raise ValueError(
+                f"Per-layer KV cache dtype requires --prefill-attention-backend fa3, "
+                f"but got '{prefill_backend}'. "
+                "Per-layer dtype with int4/int8 is only supported with fa3 prefill backend."
+            )
+
+        # Check MLA backend is not enabled
+        if self.use_mla_backend:
+            raise ValueError(
+                "Per-layer KV cache dtype is not supported with MLA backend. "
+                "MLA (Multi-head Latent Attention) uses a different KV cache structure."
+            )
+
+        # Check speculative decoding is not enabled
+        if not self.spec_algorithm.is_none():
+            raise ValueError(
+                "Per-layer KV cache dtype is not supported with speculative decoding. "
+                f"Current speculative algorithm: {self.spec_algorithm}"
+            )
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
