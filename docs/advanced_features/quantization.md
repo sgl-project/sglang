@@ -235,8 +235,8 @@ When serving a ModelOpt-exported HuggingFace checkpoint with `--quantization mod
 Supported `quant_algo` values for `modelopt_fp8`:
 
 - `FP8`: static FP8 (weights + activation scales exported)
-- `FP8_PER_CHANNEL_PER_TOKEN` (aka `fp8_pc_pt`): per-output-channel weight scale + dynamic per-token activation quantization
-- `FP8_PB_WO` / `fp8_pb_wo` (aka `fp8_pb_wo`): 2D blockwise FP8 weight-only with dynamic per-token activation quantization
+- `FP8_PER_CHANNEL_PER_TOKEN`: per-output-channel weight scale + dynamic per-token activation quantization
+- `FP8_PB_WO` / `fp8_pb_wo`: 2D blockwise FP8 weight-only with dynamic per-token activation quantization
 
 ##### Python API Usage
 
