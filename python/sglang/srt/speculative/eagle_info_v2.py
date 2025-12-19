@@ -411,6 +411,54 @@ def fill_accepted_out_cache_loc(
         tl.store(accepted_out_cache_loc + dst, value)
 
 
+
+@triton.jit
+def build_compact_kv_src_tgt_cache_loc(
+    accept_index,
+    accept_lens,
+    out_cache_loc,
+    src_cache_loc,
+    tgt_cache_loc,
+    draft_token_num: tl.constexpr,
+    accept_index_len: tl.constexpr,
+    accept_index_upper: tl.constexpr,
+):
+    """
+    Build (src_cache_loc, tgt_cache_loc) pairs to compact accepted KV cache to the
+    front of the per-request verify slots without any dynamic allocation.
+
+    Layout:
+    - accept_index: [bs, accept_index_len] (padded with -1)
+    - out_cache_loc: [bs, draft_token_num]
+    - src/tgt_cache_loc: [bs, accept_index_len]
+
+    For each request i and position j in [0, accept_index_len):
+    - tgt = out_cache_loc[i, j]
+    - src = out_cache_loc[accept_index[i, j]] if j < accept_lens[i] and accept_index[i, j] >= 0
+      else tgt (no-op copy)
+    """
+    bid = tl.program_id(axis=0)
+    offsets = tl.arange(0, accept_index_upper)
+    mask = offsets < accept_index_len
+
+    accept_len = tl.load(accept_lens + bid)
+
+    tgt_pos = bid * draft_token_num + offsets
+    tgt_vals = tl.load(out_cache_loc + tgt_pos, mask=mask, other=0)
+    src_vals = tgt_vals
+
+    acc_idx = tl.load(
+        accept_index + bid * accept_index_len + offsets, mask=mask, other=-1
+    )
+    copy_mask = mask & (offsets < accept_len) & (acc_idx >= 0)
+    src_candidate = tl.load(out_cache_loc + acc_idx, mask=copy_mask, other=0)
+    src_vals = tl.where(copy_mask, src_candidate, src_vals)
+
+    out_pos = bid * accept_index_len + offsets
+    tl.store(src_cache_loc + out_pos, src_vals, mask=mask)
+    tl.store(tgt_cache_loc + out_pos, tgt_vals, mask=mask)
+
+
 @triton.jit
 def compact_data_tensors_kernel(
     accept_index,
