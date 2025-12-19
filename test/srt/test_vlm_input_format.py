@@ -285,7 +285,10 @@ class TestLlama4ImageUnderstandsImage(
     @classmethod
     def _init_visual(cls):
         model = AutoModel.from_pretrained(
-            cls.model_path, trust_remote_code=True, torch_dtype="auto"
+            cls.model_path,
+            trust_remote_code=True,
+            torch_dtype="auto",
+            force_download=True,
         )
         cls.vision_tower = model.vision_model.eval().to(cls.device)
         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
