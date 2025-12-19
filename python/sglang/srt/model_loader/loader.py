@@ -283,7 +283,7 @@ def _initialize_model(
         for layer in mdl.model.layers:
             if hasattr(layer, 'layer_communicator') and hasattr(layer, 'mlp'):
                 lmlp = layer.mlp
-                cachelist = [lmlp.getattr(lmlp, name).weight for name in ['gate_up_proj', 'gate_proj', 'up_proj', 'down_proj'] if hasattr(lmlp, name)]
+                cachelist = [getattr(lmlp, name).weight for name in ['gate_up_proj', 'gate_proj', 'up_proj', 'down_proj'] if hasattr(lmlp, name)]
 #                 for tname, tensor in lmlp.named_parameters():
 #                     if (
 #                         tname.endswith(".weight") and
