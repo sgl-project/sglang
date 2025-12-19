@@ -66,8 +66,9 @@ template <
     template <typename...> typename EpilogueVisitor = cutlass::epilogue::threadblock::Sm80EVT,
     typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
 struct DeviceGemmFp8RowwiseSm89 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t> || 
-    std::is_same_v<ElementType, cutlass::float_e5m2_t>, "ElementType must be FP8(e4m3 or e5m2)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
 
   using ElementA = ElementType;
   using LayoutA = cutlass::layout::RowMajor;
@@ -467,8 +468,9 @@ template <
     typename TileSchedulerType = void,
     bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm90 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t> || 
-    std::is_same_v<ElementType, cutlass::float_e5m2_t>, "ElementType must be FP8(e4m3 or e5m2)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
 
   // A matrix configuration
   using ElementA = ElementType;               // Element type for A matrix operand
@@ -830,8 +832,9 @@ template <
     typename TileSchedulerType = void,
     bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm100 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t> || 
-    std::is_same_v<ElementType, cutlass::float_e5m2_t>, "ElementType must be FP8(e4m3 or e5m2)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
   using TileShape = CTAShape;
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
@@ -1206,8 +1209,9 @@ template <
     typename TileSchedulerType = void,
     bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm120 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t> || 
-    std::is_same_v<ElementType, cutlass::float_e5m2_t>, "ElementType must be FP8(e4m3 or e5m2)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
   using TileShape = CTAShape;
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
@@ -1494,7 +1498,9 @@ torch::Tensor fp8_scaled_mm(
   TORCH_CHECK(
       (mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
   TORCH_CHECK(mat_a.scalar_type() == mat_b.scalar_type(), "mat_a must be the same type as mat_b");
-  TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn || mat_a.scalar_type() == torch::kFloat8_e5m2, "mat_a must be Float8_e4m3fn or Float8_e5m2");
+  TORCH_CHECK(
+      mat_a.scalar_type() == torch::kFloat8_e4m3fn || mat_a.scalar_type() == torch::kFloat8_e5m2,
+      "mat_a must be Float8_e4m3fn or Float8_e5m2");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
   TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
@@ -1527,7 +1533,8 @@ torch::Tensor fp8_scaled_mm(
       sm120_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
-  } else if (sm_version == 100
+  } else if (
+      sm_version == 100
 #if CUDA_VERSION >= 12090
       || sm_version == 103
 #endif

@@ -1,9 +1,9 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/util/Float8_e4m3fn.h>
+#include <c10/util/Float8_e5m2.h>
 
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
-#include <c10/util/Float8_e4m3fn.h>
-#include <c10/util/Float8_e5m2.h>
 #include <type_traits>
 
 #ifdef USE_ROCM
@@ -29,28 +29,28 @@ __host__ __device__ __forceinline__ float fp8_max() {
 
 template <typename T>
 __device__ __forceinline__ float to_float(T x) {
-    if constexpr (std::is_same_v<T, __half>) {
-        return __half2float(x);
-    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-        return __bfloat162float(x);
-    } else {
-        return static_cast<float>(x);
-    }
+  if constexpr (std::is_same_v<T, __half>) {
+    return __half2float(x);
+  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    return __bfloat162float(x);
+  } else {
+    return static_cast<float>(x);
+  }
 }
 
 template <typename T>
 __device__ __forceinline__ T from_float(float x) {
-    if constexpr (std::is_same_v<T, __half>) {
-        return __float2half(x);
-    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-        return __float2bfloat16(x);
-    } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-        return static_cast<T>(x);
-    } else if constexpr (std::is_same_v<T, __nv_fp8_e5m2>) {
-        return static_cast<T>(x);
-    } else {
-        return static_cast<T>(x);
-    }
+  if constexpr (std::is_same_v<T, __half>) {
+    return __float2half(x);
+  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    return __float2bfloat16(x);
+  } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+    return static_cast<T>(x);
+  } else if constexpr (std::is_same_v<T, __nv_fp8_e5m2>) {
+    return static_cast<T>(x);
+  } else {
+    return static_cast<T>(x);
+  }
 }
 
 // ---------------------------------------------------------------------------
