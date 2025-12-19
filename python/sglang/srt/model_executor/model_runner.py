@@ -97,6 +97,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -1723,6 +1724,13 @@ class ModelRunner:
                 "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
             )
             return False
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+            # TODO(yuwei): fix the compilation errors for MOE A2A backend
+            log_info_on_rank0(
+                logger,
+                "Disable piecewise CUDA graph due to existing compilation errors",
+            )
+            return False
         return True
 
     def init_memory_pool(
@@ -2623,9 +2631,10 @@ class ModelRunner:
         ):
             return
 
-        # Collect attention layers from the model
-        self.attention_layers = []
+        # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
+        self.attention_layers = []
+        self.moe_layers = []
         for layer in self.model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
@@ -2642,6 +2651,17 @@ class ModelRunner:
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):
                     self.attention_layers.append(layer.attention.attn)
+
+            moe_block = None
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                moe_block = layer.mlp.experts
+            if hasattr(layer, "block_sparse_moe") and hasattr(
+                layer.block_sparse_moe, "experts"
+            ):
+                moe_block = layer.block_sparse_moe.experts
+            if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
+                moe_block = layer.moe.experts
+            self.moe_layers.append(moe_block)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA
