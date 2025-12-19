@@ -271,7 +271,7 @@ def shard_model(
         "reshard_after_forward": reshard_after_forward,
         "mesh": mesh,
         "mp_policy": mp_policy,
-        "process_group": process_group,
+        # "process_group": process_group,
     }
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=pin_cpu_memory)
