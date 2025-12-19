@@ -212,10 +212,12 @@ class MiMoV2ModelNextN(nn.Module):
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
-                hidden_states_before_norm = hidden_states + residual
+                if forward_batch.return_hidden_states_before_norm:
+                    hidden_states_before_norm = hidden_states + residual
                 hidden_states, _ = self.final_layernorm(hidden_states, residual)
             else:
-                hidden_states_before_norm = hidden_states
+                if forward_batch.return_hidden_states_before_norm:
+                    hidden_states_before_norm = hidden_states
                 hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states, hidden_states_before_norm
