@@ -732,11 +732,11 @@ class ModelConfig:
 
         # Filter out None values
         cfg_list = [item for item in cfg_list if item is not None]
-        assert (
-            len(cfg_list) == 1
-        ), "Config list contains configs from 2 methods, must be only 1"
-
-        quant_cfg = cfg_list[0]
+        if len(cfg_list) > 1:
+            raise ValueError(
+                "Config list contains configs from 2 methods, must be only 1"
+            )
+        quant_cfg = cfg_list[0] if cfg_list else None
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
