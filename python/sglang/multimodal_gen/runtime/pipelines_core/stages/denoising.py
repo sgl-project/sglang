@@ -189,12 +189,10 @@ class DenoisingStage(PipelineStage):
         )
 
         dummy_latents = batch.latents[:1].clone()
-        dummy_encoder_hidden_states = None
-        if (
-            hasattr(batch, "encoder_hidden_states")
-            and batch.encoder_hidden_states is not None
-        ):
-            dummy_encoder_hidden_states = batch.encoder_hidden_states[:1].clone()
+        
+        dummy_prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+        if dummy_prompt_embeds is not None and hasattr(dummy_prompt_embeds, 'shape'):
+            dummy_prompt_embeds = dummy_prompt_embeds[:1]
 
         with torch.no_grad():
             with set_forward_context(
@@ -204,7 +202,7 @@ class DenoisingStage(PipelineStage):
             ):
                 _ = self.transformer(
                     hidden_states=dummy_latents,
-                    encoder_hidden_states=dummy_encoder_hidden_states,
+                    encoder_hidden_states=dummy_prompt_embeds,
                     timestep=dummy_timestep,
                     guidance=None,
                 )
@@ -217,7 +215,7 @@ class DenoisingStage(PipelineStage):
                 ):
                     _ = self.transformer_2(
                         hidden_states=dummy_latents,
-                        encoder_hidden_states=dummy_encoder_hidden_states,
+                        encoder_hidden_states=dummy_prompt_embeds,
                         timestep=dummy_timestep,
                         guidance=None,
                     )
