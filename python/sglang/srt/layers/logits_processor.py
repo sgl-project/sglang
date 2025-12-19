@@ -144,8 +144,6 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
-    return_hidden_states_before_norm: bool = False
-
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -196,7 +194,6 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
-            return_hidden_states_before_norm=forward_batch.return_hidden_states_before_norm,
         )
 
     def compute_dp_attention_metadata(self):
@@ -568,10 +565,7 @@ class LogitsProcessor(nn.Module):
 
         del hidden_states
 
-        if (
-            logits_metadata.return_hidden_states_before_norm
-            and hidden_states_to_store_before_norm is not None
-        ):
+        if hidden_states_to_store_before_norm is not None:
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         if not logits_metadata.extend_return_logprob:
