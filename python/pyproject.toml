@@ -27,7 +27,6 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "fitz",
   "flashinfer_python==0.5.3", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.5.3",
   "gguf",
@@ -53,6 +52,7 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
+  "PyMuPDF>=1.22",
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
