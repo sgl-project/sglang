@@ -22,7 +22,7 @@ use uuid::Uuid;
 use super::conversions;
 use crate::{
     mcp::{self, McpManager},
-    observability::metrics::{smg_labels, SmgMetrics},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::{
             ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
@@ -285,7 +285,7 @@ pub(super) async fn execute_tool_loop(
             state.iteration += 1;
 
             // Record tool loop iteration metric
-            SmgMetrics::record_mcp_tool_iteration(&current_request.model);
+            Metrics::record_mcp_tool_iteration(&current_request.model);
 
             debug!(
                 "Tool loop iteration {}: found {} tool call(s)",
@@ -408,18 +408,18 @@ pub(super) async fn execute_tool_loop(
                 let tool_duration = tool_start.elapsed();
 
                 // Record MCP tool metrics
-                SmgMetrics::record_mcp_tool_duration(
+                Metrics::record_mcp_tool_duration(
                     &current_request.model,
                     &tool_name,
                     tool_duration,
                 );
-                SmgMetrics::record_mcp_tool_call(
+                Metrics::record_mcp_tool_call(
                     &current_request.model,
                     &tool_name,
                     if success {
-                        smg_labels::RESULT_SUCCESS
+                        metrics_labels::RESULT_SUCCESS
                     } else {
-                        smg_labels::RESULT_ERROR
+                        metrics_labels::RESULT_ERROR
                     },
                 );
 
@@ -665,7 +665,7 @@ async fn execute_tool_loop_streaming_internal(
         state.iteration += 1;
 
         // Record tool loop iteration metric
-        SmgMetrics::record_mcp_tool_iteration(&model);
+        Metrics::record_mcp_tool_iteration(&model);
 
         if state.iteration > MAX_ITERATIONS {
             return Err(format!(
@@ -928,14 +928,14 @@ async fn execute_tool_loop_streaming_internal(
                 let tool_duration = tool_start.elapsed();
 
                 // Record MCP tool metrics
-                SmgMetrics::record_mcp_tool_duration(&model, &tool_name, tool_duration);
-                SmgMetrics::record_mcp_tool_call(
+                Metrics::record_mcp_tool_duration(&model, &tool_name, tool_duration);
+                Metrics::record_mcp_tool_call(
                     &model,
                     &tool_name,
                     if success {
-                        smg_labels::RESULT_SUCCESS
+                        metrics_labels::RESULT_SUCCESS
                     } else {
-                        smg_labels::RESULT_ERROR
+                        metrics_labels::RESULT_ERROR
                     },
                 );
 
