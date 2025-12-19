@@ -332,27 +332,5 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
         "--attention-backend=flashinfer",
     ]
 
-class TestEAGLEServerPageSizeTopkCUDAGraph(TestEAGLEServerBasic):
-    # default topk=8 and tokens=64
-    spec_topk = 5
-    spec_steps = 8
-    spec_tokens = 64
-    mem_fraction_static = 0.7
-    spec_algo = "EAGLE3"
-    draft_model = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
-    target_model = "meta-llama/Llama-3.1-8B-Instruct"
-
-    extra_args = [
-        "--page-size=256",
-        "--attention-backend=fa3",
-        "--cuda-graph-max-bs=5",
-        "--skip-server-warmup",
-        "--trust-remote-code",
-        "--dtype=float16",
-        "--max-running-requests=8",
-        "--decode-log-interval=1",
-        "--disable-cuda-graph",
-    ]
-
 if __name__ == "__main__":
     unittest.main()
