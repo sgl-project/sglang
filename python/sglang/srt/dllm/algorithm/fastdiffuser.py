@@ -44,7 +44,8 @@ class FastDiffuser(DllmAlgorithm):
         self.threshold = config.algorithm_config.get("threshold", 0.9)
 
         logger.info(f"FastDiffuser initialized: block_size={self.block_size}, "
-                   f"temperature={self.temperature}, threshold={self.threshold}")
+                   f"max_steps={self.max_steps}, temperature={self.temperature}, "
+                   f"threshold={self.threshold}")
 
     def run(
         self,
@@ -66,13 +67,16 @@ class FastDiffuser(DllmAlgorithm):
         start = len(forward_batch.input_ids) - torch.sum(mask_index).item()
 
         # Iterative denoising loop (like LLADA2)
-        for _ in range(self.block_size):
+        total_iterations = 0
+        for _ in range(self.max_steps):
             mask_index = forward_batch.input_ids == self.mask_id
             if torch.sum(mask_index).item() == 0:
                 break
 
             # Forward pass
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            total_iterations += 1
+
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             # Get predictions with Gumbel noise
@@ -98,7 +102,7 @@ class FastDiffuser(DllmAlgorithm):
 
             # Update input_ids
             forward_batch.input_ids[transfer_index] = x[transfer_index]
-
+        logger.info("FastDiffuser finished with total block iterations: %d", total_iterations)
         # Final forward pass (like LLADA2)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph

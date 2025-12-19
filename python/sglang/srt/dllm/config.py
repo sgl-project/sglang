@@ -11,11 +11,13 @@ class DllmConfig:
         algorithm_config: dict[str, Any],
         block_size: int,
         mask_id: int,
+        max_steps: int,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
+        self.max_steps = max_steps
 
     @staticmethod
     def from_server_args(
@@ -46,6 +48,8 @@ class DllmConfig:
             )
 
         algorithm_config = {}
+        max_steps = block_size  # Default max_steps to block_size
+
         if server_args.dllm_algorithm_config is not None:
             try:
                 import yaml
@@ -59,10 +63,12 @@ class DllmConfig:
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
+            max_steps = algorithm_config.get("max_steps", max_steps)
 
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,
             block_size=block_size,
             mask_id=mask_id,
+            max_steps=max_steps,
         )

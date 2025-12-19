@@ -11,6 +11,7 @@ class DllmAlgorithm:
     ):
         self.block_size = config.block_size
         self.mask_id = config.mask_id
+        self.max_steps = config.max_steps
 
     @staticmethod
     def from_server_args(server_args: ServerArgs):
