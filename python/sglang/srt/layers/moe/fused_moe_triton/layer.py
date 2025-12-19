@@ -1226,7 +1226,6 @@ class FlashInferFP4MoE(FusedMoE):
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
-            tile_tokens_dim=None,
             routing_method_type=routing_method_type,
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
