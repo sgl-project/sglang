@@ -242,7 +242,7 @@ class CudaPlatformBase(Platform):
                 except ImportError as e:
                     logger.info(e)
                     logger.info(
-                        "Sage Attention 3 backend is not installed, fallback to Torch SDPA (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Flash Attention."
+                        "Sage Attention 3 backend is not installed, Falling back to Torch SDPA (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation)"
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
 
