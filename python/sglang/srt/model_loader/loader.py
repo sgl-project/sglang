@@ -283,7 +283,7 @@ def _initialize_model(
         for layer in mdl.model.layers:
             if hasattr(layer, 'layer_communicator') and hasattr(layer, 'mlp'):
                 lmlp = layer.mlp
-                cachelist = []
+                cachelist = [lmlp.getattr(lmlp, name).weight for name in ['gate_up_proj', 'gate_proj', 'up_proj', 'down_proj'] if hasattr(lmlp, name)]
 #                 for tname, tensor in lmlp.named_parameters():
 #                     if (
 #                         tname.endswith(".weight") and
@@ -296,14 +296,6 @@ def _initialize_model(
 #                         )
 #                     ):
 #                         cachelist.append(tensor)
-                if hasattr(lmlp, 'gate_up_proj'):
-                    cachelist.append(lmlp.gate_up_proj.weight)
-                if hasattr(lmlp, 'gate_proj'):
-                    cachelist.append(lmlp.gate_proj.weight)
-                if hasattr(lmlp, 'up_proj'):
-                    cachelist.append(lmlp.up_proj.weight)
-                if hasattr(lmlp, 'down_proj'):
-                    cachelist.append(lmlp.down_proj.weight)
                 if get_global_server_args().enable_weights_prefetching and len(cachelist):
                     layer.layer_communicator._context.cache = cachelist
                     def mlpwrap(fwd):
