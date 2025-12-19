@@ -37,7 +37,6 @@ from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_c
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
-    log_generation_timer,
     suppress_loggers,
     suppress_other_loggers,
 )
@@ -264,54 +263,47 @@ class DiffGenerator:
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
-            try:
-                with log_generation_timer(
-                    logger, req.prompt, request_idx + 1, len(requests)
-                ) as timer:
-                    output_batch = self._send_to_scheduler_and_wait_for_response([req])
-                    if output_batch.error:
-                        raise Exception(f"{output_batch.error}")
+            # with log_generation_timer(
+            #     logger, req.prompt, request_idx + 1, len(requests)
+            # ) as timer:
+            output_batch = self._send_to_scheduler_and_wait_for_response([req])
+            if output_batch.error:
+                raise Exception(f"{output_batch.error}")
 
-                    if output_batch.output is None:
-                        logger.error(
-                            "Received empty output from scheduler for prompt %d",
-                            request_idx + 1,
-                        )
-                        continue
-                    for output_idx, sample in enumerate(output_batch.output):
-                        num_outputs = len(output_batch.output)
-                        # print(f"283: {output_batch.output}", flush=True)
-                        print(f"283: {output_idx}", flush=True)
-                        print(f"284: {sample}", flush=True)
-                        frames = self.post_process_sample(
-                            sample,
-                            fps=req.fps,
-                            save_output=req.save_output,
-                            save_file_path=req.output_file_path(
-                                num_outputs, output_idx
-                            ),
-                            data_type=req.data_type,
-                        )
-
-                        result_item: dict[str, Any] = {
-                            "samples": sample,
-                            "frames": frames,
-                            "prompts": req.prompt,
-                            "size": (req.height, req.width, req.num_frames),
-                            "generation_time": timer.duration,
-                            "timings": (
-                                output_batch.timings.to_dict()
-                                if output_batch.timings
-                                else {}
-                            ),
-                            "trajectory": output_batch.trajectory_latents,
-                            "trajectory_timesteps": output_batch.trajectory_timesteps,
-                            "trajectory_decoded": output_batch.trajectory_decoded,
-                            "prompt_index": output_idx,
-                        }
-                        results.append(result_item)
-            except Exception:
+            if output_batch.output is None:
+                logger.error(
+                    "Received empty output from scheduler for prompt %d",
+                    request_idx + 1,
+                )
                 continue
+            for output_idx, sample in enumerate(output_batch.output):
+                num_outputs = len(output_batch.output)
+                # print(f"283: {output_batch.output}", flush=True)
+                print(f"283: {output_idx}", flush=True)
+                print(f"284: {sample}", flush=True)
+                frames = self.post_process_sample(
+                    sample,
+                    fps=req.fps,
+                    save_output=req.save_output,
+                    save_file_path=req.output_file_path(num_outputs, output_idx),
+                    data_type=req.data_type,
+                )
+
+                result_item: dict[str, Any] = {
+                    "samples": sample,
+                    "frames": frames,
+                    "prompts": req.prompt,
+                    "size": (req.height, req.width, req.num_frames),
+                    # "generation_time": timer.duration,
+                    "timings": (
+                        output_batch.timings.to_dict() if output_batch.timings else {}
+                    ),
+                    "trajectory": output_batch.trajectory_latents,
+                    "trajectory_timesteps": output_batch.trajectory_timesteps,
+                    "trajectory_decoded": output_batch.trajectory_decoded,
+                    "prompt_index": output_idx,
+                }
+                results.append(result_item)
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)

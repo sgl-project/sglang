@@ -586,7 +586,9 @@ class QwenImageTransformer2DModel(nn.Module):
         axes_dims_rope = config.axes_dims_rope
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
-
+        self.in_channels = in_channels
+        self.config = config
+        num_layers = 1
         self.rotary_emb = QwenEmbedRope(
             theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
         )
@@ -622,6 +624,7 @@ class QwenImageTransformer2DModel(nn.Module):
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
@@ -655,10 +658,12 @@ class QwenImageTransformer2DModel(nn.Module):
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+        print(f"661 {hidden_states.shape=}")
+        print(f"662 {encoder_hidden_states.shape=}")
 
         hidden_states = self.img_in(hidden_states)
 
-        timestep = (timestep / 1000).to(hidden_states.dtype)
+        timestep = (timestep).to(hidden_states.dtype)
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
@@ -674,9 +679,10 @@ class QwenImageTransformer2DModel(nn.Module):
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
             )
-
+        print(f"680 {hidden_states.shape=}")
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
-
+        print(f"684 {hidden_states.shape=}")
         output = self.proj_out(hidden_states)
+        print(f"686 {output.shape=}")
         return output

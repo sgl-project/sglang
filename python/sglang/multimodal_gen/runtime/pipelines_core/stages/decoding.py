@@ -209,7 +209,7 @@ class DecodingStage(PipelineStage):
                 trajectory_decoded.append(decoded_frames.cpu().float())
         else:
             trajectory_decoded = None
-
+        print(f"212 {frames.shape=}")
         # Convert to CPU float32 for compatibility
         frames = frames.cpu().float()
 
