@@ -20,7 +20,10 @@ from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
-from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    Wan2_2_TI2V_5B_Config,
+    WanI2V480PConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -781,7 +784,7 @@ class DenoisingStage(PipelineStage):
         # replicated on all SP ranks, not sharded, as it provides global context.
         # For Wan2_2_TI2V_5B_Config, it has very special settings
         if (
-            type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
+            isinstance(server_args.pipeline_config, WanI2V480PConfig)
             and batch.image_latent is not None
         ):
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
