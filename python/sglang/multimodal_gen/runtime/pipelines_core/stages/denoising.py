@@ -147,8 +147,6 @@ class DenoisingStage(PipelineStage):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
-        # warmup state
-        self._warmup_done = False
 
     def torch_compile_module(self, module):
         """
@@ -170,62 +168,6 @@ class DenoisingStage(PipelineStage):
         compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
         setattr(module, "forward", compiled_forward)
         return module
-
-    def _run_warmup(self, batch: Req, server_args: ServerArgs) -> None:
-        """
-        Run a warmup forward pass to initialize NCCL communication, torch.compile,
-        and CUDA kernels. This reduces the latency of the first real denoising step.
-
-        In serving mode, the warmup state is cached across requests.
-        """
-        if self._warmup_done:
-            return
-
-        logger.info("Running warmup step to initialize kernels and communication...")
-        warmup_start = time.time()
-
-        dummy_timestep = torch.tensor(
-            [999], device=batch.latents.device, dtype=torch.long
-        )
-
-        dummy_latents = batch.latents[:1].clone()
-        
-        dummy_prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
-        if dummy_prompt_embeds is not None and hasattr(dummy_prompt_embeds, 'shape'):
-            dummy_prompt_embeds = dummy_prompt_embeds[:1]
-
-        with torch.no_grad():
-            with set_forward_context(
-                current_timestep=0,
-                attn_metadata=None,
-                forward_batch=batch,
-            ):
-                _ = self.transformer(
-                    hidden_states=dummy_latents,
-                    encoder_hidden_states=dummy_prompt_embeds,
-                    timestep=dummy_timestep,
-                    guidance=None,
-                )
-
-            if self.transformer_2 is not None:
-                with set_forward_context(
-                    current_timestep=0,
-                    attn_metadata=None,
-                    forward_batch=batch,
-                ):
-                    _ = self.transformer_2(
-                        hidden_states=dummy_latents,
-                        encoder_hidden_states=dummy_prompt_embeds,
-                        timestep=dummy_timestep,
-                        guidance=None,
-                    )
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        self._warmup_done = True
-        warmup_time = (time.time() - warmup_start) * 1000
-        logger.info(f"Warmup completed in {warmup_time:.2f}ms")
 
     def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
@@ -1023,9 +965,6 @@ class DenoisingStage(PipelineStage):
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
-
-        # Run warmup on first forward call to reduce first step latency
-        self._run_warmup(batch, server_args)
 
         # Run denoising loop
         denoising_start_time = time.time()
