@@ -117,6 +117,18 @@ find_latest_image() {
     fi
   done
 
+  # If still not found, try finding any image matching ROCm+arch from remote registry
+  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  for days_back in {0..6}; do
+    local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
+    local remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1)
+    if [[ -n "$remote_tags" ]]; then
+      echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
+      echo "rocm/sgl-dev:${remote_tags}"
+      return 0
+    fi
+  done
+
   echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
   local any_local
   any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
