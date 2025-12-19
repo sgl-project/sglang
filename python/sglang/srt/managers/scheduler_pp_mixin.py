@@ -902,29 +902,45 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
     ):
+        # CP mode: In CP mode, the attention input is scattered during the prefill phase,
+        # while the MLP output is already in full form during decoding.
+        # Neither requires the attention TP all-gather operation.
+        use_tp_allgather = not self.server_args.enable_nsa_prefill_context_parallel
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=self.attn_tp_group,
+                all_gather_group=self.attn_tp_group if use_tp_allgather else None,
                 async_send=async_send,
             )
         )
         return p2p_work
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+        # CP mode: In CP mode, the attention input is scattered during the prefill phase,
+        # while the MLP output is already in full form during decoding.
+        # Neither requires the attention TP all-gather operation.
+        use_tp_allgather = not self.server_args.enable_nsa_prefill_context_parallel
+
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(all_gather_group=self.attn_tp_group)
+                self.pp_group.recv_tensor_dict(
+                    all_gather_group=self.attn_tp_group if use_tp_allgather else None
+                )
             )
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
+        # CP mode: In CP mode, the attention input is scattered during the prefill phase,
+        # while the MLP output is already in full form during decoding.
+        # Neither requires the attention TP all-gather operation.
+        use_tp_allgather = not self.server_args.enable_nsa_prefill_context_parallel
+
         res = self.pp_group.recv_tensor_dict(
-            all_gather_group=self.attn_tp_group,
+            all_gather_group=self.attn_tp_group if use_tp_allgather else None,
         )
         return res
 
