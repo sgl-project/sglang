@@ -218,9 +218,6 @@ class ServerArgs:
     # Workload type
     workload_type: WorkloadType = WorkloadType.T2V
 
-    # True when running "offline local mode" (e.g., `sglang generate`)
-    offline_mode: bool = False
-
     # Cache strategy
     cache_strategy: str = "none"
 
