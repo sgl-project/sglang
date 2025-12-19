@@ -67,6 +67,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
@@ -2119,13 +2120,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"Loaded adapters: {list(self.lora_ref_cache.keys())}"
                 )
 
-            logger.info(f"Reloading evicted adapter: {lora_path}")
-            new_lora_ref = self.lora_ref_cache[lora_path]
+            # Adapter is in cache, reload it
+            cached_ref = self.lora_ref_cache[lora_path]
+            # If adapter is still in registry and allow_runtime_lora_updating is enabled,
+            # unload it first to pick up updated weights (for RL training scenario)
+            if (
+                self.server_args.allow_runtime_lora_updating
+                and lora_path in self.lora_registry._registry
+            ):
+                logger.info(
+                    f"Reloading adapter '{lora_path}' to pick up updated weights"
+                )
+                async with self.lora_update_lock:
+                    await self._unload_lora_adapter_locked(
+                        UnloadLoRAAdapterReqInput(lora_name=lora_path)
+                    )
+            else:
+                logger.info(f"Reloading evicted adapter: {lora_path}")
+
             load_result = await self.load_lora_adapter(
                 LoadLoRAAdapterReqInput(
-                    lora_name=new_lora_ref.lora_name,
-                    lora_path=new_lora_ref.lora_path,
-                    pinned=new_lora_ref.pinned,
+                    lora_name=cached_ref.lora_name,
+                    lora_path=cached_ref.lora_path,
+                    pinned=cached_ref.pinned,
                 )
             )
             if (
