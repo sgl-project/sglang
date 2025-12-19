@@ -11,15 +11,15 @@ import time
 from typing import Tuple
 
 import torch
-from transformers import AutoTokenizer, PreTrainedTokenizer
-
 import xgrammar as xgr
+from transformers import AutoTokenizer, PreTrainedTokenizer
+from xgrammar import allocate_token_bitmask
+
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammar
 from sglang.srt.speculative.spec_utils import (
     _traverse_draft_tree_native,
     traverse_tree_fallback,
 )
-from xgrammar import allocate_token_bitmask
 
 
 def compile_grammar(tokenizer: PreTrainedTokenizer) -> xgr.CompiledGrammar:
