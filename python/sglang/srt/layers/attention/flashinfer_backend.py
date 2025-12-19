@@ -853,7 +853,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
                 if self.dcp_size > 1:
-                    assert q.is_contiguous()
                     q = get_dcp_group().all_gather(q, dim=1)
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
@@ -904,6 +903,10 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        q = q.contiguous()
+        if self.dcp_size > 1:
+            q = get_dcp_group().all_gather(q, dim=1)
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -918,9 +921,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         # Call the wrapped function
-        q = q.contiguous()
-        if self.dcp_size > 1:
-            q = get_dcp_group().all_gather(q, dim=1)
         o, s = decode_wrapper.forward_return_lse(
             q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
