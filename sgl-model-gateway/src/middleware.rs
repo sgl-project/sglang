@@ -418,7 +418,7 @@ impl QueueProcessor {
     }
 
     pub async fn run(mut self) {
-        info!("Starting concurrency queue processor");
+        debug!("Starting concurrency queue processor");
 
         // Process requests in a single task to reduce overhead
         while let Some(queued) = self.queue_rx.recv().await {
