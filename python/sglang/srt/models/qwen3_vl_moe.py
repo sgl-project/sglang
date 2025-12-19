@@ -46,7 +46,6 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self.hidden_size = config.hidden_size
-        # copy paste original hardcoded value in codebase
         self.deepstack_embed_to_decoder_layer = range(
             len(config.vision_config.deepstack_visual_indexes)
         )
