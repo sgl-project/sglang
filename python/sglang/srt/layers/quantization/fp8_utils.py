@@ -1170,40 +1170,6 @@ def scaled_fp8_blockwise(
     data_hp: torch.Tensor, weight_block_size: tuple[int, int] = (128, 128)
 ):
     # cast tensor from high precision to FP8 with 128*128 blockwise quantization.
-
-
-    #   output_dtype = input.dtype
-    # dtype_supported = output_dtype == torch.bfloat16
-
-    # # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    # shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
-
-    # if not (shape_supported and dtype_supported):
-    #     # fall back to triton
-    #     # If weight_scale is in UE8M0 packed format (int32), convert back to float32
-    #     # UE8M0 format has shape (N, K//block_k//4) with dtype int32
-    #     # Triton expects shape (N//block_n, K//block_k) with dtype float32
-    #     if weight_scale.dtype == torch.int32:
-    #         weight_scale = _unpack_ue8m0_scale_for_triton(
-    #             weight_scale, weight.shape, block_size
-    #         )
-    #     return triton_w8a8_block_fp8_linear(
-    #         input, weight, block_size, weight_scale, input_scale, bias
-    #     )
-
-
-
-    # assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
-
-    # block_size1 = weight_block_size[1]
-    # block_size0 = weight_block_size[0]
-    # assert (
-    #     data_hp.shape[1] % block_size1 == 0
-    # ), f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
-    # assert (
-    #     data_hp.shape[0] % block_size0 == 0
-    # ), f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
-     # Validate input shape - must be 2D
     if data_hp.ndim != 2:
         raise ValueError(f"Only 2d input tensor is supported, got shape {data_hp.shape}")
 
