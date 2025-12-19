@@ -218,14 +218,7 @@ class CommonKVSender(BaseKVSender):
         url = f"http://{self.bootstrap_server_url}/route"
         payload = {
             "role": "Prefill",
-            "attn_tp_size": self.kv_mgr.attn_tp_size,
-            "attn_tp_rank": self.kv_mgr.attn_tp_rank,
-            "attn_dp_size": self.kv_mgr.attn_dp_size,
             "attn_dp_rank": self.kv_mgr.attn_dp_rank,
-            "pp_size": self.kv_mgr.pp_size,
-            "pp_rank": self.kv_mgr.pp_rank,
-            "system_dp_size": self.kv_mgr.system_dp_size,
-            "system_dp_rank": self.kv_mgr.system_dp_rank,
             "rank_ip": self.kv_mgr.local_ip,
             "rank_port": self.kv_mgr.rank_port,
             "bootstrap_room": self.bootstrap_room,
