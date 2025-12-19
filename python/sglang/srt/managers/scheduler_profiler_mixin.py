@@ -9,6 +9,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
@@ -69,6 +70,7 @@ class SchedulerProfilerMixin:
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
+        profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.configure(
@@ -82,6 +84,7 @@ class SchedulerProfilerMixin:
                 profile_id=profile_id,
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
+                profile_stages=profile_stages,
             )
 
         if self.profile_in_progress:
@@ -199,7 +202,8 @@ class SchedulerProfilerMixin:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            torch.cuda.cudart().cudaProfilerStart()
+            if self.gpu_id == get_global_server_args().base_gpu_id:
+                torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -308,7 +312,8 @@ class SchedulerProfilerMixin:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            torch.cuda.cudart().cudaProfilerStop()
+            if self.gpu_id == get_global_server_args().base_gpu_id:
+                torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
 
@@ -377,6 +382,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.profile_stages,
                 )
             else:
                 self.init_profile(

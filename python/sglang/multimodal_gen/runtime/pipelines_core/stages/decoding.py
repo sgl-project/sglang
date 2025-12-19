@@ -20,11 +20,32 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+def _ensure_tensor_decode_output(decode_output):
+    """
+    Ensure VAE decode output is a tensor.
+
+    Some VAE implementations return DecoderOutput objects with a .sample attribute,
+    tuples, or tensors directly. This function normalizes the output to always be a tensor.
+
+    Args:
+        decode_output: Output from VAE.decode(), can be DecoderOutput, tuple, or torch.Tensor
+
+    Returns:
+        torch.Tensor: The decoded image tensor
+    """
+    if isinstance(decode_output, tuple):
+        return decode_output[0]
+    if hasattr(decode_output, "sample"):
+        return decode_output.sample
+    return decode_output
 
 
 class DecodingStage(PipelineStage):
@@ -106,11 +127,16 @@ class DecodingStage(PipelineStage):
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
-        latents = server_args.pipeline_config.preprocess_decoding(latents)
+        # Preprocess latents before decoding (e.g., unpatchify for standard Flux2 VAE)
+        latents = server_args.pipeline_config.preprocess_decoding(
+            latents, server_args, vae=self.vae
+        )
 
         # Decode latents
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=current_platform.device_type,
+            dtype=vae_dtype,
+            enabled=vae_autocast_enabled,
         ):
             try:
                 # TODO: make it more specific
@@ -120,7 +146,8 @@ class DecodingStage(PipelineStage):
                 pass
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-            image = self.vae.decode(latents)
+            decode_output = self.vae.decode(latents)
+            image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
         image = (image / 2 + 0.5).clamp(0, 1)

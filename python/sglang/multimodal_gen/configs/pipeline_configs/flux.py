@@ -4,6 +4,7 @@ from typing import Callable, List, Optional
 
 import PIL
 import torch
+from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_preprocess_text,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -80,6 +82,9 @@ class FluxPipelineConfig(ImagePipelineConfig):
             None,
         ]
     )
+
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        return self._prepare_sigmas(sigmas, num_inference_steps)
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = 2 * (
@@ -210,10 +215,10 @@ def _prepare_latent_ids(
     t = torch.arange(1)  # [0] - time dimension
     h = torch.arange(height)
     w = torch.arange(width)
-    l = torch.arange(1)  # [0] - layer dimension
+    layer = torch.arange(1)  # [0] - layer dimension
 
     # Create position IDs: (H*W, 4)
-    latent_ids = torch.cartesian_prod(t, h, w, l)
+    latent_ids = torch.cartesian_prod(t, h, w, layer)
 
     # Expand to batch: (B, H*W, 4)
     latent_ids = latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
@@ -284,9 +289,9 @@ def _prepare_text_ids(
         t = torch.arange(1) if t_coord is None else t_coord[i]
         h = torch.arange(1)
         w = torch.arange(1)
-        l = torch.arange(L)
+        layer = torch.arange(L)
 
-        coords = torch.cartesian_prod(t, h, w, l)
+        coords = torch.cartesian_prod(t, h, w, layer)
         out_ids.append(coords)
 
     return torch.stack(out_ids)
@@ -461,11 +466,40 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
         return None
 
-    def resize_condition_image(self, image, target_width, target_height):
-        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+    def preprocess_condition_image(
+        self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
+    ):
+        img = image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+        image_width, image_height = img.size
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        multiple_of = vae_scale_factor * 2
+        image_width = (image_width // multiple_of) * multiple_of
+        image_height = (image_height // multiple_of) * multiple_of
+        img = vae_image_processor.preprocess(
+            img, height=image_height, width=image_width, resize_mode="crop"
+        )
+        return img, (image_width, image_height)
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        batch_size = batch.batch_size
+        # get image_latent_ids right after scale & shift
+        image_latent_ids = _prepare_image_ids([latent_condition])
+        image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
+        image_latent_ids = image_latent_ids.to(get_local_torch_device())
+        batch.condition_image_latent_ids = image_latent_ids
+
+        # latent: (1, 128, 32, 32)
+        packed = self.maybe_pack_latents(
+            latent_condition, None, batch
+        )  # (1, 1024, 128)
+        packed = packed.squeeze(0)  # (1024, 128) - remove batch dim
+
+        # Concatenate all reference tokens along sequence dimension
+        image_latents = packed.unsqueeze(0)  # (1, N*1024, 128)
+        image_latents = image_latents.repeat(batch_size, 1, 1)
+        return image_latents
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
-
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
@@ -510,24 +544,56 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def maybe_prepare_latent_ids(self, latents):
         return _prepare_latent_ids(latents)
 
-    def post_process_vae_encode(self, image_latents, vae):
+    def postprocess_vae_encode(self, image_latents, vae):
         # patchify
         image_latents = _patchify_latents(image_latents)
         return image_latents
 
-    def preprocess_decoding(self, latents):
-        latents = _unpatchify_latents(latents)
+    def _check_vae_has_bn(self, vae):
+        """Check if VAE has bn attribute (cached check to avoid repeated hasattr calls)."""
+        if not hasattr(self, "_vae_has_bn_cache"):
+            self._vae_has_bn_cache = hasattr(vae, "bn") and vae.bn is not None
+        return self._vae_has_bn_cache
+
+    def preprocess_decoding(self, latents, server_args=None, vae=None):
+        """Preprocess latents before decoding.
+
+        Dynamically adapts based on VAE type:
+        - Standard Flux2 VAE (has bn): needs unpatchify (128 channels -> 32 channels)
+        - Distilled VAE (no bn): keeps patchified latents (128 channels)
+        """
+        if vae is not None and self._check_vae_has_bn(vae):
+            return _unpatchify_latents(latents)
         return latents
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
+        """Get scale and shift for decoding.
+
+        Dynamically adapts based on VAE type:
+        - Standard Flux2 VAE (has bn): uses BatchNorm statistics
+        - Distilled VAE (no bn): uses scaling_factor from config
+        """
         vae_arch_config = self.vae_config.arch_config
-        latents_bn_mean = (
-            vae.bn.running_mean.view(1, -1, 1, 1).to(device=device).to(device, dtype)
+
+        if self._check_vae_has_bn(vae):
+            # Standard Flux2 VAE: use BatchNorm statistics
+            latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype)
+            latents_bn_std = torch.sqrt(
+                vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps
+            ).to(device, dtype)
+            return 1 / latents_bn_std, latents_bn_mean
+
+        # Distilled VAE or unknown: use scaling_factor
+        scaling_factor = (
+            getattr(vae.config, "scaling_factor", None)
+            if hasattr(vae, "config")
+            else getattr(vae, "scaling_factor", None)
+        ) or getattr(vae_arch_config, "scaling_factor", 0.13025)
+
+        scale = torch.tensor(scaling_factor, device=device, dtype=dtype).view(
+            1, 1, 1, 1
         )
-        latents_bn_std = torch.sqrt(
-            vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps
-        ).to(device, dtype)
-        return 1 / latents_bn_std, latents_bn_mean
+        return 1 / scale, None
 
     def post_denoising_loop(self, latents, batch):
         latent_ids = batch.latent_ids

@@ -30,7 +30,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instr
 
 ## DeepSeek V3/R1
 
-Please refer to [DeepSeek documents for reference](https://docs.sglang.ai/basic_usage/deepseek.html#running-examples-on-multi-node).
+Please refer to [DeepSeek documents for reference](https://docs.sglang.io/basic_usage/deepseek.html#running-examples-on-multi-node).
 
 ## Multi-Node Inference on SLURM
 
@@ -95,6 +95,6 @@ echo "[INFO] $HEAD_NODE:30000 is ready to accept connections"
 wait
 ```
 
-Then, you can test the server by sending requests following other [documents](https://docs.sglang.ai/basic_usage/openai_api_completions.html).
+Then, you can test the server by sending requests following other [documents](https://docs.sglang.io/basic_usage/openai_api_completions.html).
 
 Thanks for [aflah02](https://github.com/aflah02) for providing the example, based on his [blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang).
