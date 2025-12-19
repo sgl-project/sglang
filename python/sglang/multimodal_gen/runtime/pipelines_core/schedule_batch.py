@@ -51,7 +51,7 @@ class Req:
     generator: torch.Generator | list[torch.Generator] | None = None
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
