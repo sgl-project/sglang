@@ -268,7 +268,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_strs
 
     def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
-        output_routed_experts = []
+        output_routed_experts = None
         if recv_obj.output_routed_experts is not None:
             output_routed_experts = [
                 (
