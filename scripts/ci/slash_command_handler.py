@@ -226,7 +226,10 @@ def handle_rerun_stage(
         dispatch_resp = requests.post(
             dispatch_url,
             json={"ref": ref, "inputs": inputs},
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
         )
         success = dispatch_resp.status_code in (200, 204)
         if not success:
