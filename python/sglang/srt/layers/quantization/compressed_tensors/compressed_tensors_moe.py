@@ -111,17 +111,12 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            if _is_cuda or _is_hip:
+            if not _is_npu:
                 logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                 return CompressedTensorsWNA16MoEMethod(quant_config)
-            elif _is_npu:
-                if (
-                    quant_config._is_dynamic_token_w4(weight_quant, input_quant)
-                    and input_quant is None
-                ):
-                    logger.info_once(
-                        "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
-                    )
+            else:
+                if quant_config._is_dynamic_token_w4(weight_quant, input_quant) and input_quant is None:
+                    logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod")
                     return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoEMethod")
@@ -887,10 +882,7 @@ class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
             "input_activations"
         )
-        if not _is_npu:
-            raise NotImplementedError(
-                "w8a8 int8 compressed tensors moe scheme is supported only for Ascend device for now."
-            )
+
         self.static_input_scales = not self.input_quant.dynamic
         per_channel = (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
@@ -1314,6 +1306,9 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
         else:
             self.group_size = 128
 
+    # TODO: See if we can merge this method's logic
+    # with CompressedTensorsWNA16MoEMethod. Need more models and tests.
+    # @OrangeRedeng @TamirBaydasov
     def create_weights(
         self,
         layer: torch.nn.Module,
