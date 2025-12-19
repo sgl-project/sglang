@@ -152,9 +152,7 @@ def wait_for_server(url: str, timeout_sec: int = 60) -> bool:
                 elapsed = time.perf_counter() - start_time
                 print(f"Server is ready! (took {elapsed:.2f}s)")
                 return True
-        except (requests.exceptions.ConnectionError, 
-                requests.exceptions.Timeout,
-                requests.exceptions.RequestException) as e:
+        except requests.exceptions.RequestException:
             pass
         
         elapsed = time.perf_counter() - start_time
