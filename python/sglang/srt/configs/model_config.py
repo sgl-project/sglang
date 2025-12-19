@@ -851,16 +851,16 @@ class ModelConfig:
         needs_tf_v5 = is_glm_46vmoe
 
         tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0")
+        required_version = version.parse("4.57.3")
 
-        if tf_version < required_version:
-            if needs_tf_v5:
+        if needs_tf_v5:
+            if tf_version <= required_version:
                 raise ValueError(
                     f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
                     f"or model type {self.hf_config.model_type}. "
-                    "Please upgrade transformers to >= 5.0.0."
+                    f"Please upgrade transformers to > {required_version}"
                 )
-        elif not needs_tf_v5:
+        elif tf_version > required_version:
             logger.warning(
                 f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
                 "If you experience issues related to RoPE parameters, "
