@@ -60,6 +60,14 @@ class ModelTaskType(Enum):
     def requires_image_input(self) -> bool:
         return self == ModelTaskType.I2V or self == ModelTaskType.I2I
 
+    def accepts_image_input(self) -> bool:
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.TI2I
+            or self == ModelTaskType.TI2V
+        )
+
     def data_type(self) -> DataType:
         if self.is_image_gen():
             return DataType.IMAGE
