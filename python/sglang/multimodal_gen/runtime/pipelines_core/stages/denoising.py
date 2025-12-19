@@ -725,7 +725,6 @@ class DenoisingStage(PipelineStage):
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-
         if torch.backends.mps.is_available():
             logger.info(
                 "Memory before deallocating transformer: %s",
