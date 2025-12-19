@@ -7,15 +7,20 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.srt.utils import is_hip
 
-try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+_is_hip = is_hip()
 
-    # flash_attn 3 no longer have a different API, see following commit:
-    # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
-    flash_attn_func = flash_attn_varlen_func
-except ImportError as e:
-    raise e
+# hip sgl_kernel.flash_attn cannot import flash_attn_varlen_func
+if not _is_hip:
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        # flash_attn 3 no longer have a different API, see following commit:
+        # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
+        flash_attn_func = flash_attn_varlen_func
+    except ImportError as e:
+        raise e
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,

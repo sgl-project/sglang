@@ -74,6 +74,13 @@ class RMSNorm(CustomOp):
         out = out.view(shape)
         return out
 
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual)
+
     def forward_native(
         self,
         x: torch.Tensor,
