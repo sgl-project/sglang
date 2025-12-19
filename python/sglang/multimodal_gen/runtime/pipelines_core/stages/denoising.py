@@ -197,20 +197,30 @@ class DenoisingStage(PipelineStage):
             dummy_encoder_hidden_states = batch.encoder_hidden_states[:1].clone()
 
         with torch.no_grad():
-            _ = self.transformer(
-                hidden_states=dummy_latents,
-                encoder_hidden_states=dummy_encoder_hidden_states,
-                timestep=dummy_timestep,
-                guidance=None,
-            )
+            with set_forward_context(
+                current_timestep=0,
+                attn_metadata=None,
+                forward_batch=batch,
+            ):
+                _ = self.transformer(
+                    hidden_states=dummy_latents,
+                    encoder_hidden_states=dummy_encoder_hidden_states,
+                    timestep=dummy_timestep,
+                    guidance=None,
+                )
 
-        if self.transformer_2 is not None:
-            _ = self.transformer_2(
-                hidden_states=dummy_latents,
-                encoder_hidden_states=dummy_encoder_hidden_states,
-                timestep=dummy_timestep,
-                guidance=None,
-            )
+            if self.transformer_2 is not None:
+                with set_forward_context(
+                    current_timestep=0,
+                    attn_metadata=None,
+                    forward_batch=batch,
+                ):
+                    _ = self.transformer_2(
+                        hidden_states=dummy_latents,
+                        encoder_hidden_states=dummy_encoder_hidden_states,
+                        timestep=dummy_timestep,
+                        guidance=None,
+                    )
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
