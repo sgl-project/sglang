@@ -988,6 +988,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let bind_addr = format!("{}:{}", config.host, config.port);
     info!("Starting server on {}", bind_addr);
 
+    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| format!("Invalid address: {}", e))?;
+
+    let handle = axum_server::Handle::new();
+    let handle_clone = handle.clone();
+    let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
+    spawn(async move {
+        shutdown_signal().await;
+        handle_clone.graceful_shutdown(Some(grace_period));
+    });
+
     if let (Some(cert), Some(key)) = (
         &config.router_config.server_cert,
         &config.router_config.server_key,
@@ -1001,36 +1014,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| format!("Failed to create TLS config: {}", e))?;
 
-        let addr: std::net::SocketAddr = bind_addr
-            .parse()
-            .map_err(|e| format!("Invalid address: {}", e))?;
-
-        let handle = axum_server::Handle::new();
-        let handle_clone = handle.clone();
-        let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
-        spawn(async move {
-            shutdown_signal().await;
-            handle_clone.graceful_shutdown(Some(grace_period));
-        });
-
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
             .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     } else {
-        let addr: std::net::SocketAddr = bind_addr
-            .parse()
-            .map_err(|e| format!("Invalid address: {}", e))?;
-
-        let handle = axum_server::Handle::new();
-        let handle_clone = handle.clone();
-        let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
-        spawn(async move {
-            shutdown_signal().await;
-            handle_clone.graceful_shutdown(Some(grace_period));
-        });
-
         axum_server::bind(addr)
             .handle(handle)
             .serve(app.into_make_service())
