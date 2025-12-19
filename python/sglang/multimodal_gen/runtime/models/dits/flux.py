@@ -40,7 +40,7 @@ from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    _apply_qk_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -162,11 +162,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=False
-            )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=False
+            query, key = _apply_qk_rotary_emb(
+                query, key, cos, sin, is_neox_style=False, interleaved=False
             )
 
         x = self.attn(query, key, value)
