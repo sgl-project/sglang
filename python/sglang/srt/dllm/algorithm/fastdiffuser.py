@@ -68,7 +68,7 @@ class FastDiffuser(DllmAlgorithm):
 
         # Iterative denoising loop (like LLADA2)
         total_iterations = 0
-        for _ in range(self.max_steps):
+        for iteration in range(self.max_steps):
             mask_index = forward_batch.input_ids == self.mask_id
             if torch.sum(mask_index).item() == 0:
                 break
@@ -94,7 +94,7 @@ class FastDiffuser(DllmAlgorithm):
             confidence = torch.where(mask_index, x0_p, -np.inf)
 
             # Transfer tokens above threshold
-            transfer_index = confidence > self.threshold
+            transfer_index = (confidence > self.threshold) | (iteration == self.max_steps - 1)
             if transfer_index.sum().item() == 0:
                 # If no tokens above threshold, take the best one
                 _, select_index = torch.topk(confidence, k=1)
