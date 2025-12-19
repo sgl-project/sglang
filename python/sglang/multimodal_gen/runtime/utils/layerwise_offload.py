@@ -129,3 +129,22 @@ class LayerwiseOffloadManager:
             else:
                 target = self._named_buffers[name]
             target.data = torch.empty((1,), device=self.device, dtype=target.dtype)
+
+    @torch.compiler.disable
+    def release_all(self) -> None:
+        if not self.enabled or self.device is None:
+            return
+        if self.copy_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+        layer_indices = list(self._gpu_layers.keys())
+        for layer_idx in layer_indices:
+            param_names = self._gpu_layers.pop(layer_idx, None)
+            if not param_names:
+                continue
+            for name in param_names:
+                if name in self._named_parameters:
+                    target = self._named_parameters[name]
+                else:
+                    target = self._named_buffers[name]
+                target.data = torch.empty((1,), device=self.device, dtype=target.dtype)
