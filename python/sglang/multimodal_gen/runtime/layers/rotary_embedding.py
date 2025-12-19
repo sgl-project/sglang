@@ -27,13 +27,16 @@
 """Rotary Positional Embeddings."""
 import functools
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Tuple
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    apply_qk_rotary_embedding,
+    apply_rotary_embedding,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -82,6 +85,45 @@ def _apply_rotary_emb(
         return torch.cat((o1, o2), dim=-1)
     else:
         return apply_rotary_embedding(x, cos, sin, interleaved)
+
+
+def _apply_qk_rotary_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool,
+    interleaved: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Args:
+        q: [num_tokens, num_heads, head_size] or [num_tokens, head_size]
+        k: [num_tokens, num_heads, head_size] or [num_tokens, head_size]
+        cos: [num_tokens, head_size // 2]
+        sin: [num_tokens, head_size // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    # cos = cos.unsqueeze(-2).to(x.dtype)
+    # sin = sin.unsqueeze(-2).to(x.dtype)
+    if is_neox_style:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+        if is_neox_style:
+            q1, q2 = torch.chunk(q, 2, dim=-1)
+            k1, k2 = torch.chunk(k, 2, dim=-1)
+        else:
+            q1 = q[..., ::2]
+            q2 = q[..., 1::2]
+            k1 = k[..., ::2]
+            k2 = k[..., 1::2]
+        oq1 = (q1.float() * cos - q2.float() * sin).type_as(q1)
+        oq2 = (q2.float() * cos + q1.float() * sin).type_as(q2)
+        ok1 = (k1.float() * cos - k2.float() * sin).type_as(k1)
+        ok2 = (k2.float() * cos + k1.float() * sin).type_as(k2)
+        return torch.cat((oq1, oq2), dim=-1), torch.cat((ok1, ok2), dim=-1)
+    else:
+        return apply_qk_rotary_embedding(q, k, cos, sin, interleaved)
 
 
 @CustomOp.register("rotary_embedding")
