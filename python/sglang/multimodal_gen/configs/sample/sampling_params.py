@@ -88,7 +88,7 @@ class SamplingParams:
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
 
     # Text inputs
     prompt: str | list[str] | None = None
@@ -541,8 +541,14 @@ class SamplingParams:
         parser.add_argument(
             "--image-path",
             type=str,
+            nargs="+",
             default=SamplingParams.image_path,
-            help="Path to input image for image-to-video generation",
+            help=(
+                "Path(s) to input image(s) for image-to-image / image-to-video "
+                "generation. For multiple images, pass them as space-separated "
+                "values, e.g.: "
+                '--image-path "img1.png" "img2.png"'
+            ),
         )
         parser.add_argument(
             "--moba-config-path",
