@@ -439,7 +439,7 @@ class NativeSparseAttnBackend(
                 # after verification. Lengths vary per request based on how many tokens
                 # were accepted.
                 page_table = torch.repeat_interleave(
-                    page_table, repeats=extend_seq_lens_cpu, dim=0
+                    page_table, repeats=forward_batch.extend_seq_lens, dim=0
                 )
 
         elif forward_batch.forward_mode.is_extend():
