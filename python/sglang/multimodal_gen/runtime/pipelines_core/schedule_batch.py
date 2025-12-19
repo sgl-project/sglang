@@ -57,6 +57,7 @@ class Req:
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
+    vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -88,7 +89,9 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str = (
+        "cuda"  # Device for random generator: "cuda", "musa" or "cpu"
+    )
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False

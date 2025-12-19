@@ -258,13 +258,9 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        # Use QKVParallelLinear for fused QKV projections
-        self.to_qkv = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=head_dim,
-            total_num_heads=num_heads,
-            bias=True,
-        )
+        # Use ReplicatedLinear for fused QKV projections
+        qkv_dim = num_heads * head_dim * 3
+        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=True)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -274,13 +270,8 @@ class QwenImageCrossAttention(nn.Module):
         self.inner_kv_dim = self.inner_dim
 
         if added_kv_proj_dim is not None:
-            # Use QKVParallelLinear for added (encoder) QKV projections
-            self.to_added_qkv = QKVParallelLinear(
-                hidden_size=added_kv_proj_dim,
-                head_size=head_dim,
-                total_num_heads=num_heads,
-                bias=True,
-            )
+            # Use ReplicatedLinear for added (encoder) QKV projections
+            self.to_added_qkv = ReplicatedLinear(added_kv_proj_dim, qkv_dim, bias=True)
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
