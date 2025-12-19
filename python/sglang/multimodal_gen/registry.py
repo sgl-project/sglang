@@ -437,5 +437,11 @@ def _register_configs():
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
     )
 
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+    )
+
 
 _register_configs()
