@@ -481,6 +481,19 @@ class RouterArgs:
             help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
         )
         parser.add_argument(
+            f"--{prefix}rate-limit-rule",
+            type=str,
+            action="append",
+            default=[],
+            help="Multi-tenant and model-specific rate limiting rules (format: tenant:model:max_concurrent:refill_rate). Use '*' for wildcards.",
+        )
+        parser.add_argument(
+            f"--{prefix}rate-limit-tenant-header",
+            type=str,
+            default=RouterArgs.rate_limit_tenant_header,
+            help="Header to use for tenant identification (defaults to X-Tenant-ID)",
+        )
+        parser.add_argument(
             f"--{prefix}cors-allowed-origins",
             type=str,
             nargs="*",

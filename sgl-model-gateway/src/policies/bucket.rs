@@ -653,7 +653,7 @@ mod tests {
             .select_worker(&prefill_workers, Some(&*"a".repeat(34)))
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
         {
             let model_key = "default";
 

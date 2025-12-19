@@ -105,6 +105,8 @@ class RouterManager:
                 "client_cert_path": "--client-cert-path",
                 "client_key_path": "--client-key-path",
                 "ca_cert_paths": "--ca-cert-paths",
+                "rate_limit_rule": "--rate-limit-rule",
+                "rate_limit_tenant_header": "--rate-limit-tenant-header",
             }
             for k, v in extra.items():
                 if v is None:
@@ -116,10 +118,16 @@ class RouterManager:
                     if v:
                         cmd.append(flag)
                 elif isinstance(v, list):
-                    # Handle list arguments (e.g., ca_cert_paths)
-                    if v:  # Only add if list is not empty
-                        cmd.append(flag)
-                        cmd.extend([str(item) for item in v])
+                    # Handle list arguments
+                    # Some flags like --rate-limit-rule (action="append") require the flag to be repeated
+                    # Others like --ca-cert-paths (nargs="*") take multiple values after one flag
+                    if v:
+                        if k == "rate_limit_rule":
+                            for item in v:
+                                cmd.extend([flag, str(item)])
+                        else:
+                            cmd.append(flag)
+                            cmd.extend([str(item) for item in v])
                 else:
                     cmd.extend([flag, str(v)])
 
