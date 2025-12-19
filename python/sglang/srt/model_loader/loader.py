@@ -73,8 +73,9 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.blockwise_fp8_utils import scaled_fp8_blockwise
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import scaled_fp8_blockwise
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -1239,12 +1240,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
-            from sglang.srt.layers.quantization.blockwise_fp8_utils import (
-                scaled_fp8_blockwise,
-            )
-            from sglang.srt.layers.quantization.fp8_kernel import (
-                per_token_group_quant_fp8,
-            )
 
             # Default block size for blockwise quantization
             default_block_size = [128, 128]
