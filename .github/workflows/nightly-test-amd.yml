@@ -206,7 +206,7 @@ jobs:
       - name: Nightly Perf Test (8-GPU GROK1)
         timeout-minutes: 240
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test python3 nightly/test_grok1_perf.py
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_INT4_WEIGHT=1 python3 nightly/test_grok1_perf.py
 
   # 8-GPU Performance Tests (TP=8) - GROK2 performance benchmarks
   nightly-perf-8-gpu-grok2:
@@ -229,7 +229,7 @@ jobs:
       - name: Nightly Perf Test (8-GPU GROK2)
         timeout-minutes: 240
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test python3 nightly/test_grok2_perf.py
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_INT4_WEIGHT=0 -e RCCL_MSCCL_ENABLE=0 python3 nightly/test_grok2_perf.py
 
   # 8-GPU Performance Tests (TP=8) - DeepSeek-V3 performance benchmarks
   nightly-perf-8-gpu-deepseek-v3:
@@ -252,7 +252,7 @@ jobs:
       - name: Nightly Perf Test (8-GPU DeepSeek-V3)
         timeout-minutes: 240
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test python3 nightly/test_deepseek_v3_perf.py
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test -e SGLANG_USE_ROCM700A=1 python3 nightly/test_deepseek_v3_perf.py
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
