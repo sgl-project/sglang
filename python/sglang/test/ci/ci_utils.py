@@ -29,6 +29,7 @@ RETRIABLE_PATTERNS = [
     r"score",
     r"latency",
     r"throughput",
+    r"timeout",
 ]
 
 # Patterns that indicate non-retriable failures (real code errors)
