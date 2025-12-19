@@ -558,11 +558,12 @@ class LogitsProcessor(nn.Module):
                         if sample_indices is not None
                         else pruned_states
                     )
-                    hidden_states_to_store_before_norm = (
-                        pruned_states_before_norm[sample_indices]
-                        if sample_indices is not None
-                        else pruned_states_before_norm
-                    )
+                    if hidden_states_before_norm is not None:
+                        hidden_states_to_store_before_norm = (
+                            pruned_states_before_norm[sample_indices]
+                            if sample_indices is not None
+                            else pruned_states_before_norm
+                        )
             else:
                 assert False, "Should never reach"
 
