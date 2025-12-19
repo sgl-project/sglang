@@ -170,7 +170,8 @@ class TestDeepseekV32TBO(CustomTestCase):
             "--enable-dp-attention",
             "--enable-two-batch-overlap",
             "--moe-a2a-backend",
-            "deepep" "disable-cuda-graph",  # disable cuda graph to avoid OOM
+            "deepep",
+            "--cuda-graph-max-bs 32",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -197,7 +198,7 @@ class TestDeepseekV32TBO(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-self.assertGreater(metrics["accuracy"], 0.92)
+        self.assertGreater(metrics["accuracy"], 0.92)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
