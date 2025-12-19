@@ -453,7 +453,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     int(prefill_parallel_info["prefill_attn_tp_size"]),
                     int(prefill_parallel_info["prefill_dp_size"]),
                     int(prefill_parallel_info["prefill_pp_size"]),
-                    prefill_parallel_info.get("prefill_page_size"),
+                    int(prefill_parallel_info["prefill_page_size"]),
                 )
             else:
                 logger.error(
@@ -547,7 +547,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         system_dp_rank = data["system_dp_rank"]
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
-        page_size = data.get("page_size")  # optional for backward compatibility
+        page_size = int(data["page_size"])
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
