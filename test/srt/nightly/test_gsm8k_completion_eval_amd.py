@@ -8,29 +8,17 @@ This complements test_gsm8k_eval_amd.py which uses mgsm_en (chat completions)
 for instruction-tuned models.
 
 Base models tested here:
-- GPT-OSS series (lmsys/gpt-oss-*-bf16)
-- GROK series (lmzheng/grok-1, xai-org/grok-2, amd/grok-1-W4A8KV8)
+- GPT-OSS series (lmsys/gpt-oss-20b-bf16, lmsys/gpt-oss-120b-bf16)
+- GROK series (lmzheng/grok-1, amd/grok-1-W4A8KV8, xai-org/grok-2)
+- DeepSeek series (deepseek-ai/DeepSeek-V3-0324, deepseek-ai/DeepSeek-R1-0528)
 
 Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
-- "gpt-oss" (default): GPT-OSS models only (nightly-amd-8-gpu)
+- "gpt-oss" (default): GPT-OSS models only (nightly-amd-8-gpu-gpt-oss)
 - "grok": All GROK models (nightly-amd-8-gpu-grok)
 - "deepseek-v3-dp": DeepSeek-V3 with DP attention (nightly-amd-8-gpu-deepseek-v3-dp)
 - "deepseek-v3-tc": DeepSeek-V3 with torch compile (nightly-amd-8-gpu-deepseek-v3-tc)
 - "deepseek-r1": DeepSeek-R1 reasoning model (nightly-amd-8-gpu-deepseek-r1)
 - "all": All models
-
-Reference: benchmark/gsm8k/bench_sglang.py
-
-Runtime Reference (MI325X, 8xGPU):
-| Model                       | Server Startup | Benchmark | Total   |
-|-----------------------------|----------------|-----------|---------|
-| lmsys/gpt-oss-20b-bf16      | ~60s           | ~14s      | ~74s    |
-| lmsys/gpt-oss-120b-bf16     | ~103s          | ~19s      | ~122s   |
-| lmzheng/grok-1              | ~12min         | ~19s      | ~12.5min|
-| amd/grok-1-W4A8KV8          | ~12min         | ~14s      | ~12.5min|
-| xai-org/grok-2              | ~14min         | ~19s      | ~14.5min|
-| deepseek-ai/DeepSeek-V3-0324| TBD            | TBD       | TBD     |
-| deepseek-ai/DeepSeek-R1-0528| TBD            | TBD       | TBD     |
 """
 
 import ast
