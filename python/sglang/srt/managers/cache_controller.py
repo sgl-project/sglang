@@ -668,6 +668,9 @@ class HiCacheController:
         """
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            logger.warning(
+                f"Prefetching rate limited, Perhaps increasing the hicache ratio or size can optimize it."
+            )
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
