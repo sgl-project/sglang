@@ -54,6 +54,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
+    if server_args.tp_size is not None:
+        extra_args += f" --tp-size {server_args.tp_size}"
+
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 

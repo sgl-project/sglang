@@ -57,7 +57,7 @@ class MooncakeStoreConfig:
             raise RuntimeError(
                 f"Config file path not set. Please set {envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.name}"
             )
-        file_path = envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.value
+        file_path = envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.get()
         try:
             with open(file_path) as fin:
                 config = json.load(fin)
@@ -104,7 +104,7 @@ class MooncakeStoreConfig:
         # then fall back to LOCAL_HOSTNAME if not set.
         # This is for forward compatibility with the legacy LOCAL_HOSTNAME environment variable.
         if envs.MOONCAKE_LOCAL_HOSTNAME.is_set():
-            local_hostname = envs.MOONCAKE_LOCAL_HOSTNAME.value
+            local_hostname = envs.MOONCAKE_LOCAL_HOSTNAME.get()
         else:
             local_hostname = os.getenv(
                 "LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default
@@ -112,15 +112,15 @@ class MooncakeStoreConfig:
 
         return MooncakeStoreConfig(
             local_hostname=local_hostname,
-            metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.value,
+            metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.get(),
             global_segment_size=_parse_global_segment_size(
-                envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.value
+                envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()
             ),
-            protocol=envs.MOONCAKE_PROTOCOL.value,
-            device_name=envs.MOONCAKE_DEVICE.value,
-            master_server_address=envs.MOONCAKE_MASTER.value,
-            master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.value,
-            check_server=envs.MOONCAKE_CHECK_SERVER.value,
+            protocol=envs.MOONCAKE_PROTOCOL.get(),
+            device_name=envs.MOONCAKE_DEVICE.get(),
+            master_server_address=envs.MOONCAKE_MASTER.get(),
+            master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.get(),
+            check_server=envs.MOONCAKE_CHECK_SERVER.get(),
         )
 
     @staticmethod

@@ -243,6 +243,9 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
+        if self.pad_value is not None:
+            return
+
         from sglang.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
@@ -720,6 +723,7 @@ class Req:
         self.dimensions = dimensions
 
         # For diffusion LLM
+        self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -796,14 +800,15 @@ class Req:
         return self.dllm_config is not None
 
     def _init_fill_ids_for_dllm(self):
-        if not self.fill_ids:
-            self.fill_ids = (
+        if not self.dllm_ids:
+            self.dllm_ids = (
                 self.origin_input_ids
                 + [self.dllm_config.mask_id] * self.dllm_config.block_size
             )
         else:
             self.dllm_block_offset += self.dllm_config.block_size
-            self.fill_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+        self.fill_ids = self.dllm_ids
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
@@ -1211,6 +1216,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
 
     @classmethod
     def init_new(
@@ -1819,15 +1827,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     @property
-    def is_v2_eagle(self):
-        # FIXME: finally deprecate is_v2_eagle
+    def is_eagle_v2(self):
+        # FIXME: finally deprecate is_eagle_v2
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.is_v2_eagle:
+        if self.is_eagle_v2:
             # TODO(spec-v2): all v2 spec should go through this path
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
@@ -1907,7 +1915,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_v2_eagle:
+        if self.is_eagle_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
@@ -1980,7 +1988,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_v2_eagle
+        has_been_filtered = v1_spec_info_filtered and not self.is_eagle_v2
 
         if self.spec_info:
             self.spec_info.filter_batch(
@@ -2108,6 +2116,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            return_hidden_states_before_norm=self.return_hidden_states_before_norm,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2236,6 +2245,9 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
 
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
