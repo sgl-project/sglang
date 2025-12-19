@@ -25,10 +25,9 @@ from sglang.srt.utils import (
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
-    gelu_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
-    silu_and_mul_triton,
+    act_and_mul_triton,
     support_tensor_descriptor,
 )
 from .moe_align_block_size import moe_align_block_size
@@ -565,6 +564,7 @@ def fused_experts_impl(
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
         )
+        activation = "silu"
 
         # Activation function with multiplication
         if activation == "silu" and is_gated:
@@ -579,19 +579,14 @@ def fused_experts_impl(
                 if not filter_expert:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:
-                    kwargs = _prepare_activation_kernel_args(
-                        down_moe_use_tma,
-                        curr_topk_ids,
-                        expert_ids,
-                        num_tokens_post_padded,
-                        sorted_token_ids,
-                    )
-                    silu_and_mul_triton(
+                    act_and_mul_triton(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
-                        N,
                         config,
-                        **kwargs,
+                        topk_ids,
+                        expert_ids,
+                        down_moe_use_tma,
+                        activation,
                     )
             else:
                 vllm_ops.silu_and_mul(
@@ -604,19 +599,14 @@ def fused_experts_impl(
                 if not filter_expert:
                     gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:
-                    kwargs = _prepare_activation_kernel_args(
-                        down_moe_use_tma,
-                        curr_topk_ids,
-                        expert_ids,
-                        num_tokens_post_padded,
-                        sorted_token_ids,
-                    )
-                    gelu_and_mul_triton(
+                    act_and_mul_triton(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
-                        N,
                         config,
-                        **kwargs,
+                        topk_ids,
+                        expert_ids,
+                        down_moe_use_tma,
+                        activation,
                     )
             else:
                 vllm_ops.gelu_and_mul(
