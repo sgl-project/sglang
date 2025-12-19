@@ -18,7 +18,7 @@ use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{signal, spawn};
-use tracing::{error, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 
 use crate::{
     app_context::AppContext,
@@ -838,7 +838,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!(
+    debug!(
         "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
@@ -881,7 +881,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         let refresh_interval = Duration::from_secs(600); // 10 minutes
         let _refresh_handle =
             Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
-        info!("Started background refresh for all MCP servers (every 10 minutes)");
+        debug!("Started background refresh for all MCP servers (every 10 minutes)");
     }
 
     let worker_stats = app_context.worker_registry.stats();
@@ -896,14 +896,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let _health_checker = app_context
         .worker_registry
         .start_health_checker(config.router_config.health_check.check_interval_secs);
-    info!(
+    debug!(
         "Started health checker for workers with {}s interval",
         config.router_config.health_check.check_interval_secs
     );
 
     if let Some(ref load_monitor) = app_context.load_monitor {
         load_monitor.start().await;
-        info!("Started LoadMonitor for PowerOfTwo policies");
+        debug!("Started LoadMonitor for PowerOfTwo policies");
     }
 
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
@@ -919,13 +919,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     match processor {
         Some(proc) => {
             spawn(proc.run());
-            info!(
+            debug!(
                 "Started request queue (size: {}, timeout: {}s)",
                 config.router_config.queue_size, config.router_config.queue_timeout_secs
             );
         }
         None => {
-            info!(
+            debug!(
                 "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
                 config.router_config.max_concurrent_requests
             );
