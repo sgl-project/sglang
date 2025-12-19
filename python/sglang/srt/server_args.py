@@ -438,6 +438,10 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
 
+    # For Multi-Layer MTP
+    # FIXME: rename -> enable_multi_layer_mtp
+    enable_mtp: bool = False
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
@@ -1175,6 +1179,16 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
             self.disable_hybrid_swa_memory = True
 
+        elif "MiMoV2FlashForCausalLM" in model_arch:
+            self.swa_full_tokens_ratio = 1.0
+            logger.warning(
+                "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model"
+            )
+            if self.enable_hierarchical_cache:
+                self.disable_hybrid_swa_memory = True
+                logger.warning(
+                    "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
+                )
         elif "Llama4" in model_arch and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
@@ -3403,6 +3417,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+
+        # Speculative decoding (MTP)
+        parser.add_argument(
+            "--enable-mtp",
+            action="store_true",
+            help="Enable multi-layer MTP speculative decoding.",
         )
 
         # Expert parallelism
