@@ -362,8 +362,8 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         num_tokens = hidden_states.shape[:-1].numel()
 
         first_expert_idx = 0
-        last_expert_idx = 128
-        global_num_experts = 128
+        last_expert_idx = layer.num_experts
+        global_num_experts = layer.num_experts
 
         sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
