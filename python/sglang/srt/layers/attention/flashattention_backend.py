@@ -2480,7 +2480,7 @@ def normal_decode_set_metadata(
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
 
 
-# @torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def draft_decode_set_expand_metadata(
     cache_seqlens_int32: torch.Tensor,  # Modifies
     page_table: torch.Tensor, # Modifies
