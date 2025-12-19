@@ -63,6 +63,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
@@ -173,10 +176,9 @@ def _launch_subprocesses(
         scheduler_infos.append(data)
 
     # Get back some info from scheduler to tokenizer_manager
-    scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
-    return tokenizer_manager, template_manager, scheduler_info, port_args
+    return tokenizer_manager, template_manager, scheduler_infos, port_args
 
 
 class Engine(EngineBase):
@@ -221,13 +223,18 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info, port_args = (
+        tokenizer_manager, template_manager, scheduler_infos, port_args = (
             self.launch_subprocesses_func(server_args=server_args)
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-        self.scheduler_info = scheduler_info
+        self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
+        self.remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)

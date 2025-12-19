@@ -68,6 +68,7 @@ from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionMetrics,
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
@@ -98,7 +99,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
@@ -136,9 +137,10 @@ from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
-from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    RemoteInstanceWeightLoaderBackend,
+    register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -158,6 +160,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    get_local_ip_auto,
     init_custom_process_group,
     is_cuda,
     is_float4_e2m1fn_x2,
@@ -266,6 +269,13 @@ class RankZeroFilter(logging.Filter):
         return True
 
 
+@dataclass
+class ModelRunnerOutput:
+    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
+    can_run_graph: bool
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+
+
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
@@ -286,6 +296,7 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        draft_model_idx: Optional[int] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -314,10 +325,17 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
+        self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
+        self.kv_cache_memory = 0
+        self.draft_model_idx = draft_model_idx
+
+        self.remote_instance_transfer_engine = None
+        self.remote_instance_transfer_engine_session_id = ""
+        self.remote_instance_transfer_engine_weight_info = None
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -393,6 +411,9 @@ class ModelRunner:
             enable=self.server_args.enable_memory_saver
         )
 
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+            self.remote_instance_init_transfer_engine()
+
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(
@@ -430,8 +451,17 @@ class ModelRunner:
             else None
         )
         # Load the model
-        self.sampler = Sampler()
+        self.sampler = create_sampler()
         self.load_model()
+
+        if (
+            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            and self.remote_instance_transfer_engine is not None
+            and self.remote_instance_transfer_engine_weight_info is None
+        ):
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                self.model, self.remote_instance_transfer_engine
+            )
 
         # Check if the model is using hybrid SWA
         if (
@@ -455,6 +485,8 @@ class ModelRunner:
                 self.model_config.num_attention_layers,
             )
         )
+        if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
+            model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
@@ -466,6 +498,23 @@ class ModelRunner:
                 and (self.num_effective_layers == model_num_layers)
             )
         ), "PP is not compatible with MTP models."
+
+        # Consider PP, so use start_layer and end_layer.
+        full_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if hasattr(self.model_config, "full_attention_layer_ids")
+            and layer_idx in self.model_config.full_attention_layer_ids
+        ]
+        swa_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if hasattr(self.model_config, "swa_attention_layer_ids")
+            and layer_idx in self.model_config.swa_attention_layer_ids
+        ]
+        # Update back to model_config.
+        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
+        self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -546,6 +595,23 @@ class ModelRunner:
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
+
+    def remote_instance_init_transfer_engine(self):
+        try:
+            from mooncake.engine import TransferEngine
+        except ImportError as e:
+            logger.warning(
+                "Please install mooncake for using remote instance transfer engine: pip install mooncake"
+            )
+            return
+        self.remote_instance_transfer_engine = TransferEngine()
+        local_ip = get_local_ip_auto()
+        self.remote_instance_transfer_engine.initialize(
+            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
+        )
+        self.remote_instance_transfer_engine_session_id = (
+            f"{local_ip}:{self.remote_instance_transfer_engine.get_rpc_port()}"
+        )
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -764,15 +830,22 @@ class ModelRunner:
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
+            remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
+            draft_model_idx=self.draft_model_idx,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
             )
 
-        if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
+        if (
+            self.server_args.load_format == LoadFormat.REMOTE_INSTANCE
+            and self.server_args.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.NCCL
+        ):
             if self.tp_rank == 0:
                 instance_ip = socket.gethostbyname(socket.gethostname())
                 t = threading.Thread(
@@ -797,11 +870,18 @@ class ModelRunner:
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
-            self.model = get_model(
-                model_config=self.model_config,
+            self.loader = get_model_loader(
                 load_config=self.load_config,
+                model_config=self.model_config,
+            )
+            self.model = self.loader.load_model(
+                model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
+                self.remote_instance_transfer_engine_weight_info = (
+                    self.loader.remote_instance_transfer_engine_weight_info
+                )
         monkey_patch_vllm_parallel_state(reverse=True)
 
         get_offloader().post_init()
@@ -1375,6 +1455,8 @@ class ModelRunner:
             )
         elif config := self.mambaish_config:
             num_layers = len(config.full_attention_layer_ids)
+        elif self.model_config.full_attention_layer_ids:
+            num_layers = len(self.model_config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
@@ -1412,9 +1494,8 @@ class ModelRunner:
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
                 * num_layers
-                * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
 
@@ -1435,12 +1516,24 @@ class ModelRunner:
                     // scale_block_size
                 )
 
+            if self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
+                cell_size += (
+                    self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+                    * (
+                        self.model_config.hf_text_config.swa_head_dim
+                        + self.model_config.hf_text_config.swa_v_head_dim
+                    )
+                    * len(self.model_config.swa_attention_layer_ids)
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
-        max_num_token = int(rest_memory * (1 << 30) // cell_size)
+        self.kv_cache_memory = int(rest_memory * (1 << 30))
+        max_num_token = int(self.kv_cache_memory // cell_size)
+        logger.info(f"The available memory for KV cache is {rest_memory:.2f} GB.")
         return max_num_token
 
     def handle_max_mamba_cache(self, total_rest_memory):
@@ -1523,6 +1616,14 @@ class ModelRunner:
         return None
 
     @property
+    def max_token_pool_size(self):
+        """Return the max token pool size considering hybrid swa settings."""
+        if self.is_hybrid_swa:
+            return min(self.swa_max_total_num_tokens, self.max_total_num_tokens)
+        else:
+            return self.max_total_num_tokens
+
+    @property
     def kimi_linear_config(self):
         config = self.model_config.hf_config
         if isinstance(config, KimiLinearConfig):
@@ -1534,6 +1635,7 @@ class ModelRunner:
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def set_num_token_hybrid(self):
+        page_size = self.server_args.page_size
         if (
             "Llama4ForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -1551,44 +1653,33 @@ class ModelRunner:
                 4 * self.max_total_num_tokens
                 - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
             )
-            self.swa_max_total_num_tokens = int(
-                self.swa_max_total_num_tokens
-                // self.server_args.page_size
-                * self.server_args.page_size
+            self.swa_max_total_num_tokens = (
+                self.swa_max_total_num_tokens // page_size * page_size
             )
-            self.full_max_total_num_tokens = int(
-                self.full_max_total_num_tokens
-                // self.server_args.page_size
-                * self.server_args.page_size
+            self.full_max_total_num_tokens = (
+                self.full_max_total_num_tokens // page_size * page_size
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+        elif "MiMoV2MTP" in self.model_config.hf_config.architectures:
+            assert self.is_draft_worker
+            # MiMoV2MTP uses SWA, so set full KV cache to 0
+            self.full_max_total_num_tokens = 0
+            self.swa_max_total_num_tokens = (
+                self.max_total_num_tokens // page_size * page_size
+            )
+            self.max_total_num_tokens = self.swa_max_total_num_tokens
+        elif self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
+            self.full_max_total_num_tokens = (
+                self.max_total_num_tokens // page_size * page_size
+            )
+            self.swa_max_total_num_tokens = (
+                self.max_total_num_tokens // page_size * page_size
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
         else:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
-            full_attention_layer_ids = []
-            swa_attention_layer_ids = []
-
-            try:
-                layers = self.model.model.layers
-            except:
-                try:
-                    layers = self.model.language_model.model.layers
-                except:
-                    try:
-                        layers = self.model.language_model.layers
-                    except:
-                        self.is_hybrid_swa = False
-                        return
-
-            for layer in layers:
-                if (
-                    layer.self_attn.attn.sliding_window_size is None
-                    or layer.self_attn.attn.sliding_window_size == -1
-                ):
-                    full_attention_layer_ids.append(layer.layer_id)
-                else:
-                    swa_attention_layer_ids.append(layer.layer_id)
-            self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
-            self.model_config.full_attention_layer_ids = full_attention_layer_ids
+            full_layers_num = len(self.model_config.full_attention_layer_ids)
+            swa_layers_num = len(self.model_config.swa_attention_layer_ids)
 
             # Algorithm:
             # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
@@ -1597,8 +1688,6 @@ class ModelRunner:
             total_tokens = (
                 self.max_total_num_tokens * self.model_config.num_hidden_layers
             )
-            full_layers_num = len(full_attention_layer_ids)
-            swa_layers_num = len(swa_attention_layer_ids)
             swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
             # Solve the equations:
@@ -1611,9 +1700,9 @@ class ModelRunner:
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
 
-            logger.info(
-                f"Use Sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
-            )
+        logger.info(
+            f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
+        )
 
     def can_run_piecewise_cuda_graph(self):
         if self.server_args.enable_torch_compile:
@@ -1722,10 +1811,9 @@ class ModelRunner:
             else:
                 # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
                 # can be concurrently allocated, so we should give a headroom for it.
-                self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
+                extra_tokens = (
                     # draft
-                    + max_num_reqs
+                    max_num_reqs
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     # verify
@@ -1735,7 +1823,9 @@ class ModelRunner:
                 )
                 # Target worker and draft worker shares the same indices for the
                 # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                self.max_total_num_tokens += extra_tokens
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+
                 self.server_args.max_num_reqs = max_num_reqs
 
         if max_total_tokens is not None:
@@ -1797,6 +1887,7 @@ class ModelRunner:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         cache_params=config.mamba2_cache_params,
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                     )
                 else:
@@ -1931,6 +2022,18 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid_swa:
+                kwargs = {}
+                if self.is_hybrid_swa_compress:
+                    kwargs = {
+                        "swa_head_num": max(
+                            1,
+                            self.model_config.hf_text_config.swa_num_key_value_heads
+                            // get_attention_tp_size(),
+                        ),
+                        "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
+                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
+                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                    }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1943,6 +2046,7 @@ class ModelRunner:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    **kwargs,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}
@@ -2060,6 +2164,14 @@ class ModelRunner:
                     )
         else:
             assert self.is_draft_worker
+            if self.is_hybrid_swa:
+                assert (
+                    self.token_to_kv_pool_allocator.__class__
+                    == SWATokenToKVPoolAllocator
+                )
+                self.token_to_kv_pool.full_to_swa_index_mapping = (
+                    self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                )
 
         logger.info(
             f"Memory pool end. "
@@ -2090,6 +2202,16 @@ class ModelRunner:
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
+        draft_attn_backend = self.server_args.speculative_draft_attention_backend
+        if self.is_draft_worker and draft_attn_backend:
+            logger.warning(
+                f"Overriding draft attention backend to {draft_attn_backend}."
+            )
+            return self._get_attention_backend_from_str(
+                draft_attn_backend,
+                init_new_workspace=init_new_workspace,
+            )
+
         self.prefill_attention_backend_str, self.decode_attention_backend_str = (
             self.server_args.get_attention_backends()
         )
@@ -2170,11 +2292,15 @@ class ModelRunner:
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
-        if not self.server_args.enable_flashinfer_autotune:
+        if self.server_args.disable_flashinfer_autotune:
             return False
 
-        backend_str = self.server_args.attention_backend
-        if backend_str not in ["flashinfer", "trtllm_mla", "trtllm_mha"]:
+        backend_str = self.server_args.moe_runner_backend
+        if backend_str not in [
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_mxfp4",
+        ]:
             return False
 
         major, _ = torch.cuda.get_device_capability()
@@ -2252,6 +2378,7 @@ class ModelRunner:
             encoder_len_fill_value=0,
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
         )
         buffers.num_token_non_padded[...] = num_tokens
 
@@ -2672,13 +2799,13 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+    ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
-        ):
+        ) as recorder_outputs:
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2686,6 +2813,7 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+        output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
@@ -2699,7 +2827,7 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+    ) -> ModelRunnerOutput:
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -2717,7 +2845,7 @@ class ModelRunner:
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ret, can_run_graph
+            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -2729,7 +2857,7 @@ class ModelRunner:
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer
+            and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
@@ -2765,7 +2893,7 @@ class ModelRunner:
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        return ret, can_run_graph
+        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

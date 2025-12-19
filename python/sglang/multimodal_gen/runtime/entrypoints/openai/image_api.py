@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import base64
+import dataclasses
 import os
 import time
 from typing import List, Optional
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import shallow_asdict
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -55,6 +57,10 @@ def _build_sampling_params_from_request(
     image_path: Optional[str] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    guidance_scale: Optional[float] = None,
+    num_inference_steps: Optional[int] = None,
+    enable_teacache: Optional[bool] = None,
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -77,31 +83,17 @@ def _build_sampling_params_from_request(
         output_file_name=f"{request_id}.{ext}",
         seed=seed,
         generator_device=generator_device,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
+        **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
     )
     return sampling_params
 
 
 def _build_req_from_sampling(s: SamplingParams) -> Req:
-    # TODO: refactor this! this is so dangerous because we could forget to add a new field here!
-    return Req(
-        request_id=s.request_id,
-        data_type=s.data_type,
-        prompt=s.prompt,
-        negative_prompt=s.negative_prompt,
-        image_path=s.image_path,
-        height=s.height,
-        width=s.width,
-        fps=1,
-        guidance_scale=s.guidance_scale,
-        num_inference_steps=s.num_inference_steps,
-        num_frames=s.num_frames,
-        seed=s.seed,
-        generator_device=s.generator_device,
-        output_path=s.output_path,
-        output_file_name=s.output_file_name,
-        num_outputs_per_prompt=s.num_outputs_per_prompt,
-        save_output=s.save_output,
-    )
+    req_fields = {f.name for f in dataclasses.fields(Req)}
+    return Req(**{k: v for k, v in shallow_asdict(s).items() if k in req_fields})
 
 
 @router.post("/generations", response_model=ImageResponse)
@@ -118,6 +110,10 @@ async def generations(
         background=request.background,
         seed=request.seed,
         generator_device=request.generator_device,
+        negative_prompt=request.negative_prompt,
+        guidance_scale=request.guidance_scale,
+        num_inference_steps=request.num_inference_steps,
+        enable_teacache=request.enable_teacache,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
@@ -169,6 +165,10 @@ async def edits(
     seed: Optional[int] = Form(1024),
     generator_device: Optional[str] = Form("cuda"),
     user: Optional[str] = Form(None),
+    negative_prompt: Optional[str] = Form(None),
+    guidance_scale: Optional[float] = Form(None),
+    num_inference_steps: Optional[int] = Form(None),
+    enable_teacache: Optional[bool] = Form(False),
 ):
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
@@ -198,6 +198,10 @@ async def edits(
         image_path=input_paths,
         seed=seed,
         generator_device=generator_device,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        enable_teacache=enable_teacache,
     )
     batch = _build_req_from_sampling(sampling)
 
