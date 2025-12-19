@@ -181,14 +181,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
-            size,
-            page_size,
-            dtype,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
         )
 
         self.kv_lora_rank = kv_lora_rank
