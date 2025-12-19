@@ -2264,7 +2264,7 @@ class ServerArgs:
                     "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
                 )
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
-            raise ValueError("--swa_full_tokens_ratio should be in range (0, 1.0].")
+            raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
