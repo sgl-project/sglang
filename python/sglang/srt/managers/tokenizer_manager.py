@@ -41,6 +41,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.lora.lora_config import is_valid_lora_adapter_path
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
@@ -2080,9 +2081,34 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 continue
 
             if lora_path not in self.lora_ref_cache:
+                # Try auto-discovery from filesystem
+                if (
+                    self.server_args.allow_runtime_lora_updating
+                    and self.server_args.lora_cache_dir
+                ):
+                    adapter_path = os.path.normpath(
+                        os.path.join(self.server_args.lora_cache_dir, lora_path)
+                    )
+                    if is_valid_lora_adapter_path(adapter_path):
+                        logger.info(
+                            f"Auto-discovering LoRA adapter '{lora_path}' from {adapter_path}"
+                        )
+                        load_result = await self.load_lora_adapter(
+                            LoadLoRAAdapterReqInput(
+                                lora_name=lora_path,
+                                lora_path=adapter_path,
+                                pinned=False,
+                            )
+                        )
+                        if not load_result.success:
+                            raise ValueError(
+                                f"Failed to auto-load LoRA adapter {lora_path}: {load_result.error_message}"
+                            )
+                        continue
+
                 raise ValueError(
-                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
-                    f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                    f"LoRA adapter '{lora_path}' not found. "
+                    f"Loaded adapters: {list(self.lora_ref_cache.keys())}"
                 )
 
             logger.info(f"Reloading evicted adapter: {lora_path}")
