@@ -399,7 +399,6 @@ class QwenImageTransformerBlock(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         self.zero_cond_t = zero_cond_t
-        print(f"399 {zero_cond_t=}")
 
         # Image processing modules
         self.img_mod = nn.Sequential(
@@ -436,23 +435,18 @@ class QwenImageTransformerBlock(nn.Module):
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
-    def _modulate(self, x, mod_params, modulate_index=False):
-        """Apply modulation to input tensor"""
+    def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-        return fuse_scale_shift_kernel(x, scale, shift), gate.unsqueeze(1)
+        if index is not None:
+            shift_result = shift[index]
+            scale_result = scale[index]
+            gate_result = gate[index]
+        else:
+            shift_result = shift
+            scale_result = scale
+            gate_result = gate[:1].unsqueeze(1)
 
-    # def _modulate(self, x, mod_params, index=None):
-    #     shift, scale, gate = mod_params.chunk(3, dim=-1)
-    #     if index is not None:
-    #         shift_result = shift[index]
-    #         scale_result = scale[index]
-    #         gate_result  = gate[index]
-    #     else:
-    #         shift_result = shift
-    #         scale_result = scale
-    #         gate_result  = gate[:1].unsqueeze(1)
-
-    #     return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
+        return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
 
     def forward(
         self,
@@ -561,7 +555,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.zero_cond_t = zero_cond_t
-        print(f"556 {zero_cond_t=}")
 
         self.rotary_emb = QwenEmbedRope(
             theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
