@@ -92,7 +92,7 @@ class ChatCompletionSampler(SamplerBase):
         system_message: Optional[str] = None,
         temperature: float = 0.0,
         reasoning_effort: Optional[str] = None,
-        max_tokens: int = 2048,
+        max_tokens: Optional[int] = None,
         extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
