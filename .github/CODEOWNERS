@@ -29,7 +29,6 @@
 /python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
-/python/sglang/srt/utils @merrymercy @zhyncs @fzyzcjy @hnyls2002 @CatherineSue @Ying1123 @ispobock @BBuf @mickqian @Fridge003 @JustinTong0323 @ch-wan @zhaochenyang20 @ShangmingCai @xiezhq-hermann @Qiaolin-Yu
 /sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
