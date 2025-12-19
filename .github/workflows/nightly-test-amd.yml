@@ -1,6 +1,9 @@
 name: Nightly Test (AMD)
 
 on:
+  pull_request:
+    branches:
+      - main
   schedule:
     - cron: '0 0 * * *'
   push:
@@ -23,6 +26,9 @@ on:
           - 'nightly-test-8-gpu-deepseek-v3-dp'
           - 'nightly-test-8-gpu-deepseek-v3-tc'
           - 'nightly-test-8-gpu-deepseek-r1'
+          - 'nightly-perf-8-gpu-grok1'
+          - 'nightly-perf-8-gpu-grok2'
+          - 'nightly-perf-8-gpu-deepseek-v3'
   workflow_call:
     inputs:
       ref:
@@ -179,6 +185,75 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-r1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
 
+  # 8-GPU Performance Tests (TP=8) - GROK1 performance benchmarks
+  nightly-perf-8-gpu-grok1:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-grok1')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Perf Test (8-GPU GROK1)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=grok1-perf -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 14400
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+
+  # 8-GPU Performance Tests (TP=8) - GROK2 performance benchmarks
+  nightly-perf-8-gpu-grok2:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-grok2')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Perf Test (8-GPU GROK2)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=grok2-perf -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 14400
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+
+  # 8-GPU Performance Tests (TP=8) - DeepSeek-V3 performance benchmarks
+  nightly-perf-8-gpu-deepseek-v3:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-deepseek-v3')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Perf Test (8-GPU DeepSeek-V3)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-perf -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 14400
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
@@ -188,6 +263,9 @@ jobs:
       - nightly-test-8-gpu-deepseek-v3-dp
       - nightly-test-8-gpu-deepseek-v3-tc
       - nightly-test-8-gpu-deepseek-r1
+      - nightly-perf-8-gpu-grok1
+      - nightly-perf-8-gpu-grok2
+      - nightly-perf-8-gpu-deepseek-v3
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
