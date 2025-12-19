@@ -19,7 +19,7 @@ class ClipImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data_async(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
             image_data=image_data,
