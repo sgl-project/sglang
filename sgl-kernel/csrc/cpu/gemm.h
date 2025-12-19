@@ -96,9 +96,9 @@ void fused_experts_int8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-// moe implementations for fp8 w8a16
-template <typename scalar_t>
-void fused_experts_fp8_kernel_impl(
+// moe implementations for fp8 w8a16 and mxfp4
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+void fused_experts_fp_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
@@ -107,38 +107,10 @@ void fused_experts_fp8_kernel_impl(
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const at::Float8_e4m3fn* __restrict__ packed_w1,
-    const at::Float8_e4m3fn* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
-    int64_t block_size_N,
-    int64_t block_size_K,
-    const float* __restrict__ topk_weights,
-    const int32_t* __restrict__ sorted_ids,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ offsets,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t E,
-    int64_t topk,
-    int64_t num_tokens_post_pad);
-
-// moe implementations for mxfp4
-template <typename scalar_t>
-void fused_experts_fp4_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic0,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ ic2,
-    scalar_t* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
-    float* __restrict__ C_tmp,
-    const scalar_t* __restrict__ input,
-    const uint8_t* __restrict__ packed_w1,
-    const uint8_t* __restrict__ packed_w2,
-    const uint8_t* __restrict__ w1s,
-    const uint8_t* __restrict__ w2s,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
+    const param_t* __restrict__ w1s,
+    const param_t* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
     const float* __restrict__ topk_weights,

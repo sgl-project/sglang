@@ -1125,7 +1125,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
 
       CHECK_MOE_SCALES_FP8(1, 2);
-      fused_experts_fp8_kernel_impl(
+      fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1151,7 +1151,6 @@ at::Tensor fused_experts_cpu(
           topk,
           num_tokens_post_pad);
     } else if (use_mxfp4) {
-      // here we just ignore C_tmp as it is not used
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
@@ -1162,7 +1161,7 @@ at::Tensor fused_experts_cpu(
       auto w2s = w2_scale.value();
       TORCH_CHECK(w1s.numel(), E * 2 * N * K >> 5);
       TORCH_CHECK(w2s.numel(), E * K * N >> 5);
-      fused_experts_fp4_kernel_impl(
+      fused_experts_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
