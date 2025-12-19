@@ -1,3 +1,4 @@
+#include <ATen/cuda/CUDAEvent.h>
 #include <torch/all.h>
 
 #include <tuple>
@@ -70,10 +71,18 @@ void es_fp8_blockwise_scaled_grouped_mm(
   torch::Tensor mm_problem_sizes = torch::empty({num_experts, 3}, options_int32);
   torch::Tensor hm_problem_sizes = torch::empty({num_experts, 3}, options_int32);
 
+  torch::Tensor backup_workspace_0 = torch::empty_like(workspace);
+  torch::Tensor backup_workspace_1 = torch::empty_like(workspace);
+
   const std::string H20_device_type_str("NVIDIA H20");
   bool is_h20_device = std::string(at::cuda::getCurrentDeviceProperties()->name) == H20_device_type_str;
-  at::cuda::CUDAGuard device_guard{(char)a.get_device()};
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device());
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  static auto backup_stream_0 = at::cuda::getStreamFromPool();
+  static auto backup_stream_1 = at::cuda::getStreamFromPool();
+  at::cuda::CUDAEvent start_event;
+  at::cuda::CUDAEvent end_event_0;
+  at::cuda::CUDAEvent end_event_1;
 
   if (output.dtype() == torch::kBFloat16) {
     expert_specialization::es_sm90_fp8_blockwise_scaled_group_mm_pre_compute<cutlass::bfloat16_t>(
@@ -95,7 +104,7 @@ void es_fp8_blockwise_scaled_grouped_mm(
         problem_sizes,
         expert_offsets,
         is_h20_device,
-        stream);
+        stream.stream());
   } else if (output.dtype() == torch::kFloat16) {
     expert_specialization::es_sm90_fp8_blockwise_scaled_group_mm_pre_compute<cutlass::half_t>(
         out_ptrs,
@@ -116,10 +125,14 @@ void es_fp8_blockwise_scaled_grouped_mm(
         problem_sizes,
         expert_offsets,
         is_h20_device,
-        stream);
+        stream.stream());
   } else {
     TORCH_CHECK(false, "Invalid output type (must be float16 or bfloat16)");
   }
+
+  start_event.recordOnce(stream);
+  start_event.block(backup_stream_0);
+  start_event.block(backup_stream_1);
 
   if (output.dtype() == torch::kBFloat16) {
     expert_specialization::es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype<cutlass::bfloat16_t>(
@@ -137,8 +150,12 @@ void es_fp8_blockwise_scaled_grouped_mm(
         mm_problem_sizes,
         hm_problem_sizes,
         workspace,
+        backup_workspace_0,
+        backup_workspace_1,
         is_h20_device,
-        stream);
+        stream.stream(),
+        backup_stream_0.stream(),
+        backup_stream_1.stream());
   } else if (output.dtype() == torch::kFloat16) {
     expert_specialization::es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype<cutlass::half_t>(
         out_ptrs,
@@ -155,11 +172,20 @@ void es_fp8_blockwise_scaled_grouped_mm(
         mm_problem_sizes,
         hm_problem_sizes,
         workspace,
+        backup_workspace_0,
+        backup_workspace_1,
         is_h20_device,
-        stream);
+        stream.stream(),
+        backup_stream_0.stream(),
+        backup_stream_1.stream());
   } else {
     TORCH_CHECK(false, "Invalid output type (must be float16 or bfloat16)");
   }
+
+  end_event_0.recordOnce(backup_stream_0);
+  end_event_1.recordOnce(backup_stream_1);
+  end_event_0.block(stream);
+  end_event_1.block(stream);
 #else
   TORCH_CHECK_NOT_IMPLEMENTED(
       can_implement, "No implemented fp8_blockwise_scaled_grouped_mm for current compute capability: ", sm_version);
