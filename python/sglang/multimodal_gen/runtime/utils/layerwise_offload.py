@@ -20,10 +20,14 @@ class LayerwiseOffloadManager:
         self.pin_cpu_memory = pin_cpu_memory
 
         self.enabled = bool(enabled and torch.cuda.is_available())
-        self.device = torch.device("cuda", torch.cuda.current_device()) if self.enabled else None
+        self.device = (
+            torch.device("cuda", torch.cuda.current_device()) if self.enabled else None
+        )
         self.copy_stream = torch.cuda.Stream() if self.enabled else None
 
-        self._layer_name_re = re.compile(rf"(^|\.){re.escape(module_list_attr)}\.(\d+)(\.|$)")
+        self._layer_name_re = re.compile(
+            rf"(^|\.){re.escape(module_list_attr)}\.(\d+)(\.|$)"
+        )
 
         self._cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
         self._cpu_dtypes: Dict[int, Dict[str, torch.dtype]] = {}

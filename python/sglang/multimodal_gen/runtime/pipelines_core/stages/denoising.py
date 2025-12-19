@@ -715,7 +715,9 @@ class DenoisingStage(PipelineStage):
             offload_mgr.release_all()
 
         if self.transformer_2 is not None:
-            offload_mgr_2 = getattr(self.transformer_2, "_layerwise_offload_manager", None)
+            offload_mgr_2 = getattr(
+                self.transformer_2, "_layerwise_offload_manager", None
+            )
             if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
                 offload_mgr_2.release_all()
 
