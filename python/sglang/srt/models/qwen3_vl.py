@@ -548,6 +548,18 @@ class Qwen3LLMModel(Qwen3Model):
             len(config.vision_config.deepstack_visual_indexes)
         )
 
+    def get_deepstack_embeds(
+        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Get deepstack embeddings for a given layer index, or None if not applicable."""
+        if (
+            input_deepstack_embeds is None
+            or layer_idx not in self.deepstack_embed_to_decoder_layer
+        ):
+            return None
+        sep = self.hidden_size * layer_idx
+        return input_deepstack_embeds[:, sep : sep + self.hidden_size]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -579,19 +591,14 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
-            deepstack_embeds = None
-            if input_deepstack_embeds is not None:
-                prev_layer_idx = layer_idx - 1
-                if prev_layer_idx in self.deepstack_embed_to_decoder_layer:
-                    sep = self.hidden_size * prev_layer_idx
-                    deepstack_embeds = input_deepstack_embeds[
-                        :, sep : sep + self.hidden_size
-                    ]
-
             # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
             # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
             # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
             # The order matters because addition with different tensors is not associative in practice.
+            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+            deepstack_embeds = self.get_deepstack_embeds(
+                layer_idx - 1, input_deepstack_embeds
+            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -599,6 +606,11 @@ class Qwen3LLMModel(Qwen3Model):
                 residual,
                 post_residual_addition=deepstack_embeds,
             )
+
+        # Handle deepstack for the last processed layer if it exists.
+        last_deepstack = self.get_deepstack_embeds(
+            self.end_layer - 1, input_deepstack_embeds
+        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -612,7 +624,9 @@ class Qwen3LLMModel(Qwen3Model):
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states, _ = self.norm(
+                        hidden_states, residual, post_residual_addition=last_deepstack
+                    )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
