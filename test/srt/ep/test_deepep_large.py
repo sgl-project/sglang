@@ -171,7 +171,8 @@ class TestDeepseekV32TBO(CustomTestCase):
             "--enable-two-batch-overlap",
             "--moe-a2a-backend",
             "deepep",
-            "--cuda-graph-max-bs 32",
+            "--cuda-graph-max-bs",
+            "32",
         ]
         cls.process = popen_launch_server(
             cls.model,
