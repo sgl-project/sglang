@@ -55,6 +55,7 @@ class LayerwiseOffloadManager:
         if self.device is not None:
             tensor.data = torch.empty((1,), device=self.device, dtype=tensor.dtype)
 
+    @torch.compiler.disable
     def initialize(self) -> None:
         if not self.enabled:
             return
@@ -78,6 +79,7 @@ class LayerwiseOffloadManager:
         if self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
 
+    @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
         if not self.enabled or self.device is None or self.copy_stream is None:
             return
@@ -110,6 +112,7 @@ class LayerwiseOffloadManager:
 
         self._gpu_layers[layer_idx] = param_names
 
+    @torch.compiler.disable
     def release_layer(self, layer_idx: int) -> None:
         if not self.enabled or self.device is None:
             return
