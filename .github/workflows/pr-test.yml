@@ -92,15 +92,18 @@ jobs:
             echo "b200_runner=4-gpu-b200" >> $GITHUB_OUTPUT
           fi
 
-      - name: Check for enable-retry label
+      - name: Check for enable-retry label or scheduled run
         id: set-retry
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'enable-retry') }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "enable_retry=true" >> $GITHUB_OUTPUT
+            echo "Scheduled run detected, retry logic will be enabled"
+          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'enable-retry') }}" == "true" ]]; then
             echo "enable_retry=true" >> $GITHUB_OUTPUT
             echo "Enable-retry label detected, retry logic will be enabled"
           else
             echo "enable_retry=false" >> $GITHUB_OUTPUT
-            echo "No enable-retry label, retry logic disabled"
+            echo "No enable-retry label or scheduled run, retry logic disabled"
           fi
 
       - name: Show filter results in summary (table)
