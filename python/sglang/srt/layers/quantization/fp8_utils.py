@@ -176,6 +176,10 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
+if is_sm90_supported() and is_flashinfer_available():
+    # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
+    from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
     """
@@ -359,8 +363,9 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     """
     FlashInfer DeepGEMM backend for SM90 (Hopper) with swapAB optimization.
 
-    This backend uses FlashInfer's TensorRT-LLM DeepGEMM JIT compiler which includes
-    the swapAB optimization for small M dimensions (decoding/low batch sizes).
+    Uses flashinfer.gemm.fp8_blockscale_gemm_sm90 which automatically selects
+    the swapAB kernel for small M dimensions (M < 32) for better performance
+    during decoding/low batch size scenarios.
 
     For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
     """
@@ -369,6 +374,7 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
+    # fp8_blockscale_gemm_sm90 requires: N % 64 == 0, K % 128 == 0
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
     if not (shape_supported and dtype_supported):
@@ -383,20 +389,21 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
+    # - input: (M, K) BF16 or FP8
+    # - weight: (N, K) FP8 with weight_scale
+    # - weight_scale: (N, K//128) for per-token or (N//128, K//128) for per-block
+
+    output = fp8_blockscale_gemm_sm90(
         input_2d,
-        block_size[1],
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        weight,
+        input_scale=None,  # BF16 input, internal quantization
+        weight_scale=weight_scale,
+        out_dtype=output_dtype,
     )
 
-    output = w8a8_block_fp8_matmul_deepgemm(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
-    )
     if bias is not None:
         output += bias
-    return output.to(dtype=output_dtype).view(*output_shape)
+    return output.view(*output_shape)
 
 
 def cutlass_w8a8_block_fp8_linear_with_fallback(
