@@ -17,6 +17,7 @@ Usage:
 
 import multiprocessing as mp
 import socket
+
 import torch
 import torch.distributed as dist
 
@@ -40,10 +41,11 @@ def worker(world_size, rank, port):
 
     # Try to import and use deterministic kernel
     try:
+        from torch.distributed import new_group
+
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
-        from torch.distributed import new_group
 
         # Create gloo group for custom AR
         dist.barrier()

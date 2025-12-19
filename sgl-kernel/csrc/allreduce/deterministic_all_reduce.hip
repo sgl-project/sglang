@@ -38,9 +38,9 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
   TORCH_CHECK_EQ(inp.numel(), out.numel());
   TORCH_CHECK(_is_weak_contiguous_det(out));
   TORCH_CHECK(_is_weak_contiguous_det(inp));
-  
+
   auto fa = reinterpret_cast<sglang::CustomAllreduce*>(_fa);
-  
+
   // For ROCm, manually call the 1-stage kernel to ensure deterministic ordering
   // Get rank data pointer
   sglang::RankData* ptrs;
@@ -56,10 +56,10 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
     }
     ptrs = it->second;
   }
-  
+
   int size = out.numel();
   int threads = 512;
-  
+
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
       using T = float;
@@ -166,7 +166,7 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
 void deterministic_all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out) {
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
   auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-  
+
   auto input_size = inp.numel() * inp.element_size();
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());

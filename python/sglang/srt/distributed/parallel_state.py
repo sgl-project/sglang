@@ -380,11 +380,17 @@ class GroupCoordinator:
                 if is_hip():
                     if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
                         if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
-                            logger.info("[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)")
+                            logger.info(
+                                "[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)"
+                            )
                         else:
-                            logger.info("[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)")
+                            logger.info(
+                                "[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)"
+                            )
                     elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
-                        logger.info("[AR] All-reduce: 1-stage kernel (deterministic inference enabled)")
+                        logger.info(
+                            "[AR] All-reduce: 1-stage kernel (deterministic inference enabled)"
+                        )
                     else:
                         logger.info("[AR] All-reduce: default")
             except Exception as e:
@@ -586,7 +592,9 @@ class GroupCoordinator:
                 inp_size = input_.numel() * input_.element_size()
                 # Try unregistered mode first (faster for smaller tensors)
                 if inp_size < self.ca_comm.max_size:
-                    return self.ca_comm.deterministic_all_reduce(input_, registered=False)
+                    return self.ca_comm.deterministic_all_reduce(
+                        input_, registered=False
+                    )
                 # Use registered mode for larger tensors
                 self.ca_comm.register_buffer(input_)
                 return self.ca_comm.deterministic_all_reduce(input_, registered=True)

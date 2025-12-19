@@ -429,7 +429,7 @@ class CustomAllreduce:
 
 def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
-    
+
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
     """
@@ -438,15 +438,13 @@ def dispatch_custom_allreduce():
         use_1stage = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
     else:
         use_1stage = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-    
+
     # On AMD with 1-stage AR, use sglang's CustomAllreduce
     # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
     if is_hip() and use_1stage:
-        logger.info(
-            "[AR] Using sglang CustomAllreduce (1-stage kernel)"
-        )
+        logger.info("[AR] Using sglang CustomAllreduce (1-stage kernel)")
         return CustomAllreduce
-    
+
     if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (

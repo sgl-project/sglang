@@ -90,7 +90,9 @@ elif _is_hip:
     ) -> None:
         _custom_ar.all_reduce_unreg(fa, inp, reg_buffer, out)
 
-    def deterministic_all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
+    def deterministic_all_reduce_reg(
+        fa: int, inp: torch.Tensor, out: torch.Tensor
+    ) -> None:
         _custom_ar.deterministic_all_reduce_reg(fa, inp, out)
 
     def deterministic_all_reduce_unreg(
