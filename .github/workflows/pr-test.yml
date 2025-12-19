@@ -27,7 +27,6 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
-  SGLANG_CI_ENABLE_RETRY: true
 
 jobs:
   # =============================================== check changes ====================================================
@@ -39,6 +38,7 @@ jobs:
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }}
       max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
+      enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -92,6 +92,17 @@ jobs:
             echo "b200_runner=4-gpu-b200" >> $GITHUB_OUTPUT
           fi
 
+      - name: Check for enable-retry label
+        id: set-retry
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'enable-retry') }}" == "true" ]]; then
+            echo "enable_retry=true" >> $GITHUB_OUTPUT
+            echo "Enable-retry label detected, retry logic will be enabled"
+          else
+            echo "enable_retry=false" >> $GITHUB_OUTPUT
+            echo "No enable-retry label, retry logic disabled"
+          fi
+
       - name: Show filter results in summary (table)
         run: |
           {
@@ -104,6 +115,7 @@ jobs:
             echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
             echo "| max_parallel   | ${{ steps.set-parallel.outputs.max_parallel }} |"
             echo "| b200_runner    | ${{ steps.set-runner.outputs.b200_runner }} |"
+            echo "| enable_retry   | ${{ steps.set-retry.outputs.enable_retry }} |"
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== PR Gate ====================================================
@@ -603,7 +615,11 @@ jobs:
           timeout-minutes: 30
           run: |
             cd test/srt
-            python3 run_suite.py --suite quantization_test --enable-retry
+            RETRY_FLAG=""
+            if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+              RETRY_FLAG="--enable-retry"
+            fi
+            python3 run_suite.py --suite quantization_test $RETRY_FLAG
 
   unit-test-backend-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1]
@@ -645,7 +661,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15 --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 15 $RETRY_FLAG
 
 
   stage-b-test-4-gpu-b200:
@@ -728,7 +748,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-2-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG
 
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -769,7 +793,11 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG
 
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -816,7 +844,11 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG
 
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -858,7 +890,11 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, call-gate, stage-a-test-1]
@@ -1152,7 +1188,7 @@ jobs:
           cd test/srt
           python3 test_eval_accuracy_large.py
         env:
-          SGLANG_CI_ENABLE_RETRY: ${{ env.SGLANG_CI_ENABLE_RETRY }}
+          SGLANG_CI_ENABLE_RETRY: ${{ needs.check-changes.outputs.enable_retry }}
 
   accuracy-test-2-gpu:
     needs: [check-changes, call-gate, accuracy-test-1-gpu]
@@ -1194,7 +1230,7 @@ jobs:
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
         env:
-          SGLANG_CI_ENABLE_RETRY: ${{ env.SGLANG_CI_ENABLE_RETRY }}
+          SGLANG_CI_ENABLE_RETRY: ${{ needs.check-changes.outputs.enable_retry }}
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -1231,7 +1267,11 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-deepep --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-4-gpu-deepep $RETRY_FLAG
 
   unit-test-deepep-8-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -1268,7 +1308,11 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
@@ -1310,7 +1354,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
@@ -1349,7 +1397,11 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600 --enable-retry
+          RETRY_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
+            RETRY_FLAG="--enable-retry"
+          fi
+          python3 run_suite.py --suite per-commit-4-gpu-gb200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600 $RETRY_FLAG
 
   pr-test-finish:
     needs:
