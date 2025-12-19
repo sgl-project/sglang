@@ -297,13 +297,18 @@ class InputValidationStage(PipelineStage):
 
         # Validate height and width
         def check_size(value: int, name: str):
-            if value % (8 * server_args.num_gpus) != 0:
+            if value % server_args.num_gpus != 0:
                 raise ValueError(
-                    f"{name} must be divisible by (8 x num_gpus) but {value} % (8 * {server_args.num_gpus}) != 0."
+                    f"{name} must be divisible by num_gpus but {value} % {server_args.num_gpus} != 0."
                 )
 
-        check_size(batch.height, "Height")
-        check_size(batch.width, "Width")
+        temporal_compression_ratio = (
+            self.server_args.pipeline_config.vae_config.temporal_compression_ratio
+        )
+        spatial_seq_len = (batch.height * batch.width) // (
+            temporal_compression_ratio * temporal_compression_ratio
+        )
+        check_size(spatial_seq_len, "spatial_seq_len")
         result.add_check("seeds", batch.seeds, V.list_not_empty)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         return result
