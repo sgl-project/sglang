@@ -292,13 +292,8 @@ class Scheduler(
             )
         )
 
-        # Init model config
-        self.model_config = ModelConfig.from_server_args(server_args)
-        self.dllm_config = (  # For diffusion LLM
-            DllmConfig.from_server_args(server_args)
-            if server_args.dllm_algorithm is not None
-            else None
-        )
+        # Init model configs
+        self.init_model_config()
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -306,7 +301,7 @@ class Scheduler(
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
 
-        # Init pdmux context
+        # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
 
@@ -316,10 +311,10 @@ class Scheduler(
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
 
-        # Launch a tensor parallel worker
+        # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
-        # Init cache using the existing memory pool
+        # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
         # Init running status
@@ -340,10 +335,10 @@ class Scheduler(
         # Init profiler
         self.init_profiler()
 
-        # Init disaggregation
+        # Init prefill-decodedisaggregation
         self.init_disaggregation()
 
-        # Init overlap
+        # Init overlap schedule
         self.init_overlap()
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
@@ -351,6 +346,14 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+    def init_model_config(self):
+        self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.dllm_config = (  # For diffusion LLM
+            DllmConfig.from_server_args(self.server_args)
+            if self.server_args.dllm_algorithm is not None
+            else None
+        )
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -491,7 +494,7 @@ class Scheduler(
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
                     server_args=self.server_args,
-                    nccl_port=self.port_args.nccl_port,
+                    nccl_port=self.nccl_port,
                     target_worker=self.tp_worker,
                     dp_rank=self.dp_rank,
                 )
@@ -503,7 +506,7 @@ class Scheduler(
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
                     server_args=self.server_args,
-                    nccl_port=self.port_args.nccl_port,
+                    nccl_port=self.nccl_port,
                     target_worker=self.tp_worker,
                     dp_rank=self.dp_rank,
                 )
