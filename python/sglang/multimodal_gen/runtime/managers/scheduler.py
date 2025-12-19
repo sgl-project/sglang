@@ -73,7 +73,10 @@ class Scheduler:
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
+            List[Req]: self._handle_generation,
         }
+
+        self.waiting_queue: list[Req] = []
 
     def _handle_set_lora(self, reqs: List[Any]):
         # TODO: return set status
@@ -100,6 +103,14 @@ class Scheduler:
         """
         if self.receiver is not None:
             self.receiver.send_pyobj(output_batch)
+
+    def get_next_batch_to_run(self) -> list[Req] | None:
+        """pull a req from waiting_queue"""
+
+        # pop the first (earliest)
+        req = self.waiting_queue.pop()
+
+        return [req]
 
     def recv_reqs(self) -> List[Any]:
         """
@@ -154,7 +165,7 @@ class Scheduler:
         Handles abortion
         """
 
-        logger.info(
+        logger.debug(
             f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
         )
 
@@ -163,6 +174,8 @@ class Scheduler:
             # 1: receive requests
             try:
                 reqs = self.recv_reqs()
+                # after processing input reqs
+                self.waiting_queue += reqs
             except Exception as e:
                 logger.error(
                     f"Error receiving requests in scheduler event loop: {e}",
@@ -172,16 +185,17 @@ class Scheduler:
 
             # 2: execute, make sure a reply is always sent
             try:
-                first_req = reqs[0] if reqs else None
+                reqs = self.get_next_batch_to_run()
 
-                handler = self.request_handlers.get(type(first_req))
-                if handler:
-                    output_batch = handler(reqs)
-                else:
-                    output_batch = {
-                        "status": "error",
-                        "message": f"Unknown request type: {type(first_req)}",
-                    }
+                if reqs:
+                    handler = self.request_handlers.get(type(reqs[0]))
+                    if handler:
+                        output_batch = handler(reqs)
+                    else:
+                        output_batch = {
+                            "status": "error",
+                            "message": f"Unknown request type: {type(first_req)}",
+                        }
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",

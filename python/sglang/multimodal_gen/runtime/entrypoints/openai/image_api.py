@@ -55,7 +55,7 @@ def _build_sampling_params_from_request(
     size: Optional[str],
     output_format: Optional[str],
     background: Optional[str],
-    image_path: Optional[str] = None,
+    image_path: Optional[list[str]] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
     negative_prompt: Optional[str] = None,
@@ -120,6 +120,7 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+
     # Run synchronously for images and save to disk
     save_file_path = await process_generation_batch(scheduler_client, batch)
 

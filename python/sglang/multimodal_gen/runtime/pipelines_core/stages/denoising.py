@@ -527,6 +527,7 @@ class DenoisingStage(PipelineStage):
         """
         pipeline = self.pipeline() if self.pipeline else None
         if not server_args.model_loaded["transformer"]:
+            assert torch.backends.mps.is_available()
             loader = TransformerLoader()
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
@@ -544,6 +545,8 @@ class DenoisingStage(PipelineStage):
             server_args.model_loaded["transformer"] = True
         else:
             self._maybe_enable_cache_dit(batch.num_inference_steps)
+
+        assert self.transformer is not None
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
