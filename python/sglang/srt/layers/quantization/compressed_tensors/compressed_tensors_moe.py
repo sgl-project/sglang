@@ -874,8 +874,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
             # It is important to use resize_() here since it ensures
             # the same buffer is reused
-            getattr(layer, name).resize_(new_t.shape)
-            getattr(layer, name).copy_(new_t)
+            target_attr.resize_(new_t.shape)
+            target_attr.copy_(new_t)
             del new_t
 
         num_experts = layer.w13_weight_g_idx.shape[0]
@@ -931,7 +931,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_tensor(layer, "w13_weight_packed", marlin_w13_qweight)
+        replace_tensor("w13_weight_packed", marlin_w13_qweight)
         marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
@@ -939,7 +939,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_tensor(layer, "w2_weight_packed", marlin_w2_qweight)
+        replace_tensor("w2_weight_packed", marlin_w2_qweight)
         # Repack scales
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
@@ -947,7 +947,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_scale.shape[2],
             self.group_size,
         )
-        replace_tensor(layer, "w13_weight_scale", marlin_w13_scales)
+        replace_tensor("w13_weight_scale", marlin_w13_scales)
 
         marlin_w2_scales = marlin_moe_permute_scales(
             layer.w2_weight_scale,
@@ -956,7 +956,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale.shape[2],
             self.group_size,
         )
-        replace_tensor(layer, "w2_weight_scale", marlin_w2_scales)
+        replace_tensor("w2_weight_scale", marlin_w2_scales)
 
         layer.is_marlin_converted = True
 
