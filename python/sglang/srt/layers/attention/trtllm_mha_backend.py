@@ -19,7 +19,10 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
-from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.attention.utils import (
+    canonicalize_stride,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
@@ -56,6 +59,18 @@ class TRTLLMMHAMetadata:
     cu_seqlens_k: torch.Tensor = None
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+
+    # The following fields are used for Flashinfer KV update
+    # kv_indices: page indices for all requests
+    kv_indices: torch.Tensor = None
+    # kv_indptr: cumulative page count per request
+    kv_indptr: torch.Tensor = None
+    # batch_indices: which request each token belongs to
+    batch_indices: torch.Tensor = None
+    # positions: position of each token within its sequence
+    positions: torch.Tensor = None
+    # kv_last_page_len: number of valid entries in last page per request
+    kv_last_page_len: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -144,6 +159,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
         }
 
+        if self.support_rope_fusion():
+            self.decode_cuda_graph_metadata["kv_indices"] = torch.zeros(
+                max_bs * max_num_pages, dtype=torch.int32, device=self.device
+            )
+
         if (
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
@@ -207,6 +227,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
             }
+
+            if self.support_rope_fusion():
+                self.target_verify_metadata["kv_indices"] = torch.zeros(
+                    max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                )
+                self.draft_extend_metadata["kv_indices"] = torch.zeros(
+                    max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -319,6 +347,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
 
             self.draft_extend_metadata[bs] = metadata
+
+        if self.support_rope_fusion():
+            metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
+            self._init_forward_metadata_for_rope_fusion(metadata, bs, num_tokens)
+
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
@@ -422,6 +455,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.draft_extend_metadata["strided_indices"][:max_seq_pages],
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+
+        if self.support_rope_fusion():
+            # Compute total number of tokens
+            if forward_mode.is_decode_or_idle():
+                if spec_info is not None:
+                    total_num_tokens = bs * spec_info.num_draft_tokens
+                else:
+                    total_num_tokens = bs
+            elif forward_mode.is_target_verify():
+                total_num_tokens = bs * self.speculative_num_draft_tokens
+            else:  # draft_extend
+                total_num_tokens = metadata.cu_seqlens_q[-1].item()
+
+            metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
+            self._init_forward_metadata_for_rope_fusion(
+                metadata, bs, total_num_tokens, update_inplace=True
+            )
+
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -495,7 +546,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -532,7 +582,111 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
 
+        if self.support_rope_fusion():
+            # Compute total number of tokens
+            if forward_batch.forward_mode.is_decode_or_idle():
+                if forward_batch.spec_info is not None:
+                    total_num_tokens = (
+                        batch_size * forward_batch.spec_info.num_draft_tokens
+                    )
+                else:
+                    total_num_tokens = batch_size
+            elif forward_batch.forward_mode.is_target_verify():
+                total_num_tokens = batch_size * self.speculative_num_draft_tokens
+            else:
+                total_num_tokens = forward_batch.extend_num_tokens
+
+            self._init_forward_metadata_for_rope_fusion(
+                metadata, batch_size, total_num_tokens
+            )
+
         self.forward_metadata = metadata
+
+    def _init_forward_metadata_for_rope_fusion(
+        self,
+        metadata: TRTLLMMHAMetadata,
+        batch_size: int,
+        total_num_tokens: int,
+        update_inplace: bool = False,
+    ):
+        """
+        Initialize the following metadata for RoPE + FP8 quantization + KV cache update kernel.
+        - kv_indptr: cumulative page count per request
+        - batch_indices: which request each token belongs to
+        - positions: position of each token within its sequence
+        - kv_last_page_len: number of valid entries in last page per request
+        - kv_indices: page indices for all requests
+        """
+
+        # Compute number of pages per request
+        num_pages_per_req = (
+            metadata.cache_seqlens_int32 + self.page_size - 1
+        ) // self.page_size
+
+        # kv_indptr
+        if update_inplace:
+            metadata.kv_indptr[1:].copy_(
+                torch.cumsum(num_pages_per_req, dim=0, dtype=torch.int32)
+            )
+        else:
+            metadata.kv_indptr = torch.nn.functional.pad(
+                torch.cumsum(num_pages_per_req, dim=0, dtype=torch.int32), (1, 0)
+            )
+
+        # batch_indices and positions
+        if update_inplace:
+            flashinfer.page.get_batch_indices_positions(
+                metadata.cu_seqlens_q,
+                metadata.cache_seqlens_int32,
+                total_num_tokens,
+                metadata.batch_indices,
+                metadata.positions,
+            )
+        else:
+            metadata.batch_indices, metadata.positions = (
+                flashinfer.page.get_batch_indices_positions(
+                    metadata.cu_seqlens_q,
+                    metadata.cache_seqlens_int32,
+                    total_num_tokens,
+                )
+            )
+
+        # kv_last_page_len
+        if update_inplace:
+            metadata.kv_last_page_len.copy_(
+                metadata.cache_seqlens_int32 - (num_pages_per_req - 1) * self.page_size
+            )
+        else:
+            metadata.kv_last_page_len = (
+                metadata.cache_seqlens_int32 - (num_pages_per_req - 1) * self.page_size
+            )
+
+        # kv_indices
+        device = metadata.kv_indptr.device
+        if metadata.kv_indices is not None:
+            # decode
+            assert (
+                metadata.kv_indices.size(0) >= metadata.kv_indptr[-1]
+            ), f"kv_indices.size(0)={metadata.kv_indices.size(0)} < kv_indptr[-1]={metadata.kv_indptr[-1]}"
+            metadata.kv_indices = metadata.kv_indices[: metadata.kv_indptr[-1]]
+        else:
+            # extend
+            metadata.kv_indices = torch.zeros(
+                metadata.kv_indptr[-1], dtype=torch.int32, device=device
+            )
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            metadata.page_table,
+            torch.arange(batch_size, dtype=torch.int32, device=device),
+            num_pages_per_req,
+            metadata.kv_indptr,
+            None,
+            metadata.kv_indices,
+            metadata.page_table.stride(0),
+        )
+
+    def support_rope_fusion(self) -> bool:
+        """Check if supports RoPE fusion."""
+        return self.data_type == torch.float8_e4m3fn
 
     def forward_decode(
         self,
@@ -561,9 +715,43 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         if save_kv_cache and k is not None:
-            if kwargs.get("cos_sin_cache") is not None:
-                raise NotImplementedError(
-                    "Fused RoPE + FP8 quantization + KV cache update is not implemented yet"
+            if self.support_rope_fusion() and kwargs.get("rotary_emb") is not None:
+                # Use fused RoPE + FP8 quantization + KV cache update path
+                rotary_emb = kwargs.get("rotary_emb")
+
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_cache = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                v_cache = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                )
+
+                q, k = flashinfer.rope.rope_quantize_fp8(
+                    q_rope=q,
+                    k_rope=k,
+                    q_nope=None,
+                    k_nope=None,
+                    cos_sin_cache=rotary_emb.cos_sin_cache,
+                    pos_ids=forward_batch.positions,
+                    is_neox=rotary_emb.is_neox_style,
+                    quantize_dtype=torch.float8_e4m3fn,
+                    quant_scale_q=q_scale_float,
+                    quant_scale_kv=k_scale_float,
+                )[:2]
+
+                v = v.div_(v_scale_float).to(torch.float8_e4m3fn)
+
+                flashinfer.page.append_paged_kv_cache(
+                    append_key=k,
+                    append_value=v,
+                    batch_indices=self.forward_metadata.batch_indices,
+                    positions=self.forward_metadata.positions,
+                    paged_kv_cache=(k_cache, v_cache),
+                    kv_indices=self.forward_metadata.kv_indices,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_last_page_len=self.forward_metadata.kv_last_page_len,
+                    kv_layout="NHD",
                 )
             elif self.data_type == torch.float8_e4m3fn:
                 # Use fused FP8 quantization + KV cache update path
@@ -647,9 +835,43 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         if save_kv_cache and k is not None:
-            if kwargs.get("cos_sin_cache") is not None:
-                raise NotImplementedError(
-                    "Fused RoPE + FP8 quantization + KV cache update is not implemented yet"
+            if self.support_rope_fusion() and kwargs.get("rotary_emb") is not None:
+                # Use fused RoPE + FP8 quantization + KV cache update path
+                rotary_emb = kwargs.get("rotary_emb")
+
+                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_cache = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                v_cache = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                )
+
+                q, k = flashinfer.rope.rope_quantize_fp8(
+                    q_rope=q,
+                    k_rope=k,
+                    q_nope=None,
+                    k_nope=None,
+                    cos_sin_cache=rotary_emb.cos_sin_cache,
+                    pos_ids=forward_batch.positions,
+                    is_neox=rotary_emb.is_neox_style,
+                    quantize_dtype=torch.float8_e4m3fn,
+                    quant_scale_q=q_scale_float,
+                    quant_scale_kv=k_scale_float,
+                )[:2]
+
+                v = v.div_(v_scale_float).to(torch.float8_e4m3fn)
+
+                flashinfer.page.append_paged_kv_cache(
+                    append_key=k,
+                    append_value=v,
+                    batch_indices=self.forward_metadata.batch_indices,
+                    positions=self.forward_metadata.positions,
+                    paged_kv_cache=(k_cache, v_cache),
+                    kv_indices=self.forward_metadata.kv_indices,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_last_page_len=self.forward_metadata.kv_last_page_len,
+                    kv_layout="NHD",
                 )
             elif self.data_type == torch.float8_e4m3fn:
                 # Use fused FP8 quantization + KV cache update path

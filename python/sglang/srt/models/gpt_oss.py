@@ -320,7 +320,9 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        q, k = self.rotary_emb(positions, q, k, **extra_args)
+        # Skip RoPE if current attn backend supports RoPE fusion
+        if not forward_batch.attn_backend.support_rope_fusion():
+            q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -328,10 +330,19 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+
+        # Pass RoPE into attn backend if it supports RoPE fusion
+        extra_args = {}
+        if forward_batch.attn_backend.support_rope_fusion():
+            extra_args = {
+                "rotary_emb": self.rotary_emb,
+            }
+
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            **extra_args,
         )
         output, _ = self.o_proj(attn_output)
         return output
