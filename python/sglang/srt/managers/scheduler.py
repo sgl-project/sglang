@@ -275,6 +275,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.enable_mtp = server_args.enable_mtp
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -479,9 +480,37 @@ class Scheduler(
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-        self.draft_worker = self.spec_algorithm.create_draft_worker(
-            **draft_worker_kwargs
-        )
+
+        # FIXME: refactor the draft worker registration logic
+        if self.enable_mtp:
+            if self.enable_overlap:
+                from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
+
+                self.draft_worker = MTPWorkerV2(
+                    gpu_id=self.gpu_id,
+                    tp_rank=self.tp_rank,
+                    moe_ep_rank=self.moe_ep_rank,
+                    server_args=self.server_args,
+                    nccl_port=self.port_args.nccl_port,
+                    target_worker=self.tp_worker,
+                    dp_rank=self.dp_rank,
+                )
+            else:
+                from sglang.srt.speculative.mtp_worker import MTPWorker
+
+                self.draft_worker = MTPWorker(
+                    gpu_id=self.gpu_id,
+                    tp_rank=self.tp_rank,
+                    moe_ep_rank=self.moe_ep_rank,
+                    server_args=self.server_args,
+                    nccl_port=self.port_args.nccl_port,
+                    target_worker=self.tp_worker,
+                    dp_rank=self.dp_rank,
+                )
+        else:
+            self.draft_worker = self.spec_algorithm.create_draft_worker(
+                **draft_worker_kwargs
+            )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -548,7 +577,7 @@ class Scheduler(
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
 
-        # Hybrid memory pool configs
+        # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
@@ -592,8 +621,12 @@ class Scheduler(
 
                 self.tree_cache = ChunkCache(params)
             else:
-
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+
+                params.is_local_attention = (
+                    "Llama4ForConditionalGeneration"
+                    in self.model_config.hf_config.architectures
+                )
 
                 self.tree_cache = SWAChunkCache(params)
         else:
@@ -796,11 +829,14 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            draft_token_to_kv_pool = (
-                self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
-            )
-            model_config = self.draft_worker.draft_worker.draft_runner.model_config
+            if self.enable_mtp:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+            draft_token_to_kv_pool = draft_runner.token_to_kv_pool
+            model_config = draft_runner.model_config
         else:
+            # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
 
@@ -1834,13 +1870,11 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            if self.enable_dynamic_chunking:
-                history_len = len(self.chunked_req.prefix_indices)
-                dynamic_size = self.predict_next_chunk_size(history_len)
-                if dynamic_size is not None:
-                    chunked_prefill_size = dynamic_size
+        if self.chunked_req is not None and self.enable_dynamic_chunking:
+            history_len = len(self.chunked_req.prefix_indices)
+            dynamic_size = self.predict_next_chunk_size(history_len)
+            if dynamic_size is not None:
+                chunked_prefill_size = dynamic_size
 
         # Prefill policy
         adder = PrefillAdder(
