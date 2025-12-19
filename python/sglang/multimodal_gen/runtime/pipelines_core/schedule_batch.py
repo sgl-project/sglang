@@ -57,6 +57,7 @@ class Req:
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
+    vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -88,7 +89,9 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str = (
+        "cuda"  # Device for random generator: "cuda", "musa" or "cpu"
+    )
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
@@ -219,9 +222,7 @@ class Req:
             self.guidance_scale_2 = self.guidance_scale
 
     def adjust_size(self, server_args: ServerArgs):
-        if self.height is None or self.width is None:
-            self.width = 1280
-            self.height = 720
+        pass
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)

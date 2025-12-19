@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
+    next_power_of_2,
     round_up,
 )
 
@@ -193,6 +194,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        self.use_flashinfer_trtllm_moe = get_moe_runner_backend().is_flashinfer_trtllm()
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -238,7 +240,9 @@ class FusedMoE(torch.nn.Module):
             if quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
-                self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+                self.quant_method = UnquantizedFusedMoEMethod(
+                    self.use_triton_kernels, self.use_flashinfer_trtllm_moe
+                )
 
         self.quant_method.create_weights(
             layer=self,
@@ -642,9 +646,10 @@ class FusedMoE(torch.nn.Module):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if get_moe_runner_backend().is_flashinfer_trtllm() and (
+        if self.use_flashinfer_trtllm_moe and (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(self.quant_method, Fp8MoEMethod)
+            or isinstance(self.quant_method, UnquantizedFusedMoEMethod)
         ):
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
@@ -1038,29 +1043,66 @@ class FlashInferFusedMoE(FusedMoE):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert (
             self.moe_runner_config.activation == "silu"
-        ), "Only silu is supported for flashinfer blockscale fp8 moe"
+        ), "Only silu is supported for flashinfer trtllm moe"
         assert self.quant_method is not None
         assert (
             topk_output.topk_config.renormalize
-        ), "Renormalize is required for flashinfer blockscale fp8 moe"
+        ), "Renormalize is required for flashinfer trtllm moe"
         assert (
             self.num_fused_shared_experts == 0
-        ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
+        ), "Fused shared experts are not supported for flashinfer trtllm moe"
         assert (
             self.moe_runner_config.is_gated
-        ), "Only gated MoEs are supported for flashinfer blockscale fp8 moe"
+        ), "Only gated MoEs are supported for flashinfer trtllm moe"
 
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-        # Matrix multiply.
-        final_hidden_states = self.quant_method.apply_with_router_logits(
-            layer=self,
-            dispatch_output=StandardDispatchOutput(
-                hidden_states=hidden_states,
-                hidden_states_scale=None,
-                topk_output=topk_output,
-            ),
-        )
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+        correction_bias = topk_config.correction_bias
+
+        if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            # lazy import
+            try:
+                from flashinfer.fused_moe import trtllm_bf16_moe
+            except ImportError as e:
+                raise ImportError(
+                    "Can't import trtllm_bf16_moe from flashinfer. "
+                    "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
+                ) from e
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                # TODO: Now trtllm_bf16_moe doesn't support inplace output,
+                # we can move this out when it support that.
+                final_hidden_states = trtllm_bf16_moe(
+                    routing_logits=router_logits,
+                    routing_bias=correction_bias,
+                    hidden_states=hidden_states,
+                    gemm1_weights=self.w13_weight,
+                    gemm2_weights=self.w2_weight,
+                    num_experts=self.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=topk_config.num_expert_group,
+                    topk_group=topk_config.topk_group,
+                    intermediate_size=self.intermediate_size_per_partition,
+                    local_expert_offset=self.moe_ep_rank * self.num_local_experts,
+                    local_num_experts=self.num_local_experts,
+                    routing_method_type=self.routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                )
+
+        else:
+
+            final_hidden_states = self.quant_method.apply_with_router_logits(
+                layer=self,
+                dispatch_output=StandardDispatchOutput(
+                    hidden_states=hidden_states,
+                    hidden_states_scale=None,
+                    topk_output=topk_output,
+                ),
+            )
 
         # NOTE for symmetric memory tagging:
         # We do not create the context in this function.
@@ -1189,6 +1231,7 @@ class FlashInferFP4MoE(FusedMoE):
             tile_tokens_dim=None,
             routing_method_type=routing_method_type,
             do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
         )[0]
 
