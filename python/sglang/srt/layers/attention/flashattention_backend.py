@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+from sglang.srt.layers.attention.kernels.flatten_kv_cache import flatten_kv_cache_sglang
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -46,6 +48,8 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # during prefill, we pre allocate the kv cache flatten size
+    kv_flatten_size: int = 0
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -380,6 +384,7 @@ class FlashAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
+                # TODO int4 / int8 kv cache metadata for spec decode
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -453,6 +458,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.kv_flatten_size = forward_batch.seq_lens_cpu.sum().item()
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -465,6 +471,7 @@ class FlashAttentionBackend(AttentionBackend):
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
+            # TODO int4 / int8 kv cache metadata spec target verify
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = (
                     forward_batch.seq_lens + self.speculative_num_draft_tokens
@@ -596,6 +603,7 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.kv_flatten_size = forward_batch.seq_lens_cpu.sum().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -732,15 +740,18 @@ class FlashAttentionBackend(AttentionBackend):
         )
         window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
         k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
-        if (
+        if self.kv_cache_dtype_str in ("int4", "int8"):
+            pass
+
+        elif (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
             and self.fa_impl_ver != 4
         ):
+            # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+            # has corresponding quantization method so that layer.k_scale is not None,
+            # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
+            # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
@@ -790,50 +801,91 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
+            # TODO int4 / int8 kv cache metadata
         else:
             page_table = metadata.page_table
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+            max_seq_len_k = metadata.max_seq_len_k
 
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-            )
-            if layer.is_cross_attention:
-                page_table = metadata.encoder_page_table
-                cache_seqlens = metadata.encoder_lens_int32
-                cu_seqlens_k = metadata.encoder_cu_seqlens_k
-                window_size = (-1, -1)
+            if self.kv_cache_dtype_str in ("int4", "int8"):
+                kv_data = forward_batch.token_to_kv_pool.get_raw_kv_buffer(
+                    layer.layer_id
+                )
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                num_splits=self.num_splits,
-                **kwargs,
-            )
+                out_size = metadata.kv_flatten_size
+                flatten_k, flatten_v = flatten_kv_cache_sglang(
+                    k_cache=kv_data["k_buffer"],
+                    v_cache=kv_data["v_buffer"],
+                    k_scales_zeros=kv_data["k_scales_zeros"],
+                    v_scales_zeros=kv_data["v_scales_zeros"],
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_k=cu_seqlens_k if not use_local_attn else None,
+                    page_size=self.page_size,
+                    num_heads=layer.tp_k_head_num,
+                    head_dim_k=layer.head_dim,
+                    head_dim_v=layer.head_dim,  # Assuming same for simplicity
+                    quant_policy=4 if self.kv_cache_dtype_str == "int4" else 8,
+                    output_dtype=q.dtype,
+                    max_seq_len_k=max_seq_len_k,
+                    out_size=out_size,
+                )
+
+                result = flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=flatten_k,
+                    v=flatten_v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seq_len_k,  # Use pre-computed value (no DtoH copy)
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    **kwargs,
+                )
+            else:
+                key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                )
+                if layer.is_cross_attention:
+                    page_table = metadata.encoder_page_table
+                    cache_seqlens = metadata.encoder_lens_int32
+                    cu_seqlens_k = metadata.encoder_cu_seqlens_k
+                    window_size = (-1, -1)
+
+                result = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1077,10 +1129,12 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         k_descale, v_descale = None, None
+        if self.kv_cache_dtype_str in ("int4", "int8"):
+            pass
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+        elif self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
@@ -1641,6 +1695,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 # Precompute maximum sequence length
                 metadata.max_seq_len_k = seq_lens.max().item()
+                metadata.kv_flatten_size = seq_lens.sum().item()
                 # Precompute page table
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
@@ -1752,7 +1807,7 @@ class FlashAttentionBackend(AttentionBackend):
             num_tokens_per_bs = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_bs
             metadata.max_seq_len_k = seq_lens.max().item()
-
+            metadata.kv_flatten_size = seq_lens.sum().item()
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 bs * num_tokens_per_bs + 1,
@@ -1891,6 +1946,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
                 max_len = seq_lens_cpu.max().item()
+                metadata.kv_flatten_size = seq_lens_sum
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
@@ -2026,6 +2082,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
             metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.kv_flatten_size = seq_lens_sum
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )

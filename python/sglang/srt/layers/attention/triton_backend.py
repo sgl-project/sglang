@@ -62,6 +62,7 @@ class TritonAttnBackend(AttentionBackend):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
+            decode_attention_fwd_quantized,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             build_unified_kv_indices,
@@ -72,6 +73,9 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.decode_attention_fwd_quantized = torch.compiler.disable(
+            decode_attention_fwd_quantized
+        )
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -102,6 +106,11 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
+        if (
+            hasattr(model_runner.token_to_kv_pool, "dtype")
+            and model_runner.token_to_kv_pool.dtype == "int4"
+        ):
+            self.v_head_dim = self.v_head_dim * 2
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
@@ -1013,22 +1022,48 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            self.forward_metadata.attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        # Check if KV cache is quantized (INT4/INT8) for optimized attention
+        kv_pool = forward_batch.token_to_kv_pool
+        if hasattr(kv_pool, "dtype") and kv_pool.dtype in ("int4", "int8"):
+            # Use optimized quantized attention kernel
+            # This dequantizes KV cache on-the-fly inside the kernel, avoiding global memory writes
+            self.decode_attention_fwd_quantized(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                kv_pool.get_raw_key_buffer(layer.layer_id),  # Quantized K
+                kv_pool.get_raw_value_buffer(layer.layer_id),  # Quantized V
+                kv_pool.get_key_scales_zeros(layer.layer_id),  # K scales/zeros
+                kv_pool.get_value_scales_zeros(layer.layer_id),  # V scales/zeros
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                kv_pool.dtype,  # Pass dtype to select INT4 or INT8 kernel
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+        else:
+            # Standard attention with dequantized or non-quantized KV cache
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
         return o
 
 
