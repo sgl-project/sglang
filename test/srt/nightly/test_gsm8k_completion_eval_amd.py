@@ -823,7 +823,8 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
         ]
 
         # Build GitHub summary with results and failure details
-        github_summary = f"### Model Group: {self.model_group}\n\n{summary}\n"
+        # Note: summary already includes the "### Model Group:" header
+        github_summary = f"{summary}\n"
         github_summary += f"\n**Statistics:** ✅ Passed: {len(passed_models)} | ❌ Failed: {len(failed_models)} | ⏭️ Skipped: {len(skipped_models)}\n"
         github_summary += f"\n**Total Runtime:** {total_test_time:.1f}s ({total_test_time/60:.1f} min)\n"
 

@@ -1,9 +1,6 @@
 name: Nightly Test (AMD)
 
 on:
-  pull_request:
-    branches:
-      - main
   schedule:
     - cron: '0 0 * * *'
   push:
@@ -21,7 +18,7 @@ on:
         options:
           - 'all'
           - 'nightly-test-2-gpu'
-          - 'nightly-test-8-gpu'
+          - 'nightly-test-8-gpu-gpt-oss'
           - 'nightly-test-8-gpu-grok'
           - 'nightly-test-8-gpu-deepseek-v3-dp'
           - 'nightly-test-8-gpu-deepseek-v3-tc'
@@ -68,8 +65,8 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
 
   # 8-GPU tests (TP=8) - GPT-OSS models
-  nightly-test-8-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu')
+  nightly-test-8-gpu-gpt-oss:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-gpt-oss')
     runs-on: linux-mi325-gpu-8
     steps:
       - name: Checkout code
@@ -186,7 +183,7 @@ jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
       - nightly-test-2-gpu
-      - nightly-test-8-gpu
+      - nightly-test-8-gpu-gpt-oss
       - nightly-test-8-gpu-grok
       - nightly-test-8-gpu-deepseek-v3-dp
       - nightly-test-8-gpu-deepseek-v3-tc
