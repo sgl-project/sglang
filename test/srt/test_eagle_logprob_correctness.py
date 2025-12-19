@@ -1,5 +1,6 @@
 import time
 import unittest
+from contextlib import nullcontext
 
 import requests
 
@@ -50,7 +51,7 @@ class TestEagleLogprobCorrectness(unittest.TestCase):
             )
             context = envs.SGLANG_ENABLE_SPEC_V2.override(True)
         else:
-            context = envs.SGLANG_ENABLE_SPEC_V2.override(False)
+            context = nullcontext()
 
         with context:
             process = popen_launch_server(
