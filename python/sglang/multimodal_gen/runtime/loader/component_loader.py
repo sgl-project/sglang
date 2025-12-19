@@ -703,6 +703,16 @@ class TransformerLoader(ComponentLoader):
                         existing.data.copy_(tensor.to(existing.data.dtype))
                 else:
                     module.wtscale = tensor
+
+                # Cache a Python float alpha for kernels so that the forward
+                # path in ``NunchakuSVDQLinearMethod.apply`` does not need to
+                # call ``Tensor.item()`` (which would introduce GPU syncs and
+                # TorchDynamo graph breaks).
+                try:
+                    module._nunchaku_alpha = float(tensor.detach().cpu().item())
+                except Exception:
+                    module._nunchaku_alpha = None
+
                 num_patched += 1
 
         if num_patched > 0:

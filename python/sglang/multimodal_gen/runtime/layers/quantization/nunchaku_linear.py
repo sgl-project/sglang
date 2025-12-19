@@ -139,14 +139,28 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
         layer.wscales = Parameter(layer.wscales.data, requires_grad=False)
         layer.smooth_factor = Parameter(layer.smooth_factor.data, requires_grad=False)
-        layer.smooth_factor_orig = Parameter(layer.smooth_factor_orig.data, requires_grad=False)
+        layer.smooth_factor_orig = Parameter(
+            layer.smooth_factor_orig.data, requires_grad=False
+        )
         layer.proj_down = Parameter(layer.proj_down.data, requires_grad=False)
         layer.proj_up = Parameter(layer.proj_up.data, requires_grad=False)
         if hasattr(layer, "wcscales") and layer.wcscales is not None:
             layer.wcscales = Parameter(layer.wcscales.data, requires_grad=False)
         if hasattr(layer, "wtscale") and layer.wtscale is not None:
             layer.wtscale = Parameter(layer.wtscale.data, requires_grad=False)
-        
+
+        # Cache a Python float alpha for kernels to avoid calling .item()
+        # inside the hot path (which would introduce GPU syncs / graph breaks).
+        alpha: float | None = None
+        wtscale = getattr(layer, "wtscale", None)
+        if wtscale is not None:
+            if isinstance(wtscale, Parameter):
+                wtscale = wtscale.data
+            if isinstance(wtscale, torch.Tensor):
+                alpha = float(wtscale.detach().cpu().item())
+            else:
+                alpha = float(wtscale)
+        layer._nunchaku_alpha = alpha
 
     def apply(
         self,
@@ -180,10 +194,10 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
             dtype=x_2d.dtype,
             device=x_2d.device,
         )
-        wtscale = getattr(layer, "wtscale", None)
-        alpha: float | None = (
-            float(wtscale.item()) if isinstance(wtscale, torch.Tensor) else wtscale
-        )
+        # Prefer a cached Python float computed after weight loading; this
+        # avoids calling Tensor.item() during the forward, which would cause
+        # GPU syncs and TorchDynamo graph breaks.
+        alpha: float | None = getattr(layer, "_nunchaku_alpha", None)
         wcscales = getattr(layer, "wcscales", None)
 
         svdq_gemm_w4a4_cuda(
