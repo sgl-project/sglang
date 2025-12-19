@@ -566,6 +566,8 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if hidden_states_to_store_before_norm is not None:
+            # NOTE: when hidden_states_before_norm is provided, we always
+            # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         if not logits_metadata.extend_return_logprob:
