@@ -41,8 +41,6 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
-    from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
-
 
 class Qwen3Attention(nn.Module):
     def __init__(
