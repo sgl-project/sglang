@@ -903,29 +903,52 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
     ):
+        # CP mode: Disable TP allgather to avoid conflicts with CP allgather
+        # In CP mode, tensors have already been CP allgathered and reranged,
+        # so they should be sent as-is without TP allgather logic
+        use_tp_allgather = True
+        if self.server_args.enable_nsa_prefill_context_parallel:
+            # In CP mode, disable TP allgather to prevent data corruption
+            # CP allgather already produces correctly ordered full tensors
+            use_tp_allgather = False
+        
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=self.attn_tp_group,
+                all_gather_group=self.attn_tp_group if use_tp_allgather else None,
                 async_send=async_send,
             )
         )
         return p2p_work
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+        # CP mode: Disable TP allgather to avoid conflicts with CP allgather
+        # In CP mode, tensors should be received as-is without TP allgather logic
+        use_tp_allgather = True
+        if self.server_args.enable_nsa_prefill_context_parallel:
+            # In CP mode, disable TP allgather to prevent data corruption
+            # CP allgather already produces correctly ordered full tensors
+            use_tp_allgather = False
+        
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(all_gather_group=self.attn_tp_group)
+                self.pp_group.recv_tensor_dict(all_gather_group=self.attn_tp_group if use_tp_allgather else None)
             )
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
+        # CP mode: Disable TP allgather to avoid conflicts with CP allgather
+        use_tp_allgather = True
+        if self.server_args.enable_nsa_prefill_context_parallel:
+            # In CP mode, disable TP allgather to prevent data corruption
+            use_tp_allgather = False
+        
         res = self.pp_group.recv_tensor_dict(
-            all_gather_group=self.attn_tp_group,
+            all_gather_group=self.attn_tp_group if use_tp_allgather else None,
         )
         return res
 
