@@ -472,7 +472,7 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        if self.server_args.disaggregation_mode == "prefill":
+        if self.server_args.disaggregation_mode == "null":
             self.workers[self.round_robin_counter].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers

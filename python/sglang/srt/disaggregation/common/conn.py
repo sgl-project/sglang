@@ -669,9 +669,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             return web.Response(text="Bootstrap info not Found", status=404)
 
     async def _cleanup_expired_entries(self):
-        """Remove entries older than 10 minutes from prefill_dp_rank_table."""
+        """Remove entries older than cleanup interval from prefill_dp_rank_table."""
         while True:
-            await asyncio.sleep(self.entry_cleanup_interval)  # Run every 30 secs
+            await asyncio.sleep(self.entry_cleanup_interval)
             current_time = time.time()
             expired_keys = [
                 key
