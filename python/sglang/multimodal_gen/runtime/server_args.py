@@ -266,6 +266,7 @@ class ServerArgs:
     # CPU offload parameters
     dit_cpu_offload: bool = True
     use_fsdp_inference: bool = False
+    dit_layerwise_offload: bool = False
     text_encoder_cpu_offload: bool = True
     image_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
@@ -552,6 +553,12 @@ class ServerArgs:
             "--dit-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-offload",
+            action=StoreBoolean,
+            default=ServerArgs.dit_layerwise_offload,
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan).",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -894,6 +901,17 @@ class ServerArgs:
         """Validate inference arguments for consistency"""
         if current_platform.is_mps():
             self.use_fsdp_inference = False
+            self.dit_layerwise_offload = False
+
+        if self.dit_layerwise_offload:
+            if self.use_fsdp_inference:
+                raise ValueError(
+                    "dit_layerwise_offload cannot be enabled together with use_fsdp_inference."
+                )
+            if self.dit_cpu_offload:
+                raise ValueError(
+                    "dit_layerwise_offload cannot be enabled together with dit_cpu_offload."
+                )
 
         # autocast
         is_flux = (

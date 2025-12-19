@@ -792,10 +792,20 @@ class WanTransformer3DModel(CachableDiT):
             if enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                )
+            offload_mgr = getattr(self, "_layerwise_offload_manager", None)
+            if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+                for i, block in enumerate(self.blocks):
+                    offload_mgr.prefetch_layer(i + 1, non_blocking=True)
+                    hidden_states = block(
+                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    )
+                    torch.cuda.current_stream().wait_stream(offload_mgr.copy_stream)
+                    offload_mgr.release_layer(i)
+            else:
+                for block in self.blocks:
+                    hidden_states = block(
+                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    )
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
