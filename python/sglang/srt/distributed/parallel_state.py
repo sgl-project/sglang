@@ -1523,17 +1523,12 @@ def init_distributed_environment(
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(
-            # Mooncake Backend does not support isend/irecv,
-            # so a default NCCL PG is required
-            backend="nccl" if backend == "mooncake" else backend,
+            backend=backend,
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
             timeout=timeout,
         )
-        # `batch_isend_irecv` cannot be the first collective call
-        # Refer to PyTorch's doc of `batch_isend_irecv`
-        torch.distributed.barrier()
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,

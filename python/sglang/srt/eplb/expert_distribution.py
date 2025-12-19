@@ -27,7 +27,6 @@ import einops
 import torch
 import torch.distributed
 
-from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -855,9 +854,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step,
-            op=torch.distributed.ReduceOp.SUM,
-            group=get_world_group().device_group,
+            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
         )
 
         output = dict(
