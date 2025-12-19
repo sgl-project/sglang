@@ -294,9 +294,17 @@ class AscendAttnBackend(AttentionBackend):
             // self.page_size
         )
         if forward_batch.extend_seq_lens is not None:
+            self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
                 forward_batch.extend_seq_lens.cpu().int()
             )
+        if forward_batch.seq_lens is not None:
+            self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
+        else:
+            self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
+                self.device
+            ).int()
+
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
@@ -662,8 +670,9 @@ class AscendAttnBackend(AttentionBackend):
                     k_cache,
                     v_cache,
                     sinks,
+                    self.forward_metadata.extend_seq_lens,
                     self.forward_metadata.block_tables,
-                    self.forward_metadata.seq_lens_cpu_int,
+                    self.forward_metadata.seq_lens,
                     layer.scaling,
                     layer.sliding_window_size,
                     layer.tp_q_head_num,
@@ -1325,7 +1334,7 @@ class AscendAttnBackend(AttentionBackend):
                     v_cache,
                     sinks,
                     self.forward_metadata.block_tables,
-                    self.forward_metadata.seq_lens_cpu_int,
+                    self.forward_metadata.seq_lens,
                     layer.scaling,
                     layer.sliding_window_size,
                     layer.tp_q_head_num,
