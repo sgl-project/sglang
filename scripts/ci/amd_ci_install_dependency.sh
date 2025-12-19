@@ -172,8 +172,11 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         git submodule update --init --recursive
     "
 
-    # detect GPU ARCH list inside container
-    GPU_ARCH_LIST=$(docker exec ci_sglang rocminfo | grep -oE 'gfx[0-9]+' | sort -u | tr '\n' ',' | sed 's/,$//')
+    if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+        GPU_ARCH_LIST="gfx950"
+    else
+        GPU_ARCH_LIST="gfx942"
+    fi
     echo "[CI] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
     # build AITER
