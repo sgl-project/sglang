@@ -1,6 +1,6 @@
 //! Conversation CRUD handlers - shared across routers
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     http::StatusCode,
@@ -11,9 +11,13 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::data_connector::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ConversationStorage, ListParams, NewConversation, NewConversationItem, SortOrder,
+use crate::{
+    data_connector::{
+        Conversation, ConversationId, ConversationItem, ConversationItemId,
+        ConversationItemStorage, ConversationStorage, ListParams, NewConversation,
+        NewConversationItem, SortOrder,
+    },
+    observability::metrics::{metrics_labels, Metrics},
 };
 
 // ============================================================================
@@ -93,7 +97,28 @@ async fn ensure_conversation_exists(
     storage: &Arc<dyn ConversationStorage>,
     conv_id: &ConversationId,
 ) -> Result<Conversation, Response> {
-    match storage.get_conversation(conv_id).await {
+    let start = Instant::now();
+    let result = storage.get_conversation(conv_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    match result {
         Ok(Some(conv)) => Ok(conv),
         Ok(None) => Err(not_found("Conversation not found")),
         Err(e) => Err(internal_error(format!("Failed to get conversation: {e}"))),
@@ -164,8 +189,29 @@ pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: V
 
     let new_conv = NewConversation { id: None, metadata };
 
-    match storage.create_conversation(new_conv).await {
+    let start = Instant::now();
+    let result = storage.create_conversation(new_conv).await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_PUT,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_PUT,
+        duration,
+    );
+
+    match result {
         Ok(conversation) => {
+            Metrics::increment_db_items_stored(metrics_labels::STORAGE_CONVERSATION);
             info!(conversation_id = %conversation.id.0, "Created conversation");
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
@@ -176,7 +222,28 @@ pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: V
 pub async fn get_conversation(storage: &Arc<dyn ConversationStorage>, conv_id: &str) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    match storage.get_conversation(&conversation_id).await {
+    let start = Instant::now();
+    let result = storage.get_conversation(&conversation_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    match result {
         Ok(Some(conversation)) => {
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
@@ -202,10 +269,30 @@ pub async fn update_conversation(
         Err(msg) => return bad_request(msg),
     };
 
-    match storage
+    let start = Instant::now();
+    let result = storage
         .update_conversation(&conversation_id, final_metadata)
-        .await
-    {
+        .await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_PUT,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_PUT,
+        duration,
+    );
+
+    match result {
         Ok(Some(conversation)) => {
             info!(conversation_id = %conversation_id.0, "Updated conversation");
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
@@ -225,7 +312,28 @@ pub async fn delete_conversation(
         return response;
     }
 
-    match storage.delete_conversation(&conversation_id).await {
+    let start = Instant::now();
+    let result = storage.delete_conversation(&conversation_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(true) => metrics_labels::RESULT_SUCCESS,
+        Ok(false) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_DELETE,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION,
+        metrics_labels::DB_OP_DELETE,
+        duration,
+    );
+
+    match result {
         Ok(_) => {
             info!(conversation_id = %conversation_id.0, "Deleted conversation");
             (
@@ -273,7 +381,27 @@ pub async fn list_conversation_items(
         after: after.map(String::from),
     };
 
-    match item_storage.list_items(&conversation_id, params).await {
+    let start = Instant::now();
+    let result = item_storage.list_items(&conversation_id, params).await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_LIST,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_LIST,
+        duration,
+    );
+
+    match result {
         Ok(items) => {
             let item_values: Vec<Value> = items
                 .iter()
@@ -385,10 +513,29 @@ async fn process_item(
     };
 
     // Link item to conversation
-    if let Err(e) = item_storage
+    let start = Instant::now();
+    let link_result = item_storage
         .link_item(conversation_id, &item.id, added_at)
-        .await
-    {
+        .await;
+    let duration = start.elapsed();
+
+    let result_label = match &link_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        duration,
+    );
+
+    if let Err(e) = link_result {
         warn!("Failed to link item {}: {}", item.id.0, e);
     }
 
@@ -409,7 +556,28 @@ async fn process_item_reference(
 
     let item_id = ConversationItemId::from(ref_id);
 
-    let existing_item = match item_storage.get_item(&item_id).await {
+    let start = Instant::now();
+    let get_result = item_storage.get_item(&item_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &get_result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    let existing_item = match get_result {
         Ok(Some(item)) => item,
         Ok(None) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
         Err(e) => {
@@ -419,10 +587,29 @@ async fn process_item_reference(
         }
     };
 
-    if let Err(e) = item_storage
+    let start = Instant::now();
+    let link_result = item_storage
         .link_item(conversation_id, &existing_item.id, added_at)
-        .await
-    {
+        .await;
+    let duration = start.elapsed();
+
+    let result_label = match &link_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        duration,
+    );
+
+    if let Err(e) = link_result {
         warn!("Failed to link item {}: {}", existing_item.id.0, e);
     }
 
@@ -439,10 +626,28 @@ async fn process_item_with_id(
     let item_id = ConversationItemId::from(id_str);
 
     // Check if already linked
-    let is_linked = item_storage
-        .is_item_linked(conversation_id, &item_id)
-        .await
-        .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
+    let start = Instant::now();
+    let is_linked_result = item_storage.is_item_linked(conversation_id, &item_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &is_linked_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    let is_linked =
+        is_linked_result.map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
 
     if is_linked {
         return Err(bad_request_structured(json!({
@@ -454,17 +659,58 @@ async fn process_item_with_id(
     }
 
     // Check if item exists globally
-    match item_storage.get_item(&item_id).await {
+    let start = Instant::now();
+    let get_result = item_storage.get_item(&item_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &get_result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    match get_result {
         Ok(Some(existing)) => Ok((existing, None)),
         Ok(None) => {
             // Create new item with the provided ID
             let (mut new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
             new_item.id = Some(item_id);
 
-            let created = item_storage
-                .create_item(new_item)
-                .await
-                .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+            let start = Instant::now();
+            let create_result = item_storage.create_item(new_item).await;
+            let duration = start.elapsed();
+
+            let result_label = match &create_result {
+                Ok(_) => metrics_labels::RESULT_SUCCESS,
+                Err(_) => metrics_labels::RESULT_ERROR,
+            };
+
+            Metrics::record_db_operation(
+                metrics_labels::STORAGE_CONVERSATION_ITEM,
+                metrics_labels::DB_OP_PUT,
+                result_label,
+            );
+            Metrics::record_db_operation_duration(
+                metrics_labels::STORAGE_CONVERSATION_ITEM,
+                metrics_labels::DB_OP_PUT,
+                duration,
+            );
+
+            let created =
+                create_result.map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+
+            Metrics::increment_db_items_stored(metrics_labels::STORAGE_CONVERSATION_ITEM);
 
             Ok((created, warning))
         }
@@ -481,10 +727,30 @@ async fn process_new_item(
 ) -> Result<(ConversationItem, Option<String>), Response> {
     let (new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
 
-    let created = item_storage
-        .create_item(new_item)
-        .await
-        .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+    let start = Instant::now();
+    let create_result = item_storage.create_item(new_item).await;
+    let duration = start.elapsed();
+
+    let result_label = match &create_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        duration,
+    );
+
+    let created =
+        create_result.map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+
+    Metrics::increment_db_items_stored(metrics_labels::STORAGE_CONVERSATION_ITEM);
 
     Ok((created, warning))
 }
@@ -504,10 +770,29 @@ pub async fn get_conversation_item(
         return response;
     }
 
-    let is_linked = match item_storage
+    let start = Instant::now();
+    let is_linked_result = item_storage
         .is_item_linked(&conversation_id, &item_id)
-        .await
-    {
+        .await;
+    let duration = start.elapsed();
+
+    let result_label = match &is_linked_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    let is_linked = match is_linked_result {
         Ok(linked) => linked,
         Err(e) => return internal_error(format!("Failed to check item link: {e}")),
     };
@@ -516,7 +801,28 @@ pub async fn get_conversation_item(
         return not_found("Item not found in this conversation");
     }
 
-    match item_storage.get_item(&item_id).await {
+    let start = Instant::now();
+    let get_result = item_storage.get_item(&item_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &get_result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    match get_result {
         Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(&item))).into_response(),
         Ok(None) => not_found("Item not found"),
         Err(e) => internal_error(format!("Failed to get item: {e}")),
@@ -538,7 +844,27 @@ pub async fn delete_conversation_item(
             Err(response) => return response,
         };
 
-    match item_storage.delete_item(&conversation_id, &item_id).await {
+    let start = Instant::now();
+    let delete_result = item_storage.delete_item(&conversation_id, &item_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &delete_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_DELETE,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_DELETE,
+        duration,
+    );
+
+    match delete_result {
         Ok(_) => {
             info!(
                 conversation_id = %conversation_id.0,
@@ -564,16 +890,53 @@ pub async fn create_and_link_item(
         new_item.status = Some("completed".to_string());
     }
 
-    let created = item_storage
-        .create_item(new_item)
-        .await
-        .map_err(|e| format!("Failed to create item: {e}"))?;
+    let start = Instant::now();
+    let create_result = item_storage.create_item(new_item).await;
+    let duration = start.elapsed();
+
+    let result_label = match &create_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_CONVERSATION_ITEM,
+        metrics_labels::DB_OP_PUT,
+        duration,
+    );
+
+    let created = create_result.map_err(|e| format!("Failed to create item: {e}"))?;
+    Metrics::increment_db_items_stored(metrics_labels::STORAGE_CONVERSATION_ITEM);
 
     if let Some(conv_id) = conv_id_opt {
-        item_storage
+        let start = Instant::now();
+        let link_result = item_storage
             .link_item(conv_id, &created.id, Utc::now())
-            .await
-            .map_err(|e| format!("Failed to link item: {e}"))?;
+            .await;
+        let duration = start.elapsed();
+
+        let result_label = match &link_result {
+            Ok(_) => metrics_labels::RESULT_SUCCESS,
+            Err(_) => metrics_labels::RESULT_ERROR,
+        };
+
+        Metrics::record_db_operation(
+            metrics_labels::STORAGE_CONVERSATION_ITEM,
+            metrics_labels::DB_OP_PUT,
+            result_label,
+        );
+        Metrics::record_db_operation_duration(
+            metrics_labels::STORAGE_CONVERSATION_ITEM,
+            metrics_labels::DB_OP_PUT,
+            duration,
+        );
+
+        link_result.map_err(|e| format!("Failed to link item: {e}"))?;
 
         debug!(
             conversation_id = %conv_id.0,

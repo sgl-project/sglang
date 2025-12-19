@@ -2,6 +2,8 @@
 //!
 //! These handlers are used by both pipelines for retrieving and cancelling responses.
 
+use std::time::Instant;
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -11,6 +13,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     data_connector::ResponseId,
+    observability::metrics::{metrics_labels, Metrics},
     routers::{error, grpc::regular::responses::context::ResponsesContext},
 };
 
@@ -21,8 +24,29 @@ use crate::{
 pub async fn get_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
     let resp_id = ResponseId::from(response_id);
 
+    let start = Instant::now();
+    let result = ctx.response_storage.get_response(&resp_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
     // Retrieve response from storage
-    match ctx.response_storage.get_response(&resp_id).await {
+    match result {
         Ok(Some(stored_response)) => axum::Json(stored_response.raw_response).into_response(),
         Ok(None) => error::not_found(
             "response_not_found",
@@ -42,7 +66,28 @@ pub async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> 
     let resp_id = ResponseId::from(response_id);
 
     // Retrieve response from storage to check if it exists and get current status
-    match ctx.response_storage.get_response(&resp_id).await {
+    let start = Instant::now();
+    let result = ctx.response_storage.get_response(&resp_id).await;
+    let duration = start.elapsed();
+
+    let result_label = match &result {
+        Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+        Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_GET,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_GET,
+        duration,
+    );
+
+    match result {
         Ok(Some(stored_response)) => {
             // Check current status - only queued or in_progress responses can be cancelled
             let current_status = stored_response

@@ -2,7 +2,7 @@
 //!
 //! Re-exports shared CRUD handlers and provides OpenAI-specific persistence logic.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -19,6 +19,7 @@ use crate::{
         ConversationId, ConversationItemId, ConversationItemStorage, ConversationStorage,
         NewConversationItem, ResponseId, ResponseStorage,
     },
+    observability::metrics::{metrics_labels, Metrics},
     protocols::responses::{
         generate_id, ResponseInput, ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
     },
@@ -60,15 +61,54 @@ pub async fn persist_conversation_items(
     stored_response.input = Value::Array(input_items.clone());
     stored_response.output = Value::Array(output_items.clone());
 
-    response_storage
-        .store_response(stored_response)
-        .await
-        .map_err(|e| format!("Failed to store response: {}", e))?;
+    let start = Instant::now();
+    let store_result = response_storage.store_response(stored_response).await;
+    let duration = start.elapsed();
+
+    let result_label = match &store_result {
+        Ok(_) => metrics_labels::RESULT_SUCCESS,
+        Err(_) => metrics_labels::RESULT_ERROR,
+    };
+
+    Metrics::record_db_operation(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_PUT,
+        result_label,
+    );
+    Metrics::record_db_operation_duration(
+        metrics_labels::STORAGE_RESPONSE,
+        metrics_labels::DB_OP_PUT,
+        duration,
+    );
+
+    store_result.map_err(|e| format!("Failed to store response: {}", e))?;
+    Metrics::increment_db_items_stored(metrics_labels::STORAGE_RESPONSE);
 
     // Check if conversation is provided and validate it exists
     let conv_id_opt = if let Some(id) = &original_body.conversation {
         let conv_id = ConversationId::from(id.as_str());
-        match conversation_storage.get_conversation(&conv_id).await {
+        let start = Instant::now();
+        let get_result = conversation_storage.get_conversation(&conv_id).await;
+        let duration = start.elapsed();
+
+        let result_label = match &get_result {
+            Ok(Some(_)) => metrics_labels::RESULT_SUCCESS,
+            Ok(None) => metrics_labels::RESULT_NOT_FOUND,
+            Err(_) => metrics_labels::RESULT_ERROR,
+        };
+
+        Metrics::record_db_operation(
+            metrics_labels::STORAGE_CONVERSATION,
+            metrics_labels::DB_OP_GET,
+            result_label,
+        );
+        Metrics::record_db_operation_duration(
+            metrics_labels::STORAGE_CONVERSATION,
+            metrics_labels::DB_OP_GET,
+            duration,
+        );
+
+        match get_result {
             Ok(Some(_)) => Some(conv_id),
             Ok(None) => {
                 warn!(conversation_id = %conv_id.0, "Conversation not found, skipping item linking");
