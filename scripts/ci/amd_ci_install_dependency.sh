@@ -2,6 +2,14 @@
 set -euo pipefail
 HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
+OPTIONAL_DEPS="${1:-}"
+
+# Build python extras
+EXTRAS="dev_hip"
+if [ -n "$OPTIONAL_DEPS" ]; then
+    EXTRAS="dev_hip,${OPTIONAL_DEPS}"
+fi
+echo "Installing python extras: [${EXTRAS}]"
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
 if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
@@ -16,9 +24,13 @@ fi
 docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
+docker exec ci_sglang pip uninstall sglang -y || true
 # Clear Python cache to ensure latest code is used
 docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
 docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
+# Also clear cache in sglang-checkout
+docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
+docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
 docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
 
 # Helper function to install with retries and fallback PyPI mirror
@@ -52,7 +64,7 @@ case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]" --no-deps
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]" --no-deps # TODO: only for mi35x
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . --no-deps
@@ -60,7 +72,7 @@ case "${GPU_ARCH}" in
   mi30x|mi300|mi325)
     echo "Runner uses ${GPU_ARCH}; will fetch mi30x image."
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[dev_hip]"
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
@@ -79,3 +91,13 @@ docker cp ./dummy-grok ci_sglang:/
 
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
+
+# Clear pre-built AITER kernels from Docker image to avoid segfaults
+# The Docker image may contain pre-compiled kernels incompatible with the current environment
+echo "Clearing pre-built AITER kernels from Docker image..."
+docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
+docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
+
+# Pre-build AITER kernels to avoid timeout during tests
+echo "Warming up AITER JIT kernels..."
+docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"

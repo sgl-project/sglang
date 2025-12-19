@@ -15,6 +15,13 @@ class CompilationConfig:
         self.capture_sizes = capture_sizes
         self.compiler = compiler
         self.enable_debug_mode = enable_debug_mode
+        self.split_ops = [
+            "sglang.unified_attention_with_output",
+            "sglang.gdn_with_output",
+        ]
+
+    def add_split_op(self, op: str):
+        self.split_ops.append(op)
 
     def add_traced_file(self, file_path: str):
         self.traced_files.add(file_path)

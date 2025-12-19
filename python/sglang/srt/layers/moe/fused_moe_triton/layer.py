@@ -8,6 +8,10 @@ import torch
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -37,7 +41,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -57,6 +61,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
 )
+from sglang.srt.utils.common import direct_register_custom_op
 
 if is_flashinfer_available():
     from flashinfer import fp4_quantize
@@ -882,6 +887,21 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1039,6 +1059,21 @@ class FlashInferFusedMoE(FusedMoE):
         super().__init__(*args, **kwargs)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only silu is supported for flashinfer trtllm moe"
@@ -1150,6 +1185,21 @@ class FlashInferFP4MoE(FusedMoE):
         return hs_fp4, hs_sf
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         """Forward pass using FP4 TRTLLM kernel.
 
         Args:
@@ -1234,3 +1284,37 @@ class FlashInferFP4MoE(FusedMoE):
         )[0]
 
         return result
+
+
+def moe_forward_piecewise_cuda_graph_impl(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    # only standard topk output is supported for piecewise cuda graph
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
+    )
+    forward_context = get_forward_context()
+    moe_layer = forward_context.moe_layers[layer_id]
+    return moe_layer.forward_impl(hidden_states, topk_output)
+
+
+def moe_forward_piecewise_cuda_graph_impl_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_piecewise_cuda_graph_impl",
+    op_func=moe_forward_piecewise_cuda_graph_impl,
+    mutates_args=[],
+    fake_impl=moe_forward_piecewise_cuda_graph_impl_fake,
+)
