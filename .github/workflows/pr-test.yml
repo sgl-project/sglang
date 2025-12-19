@@ -448,12 +448,12 @@ jobs:
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 3
 
-  stage-b-test-2-gpu:
+  stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'stage-b-test-2-gpu') ||
+        (inputs.target_stage == 'stage-b-test-large-2-gpu') ||
         (
           !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
@@ -1363,7 +1363,7 @@ jobs:
 
         stage-a-test-1,
         stage-b-test-small-1-gpu,
-        stage-b-test-2-gpu,
+        stage-b-test-large-2-gpu,
         quantization-test,
         unit-test-backend-1-gpu,
         unit-test-backend-2-gpu,
