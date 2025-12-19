@@ -46,6 +46,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -115,10 +116,8 @@ class Qwen2_5_VLMLP(nn.Module):
         )
         self.hidden_act = hidden_act
         if self.hidden_act == "silu":
-            from sglang.srt.layers.activation import SiluAndMul
             self.act = SiluAndMul()
         elif self.hidden_act == "gelu":
-            from sglang.srt.layers.activation import GeluAndMul
             self.act = GeluAndMul()
         else:
             self.act = ACT2FN[hidden_act]
