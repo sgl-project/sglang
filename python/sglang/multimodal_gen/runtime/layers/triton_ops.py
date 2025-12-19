@@ -572,7 +572,7 @@ def _qk_rotary_embedding_kernel(
         tl.store(output_q_ptr + offsets_x1, oq1_vals.to(q1_vals.dtype), mask=mask)
         tl.store(output_q_ptr + offsets_x2, oq2_vals.to(q2_vals.dtype), mask=mask)
         tl.store(output_k_ptr + offsets_x1, ok1_vals.to(ok1_vals.dtype), mask=mask)
-        tl.store(output_q_ptr + offsets_x2, ok2_vals.to(ok2_vals.dtype), mask=mask)
+        tl.store(output_k_ptr + offsets_x2, ok2_vals.to(ok2_vals.dtype), mask=mask)
 
 
 def apply_qk_rotary_embedding(
