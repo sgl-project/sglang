@@ -9,13 +9,19 @@ for instruction-tuned models.
 
 Base models tested here:
 - GPT-OSS series (lmsys/gpt-oss-*-bf16)
-- GROK series (amd--grok-1-*, lmzheng-grok-1, grok-2)
+- GROK series (lmzheng/grok-1, xai-org/grok-2, amd/grok-1-W4A8KV8)
+
+Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
+- "gpt-oss" (default): GPT-OSS models only (nightly-amd-8-gpu)
+- "grok1-fp8": GROK1-FP8 only (nightly-amd-8-gpu-grok1-fp8)
+- "grok2": GROK2.5 only (nightly-amd-8-gpu-grok2)
+- "grok1-in4": GROK1-IN4 only (nightly-amd-8-gpu-grok1-in4)
+- "all": All models
 
 Reference: benchmark/gsm8k/bench_sglang.py
 """
 
 import ast
-import json
 import os
 import re
 import subprocess
@@ -26,11 +32,15 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+# HuggingFace Hub for model cache checking and download progress
 try:
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfFileSystem, snapshot_download
+    from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
+    print("[WARNING] huggingface_hub not available - model cache checking disabled")
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -64,10 +74,13 @@ class BaseModelConfig:
             self.env_vars = {}
 
 
-# AMD TP=8 base models for gsm8k completion benchmark
-# These models work with completion API but not chat completions
-# GPT-OSS models are cached on upstream CI at /sgl-data/hf-cache/hub/
-AMD_BASE_MODELS_TP8 = [
+# =============================================================================
+# MODEL GROUPS - Each group runs on a separate 8-GPU runner
+# =============================================================================
+
+# Group 1: GPT-OSS models (cached on upstream CI)
+# Runner: nightly-amd-8-gpu
+AMD_GPT_OSS_MODELS = [
     # GPT-OSS-20B - smaller model, run first for faster feedback
     BaseModelConfig(
         model_path="lmsys/gpt-oss-20b-bf16",
@@ -107,15 +120,15 @@ AMD_BASE_MODELS_TP8 = [
     ),
 ]
 
-# GROK models - will download from HF on first run (may take 30-60 min per model)
-# After first run, they will be cached at /sgl-data/hf-cache/hub/
-AMD_GROK_MODELS_TP8 = [
-    # GROK1-FP8 - uses aiter backend, ~300GB download
+# Group 2: GROK1-FP8 only (lmzheng/grok-1)
+# Runner: nightly-amd-8-gpu-grok1-fp8
+AMD_GROK1_FP8_MODELS = [
+    # GROK1-FP8 - cached on upstream CI, verified accuracy: 0.860
     BaseModelConfig(
         model_path="lmzheng/grok-1",
         tp_size=8,
         accuracy_threshold=0.80,
-        timeout=3600,  # 1 hour for download + kernel compilation
+        timeout=3600,  # 1 hour for kernel compilation
         tokenizer_path="Xenova/grok-1-tokenizer",
         other_args=[
             "--quantization",
@@ -132,29 +145,12 @@ AMD_GROK_MODELS_TP8 = [
             "SGLANG_INT4_WEIGHT": "0",
         },
     ),
-    # GROK1-IN4 - INT4 quantized version, ~100-150GB download
-    BaseModelConfig(
-        model_path="amd/grok-1-W4A8KV8",
-        tp_size=8,
-        accuracy_threshold=0.80,
-        timeout=3600,  # 1 hour for download + kernel compilation
-        tokenizer_path="Xenova/grok-1-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "1",
-        },
-    ),
-    # GROK2.5 (grok-2) - latest GROK model, ~300-400GB download
+]
+
+# Group 3: GROK2.5 only (xai-org/grok-2)
+# Runner: nightly-amd-8-gpu-grok2
+AMD_GROK2_MODELS = [
+    # GROK2.5 (grok-2) - latest GROK model
     BaseModelConfig(
         model_path="xai-org/grok-2",
         tp_size=8,
@@ -177,31 +173,221 @@ AMD_GROK_MODELS_TP8 = [
         },
     ),
 ]
-AMD_BASE_MODELS_TP8.extend(AMD_GROK_MODELS_TP8)
+
+# Group 4: GROK1-IN4 only (amd/grok-1-W4A8KV8)
+# Runner: nightly-amd-8-gpu-grok1-in4
+AMD_GROK1_IN4_MODELS = [
+    # GROK1-IN4 - INT4 quantized version
+    BaseModelConfig(
+        model_path="amd/grok-1-W4A8KV8",
+        tp_size=8,
+        accuracy_threshold=0.80,
+        timeout=3600,  # 1 hour for download + kernel compilation
+        tokenizer_path="Xenova/grok-1-tokenizer",
+        other_args=[
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_INT4_WEIGHT": "1",
+        },
+    ),
+]
 
 
-def check_model_available(model_path: str) -> bool:
-    """Check if a model is available (either locally cached or on HuggingFace).
-    
-    Returns True if model can be loaded, False otherwise.
+def get_model_group() -> str:
+    """Get the model group to test from environment variable."""
+    return os.environ.get("AMD_TEST_MODEL_GROUP", "gpt-oss")
+
+
+def get_models_for_group(group: str) -> List[BaseModelConfig]:
+    """Get the list of models for a given group."""
+    if group == "gpt-oss":
+        return AMD_GPT_OSS_MODELS
+    elif group == "grok1-fp8":
+        return AMD_GROK1_FP8_MODELS
+    elif group == "grok2":
+        return AMD_GROK2_MODELS
+    elif group == "grok1-in4":
+        return AMD_GROK1_IN4_MODELS
+    elif group == "all":
+        return (
+            AMD_GPT_OSS_MODELS
+            + AMD_GROK1_FP8_MODELS
+            + AMD_GROK2_MODELS
+            + AMD_GROK1_IN4_MODELS
+        )
+    else:
+        print(f"[WARNING] Unknown model group '{group}', using 'gpt-oss'")
+        return AMD_GPT_OSS_MODELS
+
+
+# =============================================================================
+# MODEL CACHE AND DOWNLOAD UTILITIES
+# =============================================================================
+
+
+def check_local_cache(model_path: str) -> Tuple[bool, str]:
+    """
+    Check if model is cached locally.
+
+    Returns:
+        Tuple of (is_cached, cache_path_or_message)
+    """
+    # Check common HF cache locations
+    cache_dirs = [
+        os.path.expanduser("~/.cache/huggingface/hub"),
+        "/sgl-data/hf-cache/hub",
+        "/home/runner/sgl-data/hf-cache",
+    ]
+
+    # Convert model_path to cache directory format (org--model)
+    cache_name = f"models--{model_path.replace('/', '--')}"
+
+    for cache_dir in cache_dirs:
+        cache_path = os.path.join(cache_dir, cache_name)
+        if os.path.exists(cache_path):
+            # Check if there are snapshots
+            snapshots_dir = os.path.join(cache_path, "snapshots")
+            if os.path.exists(snapshots_dir) and os.listdir(snapshots_dir):
+                return True, cache_path
+
+    return False, f"Not found in: {', '.join(cache_dirs)}"
+
+
+def check_hf_repo_access(model_path: str) -> Tuple[bool, str]:
+    """
+    Check if HuggingFace repository is accessible.
+
+    Returns:
+        Tuple of (is_accessible, message)
     """
     if not HF_HUB_AVAILABLE:
-        # If huggingface_hub not available, assume model exists and let server fail if not
-        return True
-    
+        return True, "huggingface_hub not available, skipping access check"
+
     try:
-        # Try to get the model path - this checks local cache first
-        from huggingface_hub import hf_hub_download, HfFileSystem
         fs = HfFileSystem()
-        # Check if model exists by listing files (works for both local cache and remote)
+        # Try to list files in the repo
         files = fs.ls(model_path, detail=False)
-        return len(files) > 0
+        if files:
+            return True, f"Repository accessible ({len(files)} files)"
+        else:
+            return False, "Repository exists but is empty"
+    except GatedRepoError:
+        return False, "GATED REPO - requires authentication/approval"
+    except RepositoryNotFoundError:
+        return False, "REPO NOT FOUND on HuggingFace"
     except Exception as e:
-        # Model not found or error accessing it
-        print(f"Model {model_path} not available: {e}")
-        return False
+        error_msg = str(e)
+        if "401" in error_msg or "unauthorized" in error_msg.lower():
+            return False, f"AUTH ERROR - may need HF_TOKEN: {error_msg[:100]}"
+        elif "404" in error_msg:
+            return False, f"NOT FOUND: {error_msg[:100]}"
+        elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+            return False, f"NETWORK ERROR: {error_msg[:100]}"
+        else:
+            return False, f"ERROR: {error_msg[:100]}"
 
 
+def log_model_status(config: BaseModelConfig) -> Tuple[bool, str]:
+    """
+    Log detailed model availability status.
+
+    Returns:
+        Tuple of (is_available, status_message)
+    """
+    model_path = config.model_path
+    print(f"\n📦 Checking model: {model_path}")
+    print("-" * 50)
+
+    # Check local cache first
+    is_cached, cache_msg = check_local_cache(model_path)
+    if is_cached:
+        print(f"  ✅ LOCAL CACHE: Found at {cache_msg}")
+        return True, f"Cached locally at {cache_msg}"
+    else:
+        print(f"  ⚠️  LOCAL CACHE: {cache_msg}")
+
+    # Check HF repo access
+    is_accessible, access_msg = check_hf_repo_access(model_path)
+    if is_accessible:
+        print(f"  ✅ HF ACCESS: {access_msg}")
+        print(f"  📥 Model will be downloaded from HuggingFace (this may take a while)")
+        return True, f"Will download from HF: {access_msg}"
+    else:
+        print(f"  ❌ HF ACCESS: {access_msg}")
+        return False, access_msg
+
+    # Also check tokenizer if specified
+    if config.tokenizer_path:
+        tok_cached, tok_msg = check_local_cache(config.tokenizer_path)
+        if tok_cached:
+            print(f"  ✅ TOKENIZER CACHE: Found at {tok_msg}")
+        else:
+            tok_accessible, tok_access_msg = check_hf_repo_access(config.tokenizer_path)
+            if tok_accessible:
+                print(f"  ✅ TOKENIZER HF: {tok_access_msg}")
+            else:
+                print(f"  ⚠️  TOKENIZER: {tok_access_msg}")
+
+    return is_accessible, access_msg
+
+
+def download_model_with_progress(
+    model_path: str, timeout: int = 3600
+) -> Tuple[bool, str]:
+    """
+    Download model with progress logging.
+
+    Returns:
+        Tuple of (success, message)
+    """
+    if not HF_HUB_AVAILABLE:
+        return True, "huggingface_hub not available, skipping pre-download"
+
+    print(f"\n📥 Pre-downloading model: {model_path}")
+    print(f"   Timeout: {timeout}s ({timeout/60:.0f} minutes)")
+    print("-" * 50)
+
+    start_time = time.time()
+
+    try:
+        # Use snapshot_download which shows progress
+        local_dir = snapshot_download(
+            repo_id=model_path,
+            local_files_only=False,
+            resume_download=True,
+        )
+        elapsed = time.time() - start_time
+        print(f"  ✅ Download complete in {elapsed:.1f}s")
+        print(f"  📁 Location: {local_dir}")
+        return True, f"Downloaded to {local_dir}"
+
+    except GatedRepoError:
+        return False, "GATED REPO - requires authentication/approval"
+    except RepositoryNotFoundError:
+        return False, "REPO NOT FOUND on HuggingFace"
+    except Exception as e:
+        error_msg = str(e)
+        elapsed = time.time() - start_time
+        if elapsed >= timeout:
+            return False, f"TIMEOUT after {elapsed:.0f}s: {error_msg[:100]}"
+        elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+            return False, f"NETWORK ERROR after {elapsed:.0f}s: {error_msg[:100]}"
+        else:
+            return False, f"ERROR after {elapsed:.0f}s: {error_msg[:100]}"
+
+
+# =============================================================================
+# BENCHMARK UTILITIES
+# =============================================================================
 
 
 def get_one_example(lines, i, include_answer):
@@ -335,21 +521,42 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
     Tests base models using few-shot completion benchmark.
     This is different from mgsm_en which uses chat completions.
+
+    Model group is selected via AMD_TEST_MODEL_GROUP env var:
+    - "gpt-oss": GPT-OSS models only (default)
+    - "grok": GROK1-FP8 and GROK2.5
+    - "grok-in4": GROK1-IN4 only
+    - "all": All models
     """
 
     @classmethod
     def setUpClass(cls):
-        # This test is for 8-GPU runner (nightly-amd-8-gpu suite)
-        # All models use TP=8
-        cls.models = AMD_BASE_MODELS_TP8
+        # Get model group from environment
+        cls.model_group = get_model_group()
+        cls.models = get_models_for_group(cls.model_group)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+
+        print(f"\n{'='*60}")
+        print(f"AMD GSM8K Completion Evaluation Test")
+        print(f"{'='*60}")
+        print(f"Model group: {cls.model_group}")
+        print(f"Models to test: {len(cls.models)}")
+        for m in cls.models:
+            print(f"  - {m.model_path}")
+        print(f"Questions per model: {cls.num_questions}")
+        print(f"{'='*60}\n")
 
     def test_gsm8k_completion_all_models(self):
         """Test all configured base models with GSM8K completion benchmark."""
         all_results = []
-        summary = "| Model | TP | Accuracy | Threshold | Invalid | Latency | Status |\n"
-        summary += "| ----- | -- | -------- | --------- | ------- | ------- | ------ |\n"
+        summary = f"### Model Group: {self.model_group}\n\n"
+        summary += (
+            "| Model | TP | Accuracy | Threshold | Invalid | Latency | Status |\n"
+        )
+        summary += (
+            "| ----- | -- | -------- | --------- | ------- | ------- | ------ |\n"
+        )
 
         for config in self.models:
             with self.subTest(model=config.model_path):
@@ -361,31 +568,40 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                 acc, invalid, latency = None, None, None
                 skipped = False
 
-                # Check if model is available before trying to launch
-                if not check_model_available(config.model_path):
-                    print(f"⏭️ SKIPPED: Model {config.model_path} not available")
-                    status = "⏭️ SKIPPED"
+                # Check model availability with detailed logging
+                is_available, status_msg = log_model_status(config)
+
+                if not is_available:
+                    print(f"\n❌ MODEL NOT AVAILABLE: {status_msg}")
+                    print(f"⏭️ SKIPPING: {config.model_path}")
+                    status = f"⏭️ SKIP ({status_msg[:20]}...)"
                     skipped = True
-                    all_results.append({
-                        "model": config.model_path,
-                        "tp_size": config.tp_size,
-                        "accuracy": None,
-                        "threshold": config.accuracy_threshold,
-                        "invalid": None,
-                        "latency": None,
-                        "passed": True,  # Don't count as failure
-                        "skipped": True,
-                        "error": "Model not available",
-                    })
+                    all_results.append(
+                        {
+                            "model": config.model_path,
+                            "tp_size": config.tp_size,
+                            "accuracy": None,
+                            "threshold": config.accuracy_threshold,
+                            "invalid": None,
+                            "latency": None,
+                            "passed": True,  # Don't count as failure
+                            "skipped": True,
+                            "error": status_msg,
+                        }
+                    )
                 else:
                     try:
                         # Launch server
+                        print(f"\n🚀 Launching server for {config.model_path}...")
                         process = popen_launch_server_for_base_model(
                             self.base_url, config
                         )
 
                         try:
                             # Run benchmark
+                            print(
+                                f"📊 Running GSM8K benchmark ({self.num_questions} questions)..."
+                            )
                             acc, invalid, latency = run_gsm8k_benchmark(
                                 self.base_url,
                                 num_questions=self.num_questions,
@@ -393,30 +609,63 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                                 parallel=64,
                             )
 
-                            print(f"Accuracy: {acc:.3f} (threshold: {config.accuracy_threshold})")
-                            print(f"Invalid: {invalid:.3f}")
-                            print(f"Latency: {latency:.1f}s")
+                            print(f"\n📈 Results for {config.model_path}:")
+                            print(
+                                f"   Accuracy: {acc:.3f} (threshold: {config.accuracy_threshold})"
+                            )
+                            print(f"   Invalid: {invalid:.3f}")
+                            print(f"   Latency: {latency:.1f}s")
 
                             passed = acc >= config.accuracy_threshold
                             status = "✅ PASS" if passed else "❌ FAIL"
 
-                            all_results.append({
-                                "model": config.model_path,
-                                "tp_size": config.tp_size,
-                                "accuracy": acc,
-                                "threshold": config.accuracy_threshold,
-                                "invalid": invalid,
-                                "latency": latency,
-                                "passed": passed,
-                                "skipped": False,
-                                "error": None,
-                            })
+                            if passed:
+                                print(f"   Status: ✅ PASSED")
+                            else:
+                                print(f"   Status: ❌ FAILED (below threshold)")
+
+                            all_results.append(
+                                {
+                                    "model": config.model_path,
+                                    "tp_size": config.tp_size,
+                                    "accuracy": acc,
+                                    "threshold": config.accuracy_threshold,
+                                    "invalid": invalid,
+                                    "latency": latency,
+                                    "passed": passed,
+                                    "skipped": False,
+                                    "error": None,
+                                }
+                            )
 
                         except Exception as e:
                             error_message = str(e)
-                            print(f"Error during benchmark: {error_message}")
+                            print(f"\n❌ Error during benchmark: {error_message}")
                             status = "❌ ERROR"
-                            all_results.append({
+                            all_results.append(
+                                {
+                                    "model": config.model_path,
+                                    "tp_size": config.tp_size,
+                                    "accuracy": None,
+                                    "threshold": config.accuracy_threshold,
+                                    "invalid": None,
+                                    "latency": None,
+                                    "passed": False,
+                                    "skipped": False,
+                                    "error": error_message,
+                                }
+                            )
+
+                        finally:
+                            print(f"\n🛑 Stopping server for {config.model_path}...")
+                            kill_process_tree(process.pid)
+
+                    except Exception as e:
+                        error_message = str(e)
+                        print(f"\n❌ Error launching server: {error_message}")
+                        status = "❌ ERROR"
+                        all_results.append(
+                            {
                                 "model": config.model_path,
                                 "tp_size": config.tp_size,
                                 "accuracy": None,
@@ -426,26 +675,8 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                                 "passed": False,
                                 "skipped": False,
                                 "error": error_message,
-                            })
-
-                        finally:
-                            kill_process_tree(process.pid)
-
-                    except Exception as e:
-                        error_message = str(e)
-                        print(f"Error launching server: {error_message}")
-                        status = "❌ ERROR"
-                        all_results.append({
-                            "model": config.model_path,
-                            "tp_size": config.tp_size,
-                            "accuracy": None,
-                            "threshold": config.accuracy_threshold,
-                            "invalid": None,
-                            "latency": None,
-                            "passed": False,
-                            "skipped": False,
-                            "error": error_message,
-                        })
+                            }
+                        )
 
                 # Add to summary
                 acc_str = f"{acc:.3f}" if acc is not None else "N/A"
@@ -455,29 +686,44 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
         # Print summary
         print(f"\n{'='*60}")
-        print("SUMMARY")
+        print(f"SUMMARY - Model Group: {self.model_group}")
         print(f"{'='*60}")
         print(summary)
 
         # Write GitHub step summary
         if is_in_ci():
-            write_github_step_summary(f"### TestNightlyGsm8kCompletionEvalAMD\n{summary}")
+            write_github_step_summary(
+                f"### TestNightlyGsm8kCompletionEvalAMD ({self.model_group})\n{summary}"
+            )
 
         # Check for failures (exclude skipped models)
-        failed_models = [r for r in all_results if not r["passed"] and not r.get("skipped", False)]
+        failed_models = [
+            r for r in all_results if not r["passed"] and not r.get("skipped", False)
+        ]
         skipped_models = [r for r in all_results if r.get("skipped", False)]
-        
+        passed_models = [
+            r for r in all_results if r["passed"] and not r.get("skipped", False)
+        ]
+
+        print(f"\n📊 Final Statistics:")
+        print(f"   Passed: {len(passed_models)}")
+        print(f"   Failed: {len(failed_models)}")
+        print(f"   Skipped: {len(skipped_models)}")
+
         if skipped_models:
-            print(f"\n⏭️ Skipped {len(skipped_models)} model(s) (not available)")
-        
+            print(f"\n⏭️ Skipped models (not available):")
+            for r in skipped_models:
+                print(f"   - {r['model']}: {r['error']}")
+
         if failed_models:
-            failure_msg = "\n".join([
-                f"- {r['model']}: accuracy={r['accuracy']}, threshold={r['threshold']}, error={r['error']}"
-                for r in failed_models
-            ])
+            failure_msg = "\n".join(
+                [
+                    f"- {r['model']}: accuracy={r['accuracy']}, threshold={r['threshold']}, error={r['error']}"
+                    for r in failed_models
+                ]
+            )
             raise AssertionError(f"The following models failed:\n{failure_msg}")
 
 
 if __name__ == "__main__":
     unittest.main()
-
