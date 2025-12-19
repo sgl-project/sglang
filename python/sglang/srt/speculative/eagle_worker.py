@@ -1021,8 +1021,8 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
             forward_batch.spec_info.topk_p, forward_batch.spec_info.topk_index = (
-                logits_output.topk_p,
-                logits_output.topk_index,
+                logits_output.topk_p.clone(),
+                logits_output.topk_index.clone(),
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
