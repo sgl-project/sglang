@@ -154,6 +154,28 @@ AMD_BASE_MODELS_TP8 = [
 #             "SGLANG_INT4_WEIGHT": "1",
 #         },
 #     ),
+#     # GROK2.5 (grok-2) - latest GROK model
+#     BaseModelConfig(
+#         model_path="xai-org/grok-2",
+#         tp_size=8,
+#         accuracy_threshold=0.915,
+#         timeout=600,  # 10 minutes for kernel compilation
+#         tokenizer_path="alvarobartt/grok-2-tokenizer",
+#         other_args=[
+#             "--quantization",
+#             "fp8",
+#             "--attention-backend",
+#             "aiter",
+#             "--mem-fraction-static",
+#             "0.85",
+#             "--trust-remote-code",
+#         ],
+#         env_vars={
+#             "RCCL_MSCCL_ENABLE": "0",
+#             "SGLANG_USE_AITER": "1",
+#             "SGLANG_INT4_WEIGHT": "0",
+#         },
+#     ),
 # ]
 # AMD_BASE_MODELS_TP8.extend(AMD_GROK_MODELS_TP8)  # Uncomment when GROK models are cached
 

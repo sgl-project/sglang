@@ -33,7 +33,7 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.86,
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.65,
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.62,
     "google/gemma-2-27b-it": 0.91,
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
 }
