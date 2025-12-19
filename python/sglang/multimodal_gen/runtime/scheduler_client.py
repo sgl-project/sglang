@@ -1,10 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
-import asyncio
 from typing import Any
 
 import zmq
-import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -12,138 +9,75 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-# Using a singleton pattern to hold the ZMQ context and the socket connected to the scheduler
 class SchedulerClient:
     """
-    A gateway for Scheduler, forwarding the ForwardBatch from http endpoints (or somewhere else) to background scheduler, with TCP socket
+    A synchronous, singleton client for communicating with the Scheduler service.
+    Designed for use in synchronous environments like the DiffGenerator or standalone scripts.
     """
-
-    _instance = None
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super(SchedulerClient, cls).__new__(cls)
-        return cls._instance
-
-    def __init__(self, *args, **kwargs):
-        # Ensure the initialization runs only once for the singleton instance
-        if getattr(self, "_init_done", False):
-            return
-        # Queue + worker to strictly serialize ZeroMQ REQ/REP interactions
-        self._request_queue = asyncio.Queue()
-        self._worker_task = None
-        self._closing = False
-        self._init_done = True
 
     def initialize(self, server_args: ServerArgs):
+        if hasattr(self, "context") and not self.context.closed:
+            logger.warning("SchedulerClient is already initialized. Re-initializing.")
+            self.close()
+
         self.server_args = server_args
-        self.context = zmq.asyncio.Context()
-        # This is the REQ socket used to connect to the backend Scheduler
+        self.context = zmq.Context()
         self.scheduler_socket = self.context.socket(zmq.REQ)
-        scheduler_endpoint = server_args.scheduler_endpoint()
+
+        # Set socket options for the main communication socket
+        self.scheduler_socket.setsockopt(zmq.LINGER, 0)
+
+        # 100 minute timeout for generation
+        self.scheduler_socket.setsockopt(zmq.RCVTIMEO, 6000000)
+
+        scheduler_endpoint = self.server_args.scheduler_endpoint()
         self.scheduler_socket.connect(scheduler_endpoint)
-        logger.info(
-            f"Scheduler client connected to backend scheduler at {scheduler_endpoint}"
+        logger.debug(
+            f"SchedulerClient connected to backend scheduler at {scheduler_endpoint}"
         )
-        # Worker will be lazily started on the first forward call to ensure a running loop exists
 
-    async def forward(self, batch: Any) -> Any:
-        """Enqueue a request to the backend Scheduler and await the reply."""
-        if self._closing:
-            raise RuntimeError(
-                "SchedulerClient is closing; cannot forward new requests"
-            )
+    def forward(self, batch: Any) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response."""
+        try:
+            self.scheduler_socket.send_pyobj(batch)
+            output_batch = self.scheduler_socket.recv_pyobj()
+            return output_batch
+        except zmq.error.Again:
+            logger.error("Timeout waiting for response from scheduler.")
+            raise TimeoutError("Scheduler did not respond in time.")
 
-        await self._ensure_worker_started()
+    def ping(self) -> bool:
+        """
+        Checks if the scheduler server is alive using a temporary socket.
+        This avoids interfering with the state of the main REQ/REP socket.
+        """
+        if not hasattr(self, "context") or self.context.closed:
+            logger.error("Cannot ping: client is not initialized.")
+            return False
 
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        await self._request_queue.put((batch, future))
-        return await future
+        ping_socket = self.context.socket(zmq.REQ)
+        ping_socket.setsockopt(zmq.LINGER, 0)
+        ping_socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2-second timeout for pings
 
-    async def _ensure_worker_started(self):
-        # Start the worker only once and only when an event loop is running
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._worker_loop())
+        endpoint = self.server_args.scheduler_endpoint()
 
-    async def _worker_loop(self):
-        while True:
-            try:
-                item = await self._request_queue.get()
-                try:
-                    batch, future = item
-                except Exception:
-                    # Malformed queue item; skip
-                    self._request_queue.task_done()
-                    continue
-
-                try:
-                    await self.scheduler_socket.send_pyobj(batch)
-                    response = await self.scheduler_socket.recv_pyobj()
-                    if not future.done():
-                        future.set_result(response)
-                except Exception as e:
-                    if not future.done():
-                        future.set_exception(e)
-                finally:
-                    self._request_queue.task_done()
-            except asyncio.CancelledError:
-                # Drain remaining items with cancellation error to avoid hanging waiters
-                while True:
-                    try:
-                        batch, future = self._request_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    try:
-                        if not future.done():
-                            future.set_exception(asyncio.CancelledError())
-                    finally:
-                        self._request_queue.task_done()
-                raise
+        try:
+            ping_socket.connect(endpoint)
+            ping_socket.send_pyobj({"method": "ping"})
+            ping_socket.recv_pyobj()
+            return True
+        except zmq.error.Again:
+            return False
+        finally:
+            ping_socket.close()
 
     def close(self):
-        self._closing = True
-        # Cancel worker if running
-        if self._worker_task is not None:
-            self._worker_task.cancel()
-        try:
+        """Closes the socket and terminates the context."""
+        if hasattr(self, "scheduler_socket"):
             self.scheduler_socket.close()
-        finally:
-            try:
-                self.context.term()
-            except Exception:
-                pass
+        if hasattr(self, "context"):
+            self.context.term()
 
 
-# Singleton instance
+# Singleton instance for easy access
 scheduler_client = SchedulerClient()
-
-
-async def run_zeromq_broker(server_args: ServerArgs):
-    """
-    This function runs as a background task in the FastAPI process.
-    It listens for TCP requests from offline clients (e.g., DiffGenerator).
-    """
-    ctx = zmq.asyncio.Context()
-    # This is the REP socket that listens for requests from DiffGenerator
-    socket = ctx.socket(zmq.REP)
-    broker_endpoint = f"tcp://*:{server_args.broker_port}"
-    socket.bind(broker_endpoint)
-    logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
-
-    while True:
-        try:
-            # 1. Receive a request from an offline client
-            request_batch = await socket.recv_pyobj()
-            logger.info("Broker received an offline job from a client.")
-
-            # 2. Forward the request to the main Scheduler via the shared client
-            response_batch = await scheduler_client.forward(request_batch)
-
-            # 3. Send the Scheduler's reply back to the offline client
-            await socket.send_pyobj(response_batch)
-
-        except Exception as e:
-            logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
-            # A reply must be sent to prevent the client from hanging
-            await socket.send_pyobj({"status": "error", "message": str(e)})
