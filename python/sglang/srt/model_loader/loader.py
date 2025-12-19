@@ -37,7 +37,7 @@ import torch
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
-    register_memory_region_v2,
+    register_memory_region,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -257,6 +257,10 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping, remap_prefix
     )
+    hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+    # pass mappings by reference to quant_config
+    if hf_to_sglang_mapper is not None and quant_config is not None:
+        quant_config.apply_sglang_mapper(hf_to_sglang_mapper)
 
     # Build kwargs conditionally
     kwargs = {
@@ -266,7 +270,7 @@ def _initialize_model(
 
     # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
+        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
     return model_class(**kwargs)
@@ -493,6 +497,23 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
+
+        if self.load_config.draft_model_idx is not None:
+            import re
+
+            pattern = r"model.mtp.layers.(\d+)."
+            filtered_weights = []
+            for name, tensor in weights_iterator:
+                group = re.match(pattern, name)
+                if group is not None:
+                    idx = int(group.group(1))
+                    if idx != self.load_config.draft_model_idx:
+                        continue
+                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                else:
+                    new_name = name
+                filtered_weights.append((source.prefix + new_name, tensor))
+            return tuple(filtered_weights)
 
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -787,6 +808,19 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         Called ONCE during model initialization.
         """
         logger.info("[QuantizedRL] Initial load with FP8 quantization")
+
+        original_load_weights = model.load_weights
+
+        def load_weights_proxy(weights):
+            if QuantizedRLModelLoader.is_reload_scenario(model):
+                logger.info("[QuantizedRL] Using fast path reload in load_weights")
+                QuantizedRLModelLoader.rebinding_and_load_weights(
+                    model, original_load_weights, weights
+                )
+            else:
+                original_load_weights(weights)
+
+        model.load_weights = load_weights_proxy
 
         model.load_weights(weights)
         original_weights = dict(model.named_parameters())
@@ -2031,10 +2065,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "TransferEngine registering memory regions (this may take a few seconds)..."
             )
             # register memory region
-            self.remote_instance_transfer_engine_weight_info = (
-                register_memory_region_v2(
-                    model, load_config.remote_instance_weight_loader_transfer_engine
-                )
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                model, load_config.remote_instance_weight_loader_transfer_engine
             )
             logger.info(
                 "TransferEngine memory regions have been successfully registered."
