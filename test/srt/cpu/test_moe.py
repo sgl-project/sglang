@@ -199,14 +199,16 @@ class TestFusedExperts(CustomTestCase):
     def test_mxfp4_moe(self, M, N, K, E, topk):
         dtype = torch.bfloat16
 
-        a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
+        a = torch.randn(M, K, dtype=dtype) / 10
 
-        w1q = torch.randint(0, 256, (E, 2 * N, K // 2), dtype=torch.uint8)
-        w1s = torch.randint(126, 127, (E, 2 * N, K // 32), dtype=torch.uint8)
+        w1_bf16 = torch.randn((E, 2 * N, K), dtype=dtype) / 10
+        w1q, w1s = MXFP4QuantizeUtil.quantize(w1_bf16)
+        w1s = w1s.reshape(E, 2 * N, K // 32)
         w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
 
-        w2q = torch.randint(0, 256, (E, K, N // 2), dtype=torch.uint8)
-        w2s = torch.randint(126, 127, (E, K, N // 32), dtype=torch.uint8)
+        w2_bf16 = torch.randn((E, K, N), dtype=dtype) / 10
+        w2q, w2s = MXFP4QuantizeUtil.quantize(w2_bf16)
+        w2s = w2s.reshape(E, K, N // 32)
         w2dq = MXFP4QuantizeUtil.dequantize(w2q, dtype, w2s)
 
         score = torch.randn((M, E), dtype=dtype)
@@ -240,7 +242,6 @@ class TestFusedExperts(CustomTestCase):
         )
 
         atol = rtol = precision[dtype]
-
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
 
