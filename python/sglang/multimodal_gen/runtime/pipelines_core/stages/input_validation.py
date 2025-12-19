@@ -303,7 +303,7 @@ class InputValidationStage(PipelineStage):
                 )
 
         temporal_compression_ratio = (
-            self.server_args.pipeline_config.vae_config.temporal_compression_ratio
+            server_args.pipeline_config.vae_config.temporal_compression_ratio
         )
         spatial_seq_len = (batch.height * batch.width) // (
             temporal_compression_ratio * temporal_compression_ratio
