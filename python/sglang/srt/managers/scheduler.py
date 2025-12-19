@@ -494,7 +494,7 @@ class Scheduler(
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
                     server_args=self.server_args,
-                    nccl_port=self.port_args.nccl_port,
+                    nccl_port=self.nccl_port,
                     target_worker=self.tp_worker,
                     dp_rank=self.dp_rank,
                 )
@@ -506,7 +506,7 @@ class Scheduler(
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
                     server_args=self.server_args,
-                    nccl_port=self.port_args.nccl_port,
+                    nccl_port=self.nccl_port,
                     target_worker=self.tp_worker,
                     dp_rank=self.dp_rank,
                 )
