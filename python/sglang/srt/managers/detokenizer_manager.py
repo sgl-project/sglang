@@ -21,6 +21,7 @@ from collections import OrderedDict
 from typing import Dict, List, Union
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 
@@ -271,7 +272,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if recv_obj.output_routed_experts is not None:
             output_routed_experts = [
                 (
-                    output_routed_experts.tolist()
+                    pybase64.b64encode(output_routed_experts.numpy().tobytes()).decode(
+                        "utf-8"
+                    )
                     if output_routed_experts is not None
                     else []
                 )

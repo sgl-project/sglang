@@ -3,6 +3,7 @@ from abc import ABC
 from typing import Optional
 
 import numpy as np
+import pybase64
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -275,3 +276,14 @@ def get_global_experts_capturer():
 def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
     global _global_expert_capturer
     _global_expert_capturer = capturer
+
+
+def extract_routed_experts_from_meta_info(data):
+    # To solve the performance issue, we return the experts_ids in base64
+    # We left this function for user to change it back to normal int32
+    # See detokenizer_manager::_extract_routed_experts
+    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+    routed_experts = np.frombuffer(
+        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+    )
+    return routed_experts

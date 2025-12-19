@@ -8,6 +8,9 @@ import requests
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    extract_routed_experts_from_meta_info,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
@@ -139,7 +142,7 @@ class TestReturnRoutedExperts(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-        result = [res["meta_info"]["routed_experts"] for res in http_result]
+        result = [extract_routed_experts_from_meta_info(res) for res in http_result]
 
         return result
 
