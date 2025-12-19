@@ -17,6 +17,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, suppress
+from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -109,6 +110,10 @@ from sglang.srt.utils import (
     is_pin_memory_available,
     rank0_log,
     set_weight_attrs,
+)
+from sglang.srt.hardware_backend.npu.cmo import (
+    get_cmo_stream,
+    wait_cmo_stream,
 )
 
 if TYPE_CHECKING:
@@ -273,7 +278,45 @@ def _initialize_model(
         kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
-    return model_class(**kwargs)
+    mdl = model_class(**kwargs)
+    if _is_npu:
+        for layer in mdl.model.layers:
+            if hasattr(layer, 'layer_communicator') and hasattr(layer, 'mlp'):
+                lmlp = layer.mlp
+                cachelist = []
+#                 for tname, tensor in lmlp.named_parameters():
+#                     if (
+#                         tname.endswith(".weight") and
+#                         (
+#                             "gate" in tname
+#                             or "gate_up_proj" in tname
+#                             or "gate_proj" in tname
+#                             or "up_proj" in tname
+#                             or "down_proj" in tname
+#                         )
+#                     ):
+#                         cachelist.append(tensor)
+                if hasattr(lmlp, 'gate_up_proj'):
+                    cachelist.append(lmlp.gate_up_proj.weight)
+                if hasattr(lmlp, 'gate_proj'):
+                    cachelist.append(lmlp.gate_proj.weight)
+                if hasattr(lmlp, 'up_proj'):
+                    cachelist.append(lmlp.up_proj.weight)
+                if hasattr(lmlp, 'down_proj'):
+                    cachelist.append(lmlp.down_proj.weight)
+                if True and len(cachelist):
+                    layer.layer_communicator._context.cache = cachelist
+                    def mlpwrap(fwd):
+                        @wraps(fwd)
+                        def mlpwrapper(*args, **kwds):
+                            fwdres = fwd(*args, **kwds)
+                            if _is_npu and get_cmo_stream():
+                                wait_cmo_stream()
+                            return fwdres
+                        return mlpwrapper
+                    lmlp.forward = mlpwrap(lmlp.forward)
+
+    return mdl
 
 
 class BaseModelLoader(ABC):
