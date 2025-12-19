@@ -29,12 +29,11 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 logger = logging.getLogger(__name__)
 
 
-class FastDLLMV2ForCausalLM(Qwen2ForCausalLM):
+class FastDLLMV2(Qwen2ForCausalLM):
     """
     Fast-dLLM v2 model for SGLang.
 
     This model is based on Qwen2 architecture with block diffusion capabilities.
-    Currently runs in standard auto-regressive mode.
     """
 
     def __init__(
@@ -45,17 +44,8 @@ class FastDLLMV2ForCausalLM(Qwen2ForCausalLM):
     ) -> None:
         super().__init__(config, quant_config=quant_config, prefix=prefix)
 
-        # Fast_dLLM specific config
-        self.bd_size = getattr(config, "bd_size", 32)
-        self.mask_token_id = getattr(config, "mask_token_id", 151665)
-
-        logger.info(
-            f"FastDLLM initialized: bd_size={self.bd_size}, "
-            f"mask_token_id={self.mask_token_id}"
-        )
-
 
 # Register with HuggingFace architecture name
-FastDLLMV2ForCausalLM.__name__ = "Fast_dLLM_QwenForCausalLM"
+FastDLLMV2.__name__ = "Fast_dLLM_QwenForCausalLM"
 
-EntryClass = FastDLLMV2ForCausalLM
+EntryClass = FastDLLMV2
