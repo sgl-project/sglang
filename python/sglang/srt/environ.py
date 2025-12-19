@@ -268,6 +268,7 @@ class Envs:
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
+    SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -329,6 +330,12 @@ class Envs:
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
+    SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+
+    # VLM Item CUDA IPC Transport
+    SGLANG_USE_CUDA_IPC_TRANSPORT=EnvBool(False)
+    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
+    SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -359,6 +366,9 @@ class Envs:
 
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
+
+    # Metrics
+    SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
 
     # fmt: on
 

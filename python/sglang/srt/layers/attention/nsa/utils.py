@@ -19,6 +19,11 @@ NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = get_bool_env_var(
 NSA_QUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_QUANT_K_CACHE_FAST", "true")
 NSA_DEQUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_DEQUANT_K_CACHE_FAST", "true")
 
+# Environment variable to control mtp precomputing of metadata for multi-step speculative decoding
+NSA_ENABLE_MTP_PRECOMPUTE_METADATA = get_bool_env_var(
+    "SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA", "true"
+)
+
 
 def print_nsa_bool_env_vars():
     msg = ""
