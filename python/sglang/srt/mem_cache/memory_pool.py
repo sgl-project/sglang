@@ -963,31 +963,19 @@ class MHATokenToKVPool(KVCache):
             grid = (N,)
             masked_set_kv_buffer_kernel[grid](
                 cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
                 loc,
                 dcp_kv_mask,
-                self.k_buffer[layer_id - self.start_layer],
                 N,
                 H,
                 D,
                 128,
                 cache_k.stride(0),
                 cache_k.stride(1),
-                self.k_buffer[layer_id - self.start_layer].stride(0),
-                self.k_buffer[layer_id - self.start_layer].stride(1),
-            )
-            masked_set_kv_buffer_kernel[grid](
-                cache_v,
-                loc,
-                dcp_kv_mask,
-                self.v_buffer[layer_id - self.start_layer],
-                N,
-                H,
-                D,
-                128,
                 cache_v.stride(0),
                 cache_v.stride(1),
-                self.v_buffer[layer_id - self.start_layer].stride(0),
-                self.v_buffer[layer_id - self.start_layer].stride(1),
             )
         else:
             _set_kv_buffer_impl(
@@ -2047,18 +2035,20 @@ def copy_all_layer_kv_cache_tiled(
 
 @triton.jit
 def masked_set_kv_buffer_kernel(
-    src_ptr,
+    k_ptr,
+    v_ptr,
+    k_buffer_ptr,
+    v_buffer_ptr,
     loc_ptr,
     mask_ptr,
-    dst_ptr,
     N: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     CHUNK: tl.constexpr,
-    src_stride_B: tl.constexpr,
-    src_stride_H: tl.constexpr,
-    dst_stride_B: tl.constexpr,
-    dst_stride_H: tl.constexpr,
+    k_stride_B: tl.constexpr,
+    k_stride_H: tl.constexpr,
+    v_stride_B: tl.constexpr,
+    v_stride_H: tl.constexpr,
 ):
     pid = tl.program_id(0)
     if pid >= N:
@@ -2081,7 +2071,12 @@ def masked_set_kv_buffer_kernel(
         row = idx // D
         col = idx % D
 
-        src_addr = src_ptr + pid * src_stride_B + row * src_stride_H + col
-        data = tl.load(src_addr, mask=mask)
-        dst_addr = dst_ptr + loc * dst_stride_B + row * dst_stride_H + col
-        tl.store(dst_addr, data, mask=mask)
+        k_addr = k_ptr + pid * k_stride_B + row * k_stride_H + col
+        key = tl.load(k_addr, mask=mask)
+        key_buffer_addr = k_buffer_ptr + loc * H * D + idx
+        tl.store(key_buffer_addr, key, mask=mask)
+
+        v_addr = v_ptr + pid * v_stride_B + row * v_stride_H + col
+        value = tl.load(v_addr, mask=mask)
+        value_buffer_addr = v_buffer_ptr + loc * H * D + idx
+        tl.store(value_buffer_addr, value, mask=mask)
