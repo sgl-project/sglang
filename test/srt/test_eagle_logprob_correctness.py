@@ -10,12 +10,13 @@ from sglang.test.test_utils import (
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     kill_process_tree,
     popen_launch_server,
 )
 
 
-class TestEagleLogprobCorrectness(unittest.TestCase):
+class TestEagleLogprobCorrectness(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.prompt = "The capital of France is"
