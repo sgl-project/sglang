@@ -61,7 +61,7 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
             model=self.model,
             eval_name="humaneval",
             num_examples=None,
-            num_threads=1,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
