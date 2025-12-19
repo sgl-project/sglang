@@ -40,9 +40,9 @@ def worker(world_size, rank, port):
 
     # Matrix sizes similar to real model layers
     # Format: (batch_size, hidden_dim) - typical tensor shape for all-reduce
-    BS = 50    # max batch_size (1..BS)
+    BS = 50  # max batch_size (1..BS)
     hidden_dim = 16384  # hidden dimension / intermediate dimension
-    
+
     # Different seed per rank - each GPU has DIFFERENT input
     torch.manual_seed(42 + rank)
 
@@ -77,7 +77,9 @@ def worker(world_size, rank, port):
         results_allreduce_only.append((checksum, first_vals))
 
         if rank == 0:
-            print(f"  Trial {trial+1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
+            print(
+                f"  Trial {trial+1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}"
+            )
 
     # Check determinism
     if rank == 0:
@@ -131,7 +133,9 @@ def worker(world_size, rank, port):
             results_allreduce_only[trial].append((bs, checksum, first_vals))
 
             if rank == 0:
-                print(f"  Batch size {bs:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
+                print(
+                    f"  Batch size {bs:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}"
+                )
 
     # Check determinism
     if rank == 0:
@@ -141,7 +145,9 @@ def worker(world_size, rank, port):
             _, ref_sum, ref_vals = results[0]
             all_match = True
             for _, s, vals in results[1:]:
-                if abs(ref_sum - s) > 1e-3 or not torch.allclose(ref_vals, vals, rtol=1e-3):
+                if abs(ref_sum - s) > 1e-3 or not torch.allclose(
+                    ref_vals, vals, rtol=1e-3
+                ):
                     all_match = False
 
         if all_match:
@@ -165,7 +171,9 @@ def main():
     print(f"Using world_size: {world_size}")
 
     if available_gpus < world_size:
-        print(f"WARNING: Only {available_gpus} GPUs available, using {available_gpus} instead")
+        print(
+            f"WARNING: Only {available_gpus} GPUs available, using {available_gpus} instead"
+        )
         world_size = available_gpus
 
     if world_size < 2:

@@ -40,23 +40,25 @@ def worker(world_size, rank, port):
 
     # Try to import and use deterministic kernel
     try:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
         from torch.distributed import new_group
-        
+
         # Create gloo group for custom AR
         dist.barrier()
         ar_group = new_group(backend="gloo")
         dist.barrier()
-        
+
         custom_ar = CustomAllreduce(group=ar_group, device=device)
-        
+
         if custom_ar is None or custom_ar.disabled:
             if rank == 0:
                 print("✗ Custom AR not available or disabled")
             dist.destroy_process_group()
             return
-        
-        if not hasattr(custom_ar, 'deterministic_all_reduce'):
+
+        if not hasattr(custom_ar, "deterministic_all_reduce"):
             if rank == 0:
                 print("✗ Deterministic kernel not available")
             dist.destroy_process_group()
@@ -65,6 +67,7 @@ def worker(world_size, rank, port):
         if rank == 0:
             print(f"✗ Failed to initialize deterministic kernel: {e}")
             import traceback
+
             traceback.print_exc()
         dist.destroy_process_group()
         return
@@ -73,9 +76,9 @@ def worker(world_size, rank, port):
 
     # Matrix sizes similar to real model layers
     # Format: (batch_size, hidden_dim) - typical tensor shape for all-reduce
-    BS = 50    # max batch_size (1..BS)
+    BS = 50  # max batch_size (1..BS)
     hidden_dim = 16384  # hidden dimension / intermediate dimension
-    
+
     # Different seed per rank - each GPU has DIFFERENT input
     torch.manual_seed(42 + rank)
 
@@ -83,12 +86,14 @@ def worker(world_size, rank, port):
     # Single request: (hidden_dim,)
     base_input = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
     base_input_rand = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
-    
+
     # Check if inputs fit in buffer
     # Buffer size is max_size bytes, input size is numel * element_size bytes
     input_size_bytes = base_input.numel() * base_input.element_size()
     if input_size_bytes > custom_ar.max_size and rank == 0:
-        print(f"Warning: Input size ({input_size_bytes/(1024*1024):.1f} MB) exceeds buffer size ({custom_ar.max_size/(1024*1024):.1f} MB)")
+        print(
+            f"Warning: Input size ({input_size_bytes/(1024*1024):.1f} MB) exceeds buffer size ({custom_ar.max_size/(1024*1024):.1f} MB)"
+        )
         print("  Using unregistered mode (will copy to buffer)")
 
     dist.barrier()
@@ -111,7 +116,7 @@ def worker(world_size, rank, port):
         # Check if input fits in buffer, use registered mode if too large
         input_size_bytes = inp.numel() * inp.element_size()
         use_registered = input_size_bytes > custom_ar.max_size
-        
+
         if use_registered:
             # For large inputs, register buffer first
             custom_ar.register_buffer(inp)
@@ -127,7 +132,9 @@ def worker(world_size, rank, port):
         results_allreduce_only.append((checksum, first_vals))
 
         if rank == 0:
-            print(f"  Trial {trial+1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
+            print(
+                f"  Trial {trial+1:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}"
+            )
 
     # Check determinism
     if rank == 0:
@@ -141,7 +148,9 @@ def worker(world_size, rank, port):
         if all_match:
             print("  ✓ DETERMINISTIC KERNEL (fixed BS): DETERMINISTIC (as expected)")
         else:
-            print("  ✗ DETERMINISTIC KERNEL (fixed BS): NON-DETERMINISTIC (unexpected!)")
+            print(
+                "  ✗ DETERMINISTIC KERNEL (fixed BS): NON-DETERMINISTIC (unexpected!)"
+            )
 
     dist.barrier()
 
@@ -171,14 +180,18 @@ def worker(world_size, rank, port):
             # Check if input fits in buffer, use registered mode if too large
             input_size_bytes = batch_flat.numel() * batch_flat.element_size()
             use_registered = input_size_bytes > custom_ar.max_size
-            
+
             if use_registered:
                 # For large inputs, register buffer first
                 custom_ar.register_buffer(batch_flat)
-                result_flat = custom_ar.deterministic_all_reduce(batch_flat, registered=True)
+                result_flat = custom_ar.deterministic_all_reduce(
+                    batch_flat, registered=True
+                )
             else:
                 # For smaller inputs, use unregistered mode
-                result_flat = custom_ar.deterministic_all_reduce(batch_flat, registered=False)
+                result_flat = custom_ar.deterministic_all_reduce(
+                    batch_flat, registered=False
+                )
             torch.cuda.synchronize()
 
             # Reshape back to (bs, hidden_dim)
@@ -191,7 +204,9 @@ def worker(world_size, rank, port):
             results_allreduce_only[trial].append((bs, checksum, first_vals))
 
             if rank == 0:
-                print(f"  Batch size {bs:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}")
+                print(
+                    f"  Batch size {bs:2d}: sum={checksum:.6f}, first5={first_vals.tolist()}"
+                )
 
     # Check determinism
     if rank == 0:
@@ -201,7 +216,9 @@ def worker(world_size, rank, port):
             _, ref_sum, ref_vals = results[0]
             all_match = True
             for _, s, vals in results[1:]:
-                if abs(ref_sum - s) > 1e-3 or not torch.allclose(ref_vals, vals, rtol=1e-3):
+                if abs(ref_sum - s) > 1e-3 or not torch.allclose(
+                    ref_vals, vals, rtol=1e-3
+                ):
                     all_match = False
 
         if all_match:
@@ -225,7 +242,9 @@ def main():
     print(f"Using world_size: {world_size}")
 
     if available_gpus < world_size:
-        print(f"WARNING: Only {available_gpus} GPUs available, using {available_gpus} instead")
+        print(
+            f"WARNING: Only {available_gpus} GPUs available, using {available_gpus} instead"
+        )
         world_size = available_gpus
 
     if world_size < 2:
