@@ -1273,6 +1273,11 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
 
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(x.dtype)
+        )
 
         local_num_experts = self.moe_runner_config.num_local_experts
         routing_method_type = self.moe_runner_config.routing_method_type
@@ -1283,6 +1288,7 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
 
         output = trtllm_mxint4_block_scale_moe(
             routing_logits=router_logits,  # float
+            routing_bias=correction_bias,
             hidden_states=x,
             gemm1_weights=layer.w13_weight_packed,
             gemm1_weights_scale=layer.w13_weight_scale,
