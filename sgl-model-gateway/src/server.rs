@@ -12,12 +12,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    serve, Json, Router,
+    Json, Router,
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::{net::TcpListener, signal, spawn};
+use tokio::{signal, spawn};
 use tracing::{error, info, warn, Level};
 
 use crate::{
@@ -636,6 +636,9 @@ pub struct ServerConfig {
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
+    /// Grace period in seconds to wait for in-flight requests during shutdown.
+    /// Default is 30 seconds.
+    pub shutdown_grace_period_secs: u64,
 }
 
 pub fn build_app(
@@ -1004,9 +1007,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
         let handle = axum_server::Handle::new();
         let handle_clone = handle.clone();
+        let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
         spawn(async move {
             shutdown_signal().await;
-            handle_clone.graceful_shutdown(None);
+            handle_clone.graceful_shutdown(Some(grace_period));
         });
 
         axum_server::bind_rustls(addr, tls_config)
@@ -1015,11 +1019,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     } else {
-        let listener = TcpListener::bind(&bind_addr)
-            .await
-            .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
-        serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+        let addr: std::net::SocketAddr = bind_addr
+            .parse()
+            .map_err(|e| format!("Invalid address: {}", e))?;
+
+        let handle = axum_server::Handle::new();
+        let handle_clone = handle.clone();
+        let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
+        spawn(async move {
+            shutdown_signal().await;
+            handle_clone.graceful_shutdown(Some(grace_period));
+        });
+
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     }
