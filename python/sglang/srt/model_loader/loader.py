@@ -861,45 +861,34 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         quantized_modules = []
 
         for name, module in model.named_modules():
+            
+            #  Skip modules that should not be quantized (lm_head, embeddings, layer norms, etc.)
+            if any(
+                skip in name
+                for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+            ):
+                logger.info(f"[QuantizedRL] Skip quantization for module: {name}")
+                continue
+
+        
+            if not hasattr(module, "weight") or module.weight is None:
+                logger.info(
+                    f"[QuantizedRL] Skip quantization for module: {name} since it does not have a weight tensor"
+                )
+                continue
+
             with device_loading_context(module, target_device):
-                # 1) Skip modules that should not be quantized (lm_head, embeddings, layer norms, etc.)
-                if any(
-                    skip in name
-                    for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
-                ):
-                    logger.info(f"[QuantizedRL] Skip quantization for module: {name}")
-                    continue
-
-                # 2) Modules without a weight tensor
-                if not hasattr(module, "weight") or module.weight is None:
-                    logger.info(
-                        f"[QuantizedRL] Skip quantization for module: {name} because it does not have a weight tensor"
-                    )
-                    continue
-
                 weight = module.weight
 
-                # 3) Only attempt blockwise quantization for 2D BF16/FP16/FP32 weights
                 if weight.dtype not in [
                     torch.bfloat16,
                     torch.float16,
                     torch.float32,
                 ]:
                     logger.info(
-                        f"[QuantizedRL] module: {name} dtype is {weight.dtype} not BF16/FP16/FP32 weights"
+                        f"[QuantizedRL] Skip quantization for module: {name} since dtype is {weight.dtype} not BF16/FP16/FP32 weights"
                     )
                     continue
-
-                use_blockwise = False
-
-                assert (
-                    weight.ndim == 2
-                ), f"Module {name} weight shape {weight.shape} is not 2D"
-                # Check whether both dimensions are divisible by the block size
-                assert (
-                    weight.shape[0] % default_block_size[0] == 0
-                    and weight.shape[1] % default_block_size[1] == 0
-                ), f"Module {name} weight shape {weight.shape} is not divisible by block size {default_block_size}"
 
                 try:
                     qweight, scale = scaled_fp8_blockwise(weight, default_block_size)
@@ -932,7 +921,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         )
 
                     module.weight = Parameter(qweight, requires_grad=False)
-                    use_blockwise = True
 
                     logger.info(
                         f"[QuantizedRL] Quantize (blockwise, initial load): {name} "
@@ -949,15 +937,15 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 except Exception as e:
                     logger.warning(
                         f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
-                        "skipping blockwise quantization for this module"
                     )
-
-                # 4) If blockwise is not applicable or fails, fallback to original weight dtype
-                if not use_blockwise:
-                    logger.info(
-                        f"[QuantizedRL] Disabled or failed blockwise fp8 for module: {name}; "
-                        f"keeping original weight dtype {weight.dtype} on initial load"
-                    )
+                    # If blockwise is not applicable or fails, fallback to per-channel quantization 
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
+                        logger.info(
+                            f"[QuantizedRL] Fllback to per-channel quantization for module: {name}; "
+    
+                        )
 
         model.flash_rl_initial_load_complete = True
         self._initial_load_complete = True
@@ -1253,38 +1241,33 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     yield (name, weight)
                 elif weight.dtype in [torch.bfloat16, torch.float32, torch.float16]:
                     # Try blockwise quantization first
-                    use_blockwise = False
                     if len(weight.shape) == 2:
                         # Check if shape is compatible with blockwise quantization
-                        if (
-                            weight.shape[0] % default_block_size[0] == 0
-                            and weight.shape[1] % default_block_size[1] == 0
-                        ):
-                            try:
-                                qweight, scale = scaled_fp8_blockwise(
-                                    weight, default_block_size
-                                )
-                                # scale shape is (blk_m, blk_n, 1), need to squeeze
-                                scale = scale.squeeze(-1)
-                                use_blockwise = True
-                                logger.info(
-                                    f"[QuantizedRL] Quantize (blockwise): {name} {weight.dtype}→FP8 "
-                                    f"(shape={weight.shape}, block_size={default_block_size})"
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
-                                    "falling back to per_token_group_quant_fp8"
-                                )
 
-                    # Fallback to per_token_group_quant_fp8 if blockwise failed or not applicable
-                    if not use_blockwise:
-                        qweight, scale = per_token_group_quant_fp8(
-                            weight, weight.shape[-1]
-                        )
-                        logger.info(
-                            f"[QuantizedRL] Quantize (per_token_group): {name} {weight.dtype}→FP8"
-                        )
+                        try:
+                            qweight, scale = scaled_fp8_blockwise(
+                                weight, default_block_size
+                            )
+                            # scale shape is (blk_m, blk_n, 1), need to squeeze
+                            scale = scale.squeeze(-1)
+                            logger.info(
+                                f"[QuantizedRL] Quantize (blockwise): {name} {weight.dtype}→FP8 "
+                                f"(shape={weight.shape}, block_size={default_block_size})"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
+                                "falling back to per_token_group_quant_fp8"
+                            )
+                            qweight, scale = per_token_group_quant_fp8(
+                                weight, weight.shape[-1]
+                            )
+                            logger.info(
+                                f"[QuantizedRL] Fallback to per-channel quantization for module: {name}; "
+                            )
+
+
+
 
                     QuantizedRLModelLoader._store_quantized_scale(
                         quantized_scales, name, scale
