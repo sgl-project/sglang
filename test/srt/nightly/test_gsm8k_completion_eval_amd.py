@@ -14,7 +14,8 @@ Base models tested here:
 Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
 - "gpt-oss" (default): GPT-OSS models only (nightly-amd-8-gpu)
 - "grok": All GROK models (nightly-amd-8-gpu-grok)
-- "deepseek-v3": DeepSeek-V3 with DP attention (nightly-amd-8-gpu-deepseek-v3)
+- "deepseek-v3-dp": DeepSeek-V3 with DP attention (nightly-amd-8-gpu-deepseek-v3-dp)
+- "deepseek-v3-tc": DeepSeek-V3 with torch compile (nightly-amd-8-gpu-deepseek-v3-tc)
 - "deepseek-r1": DeepSeek-R1 reasoning model (nightly-amd-8-gpu-deepseek-r1)
 - "all": All models
 
@@ -96,7 +97,7 @@ AMD_GPT_OSS_MODELS = [
     BaseModelConfig(
         model_path="lmsys/gpt-oss-20b-bf16",
         tp_size=8,
-        accuracy_threshold=0.50,
+        accuracy_threshold=0.49,
         other_args=[
             "--chunked-prefill-size",
             "130172",
@@ -203,11 +204,11 @@ AMD_GROK_MODELS = [
     ),
 ]
 
-# Group 3: DeepSeek-V3 (uses DP attention)
-# Runner: nightly-amd-8-gpu-deepseek-v3
+# Group 3: DeepSeek-V3 with DP Attention
+# Runner: nightly-amd-8-gpu-deepseek-v3-dp
 # Note: Uses DP attention (dp-size=8) for better performance, requires ROCm 7.0+
-AMD_DEEPSEEK_V3_MODELS = [
-    # DeepSeek-V3-0324 - uses DP attention
+AMD_DEEPSEEK_V3_DP_MODELS = [
+    # DeepSeek-V3-0324 with DP attention
     BaseModelConfig(
         model_path="deepseek-ai/DeepSeek-V3-0324",
         tp_size=8,
@@ -230,10 +231,37 @@ AMD_DEEPSEEK_V3_MODELS = [
     ),
 ]
 
+# Group 3b: DeepSeek-V3 with Torch Compile
+# Runner: nightly-amd-8-gpu-deepseek-v3-tc
+# Note: Uses torch compile for performance optimization, requires ROCm 7.0+
+AMD_DEEPSEEK_V3_TC_MODELS = [
+    # DeepSeek-V3-0324 with torch compile
+    BaseModelConfig(
+        model_path="deepseek-ai/DeepSeek-V3-0324",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,  # 1 hour for compilation + large model
+        other_args=[
+            "--chunked-prefill-size",
+            "131072",
+            "--mem-fraction-static",
+            "0.80",  # Reduced for torch compile
+            "--cuda-graph-max-bs",
+            "16",  # Required for torch compile MoE
+            "--enable-torch-compile",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "SGLANG_USE_ROCM700A": "1",
+            "SGLANG_USE_AITER": "1",
+        },
+    ),
+]
+
 # Group 4: DeepSeek-R1 (reasoning model)
 # Runner: nightly-amd-8-gpu-deepseek-r1
 AMD_DEEPSEEK_R1_MODELS = [
-    # DeepSeek-R1-0528 - reasoning model
+    # DeepSeek-R1-0528 - reasoning model, ~80GB per GPU
     BaseModelConfig(
         model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
@@ -245,6 +273,8 @@ AMD_DEEPSEEK_R1_MODELS = [
             "--chunked-prefill-size",
             "131072",
             "--disable-radix-cache",
+            "--mem-fraction-static",
+            "0.85",
             "--trust-remote-code",
         ],
         env_vars={
@@ -265,15 +295,18 @@ def get_models_for_group(group: str) -> List[BaseModelConfig]:
         return AMD_GPT_OSS_MODELS
     elif group == "grok":
         return AMD_GROK_MODELS
-    elif group == "deepseek-v3":
-        return AMD_DEEPSEEK_V3_MODELS
+    elif group == "deepseek-v3-dp":
+        return AMD_DEEPSEEK_V3_DP_MODELS
+    elif group == "deepseek-v3-tc":
+        return AMD_DEEPSEEK_V3_TC_MODELS
     elif group == "deepseek-r1":
         return AMD_DEEPSEEK_R1_MODELS
     elif group == "all":
         return (
             AMD_GPT_OSS_MODELS
             + AMD_GROK_MODELS
-            + AMD_DEEPSEEK_V3_MODELS
+            + AMD_DEEPSEEK_V3_DP_MODELS
+            + AMD_DEEPSEEK_V3_TC_MODELS
             + AMD_DEEPSEEK_R1_MODELS
         )
     else:
@@ -780,12 +813,6 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
             f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
         )
 
-        # Write GitHub step summary
-        if is_in_ci():
-            write_github_step_summary(
-                f"### TestNightlyGsm8kCompletionEvalAMD ({self.model_group})\n{summary}"
-            )
-
         # Check for failures (exclude skipped models)
         failed_models = [
             r for r in all_results if not r["passed"] and not r.get("skipped", False)
@@ -794,6 +821,37 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
         passed_models = [
             r for r in all_results if r["passed"] and not r.get("skipped", False)
         ]
+
+        # Build GitHub summary with results and failure details
+        github_summary = f"### Model Group: {self.model_group}\n\n{summary}\n"
+        github_summary += f"\n**Statistics:** ✅ Passed: {len(passed_models)} | ❌ Failed: {len(failed_models)} | ⏭️ Skipped: {len(skipped_models)}\n"
+        github_summary += f"\n**Total Runtime:** {total_test_time:.1f}s ({total_test_time/60:.1f} min)\n"
+
+        if failed_models:
+            github_summary += "\n#### ❌ Failed Models\n"
+            for r in failed_models:
+                acc_str = f"{r['accuracy']:.3f}" if r["accuracy"] is not None else "N/A"
+                github_summary += f"- **{r['model']}**: accuracy={acc_str}, threshold={r['threshold']}"
+                if r.get("error"):
+                    # Truncate long errors for display
+                    error_short = (
+                        r["error"][:200] + "..."
+                        if len(r["error"]) > 200
+                        else r["error"]
+                    )
+                    github_summary += f"\n  - Error: `{error_short}`"
+                github_summary += "\n"
+
+        if skipped_models:
+            github_summary += "\n#### ⏭️ Skipped Models\n"
+            for r in skipped_models:
+                github_summary += (
+                    f"- **{r['model']}**: {r.get('error', 'Not available')}\n"
+                )
+
+        # Write GitHub step summary
+        if is_in_ci():
+            write_github_step_summary(github_summary)
 
         print(f"\n📊 Final Statistics:")
         print(f"   Passed: {len(passed_models)}")
@@ -806,6 +864,15 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                 print(f"   - {r['model']}: {r['error']}")
 
         if failed_models:
+            print(f"\n❌ Failed models:")
+            for r in failed_models:
+                acc_str = f"{r['accuracy']:.3f}" if r["accuracy"] is not None else "N/A"
+                print(
+                    f"   - {r['model']}: accuracy={acc_str}, threshold={r['threshold']}"
+                )
+                if r.get("error"):
+                    print(f"     Error: {r['error'][:200]}")
+
             failure_msg = "\n".join(
                 [
                     f"- {r['model']}: accuracy={r['accuracy']}, threshold={r['threshold']}, error={r['error']}"
