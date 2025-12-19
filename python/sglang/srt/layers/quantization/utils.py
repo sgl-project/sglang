@@ -48,6 +48,15 @@ def is_layer_skipped(
     ignored_layers: List[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
 ) -> bool:
+
+    def _is_ignored(name: str) -> bool:
+        for pattern in ignored_layers:
+            if name == pattern:
+                return True
+            if "*" in pattern and fnmatch.fnmatch(name, pattern):
+                return True
+        return False
+
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
     proj_name = prefix.split(".")[-1]
@@ -56,6 +65,7 @@ def is_layer_skipped(
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
+
     if proj_name in fused_mapping:
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name)
@@ -64,9 +74,7 @@ def is_layer_skipped(
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
-            is_shard_skipped = any(
-                ignored in shard_prefix for ignored in ignored_layers
-            )
+            is_shard_skipped = _is_ignored(shard_prefix)
 
             if is_skipped is None:
                 is_skipped = is_shard_skipped
@@ -77,20 +85,24 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = any(ignored in prefix for ignored in ignored_layers)
+        is_skipped = _is_ignored(prefix)
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")
-            if prefix_gate in ignored_layers and prefix_up in ignored_layers:
+            if _is_ignored(prefix_gate) and _is_ignored(prefix_up):
                 is_skipped = True
         elif "experts" in prefix:
-            is_skipped = any(
-                [
-                    prefix in layer_name
-                    for layer_name in ignored_layers
-                    if "experts" in layer_name
-                ]
+            # Check if any ignored pattern contains this prefix (specific logic for experts)
+            # We adapt it to use strict string containment as before, 
+            # or we can rely on _is_ignored if the user uses wildcards.
+            # Preserving original logic structure for safety but cleaning it up.
+            experts_skipped = any(
+                prefix in layer_name
+                for layer_name in ignored_layers
+                if "experts" in layer_name
             )
+            if experts_skipped:
+                is_skipped = True
 
     assert is_skipped is not None
     return is_skipped
