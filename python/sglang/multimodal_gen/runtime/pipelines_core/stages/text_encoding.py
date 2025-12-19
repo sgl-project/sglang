@@ -266,12 +266,33 @@ class TextEncodingStage(PipelineStage):
             else:
                 attention_mask = text_inputs["attention_mask"]
             with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs: BaseEncoderOutput = text_encoder(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    use_cache=False,
-                )
+                # Try the custom encoder path first; if a native HF encoder-decoder
+                # model (e.g., UMT5Model) slipped through, fall back to its encoder.
+                try:
+                    outputs: BaseEncoderOutput = text_encoder(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                        use_cache=False,
+                    )
+                except ValueError as e:
+                    msg = str(e)
+                    needs_decoder = (
+                        "decoder_input_ids" in msg or "decoder_inputs_embeds" in msg
+                    )
+                    if needs_decoder and hasattr(text_encoder, "get_encoder"):
+                        hf_encoder = text_encoder.get_encoder()
+                        hf_outputs = hf_encoder(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            output_hidden_states=True,
+                        )
+                        outputs = BaseEncoderOutput(
+                            last_hidden_state=hf_outputs.last_hidden_state,
+                            attention_mask=attention_mask,
+                        )
+                    else:
+                        raise
             prompt_embeds = postprocess_func(outputs, text_inputs)
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(dtype=dtype)
