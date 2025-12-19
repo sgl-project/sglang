@@ -3207,7 +3207,7 @@ class ServerArgs:
         parser.add_argument(
             "--allow-runtime-lora-updating",
             action="store_true",
-            default=get_bool_env_var("SGLANG_ALLOW_RUNTIME_LORA_UPDATING", False),
+            default=get_bool_env_var("SGLANG_ALLOW_RUNTIME_LORA_UPDATING", "false"),
             help="Allow automatic discovery and loading of LoRA adapters from --lora-cache-dir at runtime. "
             "Similar to VLLM_ALLOW_RUNTIME_LORA_UPDATING in vLLM. "
             "Can also be set via SGLANG_ALLOW_RUNTIME_LORA_UPDATING environment variable.",
