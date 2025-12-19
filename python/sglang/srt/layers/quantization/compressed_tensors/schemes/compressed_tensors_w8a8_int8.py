@@ -91,14 +91,6 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 )
                 layer.register_parameter("input_zero_point", input_zero_point)
 
-
-class GPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
-
-    def __init__(
-        self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
-    ):
-        super().__init__(strategy, is_static_input_scheme, input_symmetric)
-
     @classmethod
     def get_min_capability(cls) -> int:
         # ampere and up
