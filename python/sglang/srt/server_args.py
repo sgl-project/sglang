@@ -2314,11 +2314,19 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                os.environ["NCCL_ALGO"] = "allreduce:tree"
-                self.disable_custom_all_reduce = True
-                logger.warning(
-                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
-                )
+                if is_hip():
+                    # AMD: use 1-stage all-reduce kernel which is inherently deterministic
+                    # (each GPU reads all data from all GPUs, reduces locally in fixed order)
+                    logger.info(
+                        "AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)"
+                    )
+                else:
+                    # CUDA: use NCCL tree algorithm
+                    os.environ["NCCL_ALGO"] = "allreduce:tree"
+                    self.disable_custom_all_reduce = True
+                    logger.warning(
+                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                    )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
