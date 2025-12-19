@@ -459,13 +459,11 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
   return 1u << (32 - __builtin_clz(x - 1));
 }
 
-
 #ifndef USE_ROCM
 #define SGLANG_LDG(arg) __ldg(arg)
 #else
 #define SGLANG_LDG(arg) *(arg)
 #endif
-
 
 // Define dispatch macro for Rotation Dimension (Pair Count)
 // Case 32 -> head_size 64

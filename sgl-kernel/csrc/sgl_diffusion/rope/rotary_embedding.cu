@@ -116,10 +116,7 @@ __device__ __forceinline__ RotaryVecData<scalar_t, interleaved> load_rotary_vec(
 // Compute RoPE on the loaded vector tile, then store back to q/k.
 template <typename scalar_t, bool interleaved, bool aligned_qk>
 __device__ __forceinline__ void compute_store_rotary_vec(
-    scalar_t* __restrict__ arr, 
-    const RotaryVecData<scalar_t, interleaved>& data, 
-    int rot_offset, 
-    int embed_dim) {
+    scalar_t* __restrict__ arr, const RotaryVecData<scalar_t, interleaved>& data, int rot_offset, int embed_dim) {
   constexpr int kVecBytes = 16;
   constexpr int kElePerVec = kVecBytes / sizeof(scalar_t);
 
@@ -211,7 +208,7 @@ inline __device__ void apply_token_rotary_embedding(
     const scalar_t* __restrict__ cos_ptr,  // [rot_dim]
     const scalar_t* __restrict__ sin_ptr,  // [rot_dim]
     int rot_offset,
-    int embed_dim) {  // for non-interleaved: half dim
+    int embed_dim) {            // for non-interleaved: half dim
   if constexpr (interleaved) {  // NeoX-style: interleaved layout [x0, y0, x1, y1, ...].
     const int x_index = 2 * rot_offset;
     const int y_index = x_index + 1;
@@ -224,7 +221,7 @@ inline __device__ void apply_token_rotary_embedding(
     const float y = static_cast<float>(arr[y_index]);
     arr[x_index] = static_cast<scalar_t>(x * cos_val - y * sin_val);
     arr[y_index] = static_cast<scalar_t>(y * cos_val + x * sin_val);
-  } else { // GPT-J / LLaMA style: layout [x0, x1, ..., y0, y1, ...]
+  } else {  // GPT-J / LLaMA style: layout [x0, x1, ..., y0, y1, ...]
     const int x_index = rot_offset;
     const int y_index = rot_offset + embed_dim;
 
@@ -290,7 +287,7 @@ inline __device__ void apply_token_rotary_embedding_vec(
 
     *reinterpret_cast<vec_t*>(arr + rot_offset * 2) = data.vec;
 
-  } else { // Non-interleaved
+  } else {  // Non-interleaved
     VecUnion data_x, data_y;
     data_x.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset);
     data_y.vec = *reinterpret_cast<const vec_t*>(arr + rot_offset + embed_dim);
@@ -462,7 +459,8 @@ __global__ void rotary_embedding_kernel_2d(
         int head_idx = k_i / embed_dim_for_rotation;
         int rot_offset = k_i % embed_dim_for_rotation;
         scalar_t* ptr = key_for_token + head_idx * (int)head_stride_key;
-        compute_store_rotary_vec<scalar_t, interleaved, aligned_qk>(ptr, curr_data_k, rot_offset, embed_dim_for_rotation);
+        compute_store_rotary_vec<scalar_t, interleaved, aligned_qk>(
+            ptr, curr_data_k, rot_offset, embed_dim_for_rotation);
 
         // SHIFT
         curr_data_k = next_data_k;
@@ -614,7 +612,8 @@ __launch_bounds__(512) __global__ void rotary_embedding_kernel_1d(
           int head_idx = k_i / embed_dim_for_rotation;
           int rot_offset = k_i % embed_dim_for_rotation;
           scalar_t* ptr = key_for_token + head_idx * (int)head_stride_key;
-          compute_store_rotary_vec<scalar_t, interleaved, aligned_qk>(ptr, curr_data_k, rot_offset, embed_dim_for_rotation);
+          compute_store_rotary_vec<scalar_t, interleaved, aligned_qk>(
+              ptr, curr_data_k, rot_offset, embed_dim_for_rotation);
         }
 
         // SHIFT

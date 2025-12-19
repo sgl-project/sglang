@@ -38,10 +38,14 @@ def _expand_neox_full_repeat(half: torch.Tensor) -> torch.Tensor:
     out[:, 1::2] = half
     return out
 
+
 def _expand_llama_full_cat(half: torch.Tensor) -> torch.Tensor:
     return torch.cat([half, half], dim=-1)
 
-def _make_misaligned_contiguous_like(t: torch.Tensor, offset_elems: int = 1) -> torch.Tensor:
+
+def _make_misaligned_contiguous_like(
+    t: torch.Tensor, offset_elems: int = 1
+) -> torch.Tensor:
     # Create a contiguous tensor with same shape/dtype/device but misaligned base pointer.
     numel = t.numel()
     buf = torch.empty((numel + offset_elems,), device=t.device, dtype=t.dtype)
@@ -51,7 +55,9 @@ def _make_misaligned_contiguous_like(t: torch.Tensor, offset_elems: int = 1) -> 
     return out
 
 
-def _make_tensor(shape: Tuple[int, ...], *, dtype: torch.dtype, device: str, misalign: bool) -> torch.Tensor:
+def _make_tensor(
+    shape: Tuple[int, ...], *, dtype: torch.dtype, device: str, misalign: bool
+) -> torch.Tensor:
     numel = int(np.prod(shape))
     if not misalign:
         return torch.randn(*shape, dtype=dtype, device=device)
@@ -194,14 +200,22 @@ def _predict_use_grid_2d(
     pairs_per_step = (kElePerVec // 2) if interleaved else kElePerVec
     launch_pairs_per_thread = pairs_per_step if use_vec_compute else 1
 
-    max_pairs = max(num_heads * embed_dim_for_rotation, num_kv_heads * embed_dim_for_rotation)
-    total_threads_needed = (max_pairs + launch_pairs_per_thread - 1) // launch_pairs_per_thread
+    max_pairs = max(
+        num_heads * embed_dim_for_rotation, num_kv_heads * embed_dim_for_rotation
+    )
+    total_threads_needed = (
+        max_pairs + launch_pairs_per_thread - 1
+    ) // launch_pairs_per_thread
 
     def _round_up32(x: int) -> int:
         return ((x + 31) // 32) * 32
 
-    threads_per_block_2d = min(512, max(128, _round_up32(min(total_threads_needed, 512))))
-    blocks_per_token_2d = (total_threads_needed + threads_per_block_2d - 1) // threads_per_block_2d
+    threads_per_block_2d = min(
+        512, max(128, _round_up32(min(total_threads_needed, 512)))
+    )
+    blocks_per_token_2d = (
+        total_threads_needed + threads_per_block_2d - 1
+    ) // threads_per_block_2d
     use_grid_2d = (num_tokens <= 4) and (blocks_per_token_2d > 1)
     return use_grid_2d, blocks_per_token_2d
 
@@ -488,13 +502,20 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                     raise ValueError(f"Unknown layout={case.layout}")
 
                 query = _make_tensor(
-                    query_shape, dtype=case.dtype, device=device, misalign=(case.misalign == "q")
+                    query_shape,
+                    dtype=case.dtype,
+                    device=device,
+                    misalign=(case.misalign == "q"),
                 )
-                key = _make_tensor(key_shape, dtype=case.dtype, device=device, misalign=False)
+                key = _make_tensor(
+                    key_shape, dtype=case.dtype, device=device, misalign=False
+                )
                 if case.key_mode == "no_k":
                     key = None
 
-                positions = torch.arange(seq_len, device=device, dtype=torch.int64).repeat(case.batch_size)
+                positions = torch.arange(
+                    seq_len, device=device, dtype=torch.int64
+                ).repeat(case.batch_size)
                 cos = cos_cache[positions]
                 sin = sin_cache[positions]
 
@@ -552,7 +573,9 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 k = None if key is None else key.clone()
                 sgl_rotary_cos_sin(cos, sin, q, k, case.head_size, case.interleaved)
 
-            ms, _, _ = triton.testing.do_bench(fn_sgl_cos_sin, quantiles=[0.5, 0.2, 0.8])
+            ms, _, _ = triton.testing.do_bench(
+                fn_sgl_cos_sin, quantiles=[0.5, 0.2, 0.8]
+            )
             sgl_cos_sin_time = 1000 * ms
             row_str += f" | {sgl_cos_sin_time:16.4f}"
 
@@ -569,7 +592,9 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                 )
 
             try:
-                ms, _, _ = triton.testing.do_bench(fn_sgl_pos, quantiles=[0.5, 0.2, 0.8])
+                ms, _, _ = triton.testing.do_bench(
+                    fn_sgl_pos, quantiles=[0.5, 0.2, 0.8]
+                )
                 sgl_pos_time = 1000 * ms
                 row_str += f" | {sgl_pos_time:12.4f}"
             except Exception:
@@ -578,7 +603,9 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
 
             # Prediction flags (updated for optimized kernel)
             rot_dim_from_cache = int(cos.shape[1])
-            embed_dim_for_rotation = rot_dim_from_cache if case.interleaved else (rot_dim_from_cache // 2)
+            embed_dim_for_rotation = (
+                rot_dim_from_cache if case.interleaved else (rot_dim_from_cache // 2)
+            )
 
             if query.dim() == 2:
                 query_hidden = int(query.size(1))
@@ -652,7 +679,9 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                     vllm_rope.forward_cuda(positions, q, k)
 
                 try:
-                    ms, _, _ = triton.testing.do_bench(fn_vllm, quantiles=[0.5, 0.2, 0.8])
+                    ms, _, _ = triton.testing.do_bench(
+                        fn_vllm, quantiles=[0.5, 0.2, 0.8]
+                    )
                     vllm_time = 1000 * ms
                     row_str += f" | {vllm_time:10.4f}"
                 except Exception:
@@ -661,7 +690,9 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
 
             if HAS_FLASH_ATTN:
                 try:
-                    from flash_attn.layers.rotary import RotaryEmbedding as FlashRotaryEmbedding  # noqa
+                    from flash_attn.layers.rotary import (  # noqa
+                        RotaryEmbedding as FlashRotaryEmbedding,
+                    )
 
                     flash_rotary = FlashRotaryEmbedding(case.rotary_dim, device=device)
                     qkv = torch.randn(
@@ -678,14 +709,20 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
                         qkv_fa = qkv.clone()
                         flash_rotary(qkv_fa, seqlen_offset=0)
 
-                    ms, _, _ = triton.testing.do_bench(fn_flash_attn, quantiles=[0.5, 0.2, 0.8])
+                    ms, _, _ = triton.testing.do_bench(
+                        fn_flash_attn, quantiles=[0.5, 0.2, 0.8]
+                    )
                     fa_time = 1000 * ms
                     row_str += f" | {fa_time:14.4f}"
                 except Exception:
                     row_str += f" | {'ERROR':>14}"
                     fa_time = None
 
-            if (sgl_pos_time is not None) and (sgl_cos_sin_time is not None) and (sgl_cos_sin_time > 0):
+            if (
+                (sgl_pos_time is not None)
+                and (sgl_cos_sin_time is not None)
+                and (sgl_cos_sin_time > 0)
+            ):
                 speedup = sgl_pos_time / sgl_cos_sin_time
                 row_str += f" | {speedup:9.2f}x"
             else:
@@ -706,21 +743,35 @@ def benchmark_mm_rotary_embedding(args: argparse.Namespace) -> None:
 
         native_vals = [r["native"] for r in results if r["native"] is not None]
         naive_vals = [r["naive"] for r in results if r["naive"] is not None]
-        sgl_cos_sin_vals = [r["sgl_cos_sin"] for r in results if r["sgl_cos_sin"] is not None]
+        sgl_cos_sin_vals = [
+            r["sgl_cos_sin"] for r in results if r["sgl_cos_sin"] is not None
+        ]
         sgl_pos_vals = [r["sgl_pos"] for r in results if r["sgl_pos"] is not None]
         vllm_vals = [r["vllm"] for r in results if r["vllm"] is not None]
         fa_vals = [r["flash_attn"] for r in results if r["flash_attn"] is not None]
 
         avg_row = f"{'AVG':>8}"
         if case.bench_native:
-            avg_row += f" | {np.mean(native_vals):12.4f}" if native_vals else f" | {'N/A':>12}"
-        avg_row += f" | {np.mean(naive_vals):11.4f}" if naive_vals else f" | {'N/A':>11}"
-        avg_row += f" | {np.mean(sgl_cos_sin_vals):16.4f}" if sgl_cos_sin_vals else f" | {'N/A':>16}"
-        avg_row += f" | {np.mean(sgl_pos_vals):12.4f}" if sgl_pos_vals else f" | {'N/A':>12}"
+            avg_row += (
+                f" | {np.mean(native_vals):12.4f}" if native_vals else f" | {'N/A':>12}"
+            )
+        avg_row += (
+            f" | {np.mean(naive_vals):11.4f}" if naive_vals else f" | {'N/A':>11}"
+        )
+        avg_row += (
+            f" | {np.mean(sgl_cos_sin_vals):16.4f}"
+            if sgl_cos_sin_vals
+            else f" | {'N/A':>16}"
+        )
+        avg_row += (
+            f" | {np.mean(sgl_pos_vals):12.4f}" if sgl_pos_vals else f" | {'N/A':>12}"
+        )
         avg_row += f" | {'-':>6} | {'-':>4} | {'-':>5}"
 
         if HAS_VLLM:
-            avg_row += f" | {np.mean(vllm_vals):10.4f}" if vllm_vals else f" | {'N/A':>10}"
+            avg_row += (
+                f" | {np.mean(vllm_vals):10.4f}" if vllm_vals else f" | {'N/A':>10}"
+            )
         if HAS_FLASH_ATTN:
             avg_row += f" | {np.mean(fa_vals):14.4f}" if fa_vals else f" | {'N/A':>14}"
         if sgl_pos_vals and sgl_cos_sin_vals and (np.mean(sgl_cos_sin_vals) > 0):
