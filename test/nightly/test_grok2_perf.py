@@ -4,9 +4,6 @@ This test benchmarks the Grok-2 model with FP8 quantization on 8 GPUs.
 The model path can be configured via GROK2_MODEL_PATH environment variable.
 A separate tokenizer path can be specified via GROK2_TOKENIZER_PATH.
 
-Run via AMD CI with:
-    AMD_TEST_MODEL_GROUP=grok2-perf python3 run_suite.py --suite nightly-amd-8-gpu
-
 Example usage:
     GROK2_MODEL_PATH=/path/to/grok-2 python -m pytest test_grok2_perf.py -v
 """
@@ -16,11 +13,7 @@ import unittest
 
 from nightly_utils import NightlyBenchmarkRunner
 
-from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
-
-# Register with AMD CI - 2 hour estimated time for Grok-2 perf test
-register_amd_ci(est_time=7200, suite="nightly-amd-8-gpu", nightly=True)
 
 # Model and tokenizer paths can be overridden via environment variables
 GROK2_MODEL_PATH = os.environ.get("GROK2_MODEL_PATH", "xai-org/grok-2")
@@ -30,19 +23,6 @@ GROK2_TOKENIZER_PATH = os.environ.get(
 PROFILE_DIR = "performance_profiles_grok2"
 
 
-def get_model_group() -> str:
-    """Get the model group to test from environment variable."""
-    return os.environ.get("AMD_TEST_MODEL_GROUP", "")
-
-
-def should_run_test() -> bool:
-    """Check if this test should run based on AMD_TEST_MODEL_GROUP."""
-    group = get_model_group()
-    # Run if group is grok2-perf, all, or empty (direct invocation)
-    return group in ("grok2-perf", "all", "")
-
-
-@unittest.skipUnless(should_run_test(), "Skipping: AMD_TEST_MODEL_GROUP != grok2-perf")
 class TestNightlyGrok2Performance(unittest.TestCase):
     """Nightly performance benchmark for Grok-2 model.
 

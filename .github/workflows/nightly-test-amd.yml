@@ -204,9 +204,9 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Nightly Perf Test (8-GPU GROK1)
+        timeout-minutes: 240
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=grok1-perf -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 14400
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+          bash scripts/ci/amd_ci_exec.sh "cd test && python3 nightly/test_grok1_perf.py"
 
   # 8-GPU Performance Tests (TP=8) - GROK2 performance benchmarks
   nightly-perf-8-gpu-grok2:
@@ -227,9 +227,9 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Nightly Perf Test (8-GPU GROK2)
+        timeout-minutes: 240
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=grok2-perf -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 14400
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+          bash scripts/ci/amd_ci_exec.sh "cd test && python3 nightly/test_grok2_perf.py"
 
   # 8-GPU Performance Tests (TP=8) - DeepSeek-V3 performance benchmarks
   nightly-perf-8-gpu-deepseek-v3:
@@ -250,9 +250,9 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Nightly Perf Test (8-GPU DeepSeek-V3)
+        timeout-minutes: 240
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-perf -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 14400
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+          bash scripts/ci/amd_ci_exec.sh "cd test && python3 nightly/test_deepseek_v3_perf.py"
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
