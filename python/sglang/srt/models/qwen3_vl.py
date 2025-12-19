@@ -31,13 +31,17 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -274,6 +278,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -288,7 +293,17 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 + len(self.deepstack_visual_indexes)
         )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
-        self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        if self.pp_group.is_first_rank:
+            self.pos_embed = VocabParallelEmbedding(
+                self.num_position_embeddings,
+                self.hidden_size,
+                quant_config=quant_config,
+                enable_tp=not is_dp_attention_enabled(),
+                prefix=add_prefix("pos_embed", prefix),
+            )
+        else:
+            self.pos_embed = PPMissingLayer()
+
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
