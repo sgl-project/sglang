@@ -800,9 +800,7 @@ class WanTransformer3DModel(CachableDiT):
                         hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
                     )
                     torch.cuda.current_stream().wait_stream(offload_mgr.copy_stream)
-                    # NOTE: Do not release layer weights here to allow cache-dit to reuse skipped blocks.
-                    # Weights remain on GPU until denoising completes, then released via release_all() in _post_denoising_loop.
-                    # offload_mgr.release_layer(i)
+                    offload_mgr.release_layer(i)
             else:
                 for block in self.blocks:
                     hidden_states = block(
