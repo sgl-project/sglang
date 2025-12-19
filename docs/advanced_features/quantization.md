@@ -228,6 +228,16 @@ python examples/usage/modelopt_quantize_and_export.py quantize \
 - `modelopt_fp8`: FP8 quantization with optimal performance on NVIDIA Hopper and Blackwell GPUs
 - `modelopt_fp4`: FP4 quantization with optimal performance on Nvidia Blackwell GPUs
 
+##### Supported ModelOpt FP8 `quant_algo` Values (HF Export)
+
+When serving a ModelOpt-exported HuggingFace checkpoint with `--quantization modelopt`, SGLang reads the model's `hf_quant_config.json` (or the `quantization_config` in `config.json`) and selects the appropriate ModelOpt loader based on `quant_algo`.
+
+Supported `quant_algo` values for `modelopt_fp8`:
+
+- `FP8`: static FP8 (weights + activation scales exported)
+- `FP8_PER_CHANNEL_PER_TOKEN` (aka `fp8_pc_pt`): per-output-channel weight scale + dynamic per-token activation quantization
+- `FP8_PB_WO` / `fp8_pb_wo` (aka `fp8_pb_wo`): 2D blockwise FP8 weight-only with dynamic per-token activation quantization
+
 ##### Python API Usage
 
 You can also use ModelOpt quantization programmatically:
@@ -270,6 +280,14 @@ python -m sglang.launch_server \
     --model-path ./quantized_tinyllama_fp8 \
     --quantization modelopt \
     --port 30000 --host 0.0.0.0
+```
+
+**Tip (FP8_PB_WO warmup)**: for `FP8_PB_WO` checkpoints, SGLang may auto-select the DeepGEMM backend and trigger JIT compilation during startup/warmup (e.g., CUDA graph capture). To reduce startup overhead, precompile once with:
+
+```bash
+python -m sglang.compile_deep_gemm \
+    --model ./quantized_tinyllama_fp8 \
+    --tp 1
 ```
 
 Or using the Python API:

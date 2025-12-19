@@ -23,7 +23,12 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -32,6 +37,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
+    dispatch_w8a8_block_fp8_linear,
     apply_fp8_linear,
     cutlass_fp8_supported,
     is_blackwell_supported,
@@ -210,7 +216,9 @@ class ModelOptFp8Config(ModelOptQuantConfig):
 
     def __init__(
         self,
+        quant_algo: str,
         is_checkpoint_fp8_serialized: bool = False,
+        weight_block_size: Optional[List[int]] = None,
         kv_cache_quant_method: Optional[str] = None,
         exclude_modules: Optional[List[str]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
@@ -220,10 +228,14 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             is_checkpoint_fp8_serialized (bool): Indicates if the checkpoint uses serialized FP8 format.
         """
         super().__init__(kv_cache_quant_method, exclude_modules, packed_modules_mapping)
+        self.quant_algo = quant_algo
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.weight_block_size = weight_block_size
         if is_checkpoint_fp8_serialized:
             logger.warning(
-                "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
+                "Detected ModelOpt FP8 checkpoint (quant_algo=%s). "
+                "The format is experimental and subject to change.",
+                quant_algo,
             )
 
     @classmethod
@@ -286,15 +298,23 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             raise ValueError(
                 "Cannot find 'quant_algo' in the model's quantization config. "
             )
-        if "FP8" not in quant_method:
+        quant_algo_upper = str(quant_method).upper()
+        if quant_algo_upper not in {
+            "FP8",
+            "FP8_PER_CHANNEL_PER_TOKEN",
+            "FP8_PB_WO",
+        }:
             raise ValueError(
-                "ModelOptFp8Config only supports static FP8 quantization in SGLang. "
-                "For FP4 quantization, use ModelOptFp4Config. "
-                "Check the quantization config for your model's configuration."
+                "ModelOptFp8Config only supports known ModelOpt FP8 quant_algo values. "
+                "Supported: FP8 / FP8_PER_CHANNEL_PER_TOKEN / FP8_PB_WO. "
+                f"Got: {quant_method}. For FP4 quantization, use ModelOptFp4Config."
             )
 
+        weight_block_size = [128, 128] if quant_algo_upper == "FP8_PB_WO" else None
         return cls(
+            quant_algo=quant_algo_upper,
             is_checkpoint_fp8_serialized=True,
+            weight_block_size=weight_block_size,
             kv_cache_quant_method=kv_cache_quant_method,
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
@@ -315,8 +335,183 @@ class ModelOptFp8Config(ModelOptQuantConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
+        if self.quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
+            Linear = ModelOptFp8PcPtLinearMethod
+        elif self.quant_algo == "FP8_PB_WO":
+            Linear = ModelOptFp8PbWoLinearMethod
+        else:
+            Linear = ModelOptFp8LinearMethod
         return self._get_quant_method(
-            layer, prefix, Linear=ModelOptFp8LinearMethod, Moe=ModelOptFp8MoEMethod
+            layer, prefix, Linear=Linear, Moe=ModelOptFp8MoEMethod
+        )
+
+
+class ModelOptFp8PcPtLinearMethod(LinearMethodBase):
+    """Linear method for ModelOpt FP8_PER_CHANNEL_PER_TOKEN checkpoints.
+
+    - Weight: FP8-E4M3 with per-output-channel scales (1D).
+    - Activation: dynamically scaled per token at runtime.
+    """
+
+    def __init__(self, quant_config: ModelOptFp8Config):
+        super().__init__()
+        self.quant_config = quant_config
+        self.cutlass_fp8_supported = cutlass_fp8_supported()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else params_dtype
+        )
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=weight_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            layer.register_parameter(
+                "weight_scale",
+                ChannelQuantScaleParameter(
+                    data=torch.full(
+                        (output_size_per_partition,),
+                        torch.finfo(torch.float32).min,
+                        dtype=torch.float32,
+                    ),
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                ),
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+        # `weight_scale` is already a (non-trainable) Parameter subclass
+        # (ChannelQuantScaleParameter). Do not wrap it again.
+        layer.weight_scale.requires_grad_(False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return apply_fp8_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=None,
+            bias=bias,
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            use_per_token_if_dynamic=True,
+        )
+
+
+class ModelOptFp8PbWoLinearMethod(LinearMethodBase):
+    """Linear method for ModelOpt FP8_PB_WO checkpoints (2D blockwise weight-only)."""
+
+    def __init__(self, quant_config: ModelOptFp8Config):
+        super().__init__()
+        self.quant_config = quant_config
+        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        if not self.quant_config.is_checkpoint_fp8_serialized:
+            raise ValueError(
+                "FP8_PB_WO currently only supports FP8-serialized checkpoints."
+            )
+        assert self.quant_config.weight_block_size is not None
+        block_n, block_k = self.quant_config.weight_block_size
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+        # ModelOpt exports weight_scale as a 4D tensor: [out_blk, 1, in_blk, 1].
+        out_blks = (output_size_per_partition + block_n - 1) // block_n
+        in_blks = (input_size_per_partition + block_k - 1) // block_k
+        scale = BlockQuantScaleParameter(
+            data=torch.full(
+                (out_blks, 1, in_blks, 1),
+                torch.finfo(torch.float32).min,
+                dtype=torch.float32,
+            ),
+            input_dim=2,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Materialize block scales as a 2D [out_blk, in_blk] tensor for kernels.
+        layer.weight.requires_grad_(False)
+        layer.weight_scale = Parameter(
+            layer.weight_scale.squeeze(1).squeeze(-1).contiguous(),
+            requires_grad=False,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        assert self.quant_config.weight_block_size is not None
+        return self.w8a8_block_fp8_linear(
+            x,
+            layer.weight,
+            self.quant_config.weight_block_size,
+            layer.weight_scale,
+            None,
+            bias,
         )
 
 

@@ -175,7 +175,11 @@ class QuantizationConfig(ABC):
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
-            if "FP8" in quant_algo:
+            if quant_algo in {
+                "FP8",
+                "FP8_PER_CHANNEL_PER_TOKEN",
+                "FP8_PB_WO",
+            }:
                 return "modelopt_fp8"
             elif "NVFP4" in quant_algo or "FP4" in quant_algo:
                 return "modelopt_fp4"
