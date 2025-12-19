@@ -37,7 +37,7 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 
-# NOTE: possible duplication with DataType, WorkloadType
+# NOTE: possible duplication with DataType
 # this may focus on the model's original ability
 class ModelTaskType(Enum):
     # TODO: check if I2V/TI2V models can work w/wo text
