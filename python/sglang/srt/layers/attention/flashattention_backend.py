@@ -674,7 +674,9 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 )
                 # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
-                cache_loc = forward_batch.out_cache_loc.view(-1, self.speculative_num_steps)
+                cache_loc = forward_batch.out_cache_loc.view(
+                    -1, self.speculative_num_steps
+                )
                 draft_decode_set_expand_metadata(
                     cache_seqlens_int32=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
                     page_table=expand_page_table,
@@ -1383,7 +1385,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs * self.topk,
-                    decode_length + 1, # Additional page for last partial page
+                    decode_length + 1,  # Additional page for last partial page
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -2483,7 +2485,7 @@ def normal_decode_set_metadata(
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def draft_decode_set_expand_metadata(
     cache_seqlens_int32: torch.Tensor,  # Modifies
-    page_table: torch.Tensor, # Modifies
+    page_table: torch.Tensor,  # Modifies
     last_page_lens: torch.Tensor,
     decode_length: int,
     cache_loc: torch.Tensor,

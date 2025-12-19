@@ -332,5 +332,6 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
         "--attention-backend=flashinfer",
     ]
 
+
 if __name__ == "__main__":
     unittest.main()

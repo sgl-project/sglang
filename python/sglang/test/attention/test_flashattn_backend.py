@@ -413,10 +413,11 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
                 page_size=page_size,
             )
 
-            expected_cache_seqlens = torch.tensor([decode_length + 3, decode_length + 3], dtype=torch.int32)
+            expected_cache_seqlens = torch.tensor(
+                [decode_length + 3, decode_length + 3], dtype=torch.int32
+            )
             self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
             self.assertTrue(torch.equal(page_table, expected_page_table))
-
 
     def test_update_draft_decode_set_expand_metadata_multi_batch(self):
         """
