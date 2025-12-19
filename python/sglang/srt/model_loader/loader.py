@@ -304,7 +304,7 @@ def _initialize_model(
                     cachelist.append(lmlp.up_proj.weight)
                 if hasattr(lmlp, 'down_proj'):
                     cachelist.append(lmlp.down_proj.weight)
-                if True and len(cachelist):
+                if get_global_server_args().enable_weights_prefetching and len(cachelist):
                     layer.layer_communicator._context.cache = cachelist
                     def mlpwrap(fwd):
                         @wraps(fwd)
