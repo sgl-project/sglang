@@ -28,3 +28,4 @@ class CacheInitParams:
     enable_mamba_extra_buffer: bool = False
     pp_rank: int = 0
     pp_size: int = 1
+    is_local_attention: bool = False

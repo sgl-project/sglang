@@ -3,18 +3,18 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import (
-    QKVParallelLinear,
-    ReplicatedLinear,
-)
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -49,7 +49,7 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(current_platform.device_type, enabled=False):
             half = dim // 2
             freqs = torch.exp(
                 -math.log(max_period)
@@ -77,17 +77,15 @@ class TimestepEmbedder(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = ReplicatedLinear(dim, hidden_dim, bias=False)
+        # Use ReplicatedLinear for gate and up projection (fused)
+        self.w13 = ReplicatedLinear(dim, hidden_dim * 2, bias=False)
         self.w2 = ReplicatedLinear(hidden_dim, dim, bias=False)
-        self.w3 = ReplicatedLinear(dim, hidden_dim, bias=False)
-
-    def _forward_silu_gating(self, x1, x3):
-        return F.silu(x1) * x3
+        self.act = SiluAndMul()
 
     def forward(self, x):
-        x1, _ = self.w1(x)
-        x3, _ = self.w3(x)
-        out, _ = self.w2(self._forward_silu_gating(x1, x3))
+        x13, _ = self.w13(x)
+        x = self.act(x13)
+        out, _ = self.w2(x)
         return out
 
 
@@ -107,13 +105,9 @@ class ZImageAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
-        self.to_qkv = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=self.head_dim,
-            total_num_heads=num_heads,
-            total_num_kv_heads=num_kv_heads,
-            bias=False,
-        )
+        # Use ReplicatedLinear for QKV projection (fused)
+        qkv_dim = dim + 2 * (num_kv_heads * self.head_dim)
+        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=False)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -352,6 +346,11 @@ class ZImageTransformer2DModel(CachableDiT):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
+
+    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
+    reverse_param_names_mapping = (
+        ZImageDitConfig().arch_config.reverse_param_names_mapping
+    )
 
     def __init__(
         self,
