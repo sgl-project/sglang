@@ -12,12 +12,15 @@ use std::{
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
-    generate::GenerateRequest,
-    responses::ResponsesRequest,
-    sampling_params::SamplingParams as GenerateSamplingParams,
+use crate::{
+    observability::otel_trace::inject_trace_context_grpc,
+    protocols::{
+        chat::ChatCompletionRequest,
+        common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+        generate::GenerateRequest,
+        responses::ResponsesRequest,
+        sampling_params::SamplingParams as GenerateSamplingParams,
+    },
 };
 
 // Include the generated protobuf code
@@ -163,7 +166,11 @@ impl VllmEngineClient {
     ) -> Result<AbortOnDropStream, Box<dyn std::error::Error + Send + Sync>> {
         let request_id = req.request_id.clone();
         let mut client = self.client.clone();
-        let request = Request::new(req);
+        let mut request = Request::new(req);
+
+        // Inject W3C trace context into gRPC metadata for distributed tracing
+        inject_trace_context_grpc(request.metadata_mut());
+
         let response = client.generate(request).await?;
 
         Ok(AbortOnDropStream::new(

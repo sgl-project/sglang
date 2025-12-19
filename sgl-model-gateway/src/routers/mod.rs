@@ -21,6 +21,7 @@ use crate::protocols::{
 };
 
 pub mod conversations;
+pub mod error;
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
@@ -42,24 +43,46 @@ pub trait RouterTrait: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Route a health generate request
-    async fn health_generate(&self, req: Request<Body>) -> Response;
+    async fn health_generate(&self, _req: Request<Body>) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Health generate not implemented",
+        )
+            .into_response()
+    }
 
     /// Get server information
-    async fn get_server_info(&self, req: Request<Body>) -> Response;
+    async fn get_server_info(&self, _req: Request<Body>) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
+    }
 
     /// Get available models
-    async fn get_models(&self, req: Request<Body>) -> Response;
+    async fn get_models(&self, _req: Request<Body>) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Get models not implemented").into_response()
+    }
 
     /// Get model information
-    async fn get_model_info(&self, req: Request<Body>) -> Response;
+    async fn get_model_info(&self, _req: Request<Body>) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Get model info not implemented",
+        )
+            .into_response()
+    }
 
     /// Route a generate request
     async fn route_generate(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _body: &GenerateRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Generate endpoint not implemented",
+        )
+            .into_response()
+    }
 
     /// Route a chat completion request
     async fn route_chat(
@@ -72,29 +95,49 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Route a completion request
     async fn route_completion(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _body: &CompletionRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Completion endpoint not implemented",
+        )
+            .into_response()
+    }
 
     /// Route a responses request
     async fn route_responses(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &ResponsesRequest,
-        model_id: Option<&str>,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _body: &ResponsesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses endpoint not implemented",
+        )
+            .into_response()
+    }
 
     /// Retrieve a stored/background response by id
     async fn get_response(
         &self,
-        headers: Option<&HeaderMap>,
-        response_id: &str,
-        params: &ResponsesGetParams,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _params: &ResponsesGetParams,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Get response not implemented").into_response()
+    }
 
     /// Cancel a background response by id
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response;
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Cancel response not implemented",
+        )
+            .into_response()
+    }
 
     /// Delete a response by id
     async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
@@ -121,25 +164,32 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Route embedding requests (OpenAI-compatible /v1/embeddings)
     async fn route_embeddings(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &EmbeddingRequest,
-        model_id: Option<&str>,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _body: &EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
+    }
 
     /// Route classification requests (OpenAI-compatible /v1/classify)
     async fn route_classify(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &ClassifyRequest,
-        model_id: Option<&str>,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
+    }
 
+    /// Route rerank requests
     async fn route_rerank(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &RerankRequest,
-        model_id: Option<&str>,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _body: &RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
+    }
 
     /// Get router type name
     fn router_type(&self) -> &'static str;

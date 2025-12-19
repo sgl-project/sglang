@@ -25,8 +25,8 @@ if ENABLE_JIT_DEEPGEMM:
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
 _DO_COMPILE_ALL = True
-_IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGL_IS_FIRST_RANK_ON_NODE", "true")
-_IN_PRECOMPILE_STAGE = get_bool_env_var("SGL_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
+_IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGLANG_IS_FIRST_RANK_ON_NODE", "true")
+_IN_PRECOMPILE_STAGE = get_bool_env_var("SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(

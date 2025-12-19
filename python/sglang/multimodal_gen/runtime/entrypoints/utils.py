@@ -9,11 +9,21 @@ diffusion models.
 """
 
 import dataclasses
+import os
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+import imageio
+import numpy as np
+import torch
+import torchvision
+from einops import rearrange
+
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.utils import shallow_asdict
 
 logger = init_logger(__name__)
@@ -44,3 +54,45 @@ def prepare_request(
         )
 
     return req
+
+
+def post_process_sample(
+    sample: torch.Tensor,
+    data_type: DataType,
+    fps: int,
+    save_output: bool = True,
+    save_file_path: str = None,
+):
+    """
+    Process sample output and save video if necessary
+    """
+    # Process outputs
+    if sample.dim() == 3:
+        # for images, dim t is missing
+        sample = sample.unsqueeze(1)
+    videos = rearrange(sample, "c t h w -> t c h w")
+    frames = []
+    # TODO: this can be batched
+    for x in videos:
+        x = torchvision.utils.make_grid(x, nrow=6)
+        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
+        frames.append((x * 255).numpy().astype(np.uint8))
+
+    # Save outputs if requested
+    if save_output:
+        if save_file_path:
+            os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+            if data_type == DataType.VIDEO:
+                imageio.mimsave(
+                    save_file_path,
+                    frames,
+                    fps=fps,
+                    format=data_type.get_default_extension(),
+                )
+            else:
+                imageio.imwrite(save_file_path, frames[0])
+            logger.info(f"Saved output to {CYAN}{save_file_path}{RESET}")
+        else:
+            logger.info(f"No output path provided, output not saved")
+
+    return frames

@@ -156,6 +156,8 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e HF_HOME=/sgl-data/hf-cache \
+  -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+  -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \

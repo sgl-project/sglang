@@ -6,6 +6,7 @@ import logging
 import os
 import tempfile
 from datetime import datetime
+from typing import List, Union
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -100,9 +101,9 @@ def upload_file_to_slack(
     model: str = None,
     prompt: str = None,
     file_path: str = None,
-    origin_file_path: str = None,
+    origin_file_path: Union[str, List[str]] = None,
 ) -> bool:
-    temp_path = None
+    temp_paths = []
     try:
         from slack_sdk import WebClient
 
@@ -117,17 +118,39 @@ def upload_file_to_slack(
             logger.info(f"Slack upload failed: no file path")
             return False
 
-        if origin_file_path and origin_file_path.startswith(("http", "https")):
-            suffix = os.path.splitext(urlparse(origin_file_path).path)[1] or ".tmp"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-                with urlopen(origin_file_path) as response:
-                    tf.write(response.read())
-                temp_path = tf.name
-                origin_file_path = temp_path
+        origin_paths = []
+        if isinstance(origin_file_path, str):
+            if origin_file_path:
+                origin_paths.append(origin_file_path)
+        elif isinstance(origin_file_path, list):
+            origin_paths = [p for p in origin_file_path if p]
 
-        uploads = [{"file": file_path, "title": "Generated Image"}]
-        if origin_file_path and os.path.exists(origin_file_path):
-            uploads.insert(0, {"file": origin_file_path, "title": "Original Image"})
+        final_origin_paths = []
+        for path in origin_paths:
+            if path.startswith(("http", "https")):
+                try:
+                    suffix = os.path.splitext(urlparse(path).path)[1] or ".tmp"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+                        with urlopen(path) as response:
+                            tf.write(response.read())
+                    temp_paths.append(tf.name)
+                    final_origin_paths.append(tf.name)
+                except Exception as e:
+                    logger.warning(f"Failed to download {path}: {e}")
+            else:
+                final_origin_paths.append(path)
+
+        uploads = []
+        for i, path in enumerate(final_origin_paths):
+            if os.path.exists(path):
+                title = (
+                    "Original Image"
+                    if len(final_origin_paths) == 1
+                    else f"Original Image {i+1}"
+                )
+                uploads.append({"file": path, "title": title})
+
+        uploads.append({"file": file_path, "title": "Generated Image"})
 
         message = (
             f"*Case ID:* `{case_id}`\n" f"*Model:* `{model}`\n" f"*Prompt:* {prompt}"
@@ -189,5 +212,6 @@ def upload_file_to_slack(
         logger.info(f"Slack upload failed: {e}")
         return False
     finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+        for p in temp_paths:
+            if os.path.exists(p):
+                os.remove(p)

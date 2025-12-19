@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from math import prod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -26,6 +27,20 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _get_qkv_projections(
+    attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
+):
+    img_qkv, _ = attn.to_qkv(hidden_states)
+    img_query, img_key, img_value = img_qkv.chunk(3, dim=-1)
+
+    txt_query = txt_key = txt_value = None
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+        txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        txt_query, txt_key, txt_value = txt_qkv.chunk(3, dim=-1)
+
+    return img_query, img_key, img_value, txt_query, txt_key, txt_value
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -218,7 +233,6 @@ class QwenEmbedRope(nn.Module):
 
 
 class QwenImageCrossAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,  # query_dim
@@ -243,27 +257,22 @@ class QwenImageCrossAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
+        self.added_kv_proj_dim = added_kv_proj_dim
 
-        # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
+        # Use ReplicatedLinear for fused QKV projections
+        qkv_dim = num_heads * head_dim * 3
+        self.to_qkv = ReplicatedLinear(dim, qkv_dim, bias=True)
+
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
+
         if added_kv_proj_dim is not None:
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_kv_dim, bias=True
-            )
-            if context_pre_only is not None:
-                self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
-                )
+            # Use ReplicatedLinear for added (encoder) QKV projections
+            self.to_added_qkv = ReplicatedLinear(added_kv_proj_dim, qkv_dim, bias=True)
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
@@ -290,7 +299,10 @@ class QwenImageCrossAttention(nn.Module):
             causal=False,
             supported_attention_backends={
                 AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
+                AttentionBackendEnum.SAGE_ATTN_3,
             },
         )
 
@@ -303,15 +315,9 @@ class QwenImageCrossAttention(nn.Module):
     ):
         seq_len_txt = encoder_hidden_states.shape[1]
 
-        # Compute QKV for image stream (sample projections)
-        img_query, _ = self.to_q(hidden_states)
-        img_key, _ = self.to_k(hidden_states)
-        img_value, _ = self.to_v(hidden_states)
-
-        # Compute QKV for text stream (context projections)
-        txt_query, _ = self.add_q_proj(encoder_hidden_states)
-        txt_key, _ = self.add_k_proj(encoder_hidden_states)
-        txt_value, _ = self.add_v_proj(encoder_hidden_states)
+        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
+            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        )
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -387,12 +393,14 @@ class QwenImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        zero_cond_t: bool = False,
     ):
         super().__init__()
 
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
+        self.zero_cond_t = zero_cond_t
 
         # Image processing modules
         self.img_mod = nn.Sequential(
@@ -429,10 +437,18 @@ class QwenImageTransformerBlock(nn.Module):
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
-    def _modulate(self, x, mod_params):
-        """Apply modulation to input tensor"""
+    def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-        return fuse_scale_shift_kernel(x, scale, shift), gate.unsqueeze(1)
+        if index is not None:
+            shift_result = shift[index]
+            scale_result = scale[index]
+            gate_result = gate[index]
+        else:
+            shift_result = shift
+            scale_result = scale
+            gate_result = gate[:1].unsqueeze(1)
+
+        return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
 
     def forward(
         self,
@@ -442,9 +458,13 @@ class QwenImageTransformerBlock(nn.Module):
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
+
+        if self.zero_cond_t:
+            temb = torch.chunk(temb, 2, dim=0)[0]
         txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
 
         # Split modulation parameters for norm1 and norm2
@@ -455,8 +475,7 @@ class QwenImageTransformerBlock(nn.Module):
 
         img_normed = self.img_norm1(hidden_states)
 
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
-
+        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, modulate_index)
         # Process text stream - norm1 + modulation
         txt_normed = self.txt_norm1(encoder_hidden_states)
         txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
@@ -486,7 +505,9 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process image stream - norm2 + MLP
         img_normed2 = self.img_norm2(hidden_states)
-        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+        img_modulated2, img_gate2 = self._modulate(
+            img_normed2, img_mod2, modulate_index
+        )
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
@@ -516,6 +537,8 @@ class QwenImageTransformer2DModel(CachableDiT):
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
+    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+
     def __init__(
         self,
         config: QwenImageDitConfig,
@@ -530,8 +553,10 @@ class QwenImageTransformer2DModel(CachableDiT):
         num_attention_heads = config.arch_config.num_attention_heads
         joint_attention_dim = config.arch_config.joint_attention_dim
         axes_dims_rope = config.arch_config.axes_dims_rope
+        zero_cond_t = getattr(config.arch_config, "zero_cond_t", False)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.zero_cond_t = zero_cond_t
 
         self.rotary_emb = QwenEmbedRope(
             theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
@@ -550,6 +575,7 @@ class QwenImageTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    zero_cond_t=zero_cond_t,
                 )
                 for _ in range(num_layers)
             ]
@@ -568,6 +594,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
@@ -613,6 +640,21 @@ class QwenImageTransformer2DModel(CachableDiT):
         hidden_states = self.img_in(hidden_states)
 
         timestep = (timestep / 1000).to(hidden_states.dtype)
+
+        if self.zero_cond_t:
+            timestep = torch.cat([timestep, timestep * 0], dim=0)
+            # Use torch operations for GPU efficiency
+            modulate_index = torch.tensor(
+                [
+                    [0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]])
+                    for sample in img_shapes
+                ],
+                device=timestep.device,
+                dtype=torch.int,
+            )
+        else:
+            modulate_index = None
+
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
@@ -627,6 +669,7 @@ class QwenImageTransformer2DModel(CachableDiT):
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
+                modulate_index=modulate_index,
             )
 
             # controlnet residual
@@ -639,7 +682,8 @@ class QwenImageTransformer2DModel(CachableDiT):
                     hidden_states
                     + controlnet_block_samples[index_block // interval_control]
                 )
-
+        if self.zero_cond_t:
+            temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
 

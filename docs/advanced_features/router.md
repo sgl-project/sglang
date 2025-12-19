@@ -172,10 +172,10 @@ curl -X POST http://localhost:30000/workers \
 curl http://localhost:30000/workers
 
 # Remove a worker
-curl -X DELETE http://localhost:30000/workers/grpc://0.0.0.0:31000
+curl -X DELETE http://localhost:30000/workers/grpc%3A%2F%2F0.0.0.0%3A31000
 ```
 
-Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{url}` returns both registry data and queued job status.
+Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{url}` returns both registry data and queued job status. The worker url in the removal request should be escaped.
 
 ---
 

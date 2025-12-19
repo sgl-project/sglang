@@ -5,7 +5,6 @@ use crate::{grpc_client::sglang_proto::MultimodalInputs, protocols::common::Stri
 pub mod client;
 pub mod common;
 pub mod context;
-pub mod error;
 pub mod harmony;
 pub mod pd_router;
 pub mod pipeline;

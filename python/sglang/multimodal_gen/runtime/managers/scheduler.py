@@ -78,15 +78,17 @@ class Scheduler:
     def _handle_set_lora(self, reqs: List[Any]):
         # TODO: return set status
         req = reqs[0]
-        self.worker.set_lora(req.lora_nickname, req.lora_path)
+        self.worker.set_lora(req.lora_nickname, req.lora_path, req.target)
         return {"status": "ok"}
 
-    def _handle_merge_lora(self, _reqs: List[Any]):
-        self.worker.merge_lora_weights()
+    def _handle_merge_lora(self, reqs: List[Any]):
+        req = reqs[0]
+        self.worker.merge_lora_weights(req.target)
         return {"status": "ok"}
 
-    def _handle_unmerge_lora(self, _reqs: List[Any]):
-        self.worker.unmerge_lora_weights()
+    def _handle_unmerge_lora(self, reqs: List[Any]):
+        req = reqs[0]
+        self.worker.unmerge_lora_weights(req.target)
         return {"status": "ok"}
 
     def _handle_generation(self, reqs: List[Req]):
