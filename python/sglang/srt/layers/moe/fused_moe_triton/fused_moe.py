@@ -367,25 +367,6 @@ def _down_moe_use_tma():
     return support_tensor_descriptor()
 
 
-def _prepare_activation_kernel_args(
-    down_moe_use_tma: bool,
-    curr_topk_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-) -> Dict[str, Any]:
-    """Prepare arguments for activation kernels based on sorted mode."""
-    return {
-        "topk_ids": curr_topk_ids if not down_moe_use_tma else None,
-        "expert_ids": expert_ids if down_moe_use_tma else None,
-        "num_tokens_post_padded": (
-            num_tokens_post_padded if down_moe_use_tma else None
-        ),
-        "sorted_token_ids": sorted_token_ids if down_moe_use_tma else None,
-        "down_moe_use_tma": down_moe_use_tma,
-    }
-
-
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -564,7 +545,6 @@ def fused_experts_impl(
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
         )
-        activation = "silu"
 
         # Activation function with multiplication
         if activation == "silu" and is_gated:
