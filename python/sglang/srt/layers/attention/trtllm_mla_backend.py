@@ -198,7 +198,9 @@ def unpad_draft_extend_output_kernel(
 def _quantize_fp8_qkv(q, k, v, layer):
     q = q.to(torch.float8_e4m3fn)
 
-    k_scale = getattr(layer, "k_scale_float", 1.0)
+    k_scale = getattr(layer, "k_scale_float", None)
+    if k_scale is None:
+        k_scale = 1.0
     if k_scale != 1.0:
         assert hasattr(layer, "k_scale"), "k_scale is not set"
         k_2d, _ = scaled_fp8_quant(
@@ -208,7 +210,9 @@ def _quantize_fp8_qkv(q, k, v, layer):
     else:
         k = k.to(torch.float8_e4m3fn)
 
-    v_scale = getattr(layer, "v_scale_float", 1.0)
+    v_scale = getattr(layer, "v_scale_float", None)
+    if v_scale is None:
+        v_scale = 1.0
     if v_scale != 1.0:
         assert hasattr(layer, "v_scale"), "v_scale is not set"
         v_2d, _ = scaled_fp8_quant(
