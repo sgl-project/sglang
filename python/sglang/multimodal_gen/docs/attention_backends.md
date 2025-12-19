@@ -6,6 +6,8 @@ This document describes the attention backends available in sglang diffusion (`s
 
 Attention backends are defined by `AttentionBackendEnum` (`sglang.multimodal_gen.runtime.platforms.interface.AttentionBackendEnum`) and selected via the CLI flag `--attention-backend`.
 
+Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`) and therefore applies to any model component using these layers (e.g. diffusion transformer / DiT and encoders).
+
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA.
 - **ROCm**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
