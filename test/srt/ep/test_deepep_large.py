@@ -197,6 +197,7 @@ class TestDeepseekV32TBO(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
+self.assertGreater(metrics["accuracy"], 0.92)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
