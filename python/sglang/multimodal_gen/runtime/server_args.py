@@ -558,7 +558,9 @@ class ServerArgs:
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
-            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan).",
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
+            "Cannot be used together with dit_cpu_offload or use_fsdp_inference. "
+            "When used with cache-dit, weights remain on GPU until denoising completes.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
