@@ -462,4 +462,5 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         return {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
+            "img_shapes": img_shapes,
         }
