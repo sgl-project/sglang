@@ -454,11 +454,17 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record rate limit decision
-    pub fn record_http_rate_limit(result: &'static str) {
-        counter!(
+    /// Record HTTP rate limit result (allowed/rejected) with tenant and model labels
+    pub fn record_http_rate_limit(
+        result: &'static str,
+        tenant_id: Option<&str>,
+        model_id: Option<&str>,
+    ) {
+        metrics::counter!(
             "smg_http_rate_limit_total",
-            "result" => result
+            "result" => result,
+            "tenant" => tenant_id.unwrap_or("default").to_string(),
+            "model" => model_id.unwrap_or("default").to_string()
         )
         .increment(1);
     }

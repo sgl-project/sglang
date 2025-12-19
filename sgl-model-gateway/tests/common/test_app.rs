@@ -12,7 +12,7 @@ use sgl_model_gateway::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
     mcp::{McpConfig, McpManager},
-    middleware::{AuthConfig, TokenBucket},
+    middleware::AuthConfig,
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
@@ -26,19 +26,9 @@ pub fn create_test_app(
     router_config: &RouterConfig,
 ) -> Router {
     // Initialize rate limiter
-    let rate_limiter = match router_config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = router_config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
+    let rate_limiter = Some(Arc::new(
+        sgl_model_gateway::core::rate_limiter::RateLimiter::new(router_config),
+    ));
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -192,9 +182,11 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
 
     Arc::new(
         AppContext::builder()
-            .router_config(router_config)
+            .router_config(router_config.clone())
             .client(client)
-            .rate_limiter(None)
+            .rate_limiter(Some(Arc::new(
+                sgl_model_gateway::core::rate_limiter::RateLimiter::new(&router_config),
+            )))
             .tokenizer(None)
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)

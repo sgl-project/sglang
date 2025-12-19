@@ -909,7 +909,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
-    if app_context.rate_limiter.is_none() {
+    if !app_context.rate_limiter.is_enabled() {
         info!("Rate limiting is disabled (max_concurrent_requests = -1)");
     }
 

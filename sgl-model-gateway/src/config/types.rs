@@ -33,6 +33,10 @@ pub struct RouterConfig {
     pub queue_timeout_secs: u64,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Multi-tenant and model-specific rate limiting rules
+    pub rate_limits: Option<Vec<RateLimitRule>>,
+    /// Header to use for tenant identification (defaults to X-Tenant-ID)
+    pub rate_limit_tenant_header: Option<String>,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -82,6 +86,78 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+}
+
+/// Rate limiting rule for multi-tenant and model-specific limiting
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateLimitRule {
+    /// Optional tenant ID this rule applies to
+    pub tenant_id: Option<String>,
+    /// Optional model ID this rule applies to
+    pub model_id: Option<String>,
+    /// Maximum concurrent requests for this tenant/model combination
+    pub max_concurrent_requests: i32,
+    /// Refill rate (tokens per second). If not set, defaults to max_concurrent_requests.
+    pub rate_limit_tokens_per_second: Option<i32>,
+}
+
+impl RateLimitRule {
+    /// Parse a list of rule strings in format "tenant:model:max_concurrent[:refill_rate]"
+    pub fn parse_rules(rules: &[String]) -> ConfigResult<Vec<Self>> {
+        let mut result = Vec::new();
+        for rule_str in rules {
+            let parts: Vec<&str> = rule_str.split(':').collect();
+            if parts.len() < 3 || parts.len() > 4 {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: format!(
+                        "Invalid rate limit rule format: '{}'. Expected 'tenant:model:max_concurrent[:refill_rate]'",
+                        rule_str
+                    ),
+                });
+            }
+
+            let tenant_id = match parts[0] {
+                "*" | "" => None,
+                s => Some(s.to_string()),
+            };
+
+            let model_id = match parts[1] {
+                "*" | "" => None,
+                s => Some(s.to_string()),
+            };
+
+            let max_concurrent_requests =
+                parts[2]
+                    .parse::<i32>()
+                    .map_err(|_| super::ConfigError::InvalidValue {
+                        field: "rate_limit_rule".to_string(),
+                        value: parts[2].to_string(),
+                        reason: "max_concurrent_requests must be an integer".to_string(),
+                    })?;
+
+            let rate_limit_tokens_per_second = if parts.len() == 4 {
+                Some(
+                    parts[3]
+                        .parse::<i32>()
+                        .map_err(|_| super::ConfigError::InvalidValue {
+                            field: "rate_limit_rule".to_string(),
+                            value: parts[3].to_string(),
+                            reason: "rate_limit_tokens_per_second must be an integer".to_string(),
+                        })?,
+                )
+            } else {
+                None
+            };
+
+            result.push(RateLimitRule {
+                tenant_id,
+                model_id,
+                max_concurrent_requests,
+                rate_limit_tokens_per_second,
+            });
+        }
+        Ok(result)
+    }
 }
 
 /// Tokenizer cache configuration
@@ -508,6 +584,8 @@ impl Default for RouterConfig {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            rate_limits: None,
+            rate_limit_tenant_header: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),

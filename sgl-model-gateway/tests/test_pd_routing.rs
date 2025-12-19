@@ -215,19 +215,18 @@ mod test_pd_routing {
                 use std::sync::{Arc, OnceLock};
 
                 use sgl_model_gateway::{
-                    core::{LoadMonitor, WorkerRegistry},
+                    core::{rate_limiter::RateLimiter, LoadMonitor, WorkerRegistry},
                     data_connector::{
                         MemoryConversationItemStorage, MemoryConversationStorage,
                         MemoryResponseStorage,
                     },
-                    middleware::TokenBucket,
                     policies::PolicyRegistry,
                 };
 
                 let client = reqwest::Client::new();
 
                 // Initialize rate limiter
-                let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
+                let rate_limiter = Some(Arc::new(RateLimiter::new(&config)));
 
                 // Initialize registries
                 let worker_registry = Arc::new(WorkerRegistry::new());

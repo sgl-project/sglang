@@ -212,6 +212,21 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn rate_limits(mut self, limits: Vec<super::RateLimitRule>) -> Self {
+        self.config.rate_limits = Some(limits);
+        self
+    }
+
+    pub fn rate_limit_tenant_header<S: Into<String>>(mut self, header: S) -> Self {
+        self.config.rate_limit_tenant_header = Some(header.into());
+        self
+    }
+
+    pub fn maybe_rate_limit_tenant_header(mut self, header: Option<impl Into<String>>) -> Self {
+        self.config.rate_limit_tenant_header = header.map(|h| h.into());
+        self
+    }
+
     // ==================== Security & CORS ====================
 
     pub fn api_key<S: Into<String>>(mut self, key: S) -> Self {

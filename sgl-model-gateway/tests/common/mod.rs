@@ -23,7 +23,6 @@ use sgl_model_gateway::{
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
-    middleware::TokenBucket,
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
 };
@@ -33,19 +32,9 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
-    let rate_limiter = match config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
+    let rate_limiter = Some(Arc::new(
+        sgl_model_gateway::core::rate_limiter::RateLimiter::new(&config),
+    ));
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -169,19 +158,9 @@ pub async fn create_test_context_with_mcp_config(
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
-    let rate_limiter = match config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
+    let rate_limiter = Some(Arc::new(
+        sgl_model_gateway::core::rate_limiter::RateLimiter::new(&config),
+    ));
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());

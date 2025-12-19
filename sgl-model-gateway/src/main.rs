@@ -4,8 +4,8 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use sgl_model_gateway::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
-        RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RateLimitRule,
+        RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
     observability::{
@@ -234,6 +234,14 @@ struct CliArgs {
 
     #[arg(long)]
     rate_limit_tokens_per_second: Option<i32>,
+
+    /// Multi-tenant/model rate limit rule in format 'tenant:model:max_concurrent:refill_rate'
+    /// Use '*' for wildcard tenant or model. Example: 'tenant1:gpt-4:10:5' or '*:llama-3:20:20'
+    #[arg(long, action = ArgAction::Append)]
+    rate_limit_rule: Vec<String>,
+
+    #[arg(long)]
+    rate_limit_tenant_header: Option<String>,
 
     #[arg(long, num_args = 0..)]
     cors_allowed_origins: Vec<String>,
@@ -602,6 +610,12 @@ impl CliArgs {
             None
         };
 
+        let rate_limit_rules = RateLimitRule::parse_rules(&self.rate_limit_rule).map_err(|e| {
+            ConfigError::ValidationFailed {
+                reason: e.to_string(),
+            }
+        })?;
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -653,6 +667,8 @@ impl CliArgs {
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .rate_limits(rate_limit_rules)
+            .maybe_rate_limit_tenant_header(self.rate_limit_tenant_header.clone())
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())

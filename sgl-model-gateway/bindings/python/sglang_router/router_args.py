@@ -67,6 +67,10 @@ class RouterArgs:
     queue_timeout_secs: int = 60
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: Optional[int] = None
+    # Multi-tenant and model-specific rate limiting rules (format: tenant:model:max_concurrent:refill_rate)
+    rate_limit_rule: List[str] = dataclasses.field(default_factory=list)
+    # Header to use for tenant identification (defaults to X-Tenant-ID)
+    rate_limit_tenant_header: Optional[str] = None
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
     # Retry configuration
