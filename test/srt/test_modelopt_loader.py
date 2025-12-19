@@ -29,6 +29,14 @@ from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.test.test_utils import CustomTestCase
 
+try:
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
+
+    _MODELOPT_FP8_CFG_IMPORTABLE = True
+except Exception:
+    # Some environments may not have the required CUDA extensions installed.
+    _MODELOPT_FP8_CFG_IMPORTABLE = False
+
 
 class TestModelOptModelLoader(CustomTestCase):
     """Test cases for ModelOptModelLoader functionality."""
@@ -554,12 +562,71 @@ class TestModelOptLoaderIntegration(CustomTestCase):
             ]
         )
 
-        # Convert to ServerArgs using the proper from_cli_args method
-        server_args = ServerArgs.from_cli_args(args)
+        # Convert to ServerArgs using the proper from_cli_args method.
+        # Patch __post_init__ to avoid downloading remote configs in unit tests.
+        with patch(
+            "sglang.srt.server_args.ServerArgs.__post_init__", return_value=None
+        ):
+            server_args = ServerArgs.from_cli_args(args)
 
         # Verify that modelopt_quant was properly parsed
         self.assertEqual(server_args.modelopt_quant, "fp8")
         self.assertEqual(server_args.model_path, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+
+class TestModelOptFp8ConfigVariants(CustomTestCase):
+    @unittest.skipUnless(
+        _MODELOPT_FP8_CFG_IMPORTABLE,
+        "ModelOptFp8Config is not importable in this environment.",
+    )
+    def test_modelopt_fp8_pc_pt_from_hf_quant_config(self):
+        cfg = ModelOptFp8Config.from_config(
+            {
+                "producer": {"name": "modelopt", "version": "0.0.0"},
+                "quantization": {
+                    "quant_algo": "FP8_PER_CHANNEL_PER_TOKEN",
+                    "kv_cache_quant_algo": None,
+                    "exclude_modules": ["lm_head"],
+                },
+            }
+        )
+        self.assertEqual(cfg.quant_algo, "FP8_PER_CHANNEL_PER_TOKEN")
+        self.assertIsNone(cfg.weight_block_size)
+
+    @unittest.skipUnless(
+        _MODELOPT_FP8_CFG_IMPORTABLE,
+        "ModelOptFp8Config is not importable in this environment.",
+    )
+    def test_modelopt_fp8_pb_wo_from_hf_quant_config(self):
+        cfg = ModelOptFp8Config.from_config(
+            {
+                "producer": {"name": "modelopt", "version": "0.0.0"},
+                "quantization": {
+                    # ModelOpt may emit lowercase in hf_quant_config.json
+                    "quant_algo": "fp8_pb_wo",
+                    "kv_cache_quant_algo": None,
+                    "exclude_modules": ["lm_head"],
+                },
+            }
+        )
+        self.assertEqual(cfg.quant_algo, "FP8_PB_WO")
+
+    @unittest.skipUnless(
+        _MODELOPT_FP8_CFG_IMPORTABLE,
+        "ModelOptFp8Config is not importable in this environment.",
+    )
+    def test_modelopt_fp8_unknown_quant_algo_raises(self):
+        with self.assertRaises(ValueError):
+            ModelOptFp8Config.from_config(
+                {
+                    "producer": {"name": "modelopt", "version": "0.0.0"},
+                    "quantization": {
+                        "quant_algo": "FP8_SOME_OTHER_ALGO",
+                        "kv_cache_quant_algo": None,
+                        "exclude_modules": ["lm_head"],
+                    },
+                }
+            )
 
 
 if __name__ == "__main__":

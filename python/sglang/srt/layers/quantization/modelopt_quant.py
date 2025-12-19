@@ -37,9 +37,9 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
-    dispatch_w8a8_block_fp8_linear,
     apply_fp8_linear,
     cutlass_fp8_supported,
+    dispatch_w8a8_block_fp8_linear,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
