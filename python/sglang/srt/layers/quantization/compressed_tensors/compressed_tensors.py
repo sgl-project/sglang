@@ -44,7 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
-    GPUCompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -533,13 +533,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
             if self._is_static_tensor_w8a8(weight_quant, input_quant):
-                if _is_cuda:
-                    return GPUCompressedTensorsW8A8Int8(
+                if not _is_npu:
+                    return CompressedTensorsW8A8Int8(
                         strategy=weight_quant.strategy,
                         is_static_input_scheme=True,
                         input_symmetric=input_quant.symmetric,
                     )
-                elif _is_npu:
+                else:
                     return NPUCompressedTensorsW8A8Int8(
                         strategy=weight_quant.strategy,
                         is_static_input_scheme=True,
@@ -547,13 +547,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
-                if _is_cuda:
-                    return GPUCompressedTensorsW8A8Int8(
+                if not _is_npu:
+                    return CompressedTensorsW8A8Int8(
                         strategy=weight_quant.strategy,
                         is_static_input_scheme=False,
                         input_symmetric=input_quant.symmetric,
                     )
-                elif _is_npu:
+                else:
                     return NPUCompressedTensorsW8A8Int8(
                         strategy=weight_quant.strategy,
                         is_static_input_scheme=False,
