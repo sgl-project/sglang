@@ -646,9 +646,9 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output, _ = self.draft_model_runner.forward(
+            logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -946,7 +946,7 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output, _ = self.draft_model_runner.forward(forward_batch)
+        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         if self.enable_nan_detection:
             detect_nan(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
@@ -1023,9 +1023,9 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
                 )
-            logits_output, _ = self.draft_model_runner.forward(
+            logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         if self.enable_nan_detection:
