@@ -13,14 +13,14 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.batch_sizes = [1, 1, 8, 16, 64]
+        cls.batch_sizes = [1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
         # Define variant configurations
         cls.variants = [
             {
-                "name": "basic",
+                "name": "dp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
@@ -33,7 +33,7 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                 ],
             },
             {
-                "name": "mtp",
+                "name": "dp+mtp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
@@ -56,36 +56,31 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                 ],
             },
             {
-                "name": "nsa",
+                "name": "tp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
                     "8",
-                    "--dp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--attention-backend",
-                    "nsa",
-                    "--nsa-prefill-backend",
-                    "flashmla_sparse",
-                    "--nsa-decode-backend",
-                    "flashmla_kv",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
             },
             {
-                "name": "pure_tp",
+                "name": "tp+mtp",
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
                     "8",
-                    "--attention-backend",
-                    "nsa",
-                    "--nsa-prefill-backend",
-                    "flashmla_sparse",
-                    "--nsa-decode-backend",
-                    "flashmla_kv",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--mem-frac",
+                    "0.7",
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
