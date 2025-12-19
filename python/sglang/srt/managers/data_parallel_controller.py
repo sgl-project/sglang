@@ -482,7 +482,7 @@ class DataParallelController:
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
-                
+
             assert (
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
