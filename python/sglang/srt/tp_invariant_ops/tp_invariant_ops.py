@@ -1,3 +1,5 @@
+# Adapted from TBIK: https://github.com/nanomaoli/llm_reproducibility/tree/main/src/tbik
+
 import contextlib
 import math
 from typing import Any, Callable, Dict
@@ -84,14 +86,18 @@ def matmul_kernel_tp_persistent(
 
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    manual_acc = 3
-    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
-    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
-    acc3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    # Manually unroll the first 3 accumulators to reduce indexing overhead
+    manual_acc_cnt = 3
 
-    S = tl.zeros((NEXT_POWER_OF_REMAIN_LEVEL, BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    manual_acc_level0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    manual_acc_level1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    manual_acc_level2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
 
-    S_mask = tl.arange(0, NEXT_POWER_OF_REMAIN_LEVEL)[:, None, None]
+    # Remaining accumulators for levels not manually unrolled
+    remaining_acc = tl.zeros(
+        (NEXT_POWER_OF_REMAIN_LEVEL, BLOCK_M, BLOCK_N), dtype=ACC_DTYPE
+    )
+    remaining_acc_mask = tl.arange(0, NEXT_POWER_OF_REMAIN_LEVEL)[:, None, None]
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
@@ -153,15 +159,22 @@ def matmul_kernel_tp_persistent(
 
                     if count_value_added > 1:
                         if level == 0:
-                            acc = acc1 + acc
+                            acc = manual_acc_level0 + acc
                         elif level == 1:
-                            acc = acc2 + acc
+                            acc = manual_acc_level1 + acc
                         elif level == 2:
-                            acc = acc3 + acc
+                            acc = manual_acc_level2 + acc
                         else:
-                            tmp_acc_mask = S_mask == (level - manual_acc)
+                            tmp_acc_mask = remaining_acc_mask == (
+                                level - manual_acc_cnt
+                            )
                             acc = (
-                                tl.sum(S * tmp_acc_mask, axis=0, dtype=ACC_DTYPE) + acc
+                                tl.sum(
+                                    remaining_acc * tmp_acc_mask,
+                                    axis=0,
+                                    dtype=ACC_DTYPE,
+                                )
+                                + acc
                             )
 
                     count = tl.where(
@@ -170,14 +183,18 @@ def matmul_kernel_tp_persistent(
                     if not carry_over:
                         break_flag = 1
                         if level == 0:
-                            acc1 = acc
+                            manual_acc_level0 = acc
                         elif level == 1:
-                            acc2 = acc
+                            manual_acc_level1 = acc
                         elif level == 2:
-                            acc3 = acc
+                            manual_acc_level2 = acc
                         else:
-                            tmp_acc_mask = S_mask == (level - manual_acc)
-                            S = tl.where(tmp_acc_mask, acc[None, :, :], S)
+                            tmp_acc_mask = remaining_acc_mask == (
+                                level - manual_acc_cnt
+                            )
+                            remaining_acc = tl.where(
+                                tmp_acc_mask, acc[None, :, :], remaining_acc
+                            )
 
         c_ptr = C_ptr + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
         offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -259,13 +276,15 @@ def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor = 
 
     C = torch.empty((M, N), device=A.device, dtype=out_dtype)
 
-    # manually add 3 accumulators
-    manual_acc = 3
+    # Manually unroll 3 accumulators
+    MANUAL_ACC_CNT = 3
 
     NEXT_POWER_OF_LEVEL = 2 ** math.ceil(math.log2(LEVEL_K))
-    # set the minimum value to 1 to avoid NEXT_POWER_OF_LEVEL being 0
+    # Set the minimum value to 1 to avoid NEXT_POWER_OF_LEVEL being 0
     NEXT_POWER_OF_REMAIN_LEVEL = (
-        2 ** math.ceil(math.log2(LEVEL_K - manual_acc)) if LEVEL_K > manual_acc else 1
+        2 ** math.ceil(math.log2(LEVEL_K - MANUAL_ACC_CNT))
+        if LEVEL_K > MANUAL_ACC_CNT
+        else 1
     )
 
     matmul_kernel_tp_persistent[grid](
