@@ -101,7 +101,7 @@ class TestEagleLogprobCorrectness(CustomTestCase):
         self.assertEqual(out_base["text"], out_eagle["text"])
 
         logprob_base = out_base["meta_info"]["output_token_logprobs"]
-        logprob_eagle = out_eagle["meta_info"]["logprob"]
+        logprob_eagle = out_eagle["meta_info"]["output_token_logprobs"]
         self.assertEqual(len(logprob_base), len(logprob_eagle))
 
         for i, (lp_base, lp_eagle) in enumerate(zip(logprob_base, logprob_eagle)):
