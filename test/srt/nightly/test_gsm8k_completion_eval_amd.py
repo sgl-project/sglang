@@ -107,77 +107,77 @@ AMD_BASE_MODELS_TP8 = [
     ),
 ]
 
-# GROK models - NOT cached on upstream CI yet, uncomment when cached
-# Request to cache: lmzheng/grok-1, amd/grok-1-W4A8KV8, xai-org/grok-2
-# AMD_GROK_MODELS_TP8 = [
-#     # GROK1-FP8 - uses aiter backend, needs extended timeout for kernel compilation
-#     BaseModelConfig(
-#         model_path="lmzheng/grok-1",
-#         tp_size=8,
-#         accuracy_threshold=0.80,
-#         timeout=600,  # 10 minutes for kernel compilation
-#         tokenizer_path="Xenova/grok-1-tokenizer",
-#         other_args=[
-#             "--quantization",
-#             "fp8",
-#             "--attention-backend",
-#             "aiter",
-#             "--mem-fraction-static",
-#             "0.85",
-#             "--trust-remote-code",
-#         ],
-#         env_vars={
-#             "RCCL_MSCCL_ENABLE": "0",
-#             "SGLANG_USE_AITER": "1",
-#             "SGLANG_INT4_WEIGHT": "0",
-#         },
-#     ),
-#     # GROK1-IN4 - INT4 quantized version
-#     BaseModelConfig(
-#         model_path="amd/grok-1-W4A8KV8",
-#         tp_size=8,
-#         accuracy_threshold=0.80,
-#         timeout=600,  # 10 minutes for kernel compilation
-#         tokenizer_path="Xenova/grok-1-tokenizer",
-#         other_args=[
-#             "--quantization",
-#             "fp8",
-#             "--attention-backend",
-#             "aiter",
-#             "--mem-fraction-static",
-#             "0.85",
-#             "--trust-remote-code",
-#         ],
-#         env_vars={
-#             "RCCL_MSCCL_ENABLE": "0",
-#             "SGLANG_USE_AITER": "1",
-#             "SGLANG_INT4_WEIGHT": "1",
-#         },
-#     ),
-#     # GROK2.5 (grok-2) - latest GROK model
-#     BaseModelConfig(
-#         model_path="xai-org/grok-2",
-#         tp_size=8,
-#         accuracy_threshold=0.915,
-#         timeout=600,  # 10 minutes for kernel compilation
-#         tokenizer_path="alvarobartt/grok-2-tokenizer",
-#         other_args=[
-#             "--quantization",
-#             "fp8",
-#             "--attention-backend",
-#             "aiter",
-#             "--mem-fraction-static",
-#             "0.85",
-#             "--trust-remote-code",
-#         ],
-#         env_vars={
-#             "RCCL_MSCCL_ENABLE": "0",
-#             "SGLANG_USE_AITER": "1",
-#             "SGLANG_INT4_WEIGHT": "0",
-#         },
-#     ),
-# ]
-# AMD_BASE_MODELS_TP8.extend(AMD_GROK_MODELS_TP8)  # Uncomment when GROK models are cached
+# GROK models - will download from HF on first run (may take 30-60 min per model)
+# After first run, they will be cached at /sgl-data/hf-cache/hub/
+AMD_GROK_MODELS_TP8 = [
+    # GROK1-FP8 - uses aiter backend, ~300GB download
+    BaseModelConfig(
+        model_path="lmzheng/grok-1",
+        tp_size=8,
+        accuracy_threshold=0.80,
+        timeout=3600,  # 1 hour for download + kernel compilation
+        tokenizer_path="Xenova/grok-1-tokenizer",
+        other_args=[
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_INT4_WEIGHT": "0",
+        },
+    ),
+    # GROK1-IN4 - INT4 quantized version, ~100-150GB download
+    BaseModelConfig(
+        model_path="amd/grok-1-W4A8KV8",
+        tp_size=8,
+        accuracy_threshold=0.80,
+        timeout=3600,  # 1 hour for download + kernel compilation
+        tokenizer_path="Xenova/grok-1-tokenizer",
+        other_args=[
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_INT4_WEIGHT": "1",
+        },
+    ),
+    # GROK2.5 (grok-2) - latest GROK model, ~300-400GB download
+    BaseModelConfig(
+        model_path="xai-org/grok-2",
+        tp_size=8,
+        accuracy_threshold=0.915,
+        timeout=3600,  # 1 hour for download + kernel compilation
+        tokenizer_path="alvarobartt/grok-2-tokenizer",
+        other_args=[
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_INT4_WEIGHT": "0",
+        },
+    ),
+]
+AMD_BASE_MODELS_TP8.extend(AMD_GROK_MODELS_TP8)
 
 
 def check_model_available(model_path: str) -> bool:
