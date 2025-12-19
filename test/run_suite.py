@@ -19,7 +19,11 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: ["default"],
     HWBackend.AMD: ["stage-a-test-1"],
-    HWBackend.CUDA: ["stage-a-test-1", "stage-b-test-small-1-gpu"],
+    HWBackend.CUDA: [
+        "stage-a-test-1",
+        "stage-b-test-small-1-gpu",
+        "stage-b-test-small-2-gpu",
+    ],
     HWBackend.NPU: [],
 }
 
