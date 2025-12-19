@@ -13,12 +13,23 @@ Base models tested here:
 
 Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
 - "gpt-oss" (default): GPT-OSS models only (nightly-amd-8-gpu)
-- "grok1-fp8": GROK1-FP8 only (nightly-amd-8-gpu-grok1-fp8)
-- "grok2": GROK2.5 only (nightly-amd-8-gpu-grok2)
-- "grok1-in4": GROK1-IN4 only (nightly-amd-8-gpu-grok1-in4)
+- "grok": All GROK models (nightly-amd-8-gpu-grok)
+- "deepseek-v3": DeepSeek-V3 with DP attention (nightly-amd-8-gpu-deepseek-v3)
+- "deepseek-r1": DeepSeek-R1 reasoning model (nightly-amd-8-gpu-deepseek-r1)
 - "all": All models
 
 Reference: benchmark/gsm8k/bench_sglang.py
+
+Runtime Reference (MI325X, 8xGPU):
+| Model                       | Server Startup | Benchmark | Total   |
+|-----------------------------|----------------|-----------|---------|
+| lmsys/gpt-oss-20b-bf16      | ~60s           | ~14s      | ~74s    |
+| lmsys/gpt-oss-120b-bf16     | ~103s          | ~19s      | ~122s   |
+| lmzheng/grok-1              | ~12min         | ~19s      | ~12.5min|
+| amd/grok-1-W4A8KV8          | ~12min         | ~14s      | ~12.5min|
+| xai-org/grok-2              | ~14min         | ~19s      | ~14.5min|
+| deepseek-ai/DeepSeek-V3-0324| TBD            | TBD       | TBD     |
+| deepseek-ai/DeepSeek-R1-0528| TBD            | TBD       | TBD     |
 """
 
 import ast
@@ -120,10 +131,11 @@ AMD_GPT_OSS_MODELS = [
     ),
 ]
 
-# Group 2: GROK1-FP8 only (lmzheng/grok-1)
-# Runner: nightly-amd-8-gpu-grok1-fp8
-AMD_GROK1_FP8_MODELS = [
-    # GROK1-FP8 - cached on upstream CI, verified accuracy: 0.860
+# Group 2: All GROK models
+# Runner: nightly-amd-8-gpu-grok
+# Order: GROK1-FP8 -> GROK1-IN4 -> GROK2.5
+AMD_GROK_MODELS = [
+    # GROK1-FP8 - verified accuracy: 0.860, runtime: ~12.5min
     BaseModelConfig(
         model_path="lmzheng/grok-1",
         tp_size=8,
@@ -145,12 +157,29 @@ AMD_GROK1_FP8_MODELS = [
             "SGLANG_INT4_WEIGHT": "0",
         },
     ),
-]
-
-# Group 3: GROK2.5 only (xai-org/grok-2)
-# Runner: nightly-amd-8-gpu-grok2
-AMD_GROK2_MODELS = [
-    # GROK2.5 (grok-2) - latest GROK model
+    # GROK1-IN4 - verified accuracy: 0.820, runtime: ~12.5min
+    BaseModelConfig(
+        model_path="amd/grok-1-W4A8KV8",
+        tp_size=8,
+        accuracy_threshold=0.80,
+        timeout=3600,  # 1 hour for kernel compilation
+        tokenizer_path="Xenova/grok-1-tokenizer",
+        other_args=[
+            "--quantization",
+            "fp8",
+            "--attention-backend",
+            "aiter",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_INT4_WEIGHT": "1",
+        },
+    ),
+    # GROK2.5 - verified accuracy: 0.945, runtime: ~14.5min
     BaseModelConfig(
         model_path="xai-org/grok-2",
         tp_size=8,
@@ -174,29 +203,52 @@ AMD_GROK2_MODELS = [
     ),
 ]
 
-# Group 4: GROK1-IN4 only (amd/grok-1-W4A8KV8)
-# Runner: nightly-amd-8-gpu-grok1-in4
-AMD_GROK1_IN4_MODELS = [
-    # GROK1-IN4 - INT4 quantized version
+# Group 3: DeepSeek-V3 (uses DP attention)
+# Runner: nightly-amd-8-gpu-deepseek-v3
+# Note: Uses DP attention (dp-size=8) for better performance, requires ROCm 7.0+
+AMD_DEEPSEEK_V3_MODELS = [
+    # DeepSeek-V3-0324 - uses DP attention
     BaseModelConfig(
-        model_path="amd/grok-1-W4A8KV8",
+        model_path="deepseek-ai/DeepSeek-V3-0324",
         tp_size=8,
-        accuracy_threshold=0.80,
-        timeout=3600,  # 1 hour for download + kernel compilation
-        tokenizer_path="Xenova/grok-1-tokenizer",
+        accuracy_threshold=0.93,
+        timeout=3600,  # 1 hour for large model
         other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
+            "--chunked-prefill-size",
+            "131072",
+            "--dp-size",
+            "8",
+            "--enable-dp-attention",
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",
         ],
         env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
+            "SGLANG_USE_ROCM700A": "1",
             "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "1",
+        },
+    ),
+]
+
+# Group 4: DeepSeek-R1 (reasoning model)
+# Runner: nightly-amd-8-gpu-deepseek-r1
+AMD_DEEPSEEK_R1_MODELS = [
+    # DeepSeek-R1-0528 - reasoning model
+    BaseModelConfig(
+        model_path="deepseek-ai/DeepSeek-R1-0528",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,  # 1 hour for large model
+        other_args=[
+            "--attention-backend",
+            "aiter",
+            "--chunked-prefill-size",
+            "131072",
+            "--disable-radix-cache",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "SGLANG_USE_AITER": "1",
         },
     ),
 ]
@@ -211,18 +263,18 @@ def get_models_for_group(group: str) -> List[BaseModelConfig]:
     """Get the list of models for a given group."""
     if group == "gpt-oss":
         return AMD_GPT_OSS_MODELS
-    elif group == "grok1-fp8":
-        return AMD_GROK1_FP8_MODELS
-    elif group == "grok2":
-        return AMD_GROK2_MODELS
-    elif group == "grok1-in4":
-        return AMD_GROK1_IN4_MODELS
+    elif group == "grok":
+        return AMD_GROK_MODELS
+    elif group == "deepseek-v3":
+        return AMD_DEEPSEEK_V3_MODELS
+    elif group == "deepseek-r1":
+        return AMD_DEEPSEEK_R1_MODELS
     elif group == "all":
         return (
             AMD_GPT_OSS_MODELS
-            + AMD_GROK1_FP8_MODELS
-            + AMD_GROK2_MODELS
-            + AMD_GROK1_IN4_MODELS
+            + AMD_GROK_MODELS
+            + AMD_DEEPSEEK_V3_MODELS
+            + AMD_DEEPSEEK_R1_MODELS
         )
     else:
         print(f"[WARNING] Unknown model group '{group}', using 'gpt-oss'")
@@ -523,9 +575,8 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
     This is different from mgsm_en which uses chat completions.
 
     Model group is selected via AMD_TEST_MODEL_GROUP env var:
-    - "gpt-oss": GPT-OSS models only (default)
-    - "grok": GROK1-FP8 and GROK2.5
-    - "grok-in4": GROK1-IN4 only
+    - "gpt-oss": GPT-OSS models only (default, nightly-amd-8-gpu)
+    - "grok": All GROK models (nightly-amd-8-gpu-grok)
     - "all": All models
     """
 
@@ -550,12 +601,15 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
     def test_gsm8k_completion_all_models(self):
         """Test all configured base models with GSM8K completion benchmark."""
         all_results = []
+        total_test_start = time.time()
+
+        # Summary table with runtime columns
         summary = f"### Model Group: {self.model_group}\n\n"
         summary += (
-            "| Model | TP | Accuracy | Threshold | Invalid | Latency | Status |\n"
+            "| Model | TP | Accuracy | Threshold | Startup | Bench | Total | Status |\n"
         )
         summary += (
-            "| ----- | -- | -------- | --------- | ------- | ------- | ------ |\n"
+            "| ----- | -- | -------- | --------- | ------- | ----- | ----- | ------ |\n"
         )
 
         for config in self.models:
@@ -566,7 +620,9 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                 error_message = None
                 acc, invalid, latency = None, None, None
+                startup_time, bench_time, total_time = None, None, None
                 skipped = False
+                model_start = time.time()
 
                 # Check model availability with detailed logging
                 is_available, status_msg = log_model_status(config)
@@ -574,7 +630,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                 if not is_available:
                     print(f"\n❌ MODEL NOT AVAILABLE: {status_msg}")
                     print(f"⏭️ SKIPPING: {config.model_path}")
-                    status = f"⏭️ SKIP ({status_msg[:20]}...)"
+                    status = f"⏭️ SKIP"
                     skipped = True
                     all_results.append(
                         {
@@ -584,6 +640,9 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                             "threshold": config.accuracy_threshold,
                             "invalid": None,
                             "latency": None,
+                            "startup_time": None,
+                            "bench_time": None,
+                            "total_time": None,
                             "passed": True,  # Don't count as failure
                             "skipped": True,
                             "error": status_msg,
@@ -591,38 +650,49 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                     )
                 else:
                     try:
-                        # Launch server
+                        # Launch server with timing
                         print(f"\n🚀 Launching server for {config.model_path}...")
+                        server_start = time.time()
                         process = popen_launch_server_for_base_model(
                             self.base_url, config
                         )
+                        startup_time = time.time() - server_start
+                        print(f"⏱️  Server startup: {startup_time:.1f}s")
 
                         try:
-                            # Run benchmark
+                            # Run benchmark with timing
                             print(
                                 f"📊 Running GSM8K benchmark ({self.num_questions} questions)..."
                             )
+                            bench_start = time.time()
                             acc, invalid, latency = run_gsm8k_benchmark(
                                 self.base_url,
                                 num_questions=self.num_questions,
                                 num_shots=5,
                                 parallel=64,
                             )
+                            bench_time = time.time() - bench_start
+
+                            total_time = time.time() - model_start
 
                             print(f"\n📈 Results for {config.model_path}:")
                             print(
                                 f"   Accuracy: {acc:.3f} (threshold: {config.accuracy_threshold})"
                             )
                             print(f"   Invalid: {invalid:.3f}")
-                            print(f"   Latency: {latency:.1f}s")
+                            print(f"   Benchmark latency: {latency:.1f}s")
+                            print(f"\n⏱️  Runtime breakdown:")
+                            print(f"   Server startup: {startup_time:.1f}s")
+                            print(f"   Benchmark: {bench_time:.1f}s")
+                            print(f"   Total: {total_time:.1f}s")
 
                             passed = acc >= config.accuracy_threshold
                             status = "✅ PASS" if passed else "❌ FAIL"
 
                             if passed:
-                                print(f"   Status: ✅ PASSED")
+                                print(f"\n   Status: ✅ PASSED")
                             else:
-                                print(f"   Status: ❌ FAILED (below threshold)")
+                                print(f"\n   Status: ❌ FAILED (below threshold)")
 
                             all_results.append(
                                 {
@@ -632,6 +702,9 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                                     "threshold": config.accuracy_threshold,
                                     "invalid": invalid,
                                     "latency": latency,
+                                    "startup_time": startup_time,
+                                    "bench_time": bench_time,
+                                    "total_time": total_time,
                                     "passed": passed,
                                     "skipped": False,
                                     "error": None,
@@ -640,6 +713,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                         except Exception as e:
                             error_message = str(e)
+                            total_time = time.time() - model_start
                             print(f"\n❌ Error during benchmark: {error_message}")
                             status = "❌ ERROR"
                             all_results.append(
@@ -650,6 +724,9 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                                     "threshold": config.accuracy_threshold,
                                     "invalid": None,
                                     "latency": None,
+                                    "startup_time": startup_time,
+                                    "bench_time": None,
+                                    "total_time": total_time,
                                     "passed": False,
                                     "skipped": False,
                                     "error": error_message,
@@ -662,6 +739,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                     except Exception as e:
                         error_message = str(e)
+                        total_time = time.time() - model_start
                         print(f"\n❌ Error launching server: {error_message}")
                         status = "❌ ERROR"
                         all_results.append(
@@ -672,23 +750,35 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                                 "threshold": config.accuracy_threshold,
                                 "invalid": None,
                                 "latency": None,
+                                "startup_time": None,
+                                "bench_time": None,
+                                "total_time": total_time,
                                 "passed": False,
                                 "skipped": False,
                                 "error": error_message,
                             }
                         )
 
-                # Add to summary
+                # Add to summary with runtime
                 acc_str = f"{acc:.3f}" if acc is not None else "N/A"
-                invalid_str = f"{invalid:.3f}" if invalid is not None else "N/A"
-                latency_str = f"{latency:.1f}s" if latency is not None else "N/A"
-                summary += f"| {config.model_path} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {invalid_str} | {latency_str} | {status} |\n"
+                startup_str = (
+                    f"{startup_time:.0f}s" if startup_time is not None else "N/A"
+                )
+                bench_str = f"{bench_time:.0f}s" if bench_time is not None else "N/A"
+                total_str = f"{total_time:.0f}s" if total_time is not None else "N/A"
+                summary += f"| {config.model_path} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
+
+        # Calculate total test runtime
+        total_test_time = time.time() - total_test_start
 
         # Print summary
         print(f"\n{'='*60}")
         print(f"SUMMARY - Model Group: {self.model_group}")
         print(f"{'='*60}")
         print(summary)
+        print(
+            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
+        )
 
         # Write GitHub step summary
         if is_in_ci():
