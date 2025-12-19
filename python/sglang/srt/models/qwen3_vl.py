@@ -24,7 +24,11 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
 
-from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.configs.qwen3_vl import (
+    Qwen3VLConfig,
+    Qwen3VLMoeConfig,
+    Qwen3VLVisionConfig,
+)
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -54,6 +58,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
+from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel
 from sglang.srt.models.utils import (
     RotaryPosMixin,
     WeightsMapper,
@@ -675,6 +680,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
             self.config: Qwen3VLConfig = config  # for qwen3-vl
+        elif language_model_cls is Qwen3MoeLLMModel:
+            self.config: Qwen3VLMoeConfig = config  # for qwen3-vl-moe
         else:
             self.config = config.text_config  # for qwen3-omni
             self.config.encoder_only = getattr(config, "encoder_only", False)
