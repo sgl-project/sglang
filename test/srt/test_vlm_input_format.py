@@ -271,6 +271,8 @@ class TestLlama4ImageUnderstandsImage(
     chat_template = "llama-4"
 
     def setUp(self):
+        if torch.cuda.device_count() < 4:
+            self.skipTest("Skipping Llama-4 test: requires 4 GPUs for TP=4")
         self.engine = Engine(
             model_path=self.model_path,
             trust_remote_code=True,
