@@ -163,6 +163,7 @@ fn generate_mcp_id(prefix: &str) -> String {
 /// Build mcp_list_tools output item
 fn build_mcp_list_tools_item(mcp: &Arc<McpManager>, server_label: &str) -> ResponseOutputItem {
     let tools = mcp.list_tools();
+    debug!("MCP tools: {:?}", tools);
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|t| McpToolInfo {
