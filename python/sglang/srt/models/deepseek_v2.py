@@ -3170,7 +3170,8 @@ class DeepseekV2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
@@ -3245,7 +3246,9 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if self.pp_group.is_last_rank and enable_prefill_cp(
+            forward_batch, self.nsa_enable_prefill_cp
+        ):
             # allgather + rerrange
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
