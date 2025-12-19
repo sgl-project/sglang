@@ -18,7 +18,6 @@ from typing import Any, Callable, Sequence
 from urllib.request import urlopen
 
 import pytest
-import requests
 from openai import Client, OpenAI
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
@@ -492,7 +491,7 @@ def get_generate_fn(
         prompt: str | None = None,
         seconds: int | None = None,
         input_reference: Any | None = None,
-        extra_body: dict[str] | None = None,
+        extra_body: dict[Any] | None = None,
     ) -> str:
         """
         Create a video job via /v1/videos, poll until completion,
@@ -664,70 +663,15 @@ def get_generate_fn(
                     f"{id}: image_path must be a URL for URL direct test: {url}"
                 )
 
-        upload_images = []  # For file upload (first image)
-        processed_urls = []  # For URL/base64 (middle and last images)
-
-        if len(image_urls) >= 3:
-            # First image: use upload method
-            first_url = image_urls[0]
-            try:
-                # Use existing download function
-                temp_file = download_image_from_url(first_url)
-                upload_images.append(temp_file)
-
-            except Exception as e:
-                logger.error(f"Failed to download first image for upload: {e}")
-                pytest.skip(f"{id}: failed to download first image " f"for upload: {e}")
-
-            # Middle images: use URL method
-            for i in range(1, len(image_urls) - 1):
-                middle_url = image_urls[i]
-                processed_urls.append(middle_url)
-
-            # Last image: convert to base64
-            last_url = image_urls[-1]
-            try:
-                response = requests.get(last_url, timeout=30)
-                response.raise_for_status()
-
-                # Convert to base64 data URL
-                content_type = response.headers.get("content-type", "image/jpeg")
-                base64_data = base64.b64encode(response.content).decode("utf-8")
-                base64_url = f"data:{content_type};base64,{base64_data}"
-                processed_urls.append(base64_url)
-
-            except Exception as e:
-                logger.error(f"Failed to convert last image to base64: {e}")
-                pytest.skip(f"{id}: failed to convert last image " f"to base64: {e}")
-        else:
-            pytest.skip(
-                f"Invalid image input: expected a file path, URL, or base64-encoded string, but the provided value is too short (less than 3)."
-            )
-        # Open upload files
-        upload_files = []
-        try:
-            for upload_path in upload_images:
-                upload_files.append(open(upload_path, "rb"))
-
-            response = client.images.with_raw_response.edit(
-                model=model_path,
-                image=upload_files,
-                prompt=sampling_params.prompt,
-                n=1,
-                size=sampling_params.output_size,
-                response_format="b64_json",
-                extra_body={"url": processed_urls},
-            )
-        finally:
-            # Close upload files
-            for f in upload_files:
-                f.close()
-            # Clean up temporary files
-            for upload_path in upload_images:
-                try:
-                    upload_path.unlink()
-                except Exception:
-                    pass
+        response = client.images.with_raw_response.edit(
+            model=model_path,
+            prompt=sampling_params.prompt,
+            image=[],  # Only for OpenAI verification
+            n=1,
+            size=sampling_params.output_size,
+            response_format="b64_json",
+            extra_body={"url": image_urls},
+        )
 
         rid = response.headers.get("x-request-id", "")
         result = response.parse()

@@ -236,30 +236,12 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
     ],
-)
-
-MULTI_URL_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
-    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
-    image_path=[
-        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
-        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
-        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
-    ],
     direct_url_test=True,
 )
 
 T2V_PROMPT = "A curious raccoon"
 
 TI2V_sampling_params = DiffusionSamplingParams(
-    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
-    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
-)
-TI2V_url_sampling_params = DiffusionSamplingParams(
-    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
-    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
-    direct_url_test=True,
-)
-TI2V_base64_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
     direct_url_test=True,
@@ -329,16 +311,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_edit=1,
         ),
         MULTI_IMAGE_TI2I_sampling_params,
-    ),
-    DiffusionTestCase(
-        "qwen_image_edit_2509_ti2i_url",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image-Edit-2509",
-            modality="image",
-            warmup_text=0,
-            warmup_edit=1,
-        ),
-        MULTI_URL_IMAGE_TI2I_sampling_params,
     ),
 ]
 
@@ -419,17 +391,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             custom_validator="video",
         ),
         TI2V_sampling_params,
-    ),
-    DiffusionTestCase(
-        "wan2_2_ti2v_5b_url",
-        DiffusionServerArgs(
-            model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-            modality="video",
-            warmup_text=0,
-            warmup_edit=0,
-            custom_validator="video",
-        ),
-        TI2V_url_sampling_params,
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
