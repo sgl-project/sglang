@@ -66,13 +66,14 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
 
     def test_detect_and_parse_force_reasoning(self):
         """Test forced reasoning mode."""
+        # For non-stream request, if no tags, the text should be normal
         detector = BaseReasoningFormatDetector(
             "<think>", "</think>", force_reasoning=True
         )
-        text = "This should be reasoning"
+        text = "This should be normal"
         result = detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "This should be reasoning")
-        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "This should be normal")
 
     def test_parse_streaming_increment_normal(self):
         """Test streaming parse of normal text."""
@@ -167,11 +168,11 @@ class TestDeepSeekR1Detector(CustomTestCase):
         """Test parsing DeepSeek-R1 format."""
         text = "I need to think about this. The answer is 42."
         result = self.detector.detect_and_parse(text)
-        # Should be treated as reasoning because force_reasoning=True
+        # For non-stream request, if no tags, the text should be normal
+        self.assertEqual(result.reasoning_text, "")
         self.assertEqual(
-            result.reasoning_text, "I need to think about this. The answer is 42."
+            result.normal_text, "I need to think about this. The answer is 42."
         )
-        self.assertEqual(result.normal_text, "")
 
     def test_detect_and_parse_with_end_token(self):
         """Test parsing with end token."""
