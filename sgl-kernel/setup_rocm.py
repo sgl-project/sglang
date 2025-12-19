@@ -42,6 +42,7 @@ include_dirs = [
 
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
+    "csrc/allreduce/deterministic_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
@@ -51,6 +52,7 @@ sources = [
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
     "csrc/kvcacheio/transfer.cu",
+    "csrc/elementwise/pos_enc.cu",
 ]
 
 cxx_flags = ["-O3"]

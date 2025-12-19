@@ -115,7 +115,7 @@ impl LlamaParser {
                 }
                 Err(e) => {
                     // Skip invalid JSON parts in semicolon-separated list
-                    tracing::warn!("Failed to parse tool call: {}", e);
+                    tracing::debug!("Failed to parse tool call: {}", e);
                 }
             }
         }
@@ -157,7 +157,7 @@ impl ToolParser for LlamaParser {
                 });
 
             parsed.unwrap_or_else(|e| {
-                tracing::warn!("Failed to parse tool call: {:?}", e);
+                tracing::debug!("Failed to parse tool call: {:?}", e);
                 vec![]
             })
         };

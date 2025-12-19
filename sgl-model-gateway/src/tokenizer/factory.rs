@@ -1,7 +1,7 @@
 use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 use anyhow::{Error, Result};
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{huggingface::HuggingFaceTokenizer, tiktoken::TiktokenTokenizer, traits};
 use crate::tokenizer::hub::download_tokenizer_from_hf;
@@ -148,12 +148,26 @@ fn is_likely_json(buffer: &[u8]) -> bool {
 fn is_likely_sentencepiece(buffer: &[u8]) -> bool {
     // SentencePiece models often start with specific patterns
     // This is a simplified check
-    buffer.len() >= 12
-        && (buffer.starts_with(b"\x0a\x09")
-            || buffer.starts_with(b"\x08\x00")
-            || buffer.windows(4).any(|w| w == b"<unk")
-            || buffer.windows(4).any(|w| w == b"<s>")
-            || buffer.windows(4).any(|w| w == b"</s>"))
+    if buffer.len() < 12 {
+        return false;
+    }
+
+    // Check header patterns first (cheap)
+    if buffer.starts_with(b"\x0a\x09") || buffer.starts_with(b"\x08\x00") {
+        return true;
+    }
+
+    // Single-pass scan for special token markers
+    // Instead of multiple windows() calls, scan once looking for all patterns
+    let patterns: &[&[u8]] = &[b"<unk", b"<s>", b"</s>"];
+    for window in buffer.windows(4) {
+        for pattern in patterns {
+            if window.starts_with(pattern) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Helper function to discover chat template files in a directory
@@ -201,10 +215,10 @@ fn resolve_and_log_chat_template(
 
     match (&provided_path, &final_chat_template) {
         (Some(provided), _) => {
-            info!("Using provided chat template: {}", provided);
+            debug!("Using provided chat template: {}", provided);
         }
         (None, Some(discovered)) => {
-            info!(
+            debug!(
                 "Auto-discovered chat template in '{}': {}",
                 discovery_dir.display(),
                 discovered

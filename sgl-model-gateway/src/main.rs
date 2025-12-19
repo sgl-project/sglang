@@ -215,10 +215,19 @@ struct CliArgs {
     prometheus_host: String,
 
     #[arg(long, num_args = 0..)]
+    prometheus_duration_buckets: Vec<f64>,
+
+    #[arg(long, num_args = 0..)]
     request_id_headers: Vec<String>,
 
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
+
+    /// Grace period in seconds to wait for in-flight requests during shutdown.
+    /// When the server receives SIGTERM/SIGINT, it will stop accepting new connections
+    /// and wait up to this duration for existing streaming requests to complete.
+    #[arg(long, default_value_t = 180)]
+    shutdown_grace_period_secs: u64,
 
     #[arg(long, default_value_t = -1)]
     max_concurrent_requests: i32,
@@ -357,6 +366,12 @@ struct CliArgs {
 
     #[arg(long, default_value = "localhost:4317")]
     otlp_traces_endpoint: String,
+
+    #[arg(long)]
+    tls_cert_path: Option<String>,
+
+    #[arg(long)]
+    tls_key_path: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -656,7 +671,8 @@ impl CliArgs {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
-            .igw(self.enable_igw);
+            .igw(self.enable_igw)
+            .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()
     }
@@ -681,6 +697,11 @@ impl CliArgs {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
+            duration_buckets: if self.prometheus_duration_buckets.is_empty() {
+                None
+            } else {
+                Some(self.prometheus_duration_buckets.clone())
+            },
         });
 
         ServerConfig {
@@ -698,6 +719,7 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
+            shutdown_grace_period_secs: self.shutdown_grace_period_secs,
         }
     }
 }

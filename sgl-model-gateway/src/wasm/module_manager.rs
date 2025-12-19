@@ -128,6 +128,11 @@ impl WasmModuleManager {
         &self.runtime
     }
 
+    /// Get the configured maximum body size for HTTP request/response processing
+    pub fn get_max_body_size(&self) -> usize {
+        self.runtime.get_config().max_body_size
+    }
+
     /// Execute WASM module using WebAssembly component model based on attach_point
     pub async fn execute_module_interface(
         &self,

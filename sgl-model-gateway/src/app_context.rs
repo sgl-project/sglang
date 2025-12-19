@@ -4,11 +4,11 @@ use std::{
 };
 
 use reqwest::Client;
-use tracing::info;
+use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    core::{workflow::WorkflowEngine, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
+    core::{ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
@@ -24,6 +24,7 @@ use crate::{
     },
     tool_parser::ParserFactory as ToolParserFactory,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
+    workflow::WorkflowEngine,
 };
 
 /// Error type for AppContext builder
@@ -317,7 +318,7 @@ impl AppContextBuilder {
         // Force rustls backend when TLS is configured
         if has_tls_config {
             client_builder = client_builder.use_rustls_tls();
-            info!("Using rustls TLS backend for TLS/mTLS connections");
+            debug!("Using rustls TLS backend for TLS/mTLS connections");
         }
 
         // Configure mTLS client identity if provided (certificates already loaded during config creation)
@@ -325,7 +326,7 @@ impl AppContextBuilder {
             let identity = reqwest::Identity::from_pem(identity_pem)
                 .map_err(|e| format!("Failed to create client identity: {}", e))?;
             client_builder = client_builder.identity(identity);
-            info!("mTLS client authentication enabled");
+            debug!("mTLS client authentication enabled");
         }
 
         // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
@@ -335,7 +336,7 @@ impl AppContextBuilder {
             client_builder = client_builder.add_root_certificate(cert);
         }
         if !config.ca_certificates.is_empty() {
-            info!(
+            debug!(
                 "Added {} CA certificate(s) for worker verification",
                 config.ca_certificates.len()
             );
@@ -494,7 +495,7 @@ impl AppContextBuilder {
         let mcp_manager_lock = Arc::new(OnceLock::new());
 
         // Always create with empty config and defaults
-        info!("Initializing MCP manager with empty config and default settings (5 min TTL, 100 max connections)");
+        debug!("Initializing MCP manager with empty config and default settings (5 min TTL, 100 max connections)");
 
         let empty_config = crate::mcp::McpConfig {
             servers: Vec::new(),
