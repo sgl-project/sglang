@@ -254,15 +254,14 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 
     @classmethod
-    def process_scale(cls, weight: torch.Tensor, scale, per_group_scale):
+    def process_scale(cls, weight: torch.Tensor, scale, per_group_scale, is_per_channel_weight):
         scale = scale.transpose(1, 2).contiguous()
 
-        ### TODO fix group_size=0 behavior
-        """if cls.is_per_channel_weight:
+        if is_per_channel_weight:
             scale_np = scale.cpu().numpy()
             scale_np.dtype = np.uint32
             scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-            return scale_uint64_tensor, None"""
+            return scale_uint64_tensor, None
 
         per_group_scale = per_group_scale.transpose(1, 2).contiguous()
         group_num, k, n = weight.shape
@@ -306,7 +305,7 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         return weight.view(torch.int32).contiguous()
 
     @classmethod
-    def process_weights_after_loading(cls, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(cls, layer: torch.nn.Module, is_per_channel_weight) -> None:
         layer.w13_weight = torch.nn.Parameter(
             layer.w13_weight.data.transpose(1, 2).contiguous(), requires_grad=False
         )
@@ -325,10 +324,10 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
             else None
         )
         layer.w13_weight_scale.data, w13_bias = cls.process_scale(
-            layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second
+            layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second, is_per_channel_weight
         )
         layer.w2_weight_scale.data, w2_bias = cls.process_scale(
-            layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second
+            layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second, is_per_channel_weight
         )
         if hasattr(layer, "w13_weight_scale_second"):
             # scale_second is no longer used, release this part of the memory
