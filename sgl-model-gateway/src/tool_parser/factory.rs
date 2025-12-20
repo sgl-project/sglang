@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::tool_parser::{
     parsers::{
-        DeepSeekParser, Glm4MoeParser, Glm47MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
+        DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
         MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
     },
     traits::ToolParser,
@@ -240,7 +240,7 @@ impl ParserFactory {
         registry.register_parser("llama", || Box::new(LlamaParser::new()));
         registry.register_parser("deepseek", || Box::new(DeepSeekParser::new()));
         registry.register_parser("glm4_moe", || Box::new(Glm4MoeParser::glm4()));
-        registry.register_parser("glm47_moe", || Box::new(Glm47MoeParser::glm47()));
+        registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("kimik2", || Box::new(KimiK2Parser::new()));
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
@@ -284,7 +284,7 @@ impl ParserFactory {
         // GLM models
         registry.map_model("glm-4.5*", "glm4_moe");
         registry.map_model("glm-4.6*", "glm4_moe");
-        registry.map_model("glm-4.7*", "glm47_moe");
+        registry.map_model("glm-4.7*", "glm4_moe");
         registry.map_model("glm-*", "json");
 
         // Step3 models

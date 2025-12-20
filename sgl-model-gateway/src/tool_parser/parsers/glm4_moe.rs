@@ -23,7 +23,7 @@ use crate::{
 /// - Key-value pairs for arguments
 /// - Support for multiple sequential tool calls
 /// - Configurable func_detail_extractor regex for version-specific parsing
-pub struct GlmMoeParser {
+pub struct Glm4MoeParser {
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
     /// Regex for extracting function details (version-specific)
@@ -48,7 +48,7 @@ pub struct GlmMoeParser {
     eot_token: &'static str,
 }
 
-impl GlmMoeParser {
+impl Glm4MoeParser {
     /// Create a new generic GLM MoE parser with a custom func_detail_extractor pattern
     ///
     /// # Arguments
@@ -172,14 +172,14 @@ impl GlmMoeParser {
     }
 }
 
-impl Default for GlmMoeParser {
+impl Default for Glm4MoeParser {
     fn default() -> Self {
         Self::glm4()
     }
 }
 
 #[async_trait]
-impl ToolParser for GlmMoeParser {
+impl ToolParser for Glm4MoeParser {
     async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains GLM MoE format
         if !self.has_tool_markers(text) {

@@ -20,7 +20,7 @@ pub mod helpers;
 
 // Re-export parser types for convenience
 pub use deepseek::DeepSeekParser;
-pub use glm4_moe::GlmMoeParser;
+pub use glm4_moe::Glm4MoeParser;
 pub use json::JsonParser;
 pub use kimik2::KimiK2Parser;
 pub use llama::LlamaParser;
@@ -30,5 +30,4 @@ pub use passthrough::PassthroughParser;
 pub use pythonic::PythonicParser;
 pub use qwen::QwenParser;
 pub use step3::Step3Parser;
-pub type Glm4MoeParser = GlmMoeParser;
-pub type Glm47MoeParser = GlmMoeParser;
+pub type Glm47MoeParser = Glm4MoeParser;
