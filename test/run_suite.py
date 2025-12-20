@@ -40,7 +40,7 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h20",
         "nightly-8-gpu-b200",
     ],
-    HWBackend.AMD: ["nightly-amd"],
+    HWBackend.AMD: ["nightly-amd", "nightly-amd-8-gpu"],
     HWBackend.CPU: [],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
