@@ -24,6 +24,8 @@ SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
+# color
+CYAN = "\033[1;36m"
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -394,6 +396,21 @@ def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNIN
     return original_levels
 
 
+def global_suppress_loggers():
+    # globally suppress some obsessive loggers
+    suppress_loggers(
+        [
+            "imageio",
+            "imageio_ffmpeg",
+            "PIL",
+            "PIL_Image",
+            "multipart",
+            "filelock",
+            "urllib3",
+        ]
+    )
+
+
 @contextmanager
 def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
     """
@@ -484,10 +501,6 @@ def log_generation_timer(
             total_requests,
             prompt[:100],
         )
-    else:
-        max_len = 100
-        suffix = "..." if len(prompt) > max_len else ""
-        logger.info(f"Processing prompt: {prompt[:100]}{suffix}")
 
     timer = GenerationTimer()
     timer.start_time = time.perf_counter()

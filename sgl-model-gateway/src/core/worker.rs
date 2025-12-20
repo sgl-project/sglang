@@ -8,9 +8,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use tokio::{sync::RwLock, time};
+use tokio::{sync::OnceCell, time};
 
 use super::{
     CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
@@ -515,8 +516,9 @@ pub struct BasicWorker {
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
-    /// Lazily initialized gRPC client for gRPC workers
-    pub grpc_client: Arc<RwLock<Option<Arc<GrpcClient>>>>,
+    /// Lazily initialized gRPC client for gRPC workers.
+    /// Uses OnceCell for lock-free reads after initialization.
+    pub grpc_client: Arc<OnceCell<Arc<GrpcClient>>>,
     /// Runtime-mutable models override (for lazy discovery)
     /// When set, overrides metadata.models for routing decisions.
     /// Uses std::sync::RwLock for synchronous access in supports_model().
@@ -715,64 +717,53 @@ impl Worker for BasicWorker {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
-                {
-                    let client_guard = self.grpc_client.read().await;
-                    if let Some(ref client) = *client_guard {
-                        return Ok(Some(client.clone()));
-                    }
-                }
-
-                let mut client_guard = self.grpc_client.write().await;
-
-                if let Some(ref client) = *client_guard {
-                    return Ok(Some(client.clone()));
-                }
-
-                let runtime_str = self.metadata.runtime_type.to_string();
-                tracing::info!(
-                    "Lazily initializing gRPC client ({}) for worker: {}",
-                    runtime_str,
-                    self.metadata.url
-                );
-                match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
-                    Ok(client) => {
-                        let client_arc = Arc::new(client);
-                        *client_guard = Some(client_arc.clone());
+                // OnceCell provides lock-free reads after initialization.
+                // get_or_try_init only acquires internal lock on first call.
+                let client = self
+                    .grpc_client
+                    .get_or_try_init(|| async {
+                        let runtime_str = self.metadata.runtime_type.to_string();
                         tracing::info!(
-                            "Successfully connected gRPC client ({}) for worker: {}",
+                            "Lazily initializing gRPC client ({}) for worker: {}",
                             runtime_str,
                             self.metadata.url
                         );
-                        Ok(Some(client_arc))
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to connect gRPC client for worker {}: {}",
-                            self.metadata.url,
-                            e
-                        );
-                        Err(WorkerError::ConnectionFailed {
-                            url: self.metadata.url.clone(),
-                            reason: format!("Failed to connect to gRPC server: {}", e),
-                        })
-                    }
-                }
+                        match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
+                            Ok(client) => {
+                                tracing::info!(
+                                    "Successfully connected gRPC client ({}) for worker: {}",
+                                    runtime_str,
+                                    self.metadata.url
+                                );
+                                Ok(Arc::new(client))
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to connect gRPC client for worker {}: {}",
+                                    self.metadata.url,
+                                    e
+                                );
+                                Err(WorkerError::ConnectionFailed {
+                                    url: self.metadata.url.clone(),
+                                    reason: format!("Failed to connect to gRPC server: {}", e),
+                                })
+                            }
+                        }
+                    })
+                    .await?;
+                Ok(Some(Arc::clone(client)))
             }
         }
     }
 
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
-        match self.metadata.connection_mode {
-            ConnectionMode::Http => Ok(()),
-            ConnectionMode::Grpc { .. } => {
-                let mut client_guard = self.grpc_client.write().await;
-                if client_guard.is_some() {
-                    tracing::info!("Resetting gRPC client for worker: {}", self.metadata.url);
-                    *client_guard = None;
-                }
-                Ok(())
-            }
-        }
+        // OnceCell doesn't support resetting. This is intentional for lock-free performance.
+        // If a connection fails, the worker should be removed and re-added.
+        tracing::debug!(
+            "reset_grpc_client called for {} (no-op with OnceCell)",
+            self.metadata.url
+        );
+        Ok(())
     }
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
@@ -1062,54 +1053,118 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
 }
 
-// TODO migrate code to V2 (and then remove this name suffix)
-pub struct WorkerLoadGuardV2 {
+/// RAII guard for worker load management
+///
+/// Automatically decrements worker load when dropped. Can be attached to
+/// an axum Response to tie the guard's lifetime to the response body,
+/// which is essential for streaming responses where the function returns
+/// immediately but the stream continues in the background.
+pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
 }
 
-impl WorkerLoadGuardV2 {
+impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>) -> Self {
         worker.increment_load();
         Self { worker }
     }
+
+    /// Attach this guard to a Response, tying the guard's lifetime to the response body.
+    ///
+    /// When the response body is fully consumed or dropped (e.g., client disconnects),
+    /// the guard is dropped and worker load is decremented automatically.
+    ///
+    /// This is the proper RAII pattern for SSE/streaming responses where the handler
+    /// returns immediately but the stream continues in a background task.
+    pub fn attach_to_response(
+        self,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        let (parts, body) = response.into_parts();
+
+        // Wrap body with guard - guard drops when body drops
+        let guarded_body = GuardedBody {
+            inner: body,
+            _guard: self,
+        };
+
+        axum::response::Response::from_parts(parts, Body::new(guarded_body))
+    }
 }
 
-impl Drop for WorkerLoadGuardV2 {
+impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.worker.decrement_load();
     }
 }
 
-/// RAII guard for worker load management
-pub struct WorkerLoadGuard<'a> {
-    workers: Vec<&'a dyn Worker>,
+/// Attach multiple guards to a Response (for dual prefill/decode workers)
+pub fn attach_guards_to_response(
+    guards: Vec<WorkerLoadGuard>,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    let (parts, body) = response.into_parts();
+
+    let guarded_body = MultiGuardedBody {
+        inner: body,
+        _guards: guards,
+    };
+
+    axum::response::Response::from_parts(parts, Body::new(guarded_body))
 }
 
-impl<'a> WorkerLoadGuard<'a> {
-    /// Create a new load guard for a single worker
-    pub fn new(worker: &'a dyn Worker) -> Self {
-        worker.increment_load();
-        Self {
-            workers: vec![worker],
-        }
+/// Body wrapper that holds a WorkerLoadGuard
+///
+/// When this body is dropped (stream ends or client disconnects),
+/// the guard is dropped, decrementing worker load.
+struct GuardedBody {
+    inner: Body,
+    _guard: WorkerLoadGuard,
+}
+
+/// Body wrapper that holds multiple WorkerLoadGuards (for dual prefill/decode)
+struct MultiGuardedBody {
+    inner: Body,
+    _guards: Vec<WorkerLoadGuard>,
+}
+
+impl http_body::Body for GuardedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
     }
 
-    /// Create a new load guard for multiple workers
-    pub fn new_multi(workers: Vec<&'a dyn Worker>) -> Self {
-        // Increment load counters for all workers
-        for worker in &workers {
-            worker.increment_load();
-        }
-        Self { workers }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
-impl<'a> Drop for WorkerLoadGuard<'a> {
-    fn drop(&mut self) {
-        // Decrement load counters for all workers
-        for worker in &self.workers {
-            worker.decrement_load();
-        }
+impl http_body::Body for MultiGuardedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -1545,81 +1600,6 @@ mod tests {
         );
         assert_eq!(worker.url(), "http://decode:8080");
         assert_eq!(worker.worker_type(), &WorkerType::Decode);
-    }
-
-    #[test]
-    fn test_load_guard_single_worker() {
-        use crate::core::BasicWorkerBuilder;
-        let worker = BasicWorkerBuilder::new("http://test:8080")
-            .worker_type(WorkerType::Regular)
-            .build();
-        assert_eq!(worker.load(), 0);
-
-        {
-            let _guard = WorkerLoadGuard::new(&worker);
-            assert_eq!(worker.load(), 1);
-        }
-
-        assert_eq!(worker.load(), 0);
-    }
-
-    #[test]
-    fn test_load_guard_multiple_workers() {
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(
-                BasicWorkerBuilder::new("http://w1:8080")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Box::new(
-                BasicWorkerBuilder::new("http://w2:8080")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Box::new(
-                BasicWorkerBuilder::new("http://w3:8080")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let worker_refs: Vec<&dyn Worker> = workers.iter().map(|w| w.as_ref()).collect();
-
-        {
-            let _guard = WorkerLoadGuard::new_multi(worker_refs);
-            assert_eq!(workers[0].load(), 1);
-            assert_eq!(workers[1].load(), 1);
-            assert_eq!(workers[2].load(), 1);
-        }
-
-        assert_eq!(workers[0].load(), 0);
-        assert_eq!(workers[1].load(), 0);
-        assert_eq!(workers[2].load(), 0);
-    }
-
-    #[test]
-    fn test_load_guard_panic_safety() {
-        use crate::core::BasicWorkerBuilder;
-        let worker = Arc::new(
-            BasicWorkerBuilder::new("http://test:8080")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        );
-        assert_eq!(worker.load(), 0);
-
-        let worker_clone = Arc::clone(&worker);
-
-        use std::panic::AssertUnwindSafe;
-
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = WorkerLoadGuard::new(worker_clone.as_ref());
-            assert_eq!(worker_clone.load(), 1);
-            panic!("Test panic");
-        }));
-
-        assert!(result.is_err());
-
-        assert_eq!(worker.load(), 0);
     }
 
     #[test]
