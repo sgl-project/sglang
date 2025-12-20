@@ -80,6 +80,7 @@ class TestNightlyGrok2Performance(unittest.TestCase):
                         output_lens=self.output_lens,
                         other_args=variant_config["other_args"],
                         variant=variant_config["name"],
+                        extra_bench_args=["--trust-remote-code"],
                     )
 
                     if not success:
