@@ -144,8 +144,6 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
-    return_hidden_states_before_norm: bool = False
-
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -196,7 +194,6 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
-            return_hidden_states_before_norm=forward_batch.return_hidden_states_before_norm,
         )
 
     def compute_dp_attention_metadata(self):
@@ -405,6 +402,7 @@ class LogitsProcessor(nn.Module):
             )
 
         # Get the last hidden states and last logits for the next token prediction
+        pruned_states_before_norm: Optional[torch.Tensor] = None
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
@@ -416,6 +414,7 @@ class LogitsProcessor(nn.Module):
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
+
         elif (
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob
@@ -437,11 +436,8 @@ class LogitsProcessor(nn.Module):
                     - 1
                 )
             pruned_states = hidden_states[last_index]
-            pruned_states_before_norm = (
-                hidden_states_before_norm[last_index]
-                if hidden_states_before_norm is not None
-                else None
-            )
+            if hidden_states_before_norm is not None:
+                pruned_states_before_norm = hidden_states_before_norm[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
@@ -474,7 +470,7 @@ class LogitsProcessor(nn.Module):
             sample_indices = []
             input_logprob_indices_pt = 0
             input_logprob_indices = []
-            pt, pruned_states, pruned_states_before_norm = 0, [], []
+            pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
             token_to_seq_idx = []
 
             for idx, (extend_logprob_start_len, extend_len) in enumerate(
@@ -493,9 +489,11 @@ class LogitsProcessor(nn.Module):
                 # We always need at least 1 token to sample because that's required
                 # by a caller.
                 assert extend_len > start_len
-                pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
+                pruned_states_list.append(
+                    hidden_states[pt + start_len : pt + extend_len]
+                )
                 if hidden_states_before_norm is not None:
-                    pruned_states_before_norm.append(
+                    pruned_states_before_norm_list.append(
                         hidden_states_before_norm[pt + start_len : pt + extend_len]
                     )
                 # Map each token to its sequence index, for chunked computation
@@ -514,11 +512,9 @@ class LogitsProcessor(nn.Module):
 
             # Set the last token of the last sequence
             token_to_seq_idx.append(len(logits_metadata.extend_seq_lens_cpu) - 1)
-            pruned_states = torch.cat(pruned_states)
+            pruned_states = torch.cat(pruned_states_list)
             if hidden_states_before_norm is not None:
-                pruned_states_before_norm = torch.cat(pruned_states_before_norm)
-            else:
-                pruned_states_before_norm = None
+                pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
             sample_indices = torch.tensor(
                 sample_indices, device=pruned_states.device, dtype=torch.int64
             )
@@ -558,20 +554,20 @@ class LogitsProcessor(nn.Module):
                         if sample_indices is not None
                         else pruned_states
                     )
-                    hidden_states_to_store_before_norm = (
-                        pruned_states_before_norm[sample_indices]
-                        if sample_indices is not None
-                        else pruned_states_before_norm
-                    )
+                    if hidden_states_before_norm is not None:
+                        hidden_states_to_store_before_norm = (
+                            pruned_states_before_norm[sample_indices]
+                            if sample_indices is not None
+                            else pruned_states_before_norm
+                        )
             else:
                 assert False, "Should never reach"
 
         del hidden_states
 
-        if (
-            logits_metadata.return_hidden_states_before_norm
-            and hidden_states_to_store_before_norm is not None
-        ):
+        if hidden_states_to_store_before_norm is not None:
+            # NOTE: when hidden_states_before_norm is provided, we always
+            # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         if not logits_metadata.extend_return_logprob:

@@ -11,7 +11,6 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
-use memchr::memmem;
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
@@ -19,7 +18,7 @@ use tracing::{debug, error};
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuardV2,
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType,
     },
     observability::{
@@ -265,7 +264,7 @@ impl Router {
         };
 
         let load_guard =
-            (policy.name() == "cache_aware").then(|| WorkerLoadGuardV2::new(worker.clone()));
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
         events::RequestSentEvent {
             url: worker.url().to_string(),
@@ -443,7 +442,7 @@ impl Router {
         route: &'static str,
         worker_url: &str,
         is_stream: bool,
-        mut load_guard: Option<WorkerLoadGuardV2>,
+        load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
@@ -550,7 +549,7 @@ impl Router {
                 }
             };
 
-            drop(load_guard);
+            // load_guard dropped here automatically after response body is read
             response
         } else {
             // Preserve headers for streaming response
@@ -561,18 +560,12 @@ impl Router {
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Spawn task to forward stream and detect completion
+            // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Check for stream end marker using memmem for efficiency
-                            if load_guard.is_some()
-                                && memmem::find(&bytes, b"data: [DONE]").is_some()
-                            {
-                                load_guard = None;
-                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
@@ -583,7 +576,6 @@ impl Router {
                         }
                     }
                 }
-                drop(load_guard);
             });
 
             let stream = UnboundedReceiverStream::new(rx);
@@ -592,6 +584,12 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+
+            // Attach load guard to response body for proper RAII lifecycle
+            // Guard is dropped when response body is consumed or client disconnects
+            if let Some(guard) = load_guard {
+                response = guard.attach_to_response(response);
+            }
             response
         }
     }

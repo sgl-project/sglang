@@ -153,7 +153,7 @@ def launch_http_server_only(server_args):
     app = create_app(server_args)
     uvicorn.run(
         app,
-        log_config=None,
+        use_colors=True,
         log_level=server_args.log_level,
         host=server_args.host,
         port=server_args.port,

@@ -662,12 +662,15 @@ class MiMoV2Model(nn.Module):
             )
         else:
             if hidden_states.shape[0] > 0:
+                if forward_batch.return_hidden_states_before_norm:
+                    hidden_states_before_norm = (
+                        hidden_states if residual is None else hidden_states + residual
+                    )
                 if residual is None:
-                    hidden_states_before_norm = hidden_states
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states_before_norm = hidden_states + residual
                     hidden_states, _ = self.norm(hidden_states, residual)
+
         return hidden_states, hidden_states_before_norm
 
     # If this function is called, it should always initialize KV cache scale
