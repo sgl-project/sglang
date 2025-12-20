@@ -184,7 +184,7 @@ class RotaryEmbedding(CustomOp):
             return
 
         # Align to reduce realloc frequency
-        align = envs.SGLANG_ROPE_CACHE_ALIGN.value
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
         new_len = ((needed_max_pos + align) // align) * align
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
@@ -219,6 +219,11 @@ class RotaryEmbedding(CustomOp):
             cos.view(-1, 1, 1, last_dim).contiguous(),
             sin.view(-1, 1, 1, last_dim).contiguous(),
         )
+
+    def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_sin = self.cos_sin_cache[:seqlen]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return cos, sin
 
     def forward_native(
         self,
@@ -270,27 +275,22 @@ class RotaryEmbedding(CustomOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
 
-        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
-            return self.forward_native(
-                positions, query, key, offsets, fused_set_kv_buffer_arg
-            )
-        else:
+        rotary_mode = "half"
+        if self.is_neox_style:
             rotary_mode = "half"
-            if self.is_neox_style:
-                rotary_mode = "half"
-            else:
-                rotary_mode = "interleave"
-            mrope_section = [0, 0, 0]
-            query_out, key_out = torch_npu.npu_mrope(
-                positions,
-                query,
-                key,
-                self.cos_sin_cache,
-                self.head_size,
-                mrope_section=mrope_section,
-                rotary_mode=rotary_mode,
-            )
-            return query_out, key_out
+        else:
+            rotary_mode = "interleave"
+        mrope_section = [0, 0, 0]
+        query_out, key_out = torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
+        )
+        return query_out, key_out
 
     def forward_cpu(
         self,
@@ -532,13 +532,13 @@ def _yarn_find_correction_range(
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
+    truncate: bool = True,
 ) -> Tuple[int, int]:
-    low = math.floor(
-        _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
-    )
-    high = math.ceil(
-        _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
-    )
+    low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
@@ -579,12 +579,14 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         attn_factor: float = 1,
         beta_fast: int = 32,
         beta_slow: int = 1,
+        truncate: bool = True,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        self.truncate = truncate
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
@@ -604,6 +606,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             self.rotary_dim,
             self.base,
             self.max_position_embeddings,
+            self.truncate,
         )
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
@@ -2652,6 +2655,7 @@ def get_rope(
                 if k
                 in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
             }
+            extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
             rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size,
                 rotary_dim,

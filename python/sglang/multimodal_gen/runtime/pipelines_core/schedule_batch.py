@@ -51,7 +51,7 @@ class Req:
     generator: torch.Generator | list[torch.Generator] | None = None
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
@@ -89,7 +89,9 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str = (
+        "cuda"  # Device for random generator: "cuda", "musa" or "cpu"
+    )
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
@@ -127,7 +129,10 @@ class Req:
     boundary_ratio: float | None = None
 
     # Scheduler parameters
-    num_inference_steps: int = 50
+    # Can be overridden via SGLANG_TEST_NUM_INFERENCE_STEPS env var for faster testing
+    num_inference_steps: int = int(
+        os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS", "50")
+    )
     guidance_scale: float = 1.0
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0

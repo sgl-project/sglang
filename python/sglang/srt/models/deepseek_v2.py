@@ -411,13 +411,7 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 def handle_attention_aiter(attn, forward_batch):
     if forward_batch.forward_mode.is_extend_without_speculative():
-        if is_dp_attention_enabled():
-            if sum(forward_batch.extend_prefix_lens_cpu) == 0:
-                return AttnForwardMethod.MHA
-            else:
-                return AttnForwardMethod.MLA
-        else:
-            return AttnForwardMethod.MHA
+        return AttnForwardMethod.MHA
     else:
         return AttnForwardMethod.MLA
 
@@ -1722,7 +1716,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                     layer_id=self.layer_id,
                     return_indices=False,
                 )
-
+            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
+                # MXFP4: fused RMSNorm + quant
+                q, _, _, _ = fused_rms_mxfp4_quant(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    None,
+                    None,
+                    None,
+                )
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
 
                 q, _, _, _ = fused_rms_fp8_group_quant(
@@ -1766,13 +1770,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
             )
-            kv = self.kv_b_proj(
-                kv_a_quanted,
-            )[0]
 
         else:
             kv_a = self.kv_a_layernorm(kv_a)
-            kv = self.kv_b_proj(kv_a)[0]
 
         # kv_a = self.kv_a_layernorm(kv_a)
 
@@ -1796,7 +1796,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q.dtype,
                     forward_batch,
                 )
-        kv = self.kv_b_proj(kv_a)[0]
+        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            kv = self.kv_b_proj(
+                kv_a_quanted,
+            )[0]
+        else:
+            kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]

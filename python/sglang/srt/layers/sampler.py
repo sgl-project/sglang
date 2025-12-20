@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+_CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
 class Sampler(nn.Module):
@@ -266,6 +268,42 @@ class Sampler(nn.Module):
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+
+
+def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
+    """Register a custom sampler factory for a backend string."""
+
+    if not backend:
+        raise ValueError("backend must be a non-empty string")
+
+    from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        logger.warning("Overriding existing sampler factory for backend '%s'", backend)
+    SAMPLING_BACKEND_CHOICES.add(backend)
+    _CUSTOM_SAMPLER_FACTORIES[backend] = factory
+
+
+def create_sampler(backend: Optional[str] = None) -> "Sampler":
+    """Create a sampler honoring custom backend registrations."""
+
+    server_args = get_global_server_args()
+    backend = backend or (server_args.sampling_backend if server_args else None)
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()
+        if not isinstance(sampler, Sampler):
+            raise TypeError(
+                f"Custom sampler factory for backend '{backend}' must return a Sampler"
+            )
+        return sampler
+
+    if backend is None or backend in _BUILT_IN_SAMPLING_BACKENDS:
+        return Sampler()
+
+    raise ValueError(
+        f"Unknown sampling backend '{backend}'. Register it via register_sampler_backend()."
+    )
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
