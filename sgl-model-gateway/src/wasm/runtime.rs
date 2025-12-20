@@ -529,6 +529,7 @@ mod tests {
         assert_eq!(config.thread_pool_size, cloned_config.thread_pool_size);
         assert_eq!(config.module_cache_size, cloned_config.module_cache_size);
     }
+    #[test]
     fn test_wasm_instantiation_performance_threshold() -> Result<()> {
         // A simple WASM module forcing memory allocation
         const WASM_WAT: &str = r#"
