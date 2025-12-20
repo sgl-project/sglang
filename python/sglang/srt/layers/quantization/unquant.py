@@ -471,7 +471,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_tokens = x.shape[0]
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
-        num_experts = layer.num_experts
+        num_experts = layer.w13_weight.shape[0]
         top_k = layer.top_k
         row_idx_len = num_tokens * top_k
         row_idx = (
