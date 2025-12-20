@@ -183,14 +183,13 @@ class DiffGenerator:
                 raise ValueError(f"No prompts found in file: {prompt_txt_path}")
 
             logger.info("Found %d prompts in %s", len(prompts), prompt_txt_path)
-        elif prompt is not None:
+        else:
+            if prompt is None:
+                prompt = " "
             if isinstance(prompt, str):
                 prompts.append(prompt)
             elif isinstance(prompt, list):
                 prompts.extend(prompt)
-        else:
-            raise ValueError("Either prompt or prompt_txt must be provided")
-
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
@@ -217,7 +216,9 @@ class DiffGenerator:
                 with log_generation_timer(
                     logger, req.prompt, request_idx + 1, len(requests)
                 ) as timer:
+                    print(f"218")
                     output_batch = self._send_to_scheduler_and_wait_for_response([req])
+                    print(f"220")
                     if output_batch.error:
                         raise Exception(f"{output_batch.error}")
 
