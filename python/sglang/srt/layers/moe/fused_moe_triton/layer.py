@@ -1339,7 +1339,7 @@ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
     num_expert_group: Optional[int],
     correction_bias: Optional[torch.Tensor],
     layer_id: int,
-):
+) -> torch.Tensor:
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
         router_logits=router_logits,
@@ -1363,7 +1363,7 @@ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl_fake(
     num_expert_group: Optional[int],
     correction_bias: Optional[torch.Tensor],
     layer_id: int,
-):
+) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
 
