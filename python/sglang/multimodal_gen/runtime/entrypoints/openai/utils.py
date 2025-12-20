@@ -165,7 +165,10 @@ async def process_generation_batch(
         result = await scheduler_client.forward([batch])
 
         if result.output is None:
-            raise RuntimeError("Model generation returned no output.")
+            error_msg = getattr(result, "error", "Unknown error")
+            raise RuntimeError(
+                f"Model generation returned no output. Error from scheduler: {error_msg}"
+            )
 
         save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
         post_process_sample(
