@@ -11,6 +11,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.utils.logprob import get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -450,27 +451,6 @@ def top_p_normalize_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-
-def get_top_logprobs(
-    logprobs: torch.Tensor,
-    top_logprobs_nums: List[int],
-):
-    max_k = max(top_logprobs_nums)
-    ret = logprobs.topk(max_k, dim=1)
-    values = ret.values.tolist()
-    indices = ret.indices.tolist()
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-
-    return (
-        output_top_logprobs_val,
-        output_top_logprobs_idx,
-    )
 
 
 def get_token_ids_logprobs_batch_optimized(
