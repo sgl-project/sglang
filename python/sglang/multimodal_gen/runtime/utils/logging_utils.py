@@ -255,49 +255,12 @@ def global_suppress_loggers():
     for name in target_names:
         logging.getLogger(name).setLevel(logging.ERROR)
 
-    # 1. Aggressive: find any logger that contains 'multipart' or 'uvicorn' in its name
-    for name in logging.root.manager.loggerDict:
-        if "multipart" in name or "uvicorn" in name:
-            logging.getLogger(name).setLevel(logging.ERROR)
-
-    # 2. Extreme: Add a Filter to the ROOT logger AND its handlers to drop these specific messages
-    # This catches libraries that log to root or use parent propagation.
-    # class QuietFilter(logging.Filter):
-    #     def filter(self, record):
-    #         try:
-    #             msg = record.getMessage()
-    #             # Suppress multipart parsing logs
-    #             if "Calling on_" in msg or "on_part_data" in msg or "on_header_" in msg:
-    #                 return False
-    #         except Exception:
-    #             pass
-    #         return True
-    #
-    # # Attach to the root logger instance
-    # logging.getLogger().addFilter(QuietFilter())
-    #
-    # # Also attach to all existing handlers of the root logger (The Ultimate Defense)
-    # for handler in logging.root.handlers:
-    #     handler.addFilter(QuietFilter())
-
-    # 3. Last Resort: Monkeypatch python-multipart parser's logger if it exists
-    try:
-        import multipart.multipart as mp_module
-
-        if hasattr(mp_module, "logger"):
-            mp_module.logger.setLevel(logging.ERROR)
-            mp_module.logger.propagate = False
-    except ImportError:
-        pass
-
 
 def init_logger(name: str) -> _SGLDiffusionLogger:
     """The main purpose of this function is to ensure that loggers are
     retrieved in such a way that we can be sure the root sgl_diffusion logger has
     already been configured."""
 
-    # One-and-done suppression for the current process
-    global_suppress_loggers()
 
     logger = logging.getLogger(name)
 

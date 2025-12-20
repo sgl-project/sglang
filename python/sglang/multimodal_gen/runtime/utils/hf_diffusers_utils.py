@@ -35,7 +35,6 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
-    suppress_other_loggers,
 )
 
 logger = init_logger(__name__)
@@ -395,8 +394,7 @@ def maybe_download_model(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
         with (
-            suppress_other_loggers(not_suppress_on_main_rank=False),
-            get_lock(model_name_or_path).acquire(poll_interval=2),
+            suppress_other_loggers(not_suppress_on_main_rank=False),get_lock(model_name_or_path).acquire(poll_interval=2),
         ):
             local_path = snapshot_download(
                 repo_id=model_name_or_path,
