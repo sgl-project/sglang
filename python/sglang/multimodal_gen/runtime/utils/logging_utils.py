@@ -33,7 +33,7 @@ RESET = "\033[0;0m"
 
 _FORMAT = (
     f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[PID:%(process)d] [%(name)s] [%(filename)s: %(lineno)d] %(message)s"
+    "[%(filename)s: %(lineno)d] %(message)s"
 )
 
 # _FORMAT = "[%(asctime)s] %(message)s"
@@ -261,7 +261,6 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     retrieved in such a way that we can be sure the root sgl_diffusion logger has
     already been configured."""
 
-
     logger = logging.getLogger(name)
 
     # Patch instance methods
@@ -400,7 +399,7 @@ def set_uvicorn_logging_configs():
 
 
 def configure_logger(server_args, prefix: str = ""):
-    log_format = f"[%(asctime)s PID:%(process)d{prefix}] [%(name)s] %(message)s"
+    log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
@@ -410,22 +409,6 @@ def configure_logger(server_args, prefix: str = ""):
     )
 
     set_uvicorn_logging_configs()
-    global_suppress_loggers()
-
-
-def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
-    original_levels = {}
-
-    for logger_name in loggers_to_suppress:
-        logger = logging.getLogger(logger_name)
-        original_levels[logger_name] = logger.level
-        logger.setLevel(level)
-
-    return original_levels
-
-
-# Run suppression immediately upon module import
-global_suppress_loggers()
 
 
 def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
