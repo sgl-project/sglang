@@ -2294,7 +2294,7 @@ def kill_itself_when_parent_died():
         logger.warning("kill_itself_when_parent_died is only supported in linux.")
 
 
-class UvicornAccessLogPathFilter(logging.Filter):
+class UvicornAccessLogFilter(logging.Filter):
     """Filter uvicorn access logs by request path.
 
     Notes:
@@ -2305,7 +2305,8 @@ class UvicornAccessLogPathFilter(logging.Filter):
     def __init__(self, excluded_path_prefixes=None):
         super().__init__()
         excluded_path_prefixes = excluded_path_prefixes or []
-        self.excluded_path_prefixes = [p for p in excluded_path_prefixes if p]
+        # Normalize once: drop empty prefixes, stringify, keep as tuple (fast iteration, immutable).
+        self.excluded_path_prefixes = tuple(str(p) for p in excluded_path_prefixes if p)
 
     def filter(self, record: logging.LogRecord) -> bool:
         path = None
@@ -2335,11 +2336,19 @@ class UvicornAccessLogPathFilter(logging.Filter):
             return True
 
         # Strip query string for matching
-        path = str(path).split("?", 1)[0]
-        for prefix in self.excluded_path_prefixes:
-            if path.startswith(prefix):
-                return False
-        return True
+        path = str(path)
+        # Some proxies/clients may emit absolute-form request-target in logs:
+        # e.g. "GET https://example.com/metrics HTTP/1.1" -> extract "/metrics".
+        if "://" in path:
+            try:
+                path = urlparse(path).path or path
+            except Exception:
+                # If parsing fails, fall back to the raw value.
+                pass
+        path = path.split("?", 1)[0]
+        return not any(
+            path.startswith(prefix) for prefix in self.excluded_path_prefixes
+        )
 
 
 def set_uvicorn_logging_configs(server_args=None):
@@ -2357,7 +2366,9 @@ def set_uvicorn_logging_configs(server_args=None):
     _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
 
 
-def _configure_uvicorn_access_log_filter(uvicorn_logging_config: dict, server_args=None):
+def _configure_uvicorn_access_log_filter(
+    uvicorn_logging_config: dict, server_args=None
+):
     """Configure uvicorn access log path filter into uvicorn LOGGING_CONFIG.
 
     This optionally filters uvicorn access logs (e.g., suppress noisy /metrics polling).
@@ -2369,15 +2380,16 @@ def _configure_uvicorn_access_log_filter(uvicorn_logging_config: dict, server_ar
             - uvicorn_access_log_exclude_prefixes (list[str] | tuple[str] | None)
     """
     # Optionally filter uvicorn access logs (e.g., suppress noisy /metrics polling).
-    if (
-        server_args is None
-        or not getattr(server_args, "enable_uvicorn_access_log_filter", True)
+    if server_args is None or not getattr(
+        server_args, "enable_uvicorn_access_log_filter", True
     ):
         return
 
     filter_name = "sglang_uvicorn_access_path_filter"
 
-    excluded_prefixes = getattr(server_args, "uvicorn_access_log_exclude_prefixes", None)
+    excluded_prefixes = getattr(
+        server_args, "uvicorn_access_log_exclude_prefixes", None
+    )
     if not excluded_prefixes:
         return
 
@@ -2393,7 +2405,7 @@ def _configure_uvicorn_access_log_filter(uvicorn_logging_config: dict, server_ar
 
     uvicorn_logging_config.setdefault("filters", {})
     uvicorn_logging_config["filters"][filter_name] = {
-        "()": "sglang.srt.utils.common.UvicornAccessLogPathFilter",
+        "()": "sglang.srt.utils.common.UvicornAccessLogFilter",
         "excluded_path_prefixes": excluded_prefixes,
     }
 
