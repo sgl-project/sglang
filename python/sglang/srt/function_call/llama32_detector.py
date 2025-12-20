@@ -77,9 +77,9 @@ class Llama32Detector(BaseFormatDetector):
                     dict_end = idx
                     brace_count = 0
                     for i in range(idx, action_text_len):
-                        if action_text[i] == '{':
+                        if action_text[i] == "{":
                             brace_count += 1
-                        elif action_text[i] == '}':
+                        elif action_text[i] == "}":
                             brace_count -= 1
                             if brace_count == 0:
                                 dict_end = i + 1
