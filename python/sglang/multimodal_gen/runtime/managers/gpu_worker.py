@@ -23,8 +23,8 @@ from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
+    global_suppress_loggers,
     init_logger,
-    suppress_other_loggers,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
@@ -177,7 +177,7 @@ def run_scheduler_process(
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
     configure_logger(server_args)
-    suppress_other_loggers()
+    global_suppress_loggers()
     set_cuda_arch()
 
     port_args = PortArgs.from_server_args(server_args)
