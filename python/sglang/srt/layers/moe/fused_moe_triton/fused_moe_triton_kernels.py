@@ -822,15 +822,12 @@ def act_and_mul_kernel(
     hidden_size,
     expert_ids_ptr,
     expert_step: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
 ):
     """
     Unified activation and multiply kernel that handles both sorted and unsorted routing,
     and both SiLU and GELU activations using compile-time constants.
-
-    This kernel collapses 4 variants (2 activations × 2 routing layouts) into one
-    by making activation type and routing layout compile-time constants.
     """
     InDtype = gateup_output.dtype.element_ty
     OutDtype = down_input.dtype.element_ty
@@ -848,8 +845,8 @@ def act_and_mul_kernel(
     gate_output_ptr = gateup_output_ptr
     up_output_ptr = gateup_output_ptr + half_hidden_size
 
-    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE_N):
-        offset = start_offset + tl.arange(0, BLOCK_SIZE_N)
+    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
         mask = offset < half_hidden_size
 
         gate_output = tl.load(gate_output_ptr + offset, mask=mask)
@@ -873,24 +870,18 @@ def act_and_mul_triton(
     activation: str = "silu",
 ) -> None:
     """
-    Unified activation and multiply wrapper that dispatches to the unified kernel
-    with appropriate compile-time constants.
-
     Args:
         gateup_output: Input tensor containing gate and up outputs concatenated
         down_input: Output tensor for the result
-        hidden_size: Size of the hidden dimension
         config: Configuration dictionary with BLOCK_SIZE_M and BLOCK_SIZE_N
         topk_ids: Expert IDs for unsorted routing (used when down_moe_use_tma=False)
         expert_ids: Expert IDs for sorted routing (used when down_moe_use_tma=True)
-        num_tokens_post_padded: Number of tokens after padding (used for sorted routing)
-        sorted_token_ids: Sorted token IDs (used for sorted routing)
         down_moe_use_tma: Whether to use sorted routing layout
         activation: Activation type ("silu" or "gelu")
     """
     grid = (down_input.shape[0],)
     hidden_size = gateup_output.shape[1]
-    expert_ids_row = topk_ids if not down_moe_use_tma else expert_ids
+    expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
     expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
     act_and_mul_kernel[grid](
         gateup_output,
@@ -898,9 +889,10 @@ def act_and_mul_triton(
         hidden_size,
         expert_ids_row,
         expert_step,
-        BLOCK_SIZE_N=512,
+        BLOCK_SIZE=512,
         ACTIVATION_TYPE=activation,
     )
+
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit

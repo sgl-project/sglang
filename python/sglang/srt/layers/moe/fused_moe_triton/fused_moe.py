@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -25,9 +25,9 @@ from sglang.srt.utils import (
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
+    act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
-    act_and_mul_triton,
     support_tensor_descriptor,
 )
 from .moe_align_block_size import moe_align_block_size
