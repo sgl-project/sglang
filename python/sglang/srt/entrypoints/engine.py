@@ -228,10 +228,7 @@ class Engine(EngineBase):
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-
-        scheduler_info = scheduler_infos[0]
-        self.scheduler_info = scheduler_info
-
+        self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
@@ -276,6 +273,8 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
+        # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
@@ -358,6 +357,8 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
+        # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,

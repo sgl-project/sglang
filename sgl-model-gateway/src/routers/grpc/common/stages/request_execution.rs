@@ -8,7 +8,7 @@ use super::PipelineStage;
 use crate::routers::{
     error,
     grpc::{
-        context::{ClientSelection, ExecutionResult, RequestContext},
+        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext},
         proto_wrapper::{
             ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
             ProtoStream,
@@ -58,6 +58,21 @@ impl PipelineStage for RequestExecutionStage {
                 "Client acquisition not completed",
             )
         })?;
+
+        // Create load guards for worker load tracking (increment load when created)
+        // They will be automatically dropped (and decrement load) when RequestContext is dropped
+        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "Worker selection not completed"
+            );
+            error::internal_error(
+                "worker_selection_not_completed",
+                "Worker selection not completed",
+            )
+        })?;
+
+        ctx.state.load_guards = Some(LoadGuards::from(workers));
 
         // Extract dispatch metadata for tracing span
         let request_id = ctx

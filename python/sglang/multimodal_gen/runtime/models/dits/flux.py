@@ -127,8 +127,10 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             causal=False,
             supported_attention_backends={
                 AttentionBackendEnum.FA,
+                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
+                AttentionBackendEnum.SAGE_ATTN_3,
             },
         )
 
