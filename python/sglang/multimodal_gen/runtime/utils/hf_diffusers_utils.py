@@ -391,7 +391,7 @@ def maybe_download_model(
         logger.info(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
-        with (get_lock(model_name_or_path).acquire(poll_interval=2),):
+        with get_lock(model_name_or_path).acquire(poll_interval=2):
             local_path = snapshot_download(
                 repo_id=model_name_or_path,
                 ignore_patterns=["*.onnx", "*.msgpack"],
@@ -403,7 +403,7 @@ def maybe_download_model(
                 "Downloaded model at %s is incomplete, retrying with force_download=True",
                 local_path,
             )
-            with (get_lock(model_name_or_path).acquire(poll_interval=2),):
+            with get_lock(model_name_or_path).acquire(poll_interval=2):
                 local_path = snapshot_download(
                     repo_id=model_name_or_path,
                     ignore_patterns=["*.onnx", "*.msgpack"],
