@@ -16,6 +16,8 @@ def get_top_logprobs_raw(
 ):
     max_k = max(top_logprobs_nums)
     values, indices = logprobs.topk(max_k, dim=-1)
+    values = values.tolist()
+    indices = indices.tolist()
 
     top_logprobs_val = []
     top_logprobs_idx = []
