@@ -138,7 +138,7 @@ def _cached_get_attn_backend(
 
     # get device-specific attn_backend
     if len(supported_attention_backends) == 0:
-        # all attention backends is allowed
+        # all attention backends are allowed
         pass
     elif selected_backend is None:
         logger.debug(f"Attention backend not specified")
