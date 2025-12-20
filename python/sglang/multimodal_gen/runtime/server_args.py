@@ -17,12 +17,7 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
-    QwenImagePipelineConfig,
-)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -175,35 +170,6 @@ class ExecutionMode(str, Enum):
         return [mode.value for mode in cls]
 
 
-class WorkloadType(str, Enum):
-    """
-    Enumeration for different workload types.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    I2V = "i2v"  # Image to Video
-    T2V = "t2v"  # Text to Video
-    T2I = "t2i"  # Text to Image
-    I2I = "i2i"  # Image to Image
-
-    @classmethod
-    def from_string(cls, value: str) -> "WorkloadType":
-        """Convert string to WorkloadType enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid workload type: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [workload.value for workload in cls]
-
-
-# args for sgl_diffusion framework
 @dataclasses.dataclass
 class ServerArgs:
     # Model and path configuration (for convenience)
@@ -214,9 +180,6 @@ class ServerArgs:
 
     # Running mode
     mode: ExecutionMode = ExecutionMode.INFERENCE
-
-    # Workload type
-    workload_type: WorkloadType = WorkloadType.T2V
 
     # Cache strategy
     cache_strategy: str = "none"
@@ -279,7 +242,7 @@ class ServerArgs:
     # Compilation
     enable_torch_compile: bool = False
 
-    disable_autocast: bool = False
+    disable_autocast: bool | None = None
 
     # VSA parameters
     VSA_sparsity: float = 0.0  # inference/validation sparsity
@@ -406,15 +369,6 @@ class ServerArgs:
             choices=ExecutionMode.choices(),
             default=ServerArgs.mode.value,
             help="The mode to run SGLang-diffusion",
-        )
-
-        # Workload type
-        parser.add_argument(
-            "--workload-type",
-            type=str,
-            choices=WorkloadType.choices(),
-            default=ServerArgs.workload_type.value,
-            help="The workload type",
         )
 
         # distributed_executor_backend
@@ -796,10 +750,6 @@ class ServerArgs:
         if "mode" in kwargs and isinstance(kwargs["mode"], str):
             kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
 
-        # Convert workload_type string to enum if necessary
-        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
-            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
-
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -896,13 +846,10 @@ class ServerArgs:
             self.use_fsdp_inference = False
 
         # autocast
-        is_flux = (
-            isinstance(self.pipeline_config, FluxPipelineConfig)
-            or isinstance(self.pipeline_config, QwenImagePipelineConfig)
-            or isinstance(self.pipeline_config, QwenImageEditPipelineConfig)
-        )
-        if is_flux:
-            self.disable_autocast = True
+        if self.disable_autocast is None:
+            self.disable_autocast = not self.pipeline_config.enable_autocast
+        else:
+            self.disable_autocast = False
 
         # Validate mode consistency
         assert isinstance(
@@ -911,14 +858,6 @@ class ServerArgs:
         assert (
             self.mode in ExecutionMode.choices()
         ), f"Invalid execution mode: {self.mode}"
-
-        # Validate workload type
-        assert isinstance(
-            self.workload_type, WorkloadType
-        ), f"Workload type must be a WorkloadType enum, got {type(self.workload_type)}"
-        assert (
-            self.workload_type in WorkloadType.choices()
-        ), f"Invalid workload type: {self.workload_type}"
 
         if self.tp_size == -1:
             self.tp_size = 1
