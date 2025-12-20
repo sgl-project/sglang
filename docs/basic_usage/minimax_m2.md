@@ -1,4 +1,4 @@
-# MiniMax M2/M2.1 Usage
+# MiniMax M2.1/M2 Usage
 
 [MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) and [MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) are advanced large language models created by [MiniMax](https://www.minimax.io/).
 
@@ -6,7 +6,7 @@ MiniMax-M2 series redefines efficiency for agents. It's a compact, fast, and cos
 
 ## Supported Models
 
-This guide applies to the following models. You only need to update the model name during deployment. The following examples use **MiniMax-M2.1**:
+This guide applies to the following models. You only need to update the model name during deployment. The following examples use **MiniMax-M2**:
 
 - [MiniMaxAI/MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1)
 - [MiniMaxAI/MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2)
@@ -24,7 +24,7 @@ The following are recommended configurations; actual requirements should be adju
 
 ```bash
 python -m sglang.launch_server \
-    --model-path MiniMaxAI/MiniMax-M2.1 \
+    --model-path MiniMaxAI/MiniMax-M2 \
     --tp-size 4 \
     --tool-call-parser minimax-m2 \
     --reasoning-parser minimax-append-think \
@@ -38,7 +38,7 @@ python -m sglang.launch_server \
 
 ```bash
 python -m sglang.launch_server \
-    --model-path MiniMaxAI/MiniMax-M2.1 \
+    --model-path MiniMaxAI/MiniMax-M2 \
     --tp-size 8 \
     --ep-size 8 \
     --tool-call-parser minimax-m2 \
@@ -57,7 +57,7 @@ After startup, you can test the SGLang OpenAI-compatible API with the following 
 curl http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "MiniMaxAI/MiniMax-M2.1",
+        "model": "MiniMaxAI/MiniMax-M2",
         "messages": [
             {"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]},
             {"role": "user", "content": [{"type": "text", "text": "Who won the world series in 2020?"}]}
