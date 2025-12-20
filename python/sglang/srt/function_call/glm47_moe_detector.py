@@ -120,21 +120,11 @@ def parse_arguments(
         return json_value, False
 
 
-class Glm4MoeDetector(BaseFormatDetector):
+class Glm47MoeDetector(BaseFormatDetector):
     """
-    Detector for GLM-4.5 and GLM-4.6 models.
-    Assumes function call format (with actual newlines):
-      <tool_call>get_weather
-      <arg_key>city</arg_key>
-      <arg_value>北京</arg_value>
-      <arg_key>date</arg_key>
-      <arg_value>2024-06-27</arg_value>
-      </tool_call>
-
-    Or with literal \n characters (escaped as \\n in the output):
-      <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>北京</arg_value>\n</tool_call>
-
-    Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
+    Detector for GLM-4.7 and GLM-5 models.
+    Assumes function call format:
+      <tool_call>get_weather<arg_key>city</arg_key><arg_value>北京</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>
     """
 
     def __init__(self):
@@ -143,7 +133,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.eot_token = "</tool_call>"
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
@@ -191,10 +181,11 @@ class Glm4MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 func_name = func_detail.group(1)
                 func_args = func_detail.group(2)
-                pairs = self.func_arg_regex.findall(func_args)
-
-                # Parse arguments using shared method
-                arguments = self._parse_argument_pairs(pairs, func_name, tools)
+                arguments = {}
+                if func_args:
+                    pairs = self.func_arg_regex.findall(func_args)
+                    # Parse arguments using shared method
+                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": arguments}
@@ -421,7 +412,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         try:
             # Try to match a partial or complete tool call
             partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
+                pattern=r"<tool_call>(.*?)(<arg_key>.*?)?(</tool_call>|$)",
                 string=current_text,
                 flags=re.DOTALL,
             )
