@@ -884,7 +884,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             bias,
             activation,
             conv_state_indices=cache_indices,
-            metadata=forward_batch
         )
 
         query, key, value = torch.split(
