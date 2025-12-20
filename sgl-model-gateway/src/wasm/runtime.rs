@@ -4,6 +4,7 @@
 //! Provides a thread pool for concurrent WASM execution and metrics tracking.
 
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -15,7 +16,8 @@ use tokio::sync::oneshot;
 use tracing::{debug, error};
 use wasmtime::{
     component::{Component, Linker, ResourceTable},
-    Config, Engine, Store, StoreLimitsBuilder, UpdateDeadline,
+    Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store, StoreLimitsBuilder,
+    UpdateDeadline,
 };
 use wasmtime_wasi::WasiCtx;
 
@@ -245,7 +247,19 @@ impl WasmThreadPool {
             "Worker started"
         );
 
+        let mut pool_config = PoolingAllocationConfig::default();
+        let max_memory_bytes = (config.max_memory_pages as usize) * 65536;
+
+        // Since this thread handles tasks sequentially, we don't need a large pool per thread.
+        // A pool size of 20 allows for efficient reuse without hogging memory.
+        pool_config.total_core_instances(20);
+        pool_config.max_memory_size(max_memory_bytes);
+        pool_config.max_component_instance_size(max_memory_bytes);
+        pool_config.max_tables_per_component(5);
+
         let mut wasmtime_config = Config::new();
+        wasmtime_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool_config));
+
         wasmtime_config.async_stack_size(config.max_stack_size);
         wasmtime_config.async_support(true);
         wasmtime_config.wasm_component_model(true); // Enable component model
@@ -263,6 +277,8 @@ impl WasmThreadPool {
                 return;
             }
         };
+
+        let mut component_cache: HashMap<Vec<u8>, Component> = HashMap::new();
 
         // Start epoch incrementer for timeout enforcement.
         // The engine's epoch counter is incremented periodically, and each Store
@@ -307,6 +323,7 @@ impl WasmThreadPool {
                 } => {
                     let result = Self::execute_component_in_worker(
                         &engine,
+                        &mut component_cache, // Pass the cache
                         wasm_bytes,
                         attach_point,
                         input,
@@ -322,22 +339,41 @@ impl WasmThreadPool {
 
     async fn execute_component_in_worker(
         engine: &Engine,
+        cache: &mut HashMap<Vec<u8>, Component>, //  cache argument
         wasm_bytes: Vec<u8>,
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
         config: &WasmRuntimeConfig,
     ) -> Result<WasmComponentOutput> {
-        // Compile component from bytes
+        // Compile component from bytes OR retrieve from cache
         // Note: The WASM file must be in component format (not plain WASM module)
-        // Use `wasm-tools component new` to wrap a WASM module into a component if needed
-        let component = Component::new(engine, &wasm_bytes).map_err(|e| {
-            WasmRuntimeError::CompileFailed(format!(
-                "failed to parse WebAssembly component: {}. \
-                 Hint: The WASM file must be in component format. \
-                 If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
-                e
-            ))
-        })?;
+        let component = if let Some(comp) = cache.get(&wasm_bytes) {
+            comp.clone() // Component is just a handle (cheap clone)
+        } else {
+            // Check cache size limit
+            if cache.len() >= config.module_cache_size {
+                debug!(
+                    target: "sgl_model_gateway::wasm::runtime",
+                    "Module cache full ({} items), clearing.",
+                    cache.len()
+                );
+                cache.clear();
+            }
+
+            // Compile new component
+            let comp = Component::new(engine, &wasm_bytes).map_err(|e| {
+                WasmRuntimeError::CompileFailed(format!(
+                    "failed to parse WebAssembly component: {}. \
+                     Hint: The WASM file must be in component format. \
+                     If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
+                    e
+                ))
+            })?;
+
+            // Insert into cache
+            cache.insert(wasm_bytes.clone(), comp.clone());
+            comp
+        };
 
         let mut linker = Linker::<WasiState>::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
