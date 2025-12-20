@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import pickle
+from collections import deque
 from typing import Any, List
 
 import zmq
@@ -77,7 +78,8 @@ class Scheduler:
             List[Req]: self._handle_generation,
         }
 
-        self.waiting_queue: list[tuple[bytes, Req]] = []
+        # FIFO, new reqs are appended
+        self.waiting_queue: deque[tuple[bytes, Req]] = deque()
 
     def _handle_set_lora(self, reqs: List[Any]):
         # TODO: return set status
@@ -111,7 +113,7 @@ class Scheduler:
             return None
 
         # pop the first (earliest)
-        item = self.waiting_queue.pop(0)
+        item = self.waiting_queue.popleft()
 
         return [item]
 

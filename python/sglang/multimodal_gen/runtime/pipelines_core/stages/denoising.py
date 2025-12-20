@@ -64,9 +64,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.platforms.interface import (
-    AttentionBackendEnum,
-)
+from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -529,7 +527,9 @@ class DenoisingStage(PipelineStage):
         """
         pipeline = self.pipeline() if self.pipeline else None
         if not server_args.model_loaded["transformer"]:
-            assert torch.backends.mps.is_available()
+            assert (
+                torch.backends.mps.is_available()
+            ), "transformer should be loaded at this point except on mps"
             loader = TransformerLoader()
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
@@ -757,13 +757,9 @@ class DenoisingStage(PipelineStage):
                 torch.mps.current_allocated_memory(),
             )
 
-        print(f"{current_platform.get_available_memory(get_local_torch_device())=}")
         # In offline local mode (`sglang generate`), offload transformer weights to CPU
         # after denoising to reduce peak VRAM during VAE decoding.
-        if (
-            current_platform.is_cuda_alike()
-            and current_platform.get_available_memory(get_local_torch_device()) < 10
-        ):
+        if current_platform.is_cuda_alike() and server_args.is_local_mode:
             for model in (self.transformer, self.transformer_2):
                 if model is not None:
                     model.to("cpu")

@@ -29,7 +29,7 @@ async def run_zeromq_broker(server_args: ServerArgs):
             logger.info("Broker received an offline job from a client.")
 
             # 2. Forward the request to the main Scheduler via the shared client
-            response_batch = await scheduler_client.forward(request_batch)
+            response_batch = await async_scheduler_client.forward(request_batch)
 
             # 3. Send the Scheduler's reply back to the offline client
             await socket.send_pyobj(response_batch)
@@ -195,5 +195,5 @@ class AsyncSchedulerClient:
 
 
 # Singleton instances for easy access
-scheduler_client = AsyncSchedulerClient()
+async_scheduler_client = AsyncSchedulerClient()
 sync_scheduler_client = SchedulerClient()

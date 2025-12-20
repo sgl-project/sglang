@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import shallow_asdict
@@ -122,7 +122,7 @@ async def generations(
     )
 
     # Run synchronously for images and save to disk
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path = await process_generation_batch(async_scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -219,7 +219,7 @@ async def edits(
     )
     batch = _build_req_from_sampling(sampling)
 
-    save_file_path = await process_generation_batch(scheduler_client, batch)
+    save_file_path = await process_generation_batch(async_scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,
