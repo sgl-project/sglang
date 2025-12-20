@@ -1,10 +1,3 @@
-"""Unified MiniMax-M2 performance and accuracy tests using nightly_metrics.
-
-This file replaces test_minimax_m2_perf.py and adds accuracy testing.
-Configuration: TP=8 + EP=8 (expert parallelism) for MoE.
-MiniMax-M2 is a 230B MoE model with 10B active params.
-"""
-
 import sys
 import unittest
 from pathlib import Path
@@ -12,10 +5,12 @@ from pathlib import Path
 # Add nightly directory to path for run_combined_tests import
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "nightly"))
 
-from run_combined_tests import run_metrics
+from run_accuracy import AccuracyTestParams
+from run_combined_tests import run_combined_tests
+from run_performance import PerformanceTestParams
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
+from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
@@ -35,38 +30,29 @@ class TestMiniMaxM2Unified(unittest.TestCase):
 
     def test_minimax_m2(self):
         """Run performance and accuracy for MiniMax-M2."""
-        print("\n" + "=" * 80)
-        print("RUNNING: TestMiniMaxM2Unified.test_minimax_m2")
-        print("=" * 80)
+        base_args = [
+            "--tp=8",
+            "--ep=8",
+            "--trust-remote-code",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
+        ]
 
         variants = [
             ModelLaunchSettings(
                 MINIMAX_M2_MODEL_PATH,
                 tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--ep",
-                    "8",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
+                extra_args=base_args,
             ),
         ]
 
-        # Run both performance and accuracy
-        # run_metrics() handles summary printing and raises AssertionError on failure
-        run_metrics(
+        run_combined_tests(
             models=variants,
-            run_perf=True,
-            run_accuracy=True,
-            is_vlm=False,
-            base_url=DEFAULT_URL_FOR_TEST,
-            profile_dir="performance_profiles_minimax_m2",
             test_name="MiniMax-M2 Unified",
-            batch_sizes=[1, 1, 8, 16, 64],
-            eval_name="mgsm_en",
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.80),
+            performance_params=PerformanceTestParams(
+                profile_dir="performance_profiles_minimax_m2",
+            ),
         )
 
 

@@ -1,13 +1,3 @@
-"""Unified DeepSeek V3.2 performance and accuracy tests using run_combined_tests.
-
-This file tests the 4 variants from test_deepseek_v32_perf.py with both
-performance and accuracy tests.
-
-Custom backend tests remain separate:
-- test_deepseek_v32_nsabackend.py (NSA backend variants with custom eval)
-- test_deepseek_v32_gpqa.py (GPQA evaluation with thinking mode)
-"""
-
 import sys
 import unittest
 from pathlib import Path
@@ -15,131 +5,188 @@ from pathlib import Path
 # Add nightly directory to path for run_combined_tests import
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "nightly"))
 
-from run_combined_tests import run_metrics
+from run_accuracy import AccuracyTestParams
+from run_combined_tests import run_combined_tests
+from run_performance import PerformanceTestParams
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
+from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-# H200 only - DeepSeek V3.2 requires H200 for dp-attention configs
-register_cuda_ci(est_time=8000, suite="nightly-8-gpu-h200-basic", nightly=True)
+register_cuda_ci(est_time=8000, suite="nightly-8-gpu-common", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
+
+BASE_ARGS = [
+    "--trust-remote-code",
+    "--model-loader-extra-config",
+    '{"enable_multithread_load": true}',
+]
+
+DP_ARGS = [
+    "--tp=8",
+    "--dp=8",
+    "--enable-dp-attention",
+]
+
+# Accuracy thresholds
+GSM8K_BASELINE = 0.935
+GPQA_BASELINE = 0.835
 
 
 class TestDeepseekV32Unified(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
-    Tests 4 variants (matching test_deepseek_v32_perf.py on main):
+    Tests multiple variants with both performance and accuracy tests:
     - dp: Standard TP=8 + DP=8 with dp-attention
     - dp+mtp: DP + EAGLE speculative decoding
     - tp: Pure TP=8 only
     - tp+mtp: Pure TP=8 + EAGLE speculative decoding
-
-    Each variant runs BOTH:
-    - Performance test (using NightlyBenchmarkRunner)
-    - Accuracy test (using run_eval with mgsm_en)
     """
 
+    @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
     def test_deepseek_v32_all_variants(self):
         """Run performance and accuracy for all DeepSeek V3.2 variants."""
-        print("\n" + "=" * 80)
-        print("RUNNING: TestDeepseekV32Unified.test_deepseek_v32_all_variants")
-        print("=" * 80)
-
-        # Define all model variants (matching test_deepseek_v32_perf.py on main)
+        TP_ARGS = [
+            "--tp=8",
+        ]
+        MTP_ARGS = [
+            "--speculative-algorithm=EAGLE",
+            "--speculative-num-steps=3",
+            "--speculative-eagle-topk=1",
+            "--speculative-num-draft-tokens=4",
+            "--mem-frac=0.7",
+        ]
         variants = [
-            # Variant: "dp"
-            # Standard TP=8 + DP=8 with dp-attention
+            # Variant: "dp" - Standard TP=8 + DP=8 with dp-attention
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--dp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
+                extra_args=BASE_ARGS + DP_ARGS,
             ),
-            # Variant: "dp+mtp"
-            # DP + EAGLE speculative decoding
+            # Variant: "dp+mtp" - DP + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--dp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-num-steps",
-                    "3",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "4",
-                    "--mem-frac",
-                    "0.7",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
+                extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
             ),
-            # Variant: "tp"
-            # Pure TP=8 only
+            # Variant: "tp" - Pure TP=8 only
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
+                extra_args=BASE_ARGS + TP_ARGS,
             ),
-            # Variant: "tp+mtp"
-            # Pure TP=8 + EAGLE speculative decoding
+            # Variant: "tp+mtp" - Pure TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-num-steps",
-                    "3",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "4",
-                    "--mem-frac",
-                    "0.7",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
+                extra_args=BASE_ARGS + TP_ARGS + MTP_ARGS,
             ),
         ]
 
-        # Run both performance and accuracy for all variants
-        # run_metrics() handles summary printing and raises AssertionError on failure
-        run_metrics(
+        run_combined_tests(
             models=variants,
-            run_perf=True,
-            run_accuracy=True,
-            is_vlm=False,
-            base_url=DEFAULT_URL_FOR_TEST,
-            profile_dir="performance_profiles_deepseek_v32",
             test_name="DeepSeek-V3.2 Unified",
-            batch_sizes=[1, 8, 16, 64],
-            eval_name="mgsm_en",
+            accuracy_params=AccuracyTestParams(
+                dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
+            ),
+            performance_params=PerformanceTestParams(
+                batch_sizes=[1, 8, 16, 64],
+                profile_dir="performance_profiles_deepseek_v32",
+            ),
+        )
+
+    @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
+    def test_deepseek_v32_nsa_backends(self):
+        """Test NSA attention backend variants (H200 only).
+
+        Tests three NSA backend configurations:
+        - flashmla: flashmla_sparse prefill + flashmla_kv decode
+        - fa3: FA3 prefill + FA3 decode
+        - fp8kvcache: default backends with FP8 KV cache
+        """
+        NSA_FLASHMLA_ARGS = [
+            "--attention-backend=nsa",
+            "--nsa-prefill-backend=flashmla_sparse",
+            "--nsa-decode-backend=flashmla_kv",
+        ]
+
+        NSA_FA3_ARGS = [
+            "--attention-backend=nsa",
+            "--nsa-prefill-backend=fa3",
+            "--nsa-decode-backend=fa3",
+        ]
+
+        NSA_FP8KV_ARGS = [
+            "--attention-backend=nsa",
+            "--kv-cache-dtype=fp8_e4m3",
+        ]
+
+        nsa_variants = [
+            # flashmla backend
+            ModelLaunchSettings(
+                DEEPSEEK_V32_MODEL_PATH,
+                tp_size=8,
+                extra_args=BASE_ARGS + DP_ARGS + NSA_FLASHMLA_ARGS,
+            ),
+            # fa3 backend
+            ModelLaunchSettings(
+                DEEPSEEK_V32_MODEL_PATH,
+                tp_size=8,
+                extra_args=BASE_ARGS + DP_ARGS + NSA_FA3_ARGS,
+            ),
+            # fp8 kv cache
+            ModelLaunchSettings(
+                DEEPSEEK_V32_MODEL_PATH,
+                tp_size=8,
+                extra_args=BASE_ARGS + DP_ARGS + NSA_FP8KV_ARGS,
+            ),
+        ]
+
+        run_combined_tests(
+            models=nsa_variants,
+            test_name="DeepSeek-V3.2 NSA Backends",
+            accuracy_params=AccuracyTestParams(
+                dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
+            ),
+            performance_params=PerformanceTestParams(
+                batch_sizes=[1, 8, 16, 64],
+                profile_dir="performance_profiles_deepseek_v32_nsa",
+            ),
+        )
+
+    @unittest.skipIf(not is_blackwell_system(), "Requires B200")
+    def test_deepseek_v32_b200(self):
+        """Test DeepSeek V3.2 with GPQA evaluation using thinking mode (B200 only).
+
+        This test runs GPQA evaluation with the reasoning parser enabled.
+        """
+        B200_REASONING_ARGS = [
+            "--tool-call-parser=deepseekv32",
+            "--reasoning-parser=deepseek-v3",
+        ]
+
+        variants = [
+            ModelLaunchSettings(
+                DEEPSEEK_V32_MODEL_PATH,
+                tp_size=8,
+                extra_args=BASE_ARGS + DP_ARGS + B200_REASONING_ARGS,
+            ),
+        ]
+
+        run_combined_tests(
+            models=variants,
+            test_name="DeepSeek-V3.2 GPQA (B200)",
+            accuracy_params=AccuracyTestParams(
+                dataset="gpqa",
+                baseline_accuracy=GPQA_BASELINE,
+                num_examples=198,
+                num_threads=198,
+                max_tokens=120000,
+                thinking_mode="deepseek-v3",
+                temperature=0.1,
+                repeat=4,
+            ),
+            performance_params=None,  # Skip performance test for GPQA
         )
 
 

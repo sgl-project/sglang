@@ -1,9 +1,3 @@
-"""Unified DeepSeek-V3.1 performance and accuracy tests using nightly_metrics.
-
-This file replaces test_deepseek_v31_perf.py and adds accuracy testing.
-Two variants: basic (TP=8) and mtp (TP=8 + EAGLE speculative decoding).
-"""
-
 import sys
 import unittest
 from pathlib import Path
@@ -11,17 +5,20 @@ from pathlib import Path
 # Add nightly directory to path for run_combined_tests import
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "nightly"))
 
-from run_combined_tests import run_metrics
+from run_accuracy import AccuracyTestParams
+from run_combined_tests import run_combined_tests
+from run_performance import PerformanceTestParams
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
+from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-# B200 only - requires specific hardware capabilities
-register_cuda_ci(est_time=12000, suite="nightly-8-gpu-b200-basic", nightly=True)
+# Runs on both H200 and B200 via nightly-8-gpu-common suite
+register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
 
+@unittest.skipIf(not is_blackwell_system(), "Requires B200")
 class TestDeepseekV31Unified(unittest.TestCase):
     """Unified test class for DeepSeek-V3.1 performance and accuracy.
 
@@ -36,61 +33,45 @@ class TestDeepseekV31Unified(unittest.TestCase):
 
     def test_deepseek_v31_all_variants(self):
         """Run performance and accuracy for all DeepSeek-V3.1 variants."""
-        print("\n" + "=" * 80)
-        print("RUNNING: TestDeepseekV31Unified.test_deepseek_v31_all_variants")
-        print("=" * 80)
+        # Define base arguments shared by most variants
+        base_args = [
+            "--tp=8",
+            "--trust-remote-code",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
+        ]
+        mtp_args = [
+            "--speculative-algorithm=EAGLE",
+            "--speculative-num-steps=3",
+            "--speculative-eagle-topk=1",
+            "--speculative-num-draft-tokens=4",
+            "--mem-frac=0.7",
+        ]
 
         variants = [
-            # Variant: "basic" (from test_deepseek_v31_perf.py)
-            # Standard TP=8
+            # Variant: "basic" - Standard TP=8
             ModelLaunchSettings(
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
+                extra_args=base_args,
             ),
-            # Variant: "mtp" (from test_deepseek_v31_perf.py)
-            # TP=8 + EAGLE speculative decoding
+            # Variant: "mtp" - TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
-                extra_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-num-steps",
-                    "3",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "4",
-                    "--mem-frac",
-                    "0.7",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
+                extra_args=base_args + mtp_args,
             ),
         ]
 
-        # Run both performance and accuracy for all variants
-        # run_metrics() handles summary printing and raises AssertionError on failure
-        run_metrics(
+        run_combined_tests(
             models=variants,
-            run_perf=True,
-            run_accuracy=True,
-            is_vlm=False,
-            base_url=DEFAULT_URL_FOR_TEST,
-            profile_dir="performance_profiles_deepseek_v31",
             test_name="DeepSeek-V3.1 Unified",
-            batch_sizes=[1, 1, 8, 16, 64],
-            eval_name="mgsm_en",
+            accuracy_params=AccuracyTestParams(
+                dataset="gsm8k", baseline_accuracy=0.935
+            ),
+            performance_params=PerformanceTestParams(
+                profile_dir="performance_profiles_deepseek_v31",
+            ),
         )
 
 
