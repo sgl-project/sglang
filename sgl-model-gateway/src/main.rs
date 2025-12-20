@@ -223,6 +223,12 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
 
+    /// Grace period in seconds to wait for in-flight requests during shutdown.
+    /// When the server receives SIGTERM/SIGINT, it will stop accepting new connections
+    /// and wait up to this duration for existing streaming requests to complete.
+    #[arg(long, default_value_t = 180)]
+    shutdown_grace_period_secs: u64,
+
     #[arg(long, default_value_t = -1)]
     max_concurrent_requests: i32,
 
@@ -713,6 +719,7 @@ impl CliArgs {
             } else {
                 Some(self.request_id_headers.clone())
             },
+            shutdown_grace_period_secs: self.shutdown_grace_period_secs,
         }
     }
 }
