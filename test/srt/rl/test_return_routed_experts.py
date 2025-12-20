@@ -142,7 +142,10 @@ class TestReturnRoutedExperts(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-        result = [extract_routed_experts_from_meta_info(res).reshape(-1, 48, 8) for res in http_result]
+        result = [
+            extract_routed_experts_from_meta_info(res).reshape(-1, 48, 8)
+            for res in http_result
+        ]
 
         return result
 
