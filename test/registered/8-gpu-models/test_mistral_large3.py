@@ -6,9 +6,9 @@ from pathlib import Path
 # Add nightly directory to path for run_combined_tests import
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "nightly"))
 
-from run_accuracy import AccuracyTestParams
+from accuracy_test_runner import AccuracyTestParams
+from performance_test_runner import PerformanceTestParams
 from run_combined_tests import run_combined_tests
-from run_performance import PerformanceTestParams
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
