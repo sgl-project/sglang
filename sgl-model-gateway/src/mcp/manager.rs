@@ -157,7 +157,10 @@ impl McpManager {
         self.inventory
             .list_tools()
             .into_iter()
-            .map(|(_tool_name, _server_name, tool_info)| tool_info)
+            .map(|(tool_name, _server_name, mut tool_info)| {
+                tool_info.name = Cow::Owned(tool_name);
+                tool_info
+            })
             .collect()
     }
 
@@ -191,7 +194,7 @@ impl McpManager {
 
         // Call the tool
         let request = CallToolRequestParam {
-            name: Cow::Owned(tool_name.to_string()),
+            name: Cow::Owned(tool_info.name.to_string()),
             arguments: args_map,
         };
 
@@ -481,7 +484,8 @@ impl McpManager {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_key);
                 for t in ts {
-                    inventory.insert_tool(t.name.to_string(), server_key.to_string(), t);
+                    let qualified_tool_name: String = format!("{}.{}", server_key, t.name);
+                    inventory.insert_tool(qualified_tool_name, server_key.to_string(), t);
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_key, e),
@@ -517,8 +521,12 @@ impl McpManager {
             Ok(ts) => {
                 info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
-                    self.inventory
-                        .insert_tool(t.name.to_string(), server_name.to_string(), t);
+                    let qualified_tool_name: String = format!("{}.{}", server_name, t.name);
+                    self.inventory.insert_tool(
+                        qualified_tool_name,
+                        server_name.to_string(),
+                        t,
+                    );
                 }
             }
             Err(e) => warn!("Failed to list tools from '{}': {}", server_name, e),
