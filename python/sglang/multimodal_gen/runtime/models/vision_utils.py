@@ -108,7 +108,8 @@ def load_image(
     """
     if isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
-            image = PIL.Image.open(requests.get(image, stream=True).raw)
+            with suppress_other_loggers(not_suppress_on_main_rank=True):
+                image = PIL.Image.open(requests.get(image, stream=True).raw)
         elif os.path.isfile(image):
             image = PIL.Image.open(image)
         else:

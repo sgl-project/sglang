@@ -28,7 +28,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
     import gradio as gr
 
     # init client
-    async_scheduler_client.initialize(server_args)
+    sync_scheduler_client.initialize(server_args)
 
     # server_args will be reused in gradio_generate function
     def gradio_generate(
