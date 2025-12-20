@@ -4,6 +4,7 @@ from typing import Dict, Set
 import torch
 
 
+# Adapted from skywork AI Infra diffusion optimize
 class LayerwiseOffloadManager:
     def __init__(
         self,
