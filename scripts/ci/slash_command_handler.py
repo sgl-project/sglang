@@ -144,11 +144,13 @@ def handle_rerun_stage(
     nvidia_stages = [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
+        "stage-b-test-2-gpu",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
         "unit-test-backend-1-gpu",
         "unit-test-backend-2-gpu",
+        "stage-b-test-4-gpu-b200",
         "unit-test-backend-4-gpu",
         "unit-test-backend-8-gpu-h200",
         "unit-test-backend-8-gpu-h20",

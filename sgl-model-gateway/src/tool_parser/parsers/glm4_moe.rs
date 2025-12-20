@@ -146,7 +146,7 @@ impl Glm4MoeParser {
                 Ok(Some(tool)) => tools.push(tool),
                 Ok(None) => continue,
                 Err(e) => {
-                    tracing::warn!("Failed to parse tool call: {}", e);
+                    tracing::debug!("Failed to parse tool call: {}", e);
                     continue;
                 }
             }
@@ -254,7 +254,7 @@ impl ToolParser for Glm4MoeParser {
                 // Validate tool name
                 if !tool_indices.contains_key(&tool_call.function.name) {
                     // Invalid tool name - skip this tool, preserve indexing for next tool
-                    tracing::warn!("Invalid tool name '{}' - skipping", tool_call.function.name);
+                    tracing::debug!("Invalid tool name '{}' - skipping", tool_call.function.name);
                     helpers::reset_current_tool_state(
                         &mut self.buffer,
                         &mut false, // glm4_moe doesn't track name_sent per tool

@@ -12,12 +12,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    serve, Json, Router,
+    Json, Router,
 };
+use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::{net::TcpListener, signal, spawn};
-use tracing::{error, info, warn, Level};
+use tokio::{signal, spawn};
+use tracing::{debug, error, info, warn, Level};
 
 use crate::{
     app_context::AppContext,
@@ -27,6 +28,7 @@ use crate::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
             create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
             create_worker_registration_workflow, create_worker_removal_workflow,
+            create_worker_update_workflow,
         },
         worker_to_info, Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
@@ -45,7 +47,7 @@ use crate::{
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
-        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
+        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest},
     },
     routers::{conversations, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
@@ -588,6 +590,41 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<Strin
     }
 }
 
+async fn update_worker(
+    State(state): State<Arc<AppState>>,
+    Path(url): Path<String>,
+    Json(update): Json<WorkerUpdateRequest>,
+) -> Response {
+    let worker_id = url.clone();
+    let job = Job::UpdateWorker {
+        url,
+        update: Box::new(update),
+    };
+
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_id,
+                "message": "Worker update queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
+        }
+        Err(error) => {
+            let error_response = WorkerErrorResponse {
+                error,
+                code: "INTERNAL_SERVER_ERROR".to_string(),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
+        }
+    }
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -599,6 +636,9 @@ pub struct ServerConfig {
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
+    /// Grace period in seconds to wait for in-flight requests during shutdown.
+    /// Default is 30 seconds.
+    pub shutdown_grace_period_secs: u64,
 }
 
 pub fn build_app(
@@ -679,8 +719,10 @@ pub fn build_app(
     let worker_routes = Router::new()
         .route("/workers", post(create_worker))
         .route("/workers", get(list_workers_rest))
-        .route("/workers/{url}", get(get_worker))
-        .route("/workers/{url}", delete(delete_worker))
+        .route(
+            "/workers/{url}",
+            get(get_worker).put(update_worker).delete(delete_worker),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -696,6 +738,7 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
+        .layer(middleware::HttpMetricsLayer::new())
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
@@ -780,6 +823,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .register_workflow(create_worker_removal_workflow())
         .expect("worker_removal workflow should be valid");
     engine
+        .register_workflow(create_worker_update_workflow())
+        .expect("worker_update workflow should be valid");
+    engine
         .register_workflow(create_mcp_registration_workflow())
         .expect("mcp_registration workflow should be valid");
     engine
@@ -792,7 +838,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!(
+    debug!(
         "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
@@ -835,7 +881,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         let refresh_interval = Duration::from_secs(600); // 10 minutes
         let _refresh_handle =
             Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
-        info!("Started background refresh for all MCP servers (every 10 minutes)");
+        debug!("Started background refresh for all MCP servers (every 10 minutes)");
     }
 
     let worker_stats = app_context.worker_registry.stats();
@@ -850,14 +896,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let _health_checker = app_context
         .worker_registry
         .start_health_checker(config.router_config.health_check.check_interval_secs);
-    info!(
+    debug!(
         "Started health checker for workers with {}s interval",
         config.router_config.health_check.check_interval_secs
     );
 
     if let Some(ref load_monitor) = app_context.load_monitor {
         load_monitor.start().await;
-        info!("Started LoadMonitor for PowerOfTwo policies");
+        debug!("Started LoadMonitor for PowerOfTwo policies");
     }
 
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
@@ -873,13 +919,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     match processor {
         Some(proc) => {
             spawn(proc.run());
-            info!(
+            debug!(
                 "Started request queue (size: {}, timeout: {}s)",
                 config.router_config.queue_size, config.router_config.queue_timeout_secs
             );
         }
         None => {
-            info!(
+            debug!(
                 "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
                 config.router_config.max_concurrent_requests
             );
@@ -941,13 +987,45 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
     let bind_addr = format!("{}:{}", config.host, config.port);
     info!("Starting server on {}", bind_addr);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
-    serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| format!("Invalid address: {}", e))?;
+
+    let handle = axum_server::Handle::new();
+    let handle_clone = handle.clone();
+    let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
+    spawn(async move {
+        shutdown_signal().await;
+        handle_clone.graceful_shutdown(Some(grace_period));
+    });
+
+    if let (Some(cert), Some(key)) = (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        info!("TLS enabled");
+        ring::default_provider()
+            .install_default()
+            .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
+
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+            .await
+            .map_err(|e| format!("Failed to create TLS config: {}", e))?;
+
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    } else {
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    }
 
     Ok(())
 }
