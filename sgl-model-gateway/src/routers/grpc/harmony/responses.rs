@@ -787,8 +787,8 @@ async fn execute_mcp_tool_loop_streaming(
             "Harmony Responses streaming iteration"
         );
 
-        // Execute pipeline and get stream
-        let execution_result = match ctx
+        // Execute pipeline and get stream + load guards
+        let (execution_result, _load_guards) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(&current_request, ctx)
             .await
@@ -805,6 +805,7 @@ async fn execute_mcp_tool_loop_streaming(
         };
 
         // Process stream with token-level streaming (mixed tools - emits correct events per tool type)
+        // Load guards are held during processing and dropped when iteration completes
         let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
             execution_result,
             emitter,
@@ -999,8 +1000,8 @@ async fn execute_without_mcp_streaming(
 ) {
     debug!("No MCP tools - executing single iteration");
 
-    // Execute pipeline and get stream
-    let execution_result = match ctx
+    // Execute pipeline and get stream + load guards
+    let (execution_result, _load_guards) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(current_request, ctx)
         .await
@@ -1018,6 +1019,7 @@ async fn execute_without_mcp_streaming(
 
     // Process stream (emits all output items during streaming - function tool path emits function_call_arguments.* events)
     // Pass empty HashSet so all tools are treated as function tools (per-tool detection)
+    // Load guards are held during processing and dropped when iteration completes
     let empty_mcp_tools = std::collections::HashSet::new();
     let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
         execution_result,
@@ -1033,6 +1035,7 @@ async fn execute_without_mcp_streaming(
             return;
         }
     };
+    // _load_guards dropped here after iteration completes
 
     // Extract usage from iteration result
     let usage = match iteration_result {

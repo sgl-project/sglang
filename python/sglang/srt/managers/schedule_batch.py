@@ -1217,9 +1217,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
-    # For hidden states before normal
-    return_hidden_states_before_norm: bool = False
-
     @classmethod
     def init_new(
         cls,
@@ -1746,21 +1743,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         ):
             if len(sorted_indices) == 1:
-                # Corner case: only one request left
-                if self.is_hybrid_swa:
-                    full_available_size = (
-                        self.token_to_kv_pool_allocator.full_available_size()
-                    )
-                    swa_available_size = (
-                        self.token_to_kv_pool_allocator.swa_available_size()
-                    )
-                    assert (
-                        full_available_size > 0 and swa_available_size > 0
-                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
-                else:
-                    assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
-                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
+                # Always keep at least one request
                 break
 
             first_iter = False
@@ -1770,11 +1753,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-            if len(retracted_reqs) == 0:
-                # Corner case: only one request left
-                raise ValueError(
-                    "Failed to retract any request. No space left for only one request."
-                )
+        if len(sorted_indices) <= 1 and not self.check_decode_mem(
+            selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+        ):
+            # Retracting loops ends and still not enough memory
+            raise ValueError(
+                "Out of memory even after retracting all other requests in the decode batch."
+            )
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -2116,7 +2101,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
-            return_hidden_states_before_norm=self.return_hidden_states_before_norm,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,

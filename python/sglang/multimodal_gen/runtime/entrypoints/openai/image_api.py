@@ -21,8 +21,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
-    _save_upload_to_path,
+    merge_image_input_list,
     process_generation_batch,
+    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -154,6 +155,8 @@ async def generations(
 async def edits(
     image: Optional[List[UploadFile]] = File(None),
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
+    url: Optional[List[str]] = Form(None),
+    url_array: Optional[List[str]] = Form(None, alias="url[]"),
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
@@ -173,20 +176,30 @@ async def edits(
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
-    if not images or len(images) == 0:
-        raise HTTPException(status_code=422, detail="Field 'image' is required")
+    urls = url or url_array
+
+    if (not images or len(images) == 0) and (not urls or len(urls) == 0):
+        raise HTTPException(
+            status_code=422, detail="Field 'image' or 'url' is required"
+        )
 
     # Save all input images; additional images beyond the first are saved for potential future use
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    if images is not None and not isinstance(images, list):
-        images = [images]
+    image_list = merge_image_input_list(images, urls)
+
     input_paths = []
-    for idx, img in enumerate(images):
-        filename = img.filename or f"image_{idx}"
-        input_path = os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
-        await _save_upload_to_path(img, input_path)
-        input_paths.append(input_path)
+    try:
+        for idx, img in enumerate(image_list):
+            filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+            input_path = await save_image_to_path(
+                img, os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
+            )
+            input_paths.append(input_path)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Failed to process image source: {str(e)}"
+        )
 
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
