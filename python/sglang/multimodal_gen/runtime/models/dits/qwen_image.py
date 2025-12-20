@@ -44,7 +44,7 @@ def _get_qkv_projections(
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
-    def __init__(self, embedding_dim):
+    def __init__(self, embedding_dim, use_additional_t_cond=False):
         super().__init__()
 
         self.time_proj = Timesteps(
@@ -53,14 +53,25 @@ class QwenTimestepProjEmbeddings(nn.Module):
         self.timestep_embedder = TimestepEmbedding(
             in_channels=256, time_embed_dim=embedding_dim
         )
+        self.use_additional_t_cond = use_additional_t_cond
+        if use_additional_t_cond:
+            self.addition_t_embedding = nn.Embedding(2, embedding_dim)
 
-    def forward(self, timestep, hidden_states):
+    def forward(self, timestep, hidden_states, addition_t_cond=None):
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(
             timesteps_proj.to(dtype=hidden_states.dtype)
         )  # (N, D)
 
         conditioning = timesteps_emb
+        if self.use_additional_t_cond:
+            if addition_t_cond is None:
+                raise ValueError(
+                    "When additional_t_cond is True, addition_t_cond must be provided."
+                )
+            addition_t_emb = self.addition_t_embedding(addition_t_cond)
+            addition_t_emb = addition_t_emb.to(dtype=hidden_states.dtype)
+            conditioning = conditioning + addition_t_emb
 
         return conditioning
 
@@ -198,6 +209,169 @@ class QwenEmbedRope(nn.Module):
             freqs_pos[0][idx : idx + frame]
             .view(frame, 1, 1, -1)
             .expand(frame, height, width, -1)
+        )
+        if self.scale_rope:
+            freqs_height = torch.cat(
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                dim=0,
+            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(
+                frame, height, width, -1
+            )
+            freqs_width = torch.cat(
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                dim=0,
+            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(
+                frame, height, width, -1
+            )
+        else:
+            freqs_height = (
+                freqs_pos[1][:height]
+                .view(1, height, 1, -1)
+                .expand(frame, height, width, -1)
+            )
+            freqs_width = (
+                freqs_pos[2][:width]
+                .view(1, 1, width, -1)
+                .expand(frame, height, width, -1)
+            )
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
+            seq_lens, -1
+        )
+        return freqs.clone().contiguous()
+
+
+class QwenEmbedLayer3DRope(nn.Module):
+    def __init__(self, theta: int, axes_dim: List[int], scale_rope=False):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+        pos_index = torch.arange(4096)
+        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        self.pos_freqs = torch.cat(
+            [
+                self.rope_params(pos_index, self.axes_dim[0], self.theta),
+                self.rope_params(pos_index, self.axes_dim[1], self.theta),
+                self.rope_params(pos_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+        self.neg_freqs = torch.cat(
+            [
+                self.rope_params(neg_index, self.axes_dim[0], self.theta),
+                self.rope_params(neg_index, self.axes_dim[1], self.theta),
+                self.rope_params(neg_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+
+        self.scale_rope = scale_rope
+
+    def rope_params(self, index, dim, theta=10000):
+        """
+        Args:
+            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
+        """
+        assert dim % 2 == 0
+        freqs = torch.outer(
+            index,
+            1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)),
+        )
+        freqs = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs
+
+    def forward(self, video_fhw, txt_seq_lens, device):
+        """
+        Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
+        txt_length: [bs] a list of 1 integers representing the length of the text
+        """
+        if self.pos_freqs.device != device:
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
+
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        if not isinstance(video_fhw, list):
+            video_fhw = [video_fhw]
+
+        vid_freqs = []
+        max_vid_index = 0
+        layer_num = len(video_fhw) - 1
+        for idx, fhw in enumerate(video_fhw):
+            frame, height, width = fhw
+            if idx != layer_num:
+                video_freq = self._compute_video_freqs(frame, height, width, idx)
+            else:
+                ### For the condition image, we set the layer index to -1
+                video_freq = self._compute_condition_freqs(frame, height, width)
+            video_freq = video_freq.to(device)
+            vid_freqs.append(video_freq)
+
+            if self.scale_rope:
+                max_vid_index = max(height // 2, width // 2, max_vid_index)
+            else:
+                max_vid_index = max(height, width, max_vid_index)
+
+        max_vid_index = max(max_vid_index, layer_num)
+        max_len = max(txt_seq_lens)
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        vid_freqs = torch.cat(vid_freqs, dim=0)
+
+        return vid_freqs, txt_freqs
+
+    @functools.lru_cache(maxsize=None)
+    def _compute_video_freqs(self, frame, height, width, idx=0):
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = (
+            freqs_pos[0][idx : idx + frame]
+            .view(frame, 1, 1, -1)
+            .expand(frame, height, width, -1)
+        )
+        if self.scale_rope:
+            freqs_height = torch.cat(
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                dim=0,
+            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(
+                frame, height, width, -1
+            )
+            freqs_width = torch.cat(
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                dim=0,
+            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(
+                frame, height, width, -1
+            )
+        else:
+            freqs_height = (
+                freqs_pos[1][:height]
+                .view(1, height, 1, -1)
+                .expand(frame, height, width, -1)
+            )
+            freqs_width = (
+                freqs_pos[2][:width]
+                .view(1, 1, width, -1)
+                .expand(frame, height, width, -1)
+            )
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
+            seq_lens, -1
+        )
+        return freqs.clone().contiguous()
+
+    @functools.lru_cache(maxsize=None)
+    def _compute_condition_freqs(self, frame, height, width):
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = (
+            freqs_neg[0][-1:].view(frame, 1, 1, -1).expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
@@ -553,16 +727,35 @@ class QwenImageTransformer2DModel(CachableDiT):
         num_attention_heads = config.arch_config.num_attention_heads
         joint_attention_dim = config.arch_config.joint_attention_dim
         axes_dims_rope = config.arch_config.axes_dims_rope
-        zero_cond_t = getattr(config.arch_config, "zero_cond_t", False)
+        self.zero_cond_t = getattr(config.arch_config, "zero_cond_t", False)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
-        self.zero_cond_t = zero_cond_t
+
+        self.use_additional_t_cond: bool = getattr(
+            config.arch_config, "use_additional_t_cond", False
+        )  # For qwen-image-layered now
+        self.use_layer3d_rope: bool = getattr(
+            config.arch_config, "use_layer3d_rope", False
+        )  # For qwen-image-layered now
 
         self.rotary_emb = QwenEmbedRope(
             theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
         )
 
+        if not self.use_layer3d_rope:
+            self.pos_embed = QwenEmbedRope(
+                theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
+            )
+        else:
+            self.pos_embed = QwenEmbedLayer3DRope(
+                theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
+            )
+
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
+        self.time_text_embed = QwenTimestepProjEmbeddings(
+            embedding_dim=self.inner_dim,
+            use_additional_t_cond=self.use_additional_t_cond,
+        )
 
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
 
@@ -575,7 +768,7 @@ class QwenImageTransformer2DModel(CachableDiT):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
-                    zero_cond_t=zero_cond_t,
+                    zero_cond_t=self.zero_cond_t,
                 )
                 for _ in range(num_layers)
             ]
@@ -597,6 +790,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         img_shapes: Optional[List[Tuple[int, int, int]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
+        additional_t_cond: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
         attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_block_samples=None,
@@ -658,7 +852,7 @@ class QwenImageTransformer2DModel(CachableDiT):
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
-        temb = self.time_text_embed(timestep, hidden_states)
+        temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
         image_rotary_emb = freqs_cis
         for index_block, block in enumerate(self.transformer_blocks):
