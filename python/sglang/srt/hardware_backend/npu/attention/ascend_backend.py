@@ -87,9 +87,7 @@ class AscendAttnMaskBuilder:
         self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
         # Initialize mixed chunk mask cache
-        mixed_chunk_cache_len = 8192
-        self.mix_mask_cache = self.generate_attn_mask(mixed_chunk_cache_len, "mix")
-        self.mix_seq_len_cached = self.mix_mask_cache.shape[0]
+        self.mixed_chunk_attn_mask = self.get_splitfuse_attn_mask()
 
         if use_mla:
             # Initialize RingMla mask
@@ -196,35 +194,9 @@ class AscendAttnMaskBuilder:
         :param device: Device to run the model on.
         :return: A tensor representing the splitfuse attention mask.
         """
-        if dtype not in [torch.float16, torch.bfloat16]:
-            raise ValueError("splitfuse_attn_mask now only supports bf16 and fp16")
-        max_seq_len = max(seq_lens, default=0)
-        self.mix_mask_cache, self.mix_seq_len_cached = self.update_attn_cache(
-            max_seq_len, self.mix_mask_cache, self.mix_seq_len_cached, dtype, mode="mix"
-        )
-        attn_mask = torch.index_select(self.mix_mask_cache, dim=0, index=position)[
-            :, :max_seq_len
-        ]
-        return attn_mask.contiguous().to(device, non_blocking=True)
-
-    def update_mask(self, forward_metadata):
-        """
-        Update the splitfuse attention mask based on forward metadata.
-
-        :param forward_metadata: Forward metadata containing sequence lengths and extended lengths.
-        :return: Updated splitfuse attention mask.
-        """
-        attn_mask_id = self.get_attention_mask_id(
-            forward_metadata.seq_lens_cpu_int,
-            forward_metadata.extend_seq_lens_cpu_int,
-        )
-        mix_mask = self.get_splitfuse_attn_mask(
-            seq_lens=forward_metadata.seq_lens_cpu_int,
-            position=attn_mask_id,
-            dtype=torch.float16,
-            device=self.device,
-        ).to(torch.bfloat16)
-        return mix_mask
+        if self.mixed_chunk_attn_mask is None:
+            self.mixed_chunk_attn_mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)
+        return self.mixed_chunk_attn_mask
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -333,10 +305,6 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 )
 
-        if forward_batch.forward_mode.is_mixed():
-            self.mix_mask = self.ascend_attn_mask_builder.update_mask(
-                self.forward_metadata
-            )
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -1450,29 +1418,28 @@ class AscendAttnBackend(AttentionBackend):
             )
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        num_block, block_size, _, _ = k_cache.shape
+        key = k_cache.view(num_block, block_size, -1)
+        value = v_cache.view(num_block, block_size, -1)
 
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        # Initialize the output tensor for attention results
-        attn_output = torch.empty(
-            (query.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-            dtype=query.dtype,
-            device=query.device,
+        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            key,
+            value,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="TND",
+            block_size=block_size,
+            block_table=self.forward_metadata.block_tables,
+            atten_mask=self.mix_mask,
+            sparse_mode=3,
+            actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+            actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+            scale=layer.scaling,
         )
 
-        torch_npu._npu_paged_attention_splitfuse(
-            query=query,
-            key_cache=k_cache,
-            value_cache=v_cache,
-            block_table=self.forward_metadata.block_tables,
-            context_lens=self.forward_metadata.seq_lens_cpu_int,
-            mask=self.mix_mask,
-            seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
-            scale_value=layer.scaling,
-            num_heads=layer.tp_q_head_num,
-            num_kv_heads=layer.tp_k_head_num,
-            out=attn_output,
-        )
         return attn_output.view(
             attn_output.shape[0], layer.tp_q_head_num * layer.v_head_dim
         )
