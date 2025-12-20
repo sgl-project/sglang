@@ -270,6 +270,13 @@ def is_blackwell():
 
 
 @lru_cache(maxsize=1)
+def is_sm120():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 12
+
+
+@lru_cache(maxsize=1)
 def is_hpu() -> bool:
     return hasattr(torch, "hpu") and torch.hpu.is_available()
 
