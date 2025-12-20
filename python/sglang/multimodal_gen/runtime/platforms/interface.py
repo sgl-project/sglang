@@ -70,7 +70,7 @@ class DeviceCapability(NamedTuple):
         return self.major * 10 + self.minor
 
 
-BYTES_PER_GB = 1024 ^ 3
+BYTES_PER_GB = 1024 ** 3
 
 
 class Platform:
