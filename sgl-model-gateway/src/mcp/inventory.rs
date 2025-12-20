@@ -353,14 +353,14 @@ mod tests {
         let prompt = create_test_prompt("test_prompt");
 
         inventory.insert_prompt(
-            "test_prompt".to_string(),
+            "server1.test_prompt".to_string(),
             "server1".to_string(),
             prompt.clone(),
         );
 
-        assert!(inventory.has_prompt("test_prompt"));
+        assert!(inventory.has_prompt("server1.test_prompt"));
 
-        let result = inventory.get_prompt("test_prompt");
+        let result = inventory.get_prompt("server1.test_prompt");
         assert!(result.is_some());
 
         let (server_name, retrieved_prompt) = result.unwrap();
@@ -428,7 +428,7 @@ mod tests {
             create_test_tool("tool1"),
         );
         inventory.insert_prompt(
-            "prompt1".to_string(),
+            "server1.prompt1".to_string(),
             "server1".to_string(),
             create_test_prompt("prompt1"),
         );

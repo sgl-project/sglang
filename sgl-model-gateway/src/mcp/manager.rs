@@ -218,7 +218,7 @@ impl McpManager {
         args: Option<Map<String, serde_json::Value>>,
     ) -> McpResult<GetPromptResult> {
         // Get server that owns this prompt
-        let (server_name, _prompt_info) = self
+        let (server_name, prompt_info) = self
             .inventory
             .get_prompt(prompt_name)
             .ok_or_else(|| McpError::PromptNotFound(prompt_name.to_string()))?;
@@ -231,7 +231,7 @@ impl McpManager {
 
         // Get the prompt
         let request = GetPromptRequestParam {
-            name: prompt_name.to_string(),
+            name: prompt_info.name.to_string(),
             arguments: args,
         };
 
@@ -246,7 +246,10 @@ impl McpManager {
         self.inventory
             .list_prompts()
             .into_iter()
-            .map(|(_prompt_name, _server_name, prompt_info)| prompt_info)
+            .map(|(prompt_name, _server_name, mut prompt_info)| {
+                prompt_info.name = prompt_name;
+                prompt_info
+            })
             .collect()
     }
 
@@ -496,7 +499,8 @@ impl McpManager {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_key);
                 for p in ps {
-                    inventory.insert_prompt(p.name.clone(), server_key.to_string(), p);
+                    let qualified_prompt_name: String = format!("{}.{}", server_key, p.name);
+                    inventory.insert_prompt(qualified_prompt_name, server_key.to_string(), p);
                 }
             }
             Err(e) => debug!("No prompts or failed to list on '{}': {}", server_key, e),
@@ -537,8 +541,12 @@ impl McpManager {
             Ok(ps) => {
                 info!("Discovered {} prompts from '{}'", ps.len(), server_name);
                 for p in ps {
-                    self.inventory
-                        .insert_prompt(p.name.clone(), server_name.to_string(), p);
+                    let qualified_prompt_name: String = format!("{}.{}", server_name, p.name);
+                    self.inventory.insert_prompt(
+                        qualified_prompt_name,
+                        server_name.to_string(),
+                        p,
+                    );
                 }
             }
             Err(e) => debug!("No prompts or failed to list on '{}': {}", server_name, e),
