@@ -576,7 +576,7 @@ def _causal_conv1d_update_kernel(
     conv_state_ptr,
     conv_state_indices_ptr,
     intermediate_conv_window_ptr,
-    intermediate_state_indices_ptr,
+    intermediate_accepted_steps_ptr,
     retrieve_next_token_ptr,
     retrieve_next_sibling_ptr,
     retrieve_parent_token_ptr,
@@ -599,7 +599,7 @@ def _causal_conv1d_update_kernel(
     stride_inter_step: tl.constexpr,
     stride_inter_dim: tl.constexpr,
     stride_inter_win: tl.constexpr,
-    stride_intermediate_state_indices: tl.constexpr,
+    stride_intermediate_accepted_steps: tl.constexpr,
     stride_retrieve_next_token_seq: tl.constexpr,
     stride_retrieve_next_token_token: tl.constexpr,
     stride_retrieve_next_sibling_seq: tl.constexpr,
@@ -631,18 +631,15 @@ def _causal_conv1d_update_kernel(
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    if IS_CONTINUOUS_BATCHING:
-        # mask = idx_seq < batch
-        conv_state_batch_coord = tl.load(
-            conv_state_indices_ptr + idx_seq * stride_state_indices
+    # mask = idx_seq < batch
+    conv_state_batch_coord = tl.load(
+        conv_state_indices_ptr + idx_seq * stride_state_indices
+    ).to(tl.int64)
+    if SAVE_INTERMEDIATE:
+        accepted_step = tl.load(
+            intermediate_accepted_steps_ptr
+            + conv_state_batch_coord * stride_intermediate_accepted_steps
         ).to(tl.int64)
-        if SAVE_INTERMEDIATE:
-            intermediate_state_batch_coord = tl.load(
-                intermediate_state_indices_ptr
-                + idx_seq * stride_intermediate_state_indices
-            ).to(tl.int64)
-    else:
-        conv_state_batch_coord = idx_seq
     if USE_PAD_SLOT:  # noqa
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
@@ -650,11 +647,21 @@ def _causal_conv1d_update_kernel(
 
     # STEP 1: READ init_state data
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
-    conv_states_base = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
-    )
+    if accepted_step == -1:
+        conv_states_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        stride_win = stride_conv_state_tok
+    else:
+        conv_states_base = (
+            intermediate_conv_window_ptr
+            + conv_state_batch_coord * stride_inter_seq
+            + accepted_step * stride_inter_step
+            + idx_feats * stride_inter_dim
+        )
+        stride_win = stride_inter_win
     mask_w = idx_feats < dim
 
     prior_tokens = conv_states_base
@@ -662,13 +669,13 @@ def _causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens  # [BLOCK_N]
         col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 3:
-        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
+        conv_states_ptrs = prior_tokens + 1 * stride_win  # [BLOCK_N]
         col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 4:
-        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
+        conv_states_ptrs = prior_tokens + 2 * stride_win  # [BLOCK_N]
         col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH == 5:
-        conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
+        conv_states_ptrs = prior_tokens + 3 * stride_win  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
     # STEP 3: init accumulator
@@ -782,7 +789,7 @@ def _causal_conv1d_update_kernel(
                     # Layout: [seq(cache line), step, dim, win(K-1)]
                     base_ptr = (
                         intermediate_conv_window_ptr
-                        + intermediate_state_batch_coord * stride_inter_seq
+                        + conv_state_batch_coord * stride_inter_seq
                         + idx_token * stride_inter_step
                         + idx_feats * stride_inter_dim
                     )
@@ -869,7 +876,7 @@ def _causal_conv1d_update_kernel(
                 # Layout: [seq(cache line), step, dim, win(K-1)]
                 base_ptr = (
                     intermediate_conv_window_ptr
-                    + intermediate_state_batch_coord * stride_inter_seq
+                    + conv_state_batch_coord * stride_inter_seq
                     + idx_token * stride_inter_step
                     + idx_feats * stride_inter_dim
                 )
@@ -914,7 +921,7 @@ def causal_conv1d_update(
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
     intermediate_conv_window: Optional[torch.Tensor] = None,
-    intermediate_state_indices: Optional[torch.Tensor] = None,
+    intermediate_accepted_steps: Optional[torch.Tensor] = None,
     retrieve_next_token: Optional[torch.Tensor] = None,
     retrieve_next_sibling: Optional[torch.Tensor] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
@@ -975,8 +982,8 @@ def causal_conv1d_update(
             assert conv_state.size(0) >= batch
         else:
             assert (batch,) == conv_state_indices.shape
-            assert intermediate_state_indices is not None
-            assert (batch,) == intermediate_state_indices.shape
+            assert intermediate_accepted_steps is not None
+            assert (batch,) == intermediate_accepted_steps.shape
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
@@ -993,9 +1000,9 @@ def causal_conv1d_update(
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
     )
-    stride_intermediate_state_indices = (
-        intermediate_state_indices.stride(0)
-        if intermediate_state_indices is not None
+    stride_intermediate_accepted_steps = (
+        intermediate_accepted_steps.stride(0)
+        if intermediate_accepted_steps is not None
         else 0
     )
     state_len = width - 1
@@ -1054,7 +1061,7 @@ def causal_conv1d_update(
         conv_state,
         conv_state_indices,
         intermediate_conv_window if intermediate_conv_window is not None else x,
-        intermediate_state_indices,
+        intermediate_accepted_steps,
         retrieve_next_token,
         retrieve_next_sibling,
         retrieve_parent_token,
@@ -1077,7 +1084,7 @@ def causal_conv1d_update(
         stride_inter_step,
         stride_inter_dim,
         stride_inter_win,
-        stride_intermediate_state_indices,
+        stride_intermediate_accepted_steps,
         stride_retrieve_next_token_seq,
         stride_retrieve_next_token_token,
         stride_retrieve_next_sibling_seq,

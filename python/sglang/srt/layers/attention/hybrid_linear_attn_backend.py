@@ -997,7 +997,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 activation,
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                intermediate_accepted_steps=intermediate_accepted_steps,
+                # intermediate_state_indices=intermediate_state_indices[:batch_size],
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
@@ -1346,27 +1347,27 @@ class HybridLinearAttnBackend(AttentionBackend):
                 :request_number
             ]
         )
-        intermediate_state_indices = torch.arange(
-            request_number, dtype=torch.int32, device=state_indices_tensor.device
-        )
+        # intermediate_state_indices = torch.arange(
+        #     request_number, dtype=torch.int32, device=state_indices_tensor.device
+        # )
 
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv[0]
+        # conv_states = mamba_caches.conv[0]
         # # ssm_states = mamba_caches.temporal
         # # intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        # intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # # Compute common indices once to avoid duplication
-        valid_mask = accepted_steps >= 0
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        src_state_indices = intermediate_state_indices[valid_mask].to(
-            torch.int64
-        )  # [N]
-        last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
-        mamba_caches.intermediate_accepted_steps[dst_state_indices] = last_steps.to(mamba_caches.intermediate_accepted_steps.dtype, copy=False)
+        # valid_mask = accepted_steps >= 0
+        # dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
+        # src_state_indices = intermediate_state_indices[valid_mask].to(
+        #     torch.int64
+        # )  # [N]
+        # last_steps = accepted_steps[valid_mask]  # [N]
+        mamba_caches.intermediate_accepted_steps[state_indices_tensor] = accepted_steps
 
         # # scatter into ssm_states at the chosen cache lines
         # # ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
@@ -1374,9 +1375,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # # ].to(ssm_states.dtype, copy=False)
 
         # Scatter into conv_states at the chosen cache lines
-        conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
-            :, src_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        # conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
+        #     :, src_state_indices, last_steps
+        # ].to(conv_states.dtype, copy=False)
 
         # # Track indices used for tracking mamba states for prefix cache
         # if mamba_track_indices is not None:
