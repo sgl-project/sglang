@@ -123,7 +123,6 @@ class Scheduler:
         """
         if self.receiver is not None:
             try:
-                # ROUTER socket receives [identity, empty, payload]
                 identity, _, payload = self.receiver.recv_multipart()
                 recv_reqs = pickle.loads(payload)
             except zmq.ZMQError:
