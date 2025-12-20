@@ -16,14 +16,22 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from diffusers.models.attention import FeedForward
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    apply_rotary_embedding,
+    fuse_scale_shift_kernel,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenEmbedRope,
     QwenImageTransformerBlock,
     QwenTimestepProjEmbeddings,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -69,8 +77,9 @@ class QwenImageControlNetModel(nn.Module):
         lambda n, m: isinstance(m, QwenImageTransformerBlock),
     ]
 
-    # Parameter name mapping - identity mapping since we match InstantX architecture
-    param_names_mapping = {}
+    # Parameter name mapping - use same mapping as base QwenImage transformer
+    # This converts InstantX's separate to_q/to_k/to_v to fused to_qkv
+    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(
