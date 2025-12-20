@@ -4,7 +4,6 @@
 //! Provides a thread pool for concurrent WASM execution and metrics tracking.
 
 use std::{
-    collections::HashMap,
     num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -364,8 +363,7 @@ impl WasmThreadPool {
                 ))
             })?;
 
-            // Insert into cache
-            cache.insert(wasm_bytes, comp.clone());
+            cache.push(wasm_bytes, comp.clone());
             comp
         };
 
