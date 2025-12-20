@@ -8,7 +8,7 @@ use super::PipelineStage;
 use crate::routers::{
     error,
     grpc::{
-        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
+        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext},
         proto_wrapper::{ProtoGenerateRequest, ProtoStream},
     },
 };
@@ -69,16 +69,7 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
-        let load_guards = match workers {
-            WorkerSelection::Single { worker } => {
-                LoadGuards::Single(crate::core::WorkerLoadGuardV2::new(worker.clone()))
-            }
-            WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
-                prefill: crate::core::WorkerLoadGuardV2::new(prefill.clone()),
-                decode: crate::core::WorkerLoadGuardV2::new(decode.clone()),
-            },
-        };
-        ctx.state.load_guards = Some(load_guards);
+        ctx.state.load_guards = Some(LoadGuards::from(workers));
 
         // Extract dispatch metadata for tracing span
         let request_id = ctx
