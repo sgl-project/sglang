@@ -51,6 +51,7 @@ suites = {
         TestFile("rl/test_fp32_lm_head.py", 9),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 195),
+        TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_create_kvindices.py", 7),
@@ -139,7 +140,7 @@ suites = {
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_piecewise_cuda_graph_2_gpu.py", 200),
+        TestFile("test_piecewise_cuda_graph_2_gpu.py", 400),
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
@@ -161,7 +162,7 @@ suites = {
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
-        TestFile("test_disaggregation_pp.py", 140),
+        TestFile("test_disaggregation_pp.py", 180),
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200-stage-b": [
@@ -315,6 +316,10 @@ suite_amd = {
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
+    ],
+    # AMD 8-GPU tests for base models using gsm8k completion benchmark
+    "nightly-amd-8-gpu": [
+        TestFile("nightly/test_gsm8k_completion_eval_amd.py"),
     ],
 }
 
