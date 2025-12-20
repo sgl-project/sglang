@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import pickle
 from typing import Any, List
 
 import zmq
@@ -50,7 +51,7 @@ class Scheduler:
         endpoint = server_args.scheduler_endpoint()
         if gpu_id == 0:
             self.receiver, actual_endpoint = get_zmq_socket(
-                self.context, zmq.REP, endpoint, True
+                self.context, zmq.ROUTER, endpoint, True
             )
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
@@ -76,7 +77,7 @@ class Scheduler:
             List[Req]: self._handle_generation,
         }
 
-        self.waiting_queue: list[Req] = []
+        self.waiting_queue: list[tuple[bytes, Req]] = []
 
     def _handle_set_lora(self, reqs: List[Any]):
         # TODO: return set status
@@ -97,28 +98,32 @@ class Scheduler:
     def _handle_generation(self, reqs: List[Req]):
         return self.worker.execute_forward(reqs)
 
-    def return_result(self, output_batch: OutputBatch):
+    def return_result(self, output_batch: OutputBatch, identity: bytes | None = None):
         """
         replies to client, only on rank 0
         """
-        if self.receiver is not None:
-            self.receiver.send_pyobj(output_batch)
+        if self.receiver is not None and identity is not None:
+            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
-    def get_next_batch_to_run(self) -> list[Req] | None:
+    def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
         """pull a req from waiting_queue"""
+        if not self.waiting_queue:
+            return None
 
         # pop the first (earliest)
-        req = self.waiting_queue.pop()
+        item = self.waiting_queue.pop(0)
 
-        return [req]
+        return [item]
 
-    def recv_reqs(self) -> List[Any]:
+    def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
         """
         if self.receiver is not None:
             try:
-                recv_reqs = self.receiver.recv_pyobj()
+                # ROUTER socket receives [identity, empty, payload]
+                identity, _, payload = self.receiver.recv_multipart()
+                recv_reqs = pickle.loads(payload)
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
@@ -126,6 +131,9 @@ class Scheduler:
             # Ensure recv_reqs is a list
             if not isinstance(recv_reqs, list):
                 recv_reqs = [recv_reqs]
+
+            # Pack with identity for rank 0
+            recv_reqs = [(identity, req) for req in recv_reqs]
         else:
             recv_reqs = None
 
@@ -158,7 +166,6 @@ class Scheduler:
 
         return recv_reqs
 
-    # TODO: queueing, cancellation
     def event_loop(self) -> None:
         """
         The main event loop that listens for ZMQ requests.
@@ -170,12 +177,11 @@ class Scheduler:
         )
 
         while self._running:
-            reqs = None
             # 1: receive requests
             try:
-                reqs = self.recv_reqs()
+                new_reqs = self.recv_reqs()
                 # after processing input reqs
-                self.waiting_queue += reqs
+                self.waiting_queue.extend(new_reqs)
             except Exception as e:
                 logger.error(
                     f"Error receiving requests in scheduler event loop: {e}",
@@ -184,10 +190,15 @@ class Scheduler:
                 continue
 
             # 2: execute, make sure a reply is always sent
-            try:
-                reqs = self.get_next_batch_to_run()
+            while self.waiting_queue:
+                items = self.get_next_batch_to_run()
+                if not items:
+                    break
 
-                if reqs:
+                identities = [item[0] for item in items]
+                reqs = [item[1] for item in items]
+
+                try:
                     first_req = reqs[0]
                     handler = self.request_handlers.get(type(first_req))
                     if handler:
@@ -197,24 +208,25 @@ class Scheduler:
                             "status": "error",
                             "message": f"Unknown request type: {type(first_req)}",
                         }
-            except Exception as e:
-                logger.error(
-                    f"Error executing request in scheduler event loop: {e}",
-                    exc_info=True,
-                )
-                # Determine appropriate error response format
-                output_batch = (
-                    OutputBatch(error=str(e))
-                    if reqs and isinstance(reqs[0], Req)
-                    else {"status": "error", "message": str(e)}
-                )
+                except Exception as e:
+                    logger.error(
+                        f"Error executing request in scheduler event loop: {e}",
+                        exc_info=True,
+                    )
+                    # Determine appropriate error response format
+                    output_batch = (
+                        OutputBatch(error=str(e))
+                        if reqs and isinstance(reqs[0], Req)
+                        else {"status": "error", "message": str(e)}
+                    )
 
-            try:
-                self.return_result(output_batch)
-            except zmq.ZMQError as e:
-                # Reply failed; log and keep loop alive to accept future requests
-                logger.error(f"ZMQ error sending reply: {e}")
-                continue
+                try:
+                    # TODO: Support sending back to multiple identities if batched
+                    self.return_result(output_batch, identities[0])
+                except zmq.ZMQError as e:
+                    # Reply failed; log and keep loop alive to accept future requests
+                    logger.error(f"ZMQ error sending reply: {e}")
+                    continue
 
         logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:

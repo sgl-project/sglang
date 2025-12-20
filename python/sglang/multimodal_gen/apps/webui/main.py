@@ -9,8 +9,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
 )
+from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
 
 
 def add_webui_args(parser: argparse.ArgumentParser):
@@ -25,7 +25,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
     import gradio as gr
 
     # init client
-    sync_scheduler_client.initialize(server_args)
+    scheduler_client.initialize(server_args)
 
     # server_args will be reused in gradio_generate function
     def gradio_generate(
@@ -66,7 +66,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
             server_args=server_args,
             sampling_params=sampling_params,
         )
-        result = sync_scheduler_client.forward([batch])
+        result = scheduler_client.forward([batch])
         save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
         frames = post_process_sample(
             result.output[0],
