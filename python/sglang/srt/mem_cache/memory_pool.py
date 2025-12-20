@@ -16,6 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import dataclasses
+import os
 from dataclasses import dataclass
 from typing import List
 
@@ -49,6 +50,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
+    set_mla_kv_buffer_fp8_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
@@ -1485,6 +1487,9 @@ class MLATokenToKVPool(KVCache):
             # NSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
 
+        # Flag for debug logging (only print once)
+        self._debug_printed_mla_kv = False
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1578,7 +1583,54 @@ class MLATokenToKVPool(KVCache):
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
             cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
             cache_k = cache_k.view(self.store_dtype)
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+
+            # DEBUG: Collect shape/stride/dtype info for optimization (only print once)
+            # Related issues: #15025, #15104
+            # Set SGLANG_DEBUG_MEMORY_POOL=1 to enable debug logging
+            if envs.SGLANG_DEBUG_MEMORY_POOL and not self._debug_printed_mla_kv:
+                self._debug_printed_mla_kv = True
+                dst = self.kv_buffer[layer_id - self.start_layer]
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info("=" * 60)
+                logger.info("DEBUG: set_mla_kv_buffer FP8 path")
+                logger.info(f"dst.shape = {dst.shape}")
+                logger.info(f"dst.dtype = {dst.dtype}")
+                logger.info(f"dst.stride() = {dst.stride()}")
+                logger.info(f"dst.storage_offset() = {dst.storage_offset()}")
+                logger.info(f"cache_k.shape = {cache_k.shape}")
+                logger.info(f"cache_k.dtype = {cache_k.dtype}")
+                logger.info(f"cache_k.stride() = {cache_k.stride()}")
+                logger.info(f"cache_k.storage_offset() = {cache_k.storage_offset()}")
+                logger.info(f"loc.dtype = {loc.dtype}")
+                logger.info(f"loc.ndim = {loc.ndim}")
+                logger.info(f"loc.device = {loc.device}")
+                logger.info(f"loc.numel() = {loc.numel()}")
+                # Only compute unique for small loc tensors
+                if loc.numel() <= 256:
+                    logger.info(f"loc.unique().numel() = {loc.unique().numel()}")
+                    logger.info(f"loc is unique: {loc.numel() == loc.unique().numel()}")
+                else:
+                    logger.info(f"loc.unique().numel() = skipped (loc.numel() > 256)")
+                    logger.info(f"loc is unique: skipped")
+                logger.info("=" * 60)
+
+            # TODO: Replace index_put_ with Triton kernel to reduce CPU overhead
+            # Currently this line triggers expensive aten::index_put_ operation
+            # See #15104 for profiling data showing ~44ms CPU overhead
+
+            # EXPERIMENTAL: Use Triton kernel to avoid index_put_ overhead
+            # Set SGLANG_USE_TRITON_FP8_SCATTER=1 to enable (requires testing/validation)
+            use_triton = os.environ.get("SGLANG_USE_TRITON_FP8_SCATTER", "0") == "1"
+
+            if use_triton:
+                set_mla_kv_buffer_fp8_triton(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k,
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
