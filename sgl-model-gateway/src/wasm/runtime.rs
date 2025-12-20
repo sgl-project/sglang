@@ -5,6 +5,7 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -12,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use lru::LruCache;
 use tokio::sync::oneshot;
 use tracing::{debug, error};
 use wasmtime::{
@@ -278,7 +280,9 @@ impl WasmThreadPool {
             }
         };
 
-        let mut component_cache: HashMap<Vec<u8>, Component> = HashMap::new();
+        let cache_capacity =
+            NonZeroUsize::new(config.module_cache_size).unwrap_or(NonZeroUsize::new(10).unwrap());
+        let mut component_cache: LruCache<Vec<u8>, Component> = LruCache::new(cache_capacity);
 
         // Start epoch incrementer for timeout enforcement.
         // The engine's epoch counter is incremented periodically, and each Store
@@ -339,7 +343,7 @@ impl WasmThreadPool {
 
     async fn execute_component_in_worker(
         engine: &Engine,
-        cache: &mut HashMap<Vec<u8>, Component>, //  cache argument
+        cache: &mut LruCache<Vec<u8>, Component>, //  cache argument
         wasm_bytes: Vec<u8>,
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
@@ -350,16 +354,6 @@ impl WasmThreadPool {
         let component = if let Some(comp) = cache.get(&wasm_bytes) {
             comp.clone() // Component is just a handle (cheap clone)
         } else {
-            // Check cache size limit
-            if cache.len() >= config.module_cache_size {
-                debug!(
-                    target: "sgl_model_gateway::wasm::runtime",
-                    "Module cache full ({} items), clearing.",
-                    cache.len()
-                );
-                cache.clear();
-            }
-
             // Compile new component
             let comp = Component::new(engine, &wasm_bytes).map_err(|e| {
                 WasmRuntimeError::CompileFailed(format!(
