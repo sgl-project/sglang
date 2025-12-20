@@ -1,5 +1,3 @@
-import ast
-import html
 import json
 import logging
 import re
@@ -356,7 +354,9 @@ class MinimaxM2Detector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def _parse_and_stream_parameters(self, text_to_parse: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def _parse_and_stream_parameters(
+        self, text_to_parse: str, tools: List[Tool]
+    ) -> List[ToolCallItem]:
         """
         Parse complete parameter blocks from text and return any tool call items to emit.
 
@@ -388,7 +388,9 @@ class MinimaxM2Detector(BaseFormatDetector):
         for match in param_matches:
             param_name = match.group(1).strip()
             param_value = match.group(2)
-            new_params[param_name] = self._parse_parameter(param_name, param_value, tools)
+            new_params[param_name] = self._parse_parameter(
+                param_name, param_value, tools
+            )
 
         # Calculate parameter diff to stream with proper incremental JSON building
         if new_params != self._current_parameters:
