@@ -396,6 +396,21 @@ def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNIN
     return original_levels
 
 
+def global_suppress_loggers():
+    # globally suppress some obsessive loggers
+    suppress_loggers(
+        [
+            "imageio",
+            "imageio_ffmpeg",
+            "PIL",
+            "PIL_Image",
+            "multipart",
+            "filelock",
+            "urllib3",
+        ]
+    )
+
+
 @contextmanager
 def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
     """
