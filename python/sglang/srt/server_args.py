@@ -1074,7 +1074,11 @@ class ServerArgs:
                         # set prefill/decode backends for Blackwell. The default settings are for Hopper.
                         if major >= 10:
                             self.nsa_prefill_backend = "flashmla_sparse"
-                            self.nsa_decode_backend = "flashmla_sparse"
+                            self.nsa_decode_backend = (
+                                "flashinfer"
+                                if self.kv_cache_dtype == "bfloat16"
+                                else "flashmla_sparse"
+                            )
 
                     # Logging env vars for NSA
                     from sglang.srt.layers.attention.nsa.utils import (
