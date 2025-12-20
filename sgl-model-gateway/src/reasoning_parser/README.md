@@ -25,7 +25,7 @@ The reasoning parser layer provides a unified interface for detecting and extrac
 
 ### Architecture Highlights
 
-- **Model-Specific Parsers**: DeepSeek-R1, Qwen3, Kimi, GLM45, Step3 variants
+- **Model-Specific Parsers**: DeepSeek-R1, Qwen3, Kimi, GLM45, GLM47, Step3 variants
 - **Parser Pooling**: Singleton instances per model type for memory efficiency
 - **High Concurrency**: Mutex-protected parsers handle 1000+ req/sec
 - **Buffer Overflow Protection**: Configurable max buffer size (default 64KB)
@@ -56,6 +56,7 @@ graph TB
         PP --> QWT[Qwen3-Thinking]
         PP --> KM[Kimi]
         PP --> GL[GLM45]
+        PP --> GL47[GLM47]
         PP --> S3[Step3]
         PP --> PT[Passthrough]
     end
@@ -65,6 +66,7 @@ graph TB
         QW --> BP
         KM --> BP
         GL --> BP
+        GL47 --> BP
         S3 --> BP
     end
 
@@ -326,6 +328,7 @@ classDiagram
 - `qwen3_thinking`: Qwen3 thinking variant (initial_in_reasoning=true)
 - `kimi`: Kimi with Unicode tokens
 - `glm45`: GLM-4.5 / GLM-4.6 parser
+- `glm47`: GLM-4.7 parser
 - `step3`: Step3 parser
 - `passthrough`: No-op fallback parser
 
@@ -337,6 +340,7 @@ classDiagram
 "qwen3" → "qwen3"
 "qwen" → "qwen3"
 "glm45" → "glm45"
+"glm47" → "glm47"
 "kimi" → "kimi"
 "step3" → "step3"
 ```

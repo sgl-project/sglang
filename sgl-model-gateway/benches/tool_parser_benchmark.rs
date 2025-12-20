@@ -94,6 +94,8 @@ analyze_customer_behavior
 <parameter>confidence_level=0.95</parameter>
 </tool>"#;
 
+const GLM47_FORMAT: &str = r#"<tool>analyze_customer_behavior<parameter>dataset_id=customer_interactions_2024</parameter><parameter>analysis_type=cohort_retention</parameter><parameter>cohort_definition=signup_month</parameter><parameter>retention_periods=[1, 7, 14, 30, 60, 90, 180, 365]</parameter><parameter>segment_by=["acquisition_channel", "pricing_tier", "industry", "company_size"]</parameter><parameter>metrics=["active_users", "revenue", "feature_usage", "engagement_score"]</parameter><parameter>statistical_tests=["chi_square", "anova", "trend_analysis"]</parameter><parameter>visualization_types=["heatmap", "line_chart", "funnel", "sankey"]</parameter><parameter>export_format=dashboard</parameter><parameter>confidence_level=0.95</parameter></tool>"#;
+
 const STEP3_FORMAT: &str = r#"<step.tML version="0.1">
 <call>
 <name>orchestrate_ml_pipeline</name>
@@ -286,6 +288,7 @@ fn bench_complete_parsing(c: &mut Criterion) {
         ("deepseek", "deepseek", DEEPSEEK_FORMAT),
         ("kimik2", "kimik2", KIMIK2_FORMAT),
         ("glm4", "glm4_moe", GLM4_FORMAT),
+        ("glm47", "glm47_moe", GLM47_FORMAT),
         ("step3", "step3", STEP3_FORMAT),
         ("gpt_oss", "gpt_oss", GPT_OSS_FORMAT),
     ];
