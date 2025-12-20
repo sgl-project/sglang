@@ -80,6 +80,19 @@ class RocmPlatform(Platform):
         elif selected_backend in (AttentionBackendEnum.FA, None):
             pass
 
+        elif selected_backend == AttentionBackendEnum.AITER:
+            if dtype not in (torch.float16, torch.bfloat16):
+                logger.warning(
+                    "AITer backend only supports fp16/bf16 inputs but got dtype=%s. "
+                    "Falling back to Torch SDPA backend.",
+                    dtype,
+                )
+                # TODO: need to compare triton with sdpa as an alternative backend
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+            logger.info("Using AITer backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,

@@ -34,10 +34,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
     log_generation_timer,
-    suppress_loggers,
 )
-
-suppress_loggers(["imageio", "imageio_ffmpeg", "PIL", "PIL_Image"])
 
 logger = init_logger(__name__)
 
@@ -52,7 +49,6 @@ except RuntimeError:
     pass
 
 
-# TODO: rename
 class DiffGenerator:
     """
     A unified class for generating images/videos using diffusion models.
@@ -412,9 +408,6 @@ class DiffGenerator:
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
-
-    def __enter__(self):
-        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()

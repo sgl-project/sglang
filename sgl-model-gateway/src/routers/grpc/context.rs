@@ -14,7 +14,7 @@ use super::{
     proto_wrapper::{ProtoGenerateComplete, ProtoGenerateRequest, ProtoStream},
 };
 use crate::{
-    core::Worker,
+    core::{Worker, WorkerLoadGuardV2},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::{GenerateRequest, GenerateResponse},
@@ -75,6 +75,9 @@ pub struct ProcessingState {
 
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
+
+    // Load guard for worker load tracking (created at execution stage)
+    pub load_guards: Option<LoadGuards>,
 
     // Stage 6: Response processing state
     pub response: ResponseState,
@@ -141,6 +144,16 @@ pub struct DispatchMetadata {
     pub created: u64,
     pub weight_version: Option<String>,
     pub is_streaming: bool,
+}
+
+/// Load guards for worker load tracking
+/// Automatically decrements load when dropped
+pub enum LoadGuards {
+    Single(WorkerLoadGuardV2),
+    Dual {
+        prefill: WorkerLoadGuardV2,
+        decode: WorkerLoadGuardV2,
+    },
 }
 
 /// Response processing state (Step 6)

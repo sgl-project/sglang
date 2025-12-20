@@ -82,6 +82,7 @@ class SWAChunkCache(ChunkCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
+        self.is_local_attention = params.is_local_attention
 
     def evict_swa(
         self,
@@ -89,10 +90,14 @@ class SWAChunkCache(ChunkCache):
         prelen: int,
         attention_chunk_size: int,
     ):
-        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
-            new_evicted_seqlen_local = attention_chunk_size * (
-                prelen // attention_chunk_size
-            )
+        thresh = req.evicted_seqlen_local + attention_chunk_size * 2
+        if self.is_local_attention:
+            thresh -= attention_chunk_size
+
+        if prelen >= thresh:
+            new_evicted_seqlen_local = (
+                prelen // attention_chunk_size * attention_chunk_size
+            ) - (attention_chunk_size if not self.is_local_attention else 0)
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]

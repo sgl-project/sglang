@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{error, trace, warn};
 use uuid::Uuid;
 
 use super::conversions;
@@ -236,15 +236,17 @@ pub(super) async fn execute_tool_loop(
     const MAX_ITERATIONS: usize = 10;
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
-    debug!(
+    trace!(
         "Starting MCP tool loop: server_label={}, max_tool_calls={:?}, max_iterations={}",
-        server_label, max_tool_calls, MAX_ITERATIONS
+        server_label,
+        max_tool_calls,
+        MAX_ITERATIONS
     );
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = ctx.mcp_manager.list_tools();
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
-    debug!(
+    trace!(
         "Converted {} MCP tools to chat format",
         mcp_chat_tools.len()
     );
@@ -287,7 +289,7 @@ pub(super) async fn execute_tool_loop(
             // Record tool loop iteration metric
             Metrics::record_mcp_tool_iteration(&current_request.model);
 
-            debug!(
+            trace!(
                 "Tool loop iteration {}: found {} tool call(s)",
                 state.iteration,
                 tool_calls.len()
@@ -300,7 +302,7 @@ pub(super) async fn execute_tool_loop(
                 .into_iter()
                 .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
 
-            debug!(
+            trace!(
                 "Separated tool calls: {} MCP, {} function",
                 mcp_tool_calls.len(),
                 function_tool_calls.len()
@@ -377,9 +379,11 @@ pub(super) async fn execute_tool_loop(
 
             // Execute all MCP tools
             for (call_id, tool_name, args_json_str) in mcp_tool_calls {
-                debug!(
+                trace!(
                     "Calling MCP tool '{}' (call_id: {}) with args: {}",
-                    tool_name, call_id, args_json_str
+                    tool_name,
+                    call_id,
+                    args_json_str
                 );
 
                 let tool_start = Instant::now();
@@ -493,9 +497,10 @@ pub(super) async fn execute_tool_loop(
             // Continue to next iteration
         } else {
             // No more tool calls, we're done
-            debug!(
+            trace!(
                 "Tool loop completed: {} iterations, {} total calls",
-                state.iteration, state.total_calls
+                state.iteration,
+                state.total_calls
             );
 
             // Convert final chat response to responses format
@@ -527,7 +532,7 @@ pub(super) async fn execute_tool_loop(
                 // Append all mcp_call items at the end
                 responses_response.output.extend(state.mcp_call_items);
 
-                debug!(
+                trace!(
                     "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
                     state.total_calls
                 );
@@ -653,7 +658,7 @@ async fn execute_tool_loop_streaming_internal(
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_tools = ctx.mcp_manager.list_tools();
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
-    debug!(
+    trace!(
         "Streaming: Converted {} MCP tools to chat format",
         mcp_chat_tools.len()
     );
@@ -674,7 +679,7 @@ async fn execute_tool_loop_streaming_internal(
             ));
         }
 
-        debug!("Streaming MCP tool loop iteration {}", state.iteration);
+        trace!("Streaming MCP tool loop iteration {}", state.iteration);
 
         // Emit mcp_list_tools as first output item (only once, on first iteration)
         if !mcp_list_tools_emitted {
@@ -758,7 +763,7 @@ async fn execute_tool_loop_streaming_internal(
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
 
         if !tool_calls.is_empty() {
-            debug!(
+            trace!(
                 "Tool loop iteration {}: found {} tool call(s)",
                 state.iteration,
                 tool_calls.len()
@@ -771,7 +776,7 @@ async fn execute_tool_loop_streaming_internal(
                 .into_iter()
                 .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
 
-            debug!(
+            trace!(
                 "Separated tool calls: {} MCP, {} function",
                 mcp_tool_calls.len(),
                 function_tool_calls.len()
@@ -799,9 +804,12 @@ async fn execute_tool_loop_streaming_internal(
             for (call_id, tool_name, args_json_str) in mcp_tool_calls {
                 state.total_calls += 1;
 
-                debug!(
+                trace!(
                     "Executing tool call {}/{}: {} (call_id: {})",
-                    state.total_calls, state.total_calls, tool_name, call_id
+                    state.total_calls,
+                    state.total_calls,
+                    tool_name,
+                    call_id
                 );
 
                 // Allocate output_index for this mcp_call item
@@ -837,9 +845,10 @@ async fn execute_tool_loop_streaming_internal(
                 emitter.send_event(&event, &tx)?;
 
                 // Execute the MCP tool - manager handles parsing and type coercion
-                debug!(
+                trace!(
                     "Calling MCP tool '{}' with args: {}",
-                    tool_name, args_json_str
+                    tool_name,
+                    args_json_str
                 );
                 let tool_start = Instant::now();
                 let (output_str, success, error) = match ctx
@@ -952,7 +961,7 @@ async fn execute_tool_loop_streaming_internal(
 
             // If there are function tool calls, emit events and exit MCP loop
             if !function_tool_calls.is_empty() {
-                debug!(
+                trace!(
                     "Found {} function tool call(s) - emitting events and exiting MCP loop",
                     function_tool_calls.len()
                 );
@@ -1067,7 +1076,7 @@ async fn execute_tool_loop_streaming_internal(
         }
 
         // No tool calls, this is the final response
-        debug!("No tool calls found, ending streaming MCP loop");
+        trace!("No tool calls found, ending streaming MCP loop");
 
         // Check for reasoning content
         let reasoning_content = accumulated_response

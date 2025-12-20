@@ -12,7 +12,7 @@ use std::{
 };
 
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 use wasmtime::{
     component::{Component, Linker, ResourceTable},
     Config, Engine, Store, StoreLimitsBuilder, UpdateDeadline,
@@ -181,7 +181,7 @@ impl WasmThreadPool {
             .max(1);
         let num_workers = config.thread_pool_size.clamp(1, max_workers);
 
-        info!(
+        debug!(
             target: "sgl_model_gateway::wasm::runtime",
             "Initializing WASM runtime with {} workers",
             num_workers

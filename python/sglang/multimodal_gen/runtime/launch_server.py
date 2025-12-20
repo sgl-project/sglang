@@ -1,17 +1,24 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import multiprocessing as mp
+import os
+import sys
 
 import uvicorn
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    prepare_server_args,
+    set_global_server_args,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     logger,
     suppress_other_loggers,
 )
+from sglang.srt.utils import kill_process_tree
 
 
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
@@ -152,3 +159,12 @@ def launch_http_server_only(server_args):
         port=server_args.port,
         reload=False,
     )
+
+
+if __name__ == "__main__":
+    server_args = prepare_server_args(sys.argv[1:])
+
+    try:
+        launch_server(server_args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)

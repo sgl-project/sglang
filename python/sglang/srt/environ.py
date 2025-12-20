@@ -308,6 +308,11 @@ class Envs:
 
     # Deterministic inference
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
+    # If not set: auto (enabled when --enable-deterministic-inference is on)
+    # Set to 1: force enable (even without --enable-deterministic-inference)
+    # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
+    SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
