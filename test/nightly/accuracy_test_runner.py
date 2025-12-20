@@ -9,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 
@@ -39,6 +40,32 @@ class AccuracyTestResult:
     baseline_accuracy: float
     error: Optional[str]
     latency: Optional[float] = None
+
+
+def write_accuracy_github_summary(
+    test_name: str,
+    dataset: str,
+    results: List[AccuracyTestResult],
+) -> None:
+    """Write accuracy test results to GitHub step summary.
+
+    Args:
+        test_name: Name of the test
+        dataset: Dataset name used for evaluation
+        results: List of AccuracyTestResult objects
+    """
+    summary = f"## {test_name} - Accuracy ({dataset})\n"
+    summary += "| model | status | score | baseline | error |\n"
+    summary += "| ----- | ------ | ----- | -------- | ----- |\n"
+
+    for result in results:
+        status_emoji = "✅" if result.passed else "❌"
+        score_str = f"{result.score:.4f}" if result.score is not None else "N/A"
+        baseline_str = f"{result.baseline_accuracy:.4f}"
+        error_str = result.error if result.error else "-"
+        summary += f"| {result.model} | {status_emoji} | {score_str} | {baseline_str} | {error_str} |\n"
+
+    write_github_step_summary(summary)
 
 
 def _run_simple_eval(
@@ -234,79 +261,3 @@ def run_accuracy_test(
         error=error if not passed else None,
         latency=latency,
     )
-
-
-def run_accuracy_for_models(
-    models: List[ModelLaunchSettings],
-    params: AccuracyTestParams,
-    test_name: str = "AccuracyTest",
-    base_url: Optional[str] = None,
-) -> dict:
-    """Run accuracy tests for multiple models.
-
-    Args:
-        models: List of ModelLaunchSettings to test
-        params: AccuracyTestParams (shared across all models)
-        test_name: Name for the test (used in summary)
-        base_url: Server base URL
-
-    Returns:
-        dict with results:
-        {
-            "all_passed": bool,
-            "dataset": str,
-            "results": [AccuracyTestResult, ...]
-        }
-    """
-    base_url = base_url or DEFAULT_URL_FOR_TEST
-
-    print("\n" + "=" * 80)
-    print(f"ACCURACY TESTS: {test_name}")
-    print(f"  Dataset: {params.dataset}")
-    print(f"  Baseline: {params.baseline_accuracy}")
-    print(f"  Models: {len(models)}")
-    print("=" * 80)
-
-    all_results = []
-    all_passed = True
-
-    for model in models:
-        print("\n" + "-" * 60)
-        print(f"Model: {model.model_path}")
-        print(f"  TP Size: {model.tp_size}")
-        print(f"  Extra Args: {model.extra_args}")
-        print("-" * 60)
-
-        result = run_accuracy_test(
-            model=model,
-            params=params,
-            base_url=base_url,
-        )
-
-        all_results.append(result)
-
-        if not result.passed:
-            all_passed = False
-
-    # Print summary
-    print("\n" + "=" * 60)
-    print(f"Accuracy Test Summary: {test_name}")
-    print(f"Dataset: {params.dataset}")
-    print(f"Baseline: {params.baseline_accuracy}")
-    print("=" * 60)
-    for result in all_results:
-        status = "PASS" if result.passed else "FAIL"
-        score_str = f"{result.score:.3f}" if result.score is not None else "N/A"
-        print(f"  {result.model}: {status} (score: {score_str})")
-        if result.error:
-            print(f"    Error: {result.error}")
-
-    print("\n" + "=" * 60)
-    print(f"OVERALL: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
-    print("=" * 60 + "\n")
-
-    return {
-        "all_passed": all_passed,
-        "dataset": params.dataset,
-        "results": all_results,
-    }

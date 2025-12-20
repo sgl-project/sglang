@@ -4,6 +4,7 @@ from accuracy_test_runner import (
     AccuracyTestParams,
     AccuracyTestResult,
     run_accuracy_test,
+    write_accuracy_github_summary,
 )
 from nightly_utils import NightlyBenchmarkRunner
 from performance_test_runner import (
@@ -12,7 +13,7 @@ from performance_test_runner import (
     run_performance_test,
 )
 
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings, is_in_ci
 
 
 def run_combined_tests(
@@ -132,6 +133,15 @@ def run_combined_tests(
     # Write performance report if we ran perf tests
     if run_perf and perf_runner:
         perf_runner.write_final_report()
+
+    # Write accuracy results to GitHub summary if in CI
+    if run_accuracy and is_in_ci():
+        accuracy_results = [
+            r["accuracy_result"] for r in all_results if r["accuracy_result"]
+        ]
+        write_accuracy_github_summary(
+            test_name, accuracy_params.dataset, accuracy_results
+        )
 
     # Print summary
     print("\n" + "=" * 60)
