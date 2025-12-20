@@ -59,6 +59,39 @@ def get_top_logprobs(
     return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage="decode")
 
 
+def get_token_ids_logprobs_prefill(
+    all_logprobs: torch.Tensor,
+    logits_metadata: LogitsMetadata,
+    delay_cpu_copy: bool = False,
+):
+    input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
+    pt = 0
+    for token_ids, pruned_len in zip(
+        logits_metadata.token_ids_logprobs,
+        logits_metadata.extend_logprob_pruned_lens_cpu,
+    ):
+        if pruned_len <= 0:
+            input_token_ids_logprobs_val.append([])
+            input_token_ids_logprobs_idx.append([])
+            continue
+
+        position_logprobs = all_logprobs[
+            pt : pt + pruned_len, token_ids
+        ]  # Shape: [pruned_len, num_tokens]
+
+        if delay_cpu_copy:
+            # Keep as tensor to delay GPU-to-CPU transfer
+            input_token_ids_logprobs_val.append(position_logprobs)
+        else:
+            # Convert to list immediately (default behavior)
+            input_token_ids_logprobs_val.append(position_logprobs.tolist())
+
+        input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
+        pt += pruned_len
+
+    return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
+
+
 def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []

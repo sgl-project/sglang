@@ -40,7 +40,10 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.utils.logprob import get_top_logprobs_prefill
+from sglang.srt.layers.utils.logprob import (
+    get_token_ids_logprobs_prefill,
+    get_top_logprobs_prefill,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -352,7 +355,7 @@ class LogitsProcessor(nn.Module):
             (
                 input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx,
-            ) = self.get_token_ids_logprobs(
+            ) = get_token_ids_logprobs_prefill(
                 sliced_logprobs, logits_metadata, delay_cpu_copy=True
             )
 
@@ -666,7 +669,7 @@ class LogitsProcessor(nn.Module):
             (
                 input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx,
-            ) = self.get_token_ids_logprobs(input_logprobs, logits_metadata)
+            ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
         else:
             input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
@@ -1038,39 +1041,6 @@ class LogitsProcessor(nn.Module):
 
             pt += pruned_len
         return next_split_pruned_len
-
-    @staticmethod
-    def get_token_ids_logprobs(
-        all_logprobs: torch.Tensor,
-        logits_metadata: LogitsMetadata,
-        delay_cpu_copy: bool = False,
-    ):
-        input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
-        pt = 0
-        for token_ids, pruned_len in zip(
-            logits_metadata.token_ids_logprobs,
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-        ):
-            if pruned_len <= 0:
-                input_token_ids_logprobs_val.append([])
-                input_token_ids_logprobs_idx.append([])
-                continue
-
-            position_logprobs = all_logprobs[
-                pt : pt + pruned_len, token_ids
-            ]  # Shape: [pruned_len, num_tokens]
-
-            if delay_cpu_copy:
-                # Keep as tensor to delay GPU-to-CPU transfer
-                input_token_ids_logprobs_val.append(position_logprobs)
-            else:
-                # Convert to list immediately (default behavior)
-                input_token_ids_logprobs_val.append(position_logprobs.tolist())
-
-            input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
-            pt += pruned_len
-
-        return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
 
     @staticmethod
     def get_token_ids_logprobs_chunk(
