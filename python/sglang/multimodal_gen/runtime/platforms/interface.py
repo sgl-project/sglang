@@ -70,6 +70,9 @@ class DeviceCapability(NamedTuple):
         return self.major * 10 + self.minor
 
 
+BYTES_PER_GB = 1024 ^ 3
+
+
 class Platform:
     _enum: PlatformEnum
     device_name: str
@@ -229,6 +232,14 @@ class Platform:
         Return the memory usage in bytes.
         """
         raise NotImplementedError
+
+    @classmethod
+    def get_available_memory(cls, device: torch.types.Device | None = None) -> float:
+        """GB"""
+        return (
+            cls.get_device_total_memory(device.index)
+            - cls.get_current_memory_usage(device)
+        ) / BYTES_PER_GB
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

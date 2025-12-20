@@ -752,9 +752,11 @@ class DenoisingStage(PipelineStage):
                 torch.mps.current_allocated_memory(),
             )
 
-        # In offline local mode (`sglang generate`), offload transformer weights to CPU
-        # after denoising to reduce peak VRAM during VAE decoding.
-        if current_platform.is_cuda_alike() and server_args.is_local_mode:
+        # offload transformer weights to CPU after denoising if not enough memory left
+        if (
+            current_platform.is_cuda_alike()
+            and current_platform.get_available_memory(get_local_torch_device()) < 10
+        ):
             for model in (self.transformer, self.transformer_2):
                 if model is not None:
                     model.to("cpu")
