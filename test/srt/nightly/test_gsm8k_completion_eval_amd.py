@@ -17,6 +17,7 @@ Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
 - "grok": All GROK models (nightly-amd-8-gpu-grok)
 - "deepseek-v3-dp": DeepSeek-V3 with DP attention (nightly-amd-8-gpu-deepseek-v3-dp)
 - "deepseek-v3-tc": DeepSeek-V3 with torch compile (nightly-amd-8-gpu-deepseek-v3-tc)
+- "deepseek-v3-mtp": DeepSeek-V3 with MTP/EAGLE (nightly-amd-8-gpu-deepseek-v3-mtp)
 - "deepseek-r1": DeepSeek-R1 reasoning model (nightly-amd-8-gpu-deepseek-r1)
 - "all": All models
 """
@@ -247,6 +248,38 @@ AMD_DEEPSEEK_V3_TC_MODELS = [
     ),
 ]
 
+# Group 3c: DeepSeek-V3 with MTP (EAGLE speculative decoding)
+# Runner: nightly-amd-8-gpu-deepseek-v3-mtp
+# Note: Uses MTP for improved throughput, requires ROCm 7.0+
+AMD_DEEPSEEK_V3_MTP_MODELS = [
+    # DeepSeek-V3-0324 with MTP (EAGLE speculative decoding)
+    BaseModelConfig(
+        model_path="deepseek-ai/DeepSeek-V3-0324",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,  # 1 hour for large model
+        other_args=[
+            "--chunked-prefill-size",
+            "131072",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--mem-fraction-static",
+            "0.7",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "SGLANG_USE_ROCM700A": "1",
+            "SGLANG_USE_AITER": "1",
+        },
+    ),
+]
+
 # Group 4: DeepSeek-R1 (reasoning model)
 # Runner: nightly-amd-8-gpu-deepseek-r1
 AMD_DEEPSEEK_R1_MODELS = [
@@ -288,6 +321,8 @@ def get_models_for_group(group: str) -> List[BaseModelConfig]:
         return AMD_DEEPSEEK_V3_DP_MODELS
     elif group == "deepseek-v3-tc":
         return AMD_DEEPSEEK_V3_TC_MODELS
+    elif group == "deepseek-v3-mtp":
+        return AMD_DEEPSEEK_V3_MTP_MODELS
     elif group == "deepseek-r1":
         return AMD_DEEPSEEK_R1_MODELS
     elif group == "all":
@@ -296,6 +331,7 @@ def get_models_for_group(group: str) -> List[BaseModelConfig]:
             + AMD_GROK_MODELS
             + AMD_DEEPSEEK_V3_DP_MODELS
             + AMD_DEEPSEEK_V3_TC_MODELS
+            + AMD_DEEPSEEK_V3_MTP_MODELS
             + AMD_DEEPSEEK_R1_MODELS
         )
     else:
