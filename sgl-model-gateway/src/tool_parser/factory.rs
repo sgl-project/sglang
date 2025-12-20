@@ -239,8 +239,8 @@ impl ParserFactory {
         registry.register_parser("pythonic", || Box::new(PythonicParser::new()));
         registry.register_parser("llama", || Box::new(LlamaParser::new()));
         registry.register_parser("deepseek", || Box::new(DeepSeekParser::new()));
-        registry.register_parser("glm4_moe", || Box::new(Glm4MoeParser::new()));
-        registry.register_parser("glm47_moe", || Box::new(Glm47MoeParser::new()));
+        registry.register_parser("glm4_moe", || Box::new(Glm4MoeParser::glm4()));
+        registry.register_parser("glm47_moe", || Box::new(Glm47MoeParser::glm47()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("kimik2", || Box::new(KimiK2Parser::new()));
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
