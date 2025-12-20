@@ -236,7 +236,6 @@ struct CliArgs {
     rate_limit_tokens_per_second: Option<i32>,
 
     /// Multi-tenant/model rate limit rule in format 'tenant:model:max_concurrent:refill_rate'
-    /// Use '*' for wildcard tenant or model. Example: 'tenant1:gpt-4:10:5' or '*:llama-3:20:20'
     #[arg(long, action = ArgAction::Append)]
     rate_limit_rule: Vec<String>,
 

@@ -13,7 +13,6 @@ def test_multi_tenant_rate_limiting(router_manager, mock_workers):
     # Start 1 mock worker with slight latency to allow concurrency to build
     _, urls, _ = mock_workers(n=1, args=["--latency-ms", "500"])
 
-    # Configure router with specific rules
     # customer-a: restricted to 1 concurrent request
     # model-b: restricted to 2 concurrent requests globally
     # default: 10 concurrent requests
