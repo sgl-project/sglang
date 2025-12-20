@@ -1,4 +1,5 @@
 import re
+from contextlib import contextmanager
 from typing import Dict, Set
 
 import torch
@@ -6,6 +7,19 @@ import torch
 
 # Adapted from skywork AI Infra diffusion optimize
 class LayerwiseOffloadManager:
+    """A lightweight layerwise CPU offload manager.
+
+    This utility offloads per-layer parameters/buffers from GPU to CPU, and
+    supports async H2D prefetch using a dedicated CUDA stream.
+
+    Typical usage:
+    - Construct the manager with the target model and the list-like module
+      attribute that represents transformer blocks (e.g. ``blocks``).
+    - Call :meth:`initialize` once to offload weights and prefetch layer 0.
+    - During forward, call :meth:`prefetch_layer` for the next layer and
+      :meth:`release_layer` for the finished layer.
+    """
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -14,6 +28,7 @@ class LayerwiseOffloadManager:
         num_layers: int,
         enabled: bool,
         pin_cpu_memory: bool = True,
+        auto_initialize: bool = False,
     ) -> None:
         self.model = model
         self.module_list_attr = module_list_attr
@@ -36,6 +51,9 @@ class LayerwiseOffloadManager:
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
+
+        if auto_initialize:
+            self.initialize()
 
     def _match_layer_idx(self, name: str) -> int | None:
         m = self._layer_name_re.search(name)
@@ -116,6 +134,30 @@ class LayerwiseOffloadManager:
             param_names.add(name)
 
         self._gpu_layers[layer_idx] = param_names
+
+    @contextmanager
+    def layer_scope(
+        self,
+        *,
+        prefetch_layer_idx: int | None,
+        release_layer_idx: int | None,
+        non_blocking: bool = True,
+    ):
+        """A helper context manager to improve readability at call sites.
+
+        It optionally prefetches ``prefetch_layer_idx`` before entering the
+        context, and waits for the copy stream then releases
+        ``release_layer_idx`` on exit.
+        """
+        if self.enabled and prefetch_layer_idx is not None:
+            self.prefetch_layer(prefetch_layer_idx, non_blocking=non_blocking)
+        try:
+            yield
+        finally:
+            if self.enabled and self.copy_stream is not None:
+                torch.cuda.current_stream().wait_stream(self.copy_stream)
+            if self.enabled and release_layer_idx is not None:
+                self.release_layer(release_layer_idx)
 
     @torch.compiler.disable
     def release_layer(self, layer_idx: int) -> None:

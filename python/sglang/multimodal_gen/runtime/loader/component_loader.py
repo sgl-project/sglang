@@ -713,8 +713,8 @@ class TransformerLoader(ComponentLoader):
                     num_layers=num_layers,
                     enabled=True,
                     pin_cpu_memory=server_args.pin_cpu_memory,
+                    auto_initialize=True,
                 )
-                mgr.initialize()
                 setattr(model, "_layerwise_offload_manager", mgr)
 
         return model

@@ -956,8 +956,15 @@ def _warmup_ulysses_communication():
 
         warmup_start = time.time()
 
-        device = torch.device(f"cuda:{get_world_group().local_rank}")
-        dummy_tensor = torch.randn(1024, device=device, dtype=torch.float32)
+        device = get_local_torch_device()
+        if device.type != "cuda":
+            logger.info(
+                "Ulysses communication warmup is only supported on CUDA, got %s; skipping.",
+                device.type,
+            )
+            return
+
+        dummy_tensor = torch.zeros(1024, device=device, dtype=torch.float32)
 
         output = ft_c.all_to_all_single(
             dummy_tensor,
