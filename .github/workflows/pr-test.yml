@@ -195,8 +195,7 @@ jobs:
       - name: Compute partitions
         id: compute
         run: |
-          cd python
-          python -m sglang.multimodal_gen.test.compute_partitions --target-time 600
+          python scripts/ci/compute_diffusion_partitions.py --target-time 600
 
   # =============================================== sgl-kernel ====================================================
 

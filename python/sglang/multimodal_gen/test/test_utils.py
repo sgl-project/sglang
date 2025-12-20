@@ -561,21 +561,3 @@ class TestGenerateBase(TestCLIBase):
             model_path=self.model_path,
             test_key="test_mixed",
         )
-
-
-# === Partition utilities for CI ===
-
-DEFAULT_EST_TIME_SECONDS = 300.0  # 5 minutes default for cases without baseline
-
-
-def get_case_est_time(case_id: str) -> float:
-    """
-    Get estimated time in seconds from perf_baselines.json.
-    Returns default value if case has no baseline.
-    """
-    from sglang.multimodal_gen.test.server.testcase_configs import BASELINE_CONFIG
-
-    scenario = BASELINE_CONFIG.scenarios.get(case_id)
-    if scenario is None:
-        return DEFAULT_EST_TIME_SECONDS
-    return scenario.expected_e2e_ms / 1000.0
