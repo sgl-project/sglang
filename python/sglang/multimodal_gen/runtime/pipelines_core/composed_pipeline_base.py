@@ -278,6 +278,10 @@ class ComposedPipelineBase(ABC):
             transformers_or_diffusers,
             architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
+            print(
+                f"282: {module_name}, {transformers_or_diffusers}, {architecture}",
+                flush=True,
+            )
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",

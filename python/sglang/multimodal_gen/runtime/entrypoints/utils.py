@@ -90,7 +90,16 @@ def post_process_sample(
                     format=data_type.get_default_extension(),
                 )
             else:
-                imageio.imwrite(save_file_path, frames[0])
+                if len(frames) > 1:
+                    for i, image in enumerate(frames):
+                        parts = save_file_path.rsplit(".", 1)
+                        if len(parts) == 2:
+                            indexed_path = f"{parts[0]}_{i}.{parts[1]}"
+                        else:
+                            indexed_path = f"{save_file_path}_{i}"
+                        imageio.imwrite(indexed_path, image)
+                else:
+                    imageio.imwrite(save_file_path, frames[0])
             logger.info(f"Saved output to {CYAN}{save_file_path}{RESET}")
         else:
             logger.info(f"No output path provided, output not saved")
