@@ -165,26 +165,23 @@ async def create_video(
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
-
-        if input_reference is not None:
-            uploads_dir = os.path.join("outputs", "uploads")
-            input_path = os.path.join(
-                uploads_dir, f"{request_id}_{input_reference.filename}"
+        if input_reference is None and reference_url is None:
+            raise HTTPException(
+                status_code=400,
+                detail="input_reference file or reference_url is required",
             )
-            await save_image_to_path(input_reference, input_path)
-        elif reference_url is not None:
-            image_list = merge_image_input_list(reference_url)
-            # Save first input image
-            image = image_list[0]
-            uploads_dir = os.path.join("outputs", "uploads")
-            filename = image.filename if hasattr(image, "filename") else f"url_image"
-            input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
-            try:
-                input_path = await save_image_to_path(image, input_path)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400, detail=f"Failed to process image source: {str(e)}"
-                )
+        image_list = merge_image_input_list(input_reference, reference_url)
+        # Save first input image
+        image = image_list[0]
+        uploads_dir = os.path.join("outputs", "uploads")
+        filename = image.filename if hasattr(image, "filename") else f"url_image"
+        input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+        try:
+            input_path = await save_image_to_path(image, input_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to process image source: {str(e)}"
+            )
 
         # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
         extra_from_form: Dict[str, Any] = {}
