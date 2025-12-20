@@ -26,5 +26,7 @@ jobs:
           version=$(cat sgl-model-gateway/bindings/python/sglang_router/version.py | cut -d'"' -f2)
           tag=v${version}
 
-          docker build . -f docker/gateway.Dockerfile -t lmsysorg/sglang-router:${tag} --no-cache
-          docker push lmsysorg/sglang-router:${tag}
+          docker build . -f docker/gateway.Dockerfile -t lmsysorg/sgl-model-gateway:${tag} --no-cache
+          docker tag lmsysorg/sgl-model-gateway:${tag} lmsysorg/sgl-model-gateway:latest
+          docker push lmsysorg/sgl-model-gateway:${tag}
+          docker push lmsysorg/sgl-model-gateway:latest
