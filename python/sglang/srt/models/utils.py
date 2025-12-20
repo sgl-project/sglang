@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
 
@@ -103,6 +104,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
     return (
         _is_cuda
+        and not get_is_capture_mode()
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
     )
