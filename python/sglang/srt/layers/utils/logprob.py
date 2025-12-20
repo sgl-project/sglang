@@ -59,51 +59,47 @@ def get_top_logprobs(
     return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage="decode")
 
 
-def get_token_ids_logprobs_prefill(
-    all_logprobs: torch.Tensor,
-    logits_metadata: LogitsMetadata,
+def get_token_ids_logprobs_raw(
+    logprobs: torch.Tensor,
+    token_ids_logprobs: List[Optional[List[int]]],
+    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
+    stage: str = "decode",
     delay_cpu_copy: bool = False,
 ):
-    input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
-    pt = 0
-    for token_ids, pruned_len in zip(
+    vals, idxs = [], []
+    if stage == "decode":
+        for i, token_ids in enumerate(token_ids_logprobs):
+            if token_ids is None:
+                vals.append([])
+                idxs.append([])
+            else:
+                vals.append(logprobs[i, token_ids].tolist())
+                idxs.append(token_ids)
+    else:  # prefill
+        pt = 0
+        for token_ids, pruned_len in zip(
+            token_ids_logprobs, extend_logprob_pruned_lens_cpu
+        ):
+            if pruned_len <= 0:
+                vals.append([])
+                idxs.append([])
+                continue
+            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids]
+            vals.append(pos_logprobs if delay_cpu_copy else pos_logprobs.tolist())
+            idxs.append([token_ids for _ in range(pruned_len)])
+            pt += pruned_len
+    return vals, idxs
+
+
+def get_token_ids_logprobs_prefill(all_logprobs, logits_metadata, delay_cpu_copy=False):
+    return get_token_ids_logprobs_raw(
+        all_logprobs,
         logits_metadata.token_ids_logprobs,
         logits_metadata.extend_logprob_pruned_lens_cpu,
-    ):
-        if pruned_len <= 0:
-            input_token_ids_logprobs_val.append([])
-            input_token_ids_logprobs_idx.append([])
-            continue
-
-        position_logprobs = all_logprobs[
-            pt : pt + pruned_len, token_ids
-        ]  # Shape: [pruned_len, num_tokens]
-
-        if delay_cpu_copy:
-            # Keep as tensor to delay GPU-to-CPU transfer
-            input_token_ids_logprobs_val.append(position_logprobs)
-        else:
-            # Convert to list immediately (default behavior)
-            input_token_ids_logprobs_val.append(position_logprobs.tolist())
-
-        input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
-        pt += pruned_len
-
-    return input_token_ids_logprobs_val, input_token_ids_logprobs_idx
-
-
-def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
-
-    return (
-        output_token_ids_logprobs_val,
-        output_token_ids_logprobs_idx,
+        stage="prefill",
+        delay_cpu_copy=delay_cpu_copy,
     )
+
+
+def get_token_ids_logprobs(logprobs, token_ids_logprobs):
+    return get_token_ids_logprobs_raw(logprobs, token_ids_logprobs, stage="decode")
