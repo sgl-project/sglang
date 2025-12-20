@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration - 2-GPU tests (80GB GPUs required)
-register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=255, suite="stage-b-test-large-2-gpu")
 
 
 class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):
