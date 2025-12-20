@@ -53,7 +53,18 @@ impl StepTracker {
     }
 }
 
-/// Linear backoff implementation that increases delay by a fixed amount each retry
+/// Fixed backoff that returns the same delay every time
+struct FixedBackoff(Duration);
+
+impl Backoff for FixedBackoff {
+    fn reset(&mut self) {}
+
+    fn next_backoff(&mut self) -> Option<Duration> {
+        Some(self.0)
+    }
+}
+
+/// Linear backoff that increases delay by a fixed amount each retry
 struct LinearBackoff {
     current: Duration,
     increment: Duration,
@@ -257,9 +268,8 @@ impl WorkflowEngine {
 
             // Handle blocked workflow (no ready steps, none running, but work remains)
             if ready_step_indices.is_empty() && running_count == 0 && pending_check.is_empty() {
-                // Check if blocked by failure
-                let has_failed = !tracker.read().failed.is_empty();
-                let error_message = if has_failed {
+                let failed_step = tracker.read().failed.iter().next().cloned();
+                let error_message = if failed_step.is_some() {
                     "Workflow failed due to step dependency failure".to_string()
                 } else {
                     "Workflow deadlocked: no steps ready and none running. This may indicate a scheduler bug.".to_string()
@@ -268,8 +278,6 @@ impl WorkflowEngine {
                 self.state_store.update(instance_id, |s| {
                     s.status = WorkflowStatus::Failed;
                 })?;
-
-                let failed_step = tracker.read().failed.iter().next().cloned();
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowFailed {
                         instance_id,
@@ -556,19 +564,9 @@ impl WorkflowEngine {
         }
     }
 
-    /// Create a backoff instance from strategy
     fn create_backoff(strategy: &BackoffStrategy) -> Box<dyn Backoff + Send> {
         match strategy {
-            BackoffStrategy::Fixed(duration) => {
-                // For fixed backoff, use exponential with multiplier 1.0
-                let backoff = ExponentialBackoffBuilder::new()
-                    .with_initial_interval(*duration)
-                    .with_multiplier(1.0)
-                    .with_max_interval(*duration)
-                    .with_max_elapsed_time(None)
-                    .build();
-                Box::new(backoff)
-            }
+            BackoffStrategy::Fixed(duration) => Box::new(FixedBackoff(*duration)),
             BackoffStrategy::Exponential { base, max } => {
                 let backoff = ExponentialBackoffBuilder::new()
                     .with_initial_interval(*base)
@@ -578,7 +576,6 @@ impl WorkflowEngine {
                 Box::new(backoff)
             }
             BackoffStrategy::Linear { increment, max } => {
-                // Use proper linear backoff: increment, 2*increment, 3*increment, ...
                 Box::new(LinearBackoff::new(*increment, *max))
             }
         }
