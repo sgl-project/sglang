@@ -489,6 +489,10 @@ impl Drop for WasmThreadPool {
 
 #[cfg(test)]
 mod tests {
+    use std::{num::NonZeroUsize, time::Instant};
+
+    use lru::LruCache;
+
     use super::*;
     use crate::wasm::config::WasmRuntimeConfig;
 
