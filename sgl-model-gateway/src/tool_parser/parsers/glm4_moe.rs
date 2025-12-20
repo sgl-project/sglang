@@ -22,7 +22,6 @@ use crate::{
 /// - XML-style tags for tool calls
 /// - Key-value pairs for arguments
 /// - Support for multiple sequential tool calls
-/// - Configurable func_detail_extractor regex for version-specific parsing
 pub struct Glm4MoeParser {
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
@@ -340,4 +339,3 @@ impl ToolParser for Glm4MoeParser {
         self.streamed_args_for_tool.clear();
     }
 }
-
