@@ -79,6 +79,7 @@ class Mamba2StateShape:
     intermediate_size: int
     conv_dim: int
     ssm_state_size: int
+    num_k_heads: int
     num_heads: int
     head_dim: int
     state_size: int
@@ -116,6 +117,7 @@ class Mamba2StateShape:
             intermediate_size=intermediate_size,
             conv_dim=conv_dim,
             ssm_state_size=state_size,
+            num_k_heads=n_groups,
             num_heads=num_heads,
             head_dim=head_dim,
             state_size=state_size,

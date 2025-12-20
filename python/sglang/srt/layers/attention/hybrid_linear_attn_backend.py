@@ -964,7 +964,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            intermediate_k = mamba_cache_params.intermediate_k
+            intermediate_v = mamba_cache_params.intermediate_v
+            intermediate_g = mamba_cache_params.intermediate_g
+            intermediate_beta = mamba_cache_params.intermediate_beta
+            intermediate_accepted_steps = mamba_cache_params.intermediate_accepted_steps
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
@@ -1058,11 +1062,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
+                intermediate_k=intermediate_k,
+                intermediate_v=intermediate_v,
+                intermediate_g=intermediate_g,
+                intermediate_beta=intermediate_beta,
+                intermediate_accepted_steps=intermediate_accepted_steps,
+                # intermediate_states_buffer=intermediate_state_cache,
+                # intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
+            # intermediate_k[cache_indices] = key
+            # intermediate_v[cache_indices] = value
+            # intermediate_g[cache_indices] = g
+            # intermediate_beta[cache_indices] = beta
         else:
             recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
@@ -1342,45 +1355,46 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
         conv_states = mamba_caches.conv[0]
-        ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
+        # # ssm_states = mamba_caches.temporal
+        # # intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Compute common indices once to avoid duplication
+        # # Compute common indices once to avoid duplication
         valid_mask = accepted_steps >= 0
         dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
         src_state_indices = intermediate_state_indices[valid_mask].to(
             torch.int64
         )  # [N]
         last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
+        mamba_caches.intermediate_accepted_steps[dst_state_indices] = last_steps.to(mamba_caches.intermediate_accepted_steps.dtype, copy=False)
 
-        # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
-            :, src_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
+        # # scatter into ssm_states at the chosen cache lines
+        # # ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
+        # #     :, src_state_indices, last_steps
+        # # ].to(ssm_states.dtype, copy=False)
 
         # Scatter into conv_states at the chosen cache lines
         conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
             :, src_state_indices, last_steps
         ].to(conv_states.dtype, copy=False)
 
-        # Track indices used for tracking mamba states for prefix cache
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            track_mask = mamba_steps_to_track >= 0
-            track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
-            if track_steps.numel() == 0:
-                # No track indices to update
-                return
-            dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
-            src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
+        # # Track indices used for tracking mamba states for prefix cache
+        # if mamba_track_indices is not None:
+        #     assert mamba_steps_to_track is not None
+        #     track_mask = mamba_steps_to_track >= 0
+        #     track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
+        #     if track_steps.numel() == 0:
+        #         # No track indices to update
+        #         return
+        #     dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
+        #     src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
 
-            # scatter into ssm_states at the chosen track states
-            ssm_states[:, dst_track_indices, :] = intermediate_state_cache[
-                :, src_track_indices, track_steps
-            ].to(ssm_states.dtype, copy=False)
+        #     # scatter into ssm_states at the chosen track states
+        #     # ssm_states[:, dst_track_indices, :] = intermediate_state_cache[
+        #     #     :, src_track_indices, track_steps
+        #     # ].to(ssm_states.dtype, copy=False)
 
-            # scatter into conv_states at the chosen track states
-            conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-                :, src_track_indices, track_steps
-            ].to(conv_states.dtype, copy=False)
+        #     # scatter into conv_states at the chosen track states
+        #     conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
+        #         :, src_track_indices, track_steps
+        #     ].to(conv_states.dtype, copy=False)
