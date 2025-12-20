@@ -5,7 +5,7 @@ from typing import Literal, Optional
 import torch
 
 _HAS_COS_SIN = hasattr(torch.ops.sgl_kernel, "rotary_embedding_cos_sin")
-_HAS_GENERIC = hasattr(torch.ops.sgl_kernel, "rotary_embedding")
+_HAS_POSITION = hasattr(torch.ops.sgl_kernel, "rotary_embedding")
 
 
 def _resolve_interleaved(interleaved: Optional[bool], is_neox: Optional[bool]) -> bool:
@@ -36,16 +36,6 @@ def apply_rotary_embedding(
     positions: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
 ) -> None:
-    """内部统一的 rotary dispatch：
-
-    - mode="cos_sin": 使用 (cos, sin) 直接旋转
-    - mode="positions": 使用 (positions, cos_sin_cache) 旋转
-
-    interleaved/is_neox:
-      - True (NeoX): [x0, y0, x1, y1, ...]
-      - False (GPT-J/LLaMA): [x0, x1, ..., y0, y1, ...]
-    """
-
     effective_interleaved = _resolve_interleaved(interleaved, is_neox)
 
     if mode == "cos_sin":
@@ -63,8 +53,7 @@ def apply_rotary_embedding(
             )
             return
 
-        # Some older builds overload `rotary_embedding` directly with cos/sin signature.
-        if _HAS_GENERIC:
+        if _HAS_POSITION:
             torch.ops.sgl_kernel.rotary_embedding(
                 cos,
                 sin,
@@ -83,27 +72,12 @@ def apply_rotary_embedding(
         if positions is None or cos_sin_cache is None:
             raise ValueError("mode='positions' requires positions and cos_sin_cache")
 
-        if not _HAS_GENERIC:
+        if not _HAS_POSITION:
             raise RuntimeError(
                 "No positions rotary embedding kernel is available in torch.ops.sgl_kernel"
             )
 
-        # Prefer keyword call if supported.
-        try:
-            torch.ops.sgl_kernel.rotary_embedding(
-                positions=positions,
-                query=query,
-                key=key if key is not None else None,
-                head_size=head_size,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=effective_interleaved,
-            )
-            return
-        except Exception:
-            pass
-
-        # Fallback to positional signature used by some builds/tests:
-        # rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+        # Use positional args for maximum compatibility across builds.
         torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,
@@ -113,9 +87,6 @@ def apply_rotary_embedding(
             effective_interleaved,
         )
         return
-
-    raise ValueError(f"Unknown mode: {mode}")
-
 
 def rotary_embedding_cos_sin(
     cos: torch.Tensor,

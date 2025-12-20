@@ -469,7 +469,7 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
 // Case 32 -> head_size 64
 // Case 64 -> head_size 128
 // Case 128 -> head_size 256
-#define DISPATCH_ROT_DIM(embed_dim, ...)  \
+#define _DIFFUSION_ROT_EMBED_DIM(embed_dim, ...)  \
   switch (embed_dim) {                    \
     case 16: {                            \
       constexpr int ROT_EMBED_DIM = 16;   \

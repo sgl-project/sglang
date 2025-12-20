@@ -807,7 +807,7 @@ void rotary_embedding_cos_sin(
         size_t smem_size = 0;
 
         // Kernel Dispatch
-        DISPATCH_ROT_DIM(
+        _DIFFUSION_ROT_EMBED_DIM(
             embed_dim_for_rotation,
             auto launch_kernel =
                 [&](bool vec_compute, bool aligned_qk) {
