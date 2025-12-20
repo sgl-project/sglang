@@ -73,7 +73,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import RequestStage
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -653,6 +653,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            if (
+                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                and mm_inputs
+                and "mm_items" in mm_inputs
+            ):
+                for item in mm_inputs["mm_items"]:
+                    if isinstance(item, MultimodalDataItem):
+                        item.set_pad_value()
         else:
             mm_inputs = None
 
@@ -1257,6 +1265,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         return success, message, num_paused_requests
 
+    def _update_model_path_info(self, model_path: str, load_format: str):
+        self.served_model_name = model_path
+        self.server_args.model_path = model_path
+        self.server_args.load_format = load_format
+        self.model_path = model_path
+
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
@@ -1265,10 +1279,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
             if result.success:
-                self.served_model_name = obj.model_path
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp = []
@@ -1276,9 +1287,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
@@ -1537,6 +1546,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 self._add_metric_if_present(
                     recv_obj, "prefill_launch_latency", meta_info, i
+                )
+                self._add_metric_if_present(
+                    recv_obj, "prefill_finished_ts", meta_info, i
                 )
 
             if getattr(state.obj, "return_logprob", False):
@@ -1836,12 +1848,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             meta_info["request_sent_to_scheduler_ts"] = (
                 state.request_sent_to_scheduler_ts
             )
-        # For embeddings, there's no separate prefill phase, so omit `prefill_finished_ts`.
-        if (
-            not isinstance(recv_obj, BatchEmbeddingOutput)
-            and state.first_token_time > 0
-        ):
-            meta_info["prefill_finished_ts"] = state.first_token_time
         if state.response_sent_to_client_ts > 0:
             meta_info["response_sent_to_client_ts"] = state.response_sent_to_client_ts
         if state.finished_time > 0:

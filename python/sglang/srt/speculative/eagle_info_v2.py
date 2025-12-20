@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -79,6 +80,12 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        if isinstance(batch.tree_cache, SWAChunkCache):
+            for req in batch.reqs:
+                batch.tree_cache.evict_swa(
+                    req, req.seqlen - 1, batch.model_config.attention_chunk_size
+                )
+
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
