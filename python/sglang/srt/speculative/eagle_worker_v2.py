@@ -121,7 +121,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=target_worker.pp_rank,
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 nccl_port=nccl_port,
