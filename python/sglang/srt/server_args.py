@@ -2356,7 +2356,7 @@ class ServerArgs:
                 for modality in self.limit_mm_data_per_request.keys():
                     if modality not in allowed_modalities:
                         raise ValueError(
-                            f"Invalid modality '{modality}' in limit_mm_per_prompt. "
+                            f"Invalid modality '{modality}' in --limit-mm-data-per-request."
                             f"Allowed modalities are: {list(allowed_modalities)}"
                         )
 
