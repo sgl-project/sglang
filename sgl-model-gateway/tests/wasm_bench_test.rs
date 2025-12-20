@@ -1,5 +1,6 @@
-use std::time::Instant;
+use std::{num::NonZeroUsize, time::Instant};
 
+use lru::LruCache; // Ensure 'lru' is in your dev-dependencies
 use wasmtime::*;
 
 const WASM_WAT: &str = r#"
@@ -13,27 +14,31 @@ const WASM_WAT: &str = r#"
 "#;
 
 #[test]
-fn benchmark_wasm_instantiation_overhead() -> Result<()> {
+fn benchmark_wasm_full_pipeline_optimization() -> Result<()> {
     println!("\n=======================================================");
-    println!("🚀 BENCHMARKING WASM INSTANCE POOLING OPTIMIZATION");
+    println!("🚀 BENCHMARKING: CACHING + POOLING VS BASELINE");
     println!("=======================================================");
 
-    let iterations = 5000;
+    let iterations = 1000; // Reduced iterations because "Standard" is slow!
 
-    // --- Scenario A: Standard Allocator ---
+    // --- Scenario A: The "Old" Way (No Cache + Standard Allocator) ---
+    // This simulates the issue you fixed: Re-compiling and re-allocating every request.
     let engine_standard = Engine::default();
-    let module_standard = Module::new(&engine_standard, WASM_WAT)?;
 
     let start_standard = Instant::now();
     for _ in 0..iterations {
+        // 1. Compile (Simulating the lack of caching/re-compilation)
+        let module = Module::new(&engine_standard, WASM_WAT)?;
+
+        // 2. Instantiate (Standard allocator overhead)
         let mut store = Store::new(&engine_standard, ());
-        let instance = Instance::new(&mut store, &module_standard, &[])?;
+        let instance = Instance::new(&mut store, &module, &[])?;
         let run_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "run")?;
         let _ = run_func.call(&mut store, (10, 20))?;
     }
     let duration_standard = start_standard.elapsed();
 
-    // --- Scenario B: Pooled Allocator ---
+    // --- Scenario B: The "New" Way (LRU Cache + Pooled Allocator) ---
     let mut pool_config = PoolingAllocationConfig::default();
     pool_config.total_core_instances(100);
 
@@ -41,12 +46,24 @@ fn benchmark_wasm_instantiation_overhead() -> Result<()> {
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool_config));
 
     let engine_pooled = Engine::new(&config)?;
-    let module_pooled = Module::new(&engine_pooled, WASM_WAT)?;
+
+    // Initialize Cache (Simulating your new worker_loop)
+    let cache_capacity = NonZeroUsize::new(100).unwrap();
+    let mut cache: LruCache<Vec<u8>, Module> = LruCache::new(cache_capacity);
+
+    // Pre-seed the cache (Simulating a "Warm" cache hit)
+    let module_precompiled = Module::new(&engine_pooled, WASM_WAT)?;
+    let wasm_key = WASM_WAT.as_bytes().to_vec();
+    cache.push(wasm_key.clone(), module_precompiled);
 
     let start_pooled = Instant::now();
     for _ in 0..iterations {
+        // 1. LRU Lookup (Simulating the new cache check)
+        let module = cache.get(&wasm_key).expect("Cache hit").clone();
+
+        // 2. Instantiate (Pooled allocator - fast path)
         let mut store = Store::new(&engine_pooled, ());
-        let instance = Instance::new(&mut store, &module_pooled, &[])?;
+        let instance = Instance::new(&mut store, &module, &[])?;
         let run_func = instance.get_typed_func::<(i32, i32), i32>(&mut store, "run")?;
         let _ = run_func.call(&mut store, (10, 20))?;
     }
@@ -59,20 +76,23 @@ fn benchmark_wasm_instantiation_overhead() -> Result<()> {
 
     println!("Iterations:           {}", iterations);
     println!("-------------------------------------------------------");
-    println!("Metric                | Standard (No Pool) | Pooled (Optimized)");
-    println!("----------------------|--------------------|-------------------");
+    println!("Metric                | Old (Compile+Alloc) | New (LRU+Pool)");
+    println!("----------------------|---------------------|----------------");
     println!(
-        "Total Time            | {:<18.2?} | {:<18.2?}",
+        "Total Time            | {:<19.2?} | {:<18.2?}",
         duration_standard, duration_pooled
     );
     println!(
-        "Avg Latency (per op)  | {:<10.3} µs      | {:<10.3} µs",
+        "Avg Latency (per op)  | {:<10.3} µs       | {:<10.3} µs",
         avg_std_us, avg_pool_us
     );
     println!("-------------------------------------------------------");
     println!("⚡ SPEEDUP FACTOR:      {:.2}x FASTER", speedup);
     println!("=======================================================\n");
 
-    assert!(speedup > 1.5, "Pooling should be significantly faster!");
+    assert!(
+        speedup > 10.0,
+        "The optimized pipeline should be vastly faster!"
+    );
     Ok(())
 }
