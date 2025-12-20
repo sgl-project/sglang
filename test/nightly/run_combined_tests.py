@@ -1,8 +1,12 @@
 from typing import List, Optional
 
+from accuracy_test_runner import (
+    AccuracyTestParams,
+    AccuracyTestResult,
+    run_accuracy_test,
+)
 from nightly_utils import NightlyBenchmarkRunner
-from run_accuracy import AccuracyTestParams, AccuracyTestResult, run_accuracy_test
-from run_performance import (
+from performance_test_runner import (
     PerformanceTestParams,
     PerformanceTestResult,
     run_performance_test,
