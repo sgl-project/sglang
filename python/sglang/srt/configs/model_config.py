@@ -1082,6 +1082,7 @@ multimodal_model_archs = [
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
+    "MiDashengLMModel",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
