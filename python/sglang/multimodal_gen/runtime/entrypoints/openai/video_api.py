@@ -16,7 +16,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -325,7 +325,10 @@ async def download_video_content(
         raise HTTPException(status_code=404, detail="Video not found")
 
     if job.get("url"):
-        return RedirectResponse(job.get("url"))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+        )
 
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):

@@ -7,7 +7,7 @@ import time
 from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -157,11 +157,15 @@ async def generations(
             ]
         )
     elif resp_format == "url":
-        final_url = cloud_url or f"/v1/images/{request_id}/content"
+        if not cloud_url:
+            raise HTTPException(
+                status_code=400,
+                detail="response_format='url' requires cloud storage to be configured.",
+            )
         return ImageResponse(
             data=[
                 ImageResponseData(
-                    url=final_url,
+                    url=cloud_url,
                     revised_prompt=request.prompt,
                 )
             ]
@@ -272,9 +276,13 @@ async def edits(
             data=[ImageResponseData(b64_json=b64_data, revised_prompt=prompt)]
         )
     else:
-        final_url = cloud_url or f"/v1/images/{request_id}/content"
+        if response_format == "url" and not cloud_url:
+            raise HTTPException(
+                status_code=400,
+                detail="response_format='url' requires cloud storage to be configured.",
+            )
         return ImageResponse(
-            data=[ImageResponseData(url=final_url, revised_prompt=prompt)]
+            data=[ImageResponseData(url=cloud_url, revised_prompt=prompt)]
         )
 
 
@@ -287,7 +295,10 @@ async def download_image_content(
         raise HTTPException(status_code=404, detail="Image not found")
 
     if item.get("url"):
-        return RedirectResponse(item.get("url"))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {item.get('url')}",
+        )
 
     file_path = item.get("file_path")
     if not file_path or not os.path.exists(file_path):
