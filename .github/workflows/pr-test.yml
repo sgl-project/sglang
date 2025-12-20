@@ -173,6 +173,32 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
+  # =============================================== Diffusion Partition Computation ====================================================
+  compute-diffusion-partitions:
+    needs: [check-changes, call-gate]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      needs.check-changes.outputs.multimodal_gen == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
+      matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Compute partitions
+        id: compute
+        run: |
+          cd python
+          python -m sglang.multimodal_gen.test.compute_partitions --target-time 600
+
   # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-build-wheels:
@@ -742,7 +768,7 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu-b200
 
   multimodal-gen-test-1-gpu:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, compute-diffusion-partitions, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -750,14 +776,14 @@ jobs:
         (
           !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true'
+          needs.check-changes.outputs.multimodal_gen == 'true' &&
+          needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"part":[],"total":[]}'
         )
       )
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
-      matrix:
-        part: [0, 1]
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1gpu) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -775,6 +801,7 @@ jobs:
       - name: Install dependencies
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+
       - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
@@ -786,12 +813,12 @@ jobs:
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ matrix.total }} \
             $CONTINUE_ON_ERROR_FLAG
 
 
   multimodal-gen-test-2-gpu:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, compute-diffusion-partitions, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -799,14 +826,14 @@ jobs:
         (
           !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true'
+          needs.check-changes.outputs.multimodal_gen == 'true' &&
+          needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"part":[],"total":[]}'
         )
       )
     runs-on: 2-gpu-runner
     strategy:
       fail-fast: false
-      matrix:
-        part: [0, 1]
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -836,7 +863,7 @@ jobs:
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ matrix.total }} \
             $CONTINUE_ON_ERROR_FLAG
 
   quantization-test:
@@ -1739,6 +1766,7 @@ jobs:
       [
         call-gate,
         check-changes,
+        compute-diffusion-partitions,
 
         sgl-kernel-build-wheels,
         sgl-kernel-unit-test,

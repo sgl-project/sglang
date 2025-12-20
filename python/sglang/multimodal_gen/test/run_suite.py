@@ -1,6 +1,9 @@
 """
 Test runner for multimodal_gen that manages test suites and parallel execution.
 
+Uses LPT (Longest Processing Time First) algorithm for load-balanced partitioning
+based on estimated test times from perf_baselines.json.
+
 Usage:
     python3 run_suite.py --suite <suite_name> --partition-id <id> --total-partitions <num>
 
@@ -15,26 +18,118 @@ import sys
 from pathlib import Path
 
 import tabulate
+from typing import List
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    BASELINE_CONFIG,
+    ONE_GPU_CASES_A,
+    ONE_GPU_CASES_B,
+    TWO_GPU_CASES_A,
+    TWO_GPU_CASES_B,
+    DiffusionTestCase,
+)
 
 logger = init_logger(__name__)
 
+DEFAULT_EST_TIME_SECONDS = 300.0  # 5 minutes default for cases without baseline
+
+# Suite definitions using DiffusionTestCase lists
 SUITES = {
+    "1-gpu": ONE_GPU_CASES_A + ONE_GPU_CASES_B,
+    "2-gpu": TWO_GPU_CASES_A + TWO_GPU_CASES_B,
+}
+
+# Mapping from suite to test files
+SUITE_FILES = {
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
-        # add new 1-gpu test files here
     ],
     "2-gpu": [
         "test_server_2_gpu_a.py",
         "test_server_2_gpu_b.py",
-        # add new 2-gpu test files here
     ],
 }
+
+
+def get_case_est_time(case_id: str) -> float:
+    """
+    Get estimated time in seconds from perf_baselines.json.
+    Returns default value if case has no baseline.
+    """
+    scenario = BASELINE_CONFIG.scenarios.get(case_id)
+    if scenario is None:
+        return DEFAULT_EST_TIME_SECONDS
+    return scenario.expected_e2e_ms / 1000.0
+
+
+def auto_partition(
+    cases: List[DiffusionTestCase],
+    rank: int,
+    size: int,
+) -> List[DiffusionTestCase]:
+    """
+    Partition cases using LPT (Longest Processing Time First) greedy algorithm.
+
+    This algorithm distributes cases across partitions to balance the total
+    estimated time in each partition.
+
+    Args:
+        cases: List of DiffusionTestCase objects
+        rank: Index of the partition to return (0 to size-1)
+        size: Total number of partitions
+
+    Returns:
+        List of DiffusionTestCase objects assigned to the specified partition
+    """
+    if not cases or size <= 0:
+        return []
+
+    # Get estimated time for each case
+    cases_with_time = [(case, get_case_est_time(case.id)) for case in cases]
+
+    # Sort by time descending (LPT heuristic)
+    sorted_cases = sorted(cases_with_time, key=lambda x: x[1], reverse=True)
+
+    # Initialize partitions
+    partitions: List[List[DiffusionTestCase]] = [[] for _ in range(size)]
+    partition_sums = [0.0] * size
+
+    # Greedy assignment: assign each case to partition with smallest current sum
+    for case, est_time in sorted_cases:
+        min_idx = partition_sums.index(min(partition_sums))
+        partitions[min_idx].append(case)
+        partition_sums[min_idx] += est_time
+
+    if rank < size:
+        return partitions[rank]
+    return []
+
+
+def get_suite_files(suite: str, target_dir: Path) -> List[str]:
+    """
+    Get test file paths for the specified suite.
+
+    Args:
+        suite: Suite name (e.g., "1-gpu", "2-gpu")
+        target_dir: Base directory for test files
+
+    Returns:
+        List of absolute file paths
+    """
+    files = SUITE_FILES.get(suite, [])
+    result = []
+    for f in files:
+        f_path = target_dir / f
+        if f_path.exists():
+            result.append(str(f_path))
+        else:
+            logger.warning(f"Test file {f} not found in {target_dir}")
+    return result
 
 
 def parse_args():
@@ -220,7 +315,44 @@ def run_pytest(files, filter_expr=None):
 def main():
     args = parse_args()
 
-    # 1. resolve base path
+    # 1. Get all cases for the suite
+    all_cases = SUITES.get(args.suite, [])
+
+    if not all_cases:
+        print(f"No cases found for suite '{args.suite}'.")
+        sys.exit(0)
+
+    # 2. Use LPT algorithm for partitioning
+    my_cases = auto_partition(all_cases, args.partition_id, args.total_partitions)
+
+    if not my_cases:
+        print(f"No cases assigned to partition {args.partition_id}. Exiting success.")
+        sys.exit(0)
+
+    # 3. Print partition info
+    print(
+        f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions}"
+    )
+    print(f"Running {len(my_cases)} cases in this partition:")
+    total_est_time = 0.0
+    for case in my_cases:
+        est = get_case_est_time(case.id)
+        total_est_time += est
+        print(f"  - {case.id} (est: {est:.1f}s)")
+    print(f"Total estimated time: {total_est_time:.1f}s ({total_est_time/60:.1f} min)")
+    print()
+
+    # 4. Build pytest filter expression from case IDs
+    case_ids = [case.id for case in my_cases]
+    partition_filter = " or ".join(case_ids)
+
+    # Combine with additional filter if provided
+    if args.filter:
+        filter_expr = f"({partition_filter}) and ({args.filter})"
+    else:
+        filter_expr = partition_filter
+
+    # 5. Get test files for the suite
     current_file_path = Path(__file__).resolve()
     test_root_dir = current_file_path.parent
     target_dir = test_root_dir / args.base_dir
@@ -229,18 +361,9 @@ def main():
         print(f"Error: Target directory {target_dir} does not exist.")
         sys.exit(1)
 
-    # 2. get files from suite
-    suite_files_rel = SUITES[args.suite]
+    suite_files = get_suite_files(args.suite, target_dir)
 
-    suite_files_abs = []
-    for f_rel in suite_files_rel:
-        f_abs = target_dir / f_rel
-        if not f_abs.exists():
-            print(f"Warning: Test file {f_rel} not found in {target_dir}. Skipping.")
-            continue
-        suite_files_abs.append(str(f_abs))
-
-    if not suite_files_abs:
+    if not suite_files:
         print(f"No valid test files found for suite '{args.suite}'.")
         sys.exit(0)
 
