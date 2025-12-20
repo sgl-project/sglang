@@ -395,26 +395,16 @@ def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNIN
     return original_levels
 
 
-def global_suppress_loggers():
+def globally_suppress_loggers():
     # globally suppress some obsessive loggers
     target_names = [
         "imageio",
         "imageio_ffmpeg",
         "PIL",
         "PIL_Image",
-        "multipart",
-        "multipart.multipart",
-        "python_multipart",
         "python_multipart.multipart",
         "filelock",
         "urllib3",
-        "httpcore",
-        "httpx",
-        "asyncio",
-        "uvicorn",
-        "uvicorn.error",
-        "uvicorn.access",
-        "starlette",
     ]
 
     for name in target_names:
