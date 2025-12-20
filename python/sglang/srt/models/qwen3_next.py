@@ -202,7 +202,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
-        prefix: str = ""
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -230,7 +230,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=None,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("conv1d", prefix)
+            prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
         projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
@@ -243,7 +243,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_qkvz", prefix)
+            prefix=add_prefix("in_proj_qkvz", prefix),
         )
         self.in_proj_ba = ColumnParallelLinear(
             input_size=self.hidden_size,
@@ -252,7 +252,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_ba", prefix)
+            prefix=add_prefix("in_proj_ba", prefix),
         )
 
         query_key_settings = (self.key_dim, 0, False)
@@ -301,7 +301,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("out_proj", prefix)
+            prefix=add_prefix("out_proj", prefix),
         )
 
     def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
@@ -506,14 +506,14 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", ""))
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
         else:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", ""))
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -622,7 +622,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix)
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.o_proj = RowParallelLinear(
@@ -633,7 +633,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            prefix=add_prefix("o_proj", prefix)
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.attn = RadixAttention(
@@ -664,7 +664,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", ""))
+                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -672,7 +672,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", ""))
+                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
