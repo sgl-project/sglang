@@ -22,7 +22,10 @@ from openai import Client, OpenAI
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import is_hip, kill_process_tree
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    global_suppress_loggers,
+    init_logger,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
@@ -39,6 +42,8 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 logger = init_logger(__name__)
+
+global_suppress_loggers()
 
 
 def download_image_from_url(url: str) -> Path:
@@ -671,6 +676,7 @@ def get_generate_fn(
         prompt: str | None = None,
         seconds: int | None = None,
         input_reference: Any | None = None,
+        extra_body: dict[Any] | None = None,
     ) -> str:
         """
         Create a video job via /v1/videos, poll until completion,
@@ -687,6 +693,8 @@ def get_generate_fn(
             create_kwargs["seconds"] = seconds
         if input_reference is not None:
             create_kwargs["input_reference"] = input_reference  # triggers multipart
+        if extra_body is not None:
+            create_kwargs["extra_body"] = extra_body
 
         job = client.videos.create(**create_kwargs)  # type: ignore[attr-defined]
         video_id = job.id
@@ -839,6 +847,53 @@ def get_generate_fn(
 
         return rid
 
+    def generate_image_edit_url(case_id, client) -> str:
+        """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
+        if not sampling_params.prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
+
+        # Handle both single URL and list of URLs
+        image_urls = sampling_params.image_path
+        if not isinstance(image_urls, list):
+            image_urls = [image_urls]
+
+        # Validate all URLs
+        for url in image_urls:
+            if not is_image_url(url):
+                pytest.skip(
+                    f"{id}: image_path must be a URL for URL direct test: {url}"
+                )
+
+        response = client.images.with_raw_response.edit(
+            model=model_path,
+            prompt=sampling_params.prompt,
+            image=[],  # Only for OpenAI verification
+            n=1,
+            size=sampling_params.output_size,
+            response_format="b64_json",
+            extra_body={"url": image_urls},
+        )
+
+        rid = response.headers.get("x-request-id", "")
+        result = response.parse()
+        validate_image(result.data[0].b64_json)
+
+        # Save and upload result for verification
+        img_data = base64.b64decode(result.data[0].b64_json)
+        tmp_path = f"{rid}.png"
+        with open(tmp_path, "wb") as f:
+            f.write(img_data)
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+            origin_file_path=str(sampling_params.image_path),
+        )
+        os.remove(tmp_path)
+
+        return rid
+
     def generate_video(case_id, client) -> str:
         """T2V: Text ? Video."""
         if not sampling_params.prompt:
@@ -876,6 +931,19 @@ def get_generate_fn(
                 input_reference=fh,
             )
 
+    def generate_text_url_image_to_video(case_id, client) -> str:
+        if not sampling_params.prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
+        return _create_and_download_video(
+            client,
+            case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            size=sampling_params.output_size,
+            seconds=video_seconds,
+            extra_body={"reference_url": sampling_params.image_path},
+        )
+
     def generate_text_image_to_video(case_id, client) -> str:
         """TI2V: Text + Image ? Video."""
         if not sampling_params.prompt or not sampling_params.image_path:
@@ -901,13 +969,19 @@ def get_generate_fn(
 
     if modality == "video":
         if sampling_params.image_path and sampling_params.prompt:
-            fn = generate_text_image_to_video
+            if getattr(sampling_params, "direct_url_test", False):
+                fn = generate_text_url_image_to_video
+            else:
+                fn = generate_text_image_to_video
         elif sampling_params.image_path:
             fn = generate_image_to_video
         else:
             fn = generate_video
     elif sampling_params.prompt and sampling_params.image_path:
-        fn = generate_image_edit
+        if getattr(sampling_params, "direct_url_test", False):
+            fn = generate_image_edit_url
+        else:
+            fn = generate_image_edit
     else:
         fn = generate_image
 
