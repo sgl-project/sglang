@@ -1,10 +1,85 @@
 use std::{
+    borrow::Cow,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+/// Static string constants for boolean labels to avoid allocations.
+pub const STREAMING_TRUE: &str = "true";
+pub const STREAMING_FALSE: &str = "false";
+
+/// Convert a bool to a static string reference (zero-cost).
+#[inline]
+pub const fn bool_to_static_str(b: bool) -> &'static str {
+    if b {
+        STREAMING_TRUE
+    } else {
+        STREAMING_FALSE
+    }
+}
+
+/// Static lookup table for common HTTP status codes to avoid allocations.
+/// Returns a static string for known codes, or None for unknown codes.
+#[inline]
+pub fn status_code_to_static_str(code: u16) -> Option<&'static str> {
+    match code {
+        200 => Some("200"),
+        201 => Some("201"),
+        204 => Some("204"),
+        400 => Some("400"),
+        401 => Some("401"),
+        403 => Some("403"),
+        404 => Some("404"),
+        408 => Some("408"),
+        422 => Some("422"),
+        429 => Some("429"),
+        500 => Some("500"),
+        502 => Some("502"),
+        503 => Some("503"),
+        504 => Some("504"),
+        _ => None,
+    }
+}
+
+/// Static HTTP method strings to avoid allocations on every request.
+pub mod http_methods {
+    pub const GET: &str = "GET";
+    pub const POST: &str = "POST";
+    pub const PUT: &str = "PUT";
+    pub const DELETE: &str = "DELETE";
+    pub const PATCH: &str = "PATCH";
+    pub const HEAD: &str = "HEAD";
+    pub const OPTIONS: &str = "OPTIONS";
+}
+
+/// Convert HTTP method to static string. Returns the method as-is for unknown methods.
+#[inline]
+pub fn method_to_static_str(method: &str) -> &'static str {
+    match method {
+        "GET" => http_methods::GET,
+        "POST" => http_methods::POST,
+        "PUT" => http_methods::PUT,
+        "DELETE" => http_methods::DELETE,
+        "PATCH" => http_methods::PATCH,
+        "HEAD" => http_methods::HEAD,
+        "OPTIONS" => http_methods::OPTIONS,
+        // For unknown methods, we return a static "OTHER" to avoid allocation
+        // This is acceptable since unknown methods are rare in practice
+        _ => "OTHER",
+    }
+}
+
+/// Get status code as Cow - static for common codes, allocated for rare ones.
+#[inline]
+pub fn status_code_to_cow(code: u16) -> Cow<'static, str> {
+    match status_code_to_static_str(code) {
+        Some(s) => Cow::Borrowed(s),
+        None => Cow::Owned(code.to_string()),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -333,22 +408,25 @@ pub struct StreamingMetricsParams<'a> {
 }
 
 impl Metrics {
-    /// Record an HTTP request
-    pub fn record_http_request(method: &str, path: &str, status_class: &str) {
+    /// Record an HTTP request.
+    /// For best performance, pass static strings (use `method_to_static_str` for method,
+    /// `status_to_class` for status_class returns static, and cache normalized paths).
+    pub fn record_http_request(method: &'static str, path: &str, status_class: &'static str) {
         counter!(
             "smg_http_requests_total",
-            "method" => method.to_string(),
+            "method" => method,
             "path" => path.to_string(),
-            "status" => status_class.to_string()
+            "status" => status_class
         )
         .increment(1);
     }
 
-    /// Record HTTP request duration
-    pub fn record_http_duration(method: &str, path: &str, duration: Duration) {
+    /// Record HTTP request duration.
+    /// For best performance, pass static strings for method.
+    pub fn record_http_duration(method: &'static str, path: &str, duration: Duration) {
         histogram!(
             "smg_http_request_duration_seconds",
-            "method" => method.to_string(),
+            "method" => method,
             "path" => path.to_string()
         )
         .record(duration.as_secs_f64());
@@ -359,11 +437,18 @@ impl Metrics {
         gauge!("smg_http_connections_active").set(count as f64);
     }
 
-    /// Record HTTP response
+    /// Record HTTP response.
+    /// Uses static strings for common status codes to avoid allocations.
     pub fn record_http_response(status_code: u16, error_code: &str) {
+        // Use static string for common codes, allocate only for rare ones
+        let status_str: Cow<'static, str> = match status_code_to_static_str(status_code) {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(status_code.to_string()),
+        };
+        // metrics crate accepts Into<SharedString> which handles Cow efficiently
         counter!(
             "smg_http_responses_total",
-            "status_code" => status_code.to_string(),
+            "status_code" => status_str,
             "error_code" => error_code.to_string()
         )
         .increment(1);
@@ -382,14 +467,18 @@ impl Metrics {
     // Layer 2: Router metrics
     // ========================================================================
 
-    /// Record a routed request
+    /// Record a routed request.
+    ///
+    /// # Arguments
+    /// * `streaming` - Use `bool_to_static_str(request.stream)` or the constants
+    ///   `STREAMING_TRUE`/`STREAMING_FALSE` to avoid allocation.
     pub fn record_router_request(
         router_type: &'static str,
         backend_type: &'static str,
         connection_mode: &'static str,
         model_id: &str,
         endpoint: &'static str,
-        streaming: bool,
+        streaming: &'static str,
     ) {
         counter!(
             "smg_router_requests_total",
@@ -398,7 +487,7 @@ impl Metrics {
             "connection_mode" => connection_mode,
             "model" => model_id.to_string(),
             "endpoint" => endpoint,
-            "streaming" => streaming.to_string()
+            "streaming" => streaming
         )
         .increment(1);
     }
@@ -458,16 +547,18 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record upstream backend response
+    /// Record upstream backend response.
+    /// Uses static strings for common status codes to avoid allocations.
     pub fn record_router_upstream_response(
         router_type: &'static str,
         status_code: u16,
         error_code: &str,
     ) {
+        let status_str: Cow<'static, str> = status_code_to_cow(status_code);
         counter!(
             "smg_router_upstream_responses_total",
             "router_type" => router_type,
-            "status_code" => status_code.to_string(),
+            "status_code" => status_str,
             "error_code" => error_code.to_string()
         )
         .increment(1);
@@ -566,8 +657,8 @@ impl Metrics {
             input_tokens,
             output_tokens,
         } = params;
-        // metrics-rs requires owned strings for dynamic labels (uses Cow<'static, str>).
-        // We allocate once and clone for each metric - unavoidable with this API.
+
+        // Allocate model string once, clone as needed for each metric
         let model = model_id.to_string();
 
         // TTFT and TPOT (only if we have a first token time)
@@ -596,7 +687,7 @@ impl Metrics {
             }
         }
 
-        // Generation duration
+        // Generation duration (always recorded)
         histogram!(
             "smg_router_generation_duration_seconds",
             "router_type" => router_type,
@@ -619,7 +710,7 @@ impl Metrics {
             .increment(input);
         }
 
-        // Output tokens
+        // Output tokens (always recorded - move model on final use)
         counter!(
             "smg_router_tokens_total",
             "router_type" => router_type,
@@ -792,11 +883,20 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record retry backoff duration
+    /// Record retry backoff duration.
+    /// Uses static strings for common attempt numbers (1-5).
     pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
+        let attempt_str: Cow<'static, str> = match attempt {
+            1 => Cow::Borrowed("1"),
+            2 => Cow::Borrowed("2"),
+            3 => Cow::Borrowed("3"),
+            4 => Cow::Borrowed("4"),
+            5 => Cow::Borrowed("5"),
+            _ => Cow::Owned(attempt.to_string()),
+        };
         histogram!(
             "smg_worker_retry_backoff_seconds",
-            "attempt" => attempt.to_string()
+            "attempt" => attempt_str
         )
         .record(duration.as_secs_f64());
     }

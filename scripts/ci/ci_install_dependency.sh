@@ -43,6 +43,7 @@ fi
 
 # Install protoc for router build (gRPC protobuf compilation)
 if [ "${INSTALL_PROTOC:-0}" = "1" ]; then
+    # TODO: move this to a separate script
     echo "Installing protoc..."
     if command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
@@ -108,6 +109,7 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
+# Remove flash_attn folder to avoid conflicts
 PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
@@ -215,15 +217,3 @@ python3 -c "import torch; print(torch.version.cuda)"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
-
-# Remove flash_attn folder to avoid conflicts with sgl-kernel
-PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
-FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
-
-if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
-    echo "error: this should not happen"
-else
-    echo "Directory $FLASH_ATTN_PATH does not exist."
-fi
