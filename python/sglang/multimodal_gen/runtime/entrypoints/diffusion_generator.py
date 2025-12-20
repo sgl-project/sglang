@@ -28,8 +28,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -383,9 +383,11 @@ class DiffGenerator:
             lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
         )
         return self.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            **kwargs,
+            sampling_params_kwargs=dict(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                **kwargs,
+            )
         )
 
     def shutdown(self):
