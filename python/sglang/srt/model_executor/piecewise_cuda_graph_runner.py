@@ -63,50 +63,6 @@ if TYPE_CHECKING:
 
 
 @contextmanager
-def disable_ca_comm(tp_group):
-    """
-    Context manager to temporarily disable custom allreduce communication.
-
-    This is used during Piecewise CUDA graph capture to avoid custom allreduce operations
-    that may not be compatible with graph capture.
-
-    TODO(yuwei): Fix this
-    """
-    if tp_group.ca_comm is None:
-        yield
-        return
-
-    original_disabled = tp_group.ca_comm.disabled
-    tp_group.ca_comm.original_disabled = original_disabled
-    try:
-        tp_group.ca_comm.disabled = True
-        yield
-    finally:
-        tp_group.ca_comm.disabled = original_disabled
-
-
-@contextmanager
-def use_original_ca_comm(tp_group):
-    """
-    For the module not in piecewise cuda graph capture, use the original custom allreduce communication.
-    This is a no-op if not using piecewise cuda graph because .disabled == .original_disabled
-
-    TODO(Byron): remove this once custom allreduce is enabled in piecewise cuda graph
-    """
-    if tp_group.ca_comm is None:
-        yield
-        return
-
-    current_disabled = tp_group.ca_comm.disabled
-    original_disabled = tp_group.ca_comm.original_disabled
-    try:
-        tp_group.ca_comm.disabled = original_disabled
-        yield
-    finally:
-        tp_group.ca_comm.disabled = current_disabled
-
-
-@contextmanager
 def freeze_gc(enable_cudagraph_gc: bool):
     """
     Optimize garbage collection during CUDA graph capture.
