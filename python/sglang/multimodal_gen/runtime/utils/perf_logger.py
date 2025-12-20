@@ -143,7 +143,7 @@ class StageProfiler:
 
     def __enter__(self):
         if self.simple_log:
-            self.logger.info(f"[{self.stage_name}] started...", group_master_only=True)
+            self.logger.info(f"[{self.stage_name}] started...")
 
         if (self.metrics_enabled and self.timings) or self.simple_log:
             self.start_time = time.perf_counter()
@@ -169,7 +169,6 @@ class StageProfiler:
         if self.simple_log:
             self.logger.info(
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
-                group_master_only=True,
             )
 
         if self.metrics_enabled and self.timings:
