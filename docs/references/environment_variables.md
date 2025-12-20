@@ -83,6 +83,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FLASHINFER_FP4_GEMM_BACKEND` | Select backend for `mm_fp4` on Blackwell GPUS | `` |
 | `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` (deprecated) | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=cutlass` instead. | `false` |
 | `SGLANG_CUTLASS_MOE` (deprecated) | Use Cutlass FP8 MoE kernel on Blackwell GPUs (deprecated, use --moe-runner-backend=cutlass) | `false` |
+| `SGLANG_CUTLASS_MOE_USE_ES` | Use Expert Specialization in CUTLASS FP8 MoE kernel on Hopper | `false` |
 
 
 ## Distributed Computing
