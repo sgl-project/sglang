@@ -463,7 +463,7 @@ impl RequestPipeline {
             metrics_labels::CONNECTION_GRPC,
             model_id.as_deref().unwrap_or("unknown"),
             metrics_labels::ENDPOINT_EMBEDDINGS,
-            false,
+            bool_to_static_str(false),
         );
 
         let mut ctx = RequestContext::for_embedding(request, headers, model_id.clone(), components);
