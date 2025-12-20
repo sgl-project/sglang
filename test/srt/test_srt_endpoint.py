@@ -496,7 +496,7 @@ class TestSRTEndpoint(CustomTestCase):
         self.assertEqual(send_and_check_cached_tokens(range(0, 11000)), 10000)
 
     def test_get_server_info(self):
-        response = requests.get(self.base_url + "/get_server_info")
+        response = requests.get(self.base_url + "/server_info")
         response_json = response.json()
 
         max_total_num_tokens = response_json["max_total_num_tokens"]
@@ -626,7 +626,7 @@ class TestSRTEndpoint(CustomTestCase):
         tp = ThreadPoolExecutor(max_workers=30)
 
         def s():
-            server_info = requests.get(self.base_url + "/get_server_info")
+            server_info = requests.get(self.base_url + "/server_info")
             server_info.json()
 
         futures = []
