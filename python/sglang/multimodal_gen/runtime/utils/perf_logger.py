@@ -168,7 +168,7 @@ class StageProfiler:
 
         if self.simple_log:
             self.logger.info(
-                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds"
+                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
         if self.metrics_enabled and self.timings:

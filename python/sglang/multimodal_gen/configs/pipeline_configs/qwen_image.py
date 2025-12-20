@@ -80,6 +80,8 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     # VAE
     vae_config: VAEConfig = field(default_factory=QwenImageVAEConfig)
 
+    enable_autocast: bool = False
+
     # Text encoding stage
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen2_5VLConfig(),)
