@@ -58,14 +58,17 @@ class HiRadixCacheDirect(RadixCache):
             # Check if the storage backend has a clear method (for nixl backends)
             if hasattr(self.cache_controller.storage_backend, "clear"):
                 self.cache_controller.storage_backend.clear()
+                logger.info(
+                    "Hierarchical cache direct storage backend cleared successfully!"
+                )
                 return True
             else:
                 logger.warning(
-                    "hierarchical cache memcache store does not support clear operation."
+                    "hierarchical cache direct storage backend does not support clear operation."
                 )
                 return False
         except Exception as e:
-            logger.error(f"Failed to clear hierarchical cache storage backend: {e}")
+            logger.error(f"Failed to clear hierarchical cache direct storage backend: {e}")
             return False
 
     def evict(self, num_tokens: int):
