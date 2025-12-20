@@ -14,7 +14,7 @@ use super::{
     proto_wrapper::{ProtoGenerateComplete, ProtoGenerateRequest, ProtoStream},
 };
 use crate::{
-    core::{Worker, WorkerLoadGuardV2},
+    core::{attach_guards_to_response, Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::{GenerateRequest, GenerateResponse},
@@ -149,11 +149,45 @@ pub struct DispatchMetadata {
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
 pub enum LoadGuards {
-    Single(WorkerLoadGuardV2),
+    Single(WorkerLoadGuard),
     Dual {
-        prefill: WorkerLoadGuardV2,
-        decode: WorkerLoadGuardV2,
+        prefill: WorkerLoadGuard,
+        decode: WorkerLoadGuard,
     },
+}
+
+impl From<&WorkerSelection> for LoadGuards {
+    fn from(selection: &WorkerSelection) -> Self {
+        match selection {
+            WorkerSelection::Single { worker } => {
+                LoadGuards::Single(WorkerLoadGuard::new(worker.clone()))
+            }
+            WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
+                prefill: WorkerLoadGuard::new(prefill.clone()),
+                decode: WorkerLoadGuard::new(decode.clone()),
+            },
+        }
+    }
+}
+
+impl LoadGuards {
+    /// Attach these load guards to a Response, tying their lifetime to the response body.
+    ///
+    /// When the response body is fully consumed or dropped (e.g., client disconnects),
+    /// the guards are dropped and worker load is decremented automatically.
+    ///
+    /// This is the proper RAII pattern for SSE/streaming responses.
+    pub fn attach_to_response(
+        self,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        let guards = match self {
+            LoadGuards::Single(guard) => vec![guard],
+            LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
+        };
+
+        attach_guards_to_response(guards, response)
+    }
 }
 
 /// Response processing state (Step 6)
