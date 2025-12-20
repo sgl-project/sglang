@@ -256,14 +256,18 @@ class PiecewiseCudaGraphRunner:
             if self.pp_size > 1:
                 hidden_size = self.model_runner.model_config.hidden_size
                 dtype = self.model_runner.model_config.dtype
-                # Note: piecewise captures with bs=1, but we need buffer for PP proxy tensors
-                # The buffer size is 1 since we capture with batch_size=1
+                # Note: PP proxy tensors have shape [num_tokens, hidden_dim], not [batch_size, hidden_dim]
+                # We allocate buffer with max_num_tokens to support all possible token counts during replay
                 self.pp_proxy_tensors_buffer = {
                     "hidden_states": torch.zeros(
-                        (1, hidden_size), dtype=dtype, device=self.device
+                        (self.max_num_tokens, hidden_size),
+                        dtype=dtype,
+                        device=self.device,
                     ),
                     "residual": torch.zeros(
-                        (1, hidden_size), dtype=dtype, device=self.device
+                        (self.max_num_tokens, hidden_size),
+                        dtype=dtype,
+                        device=self.device,
                     ),
                 }
             else:
@@ -451,8 +455,9 @@ class PiecewiseCudaGraphRunner:
         # Pipeline parallelism: create PP proxy tensors if needed
         pp_proxy_tensors = None
         if self.pp_size > 1:
+            # PP proxy tensors have shape [num_tokens, hidden_dim]
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:bs] for k, v in self.pp_proxy_tensors_buffer.items()}
+                {k: v[:num_tokens] for k, v in self.pp_proxy_tensors_buffer.items()}
             )
 
         if self.model_runner.server_args.enable_lora:
@@ -663,13 +668,14 @@ class PiecewiseCudaGraphRunner:
             pp_proxy_tensors = kwargs.get("pp_proxy_tensors", None)
             if self.model_supports_pp_proxy_tensors and pp_proxy_tensors is not None:
                 # Copy PP proxy tensors to buffer if needed
-                bs = forward_batch.batch_size
+                # PP proxy tensors have shape [num_tokens, hidden_dim]
+                num_tokens = len(forward_batch.input_ids)
                 for key, buf in self.pp_proxy_tensors_buffer.items():
                     if key in pp_proxy_tensors.tensors:
                         src = pp_proxy_tensors.tensors[key]
-                        buf[:bs].copy_(src[:bs])
+                        buf[:num_tokens].copy_(src[:num_tokens])
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v[:bs] for k, v in self.pp_proxy_tensors_buffer.items()}
+                    {k: v[:num_tokens] for k, v in self.pp_proxy_tensors_buffer.items()}
                 )
 
             # Replay
@@ -702,9 +708,10 @@ class PiecewiseCudaGraphRunner:
                 else:
                     # Handle PPProxyTensors output
                     assert isinstance(output, PPProxyTensors)
-                    bs = forward_batch.batch_size
+                    # PP proxy tensors have shape [num_tokens, hidden_dim]
+                    num_tokens = self.raw_num_tokens
                     return PPProxyTensors(
-                        {k: v[:bs] for k, v in output.tensors.items()}
+                        {k: v[:num_tokens] for k, v in output.tensors.items()}
                     )
 
     def get_spec_info(self, num_tokens: int):
