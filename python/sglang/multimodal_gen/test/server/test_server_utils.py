@@ -22,7 +22,10 @@ from openai import Client, OpenAI
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import is_hip, kill_process_tree
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    globally_suppress_loggers,
+    init_logger,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
@@ -39,6 +42,8 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 logger = init_logger(__name__)
+
+globally_suppress_loggers()
 
 
 def download_image_from_url(url: str) -> Path:

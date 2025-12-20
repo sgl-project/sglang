@@ -20,7 +20,10 @@ from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
-from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    Wan2_2_TI2V_5B_Config,
+    WanI2V480PConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -61,7 +64,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -137,18 +139,10 @@ class DenoisingStage(PipelineStage):
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
+        # TODO(will): hack, should use the actual one in dit
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
-            dtype=torch.float16,  # TODO(will): hack
-            supported_attention_backends={
-                AttentionBackendEnum.SLIDING_TILE_ATTN,
-                AttentionBackendEnum.AITER,
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN_3,
-            },  # hack
+            dtype=torch.float16,
         )
 
         # cfg
@@ -651,6 +645,11 @@ class DenoisingStage(PipelineStage):
                 self.device,
                 getattr(self.transformer, "rotary_emb", None),
                 dtype=target_dtype,
+            )
+            | dict(
+                encoder_hidden_states=server_args.pipeline_config.get_pos_prompt_embeds(
+                    batch
+                )
             ),
         )
 
@@ -666,6 +665,11 @@ class DenoisingStage(PipelineStage):
                     self.device,
                     getattr(self.transformer, "rotary_emb", None),
                     dtype=target_dtype,
+                )
+                | dict(
+                    encoder_hidden_states=server_args.pipeline_config.get_neg_prompt_embeds(
+                        batch
+                    )
                 ),
             )
         else:
@@ -722,6 +726,17 @@ class DenoisingStage(PipelineStage):
             latents, batch
         )
 
+        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
+        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
+            offload_mgr.release_all()
+
+        if self.transformer_2 is not None:
+            offload_mgr_2 = getattr(
+                self.transformer_2, "_layerwise_offload_manager", None
+            )
+            if offload_mgr_2 is not None and getattr(offload_mgr_2, "enabled", False):
+                offload_mgr_2.release_all()
+
         # Save STA mask search results if needed
         if (
             st_attn_available
@@ -774,10 +789,11 @@ class DenoisingStage(PipelineStage):
         else:
             batch.did_sp_shard_latents = False
 
-        # For I2I tasks like QwenImageEdit, the image_latent (input image) should be
+        # For I2I tasks like QwenImageEdit, where the image latents is provided as condition, the image_latent (input image) should be
         # replicated on all SP ranks, not sharded, as it provides global context.
+        # For Wan2_2_TI2V_5B_Config, it has very special settings
         if (
-            server_args.pipeline_config.task_type != ModelTaskType.I2I
+            isinstance(server_args.pipeline_config, WanI2V480PConfig)
             and batch.image_latent is not None
         ):
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
@@ -996,10 +1012,6 @@ class DenoisingStage(PipelineStage):
         ):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
-                    # Skip if interrupted
-                    if hasattr(self, "interrupt") and self.interrupt:
-                        continue
-
                     with StageProfiler(
                         f"denoising_step_{i}", logger=logger, timings=batch.timings
                     ):
@@ -1232,7 +1244,6 @@ class DenoisingStage(PipelineStage):
         current_model,
         latent_model_input,
         timestep,
-        prompt_embeds,
         target_dtype,
         guidance: torch.Tensor,
         **kwargs,
@@ -1352,7 +1363,6 @@ class DenoisingStage(PipelineStage):
         # Pass ControlNet residuals to transformer
         return current_model(
             hidden_states=latent_model_input,
-            encoder_hidden_states=prompt_embeds,
             timestep=timestep,
             guidance=guidance,
             controlnet_block_samples=controlnet_block_samples,
@@ -1410,9 +1420,6 @@ class DenoisingStage(PipelineStage):
                     current_model=current_model,
                     latent_model_input=latent_model_input,
                     timestep=timestep,
-                    prompt_embeds=server_args.pipeline_config.get_pos_prompt_embeds(
-                        batch
-                    ),
                     target_dtype=target_dtype,
                     guidance=guidance,
                     **image_kwargs,
@@ -1438,9 +1445,6 @@ class DenoisingStage(PipelineStage):
                     current_model=current_model,
                     latent_model_input=latent_model_input,
                     timestep=timestep,
-                    prompt_embeds=server_args.pipeline_config.get_neg_prompt_embeds(
-                        batch
-                    ),
                     target_dtype=target_dtype,
                     guidance=guidance,
                     **image_kwargs,
