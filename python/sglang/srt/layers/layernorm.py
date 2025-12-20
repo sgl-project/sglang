@@ -194,13 +194,17 @@ class RMSNorm(CustomOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
-        post_residual_addition = kwargs.get("post_residual_addition", 0.0)
+        post_residual_addition = kwargs.get("post_residual_addition")
         x = x.to(torch.float32)
         if residual is not None:
             x = (
                 x
                 + residual.to(torch.float32)
-                + (post_residual_addition.to(torch.float32))
+                + (
+                    post_residual_addition.to(torch.float32)
+                    if post_residual_addition is not None
+                    else 0.0
+                )
             )
             if self.fp32_residual:
                 residual = x.clone()
