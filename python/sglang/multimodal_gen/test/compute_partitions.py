@@ -16,26 +16,13 @@ from typing import List
 
 # Import case configurations
 from sglang.multimodal_gen.test.server.testcase_configs import (
-    BASELINE_CONFIG,
     ONE_GPU_CASES_A,
     ONE_GPU_CASES_B,
     TWO_GPU_CASES_A,
     TWO_GPU_CASES_B,
     DiffusionTestCase,
 )
-
-DEFAULT_EST_TIME_SECONDS = 300.0  # 5 minutes default for cases without baseline
-
-
-def get_case_est_time(case_id: str) -> float:
-    """
-    Get estimated time in seconds from perf_baselines.json.
-    Returns default value if case has no baseline.
-    """
-    scenario = BASELINE_CONFIG.scenarios.get(case_id)
-    if scenario is None:
-        return DEFAULT_EST_TIME_SECONDS
-    return scenario.expected_e2e_ms / 1000.0
+from sglang.multimodal_gen.test.test_utils import get_case_est_time
 
 
 def compute_partition_count(
@@ -72,19 +59,24 @@ def output_github_matrix(suite: str, partition_count: int):
     """
     Output GitHub Actions matrix format to GITHUB_OUTPUT.
 
+    Uses 'include' structure to create paired values instead of Cartesian product.
+    Uses compact JSON (no spaces) for consistent string matching in workflow conditions.
+
     Args:
         suite: Suite name (e.g., "1gpu", "2gpu")
         partition_count: Number of partitions
     """
     if partition_count <= 0:
-        matrix = {"part": [], "total": []}
+        matrix = {"include": []}
     else:
         matrix = {
-            "part": list(range(partition_count)),
-            "total": [partition_count] * partition_count,
+            "include": [
+                {"part": i, "total": partition_count} for i in range(partition_count)
+            ]
         }
 
-    matrix_json = json.dumps(matrix)
+    # Use compact JSON (no spaces) for consistent matching in workflow conditions
+    matrix_json = json.dumps(matrix, separators=(",", ":"))
 
     # Output to GITHUB_OUTPUT if running in GitHub Actions
     github_output = os.environ.get("GITHUB_OUTPUT")
@@ -120,50 +112,39 @@ def main():
     )
     args = parser.parse_args()
 
-    # 1-GPU cases
-    one_gpu_cases = ONE_GPU_CASES_A + ONE_GPU_CASES_B
-    one_gpu_total_time = sum(get_case_est_time(case.id) for case in one_gpu_cases)
-    one_gpu_partitions = compute_partition_count(
-        one_gpu_cases,
-        args.target_time,
-        args.min_partitions,
-        args.max_partitions,
-    )
+    # Define suites
+    suites = {
+        "1gpu": ONE_GPU_CASES_A + ONE_GPU_CASES_B,
+        "2gpu": TWO_GPU_CASES_A + TWO_GPU_CASES_B,
+    }
 
-    # 2-GPU cases
-    two_gpu_cases = TWO_GPU_CASES_A + TWO_GPU_CASES_B
-    two_gpu_total_time = sum(get_case_est_time(case.id) for case in two_gpu_cases)
-    two_gpu_partitions = compute_partition_count(
-        two_gpu_cases,
-        args.target_time,
-        args.min_partitions,
-        args.max_partitions,
-    )
-
-    # Print summary
+    # Print header
     print("=== Diffusion Partition Computation ===")
     print(
         f"Target time per partition: {args.target_time}s ({args.target_time/60:.1f} min)"
     )
     print()
-    print("1-GPU suite:")
-    print(f"  Cases: {len(one_gpu_cases)}")
-    print(
-        f"  Total estimated time: {one_gpu_total_time:.1f}s ({one_gpu_total_time/60:.1f} min)"
-    )
-    print(f"  Partitions: {one_gpu_partitions}")
-    print()
-    print("2-GPU suite:")
-    print(f"  Cases: {len(two_gpu_cases)}")
-    print(
-        f"  Total estimated time: {two_gpu_total_time:.1f}s ({two_gpu_total_time/60:.1f} min)"
-    )
-    print(f"  Partitions: {two_gpu_partitions}")
-    print()
 
-    # Output GitHub Actions matrix
-    output_github_matrix("1gpu", one_gpu_partitions)
-    output_github_matrix("2gpu", two_gpu_partitions)
+    # Process each suite
+    for suite_name, cases in suites.items():
+        total_time = sum(get_case_est_time(case.id) for case in cases)
+        num_partitions = compute_partition_count(
+            cases,
+            args.target_time,
+            args.min_partitions,
+            args.max_partitions,
+        )
+
+        # Print suite summary
+        display_name = suite_name.upper().replace("GPU", "-GPU")
+        print(f"{display_name} suite:")
+        print(f"  Cases: {len(cases)}")
+        print(f"  Total estimated time: {total_time:.1f}s ({total_time/60:.1f} min)")
+        print(f"  Partitions: {num_partitions}")
+        print()
+
+        # Output GitHub Actions matrix
+        output_github_matrix(suite_name, num_partitions)
 
 
 if __name__ == "__main__":

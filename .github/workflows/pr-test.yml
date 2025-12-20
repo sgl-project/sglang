@@ -175,11 +175,10 @@ jobs:
 
   # =============================================== Diffusion Partition Computation ====================================================
   compute-diffusion-partitions:
+    # Runs on ubuntu-latest (lightweight), computes partition matrix for diffusion jobs.
+    # Diffusion jobs check result == 'success' before using the matrix.
     needs: [check-changes, call-gate]
-    if: |
-      always() &&
-      !failure() && !cancelled() &&
-      needs.check-changes.outputs.multimodal_gen == 'true'
+    if: always() && !failure() && !cancelled()
     runs-on: ubuntu-latest
     outputs:
       matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
@@ -771,13 +770,14 @@ jobs:
     needs: [check-changes, call-gate, compute-diffusion-partitions, sgl-kernel-build-wheels]
     if: |
       always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
       (
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
           !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true' &&
-          needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"part":[],"total":[]}'
+          needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
     runs-on: 1-gpu-runner
@@ -821,13 +821,14 @@ jobs:
     needs: [check-changes, call-gate, compute-diffusion-partitions, sgl-kernel-build-wheels]
     if: |
       always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
       (
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
           !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true' &&
-          needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"part":[],"total":[]}'
+          needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
     runs-on: 2-gpu-runner

@@ -22,17 +22,15 @@ from typing import List
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
-    BASELINE_CONFIG,
     ONE_GPU_CASES_A,
     ONE_GPU_CASES_B,
     TWO_GPU_CASES_A,
     TWO_GPU_CASES_B,
     DiffusionTestCase,
 )
+from sglang.multimodal_gen.test.test_utils import get_case_est_time
 
 logger = init_logger(__name__)
-
-DEFAULT_EST_TIME_SECONDS = 300.0  # 5 minutes default for cases without baseline
 
 # Suite definitions using DiffusionTestCase lists
 SUITES = {
@@ -54,17 +52,6 @@ SUITE_FILES = {
         "test_server_2_gpu_b.py",
     ],
 }
-
-
-def get_case_est_time(case_id: str) -> float:
-    """
-    Get estimated time in seconds from perf_baselines.json.
-    Returns default value if case has no baseline.
-    """
-    scenario = BASELINE_CONFIG.scenarios.get(case_id)
-    if scenario is None:
-        return DEFAULT_EST_TIME_SECONDS
-    return scenario.expected_e2e_ms / 1000.0
 
 
 def auto_partition(
