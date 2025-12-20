@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
 )
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.srt.managers.io_struct import VertexGenerateReqInput
 
@@ -105,7 +105,7 @@ def encode_video_to_base64(file_path: str):
 async def forward_to_scheduler(req_obj, sp):
     """Forwards request to scheduler and processes the result."""
     try:
-        response = await scheduler_client.forward(req_obj)
+        response = await sync_scheduler_client.forward(req_obj)
         if response.output is None:
             raise RuntimeError("Model generation returned no output.")
 

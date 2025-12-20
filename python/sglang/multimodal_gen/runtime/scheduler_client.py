@@ -10,7 +10,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-
 async def run_zeromq_broker(server_args: ServerArgs):
     """
     This function runs as a background task in the FastAPI process.
@@ -39,8 +38,6 @@ async def run_zeromq_broker(server_args: ServerArgs):
             logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
             # A reply must be sent to prevent the client from hanging
             await socket.send_pyobj({"status": "error", "message": str(e)})
-
-
 
 
 class SchedulerClient:
