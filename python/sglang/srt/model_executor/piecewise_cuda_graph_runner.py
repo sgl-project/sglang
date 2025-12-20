@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -154,6 +155,11 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+            self.compile_config.add_split_op(
+                "sglang.moe_forward_piecewise_cuda_graph_impl"
+            )
+
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
         # Batch sizes to capture
@@ -202,6 +208,7 @@ class PiecewiseCudaGraphRunner:
                 )
 
         self.attention_layers = self.model_runner.attention_layers
+        self.moe_layers = self.model_runner.moe_layers
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -308,7 +315,7 @@ class PiecewiseCudaGraphRunner:
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
         with set_forward_context(
-            forward_batch, self.attention_layers, self.quant_config
+            forward_batch, self.attention_layers, self.quant_config, self.moe_layers
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -321,7 +328,6 @@ class PiecewiseCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
-        # TODO(yuwei): support return input_ids' logprob
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
@@ -455,7 +461,7 @@ class PiecewiseCudaGraphRunner:
 
             kwargs = {}
             with set_forward_context(
-                forward_batch, self.attention_layers, self.quant_config
+                forward_batch, self.attention_layers, self.quant_config, self.moe_layers
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -582,7 +588,10 @@ class PiecewiseCudaGraphRunner:
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(
-                static_forward_batch, self.attention_layers, self.quant_config
+                static_forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
             ):
                 with set_compiled(True):
                     output = self.model_runner.model.forward(
