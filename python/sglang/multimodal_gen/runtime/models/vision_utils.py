@@ -15,6 +15,8 @@ import requests
 import torch
 from packaging import version
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import suppress_other_loggers
+
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
         "linear": PIL.Image.Resampling.BILINEAR,
