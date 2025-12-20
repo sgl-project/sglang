@@ -363,9 +363,10 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ):
         hidden_states, residual = self.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, **kwargs
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
