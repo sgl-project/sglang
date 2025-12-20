@@ -209,7 +209,7 @@ class TestDeepseekV3FP4PiecewiseCudaGraph(CustomTestCase):
 
     def test_a_gsm8k(
         self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+    ):
         args = SimpleNamespace(
             num_shots=8,
             data_path=None,
@@ -240,7 +240,7 @@ class TestDeepseekV3FP4PiecewiseCudaGraph(CustomTestCase):
                 f"### test_bs_1_speed (deepseek-v3-fp4)\n" f"{speed=:.2f} token/s\n"
             )
 
-        self.assertGreater(speed, 75)
+        self.assertGreater(speed, 120)
 
 
 if __name__ == "__main__":
