@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.utils.logprob import get_top_logprobs_prefill
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -360,7 +361,7 @@ class LogitsProcessor(nn.Module):
             (
                 input_top_logprobs_val,
                 input_top_logprobs_idx,
-            ) = self.get_top_logprobs(sliced_logprobs, logits_metadata)
+            ) = get_top_logprobs_prefill(sliced_logprobs, logits_metadata)
 
         # For input_token_logprobs, use delimiter token logprobs
         input_token_logprobs = sliced_logprobs[:, delimiter_token]
@@ -646,7 +647,7 @@ class LogitsProcessor(nn.Module):
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
         )
 
-    def _process_input_logprobs(self, input_logprobs, logits_metadata):
+    def _process_input_logprobs(self, input_logprobs, logits_metadata: LogitsMetadata):
         input_logprobs = self.compute_temp_top_p_normalized_logprobs(
             input_logprobs, logits_metadata
         )
@@ -656,7 +657,7 @@ class LogitsProcessor(nn.Module):
             (
                 input_top_logprobs_val,
                 input_top_logprobs_idx,
-            ) = self.get_top_logprobs(input_logprobs, logits_metadata)
+            ) = get_top_logprobs_prefill(input_logprobs, logits_metadata)
         else:
             input_top_logprobs_val = input_top_logprobs_idx = None
 
@@ -963,35 +964,6 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
-
-    @staticmethod
-    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
-        max_k = max(logits_metadata.top_logprobs_nums)
-        ret = all_logprobs.topk(max_k, dim=1)
-        values = ret.values.tolist()
-        indices = ret.indices.tolist()
-
-        input_top_logprobs_val, input_top_logprobs_idx = [], []
-
-        pt = 0
-        for k, pruned_len in zip(
-            logits_metadata.top_logprobs_nums,
-            logits_metadata.extend_logprob_pruned_lens_cpu,
-        ):
-            if pruned_len <= 0:
-                input_top_logprobs_val.append([])
-                input_top_logprobs_idx.append([])
-                continue
-
-            input_top_logprobs_val.append(
-                [values[pt + j][:k] for j in range(pruned_len)]
-            )
-            input_top_logprobs_idx.append(
-                [indices[pt + j][:k] for j in range(pruned_len)]
-            )
-            pt += pruned_len
-
-        return input_top_logprobs_val, input_top_logprobs_idx
 
     @staticmethod
     def get_top_logprobs_chunk(

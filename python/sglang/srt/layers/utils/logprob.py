@@ -1,6 +1,36 @@
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsMetadata
+
+
+def get_top_logprobs_prefill(
+    all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
+):
+    max_k = max(logits_metadata.top_logprobs_nums)
+    ret = all_logprobs.topk(max_k, dim=1)
+    values = ret.values.tolist()
+    indices = ret.indices.tolist()
+
+    input_top_logprobs_val, input_top_logprobs_idx = [], []
+
+    pt = 0
+    for k, pruned_len in zip(
+        logits_metadata.top_logprobs_nums,
+        logits_metadata.extend_logprob_pruned_lens_cpu,
+    ):
+        if pruned_len <= 0:
+            input_top_logprobs_val.append([])
+            input_top_logprobs_idx.append([])
+            continue
+
+        input_top_logprobs_val.append([values[pt + j][:k] for j in range(pruned_len)])
+        input_top_logprobs_idx.append([indices[pt + j][:k] for j in range(pruned_len)])
+        pt += pruned_len
+
+    return input_top_logprobs_val, input_top_logprobs_idx
 
 
 def get_top_logprobs(
