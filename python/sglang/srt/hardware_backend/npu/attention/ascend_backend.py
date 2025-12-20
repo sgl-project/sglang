@@ -87,7 +87,8 @@ class AscendAttnMaskBuilder:
         self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
         # Initialize mixed chunk mask cache
-        self.mixed_chunk_attn_mask = self.get_splitfuse_attn_mask()
+        mixed_mask_len = 2048
+        self.mixed_chunk_attn_mask = self.get_splitfuse_attn_mask(mixed_mask_len)
 
         if use_mla:
             # Initialize RingMla mask
@@ -181,22 +182,15 @@ class AscendAttnMaskBuilder:
     def get_splitfuse_attn_mask(
         self,
         seq_lens: torch.Tensor = None,
-        position: torch.Tensor = None,
-        dtype: torch.dtype = None,
-        device: torch.device = None,
     ) -> torch.Tensor:
         """
         Generate a splitfuse attention mask.
 
         :param seq_lens: Sequence lengths.
-        :param position: Position indices for the mask.
-        :param dtype: Data type of the mask tensor.
-        :param device: Device to run the model on.
         :return: A tensor representing the splitfuse attention mask.
         """
-        if self.mixed_chunk_attn_mask is None:
-            self.mixed_chunk_attn_mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)
-        return self.mixed_chunk_attn_mask
+        attn_mask = torch.triu(torch.ones(seq_lens, seq_lens), diagonal=1).to(torch.int8).to(self.device)
+        return attn_mask
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -231,7 +225,7 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mask,
             self.ascend_attn_mask_builder.fia_mask,
             self.ascend_attn_mask_builder.mtp_mask,
-            self.ascend_attn_mask_builder.mix_mask_cache,
+            self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
