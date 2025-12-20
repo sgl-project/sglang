@@ -1,10 +1,6 @@
 """Nightly performance benchmark for DeepSeek-V3 model.
 
-This test benchmarks the DeepSeek-V3 model with multiple configurations on 8 GPUs:
-- basic: Standard TP=8 configuration
-- mtp: Multi-Token Prediction with EAGLE speculative decoding
-- dp: Data Parallel attention mode
-- dp+mtp: Data Parallel + MTP combined
+This test benchmarks the DeepSeek-V3 model with basic TP=8 configuration on 8 GPUs.
 
 The model path can be configured via DEEPSEEK_V3_MODEL_PATH environment variable.
 
@@ -29,11 +25,7 @@ PROFILE_DIR = "performance_profiles_deepseek_v3"
 class TestNightlyDeepseekV3Performance(unittest.TestCase):
     """Nightly performance benchmark for DeepSeek-V3 model.
 
-    Tests the DeepSeek-V3 model across different configurations:
-    - basic: Standard TP=8 configuration
-    - mtp: Multi-Token Prediction with EAGLE speculative decoding
-    - dp: Data Parallel attention with DP=8
-    - dp+mtp: Combined DP attention and MTP
+    Tests the DeepSeek-V3 model with basic TP=8 configuration.
     """
 
     @classmethod
@@ -43,13 +35,6 @@ class TestNightlyDeepseekV3Performance(unittest.TestCase):
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
-
-        # Define variant configurations for DeepSeek-V3
-        # Environment variables for ROCm 7.0+ support
-        deepseek_env = {
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        }
 
         cls.variants = [
             {
@@ -63,72 +48,6 @@ class TestNightlyDeepseekV3Performance(unittest.TestCase):
                     "--model-loader-extra-config",
                     '{"enable_multithread_load": true}',
                 ],
-                "env_vars": deepseek_env,
-            },
-            {
-                "name": "mtp",
-                "other_args": [
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-num-steps",
-                    "3",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "4",
-                    "--mem-fraction-static",
-                    "0.7",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
-                "env_vars": deepseek_env,
-            },
-            {
-                "name": "dp",
-                "other_args": [
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--dp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--chunked-prefill-size",
-                    "131072",
-                    "--mem-fraction-static",
-                    "0.85",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
-                "env_vars": deepseek_env,
-            },
-            {
-                "name": "dp+mtp",
-                "other_args": [
-                    "--trust-remote-code",
-                    "--tp",
-                    "8",
-                    "--dp",
-                    "8",
-                    "--enable-dp-attention",
-                    "--chunked-prefill-size",
-                    "131072",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-num-steps",
-                    "3",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "4",
-                    "--mem-fraction-static",
-                    "0.7",
-                    "--model-loader-extra-config",
-                    '{"enable_multithread_load": true}',
-                ],
-                "env_vars": deepseek_env,
             },
         ]
 

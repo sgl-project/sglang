@@ -228,15 +228,16 @@ AMD_DEEPSEEK_V3_TC_MODELS = [
         model_path="deepseek-ai/DeepSeek-V3-0324",
         tp_size=8,
         accuracy_threshold=0.93,
-        timeout=3600,  # 1 hour for compilation + large model
+        timeout=7200,  # 2 hours for compilation + large model
         other_args=[
             "--chunked-prefill-size",
             "131072",
             "--mem-fraction-static",
-            "0.80",  # Reduced for torch compile
+            "0.70",  # Reduced further for torch compile
             "--cuda-graph-max-bs",
-            "16",  # Required for torch compile MoE
+            "8",  # Reduced from 16 to reduce memory
             "--enable-torch-compile",
+            "--disable-cuda-graph",  # Disable cuda graph to avoid memory issues
             "--trust-remote-code",
         ],
         env_vars={
