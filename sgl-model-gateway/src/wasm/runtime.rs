@@ -371,7 +371,7 @@ impl WasmThreadPool {
             })?;
 
             // Insert into cache
-            cache.insert(wasm_bytes.clone(), comp.clone());
+            cache.insert(wasm_bytes, comp.clone());
             comp
         };
 
