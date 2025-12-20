@@ -13,11 +13,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    configure_logger,
-    global_suppress_loggers,
-    logger,
-)
+from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.srt.utils import kill_process_tree
 
 
@@ -27,7 +23,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         launch_http_server: False for offline local mode
     """
     configure_logger(server_args)
-    global_suppress_loggers()
 
     # Start a new server with multiple worker processes
     logger.info("Starting server...")

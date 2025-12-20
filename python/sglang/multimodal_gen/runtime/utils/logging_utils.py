@@ -10,7 +10,6 @@ import logging
 import os
 import sys
 import time
-import warnings
 from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
@@ -230,32 +229,6 @@ class _SGLDiffusionLogger(Logger):
     ) -> None: ...
 
 
-def global_suppress_loggers():
-    # globally suppress some obsessive loggers
-    target_names = [
-        "imageio",
-        "imageio_ffmpeg",
-        "PIL",
-        "PIL_Image",
-        "multipart",
-        "multipart.multipart",
-        "python_multipart",
-        "python_multipart.multipart",
-        "filelock",
-        "urllib3",
-        "httpcore",
-        "httpx",
-        "asyncio",
-        "uvicorn",
-        "uvicorn.error",
-        "uvicorn.access",
-        "starlette",
-    ]
-
-    for name in target_names:
-        logging.getLogger(name).setLevel(logging.ERROR)
-
-
 def init_logger(name: str) -> _SGLDiffusionLogger:
     """The main purpose of this function is to ensure that loggers are
     retrieved in such a way that we can be sure the root sgl_diffusion logger has
@@ -424,57 +397,28 @@ def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNIN
 
 def global_suppress_loggers():
     # globally suppress some obsessive loggers
-    suppress_loggers(
-        [
-            "imageio",
-            "imageio_ffmpeg",
-            "PIL",
-            "PIL_Image",
-            "multipart",
-            "filelock",
-            "urllib3",
-        ]
-    )
-
-
-@contextmanager
-def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
-    """
-    A context manager to temporarily suppress specified loggers.
-
-    Args:
-        not_suppress_on_main_rank (bool): If True, loggers will not be
-            suppressed on the main process (rank 0).
-    """
-    # This is a global setting that we want to apply to all ranks
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
-
-    should_suppress = True
-    if not_suppress_on_main_rank:
-        if get_is_main_process():
-            should_suppress = False
-
-    loggers_to_suppress = [
-        "urllib3",
+    target_names = [
         "imageio",
         "imageio_ffmpeg",
         "PIL",
         "PIL_Image",
-    ]
-    filelock_loggers = [
+        "multipart",
+        "multipart.multipart",
+        "python_multipart",
+        "python_multipart.multipart",
         "filelock",
+        "urllib3",
+        "httpcore",
+        "httpx",
+        "asyncio",
+        "uvicorn",
+        "uvicorn.error",
+        "uvicorn.access",
+        "starlette",
     ]
-    original_levels = suppress_loggers(loggers_to_suppress)
-    original_levels.update(suppress_loggers(filelock_loggers, level=logging.ERROR))
 
-    try:
-        yield
-    finally:
-        if should_suppress:
-            for logger_name, level in original_levels.items():
-                logging.getLogger(logger_name).setLevel(level)
+    for name in target_names:
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 
 # source: https://github.com/vllm-project/vllm/blob/a11f4a81e027efd9ef783b943489c222950ac989/vllm/utils/system_utils.py#L60
