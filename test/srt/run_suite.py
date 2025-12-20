@@ -140,7 +140,7 @@ suites = {
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_piecewise_cuda_graph_2_gpu.py", 200),
+        TestFile("test_piecewise_cuda_graph_2_gpu.py", 400),
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
@@ -316,6 +316,10 @@ suite_amd = {
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
+    ],
+    # AMD 8-GPU tests for base models using gsm8k completion benchmark
+    "nightly-amd-8-gpu": [
+        TestFile("nightly/test_gsm8k_completion_eval_amd.py"),
     ],
 }
 

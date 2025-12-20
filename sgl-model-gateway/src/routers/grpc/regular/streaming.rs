@@ -81,6 +81,9 @@ impl StreamingProcessor {
     /// - Channel creation
     /// - Background task spawning
     /// - SSE response building
+    ///
+    /// Note: Caller should attach load guards to the returned response using
+    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
     pub fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -633,6 +636,9 @@ impl StreamingProcessor {
     /// Process streaming generate response and return SSE response
     ///
     /// Simpler than chat - no tool/reasoning parsing, just text accumulation
+    ///
+    /// Note: Caller should attach load guards to the returned response using
+    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
     pub fn process_streaming_generate(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
