@@ -1678,7 +1678,6 @@ class ModelRunner:
                 "Disable piecewise CUDA graph because piecewise_cuda_graph has conflict with torch compile",
             )
             return False
-        # PP support is now enabled for piecewise CUDA graph
         return True
 
     def init_memory_pool(

@@ -20,7 +20,7 @@ import gc
 import inspect
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
@@ -239,9 +239,12 @@ class PiecewiseCudaGraphRunner:
                     (self.max_num_tokens, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
                 )
-            self.mrope_positions = torch.zeros(
-                (3, self.max_num_tokens), dtype=torch.int64
-            )
+                self.mrope_positions = torch.zeros(
+                    (3, self.max_num_tokens), dtype=torch.int64
+                )
+            else:
+                self.input_embeds = None
+                self.mrope_positions = None
 
             # PP proxy tensors buffer (for pipeline parallelism)
             if self.pp_size > 1:
@@ -351,7 +354,9 @@ class PiecewiseCudaGraphRunner:
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
                 mrope_positions=(
-                    self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+                    self.mrope_positions[:, :num_tokens]
+                    if self.mrope_positions is not None
+                    else None
                 ),
                 spec_algorithm=None,
                 spec_info=None,
@@ -436,7 +441,9 @@ class PiecewiseCudaGraphRunner:
         )
         positions = self.positions[:num_tokens]
         mrope_positions = (
-            self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+            self.mrope_positions[:, :num_tokens]
+            if self.mrope_positions is not None
+            else None
         )
 
         global_dp_buffer_len = None
@@ -543,7 +550,6 @@ class PiecewiseCudaGraphRunner:
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ):
         num_tokens = len(forward_batch.input_ids)
@@ -575,7 +581,10 @@ class PiecewiseCudaGraphRunner:
             else None
         )
 
-        if forward_batch.mrope_positions is not None:
+        if (
+            forward_batch.mrope_positions is not None
+            and self.mrope_positions is not None
+        ):
             self.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
 
         input_ids = self.input_ids[:static_num_tokens]
@@ -586,6 +595,7 @@ class PiecewiseCudaGraphRunner:
         mrope_positions = (
             self.mrope_positions[:, :static_num_tokens]
             if forward_batch.mrope_positions is not None
+            and self.mrope_positions is not None
             else None
         )
 
@@ -646,18 +656,11 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-            # Extract pp_proxy_tensors from kwargs if present (avoid in-place modification)
-            pp_proxy_tensors = kwargs.get("pp_proxy_tensors", None)
-            forward_kwargs = kwargs.copy()
-            if "pp_proxy_tensors" in forward_kwargs:
-                del forward_kwargs["pp_proxy_tensors"]
-
-            static_forward_batch = self.replay_prepare(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors, **forward_kwargs
-            )
+            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
             # Prepare PP proxy tensors for forward if needed
             # Use cached check to avoid expensive inspect.signature() in hot path
+            pp_proxy_tensors = kwargs.get("pp_proxy_tensors", None)
             if self.model_supports_pp_proxy_tensors and pp_proxy_tensors is not None:
                 # Copy PP proxy tensors to buffer if needed
                 bs = forward_batch.batch_size
@@ -665,7 +668,7 @@ class PiecewiseCudaGraphRunner:
                     if key in pp_proxy_tensors.tensors:
                         src = pp_proxy_tensors.tensors[key]
                         buf[:bs].copy_(src[:bs])
-                forward_kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v[:bs] for k, v in self.pp_proxy_tensors_buffer.items()}
                 )
 
@@ -678,7 +681,7 @@ class PiecewiseCudaGraphRunner:
                         static_forward_batch.input_ids,
                         static_forward_batch.positions,
                         static_forward_batch,
-                        **forward_kwargs,
+                        **kwargs,
                     )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
