@@ -31,7 +31,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import orjson
 import uvloop
 import zmq
 import zmq.asyncio
@@ -184,11 +183,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
-        self.preferred_sampling_params = (
-            orjson.loads(server_args.preferred_sampling_params)
-            if server_args.preferred_sampling_params
-            else None
-        )
+        self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
 
@@ -628,6 +623,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            self._validate_mm_limits(obj)
 
             mm_inputs = None
 
@@ -747,6 +743,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+
+    def _validate_mm_limits(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if not self.server_args.limit_mm_data_per_request:
+            return
+
+        for modality, limit in self.server_args.limit_mm_data_per_request.items():
+            data = getattr(obj, f"{modality}_data", None)
+            if data:
+                count = len(data) if isinstance(data, list) else 1
+                if count > limit:
+                    raise ValueError(
+                        f"{modality.capitalize()} count {count} exceeds limit {limit} per request."
+                    )
 
     def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
         """Validate the request for Matryoshka dim if it has the field set."""
