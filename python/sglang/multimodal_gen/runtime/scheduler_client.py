@@ -10,10 +10,43 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+
+async def run_zeromq_broker(server_args: ServerArgs):
+    """
+    This function runs as a background task in the FastAPI process.
+    It listens for TCP requests from offline clients (e.g., DiffGenerator).
+    """
+    ctx = zmq.asyncio.Context()
+    # This is the REP socket that listens for requests from DiffGenerator
+    socket = ctx.socket(zmq.REP)
+    broker_endpoint = f"tcp://*:{server_args.broker_port}"
+    socket.bind(broker_endpoint)
+    logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
+
+    while True:
+        try:
+            # 1. Receive a request from an offline client
+            request_batch = await socket.recv_pyobj()
+            logger.info("Broker received an offline job from a client.")
+
+            # 2. Forward the request to the main Scheduler via the shared client
+            response_batch = await scheduler_client.forward(request_batch)
+
+            # 3. Send the Scheduler's reply back to the offline client
+            await socket.send_pyobj(response_batch)
+
+        except Exception as e:
+            logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
+            # A reply must be sent to prevent the client from hanging
+            await socket.send_pyobj({"status": "error", "message": str(e)})
+
+
+
+
 class SchedulerClient:
     """
     A synchronous, singleton client for communicating with the Scheduler service.
-    Designed for use in synchronous environments like the DiffGenerator or standalone scripts.
+    Designed for use in DiffGenerator, where synchronous usage is preferred
     """
 
     def __init__(self):
