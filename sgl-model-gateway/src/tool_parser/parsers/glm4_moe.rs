@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-/// Generic GLM MoE format parser for tool calls
+/// GLM-4 MoE format parser for tool calls
 ///
 /// Handles both GLM-4 MoE and GLM-4.7 MoE formats:
 /// - GLM-4: `<tool_call>{name}\n<arg_key>{key}</arg_key>\n<arg_value>{value}</arg_value>\n</tool_call>`
@@ -26,7 +26,7 @@ use crate::{
 pub struct Glm4MoeParser {
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
-    /// Regex for extracting function details (version-specific)
+    /// Regex for extracting function details
     func_detail_extractor: Regex,
     /// Regex for extracting argument key-value pairs
     arg_extractor: Regex,
@@ -181,7 +181,7 @@ impl Default for Glm4MoeParser {
 #[async_trait]
 impl ToolParser for Glm4MoeParser {
     async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
-        // Check if text contains GLM MoE format
+        // Check if text contains GLM-4 MoE format
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
         }
@@ -273,7 +273,7 @@ impl ToolParser for Glm4MoeParser {
                     tracing::debug!("Invalid tool name '{}' - skipping", tool_call.function.name);
                     helpers::reset_current_tool_state(
                         &mut self.buffer,
-                        &mut false, // glm_moe doesn't track name_sent per tool
+                        &mut false, // glm4_moe doesn't track name_sent per tool
                         &mut self.streamed_args_for_tool,
                         &self.prev_tool_call_arr,
                     );
