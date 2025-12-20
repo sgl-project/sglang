@@ -5,6 +5,7 @@
 // Individual parser modules
 pub mod deepseek;
 pub mod glm4_moe;
+pub mod glm47_moe;
 pub mod json;
 pub mod kimik2;
 pub mod llama;

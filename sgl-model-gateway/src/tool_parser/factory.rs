@@ -284,6 +284,7 @@ impl ParserFactory {
         // GLM models
         registry.map_model("glm-4.5*", "glm4_moe");
         registry.map_model("glm-4.6*", "glm4_moe");
+        registry.map_model("glm-4.7*", "glm47_moe");
         registry.map_model("glm-*", "json");
 
         // Step3 models
