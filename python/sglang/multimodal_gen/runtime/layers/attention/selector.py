@@ -89,7 +89,7 @@ def get_global_forced_attn_backend() -> AttentionBackendEnum | None:
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
-    supported_attention_backends: set[AttentionBackendEnum] = None,
+    supported_attention_backends: set[AttentionBackendEnum] | None = None,
 ) -> type[AttentionBackend]:
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -137,7 +137,10 @@ def _cached_get_attn_backend(
                 )
 
     # get device-specific attn_backend
-    if selected_backend is None:
+    if len(supported_attention_backends) == 0:
+        # all attention backends is allowed
+        pass
+    elif selected_backend is None:
         logger.debug(f"Attention backend not specified")
     elif selected_backend not in supported_attention_backends:
         supported_attention_backends_str = [
