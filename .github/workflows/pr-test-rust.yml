@@ -335,7 +335,7 @@ jobs:
           context: .
           file: docker/gateway.Dockerfile
           push: false
-          tags: sglang-router:test
+          tags: sgl-model-gateway:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
