@@ -3,7 +3,6 @@ Unit tests for Triton FP8 scatter kernel used in MLA KV cache writes.
 Tests correctness against PyTorch index_put_ baseline.
 """
 
-import pytest
 import torch
 
 from sglang.srt.mem_cache.utils import set_mla_kv_buffer_fp8_triton

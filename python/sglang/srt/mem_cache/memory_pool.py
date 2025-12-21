@@ -16,7 +16,6 @@ limitations under the License.
 from __future__ import annotations
 
 import dataclasses
-import os
 from dataclasses import dataclass
 from typing import List
 
