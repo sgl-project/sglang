@@ -20,6 +20,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+from contextlib import nullcontext
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -400,6 +401,9 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
+    if is_in_piecewise_cuda_graph():
+        return AttnForwardMethod.MLA
+
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     if forward_batch.forward_mode.is_extend_without_speculative() and (
         not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
@@ -666,6 +670,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -3188,7 +3193,13 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            # NOTE: torch dynamo does not support graph break in context manager
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]

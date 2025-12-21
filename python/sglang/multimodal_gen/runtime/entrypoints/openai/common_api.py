@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 router = APIRouter(prefix="/v1")
@@ -95,3 +96,16 @@ async def unmerge_lora_weights(
         f"Successfully unmerged LoRA weights (target: {target})",
         "Failed to unmerge LoRA weights",
     )
+
+
+@router.get("/model_info")
+async def model_info():
+    """Get the model information."""
+    server_args = get_global_server_args()
+    if not server_args:
+        raise HTTPException(status_code=500, detail="Server args not initialized")
+
+    result = {
+        "model_path": server_args.model_path,
+    }
+    return result

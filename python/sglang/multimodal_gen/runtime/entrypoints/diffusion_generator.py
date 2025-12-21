@@ -232,6 +232,7 @@ class DiffGenerator:
                             sample,
                             fps=req.fps,
                             save_output=req.save_output,
+                            # TODO: output file path for req should be determined
                             save_file_path=req.output_file_path(
                                 num_outputs, output_idx
                             ),

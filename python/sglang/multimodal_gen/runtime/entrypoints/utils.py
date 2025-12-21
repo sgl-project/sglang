@@ -91,7 +91,7 @@ def post_process_sample(
                 )
             else:
                 imageio.imwrite(save_file_path, frames[0])
-            logger.info(f"Saved output to {CYAN}{save_file_path}{RESET}")
+            logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
             logger.info(f"No output path provided, output not saved")
 
