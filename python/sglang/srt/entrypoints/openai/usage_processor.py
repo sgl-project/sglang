@@ -46,6 +46,7 @@ class UsageProcessor:
     @staticmethod
     def calculate_streaming_usage(
         prompt_tokens: Mapping[int, int],
+        reasoning_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
         n_choices: int,
@@ -55,6 +56,7 @@ class UsageProcessor:
         total_prompt_tokens = sum(
             tok for idx, tok in prompt_tokens.items() if idx % n_choices == 0
         )
+        total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
 
         cached_details = (
@@ -67,6 +69,7 @@ class UsageProcessor:
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
+            reasoning_tokens=total_reasoning_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
         )
