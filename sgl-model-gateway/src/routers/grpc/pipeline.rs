@@ -548,12 +548,13 @@ impl RequestPipeline {
     /// Execute Harmony Responses pipeline iteration with streaming support
     ///
     /// This version executes the pipeline up to the dispatch stage and returns
-    /// the raw ExecutionResult (with stream) for token-level streaming processing.
+    /// the raw ExecutionResult (with stream) and LoadGuards for token-level streaming processing.
+    /// The caller is responsible for keeping load_guards alive until stream processing completes.
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &crate::protocols::responses::ResponsesRequest,
         harmony_ctx: &harmony::responses::HarmonyResponsesContext,
-    ) -> Result<ExecutionResult, Response> {
+    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
@@ -585,8 +586,8 @@ impl RequestPipeline {
             }
         }
 
-        // Extract execution_result (the raw stream from workers)
-        ctx.state.response.execution_result.take().ok_or_else(|| {
+        // Extract execution_result (the raw stream from workers) and load_guards
+        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
             error!(
                 function = "execute_harmony_responses_streaming",
                 "No ExecutionResult produced by pipeline"
@@ -595,6 +596,10 @@ impl RequestPipeline {
                 "no_execution_result_produced",
                 "No ExecutionResult produced by pipeline",
             )
-        })
+        })?;
+
+        let load_guards = ctx.state.load_guards.take();
+
+        Ok((execution_result, load_guards))
     }
 }
