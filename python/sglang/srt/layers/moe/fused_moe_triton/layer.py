@@ -404,9 +404,32 @@ class FusedMoE(torch.nn.Module):
                 if not is_bias and self.use_triton_kernels:
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
+
+                if shard_id == "w13":
+                    # For fused w13 weights [w1; w3], we need to shard w1 and w3
+                    # independently, then concatenate them back to maintain the
+                    # [w1_shard; w3_shard] structure per TP rank.
+                    single_shard_size = shard_size // 2  # Size of w1 or w3 per TP rank
+                    full_single_size = (
+                        loaded_weight.shape[shard_dim] // 2
+                    )  # Full size of w1 or w3
+
+                    # Shard w1 (from position 0)
+                    w1_shard = loaded_weight.narrow(
+                        shard_dim, single_shard_size * tp_rank, single_shard_size
+                    )
+                    # Shard w3 (from position full_single_size)
+                    w3_shard = loaded_weight.narrow(
+                        shard_dim,
+                        full_single_size + single_shard_size * tp_rank,
+                        single_shard_size,
+                    )
+
+                    loaded_weight = torch.cat([w1_shard, w3_shard], dim=shard_dim)
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, shard_size * tp_rank, shard_size
+                    )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
