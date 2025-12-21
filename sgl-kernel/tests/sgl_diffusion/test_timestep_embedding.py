@@ -4,6 +4,10 @@ import tabulate
 import torch
 from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
 
+from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+
+skip_condition = torch.cuda.get_device_capability() >= (10, 0)
+
 
 @pytest.mark.parametrize(
     "batch_size", [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384]
@@ -12,9 +16,11 @@ from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
 @pytest.mark.parametrize(
     "dtype", [torch.int32, torch.int64, torch.bfloat16, torch.float16]
 )
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() >= (10, 0),
+    reason="Skip diffusion timestep embedding test for SM100 or above",
+)
 def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
-    from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
-
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
     torch_output = timestep_embedding(t, dim)
@@ -30,7 +36,7 @@ def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
 @pytest.mark.parametrize("scale", [1, 0.01])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() >= (10, 0),
-    reason="Skip diffuser kernel test for SM100 or above",
+    reason="Skip diffusion timestep embedding test for SM100 or above",
 )
 def test_timestep_embedding_correctness_with_diffusers(
     batch_size, dim, flip_sin_to_cos, downscale_freq_shift, scale, dtype
