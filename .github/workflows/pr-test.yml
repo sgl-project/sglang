@@ -648,7 +648,7 @@ jobs:
 
 
   stage-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu]
+    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
