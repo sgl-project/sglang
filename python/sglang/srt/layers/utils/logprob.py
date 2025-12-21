@@ -262,7 +262,6 @@ def get_top_logprobs_chunk(
 
 def get_token_ids_logprobs_chunk(
     logprobs: torch.Tensor,
-    logits_metadata: LogitsMetadata,
     token_ids_logprobs: List[int],
     pruned_lens: List[int],
     input_token_ids_logprobs_val: List,

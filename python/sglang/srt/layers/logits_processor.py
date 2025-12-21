@@ -774,7 +774,6 @@ class LogitsProcessor(nn.Module):
                 ]
                 split_len_token_ids = get_token_ids_logprobs_chunk(
                     chunk_input_logprobs,
-                    logits_metadata,
                     token_ids_logprobs,
                     pruned_lens,
                     input_token_ids_logprobs_val,
