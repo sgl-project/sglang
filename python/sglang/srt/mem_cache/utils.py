@@ -373,7 +373,7 @@ def set_mla_kv_buffer_fp8_kernel(
     - No atomics needed; behavior matches index_put_ semantics (last write wins, order undefined).
     """
     token_idx = tl.program_id(0)  # Which token (0 to num_tokens-1)
-    dim_block = tl.program_id(1)   # Which dimension block
+    dim_block = tl.program_id(1)  # Which dimension block
 
     # Load target location for this token
     target_loc = tl.load(loc_ptr + token_idx).to(tl.int64)

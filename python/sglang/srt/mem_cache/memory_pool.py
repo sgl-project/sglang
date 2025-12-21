@@ -1619,7 +1619,11 @@ class MLATokenToKVPool(KVCache):
 
                 # DEBUG: Lightweight correctness check (sample 4 tokens, only when debug enabled)
                 # This runs AFTER try-except to ensure correctness failures are not silenced
-                if triton_success and envs.SGLANG_DEBUG_MEMORY_POOL.get() and loc.numel() > 0:
+                if (
+                    triton_success
+                    and envs.SGLANG_DEBUG_MEMORY_POOL.get()
+                    and loc.numel() > 0
+                ):
                     sample_size = min(4, loc.numel())
                     for i in range(sample_size):
                         l = loc[i].item()
@@ -1630,8 +1634,12 @@ class MLATokenToKVPool(KVCache):
                                 f"[MLA FP8 Triton] Correctness check FAILED at token {i}, "
                                 f"loc {l}: shapes {expected.shape} vs {actual.shape}"
                             )
-                            raise RuntimeError("Triton scatter correctness check failed")
-                    logger.debug(f"[MLA FP8 Triton] Correctness check passed (sampled {sample_size} tokens)")
+                            raise RuntimeError(
+                                "Triton scatter correctness check failed"
+                            )
+                    logger.debug(
+                        f"[MLA FP8 Triton] Correctness check passed (sampled {sample_size} tokens)"
+                    )
             else:
                 # Fallback to PyTorch index_put_ (when optimization disabled)
                 self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
