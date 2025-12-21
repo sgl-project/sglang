@@ -327,7 +327,7 @@ def add_logprob_values(
     # acceptance indices are the indices in a "flattened" batch.
     # dividing it to num_draft_tokens will yield the actual batch index.
     temperatures = temperatures[accepted_indices // num_draft_tokens]
-    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB:
+    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         logprobs = torch.nn.functional.log_softmax(
             logits_output.next_token_logits, dim=-1
         )
