@@ -1,4 +1,4 @@
-from typing import List, Union
+import re
 
 from sglang.srt.models.glmasr import GlmasrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
