@@ -99,7 +99,7 @@ def run_pytest(files, filter_expr=None):
         print("No files to run.")
         return 0
 
-    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
+    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
 
     # Add pytest -k filter if provided
     if filter_expr:
