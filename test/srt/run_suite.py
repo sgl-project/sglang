@@ -147,6 +147,7 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_epd_disaggregation.py", 150),
+        TestFile("rl/test_return_routed_experts.py", 300),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
@@ -163,7 +164,7 @@ suites = {
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200-stage-b": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),  # Stage B test
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 2000),  # Stage B test
     ],
     "per-commit-4-gpu-b200": [
         TestFile("test_flash_attention_4.py", 90),
@@ -185,7 +186,7 @@ suites = {
         # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 338),
+        TestFile("ep/test_deepep_large.py", 563),
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
