@@ -2,12 +2,13 @@ import numpy as np
 import pytest
 import tabulate
 import torch
-from diffusers.models.embeddings import get_timestep_embedding
-from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
-
-from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 
 skip_condition = torch.cuda.get_device_capability() >= (10, 0)
+if not skip_condition:
+    from diffusers.models.embeddings import get_timestep_embedding
+    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
+
+    from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 
 
 @pytest.mark.parametrize(
