@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-register_cuda_ci(est_time=7200, suite="nightly-2-gpu", nightly=True)
+register_cuda_ci(est_time=7200, suite="nightly-eval-vlm-2-gpu", nightly=True)
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds

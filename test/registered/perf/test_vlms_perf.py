@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     parse_models,
 )
 
-register_cuda_ci(est_time=7200, suite="nightly-2-gpu", nightly=True)
+register_cuda_ci(est_time=7200, suite="nightly-perf-vlm-2-gpu", nightly=True)
 
 PROFILE_DIR = "performance_profiles_vlms"
 

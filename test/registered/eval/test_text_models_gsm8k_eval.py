@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-register_cuda_ci(est_time=3600, suite="nightly-2-gpu", nightly=True)
+register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,
