@@ -186,7 +186,7 @@ suites = {
         # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 338),
+        TestFile("ep/test_deepep_large.py", 563),
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
