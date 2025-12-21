@@ -21,10 +21,10 @@ from sglang.srt.layers.attention.wave_ops.extend_attention import extend_attenti
 from sglang.srt.layers.attention.wave_ops.prefill_attention import (
     prefill_attention_wave,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 
-# Wave attention kernel unit tests
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
+# Wave attention kernel unit tests (AMD only - requires wave_lang)
+register_amd_ci(est_time=60, suite="stage-a-test-1")
 
 
 class TestWaveAttention(unittest.TestCase):
