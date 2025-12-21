@@ -1290,7 +1290,7 @@ class DenoisingStage(PipelineStage):
                     controlnet_block_samples = self.controlnet(
                         hidden_states=latent_model_input,
                         controlnet_cond=batch.control_images,
-                        encoder_hidden_states=prompt_embeds,
+                        encoder_hidden_states=kwargs.get("encoder_hidden_states"),
                         encoder_hidden_states_mask=kwargs.get(
                             "encoder_hidden_states_mask", None
                         ),
@@ -1308,7 +1308,7 @@ class DenoisingStage(PipelineStage):
                         block_samples = self.controlnet(
                             hidden_states=latent_model_input,
                             controlnet_cond=cond_image,
-                            encoder_hidden_states=prompt_embeds,
+                            encoder_hidden_states=kwargs.get("encoder_hidden_states"),
                             encoder_hidden_states_mask=kwargs.get(
                                 "encoder_hidden_states_mask", None
                             ),
@@ -1344,7 +1344,7 @@ class DenoisingStage(PipelineStage):
                 controlnet_block_samples = self.controlnet(
                     hidden_states=latent_model_input,
                     controlnet_cond=batch.control_image,
-                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states=kwargs.get("encoder_hidden_states"),
                     encoder_hidden_states_mask=kwargs.get(
                         "encoder_hidden_states_mask", None
                     ),
