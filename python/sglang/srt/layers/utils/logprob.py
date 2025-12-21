@@ -103,43 +103,6 @@ def get_top_logprobs(
     return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage="decode")
 
 
-def process_input_logprobs(input_logits, logits_metadata: LogitsMetadata):
-    input_logprobs = compute_temp_top_p_normalized_logprobs(
-        input_logits, logits_metadata
-    )
-
-    # Get the logprob of top-k tokens
-    if logits_metadata.extend_return_top_logprob:
-        (
-            input_top_logprobs_val,
-            input_top_logprobs_idx,
-        ) = get_top_logprobs_prefill(input_logprobs, logits_metadata)
-    else:
-        input_top_logprobs_val = input_top_logprobs_idx = None
-
-    # Get the logprob of given token id
-    if logits_metadata.extend_token_ids_logprob:
-        (
-            input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx,
-        ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
-    else:
-        input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
-
-    input_token_logprobs = input_logprobs[
-        torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
-        logits_metadata.extend_input_logprob_token_ids_gpu,
-    ]
-
-    return InputLogprobsResult(
-        input_token_logprobs=input_token_logprobs,
-        input_top_logprobs_val=input_top_logprobs_val,
-        input_top_logprobs_idx=input_top_logprobs_idx,
-        input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-        input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-    )
-
-
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[Optional[List[int]]],

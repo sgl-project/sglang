@@ -47,7 +47,6 @@ from sglang.srt.layers.utils.logprob import (
     get_token_ids_logprobs_prefill,
     get_top_logprobs_chunk,
     get_top_logprobs_prefill,
-    process_input_logprobs,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
@@ -622,7 +621,7 @@ class LogitsProcessor(nn.Module):
             input_logits = logits[input_logprob_indices]
             del logits
 
-            logprobs_result = process_input_logprobs(input_logits, logits_metadata)
+            logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:
             (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
                 pruned_states,
@@ -642,6 +641,42 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+        )
+
+    def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
+        input_logprobs = compute_temp_top_p_normalized_logprobs(
+            input_logits, logits_metadata
+        )
+
+        # Get the logprob of top-k tokens
+        if logits_metadata.extend_return_top_logprob:
+            (
+                input_top_logprobs_val,
+                input_top_logprobs_idx,
+            ) = get_top_logprobs_prefill(input_logprobs, logits_metadata)
+        else:
+            input_top_logprobs_val = input_top_logprobs_idx = None
+
+        # Get the logprob of given token id
+        if logits_metadata.extend_token_ids_logprob:
+            (
+                input_token_ids_logprobs_val,
+                input_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
+        else:
+            input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
+
+        input_token_logprobs = input_logprobs[
+            torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
+            logits_metadata.extend_input_logprob_token_ids_gpu,
+        ]
+
+        return InputLogprobsResult(
+            input_token_logprobs=input_token_logprobs,
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
         )
 
     def process_input_logprobs_by_chunk(
