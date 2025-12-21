@@ -41,8 +41,10 @@ from sglang.srt.layers.dp_attention import (
     get_dp_hidden_size,
 )
 from sglang.srt.layers.utils.logprob import (
+    InputLogprobsResult,
     get_token_ids_logprobs_prefill,
     get_top_logprobs_prefill,
+    process_input_logprobs,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
@@ -56,15 +58,6 @@ from sglang.srt.utils import is_npu, use_intel_amx_backend
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-
-
-@dataclasses.dataclass
-class InputLogprobsResult:
-    input_token_logprobs: torch.Tensor
-    input_top_logprobs_val: Optional[List] = None
-    input_top_logprobs_idx: Optional[List] = None
-    input_token_ids_logprobs_val: Optional[List] = None
-    input_token_ids_logprobs_idx: Optional[List] = None
 
 
 @dataclasses.dataclass
@@ -626,9 +619,7 @@ class LogitsProcessor(nn.Module):
             input_logits = logits[input_logprob_indices]
             del logits
 
-            logprobs_result = self._process_input_logprobs(
-                input_logits, logits_metadata
-            )
+            logprobs_result = process_input_logprobs(input_logits, logits_metadata)
         else:
             (logprobs_result, sampled_logits) = self._process_input_logprobs_by_chunk(
                 pruned_states,
@@ -648,42 +639,6 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
-        )
-
-    def _process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
-        input_logprobs = self.compute_temp_top_p_normalized_logprobs(
-            input_logits, logits_metadata
-        )
-
-        # Get the logprob of top-k tokens
-        if logits_metadata.extend_return_top_logprob:
-            (
-                input_top_logprobs_val,
-                input_top_logprobs_idx,
-            ) = get_top_logprobs_prefill(input_logprobs, logits_metadata)
-        else:
-            input_top_logprobs_val = input_top_logprobs_idx = None
-
-        # Get the logprob of given token id
-        if logits_metadata.extend_token_ids_logprob:
-            (
-                input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
-        else:
-            input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
-
-        input_token_logprobs = input_logprobs[
-            torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
-            logits_metadata.extend_input_logprob_token_ids_gpu,
-        ]
-
-        return InputLogprobsResult(
-            input_token_logprobs=input_token_logprobs,
-            input_top_logprobs_val=input_top_logprobs_val,
-            input_top_logprobs_idx=input_top_logprobs_idx,
-            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
         )
 
     def _process_input_logprobs_by_chunk(
@@ -1115,40 +1070,6 @@ class LogitsProcessor(nn.Module):
 
             pt += pruned_len
         return next_split_pruned_len
-
-    @staticmethod
-    def compute_temp_top_p_normalized_logprobs(
-        last_logits: torch.Tensor,
-        logits_metadata: LogitsMetadata,
-        top_p: Optional[torch.Tensor] = None,
-        temperature: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        compute logprobs for the output token from the given logits.
-
-        Returns:
-            torch.Tensor: logprobs from logits
-        """
-        if top_p is None:
-            top_p = logits_metadata.top_p
-        if temperature is None:
-            temperature = logits_metadata.temperature
-
-        # Scale logits if temperature scaling is enabled
-        if logits_metadata.temp_scaled_logprobs:
-            last_logits = last_logits / temperature
-
-        # Normalize logprobs if top_p normalization is enabled
-        # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
-        if logits_metadata.top_p_normalized_logprobs and (top_p != 1.0).any():
-            from sglang.srt.layers.sampler import top_p_normalize_probs_torch
-
-            probs = torch.softmax(last_logits, dim=-1)
-            del last_logits
-            probs = top_p_normalize_probs_torch(probs, top_p)
-            return torch.log(probs)
-        else:
-            return torch.nn.functional.log_softmax(last_logits, dim=-1)
 
 
 @triton.jit
