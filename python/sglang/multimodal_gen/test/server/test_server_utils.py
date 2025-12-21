@@ -322,6 +322,7 @@ class ServerManager:
                     with pipe:
                         for line in iter(pipe.readline, ""):
                             sys.stdout.write(line)
+                            sys.stdout.flush()
                             file.write(line)
                             file.flush()
                 except Exception as e:
@@ -360,6 +361,8 @@ class ServerManager:
         """Wait for server to become ready."""
         start = time.time()
         ready_message = "Application startup complete."
+        log_period = 30
+        prev_log_period_count = 0
 
         while time.time() - start < self.wait_deadline:
             if process.poll() is not None:
@@ -378,8 +381,10 @@ class ServerManager:
                     logger.debug("Could not read log yet: %s", e)
 
             elapsed = int(time.time() - start)
-            logger.info("[server-test] Waiting for server... elapsed=%ss", elapsed)
-            time.sleep(5)
+            if (elapsed // log_period) > prev_log_period_count:
+                prev_log_period_count = elapsed // log_period
+                logger.info("[server-test] Waiting for server... elapsed=%ss", elapsed)
+            time.sleep(1)
 
         tail = self._get_log_tail(stdout_path)
         raise TimeoutError(f"Server not ready within {self.wait_deadline}s.\n{tail}")
