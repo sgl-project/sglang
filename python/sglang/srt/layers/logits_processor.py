@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
+    compute_temp_top_p_normalized_logprobs,
     get_token_ids_logprobs_chunk,
     get_token_ids_logprobs_prefill,
     get_top_logprobs_chunk,
@@ -737,7 +738,7 @@ class LogitsProcessor(nn.Module):
                 if logits_metadata.top_p is not None
                 else None
             )
-            chunk_input_logprobs = self.compute_temp_top_p_normalized_logprobs(
+            chunk_input_logprobs = compute_temp_top_p_normalized_logprobs(
                 chunk_input_logprobs,
                 logits_metadata,
                 chunk_top_p,
