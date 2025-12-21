@@ -173,6 +173,7 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+        self.cuda_graph_kv_indices = None
 
     def get_num_kv_splits(
         self,
@@ -630,6 +631,62 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+        elif forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2: similar to DRAFT_EXTEND but with variable extend lengths
+            # For capture, we use a fixed num_tokens_per_bs like V1
+            num_tokens_per_bs = self.speculative_num_steps + 1
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                step=num_tokens_per_bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+
+            # Ensure cuda_graph_kv_indices exists (set by init_cuda_graph_state)
+            if self.cuda_graph_kv_indices is None:
+                raise RuntimeError(
+                    "cuda_graph_kv_indices is None. init_cuda_graph_state must be called before "
+                    "init_forward_metadata_capture_cuda_graph for DRAFT_EXTEND_V2 mode."
+                )
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            # Handle sliding window attention
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                window_kv_indices = self.cuda_graph_window_kv_indices
+                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                window_kv_offsets = self.cuda_graph_window_kv_offsets
+                window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
+                    update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        req_pool_indices,
+                        bs,
+                        self.token_to_kv_pool_allocator,
+                    )
+                )
+
+            custom_mask = None
+            mask_indptr = None
+            max_extend_len = num_tokens_per_bs
+            num_kv_splits = None
+            attn_logits = None
+            attn_lse = None
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
@@ -766,6 +823,69 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+        elif forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2: uses variable extend lengths from spec_info
+            seq_lens = seq_lens[:bs]
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            # Get extend_seq_lens from spec_info (set by MTP CUDA graph runner)
+            extend_seq_lens_tensor = getattr(spec_info, "extend_seq_lens_tensor", None)
+            extend_seq_lens_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
+            if extend_seq_lens_tensor is not None:
+                extend_seq_lens = extend_seq_lens_tensor.to(torch.int32)
+            elif extend_seq_lens_cpu is not None:
+                extend_seq_lens = torch.as_tensor(
+                    extend_seq_lens_cpu,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+            else:
+                # Fallback to default num_tokens_per_batch
+                default_extend = getattr(
+                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                )
+                extend_seq_lens = torch.full(
+                    (bs,), default_extend, dtype=torch.int32, device=seq_lens.device
+                )
+
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[0] = 0
+            qo_indptr[1 : bs + 1] = torch.cumsum(extend_seq_lens, dim=0)
+
+            # Handle sliding window attention for DRAFT_EXTEND_V2
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                window_kv_indices = self.cuda_graph_window_kv_indices
+                window_kv_offsets = self.cuda_graph_window_kv_offsets
+                _, _, window_kv_lens, window_kv_offsets[:bs] = (
+                    update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        req_pool_indices,
+                        bs,
+                        self.token_to_kv_pool_allocator,
+                    )
+                )
+
+            # Update max_extend_len for forward_extend
+            if extend_seq_lens_cpu:
+                self.forward_metadata.max_extend_len = int(max(extend_seq_lens_cpu))
+            else:
+                self.forward_metadata.max_extend_len = extend_seq_lens.max().item()
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
