@@ -624,7 +624,7 @@ class LogitsProcessor(nn.Module):
 
             logprobs_result = process_input_logprobs(input_logits, logits_metadata)
         else:
-            (logprobs_result, sampled_logits) = self._process_input_logprobs_by_chunk(
+            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
                 pruned_states,
                 sample_indices,
                 input_logprob_indices,
@@ -644,7 +644,7 @@ class LogitsProcessor(nn.Module):
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
         )
 
-    def _process_input_logprobs_by_chunk(
+    def process_input_logprobs_by_chunk(
         self,
         pruned_states: torch.Tensor,
         sample_indices: torch.Tensor,
