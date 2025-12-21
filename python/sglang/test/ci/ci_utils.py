@@ -285,13 +285,11 @@ def run_unittest_files(
     if retried_tests:
         passed_on_retry = [t for t, _, r in retried_tests if r == "passed"]
         failed_after_retry = [t for t, _, r in retried_tests if r != "passed"]
-        summary = f"**↻ Retried {len(retried_tests)} test(s):** "
-        parts = []
+        summary = f"**↻ Retried {len(retried_tests)} test(s):**\n"
         if passed_on_retry:
-            parts.append(f"{len(passed_on_retry)} passed on retry")
+            summary += f"- ✓ Passed on retry: {', '.join(passed_on_retry)}\n"
         if failed_after_retry:
-            parts.append(f"{len(failed_after_retry)} still failed")
-        summary += ", ".join(parts) + "\n"
+            summary += f"- ✗ Still failed: {', '.join(failed_after_retry)}\n"
         write_github_step_summary(summary)
 
     return 0 if success else -1
