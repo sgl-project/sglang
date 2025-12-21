@@ -113,6 +113,19 @@ class CudaPlatformBase(Platform):
         return float(torch.cuda.max_memory_allocated(device))
 
     @classmethod
+    def get_current_available_memory(
+        device: torch.types.Device | None = None
+    ) -> int:
+        """
+        Return current free GPU memory in GiB.
+        """
+        if device is None:
+            device = torch.device("cuda")
+    
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        return free_bytes / 1024**3
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
