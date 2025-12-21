@@ -4,6 +4,7 @@ import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,6 +15,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_results_to_json,
 )
+
+register_cuda_ci(est_time=7200, suite="nightly-2-gpu", nightly=True)
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds

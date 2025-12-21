@@ -5,6 +5,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST,
@@ -15,6 +16,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+
+# 16 GPU test (4 TP x 4 DP), runs on 2x 8-GPU B200 nodes
+register_cuda_ci(est_time=600, suite="nightly-8-gpu-b200", nightly=True)
 
 
 def test_gsm8k(base_url: str):

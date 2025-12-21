@@ -4,6 +4,7 @@ import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
@@ -18,6 +19,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_results_to_json,
 )
+
+register_cuda_ci(est_time=3600, suite="nightly-2-gpu", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,
