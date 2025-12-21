@@ -1,12 +1,12 @@
 from typing import List, Optional
 
-from accuracy_test_runner import (
+from sglang.test.accuracy_test_runner import (
     AccuracyTestParams,
     AccuracyTestResult,
     run_accuracy_test,
     write_accuracy_github_summary,
 )
-from performance_test_runner import (
+from sglang.test.performance_test_runner import (
     PerformanceTestParams,
     PerformanceTestResult,
     run_performance_test,

@@ -87,7 +87,7 @@ class TestVLMModels(CustomTestCase):
             "--limit",
             limit,
             "--config",
-            "/__w/sglang/sglang/test/nightly/ascend/vlm_models/mmmu-val.yaml",
+            "/__w/sglang/sglang/test/registered/ascend/vlm_models/mmmu-val.yaml",
         ]
 
         subprocess.run(
