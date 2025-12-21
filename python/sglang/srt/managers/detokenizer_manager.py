@@ -21,6 +21,7 @@ from collections import OrderedDict
 from typing import Dict, List, Union
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 
@@ -266,8 +267,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
+    def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
+        output_routed_experts = None
+        if recv_obj.output_routed_experts is not None:
+            output_routed_experts = [
+                (
+                    pybase64.b64encode(output_routed_experts.numpy().tobytes()).decode(
+                        "utf-8"
+                    )
+                    if output_routed_experts is not None
+                    else []
+                )
+                for output_routed_experts in recv_obj.output_routed_experts
+            ]
+        return output_routed_experts
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         output_strs = self._decode_batch_token_id_output(recv_obj)
+        output_routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -295,6 +312,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
+            output_routed_experts=output_routed_experts,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
