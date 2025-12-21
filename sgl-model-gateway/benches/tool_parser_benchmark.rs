@@ -80,7 +80,7 @@ Let me examine the scan results and provide recommendations."#;
 
 const KIMIK2_FORMAT: &str = r#"⍼validate_and_deploy⍁{"deployment_config": {"application": "payment-service", "version": "2.3.1", "environment": "staging", "region": "us-west-2", "deployment_strategy": "blue_green", "health_check": {"endpoint": "/health", "interval": 30, "timeout": 5, "healthy_threshold": 2, "unhealthy_threshold": 3}, "rollback_on_failure": true, "canary_config": {"percentage": 10, "duration_minutes": 30, "metrics": ["error_rate", "latency_p99", "success_rate"], "thresholds": {"error_rate": 0.01, "latency_p99": 500, "success_rate": 0.99}}, "pre_deployment_hooks": ["run_tests", "security_scan", "backup_database"], "post_deployment_hooks": ["smoke_tests", "notify_team", "update_documentation"]}}"#;
 
-const GLM4_FORMAT: &str = r#"<tool>
+const GLM45_FORMAT: &str = r#"<tool>
 analyze_customer_behavior
 <parameter>dataset_id=customer_interactions_2024</parameter>
 <parameter>analysis_type=cohort_retention</parameter>
@@ -287,7 +287,7 @@ fn bench_complete_parsing(c: &mut Criterion) {
         ("pythonic_multi", "pythonic", PYTHONIC_MULTI),
         ("deepseek", "deepseek", DEEPSEEK_FORMAT),
         ("kimik2", "kimik2", KIMIK2_FORMAT),
-        ("glm4", "glm4_moe", GLM4_FORMAT),
+        ("glm45", "glm45_moe", GLM45_FORMAT),
         ("glm47", "glm47_moe", GLM47_FORMAT),
         ("step3", "step3", STEP3_FORMAT),
         ("gpt_oss", "gpt_oss", GPT_OSS_FORMAT),

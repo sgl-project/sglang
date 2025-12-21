@@ -55,8 +55,7 @@ graph TB
         PP --> QW[Qwen3]
         PP --> QWT[Qwen3-Thinking]
         PP --> KM[Kimi]
-        PP --> GL[GLM45]
-        PP --> GL47[GLM47]
+        PP --> GL[GLM45/GLM47]
         PP --> S3[Step3]
         PP --> PT[Passthrough]
     end
@@ -66,7 +65,6 @@ graph TB
         QW --> BP
         KM --> BP
         GL --> BP
-        GL47 --> BP
         S3 --> BP
     end
 
@@ -327,8 +325,7 @@ classDiagram
 - `qwen3`: Qwen3 base model (initial_in_reasoning=false)
 - `qwen3_thinking`: Qwen3 thinking variant (initial_in_reasoning=true)
 - `kimi`: Kimi with Unicode tokens
-- `glm45`: GLM-4.5 / GLM-4.6 parser
-- `glm47`: GLM-4.7 parser
+- `glm45`: GLM-4.5 / GLM-4.6 / GLM-4.7 parser
 - `step3`: Step3 parser
 - `passthrough`: No-op fallback parser
 
@@ -340,7 +337,7 @@ classDiagram
 "qwen3" → "qwen3"
 "qwen" → "qwen3"
 "glm45" → "glm45"
-"glm47" → "glm47"
+"glm47" → "glm45"
 "kimi" → "kimi"
 "step3" → "step3"
 ```

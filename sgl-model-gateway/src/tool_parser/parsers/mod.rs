@@ -30,4 +30,3 @@ pub use passthrough::PassthroughParser;
 pub use pythonic::PythonicParser;
 pub use qwen::QwenParser;
 pub use step3::Step3Parser;
-pub type Glm47MoeParser = Glm4MoeParser;

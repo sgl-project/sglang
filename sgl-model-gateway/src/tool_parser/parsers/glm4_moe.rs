@@ -54,13 +54,12 @@ impl Glm4MoeParser {
     /// - `func_detail_pattern`: Regex pattern for extracting function name and arguments
     ///   - For GLM-4: `r"(?s)<tool_call>([^\n]*)\n(.*)</tool_call>"`
     ///   - For GLM-4.7: `r"(?s)<tool_call>\s*([^<\s]+)\s*(.*?)</tool_call>"`
-    pub fn new(func_detail_pattern: &str) -> Self {
+    pub(crate) fn new(func_detail_pattern: &str) -> Self {
         // Use (?s) flag for DOTALL mode to handle newlines
         let tool_call_pattern = r"(?s)<tool_call>.*?</tool_call>";
         let tool_call_extractor = Regex::new(tool_call_pattern).expect("Valid regex pattern");
 
-        let func_detail_extractor =
-            Regex::new(func_detail_pattern).expect("Valid regex pattern");
+        let func_detail_extractor = Regex::new(func_detail_pattern).expect("Valid regex pattern");
 
         let arg_pattern = r"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>";
         let arg_extractor = Regex::new(arg_pattern).expect("Valid regex pattern");
@@ -78,8 +77,8 @@ impl Glm4MoeParser {
         }
     }
 
-    /// Create a new GLM-4 MoE parser (with newline-based format)
-    pub fn glm4() -> Self {
+    /// Create a new GLM-4.5/4.6 MoE parser (with newline-based format)
+    pub fn glm45() -> Self {
         Self::new(r"(?s)<tool_call>([^\n]*)\n(.*)</tool_call>")
     }
 
@@ -272,7 +271,7 @@ impl ToolParser for Glm4MoeParser {
                     tracing::debug!("Invalid tool name '{}' - skipping", tool_call.function.name);
                     helpers::reset_current_tool_state(
                         &mut self.buffer,
-                        &mut false, // glm4_moe doesn't track name_sent per tool
+                        &mut false, // glm45_moe/glm47_moe doesn't track name_sent per tool
                         &mut self.streamed_args_for_tool,
                         &self.prev_tool_call_arr,
                     );
