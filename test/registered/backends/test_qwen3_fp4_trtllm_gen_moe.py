@@ -15,7 +15,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
 
 
-@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher (Blackwell)")
+@unittest.skipIf(
+    get_device_sm() < 100, "Test requires CUDA SM 100 or higher (Blackwell)"
+)
 class TestFlashinferTrtllmGenMoeBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
