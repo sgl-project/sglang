@@ -294,7 +294,7 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH"):
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
@@ -363,7 +363,7 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
+        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH"):
             max_seqlen = cu_seqlens[1]
             output = flash_attn_varlen_func(
                 q,
