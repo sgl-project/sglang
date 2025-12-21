@@ -25,7 +25,7 @@ class QwenImageEditPlusSamplingParams(QwenImageSamplingParams):
 
 @dataclass
 class QwenImageLayeredSamplingParams(QwenImageSamplingParams):
-    num_frames: int = 4
+    # num_frames: int = 4
     height: int = 640
     width: int = 640
     prompt: str = " "

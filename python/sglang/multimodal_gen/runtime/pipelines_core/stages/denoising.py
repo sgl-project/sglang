@@ -954,6 +954,7 @@ class DenoisingStage(PipelineStage):
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+        print(f"1002 {latents.shape=}")
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
