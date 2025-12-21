@@ -2410,7 +2410,19 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        if not self.disable_cuda_graph:
+        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
+        if is_hip():
+            if not self.disable_cuda_graph:
+                logger.warning(
+                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                )
+                self.disable_cuda_graph = True
+            if self.attention_backend not in ["triton", "aiter"]:
+                logger.warning(
+                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                )
+                self.attention_backend = "triton"
+        elif not self.disable_cuda_graph:
             if self.cuda_graph_bs != [1]:
                 logger.warning(
                     "Cuda graph bs is set to [1] because of using diffusion LLM inference"

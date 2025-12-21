@@ -496,7 +496,7 @@ class ForwardBatch:
                     for block_offset in batch.dllm_block_offsets
                     for i in range(block_offset, block_offset + block_size)
                 ],
-                dtype=torch.int32,
+                dtype=torch.int64,  # Use int64 for AMD rotary embedding kernel compatibility
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
