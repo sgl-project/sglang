@@ -35,10 +35,11 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
                     "flashmla",
                 ]
             )
+        # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
             other_args=other_args,
         )
 
@@ -91,10 +92,11 @@ class TestFlashMLAMTP(CustomTestCase):
                     "flashmla",
                 ]
             )
+        # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
             other_args=other_args,
         )
 

@@ -25,6 +25,32 @@ sglang serve "${SERVER_ARGS[@]}"
 - **--model-path**: Path to the model or model ID.
 - **--port**: HTTP port to listen on (default: `30000`).
 
+#### Get Model Information
+
+**Endpoint:** `GET /models`
+
+Returns information about the model served by this server, including model path, task type, pipeline configuration, and precision settings.
+
+**Curl Example:**
+
+```bash
+curl -sS -X GET "http://localhost:30010/models"
+```
+
+**Response Example:**
+
+```json
+{
+  "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+  "task_type": "T2V",
+  "pipeline_name": "wan_pipeline",
+  "pipeline_class": "WanPipeline",
+  "num_gpus": 4,
+  "dit_precision": "bf16",
+  "vae_precision": "fp16"
+}
+```
+
 ---
 
 ## Endpoints

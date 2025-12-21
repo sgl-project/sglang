@@ -10,7 +10,7 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use tracing::info;
+use tracing::debug;
 
 type NodeRef = Arc<Node>;
 
@@ -674,9 +674,9 @@ impl Tree {
             }
         }
 
-        info!("Before eviction - Used size per tenant:");
+        debug!("Before eviction - Used size per tenant:");
         for entry in self.tenant_char_count.iter() {
-            info!("Tenant: {}, Size: {}", entry.key(), entry.value());
+            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
 
         // Process eviction
@@ -728,9 +728,9 @@ impl Tree {
             };
         }
 
-        info!("After eviction - Used size per tenant:");
+        debug!("After eviction - Used size per tenant:");
         for entry in self.tenant_char_count.iter() {
-            info!("Tenant: {}, Size: {}", entry.key(), entry.value());
+            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
         }
     }
 

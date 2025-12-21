@@ -80,6 +80,8 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     # VAE
     vae_config: VAEConfig = field(default_factory=QwenImageVAEConfig)
 
+    enable_autocast: bool = False
+
     # Text encoding stage
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen2_5VLConfig(),)
@@ -462,4 +464,5 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         return {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
+            "img_shapes": img_shapes,
         }

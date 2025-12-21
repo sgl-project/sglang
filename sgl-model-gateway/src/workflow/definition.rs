@@ -70,6 +70,10 @@ pub struct WorkflowDefinition {
     pub steps: Vec<StepDefinition>,
     pub default_retry_policy: RetryPolicy,
     pub default_timeout: Duration,
+    /// Pre-computed reverse dependencies: step_id -> indices of steps that depend on it
+    reverse_deps: HashMap<StepId, Vec<usize>>,
+    /// Pre-computed indices of steps with no dependencies (can start immediately)
+    initial_step_indices: Vec<usize>,
 }
 
 impl WorkflowDefinition {
@@ -80,6 +84,8 @@ impl WorkflowDefinition {
             steps: Vec::new(),
             default_retry_policy: RetryPolicy::default(),
             default_timeout: Duration::from_secs(300), // 5 minutes
+            reverse_deps: HashMap::new(),
+            initial_step_indices: Vec::new(),
         }
     }
 
@@ -110,11 +116,13 @@ impl WorkflowDefinition {
         step.timeout.unwrap_or(self.default_timeout)
     }
 
-    /// Validate the workflow DAG structure.
+    /// Validate the workflow DAG structure and build dependency graph.
     /// Returns an error if:
     /// - A step depends on a non-existent step
     /// - There's a cycle in the dependencies
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// On success, pre-computes reverse dependencies for O(1) dependent lookup.
+    pub fn validate(&mut self) -> Result<(), String> {
         // Build HashMap for O(1) lookup instead of O(n) linear search
         let steps_map: HashMap<&StepId, &StepDefinition> =
             self.steps.iter().map(|s| (&s.id, s)).collect();
@@ -142,6 +150,26 @@ impl WorkflowDefinition {
                 return Err(format!("Cycle detected involving step '{}'", step.id));
             }
         }
+
+        // Build reverse dependency map: for each step, which steps depend on it?
+        self.reverse_deps.clear();
+        for (idx, step) in self.steps.iter().enumerate() {
+            for dep_id in &step.depends_on {
+                self.reverse_deps
+                    .entry(dep_id.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
+        // Cache indices of steps with no dependencies (can start immediately)
+        self.initial_step_indices = self
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.depends_on.is_empty())
+            .map(|(i, _)| i)
+            .collect();
 
         Ok(())
     }
@@ -176,19 +204,16 @@ impl WorkflowDefinition {
         false
     }
 
-    /// Get steps that have no dependencies (can run immediately)
-    pub fn get_initial_steps(&self) -> Vec<&StepDefinition> {
-        self.steps
-            .iter()
-            .filter(|s| s.depends_on.is_empty())
-            .collect()
+    /// Get indices of steps that depend on the given step
+    pub fn get_dependent_indices(&self, step_id: &StepId) -> &[usize] {
+        self.reverse_deps
+            .get(step_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
-    /// Get steps that depend on the given step
-    pub fn get_dependents(&self, step_id: &StepId) -> Vec<&StepDefinition> {
-        self.steps
-            .iter()
-            .filter(|s| s.depends_on.contains(step_id))
-            .collect()
+    /// Get indices of steps with no dependencies
+    pub fn get_initial_step_indices(&self) -> &[usize] {
+        &self.initial_step_indices
     }
 }

@@ -43,6 +43,13 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
+
+### Docker
+Pre-built Docker images are available on Docker Hub with multi-architecture support (x86_64 and ARM64):
+```bash
+docker pull lmsysorg/sgl-model-gateway:latest
+```
+
 ### Prerequisites
 - **Rust and Cargo**
   ```bash

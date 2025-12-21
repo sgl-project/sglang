@@ -918,13 +918,25 @@ class BenchmarkMetrics:
     max_concurrent_requests: int = 0
 
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 MOONCAKE_DATASET_URL = {
     "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
     "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
     "synthetic": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl",
     "toolagent": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/toolagent_trace.jsonl",
 }
+
+
+def download_and_cache_hf_file(
+    repo_id: str,
+    filename: str,
+    repo_type: str = "dataset",
+):
+    """Download a file from Hugging Face and cache it locally."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
@@ -1171,7 +1183,10 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not is_file_valid_json(dataset_path) and dataset_path == "":
-        dataset_path = download_and_cache_file(SHAREGPT_URL)
+        dataset_path = download_and_cache_hf_file(
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
+        )
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -1283,7 +1298,10 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not is_file_valid_json(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = download_and_cache_hf_file(
+                repo_id=SHAREGPT_REPO_ID,
+                filename=SHAREGPT_FILENAME,
+            )
 
         # Load the dataset.
         with open(dataset_path) as f:

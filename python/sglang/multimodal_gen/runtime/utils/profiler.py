@@ -1,3 +1,4 @@
+import gzip
 import os
 
 import torch
@@ -118,6 +119,12 @@ class SGLDiffusionProfiler:
         if dump_rank is None:
             dump_rank = self.rank
 
+        current_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        if current_rank != dump_rank:
+            return
+
         try:
             os.makedirs(self.log_dir, exist_ok=True)
             sanitized_profile_mode_id = self.profile_mode_id.replace(" ", "_")
@@ -128,6 +135,26 @@ class SGLDiffusionProfiler:
                 )
             )
             self.profiler.export_chrome_trace(trace_path)
-            logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
+
+            if self._check_trace_integrity(trace_path):
+                logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
+            else:
+                logger.warning(f"Trace file may be corrupted: {trace_path}")
         except Exception as e:
             logger.error(f"Failed to save trace: {e}")
+
+    def _check_trace_integrity(self, trace_path: str) -> bool:
+        try:
+            if not os.path.exists(trace_path) or os.path.getsize(trace_path) == 0:
+                return False
+
+            with gzip.open(trace_path, "rb") as f:
+                content = f.read()
+                if content.count(b"\x1f\x8b") > 1:
+                    logger.warning("Multiple gzip headers detected")
+                    return False
+
+            return True
+        except Exception as e:
+            logger.warning(f"Trace file integrity check failed: {e}")
+            return False

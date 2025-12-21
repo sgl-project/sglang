@@ -78,14 +78,20 @@ impl GenerateResponseProcessingStage {
             .clone();
 
         if is_streaming {
-            // Streaming: Use StreamingProcessor and return SSE response (done)
-            return Ok(Some(
-                self.streaming_processor.clone().process_streaming_generate(
-                    execution_result,
-                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch,
-                ),
-            ));
+            // Streaming: Use StreamingProcessor and return SSE response
+            let response = self.streaming_processor.clone().process_streaming_generate(
+                execution_result,
+                ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
+                dispatch,
+            );
+
+            // Attach load guards to response body for proper RAII lifecycle
+            let response = match ctx.state.load_guards.take() {
+                Some(guards) => guards.attach_to_response(response),
+                None => response,
+            };
+
+            return Ok(Some(response));
         }
 
         // Non-streaming: Delegate to ResponseProcessor

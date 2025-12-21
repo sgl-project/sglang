@@ -14,24 +14,34 @@
 
 import multiprocessing as mp
 import os
-import sys
 import unittest
-from pathlib import Path
 
-# Add test directory to path for lora_utils import
-# TODO: can be removed after migration
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-from lora_utils import (
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
     run_lora_multiple_batch_on_model_cases,
 )
-
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
+register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
 
-class TestLoRA(CustomTestCase):
+# All prompts are used at once in a batch.
+PROMPTS = [
+    "AI is a field of computer science focused on",
+    """
+    ### Instruction:
+    Tell me about llamas and alpacas
+    ### Response:
+    Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids.
+    ### Question:
+    What do you know about llamas?
+    ### Answer:
+    """,
+]
+
+
+class TestMultiLoRABackend(CustomTestCase):
     def test_ci_lora_models(self):
         run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
 
@@ -39,6 +49,7 @@ class TestLoRA(CustomTestCase):
         if is_in_ci():
             return
 
+        # Retain ONLY_RUN check here
         filtered_models = []
         for model_case in ALL_OTHER_MULTI_LORA_MODELS:
             if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:

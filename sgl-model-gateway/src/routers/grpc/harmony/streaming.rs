@@ -116,6 +116,9 @@ impl HarmonyStreamingProcessor {
     /// Process a streaming Harmony Chat Completion response
     ///
     /// Returns an SSE response with streaming token updates.
+    ///
+    /// Note: Caller should attach load guards to the returned response using
+    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
     pub fn process_streaming_chat_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,

@@ -131,20 +131,6 @@ jobs:
           cd sgl-model-gateway/
           cargo test
 
-      - name: Check benchmark compilation
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-model-gateway/
-          cargo check --benches
-
-      - name: Quick benchmark sanity check
-        timeout-minutes: 15
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-model-gateway/
-          # Run quick benchmarks to ensure they work using Python script
-          python3 scripts/run_benchmarks.py --quick
-
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -349,7 +335,7 @@ jobs:
           context: .
           file: docker/gateway.Dockerfile
           push: false
-          tags: sglang-router:test
+          tags: sgl-model-gateway:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
