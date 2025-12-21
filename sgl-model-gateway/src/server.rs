@@ -41,6 +41,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
+        common::Tool,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -55,12 +56,143 @@ use crate::{
     workflow::{LoggingSubscriber, WorkflowEngine},
 };
 
+#[derive(Deserialize)]
+pub struct ParseFunctionCallRequest {
+    pub text: String,
+    pub tool_call_parser: String,
+    pub tools: Vec<Tool>,
+}
+
+#[derive(Deserialize)]
+pub struct SeparateReasoningRequest {
+    pub text: String,
+    pub reasoning_parser: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+}
+
+async fn parse_function_call(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ParseFunctionCallRequest>,
+) -> Response {
+    match &state.context.tool_parser_factory {
+        Some(factory) => {
+            match factory.registry.get_pooled_parser(&req.tool_call_parser) {
+                Some(pooled_parser) => {
+                    let mut parser = pooled_parser.lock().await;
+                    match parser.parse_complete(&req.text).await {
+                        Ok((remaining_text, tool_calls)) => {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "remaining_text": remaining_text,
+                                    "tool_calls": tool_calls,
+                                    "success": true
+                                })),
+                            )
+                                .into_response()
+                        }
+                        Err(e) => {
+                            error!("Failed to parse function calls: {}", e);
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "error": format!("Failed to parse function calls: {}", e),
+                                    "success": false
+                                })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+                None => {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!("Unknown tool parser: {}", req.tool_call_parser),
+                            "success": false
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "Tool parser factory not initialized",
+                    "success": false
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn separate_reasoning(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SeparateReasoningRequest>,
+) -> Response {
+    match &state.context.reasoning_parser_factory {
+        Some(factory) => {
+            match factory.registry.get_pooled_parser(&req.reasoning_parser) {
+                Some(pooled_parser) => {
+                    let mut parser = pooled_parser.lock().await;
+                    match parser.detect_and_parse_reasoning(&req.text) {
+                        Ok(result) => {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "normal_text": result.normal_text,
+                                    "reasoning_text": result.reasoning_text,
+                                    "success": true
+                                })),
+                            )
+                                .into_response()
+                        }
+                        Err(e) => {
+                            error!("Failed to separate reasoning: {}", e);
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "error": format!("Failed to separate reasoning: {}", e),
+                                    "success": false
+                                })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+                None => {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!("Unknown reasoning parser: {}", req.reasoning_parser),
+                            "success": false
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "Reasoning parser factory not initialized",
+                    "success": false
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn sink_handler() -> Response {
@@ -708,6 +840,8 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/parse_function_call", post(parse_function_call))
+        .route("/separate_reasoning", post(separate_reasoning))
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
