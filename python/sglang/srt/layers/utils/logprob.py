@@ -313,10 +313,12 @@ def get_token_ids_logprobs_chunk(
 def add_logprob_values(
     batch: ScheduleBatch,
     res: EagleVerifyOutput,
-    logits_output: LogitsProcessorOutput,
+    logits_output: Optional[LogitsProcessorOutput] = None,
 ):
     # Extract args
-    logits_output = res.logits_output
+    if logits_output is None:
+        logits_output = res.logits_output
+
     top_logprobs_nums = batch.top_logprobs_nums
     token_ids_logprobs = batch.token_ids_logprobs
     accepted_indices = res.accepted_indices
