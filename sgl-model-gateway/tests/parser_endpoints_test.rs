@@ -159,7 +159,7 @@ mod parse_function_call_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Parser endpoint should return 200 for valid requests (or SERVICE_UNAVAILABLE if parser factory not initialized)
         // Since we're in a test without explicit parser factory setup, it may return 503
         assert!(
@@ -190,10 +190,11 @@ mod parse_function_call_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Should return either 400 (parser not found) or 503 (factory not initialized)
         assert!(
-            resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
             "Expected BAD_REQUEST (400) or SERVICE_UNAVAILABLE (503), got {}",
             resp.status()
         );
@@ -202,7 +203,7 @@ mod parse_function_call_tests {
             .await
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
+
         assert_eq!(body_json["success"], false);
 
         ctx.shutdown().await;
@@ -227,7 +228,7 @@ mod parse_function_call_tests {
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
-        
+
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         // Missing 'tool_call_parser' field
@@ -268,7 +269,7 @@ mod parse_function_call_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Parser should handle empty text gracefully - return 200 or 503
         assert!(
             resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
@@ -302,7 +303,7 @@ mod separate_reasoning_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Should return 200 or 503 depending on whether parser factory is initialized
         assert!(
             resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
@@ -343,10 +344,11 @@ mod separate_reasoning_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Should return 400 (parser not found) or 503 (factory not initialized)
         assert!(
-            resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
             "Expected BAD_REQUEST (400) or SERVICE_UNAVAILABLE (503), got {}",
             resp.status()
         );
@@ -355,7 +357,7 @@ mod separate_reasoning_tests {
             .await
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
+
         assert_eq!(body_json["success"], false);
 
         ctx.shutdown().await;
@@ -379,7 +381,7 @@ mod separate_reasoning_tests {
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
-        
+
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         // Missing 'reasoning_parser' field
@@ -418,7 +420,7 @@ mod separate_reasoning_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Parser should handle empty text gracefully
         assert!(
             resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
@@ -447,7 +449,7 @@ mod separate_reasoning_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Should still return 200 or 503, parser should handle gracefully
         assert!(
             resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
@@ -493,7 +495,7 @@ mod separate_reasoning_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Should handle multiple blocks gracefully
         assert!(
             resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
@@ -529,7 +531,7 @@ mod api_routing_tests {
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
-        
+
         // Should not be 404
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
 
@@ -547,7 +549,7 @@ mod api_routing_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Should not be 404
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
 
@@ -567,10 +569,11 @@ mod api_routing_tests {
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
-        
+
         // Should not accept GET (should be 405 or 404)
         assert!(
-            resp.status() == StatusCode::METHOD_NOT_ALLOWED || resp.status() == StatusCode::NOT_FOUND,
+            resp.status() == StatusCode::METHOD_NOT_ALLOWED
+                || resp.status() == StatusCode::NOT_FOUND,
             "Expected METHOD_NOT_ALLOWED (405) or NOT_FOUND (404), got {}",
             resp.status()
         );
@@ -583,10 +586,11 @@ mod api_routing_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        
+
         // Should not accept GET
         assert!(
-            resp.status() == StatusCode::METHOD_NOT_ALLOWED || resp.status() == StatusCode::NOT_FOUND,
+            resp.status() == StatusCode::METHOD_NOT_ALLOWED
+                || resp.status() == StatusCode::NOT_FOUND,
             "Expected METHOD_NOT_ALLOWED (405) or NOT_FOUND (404), got {}",
             resp.status()
         );
@@ -594,4 +598,3 @@ mod api_routing_tests {
         ctx.shutdown().await;
     }
 }
-

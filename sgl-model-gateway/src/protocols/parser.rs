@@ -21,4 +21,3 @@ pub struct SeparateReasoningRequest {
     /// The parser type/name to use for reasoning detection (e.g., "step3", "deepseek_r1")
     pub reasoning_parser: String,
 }
-
