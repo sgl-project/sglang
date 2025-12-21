@@ -113,13 +113,18 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
     def __init__(
         self, vae, tokenizer, processor, transformer, scheduler, model_path
     ) -> None:
-        self.vae = vae
+        self.vae = vae.to(torch.bfloat16)
         print(f"93 {model_path=}")
         from transformers import Qwen2_5_VLForConditionalGeneration
 
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, subfolder="text_encoder"
-        ).to(get_local_torch_device())
+        self.text_encoder = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path, subfolder="text_encoder"
+            )
+            .to(get_local_torch_device())
+            .to(torch.bfloat16)
+        )
+        print(f"123 {self.text_encoder.dtype=}", flush=True)
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer
@@ -517,9 +522,14 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch.prompt_embeds_mask = [prompt_embeds_mask]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
         batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
-        batch.latents = [latents]
+        batch.latents = latents
         batch.image_latents = [image_latents]
         batch.num_inference_steps = num_inference_steps
-        batch.sigmas = sigmas
+        batch.sigmas = sigmas.tolist()  # Convert numpy array to list for validation
+        batch.generator = torch.manual_seed(0)
+        batch.original_condition_image_size = image_size
+        batch.raw_latent_shape = latents.shape
+
+        print(f"528 {latents.dtype=}", flush=True)
 
         return batch
