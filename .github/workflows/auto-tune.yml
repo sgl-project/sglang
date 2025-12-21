@@ -6,10 +6,26 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: 'Git ref (branch/tag/SHA) to checkout; defaults to the triggering ref.'
+      model:
+        description: 'Model name/path to auto-tune.'
         required: false
         type: string
+        default: 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+      tp_size:
+        description: 'Tensor parallel size.'
+        required: false
+        type: string
+        default: '8'
+      ep_size:
+        description: 'Expert parallel size.'
+        required: false
+        type: string
+        default: '8'
+      runner:
+        description: "Runner label to use (e.g. 4-gpu-a10). Use 'all' to run the full matrix."
+        required: false
+        type: string
+        default: 'all'
 
 jobs:
   auto-tune-matrix:
@@ -17,20 +33,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner:
-          - 4-gpu-a10
-          - 4-gpu-b200
-          - 4-gpu-gb200
-          - 4-gpu-h100
-          - 8-gpu-b200
-          - 8-gpu-h20
-          - 8-gpu-h200
+        runner: ${{ fromJSON(inputs.runner == 'all' && '["4-gpu-a10","4-gpu-b200","4-gpu-gb200","4-gpu-h100","8-gpu-b200","8-gpu-h20","8-gpu-h200"]' || format('["{0}"]', inputs.runner)) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -38,14 +45,7 @@ jobs:
 
       - name: Run auto tune
         run: |
-          pip install "triton==3.1.0"
-          python3 scripts/auto_tune.py
-          pip install "triton==3.2.0"
-          python3 scripts/auto_tune.py
-          pip install "triton==3.3.1"
-          python3 scripts/auto_tune.py
-          pip install "triton==3.4.0"
-          python3 scripts/auto_tune.py
+          python3 -m sglang.auto_tune --model "${{ inputs.model }}" --tp-size "${{ inputs.tp_size }}" --ep-size "${{ inputs.ep_size }}"
 
       - name: Upload tuned configs
         if: always()
@@ -62,8 +62,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
 
       - name: Download tuned configs
         uses: actions/download-artifact@v4
