@@ -16,6 +16,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
@@ -34,11 +35,12 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error,
+        error, parse,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
@@ -53,6 +55,7 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
+    context: Option<Arc<AppContext>>,
 }
 
 impl Router {
@@ -65,6 +68,7 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
+            context: Some(ctx.clone()),
         })
     }
 
@@ -612,6 +616,7 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
+
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
@@ -790,6 +795,14 @@ impl RouterTrait for Router {
         }
     }
 
+    async fn parse_function_call(&self, req: &ParseFunctionCallRequest) -> Response {
+        parse::parse_function_call(self.context.as_ref(), req).await
+    }
+
+    async fn parse_reasoning(&self, req: &SeparateReasoningRequest) -> Response {
+        parse::parse_reasoning(self.context.as_ref(), req).await
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -824,6 +837,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
+            context: None,
         }
     }
 
