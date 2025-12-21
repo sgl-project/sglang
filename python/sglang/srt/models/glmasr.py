@@ -40,7 +40,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.llama2 import LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
