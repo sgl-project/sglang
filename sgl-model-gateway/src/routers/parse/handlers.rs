@@ -9,7 +9,10 @@ use axum::{
 };
 use tracing::error;
 
-use crate::{app_context::AppContext, protocols::parser::{ParseFunctionCallRequest, SeparateReasoningRequest}};
+use crate::{
+    app_context::AppContext,
+    protocols::parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
+};
 
 /// Parse function calls from model output text
 pub async fn parse_function_call(
@@ -134,4 +137,3 @@ pub async fn parse_reasoning(
             .into_response(),
     }
 }
-

@@ -40,9 +40,9 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error, parse,
+        error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils, parse, RouterTrait,
     },
 };
 
@@ -629,7 +629,6 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
-
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
