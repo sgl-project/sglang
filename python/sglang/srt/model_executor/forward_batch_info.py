@@ -52,7 +52,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -485,13 +485,15 @@ class ForwardBatch:
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
             block_size = batch.dllm_config.block_size
+            # Use int64 for AMD rotary embedding kernel compatibility
+            positions_dtype = torch.int64 if is_hip() else torch.int32
             ret.positions = torch.tensor(
                 [
                     i
                     for block_offset in batch.dllm_block_offsets
                     for i in range(block_offset, block_offset + block_size)
                 ],
-                dtype=torch.int64,  # Use int64 for AMD rotary embedding kernel compatibility
+                dtype=positions_dtype,
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
