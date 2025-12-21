@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 # FlashAttention4 integration test (requires SM 100+ / Blackwell B200)
-register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=200, suite="stage-b-test-large-1-gpu")
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
