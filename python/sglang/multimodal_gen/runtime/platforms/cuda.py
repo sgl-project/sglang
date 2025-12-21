@@ -117,13 +117,23 @@ class CudaPlatformBase(Platform):
         cls, device: torch.types.Device | None = None
     ) -> float:
         """
-        Return current free GPU memory in GiB.
+        Return how much GPU memory (GiB) this PyTorch process can still allocate
+        right now:
+            driver_free + (reserved - allocated)
         """
         if device is None:
             device = torch.device("cuda")
     
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-        return free_bytes / 1024**3
+        # CUDA driver view
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    
+        # PyTorch allocator view
+        reserved_bytes = torch.cuda.memory_reserved(device)
+        allocated_bytes = torch.cuda.memory_allocated(device)
+    
+        available_bytes = free_bytes + (reserved_bytes - allocated_bytes)
+        return available_bytes / 1024**3
+
 
     @classmethod
     def get_attn_backend_cls_str(
