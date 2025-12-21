@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
@@ -11,9 +11,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+# modelopt_fp4 requires SM 100+ (Blackwell)
 register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
 
 
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher (Blackwell)")
 class TestFlashinferTrtllmGenMoeBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
