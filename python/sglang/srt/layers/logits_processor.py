@@ -623,11 +623,11 @@ class LogitsProcessor(nn.Module):
                 logits[sample_indices] if sample_indices is not None else logits
             )
 
-            input_logprobs = logits[input_logprob_indices]
+            input_logits = logits[input_logprob_indices]
             del logits
 
             logprobs_result = self._process_input_logprobs(
-                input_logprobs, logits_metadata
+                input_logits, logits_metadata
             )
         else:
             (logprobs_result, sampled_logits) = self._process_input_logprobs_by_chunk(
@@ -650,9 +650,9 @@ class LogitsProcessor(nn.Module):
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
         )
 
-    def _process_input_logprobs(self, input_logprobs, logits_metadata: LogitsMetadata):
+    def _process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
         input_logprobs = self.compute_temp_top_p_normalized_logprobs(
-            input_logprobs, logits_metadata
+            input_logits, logits_metadata
         )
 
         # Get the logprob of top-k tokens
