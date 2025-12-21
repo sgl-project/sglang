@@ -205,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
-    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
