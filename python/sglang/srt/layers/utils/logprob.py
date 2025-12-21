@@ -6,8 +6,12 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
-    from sglang.srt.layers.logits_processor import LogitsMetadata
+    from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.eagle_info import EagleVerifyOutput
 
 
 class LogprobStage(Enum):
@@ -304,3 +308,82 @@ def get_token_ids_logprobs_chunk(
 
         pt += pruned_len
     return next_split_pruned_len
+
+
+def add_logprob_values(
+    batch: ScheduleBatch,
+    res: EagleVerifyOutput,
+    logits_output: LogitsProcessorOutput,
+):
+    # Extract args
+    logits_output = res.logits_output
+    top_logprobs_nums = batch.top_logprobs_nums
+    token_ids_logprobs = batch.token_ids_logprobs
+    accepted_indices = res.accepted_indices
+    assert len(accepted_indices) == len(logits_output.next_token_logits)
+
+    temperatures = batch.sampling_info.temperatures
+    num_draft_tokens = batch.spec_info.draft_token_num
+    # acceptance indices are the indices in a "flattened" batch.
+    # dividing it to num_draft_tokens will yield the actual batch index.
+    temperatures = temperatures[accepted_indices // num_draft_tokens]
+    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB:
+        logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits, dim=-1
+        )
+    else:
+        logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits / temperatures, dim=-1
+        )
+    batch_next_token_ids = res.verified_id
+    num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
+
+    # We should repeat top_logprobs_nums to match num_tokens_per_req.
+    top_logprobs_nums_repeat_interleaved = []
+    token_ids_logprobs_repeat_interleaved = []
+    for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
+        top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
+    for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
+        token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
+
+    # Extract logprobs
+    if any(x > 0 for x in top_logprobs_nums):
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = get_top_logprobs(
+            logprobs,
+            top_logprobs_nums_repeat_interleaved,
+        )
+
+    if any(x is not None for x in token_ids_logprobs):
+        (
+            logits_output.next_token_token_ids_logprobs_val,
+            logits_output.next_token_token_ids_logprobs_idx,
+        ) = get_token_ids_logprobs(
+            logprobs,
+            token_ids_logprobs_repeat_interleaved,
+        )
+
+    logits_output.next_token_logprobs = logprobs[
+        torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
+        batch_next_token_ids,
+    ]
+
+    # Add output logprobs to the request
+    pt = 0
+    next_token_logprobs = logits_output.next_token_logprobs.tolist()
+    verified_ids = batch_next_token_ids.tolist()
+    for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
+        for _ in range(num_tokens):
+            if req.return_logprob:
+                req.output_token_logprobs_val.append(next_token_logprobs[pt])
+                req.output_token_logprobs_idx.append(verified_ids[pt])
+                if req.top_logprobs_num > 0:
+                    req.output_top_logprobs_val.append(
+                        res.logits_output.next_token_top_logprobs_val[pt]
+                    )
+                    req.output_top_logprobs_idx.append(
+                        res.logits_output.next_token_top_logprobs_idx[pt]
+                    )
+            pt += 1
