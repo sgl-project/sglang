@@ -188,6 +188,8 @@ struct Router {
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
     max_concurrent_requests: i32,
+    rate_limit_rule: Vec<String>,
+    rate_limit_tenant_header: Option<String>,
     cors_allowed_origins: Vec<String>,
     retry_max_retries: u32,
     retry_initial_backoff_ms: u64,
@@ -245,7 +247,7 @@ impl Router {
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode, RateLimitRule,
         };
 
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
@@ -344,6 +346,8 @@ impl Router {
             None
         };
 
+        let rate_limits = RateLimitRule::parse_rules(&self.rate_limit_rule)?;
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -357,6 +361,8 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .rate_limits(rate_limits)
+            .maybe_rate_limit_tenant_header(self.rate_limit_tenant_header.clone())
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -458,6 +464,8 @@ impl Router {
         prefill_policy = None,
         decode_policy = None,
         max_concurrent_requests = -1,
+        rate_limit_rule = vec![],
+        rate_limit_tenant_header = None,
         cors_allowed_origins = vec![],
         retry_max_retries = 5,
         retry_initial_backoff_ms = 50,
@@ -539,6 +547,8 @@ impl Router {
         prefill_policy: Option<PolicyType>,
         decode_policy: Option<PolicyType>,
         max_concurrent_requests: i32,
+        rate_limit_rule: Vec<String>,
+        rate_limit_tenant_header: Option<String>,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
         retry_initial_backoff_ms: u64,
@@ -633,6 +643,8 @@ impl Router {
             prefill_policy,
             decode_policy,
             max_concurrent_requests,
+            rate_limit_rule,
+            rate_limit_tenant_header,
             cors_allowed_origins,
             retry_max_retries,
             retry_initial_backoff_ms,

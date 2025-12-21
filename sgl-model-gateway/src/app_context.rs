@@ -8,12 +8,11 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    core::{ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
+    core::{rate_limiter::RateLimiter, ConnectionMode, JobQueue, LoadMonitor, WorkerRegistry},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
     mcp::McpManager,
-    middleware::TokenBucket,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::router_manager::RouterManager,
@@ -43,7 +42,7 @@ impl std::error::Error for AppContextBuildError {}
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
-    pub rate_limiter: Option<Arc<TokenBucket>>,
+    pub rate_limiter: Arc<RateLimiter>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -65,7 +64,7 @@ pub struct AppContext {
 pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
-    rate_limiter: Option<Arc<TokenBucket>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
@@ -133,7 +132,7 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
+    pub fn rate_limiter(mut self, rate_limiter: Option<Arc<RateLimiter>>) -> Self {
         self.rate_limiter = rate_limiter;
         self
     }
@@ -227,7 +226,9 @@ impl AppContextBuilder {
         Ok(AppContext {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
-            rate_limiter: self.rate_limiter,
+            rate_limiter: self
+                .rate_limiter
+                .ok_or(AppContextBuildError("rate_limiter"))?,
             tokenizer: self.tokenizer,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
@@ -352,19 +353,7 @@ impl AppContextBuilder {
 
     /// Create rate limiter based on config
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
-        self.rate_limiter = match config.max_concurrent_requests {
-            n if n <= 0 => None,
-            n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
-            }
-        };
+        self.rate_limiter = Some(Arc::new(RateLimiter::new(config)));
         self
     }
 

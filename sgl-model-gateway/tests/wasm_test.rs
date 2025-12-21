@@ -75,11 +75,15 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let workflow_engine = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
 
+    let rate_limiter = Arc::new(sgl_model_gateway::core::rate_limiter::RateLimiter::new(
+        &config,
+    ));
+
     let app_context = Arc::new(
         AppContext::builder()
             .router_config(config.clone())
             .client(client)
-            .rate_limiter(None)
+            .rate_limiter(Some(rate_limiter))
             .tokenizer(None)
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)

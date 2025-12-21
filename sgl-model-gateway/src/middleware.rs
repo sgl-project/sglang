@@ -26,6 +26,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
+    core::rate_limiter::RateLimiter,
     observability::metrics::{method_to_static_str, metrics_labels, Metrics},
     routers::error::extract_error_code_from_response,
     server::AppState,
@@ -386,6 +387,8 @@ pub struct QueuedRequest {
     queued_at: Instant,
     /// Channel to send the permit back when acquired
     permit_tx: oneshot::Sender<Result<(), StatusCode>>,
+    /// The specific token bucket this request is waiting for
+    token_bucket: Arc<TokenBucket>,
 }
 
 /// Queue metrics for monitoring
@@ -399,19 +402,13 @@ pub struct QueueMetrics {
 
 /// Queue processor that handles queued requests
 pub struct QueueProcessor {
-    token_bucket: Arc<TokenBucket>,
     queue_rx: mpsc::Receiver<QueuedRequest>,
     queue_timeout: Duration,
 }
 
 impl QueueProcessor {
-    pub fn new(
-        token_bucket: Arc<TokenBucket>,
-        queue_rx: mpsc::Receiver<QueuedRequest>,
-        queue_timeout: Duration,
-    ) -> Self {
+    pub fn new(queue_rx: mpsc::Receiver<QueuedRequest>, queue_timeout: Duration) -> Self {
         Self {
-            token_bucket,
             queue_rx,
             queue_timeout,
         }
@@ -431,28 +428,30 @@ impl QueueProcessor {
             }
 
             let remaining_timeout = self.queue_timeout - elapsed;
+            let token_bucket = queued.token_bucket;
+            let permit_tx = queued.permit_tx;
 
             // Try to acquire token for this request
-            if self.token_bucket.try_acquire(1.0).await.is_ok() {
+            if token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
+                let _ = permit_tx.send(Ok(()));
             } else {
                 // Need to wait for token
-                let token_bucket = self.token_bucket.clone();
+                let tb_clone = token_bucket.clone();
 
                 // Spawn task only when we actually need to wait
                 tokio::spawn(async move {
-                    if token_bucket
+                    if tb_clone
                         .acquire_timeout(1.0, remaining_timeout)
                         .await
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
+                        let _ = permit_tx.send(Ok(()));
                     } else {
                         warn!("Queue: request timed out waiting for token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                        let _ = permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
                     }
                 });
             }
@@ -470,37 +469,88 @@ pub struct ConcurrencyLimiter {
 impl ConcurrencyLimiter {
     /// Create new concurrency limiter with optional queue
     pub fn new(
-        token_bucket: Option<Arc<TokenBucket>>,
+        rate_limiter: Arc<RateLimiter>,
         queue_size: usize,
         queue_timeout: Duration,
     ) -> (Self, Option<QueueProcessor>) {
-        match (token_bucket, queue_size) {
-            (None, _) => (Self { queue_tx: None }, None),
-            (Some(bucket), size) if size > 0 => {
-                let (queue_tx, queue_rx) = mpsc::channel(size);
-                let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
-                (
-                    Self {
-                        queue_tx: Some(queue_tx),
-                    },
-                    Some(processor),
-                )
-            }
-            (Some(_), _) => (Self { queue_tx: None }, None),
+        if queue_size > 0 && rate_limiter.is_enabled() {
+            let (queue_tx, queue_rx) = mpsc::channel(queue_size);
+            let processor = QueueProcessor::new(queue_rx, queue_timeout);
+            (
+                Self {
+                    queue_tx: Some(queue_tx),
+                },
+                Some(processor),
+            )
+        } else {
+            (Self { queue_tx: None }, None)
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ModelPeek {
+    model: Option<String>,
 }
 
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let token_bucket = match &app_state.context.rate_limiter {
-        Some(bucket) => bucket.clone(),
+    // 1. Extract tenant ID from configured header (default to X-Tenant-ID)
+    let tenant_header = app_state
+        .context
+        .router_config
+        .rate_limit_tenant_header
+        .as_deref()
+        .unwrap_or("X-Tenant-ID");
+
+    // We convert tenant_id to owned String early to avoid borrowing the request
+    // when we need to consume or modify it later.
+    let tenant_id = request
+        .headers()
+        .get(tenant_header)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // 2. Extract model ID from request (peek body for OpenAI-style requests)
+    let mut model_id = request
+        .headers()
+        .get("X-Model-ID")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    if model_id.is_none() && request.method() == http::Method::POST {
+        let max_size = app_state.context.router_config.max_payload_size;
+        let (parts, body) = request.into_parts();
+
+        // We buffer the body to peek at the model ID.
+        // This is necessary for model-based rate limiting when the model is in the JSON body.
+        match axum::body::to_bytes(body, max_size).await {
+            Ok(bytes) => {
+                if let Ok(peek) = serde_json::from_slice::<ModelPeek>(&bytes) {
+                    model_id = peek.model;
+                }
+                request = Request::from_parts(parts, Body::from(bytes));
+            }
+            Err(e) => {
+                error!("Failed to buffer body for rate limiting: {}", e);
+                request = Request::from_parts(parts, Body::empty());
+            }
+        }
+    }
+
+    let token_bucket = app_state
+        .context
+        .rate_limiter
+        .get_bucket(tenant_id.as_deref(), model_id.as_deref());
+
+    let token_bucket = match token_bucket {
+        Some(bucket) => bucket,
         None => {
-            // Rate limiting disabled, pass through immediately
+            // Rate limiting disabled or no bucket found, pass through immediately
             return next.run(request).await;
         }
     };
@@ -514,12 +564,14 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
-        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+        Metrics::record_http_rate_limit(
+            metrics_labels::RATE_LIMIT_ALLOWED,
+            tenant_id.as_deref(),
+            model_id.as_deref(),
+        );
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
-        // This ensures that for streaming responses, the token is only returned
-        // after the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
         let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
         Response::from_parts(parts, Body::new(guarded_body))
@@ -534,6 +586,7 @@ pub async fn concurrency_limit_middleware(
             let queued = QueuedRequest {
                 queued_at: Instant::now(),
                 permit_tx,
+                token_bucket: token_bucket.clone(),
             };
 
             // Try to send to queue
@@ -548,7 +601,11 @@ pub async fn concurrency_limit_middleware(
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+                            Metrics::record_http_rate_limit(
+                                metrics_labels::RATE_LIMIT_ALLOWED,
+                                tenant_id.as_deref(),
+                                model_id.as_deref(),
+                            );
                             // Dequeue for embeddings
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
@@ -563,7 +620,11 @@ pub async fn concurrency_limit_middleware(
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_http_rate_limit(
+                                metrics_labels::RATE_LIMIT_REJECTED,
+                                tenant_id.as_deref(),
+                                model_id.as_deref(),
+                            );
                             // Dequeue for embeddings on error
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
@@ -572,7 +633,11 @@ pub async fn concurrency_limit_middleware(
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_http_rate_limit(
+                                metrics_labels::RATE_LIMIT_REJECTED,
+                                tenant_id.as_deref(),
+                                model_id.as_deref(),
+                            );
                             // Dequeue for embeddings on channel error
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
@@ -583,13 +648,21 @@ pub async fn concurrency_limit_middleware(
                 }
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
-                    Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                    Metrics::record_http_rate_limit(
+                        metrics_labels::RATE_LIMIT_REJECTED,
+                        tenant_id.as_deref(),
+                        model_id.as_deref(),
+                    );
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
-            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_http_rate_limit(
+                metrics_labels::RATE_LIMIT_REJECTED,
+                tenant_id.as_deref(),
+                model_id.as_deref(),
+            );
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
     }

@@ -609,7 +609,7 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::{config::RouterConfig, middleware::TokenBucket};
+        use crate::{config::RouterConfig, core::rate_limiter::RateLimiter};
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
@@ -620,7 +620,7 @@ mod tests {
         Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
+            rate_limiter: Arc::new(RateLimiter::new(&router_config)),
             worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
