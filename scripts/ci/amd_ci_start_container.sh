@@ -3,25 +3,25 @@ set -euo pipefail
 
 # Get version from SGLang version.py file
 SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
-SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if version.py is found
+SGLANG_VERSION="v9.5.5.test"   # Default version, will be overridden if version.py is found
 
-TMP_VERSION_FILE=$(mktemp)
-if git fetch --depth=1 origin main; then
-  if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
-    VERSION_FROM_FILE="v$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)"
-    if [ -n "$VERSION_FROM_FILE" ]; then
-      SGLANG_VERSION="$VERSION_FROM_FILE"
-      echo "Using SGLang version from origin/main: $SGLANG_VERSION"
-    else
-      echo "Warning: Could not parse version from origin/main; using default $SGLANG_VERSION" >&2
-    fi
-  else
-    echo "Warning: version.py not found on origin/main; using default $SGLANG_VERSION" >&2
-  fi
-else
-  echo "Warning: failed to fetch origin/main; using default $SGLANG_VERSION" >&2
-fi
-rm -f "$TMP_VERSION_FILE"
+# TMP_VERSION_FILE=$(mktemp)
+# if git fetch --depth=1 origin main; then
+#   if git show origin/main:python/sglang/version.py >"$TMP_VERSION_FILE" 2>/dev/null; then
+#     VERSION_FROM_FILE="v$(cat "$SGLANG_VERSION_FILE" | cut -d'"' -f2)"
+#     if [ -n "$VERSION_FROM_FILE" ]; then
+#       SGLANG_VERSION="$VERSION_FROM_FILE"
+#       echo "Using SGLang version from origin/main: $SGLANG_VERSION"
+#     else
+#       echo "Warning: Could not parse version from origin/main; using default $SGLANG_VERSION" >&2
+#     fi
+#   else
+#     echo "Warning: version.py not found on origin/main; using default $SGLANG_VERSION" >&2
+#   fi
+# else
+#   echo "Warning: failed to fetch origin/main; using default $SGLANG_VERSION" >&2
+# fi
+# rm -f "$TMP_VERSION_FILE"
 
 
 # Default base tags (can be overridden by command line arguments)
