@@ -137,7 +137,9 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
-    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client).await
+    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
+        .await
+        .into_response()
 }
 
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -393,71 +395,15 @@ async fn v1_conversations_delete_item(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+    WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
-    {
-        Ok(result) => {
-            if result.failed.is_empty() {
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "status": "success",
-                        "message": result.message,
-                        "workers_flushed": result.successful.len(),
-                        "total_http_workers": result.http_workers,
-                        "total_workers": result.total_workers
-                    })),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::PARTIAL_CONTENT,
-                    Json(json!({
-                        "status": "partial_success",
-                        "message": result.message,
-                        "successful": result.successful,
-                        "failed": result.failed.into_iter().map(|(url, err)| json!({
-                            "worker": url,
-                            "error": err
-                        })).collect::<Vec<_>>(),
-                        "total_http_workers": result.http_workers,
-                        "total_workers": result.total_workers
-                    })),
-                )
-                    .into_response()
-            }
-        }
-        Err(e) => {
-            error!("Failed to flush cache: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "status": "error",
-                    "message": format!("Failed to flush cache: {}", e)
-                })),
-            )
-                .into_response()
-        }
-    }
+        .into_response()
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    let result =
-        WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
-            .await;
-
-    let loads: Vec<Value> = result
-        .loads
-        .iter()
-        .map(|info| {
-            json!({
-                "worker": &info.worker,
-                "load": info.load
-            })
-        })
-        .collect();
-
-    (StatusCode::OK, Json(json!({ "workers": loads }))).into_response()
+    WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
+        .await
+        .into_response()
 }
 
 async fn create_worker(
