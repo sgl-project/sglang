@@ -17,7 +17,7 @@ skip_condition = torch.cuda.get_device_capability() >= (10, 0)
     "dtype", [torch.int32, torch.int64, torch.bfloat16, torch.float16]
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() >= (10, 0),
+    skip_condition,
     reason="Skip diffusion timestep embedding test for SM100 or above",
 )
 def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
@@ -35,7 +35,7 @@ def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
 @pytest.mark.parametrize("downscale_freq_shift", [0, 1])
 @pytest.mark.parametrize("scale", [1, 0.01])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() >= (10, 0),
+    skip_condition,
     reason="Skip diffusion timestep embedding test for SM100 or above",
 )
 def test_timestep_embedding_correctness_with_diffusers(
