@@ -41,10 +41,10 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        common::Tool,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
@@ -55,19 +55,6 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{LoggingSubscriber, WorkflowEngine},
 };
-
-#[derive(Deserialize)]
-pub struct ParseFunctionCallRequest {
-    pub text: String,
-    pub tool_call_parser: String,
-    pub tools: Vec<Tool>,
-}
-
-#[derive(Deserialize)]
-pub struct SeparateReasoningRequest {
-    pub text: String,
-    pub reasoning_parser: String,
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -83,9 +70,9 @@ async fn parse_function_call(
 ) -> Response {
     match &state.context.tool_parser_factory {
         Some(factory) => {
-            match factory.registry.get_pooled_parser(&req.tool_call_parser) {
+            match factory.registry().get_pooled_parser(&req.tool_call_parser) {
                 Some(pooled_parser) => {
-                    let mut parser = pooled_parser.lock().await;
+                    let parser = pooled_parser.lock().await;
                     match parser.parse_complete(&req.text).await {
                         Ok((remaining_text, tool_calls)) => {
                             (
@@ -142,7 +129,7 @@ async fn separate_reasoning(
 ) -> Response {
     match &state.context.reasoning_parser_factory {
         Some(factory) => {
-            match factory.registry.get_pooled_parser(&req.reasoning_parser) {
+            match factory.registry().get_pooled_parser(&req.reasoning_parser) {
                 Some(pooled_parser) => {
                     let mut parser = pooled_parser.lock().await;
                     match parser.detect_and_parse_reasoning(&req.text) {
