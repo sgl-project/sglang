@@ -22,7 +22,7 @@ from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import GlmasrEncoderConfig, GlmasrConfig
+from transformers import GlmasrConfig, GlmasrEncoderConfig
 from transformers.models.glmasr.modeling_glmasr import (
     GlmasrEncoder,
     GlmasrMultiModalProjector,
@@ -45,62 +45,6 @@ from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
-
-class GlmasrMultimodalProcessor(BaseMultimodalProcessor):
-    models = [GlmasrForConditionalGeneration]
-
-    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.AUDIO_TOKEN = "<|begin_of_audio|><|pad|><|end_of_audio|>"
-        self.AUDIO_TOKEN_REGEX = re.compile(
-            r"<\|begin_of_audio\|>(?:<\|pad\|>)+<\|end_of_audio\|>"
-        )
-        # Collect special token ids
-        tokenizer = self._processor.tokenizer
-        self.audio_start_id = tokenizer.convert_tokens_to_ids("<|begin_of_audio|>")
-        self.audio_token_id = tokenizer.convert_tokens_to_ids("<|pad|>")
-        self.audio_end_id = tokenizer.convert_tokens_to_ids("<|end_of_audio|>")
-
-        self.mm_tokens = MultimodalSpecialTokens(
-            audio_token=self.AUDIO_TOKEN,
-            audio_token_regex=self.AUDIO_TOKEN_REGEX,
-            audio_token_id=self.audio_token_id,
-        ).build(_processor)
-
-    async def process_mm_data_async(
-        self,
-        audio_data,
-        input_text,
-        **kwargs,
-    ):
-        base_output = self.load_mm_data(
-            prompt=input_text,
-            audio_data=audio_data,
-            multimodal_tokens=self.mm_tokens,
-        )
-        if base_output is None:
-            return None
-
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
-
-        assert (
-            "feature_attention_mask" in ret
-        ), "feature_attention_mask not found in processor output"
-        input_lengths = ret["feature_attention_mask"].sum(dim=-1)
-        input_lengths = (input_lengths - 1) // 2 + 1
-        output_lengths = (input_lengths - 2) // 2 + 1
-
-        mm_items[0].audio_feature_lens = output_lengths
-
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_token_id": self.audio_token_id,
-            "audio_end_id": self.audio_end_id,
-        }
 
 class GlmasrForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
@@ -133,9 +77,7 @@ class GlmasrForConditionalGeneration(nn.Module):
         self.config = config
 
         if getattr(self.config, "audio_config", None) is None:
-            self.config.audio_config = GlmasrEncoderConfig(
-                self.config._name_or_path
-            )
+            self.config.audio_config = GlmasrEncoderConfig(self.config._name_or_path)
 
         self.audio_tower = GlmasrEncoder(
             config.audio_config,
