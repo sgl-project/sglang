@@ -44,23 +44,6 @@ class GlmasrProcessor(BaseMultimodalProcessor):
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        print(mm_items)
-        audio_lengths = ret.pop("attention_mask").sum(-1)
-
-        def _get_audio_token_length(audio_length: int, merge_factor: int = 4) -> int:
-            for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
-                audio_length = (
-                    audio_length + 2 * padding - (kernel_size - 1) - 1
-                ) // stride + 1
-            num_tokens = (audio_length - merge_factor) // merge_factor + 1
-            return min(num_tokens, 1500 // merge_factor)
-
-        input_lengths = _get_audio_token_length(audio_lengths)
-        input_lengths = (input_lengths - 1) // 2 + 1
-        output_lengths = (input_lengths - 2) // 2 + 1
-
-        mm_items[0].audio_feature_lens = output_lengths
-
         return {
             "mm_items": mm_items,
             "input_ids": input_ids.tolist(),
