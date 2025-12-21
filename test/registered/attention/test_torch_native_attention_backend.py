@@ -1,12 +1,13 @@
 """
 Usage:
-python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mmlu
+python3 -m unittest test_torch_native_attention_backend.TestTorchNativeAttnBackend.test_mmlu
 """
 
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -15,6 +16,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+# Torch native attention backend integration test with MMLU eval
+register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
 
 
 class TestTorchNativeAttnBackend(CustomTestCase):
