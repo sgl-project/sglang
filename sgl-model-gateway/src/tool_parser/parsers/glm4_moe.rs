@@ -172,7 +172,7 @@ impl Glm4MoeParser {
 
 impl Default for Glm4MoeParser {
     fn default() -> Self {
-        Self::glm4()
+        Self::glm45()
     }
 }
 
