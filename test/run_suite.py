@@ -22,7 +22,8 @@ PER_COMMIT_SUITES = {
     HWBackend.CUDA: [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
-        "stage-b-test-small-2-gpu",
+        "stage-b-test-large-1-gpu",
+        "stage-b-test-large-2-gpu",
     ],
     HWBackend.NPU: [],
 }
