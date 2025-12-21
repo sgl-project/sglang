@@ -43,9 +43,12 @@ def get_argument_type(
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    if arg_key not in tool.function.parameters["properties"]:
+    properties = (tool.function.parameters or {}).get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    if arg_key not in properties:
         return None
-    return tool.function.parameters["properties"][arg_key].get("type", None)
+    return properties[arg_key].get("type", None)
 
 
 def _convert_to_number(value: str) -> Any:

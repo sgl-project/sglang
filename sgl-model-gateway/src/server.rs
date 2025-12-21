@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -12,13 +11,14 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    serve, Json, Router,
+    Json, Router,
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::{net::TcpListener, signal, spawn};
-use tracing::{error, info, warn, Level};
+use tokio::{signal, spawn};
+use tracing::{debug, error, info, warn, Level};
+use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
@@ -30,7 +30,7 @@ use crate::{
             create_worker_registration_workflow, create_worker_removal_workflow,
             create_worker_update_workflow,
         },
-        worker_to_info, Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        worker_to_info, Job, JobQueue, JobQueueConfig, WorkerId, WorkerManager, WorkerType,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -44,6 +44,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
@@ -54,13 +55,26 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{LoggingSubscriber, WorkflowEngine},
 };
-
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+}
+
+async fn parse_function_call(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ParseFunctionCallRequest>,
+) -> Response {
+    state.router.parse_function_call(&req).await
+}
+
+async fn parse_reasoning(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SeparateReasoningRequest>,
+) -> Response {
+    state.router.parse_reasoning(&req).await
 }
 
 async fn sink_handler() -> Response {
@@ -469,6 +483,10 @@ async fn create_worker(
 
     // Submit job for async processing
     let worker_url = config.url.clone();
+    let worker_id = state
+        .context
+        .worker_registry
+        .reserve_id_for_url(&worker_url);
     let job = Job::AddWorker {
         config: Box::new(config),
     };
@@ -480,12 +498,20 @@ async fn create_worker(
         .expect("JobQueue not initialized");
     match job_queue.submit(job).await {
         Ok(_) => {
+            let location = format!("/workers/{}", worker_id.as_str());
             let response = json!({
                 "status": "accepted",
-                "worker_id": worker_url,
+                "worker_id": worker_id.as_str(),
+                "url": worker_url,
+                "location": location,
                 "message": "Worker addition queued for background processing"
             });
-            (StatusCode::ACCEPTED, Json(response)).into_response()
+            (
+                StatusCode::ACCEPTED,
+                [(http::header::LOCATION, location)],
+                Json(response),
+            )
+                .into_response()
         }
         Err(error) => {
             let error_response = WorkerErrorResponse {
@@ -498,8 +524,15 @@ async fn create_worker(
 }
 
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
-    let workers = state.context.worker_registry.get_all();
-    let worker_infos: Vec<WorkerInfo> = workers.iter().map(worker_to_info).collect();
+    let workers = state.context.worker_registry.get_all_with_ids();
+    let worker_infos: Vec<WorkerInfo> = workers
+        .iter()
+        .map(|(worker_id, worker)| {
+            let mut info = worker_to_info(worker);
+            info.id = worker_id.as_str().to_string();
+            info
+        })
+        .collect();
 
     let response = json!({
         "workers": worker_infos,
@@ -513,57 +546,81 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     Json(response).into_response()
 }
 
-async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
+fn parse_worker_id(raw: &str) -> Result<WorkerId, String> {
+    Uuid::parse_str(raw)
+        .map_err(|e| format!("Invalid worker_id '{raw}' (expected UUID). Error: {e}"))?;
+    Ok(WorkerId::from_string(raw.to_string()))
+}
+
+/// Parse worker ID from path parameter, returning an error response on failure.
+fn parse_worker_id_or_error(raw: &str) -> Result<WorkerId, Box<Response>> {
+    parse_worker_id(raw).map_err(|msg| {
+        let error = WorkerErrorResponse {
+            error: msg,
+            code: "BAD_REQUEST".to_string(),
+        };
+        Box::new((StatusCode::BAD_REQUEST, Json(error)).into_response())
+    })
+}
+
+async fn get_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+) -> Response {
+    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
+        Ok(id) => id,
+        Err(resp) => return *resp,
+    };
     let job_queue = state
         .context
         .worker_job_queue
         .get()
         .expect("JobQueue not initialized");
 
-    if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+    if let Some(worker) = state.context.worker_registry.get(&worker_id) {
         // Worker exists in registry, get its full info and attach job status if any
+        let worker_url = worker.url().to_string();
         let mut worker_info = worker_to_info(&worker);
-        if let Some(status) = job_queue.get_status(&url) {
+        worker_info.id = worker_id.as_str().to_string();
+        if let Some(status) = job_queue.get_status(&worker_url) {
             worker_info.job_status = Some(status);
         }
         return Json(worker_info).into_response();
     }
 
-    // Worker not in registry, check job queue for its status
-    if let Some(status) = job_queue.get_status(&url) {
-        // Create a partial WorkerInfo to report the job status
-        let worker_info = WorkerInfo {
-            id: url.clone(),
-            url: url.clone(),
-            model_id: "unknown".to_string(),
-            priority: 0,
-            cost: 1.0,
-            worker_type: "unknown".to_string(),
-            is_healthy: false,
-            load: 0,
-            connection_mode: "unknown".to_string(),
-            runtime_type: None,
-            tokenizer_path: None,
-            reasoning_parser: None,
-            tool_parser: None,
-            chat_template: None,
-            bootstrap_port: None,
-            metadata: HashMap::new(),
-            job_status: Some(status),
-        };
-        return Json(worker_info).into_response();
+    // Worker not in registry yet. If we can map id -> url (reserved IDs), return job status.
+    if let Some(worker_url) = state.context.worker_registry.get_url_by_id(&worker_id) {
+        if let Some(status) = job_queue.get_status(&worker_url) {
+            let worker_info = WorkerInfo::pending(worker_id.as_str(), worker_url, Some(status));
+            return Json(worker_info).into_response();
+        }
     }
 
     // Worker not found in registry or job queue
     let error = WorkerErrorResponse {
-        error: format!("Worker {url} not found"),
+        error: format!("Worker {worker_id_raw} not found"),
         code: "WORKER_NOT_FOUND".to_string(),
     };
     (StatusCode::NOT_FOUND, Json(error)).into_response()
 }
 
-async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    let worker_id = url.clone();
+async fn delete_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+) -> Response {
+    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
+        Ok(id) => id,
+        Err(resp) => return *resp,
+    };
+
+    let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
+        let error = WorkerErrorResponse {
+            error: format!("Worker {worker_id_raw} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        };
+        return (StatusCode::NOT_FOUND, Json(error)).into_response();
+    };
+
     let job = Job::RemoveWorker { url };
 
     let job_queue = state
@@ -575,7 +632,7 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<Strin
         Ok(_) => {
             let response = json!({
                 "status": "accepted",
-                "worker_id": worker_id,
+                "worker_id": worker_id.as_str(),
                 "message": "Worker removal queued for background processing"
             });
             (StatusCode::ACCEPTED, Json(response)).into_response()
@@ -592,10 +649,22 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<Strin
 
 async fn update_worker(
     State(state): State<Arc<AppState>>,
-    Path(url): Path<String>,
+    Path(worker_id_raw): Path<String>,
     Json(update): Json<WorkerUpdateRequest>,
 ) -> Response {
-    let worker_id = url.clone();
+    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
+        Ok(id) => id,
+        Err(resp) => return *resp,
+    };
+
+    let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
+        let error = WorkerErrorResponse {
+            error: format!("Worker {worker_id_raw} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        };
+        return (StatusCode::NOT_FOUND, Json(error)).into_response();
+    };
+
     let job = Job::UpdateWorker {
         url,
         update: Box::new(update),
@@ -610,7 +679,7 @@ async fn update_worker(
         Ok(_) => {
             let response = json!({
                 "status": "accepted",
-                "worker_id": worker_id,
+                "worker_id": worker_id.as_str(),
                 "message": "Worker update queued for background processing"
             });
             (StatusCode::ACCEPTED, Json(response)).into_response()
@@ -636,6 +705,7 @@ pub struct ServerConfig {
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
+    pub shutdown_grace_period_secs: u64,
 }
 
 pub fn build_app(
@@ -705,6 +775,8 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/parse/function_call", post(parse_function_call))
+        .route("/parse/reasoning", post(parse_reasoning))
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
@@ -714,10 +786,9 @@ pub fn build_app(
         ));
 
     let worker_routes = Router::new()
-        .route("/workers", post(create_worker))
-        .route("/workers", get(list_workers_rest))
+        .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
-            "/workers/{url}",
+            "/workers/{worker_id}",
             get(get_worker).put(update_worker).delete(delete_worker),
         )
         .route_layer(axum::middleware::from_fn_with_state(
@@ -835,7 +906,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
-    info!(
+    debug!(
         "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
@@ -878,7 +949,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         let refresh_interval = Duration::from_secs(600); // 10 minutes
         let _refresh_handle =
             Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
-        info!("Started background refresh for all MCP servers (every 10 minutes)");
+        debug!("Started background refresh for all MCP servers (every 10 minutes)");
     }
 
     let worker_stats = app_context.worker_registry.stats();
@@ -893,14 +964,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let _health_checker = app_context
         .worker_registry
         .start_health_checker(config.router_config.health_check.check_interval_secs);
-    info!(
+    debug!(
         "Started health checker for workers with {}s interval",
         config.router_config.health_check.check_interval_secs
     );
 
     if let Some(ref load_monitor) = app_context.load_monitor {
         load_monitor.start().await;
-        info!("Started LoadMonitor for PowerOfTwo policies");
+        debug!("Started LoadMonitor for PowerOfTwo policies");
     }
 
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
@@ -916,13 +987,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     match processor {
         Some(proc) => {
             spawn(proc.run());
-            info!(
+            debug!(
                 "Started request queue (size: {}, timeout: {}s)",
                 config.router_config.queue_size, config.router_config.queue_timeout_secs
             );
         }
         None => {
-            info!(
+            debug!(
                 "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
                 config.router_config.max_concurrent_requests
             );
@@ -985,6 +1056,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let bind_addr = format!("{}:{}", config.host, config.port);
     info!("Starting server on {}", bind_addr);
 
+    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| format!("Invalid address: {}", e))?;
+
+    let handle = axum_server::Handle::new();
+    let handle_clone = handle.clone();
+    let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
+    spawn(async move {
+        shutdown_signal().await;
+        handle_clone.graceful_shutdown(Some(grace_period));
+    });
+
     if let (Some(cert), Some(key)) = (
         &config.router_config.server_cert,
         &config.router_config.server_key,
@@ -998,28 +1082,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| format!("Failed to create TLS config: {}", e))?;
 
-        let addr: std::net::SocketAddr = bind_addr
-            .parse()
-            .map_err(|e| format!("Invalid address: {}", e))?;
-
-        let handle = axum_server::Handle::new();
-        let handle_clone = handle.clone();
-        spawn(async move {
-            shutdown_signal().await;
-            handle_clone.graceful_shutdown(None);
-        });
-
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
             .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     } else {
-        let listener = TcpListener::bind(&bind_addr)
-            .await
-            .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
-        serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     }
