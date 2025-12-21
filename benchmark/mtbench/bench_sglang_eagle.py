@@ -5,6 +5,7 @@ Benchmark SGLang EAGLE/EAGLE3 Speculative Decoding
 
 Usage:
 python3 benchmark/mtbench/bench_sglang_eagle.py --num-questions 80 --parallel 1
+python3 benchmark/mtbench/bench_sglang_eagle.py --temperature 0.7 --top-k 50
 """
 
 import argparse
@@ -71,7 +72,8 @@ def main(args):
     tic = time.perf_counter()
     rets = answer_mt_bench.run_batch(
         arguments,
-        temperature=0,
+        temperature=args.temperature,
+        top_k=args.top_k,
         max_new_tokens=2048,
         num_threads=args.parallel,
         progress_bar=True,
@@ -123,6 +125,8 @@ def main(args):
             "other": {
                 "num_questions": args.num_questions,
                 "parallel": args.parallel,
+                "temperature": args.temperature,
+                "top_k": args.top_k,
             },
         }
         fout.write(json.dumps(value) + "\n")
@@ -133,5 +137,18 @@ if __name__ == "__main__":
     parser.add_argument("--question-file", type=str, default="question.jsonl")
     parser.add_argument("--answer-file", type=str, default=None)
     parser.add_argument("--num-questions", type=int, default=80)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature. Note: temperature in [0, ~0) triggers greedy (top_k=1) in SGLang.",
+    )
+    parser.add_argument(
+        "--top-k",
+        dest="top_k",
+        type=int,
+        default=1,
+        help="Top-k sampling. Use -1 to disable (whole vocabulary). Use 1 for greedy.",
+    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)

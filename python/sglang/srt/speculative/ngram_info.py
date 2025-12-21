@@ -342,9 +342,6 @@ class NgramVerifyInput(SpecInput):
             )
 
         target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-        draft_probs = torch.zeros(
-            target_probs.shape, dtype=torch.float32, device=self.device
-        )
 
         # coins for rejection sampling
         coins = torch.rand_like(candidates, dtype=torch.float32, device=self.device)
@@ -363,7 +360,6 @@ class NgramVerifyInput(SpecInput):
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=draft_probs,
             threshold_single=get_global_server_args().speculative_accept_threshold_single,
             threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
             deterministic=True,

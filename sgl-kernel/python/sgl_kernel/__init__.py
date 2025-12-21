@@ -122,6 +122,7 @@ from sgl_kernel.speculative import (
     reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
+    tree_speculative_sampling_target_only_rejmask,
     verify_tree_greedy,
 )
 from sgl_kernel.top_k import (
