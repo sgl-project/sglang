@@ -52,6 +52,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh
+          pip install ray
 
       - name: Run auto tune
         run: |
