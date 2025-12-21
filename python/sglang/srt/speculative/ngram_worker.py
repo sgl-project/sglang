@@ -305,7 +305,7 @@ class NGRAMWorker:
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
-            verify_input = model_worker_batch.spec_info
+            verify_input: NgramVerifyInput = model_worker_batch.spec_info
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size
             )
