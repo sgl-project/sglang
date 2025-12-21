@@ -18,7 +18,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
-use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
@@ -30,7 +29,7 @@ use crate::{
             create_worker_registration_workflow, create_worker_removal_workflow,
             create_worker_update_workflow,
         },
-        worker_to_info, Job, JobQueue, JobQueueConfig, WorkerId, WorkerManager, WorkerType,
+        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -48,7 +47,7 @@ use crate::{
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
-        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest},
+        worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{conversations, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
@@ -465,185 +464,38 @@ async fn create_worker(
     State(state): State<Arc<AppState>>,
     Json(config): Json<WorkerConfigRequest>,
 ) -> Response {
-    // Warn if router has API key but worker is being added without one
-    if state.context.router_config.api_key.is_some() && config.api_key.is_none() {
-        warn!(
-            "Adding worker {} without API key while router has API key configured. \
-            Worker will be accessible without authentication. \
-            If the worker requires the same API key as the router, please specify it explicitly.",
-            config.url
-        );
-    }
-
-    // Populate dp_aware from router's configuration
-    let config = WorkerConfigRequest {
-        dp_aware: state.context.router_config.dp_aware,
-        ..config
-    };
-
-    // Submit job for async processing
-    let worker_url = config.url.clone();
-    let worker_id = state
-        .context
-        .worker_registry
-        .reserve_id_for_url(&worker_url);
-    let job = Job::AddWorker {
-        config: Box::new(config),
-    };
-
-    let job_queue = state
-        .context
-        .worker_job_queue
-        .get()
-        .expect("JobQueue not initialized");
-    match job_queue.submit(job).await {
-        Ok(_) => {
-            let location = format!("/workers/{}", worker_id.as_str());
-            let response = json!({
-                "status": "accepted",
-                "worker_id": worker_id.as_str(),
-                "url": worker_url,
-                "location": location,
-                "message": "Worker addition queued for background processing"
-            });
-            (
-                StatusCode::ACCEPTED,
-                [(http::header::LOCATION, location)],
-                Json(response),
-            )
-                .into_response()
-        }
-        Err(error) => {
-            let error_response = WorkerErrorResponse {
-                error,
-                code: "INTERNAL_SERVER_ERROR".to_string(),
-            };
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
-        }
+    match state.context.worker_service.create_worker(config).await {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
     }
 }
 
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
-    let workers = state.context.worker_registry.get_all_with_ids();
-    let worker_infos: Vec<WorkerInfo> = workers
-        .iter()
-        .map(|(worker_id, worker)| {
-            let mut info = worker_to_info(worker);
-            info.id = worker_id.as_str().to_string();
-            info
-        })
-        .collect();
-
-    let response = json!({
-        "workers": worker_infos,
-        "total": workers.len(),
-        "stats": {
-            "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
-            "decode_count": state.context.worker_registry.get_decode_workers().len(),
-            "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
-        }
-    });
-    Json(response).into_response()
-}
-
-fn parse_worker_id(raw: &str) -> Result<WorkerId, String> {
-    Uuid::parse_str(raw)
-        .map_err(|e| format!("Invalid worker_id '{raw}' (expected UUID). Error: {e}"))?;
-    Ok(WorkerId::from_string(raw.to_string()))
-}
-
-/// Parse worker ID from path parameter, returning an error response on failure.
-fn parse_worker_id_or_error(raw: &str) -> Result<WorkerId, Box<Response>> {
-    parse_worker_id(raw).map_err(|msg| {
-        let error = WorkerErrorResponse {
-            error: msg,
-            code: "BAD_REQUEST".to_string(),
-        };
-        Box::new((StatusCode::BAD_REQUEST, Json(error)).into_response())
-    })
+    state.context.worker_service.list_workers().into_response()
 }
 
 async fn get_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
 ) -> Response {
-    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
-        Ok(id) => id,
-        Err(resp) => return *resp,
-    };
-    let job_queue = state
-        .context
-        .worker_job_queue
-        .get()
-        .expect("JobQueue not initialized");
-
-    if let Some(worker) = state.context.worker_registry.get(&worker_id) {
-        // Worker exists in registry, get its full info and attach job status if any
-        let worker_url = worker.url().to_string();
-        let mut worker_info = worker_to_info(&worker);
-        worker_info.id = worker_id.as_str().to_string();
-        if let Some(status) = job_queue.get_status(&worker_url) {
-            worker_info.job_status = Some(status);
-        }
-        return Json(worker_info).into_response();
+    match state.context.worker_service.get_worker(&worker_id_raw) {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
     }
-
-    // Worker not in registry yet. If we can map id -> url (reserved IDs), return job status.
-    if let Some(worker_url) = state.context.worker_registry.get_url_by_id(&worker_id) {
-        if let Some(status) = job_queue.get_status(&worker_url) {
-            let worker_info = WorkerInfo::pending(worker_id.as_str(), worker_url, Some(status));
-            return Json(worker_info).into_response();
-        }
-    }
-
-    // Worker not found in registry or job queue
-    let error = WorkerErrorResponse {
-        error: format!("Worker {worker_id_raw} not found"),
-        code: "WORKER_NOT_FOUND".to_string(),
-    };
-    (StatusCode::NOT_FOUND, Json(error)).into_response()
 }
 
 async fn delete_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
 ) -> Response {
-    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
-        Ok(id) => id,
-        Err(resp) => return *resp,
-    };
-
-    let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
-        let error = WorkerErrorResponse {
-            error: format!("Worker {worker_id_raw} not found"),
-            code: "WORKER_NOT_FOUND".to_string(),
-        };
-        return (StatusCode::NOT_FOUND, Json(error)).into_response();
-    };
-
-    let job = Job::RemoveWorker { url };
-
-    let job_queue = state
+    match state
         .context
-        .worker_job_queue
-        .get()
-        .expect("JobQueue not initialized");
-    match job_queue.submit(job).await {
-        Ok(_) => {
-            let response = json!({
-                "status": "accepted",
-                "worker_id": worker_id.as_str(),
-                "message": "Worker removal queued for background processing"
-            });
-            (StatusCode::ACCEPTED, Json(response)).into_response()
-        }
-        Err(error) => {
-            let error_response = WorkerErrorResponse {
-                error,
-                code: "INTERNAL_SERVER_ERROR".to_string(),
-            };
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
-        }
+        .worker_service
+        .delete_worker(&worker_id_raw)
+        .await
+    {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
     }
 }
 
@@ -652,45 +504,14 @@ async fn update_worker(
     Path(worker_id_raw): Path<String>,
     Json(update): Json<WorkerUpdateRequest>,
 ) -> Response {
-    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
-        Ok(id) => id,
-        Err(resp) => return *resp,
-    };
-
-    let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
-        let error = WorkerErrorResponse {
-            error: format!("Worker {worker_id_raw} not found"),
-            code: "WORKER_NOT_FOUND".to_string(),
-        };
-        return (StatusCode::NOT_FOUND, Json(error)).into_response();
-    };
-
-    let job = Job::UpdateWorker {
-        url,
-        update: Box::new(update),
-    };
-
-    let job_queue = state
+    match state
         .context
-        .worker_job_queue
-        .get()
-        .expect("JobQueue not initialized");
-    match job_queue.submit(job).await {
-        Ok(_) => {
-            let response = json!({
-                "status": "accepted",
-                "worker_id": worker_id.as_str(),
-                "message": "Worker update queued for background processing"
-            });
-            (StatusCode::ACCEPTED, Json(response)).into_response()
-        }
-        Err(error) => {
-            let error_response = WorkerErrorResponse {
-                error,
-                code: "INTERNAL_SERVER_ERROR".to_string(),
-            };
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
-        }
+        .worker_service
+        .update_worker(&worker_id_raw, update)
+        .await
+    {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
     }
 }
 
