@@ -125,8 +125,10 @@ class RMSNorm(CustomOp):
             # but right now we can only have hidden_states+(residual+post_residual_addition).
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
             # we probably need to add another parameter to fused_add_rmsnorm
-            post_residual_addition = kwargs.get("post_residual_addition", 0.0)
-            residual = residual + post_residual_addition
+            post_residual_addition = kwargs.get("post_residual_addition")
+            residual = residual + (
+                post_residual_addition if post_residual_addition is not None else 0.0
+            )
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
