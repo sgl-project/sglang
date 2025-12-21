@@ -10,6 +10,8 @@ from typing import Callable, List, Optional, Union
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.ci.ci_register import CIRegistry
 
+# Configure logger to output to stdout
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
