@@ -40,6 +40,7 @@ python -m sglang.launch_server [args] \
   --remote-instance-weight-loader-start-seed-via-transfer-engine
 ```
 
+client instance:
 ```shell
 python -m sglang.launch_server [args] \
   --load-format remote_instance \
