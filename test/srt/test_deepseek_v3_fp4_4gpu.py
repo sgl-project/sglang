@@ -81,6 +81,7 @@ class TestDeepseekV3FP4(CustomTestCase):
 
         self.assertGreater(speed, 75)
 
+
 class TestDeepseekV3FP4PiecewiseCudaGraph(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -146,6 +147,7 @@ class TestDeepseekV3FP4PiecewiseCudaGraph(CustomTestCase):
             )
 
         self.assertGreater(speed, 120)
+
 
 if __name__ == "__main__":
     unittest.main()
