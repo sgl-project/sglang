@@ -2,13 +2,7 @@ import numpy as np
 import pytest
 import tabulate
 import torch
-
-skip_condition = torch.cuda.get_device_capability() >= (10, 0)
-if not skip_condition:
-    from diffusers.models.embeddings import get_timestep_embedding
-    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
-
-    from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
 
 
 @pytest.mark.parametrize(
@@ -18,10 +12,9 @@ if not skip_condition:
 @pytest.mark.parametrize(
     "dtype", [torch.int32, torch.int64, torch.bfloat16, torch.float16]
 )
-@pytest.mark.skipif(
-    skip_condition, reason="Skip diffusion kernel tests for SM100 or above"
-)
 def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
+    from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
     torch_output = timestep_embedding(t, dim)
@@ -36,11 +29,14 @@ def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
 @pytest.mark.parametrize("downscale_freq_shift", [0, 1])
 @pytest.mark.parametrize("scale", [1, 0.01])
 @pytest.mark.skipif(
-    skip_condition, reason="Skip diffusion kernel tests for SM100 or above"
+    torch.cuda.get_device_capability() >= (10, 0),
+    reason="Skip diffuser kernel test for SM100 or above",
 )
 def test_timestep_embedding_correctness_with_diffusers(
     batch_size, dim, flip_sin_to_cos, downscale_freq_shift, scale, dtype
 ):
+    from diffusers.models.embeddings import get_timestep_embedding
+
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
     torch_output = get_timestep_embedding(
