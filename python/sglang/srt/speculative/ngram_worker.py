@@ -207,7 +207,7 @@ class NGRAMWorker:
         # Extract args
         top_logprobs_nums = batch.top_logprobs_nums
         token_ids_logprobs = batch.token_ids_logprobs
-        accepted_indices = res.accept_index
+        accepted_indices = res.accepted_indices
         assert len(accepted_indices) == len(logits_output.next_token_logits)
 
         temperatures = batch.sampling_info.temperatures
