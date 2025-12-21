@@ -1,10 +1,10 @@
-import base64
 import io
 import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import openai
+import pybase64
 import requests
 from PIL import Image
 
@@ -32,17 +32,29 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
     model: str
     extra_args: list = []
     fixed_args: list = ["--trust-remote-code", "--enable-multimodal"]
+    trust_remote_code: bool = True
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
+
+        # Build other_args: always include extra_args, conditionally include fixed_args
+        other_args = list(cls.extra_args)
+        if cls.trust_remote_code:
+            other_args.extend(cls.fixed_args)
+        else:
+            # Exclude --trust-remote-code but keep other fixed args like --enable-multimodal
+            other_args.extend(
+                arg for arg in cls.fixed_args if arg != "--trust-remote-code"
+            )
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=cls.extra_args + cls.fixed_args,
+            other_args=other_args,
         )
         cls.base_url += "/v1"
 
@@ -386,7 +398,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             pil_img = Image.fromarray(frame)
             buff = io.BytesIO()
             pil_img.save(buff, format="JPEG")
-            base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
+            base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
             base64_frames.append(base64_str)
 
         messages = [{"role": "user", "content": []}]

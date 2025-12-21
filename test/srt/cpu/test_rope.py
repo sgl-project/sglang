@@ -1,6 +1,5 @@
 import unittest
 
-import sgl_kernel
 import torch
 from utils import precision
 
@@ -8,6 +7,7 @@ from sglang.srt.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     RotaryEmbedding,
 )
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(1234)
@@ -24,6 +24,7 @@ class TestROPE(CustomTestCase):
         k_dim = 576
         rotary_dim = 64
         is_neox_style = False
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
         # Create cos_sin_cache
         freqs = torch.rand(max_pos, qk_rope_head_dim // 2)
@@ -87,6 +88,7 @@ class TestROPE(CustomTestCase):
             rotary_dim: int,
             max_position_embeddings: int,
             base: int,
+            dims: int,
             is_neox_style: bool,
             dtype: torch.dtype,
             device: str,
@@ -95,6 +97,7 @@ class TestROPE(CustomTestCase):
             num_q_heads: int,
             num_kv_heads: int,
         ):
+            set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
             torch.manual_seed(100)
             rope_ref = RotaryEmbedding(
                 head_size,
@@ -117,7 +120,9 @@ class TestROPE(CustomTestCase):
                 dtype=dtype,
                 device=device,
             )
-
+            if dims == 4:
+                query = query.view(batch_size, seq_len, num_q_heads, head_size)
+                key = key.view(batch_size, seq_len, num_kv_heads, head_size)
             query_ref, key_ref = query.clone(), key.clone()
             query_cpu, key_cpu = query.clone(), key.clone()
 
@@ -159,19 +164,21 @@ class TestROPE(CustomTestCase):
             num_q_heads,
             num_kv_heads,
         ) in test_config:
-            single_test(
-                head_size,
-                rotary_dim,
-                max_position_embeddings,
-                base,
-                is_neox_style,
-                dtype,
-                device,
-                batch_size,
-                seq_len,
-                num_q_heads,
-                num_kv_heads,
-            )
+            for dim in [2, 4]:
+                single_test(
+                    head_size,
+                    rotary_dim,
+                    max_position_embeddings,
+                    base,
+                    dim,
+                    is_neox_style,
+                    dtype,
+                    device,
+                    batch_size,
+                    seq_len,
+                    num_q_heads,
+                    num_kv_heads,
+                )
 
 
 if __name__ == "__main__":

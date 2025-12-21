@@ -17,33 +17,56 @@ import torch
 from packaging import version
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
+
+if _is_npu:
+    from torch_npu.multiprocessing import reductions as npu_reductions
+
+    def _rebuild_npu_tensor_modified(*args):
+        args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, npu_verl_to_sglang)
+        return npu_reductions._rebuild_npu_tensor_original(*args)
+
+    def npu_verl_to_sglang(device: int):
+        assert (
+            SGLANG_TP_RANK is not None
+        ), "SGLANG_TP_RANK is not registered. Please call register_sgl_tp_rank() first."
+        return SGLANG_TP_RANK
+
+
+SGLANG_TP_RANK = None
 
 
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
 
-    # Currently, NPU does not support UUID. This has been temporarily commented out, with support expected in the fourth quarter.
-    if _is_npu:
-        return
+    if not _is_npu:
+        if hasattr(reductions, "_reduce_tensor_original"):
+            return
+        reductions._reduce_tensor_original = reductions.reduce_tensor
+        reductions._rebuild_cuda_tensor_original = reductions.rebuild_cuda_tensor
 
-    if hasattr(reductions, "_reduce_tensor_original"):
-        return
+        reductions.reduce_tensor = _reduce_tensor_modified
+        reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
+        reductions.init_reductions()
+    else:
+        # FIXME: This is a temp patch for npu as HDK does not support device uuid for now
+        if hasattr(npu_reductions, "_rebuild_npu_tensor_original"):
+            return
 
-    reductions._reduce_tensor_original = reductions.reduce_tensor
-    reductions._rebuild_cuda_tensor_original = reductions.rebuild_cuda_tensor
-
-    reductions.reduce_tensor = _reduce_tensor_modified
-    reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
-
-    reductions.init_reductions()
+        npu_reductions._rebuild_npu_tensor_original = npu_reductions.rebuild_npu_tensor
+        npu_reductions.rebuild_npu_tensor = _rebuild_npu_tensor_modified
 
 
 # The signature has not been changed for years, and we will not need this when the next version is released,
 # so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
+
+
+def register_sgl_tp_rank(rank: int):
+    global SGLANG_TP_RANK
+    SGLANG_TP_RANK = rank
 
 
 def _reduce_tensor_modified(*args, **kwargs):
@@ -88,3 +111,29 @@ def monkey_patch_torch_compile():
 
         af.auto_functionalized_v2._cacheable = True
         af.auto_functionalized._cacheable = True
+
+
+def register_fake_if_exists(op_name):
+    """
+    Decorator factory to conditionally register a fake for a custom op if it exists.
+    Parses op_name (e.g., 'sgl_kernel::gptq_gemm'), checks if the op exists via hasattr
+    on the namespace attribute of torch.ops. Registers the fake if present; otherwise,
+    returns the function unchanged.
+    Args:
+        op_name (str): Full operator name (e.g., 'sgl_kernel::gptq_gemm').
+    Returns:
+        callable: Decorator for the fake function.
+    Example:
+        @register_fake_if_exists('sgl_kernel::gptq_gemm')
+        def fake_gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
+            return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
+    """
+
+    def decorator(func):
+        namespace, bare_op = op_name.split("::")
+        ops_namespace = getattr(torch.ops, namespace, None)
+        if ops_namespace and hasattr(ops_namespace, bare_op):
+            torch.library.register_fake(op_name, func)
+        return func
+
+    return decorator

@@ -22,7 +22,6 @@ To test a specific model locally:
 import dataclasses
 import multiprocessing as mp
 import os
-import random
 import unittest
 from typing import List
 
@@ -61,6 +60,7 @@ ALL_MODELS = [
     ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
     ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
+    ModelCase("shanearora/2025-sep-a-base-model"),
     ModelCase(
         "THUDM/glm-4-9b-chat", tp_size=2, trust_remote_code=True, skip_long_prompt=True
     ),
