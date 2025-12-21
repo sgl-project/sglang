@@ -294,7 +294,11 @@ mod tests {
 
         assert!(!inventory.has_tool("server1.check_tool"));
 
-        inventory.insert_tool("server1.check_tool".to_string(), "server1".to_string(), tool);
+        inventory.insert_tool(
+            "server1.check_tool".to_string(),
+            "server1".to_string(),
+            tool,
+        );
 
         assert!(inventory.has_tool("server1.check_tool"));
     }

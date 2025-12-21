@@ -263,10 +263,7 @@ async fn test_concurrent_tool_execution() {
     // Execute tools sequentially (true concurrent execution would require Arc<Mutex>)
     let tool_calls = vec![
         ("mock_server.brave_web_search", json!({"query": "test1"})),
-        (
-            "mock_server.brave_local_search",
-            json!({"query": "test2"}),
-        ),
+        ("mock_server.brave_local_search", json!({"query": "test2"})),
     ];
 
     for (tool_name, args) in tool_calls {
@@ -383,10 +380,7 @@ async fn test_tool_info_structure() {
         .find(|t| t.name.as_ref() == "mock_server.brave_web_search")
         .expect("Should have brave_web_search tool");
 
-    assert_eq!(
-        brave_search.name.as_ref(),
-        "mock_server.brave_web_search"
-    );
+    assert_eq!(brave_search.name.as_ref(), "mock_server.brave_web_search");
     assert!(brave_search
         .description
         .as_ref()
