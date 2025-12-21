@@ -472,6 +472,11 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640  # TODO: allow user to set resolution
 
+    def _prepare_edit_cond_kwargs(
+        self, batch, prompt_embeds, rotary_emb, device, dtype
+    ):
+        return {"additional_t_cond": torch.tensor([0], device=device, dtype=torch.long)}
+
 
 #     image_caption_prompt_cn: str = """<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n# 图像标注器\n你是一个专业的图像标注器。请基于输入图像，撰写图注:\n1.
 # 使用自然、描述性的语言撰写图注，不要使用结构化形式或富文本形式。\n2. 通过加入以下内容，丰富图注细节：\n - 对象的属性：如数量、颜色、形状、大小、位置、材质、状态、动作等\n -

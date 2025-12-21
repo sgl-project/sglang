@@ -654,6 +654,7 @@ class DenoisingStage(PipelineStage):
                 )
             ),
         )
+        print(f"657 {pos_cond_kwargs=}", flush=True)
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
@@ -977,6 +978,8 @@ class DenoisingStage(PipelineStage):
         image_kwargs = prepared_vars["image_kwargs"]
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
         neg_cond_kwargs = prepared_vars["neg_cond_kwargs"]
+        print(f"981 {pos_cond_kwargs=}", flush=True)
+        print(f"982 {neg_cond_kwargs=}", flush=True)
         latents = prepared_vars["latents"]
         boundary_timestep = prepared_vars["boundary_timestep"]
         z = prepared_vars["z"]
