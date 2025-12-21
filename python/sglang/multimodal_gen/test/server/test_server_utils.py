@@ -60,7 +60,7 @@ def download_image_from_url(url: str) -> Path:
     # Determine file extension from URL
     ext = ".jpg"  # default
     if url.lower().endswith((".png", ".jpeg", ".jpg", ".webp", ".gif")):
-        ext = url[url.rfind(".") :]
+        ext = url[url.rfind("."):]
 
     # Create temporary file
     temp_file = (
@@ -143,7 +143,7 @@ class ServerContext:
                 d
                 for d in os.listdir(hf_hub_cache)
                 if d.startswith("models--")
-                and os.path.isdir(os.path.join(hf_hub_cache, d))
+                   and os.path.isdir(os.path.join(hf_hub_cache, d))
             ]
 
             # If there are cached models but no persistent marker, clean up
@@ -237,7 +237,7 @@ class ServerManager:
                 if total_used < 5 * 1024 * 1024 * 1024:  # 5GB
                     logger.info(
                         "[server-test] ROCm GPU memory is clear (used: %.2f GB)",
-                        total_used / (1024**3),
+                        total_used / (1024 ** 3),
                     )
                     return
 
@@ -246,13 +246,13 @@ class ServerManager:
                 if total_used < last_total_used:
                     logger.info(
                         "[server-test] ROCm: GPU memory clearing (used: %.2f GB, elapsed: %ds)",
-                        total_used / (1024**3),
+                        total_used / (1024 ** 3),
                         elapsed,
                     )
                 else:
                     logger.info(
                         "[server-test] ROCm: Waiting for GPU memory (used: %.2f GB, elapsed: %ds)",
-                        total_used / (1024**3),
+                        total_used / (1024 ** 3),
                         elapsed,
                     )
                 last_total_used = total_used
@@ -263,7 +263,7 @@ class ServerManager:
                 "[server-test] ROCm GPU memory not fully cleared after %.0fs (used: %.2f GB). "
                 "Proceeding anyway - this may cause OOM.",
                 max_wait,
-                total_used / (1024**3),
+                total_used / (1024 ** 3),
             )
         except Exception as e:
             logger.debug("[server-test] Could not check ROCm GPU memory: %s", e)
@@ -361,6 +361,8 @@ class ServerManager:
         """Wait for server to become ready."""
         start = time.time()
         ready_message = "Application startup complete."
+        log_period = 30
+        prev_log_period_count = 0
 
         while time.time() - start < self.wait_deadline:
             if process.poll() is not None:
@@ -379,8 +381,10 @@ class ServerManager:
                     logger.debug("Could not read log yet: %s", e)
 
             elapsed = int(time.time() - start)
-            logger.info("[server-test] Waiting for server... elapsed=%ss", elapsed)
-            time.sleep(5)
+            if (elapsed // log_period) > prev_log_period_count:
+                prev_log_period_count = elapsed // log_period
+                logger.info("[server-test] Waiting for server... elapsed=%ss", elapsed)
+            time.sleep(1)
 
         tail = self._get_log_tail(stdout_path)
         raise TimeoutError(f"Server not ready within {self.wait_deadline}s.\n{tail}")
