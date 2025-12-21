@@ -264,6 +264,7 @@ class ServerArgs:
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
+    limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
 
@@ -572,6 +573,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
+    enable_return_routed_experts: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -2367,6 +2369,29 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
+        # Validate limit_mm_per_prompt modalities
+        if self.limit_mm_data_per_request:
+            if isinstance(self.limit_mm_data_per_request, str):
+                self.limit_mm_data_per_request = json.loads(
+                    self.limit_mm_data_per_request
+                )
+
+            if isinstance(self.limit_mm_data_per_request, dict):
+                allowed_modalities = {"image", "video", "audio"}
+                for modality in self.limit_mm_data_per_request.keys():
+                    if modality not in allowed_modalities:
+                        raise ValueError(
+                            f"Invalid modality '{modality}' in --limit-mm-data-per-request."
+                            f"Allowed modalities are: {list(allowed_modalities)}"
+                        )
+
+        # Validate preferred_sampling_params
+        if self.preferred_sampling_params:
+            if isinstance(self.preferred_sampling_params, str):
+                self.preferred_sampling_params = json.loads(
+                    self.preferred_sampling_params
+                )
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
@@ -2454,6 +2479,13 @@ class ServerArgs:
             default=ServerArgs.enable_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="Limit the number of multimodal inputs per request. "
+            'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
         )
         parser.add_argument(
             "--revision",
@@ -3135,7 +3167,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--preferred-sampling-params",
-            type=str,
+            type=json.loads,
             help="json-formatted sampling settings that will be returned in /get_model_info",
         )
 
@@ -4069,6 +4101,11 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--enable-return-routed-experts",
+            action="store_true",
+            help="Enable returning routed experts of each layer with responses.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",

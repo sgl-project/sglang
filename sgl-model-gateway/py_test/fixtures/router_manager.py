@@ -148,15 +148,16 @@ class RouterManager:
             r.status_code == 202
         ), f"add_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
 
-        # Poll until worker is actually added and healthy
-        from urllib.parse import quote
+        payload = r.json()
+        worker_id = payload.get("worker_id")
+        assert worker_id, f"add_worker did not return worker_id: {payload}"
 
-        encoded_url = quote(worker_url, safe="")
+        # Poll until worker is actually added and healthy
         start = time.time()
         with requests.Session() as s:
             while time.time() - start < timeout:
                 try:
-                    r = s.get(f"{base_url}/workers/{encoded_url}", timeout=2)
+                    r = s.get(f"{base_url}/workers/{worker_id}", timeout=2)
                     if r.status_code == 200:
                         data = r.json()
                         # Check if registration job failed
@@ -179,11 +180,20 @@ class RouterManager:
     def remove_worker(
         self, base_url: str, worker_url: str, timeout: float = 30.0
     ) -> None:
-        # URL encode the worker_url for path parameter
-        from urllib.parse import quote
+        # Resolve worker_id from the current registry snapshot
+        r_list = requests.get(f"{base_url}/workers")
+        assert (
+            r_list.status_code == 200
+        ), f"list_workers failed: {r_list.status_code} {r_list.text}"
+        workers = r_list.json().get("workers", [])
+        worker_id = next(
+            (w.get("id") for w in workers if w.get("url") == worker_url), None
+        )
+        assert (
+            worker_id
+        ), f"could not find worker_id for url={worker_url}. workers={workers}"
 
-        encoded_url = quote(worker_url, safe="")
-        r = requests.delete(f"{base_url}/workers/{encoded_url}")
+        r = requests.delete(f"{base_url}/workers/{worker_id}")
         assert (
             r.status_code == 202
         ), f"remove_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
@@ -194,7 +204,7 @@ class RouterManager:
         with requests.Session() as s:
             while time.time() - start < timeout:
                 try:
-                    r = s.get(f"{base_url}/workers/{encoded_url}", timeout=2)
+                    r = s.get(f"{base_url}/workers/{worker_id}", timeout=2)
                     if r.status_code == 404:
                         # Worker successfully removed
                         return
