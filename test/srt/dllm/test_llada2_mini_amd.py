@@ -63,8 +63,9 @@ class TestLLaDA2MiniAMD(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        # Relaxed threshold for AMD - may need adjustment
+        # Relaxed thresholds for AMD - may need adjustment
         self.assertGreater(metrics["accuracy"], 0.80)
+        self.assertGreater(metrics["output_throughput"], 50)
 
     def test_bs_1_speed(self):
         """Test single batch inference speed."""
