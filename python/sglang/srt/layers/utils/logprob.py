@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import dataclasses
+from enum import Enum, auto
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata
+
+
+class LogprobStage(Enum):
+    PREFILL = auto()
+    DECODE = auto()
 
 
 @dataclasses.dataclass
@@ -55,8 +61,8 @@ def compute_temp_top_p_normalized_logprobs(
 def get_top_logprobs_raw(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
+    stage: LogprobStage,
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
-    stage: str = "decode",
 ):
     max_k = max(top_logprobs_nums)
     values, indices = logprobs.topk(max_k, dim=-1)
@@ -66,7 +72,7 @@ def get_top_logprobs_raw(
     top_logprobs_val = []
     top_logprobs_idx = []
 
-    if stage == "decode":
+    if stage == LogprobStage.DECODE:
         for i, k in enumerate(top_logprobs_nums):
             top_logprobs_val.append(values[i][:k])
             top_logprobs_idx.append(indices[i][:k])
@@ -91,8 +97,8 @@ def get_top_logprobs_prefill(
     return get_top_logprobs_raw(
         all_logprobs,
         logits_metadata.top_logprobs_nums,
-        logits_metadata.extend_logprob_pruned_lens_cpu,
-        stage="prefill",
+        stage=LogprobStage.PREFILL,
+        extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
     )
 
 
@@ -100,18 +106,18 @@ def get_top_logprobs(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
 ):
-    return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage="decode")
+    return get_top_logprobs_raw(logprobs, top_logprobs_nums, stage=LogprobStage.DECODE)
 
 
 def get_token_ids_logprobs_raw(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[Optional[List[int]]],
+    stage: LogprobStage,
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
-    stage: str = "decode",
     delay_cpu_copy: bool = False,
 ):
     vals, idxs = [], []
-    if stage == "decode":
+    if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs):
             if token_ids is None:
                 vals.append([])
@@ -135,18 +141,22 @@ def get_token_ids_logprobs_raw(
     return vals, idxs
 
 
-def get_token_ids_logprobs_prefill(all_logprobs, logits_metadata, delay_cpu_copy=False):
+def get_token_ids_logprobs_prefill(
+    all_logprobs, logits_metadata: LogitsMetadata, delay_cpu_copy=False
+):
     return get_token_ids_logprobs_raw(
         all_logprobs,
         logits_metadata.token_ids_logprobs,
-        logits_metadata.extend_logprob_pruned_lens_cpu,
-        stage="prefill",
+        stage=LogprobStage.PREFILL,
+        extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
         delay_cpu_copy=delay_cpu_copy,
     )
 
 
 def get_token_ids_logprobs(logprobs, token_ids_logprobs):
-    return get_token_ids_logprobs_raw(logprobs, token_ids_logprobs, stage="decode")
+    return get_token_ids_logprobs_raw(
+        logprobs, token_ids_logprobs, stage=LogprobStage.DECODE
+    )
 
 
 def get_top_logprobs_chunk(
