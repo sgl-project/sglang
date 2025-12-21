@@ -47,7 +47,6 @@ use crate::{
 };
 
 /// Regular router that uses injected load balancing policies
-#[derive(Debug)]
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
@@ -58,9 +57,23 @@ pub struct Router {
     context: Option<Arc<AppContext>>,
 }
 
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("client", &self.client)
+            .field("dp_aware", &self.dp_aware)
+            .field("enable_igw", &self.enable_igw)
+            .field("retry_config", &self.retry_config)
+            .field("context", &"<AppContext>")
+            .finish()
+    }
+}
+
 impl Router {
     /// Create a new router with injected policy and client
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
