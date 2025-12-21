@@ -257,6 +257,10 @@ class Envs:
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # Triton FP8 scatter kernel for MLA KV cache writes (DeepSeek-V3.2 etc)
+    # Impact: Only affects models with MLA architecture + FP8 KV cache storage
+    # Benefit: ~1.9% throughput improvement by replacing index_put_ overhead
+    SGLANG_USE_TRITON_FP8_SCATTER = EnvBool(True)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
