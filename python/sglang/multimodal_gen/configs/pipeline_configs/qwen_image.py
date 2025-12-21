@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConf
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    maybe_unpad_latents,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
@@ -471,11 +472,48 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
 @dataclass
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640  # TODO: allow user to set resolution
+    vae_precision: str = "bf16"
 
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype
     ):
         return {"additional_t_cond": torch.tensor([0], device=device, dtype=torch.long)}
+
+    def _unpad_and_unpack_latents(self, latents, batch):
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        channels = self.dit_config.arch_config.in_channels
+        batch_size = latents.shape[0]
+        layers = batch.num_frames
+
+        height = 2 * (int(batch.height) // (vae_scale_factor * 2))
+        width = 2 * (int(batch.width) // (vae_scale_factor * 2))
+
+        latents = maybe_unpad_latents(latents, batch)
+        latents = latents.view(
+            batch_size, layers + 1, height // 2, width // 2, channels // 4, 2, 2
+        )
+        latents = latents.permute(0, 1, 4, 2, 5, 3, 6)
+
+        latents = latents.reshape(
+            batch_size, layers + 1, channels // (2 * 2), height, width
+        )
+        latents = latents.permute(0, 2, 1, 3, 4)  # (b, c, f, h, w)
+        return latents, batch_size, channels, height, width
+
+    def allow_set_num_frames(self):
+        return True
+
+    def post_denoising_loop(self, latents, batch):
+        # unpack latents for qwen-image
+        (
+            latents,
+            batch_size,
+            channels,
+            height,
+            width,
+        ) = self._unpad_and_unpack_latents(latents, batch)
+        # latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
+        return latents
 
 
 #     image_caption_prompt_cn: str = """<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n# 图像标注器\n你是一个专业的图像标注器。请基于输入图像，撰写图注:\n1.

@@ -133,6 +133,7 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae_scale_factor = (
             2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         )
+        print(f"136 {self.vae_scale_factor=}")
         self.image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor * 2
         )
@@ -247,6 +248,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
     @staticmethod
     def _pack_latents(latents, batch_size, num_channels_latents, height, width, layers):
+        print(f"400 {latents.shape=}")
         latents = latents.view(
             batch_size, layers, num_channels_latents, height // 2, 2, width // 2, 2
         )
@@ -346,7 +348,10 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         # latent height and width to be divisible by 2.
         height = 2 * (int(height) // (self.vae_scale_factor * 2))
         width = 2 * (int(width) // (self.vae_scale_factor * 2))
-
+        print(
+            f"349 {batch_size}, {layers=}, {num_channels_latents=}, {height=}, {width=}",
+            flush=True,
+        )
         shape = (
             batch_size,
             layers + 1,
@@ -418,6 +423,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
     ) -> Req:
         use_en_prompt = True
         device = get_local_torch_device()
+        print(f"421 {batch.num_frames=}", flush=True)
         layers = batch.num_frames
         num_inference_steps = batch.num_inference_steps
         generator = batch.generator
@@ -474,7 +480,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             device,
             generator,
         )
-
+        print(f"477 {latents.shape=}, {image_latents.shape=}", flush=True)
         img_shapes = [
             [
                 *[

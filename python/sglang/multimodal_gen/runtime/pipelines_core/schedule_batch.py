@@ -204,6 +204,7 @@ class Req:
 
     def output_file_path(self, num_outputs, output_idx):
         output_file_name = self.output_file_name
+        print(f"207 {output_file_name=}", flush=True)
         if num_outputs > 1 and output_file_name:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"

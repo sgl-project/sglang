@@ -728,7 +728,7 @@ class DenoisingStage(PipelineStage):
         batch.latents = self.server_args.pipeline_config.post_denoising_loop(
             latents, batch
         )
-
+        print(f"731 {batch.latents.dtype=}")
         # Save STA mask search results if needed
         if (
             st_attn_available
@@ -999,6 +999,7 @@ class DenoisingStage(PipelineStage):
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+        print(f"1002 {latents.shape=}")
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
