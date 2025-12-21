@@ -1,4 +1,3 @@
-import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -11,36 +10,42 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
+# Import hashing utilities (for backward compatibility, default to SHA-256)
+# The actual hash algorithm will be set via configure_hash_algorithm()
+_hash_algorithm = "sha256"
+
+
+def configure_hash_algorithm(algorithm: str = "sha256"):
+    """Configure the hash algorithm for prefix caching.
+
+    Args:
+        algorithm: Hash algorithm to use ('sha256' or 'xxhash')
+    """
+    global _hash_algorithm
+    _hash_algorithm = algorithm
+    logger.info(f"Configured prefix caching hash algorithm: {algorithm}")
+
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
-    hasher = hashlib.sha256()
+    """Compute hash string for token IDs using the configured algorithm.
 
-    if prior_hash:
-        hasher.update(bytes.fromhex(prior_hash))
+    This function maintains backward compatibility by defaulting to SHA-256.
+    Use configure_hash_algorithm() to change the hash algorithm.
+    """
+    from sglang.srt.utils.hashing import get_hash_str as _get_hash_str
 
-    for t in token_ids:
-        if isinstance(t, tuple):
-            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
-            for elem in t:
-                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
-        else:
-            # Regular mode: single integer token
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
-
-    return hasher.hexdigest()
+    return _get_hash_str(token_ids, prior_hash, algorithm=_hash_algorithm)
 
 
 def hash_str_to_int64(hash_str: str) -> int:
-    """Convert SHA256 hex string to signed 64-bit integer for events.
+    """Convert hash hex string to signed 64-bit integer for events.
 
     Takes first 16 hex characters (64 bits) and converts to signed int64 range.
+    Works with both SHA-256 and xxHash outputs.
     """
-    # Take first 16 hex chars to get 64-bit value
-    uint64_val = int(hash_str[:16], 16)
-    # Convert to signed int64 range [-2^63, 2^63-1]
-    if uint64_val >= 2**63:
-        return uint64_val - 2**64
-    return uint64_val
+    from sglang.srt.utils.hashing import hash_str_to_int64 as _hash_str_to_int64
+
+    return _hash_str_to_int64(hash_str)
 
 
 @dataclass

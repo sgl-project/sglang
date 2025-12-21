@@ -254,14 +254,16 @@ class MultimodalDataItem:
         if self.pad_value is not None:
             return
 
-        from sglang.srt.managers.mm_utils import hash_feature
+        from sglang.srt.managers.mm_utils import (
+            hash_feature_with_configurable_algorithm,
+        )
 
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
             else:
                 hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+            self.hash = hash_feature_with_configurable_algorithm(hashed_feature)
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 

@@ -120,6 +120,11 @@ test = [
 ]
 
 dev = ["sglang[test]"]
+hicache = [
+  # Optional dependency for faster prefix caching with xxHash
+  # Falls back to SHA-256 if not installed
+  "xxhash>=3.0.0",
+]
 
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
