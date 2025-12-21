@@ -13,6 +13,113 @@ def quantize_k_cache(cache_k):
         return _quantize_k_cache_slow(cache_k)
 
 
+def quantize_k_cache_separate(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    tile_size: int = 128,
+):
+    """
+    Quantize k_nope and k_rope separately without concat, returns two tensors.
+
+    This avoids the concat operation and enables direct reuse of set_mla_kv_buffer_triton
+    by returning two separate byte tensors for the nope and rope parts.
+
+    Args:
+        k_nope: (num_tokens, dim_nope) or (num_tokens, 1, dim_nope)
+                Must have dim_nope=512 for FP8 MLA quantization
+        k_rope: (num_tokens, dim_rope) or (num_tokens, 1, dim_rope)
+                Must have dim_rope=64 for FP8 MLA quantization
+        tile_size: quantization tile size (default 128)
+
+    Returns:
+        Tuple of (nope_part, rope_part) where:
+        - nope_part: (num_tokens, 1, 528) as uint8 view, contains [nope_fp8(512) | scales(16)]
+        - rope_part: (num_tokens, 1, 128) as uint8 view, contains [rope_bf16_bytes(128)]
+
+        These two tensors can be directly passed to set_mla_kv_buffer_triton(kv_buffer, loc, nope_part, rope_part)
+    """
+    # Squeeze middle dimension if present, with explicit shape check
+    if k_nope.ndim == 3:
+        if k_nope.shape[1] != 1:
+            raise ValueError(f"Expected k_nope.shape[1] == 1, got {k_nope.shape}")
+        k_nope_2d = k_nope.squeeze(1)
+    else:
+        k_nope_2d = k_nope
+
+    if k_rope.ndim == 3:
+        if k_rope.shape[1] != 1:
+            raise ValueError(f"Expected k_rope.shape[1] == 1, got {k_rope.shape}")
+        k_rope_2d = k_rope.squeeze(1)
+    else:
+        k_rope_2d = k_rope
+
+    num_tokens = k_nope_2d.shape[0]
+    dim_nope = k_nope_2d.shape[1]
+    dim_rope = k_rope_2d.shape[1]
+
+    # Validate dimensions for FP8 MLA
+    if dim_nope != 512:
+        raise ValueError(f"Expected dim_nope=512 for FP8 MLA, got {dim_nope}")
+    if dim_rope != 64:
+        raise ValueError(f"Expected dim_rope=64 for FP8 MLA, got {dim_rope}")
+    if k_rope_2d.shape[0] != num_tokens:
+        raise ValueError(
+            f"k_nope and k_rope must have same num_tokens, got {num_tokens} vs {k_rope_2d.shape[0]}"
+        )
+
+    # Call quantization kernel
+    if NSA_QUANT_K_CACHE_FAST:
+        # Direct call to fast kernel with separate inputs (avoids concat)
+        packed_output = _quantize_k_cache_fast(
+            k_nope=k_nope_2d, k_rope=k_rope_2d, group_size=tile_size
+        )
+        # packed_output shape: (num_tokens, 656) as fp8/bf16 mix
+        # Layout: [nope_fp8(512) | nope_scales_fp32(16) | rope_bf16(128)]
+    else:
+        # Fallback: use existing slow wrapper
+        cache_k_concat = torch.cat([k_nope_2d, k_rope_2d], dim=-1)
+        packed_output_4d = quantize_k_cache(cache_k_concat.unsqueeze(1).unsqueeze(1))
+        packed_output = packed_output_4d.squeeze(1).squeeze(1)
+
+    # Convert to uint8 bytes view, handling dtype conversions safely
+    if packed_output.dtype == torch.uint8:
+        packed_bytes = packed_output
+    else:
+        # View as uint8 - this may change the last dimension size
+        packed_bytes = packed_output.view(torch.uint8)
+
+    # Validate packed bytes dimension matches expected layout
+    # Expected: 512 (nope_fp8) + 16 (scales) + 128 (rope_bf16) = 656 bytes
+    expected_bytes = 656
+    if packed_bytes.shape[1] != expected_bytes:
+        raise ValueError(
+            f"Packed output has {packed_bytes.shape[1]} bytes, expected {expected_bytes}. "
+            f"Original dtype: {packed_output.dtype}, shape: {packed_output.shape}"
+        )
+
+    # Split into nope and rope parts using layout constants
+    num_tiles = dim_nope // tile_size  # 4
+    nope_part_bytes = dim_nope + num_tiles * 4  # 512 + 16 = 528
+    # Derive rope_part_bytes from packed total to avoid hardcoding input element size
+    rope_part_bytes = packed_bytes.shape[1] - nope_part_bytes  # Should be 128
+
+    # Sanity check rope part size
+    expected_rope_bytes = 128
+    if rope_part_bytes != expected_rope_bytes:
+        raise ValueError(
+            f"Rope part has {rope_part_bytes} bytes, expected {expected_rope_bytes}"
+        )
+
+    nope_part = packed_bytes[:, :nope_part_bytes].unsqueeze(1)  # (num_tokens, 1, 528)
+    rope_part = packed_bytes[
+        :, nope_part_bytes : nope_part_bytes + rope_part_bytes
+    ].unsqueeze(
+        1
+    )  # (num_tokens, 1, 128)
+
+    return nope_part, rope_part
+
+
 # Copied from original
 def _quantize_k_cache_slow(
     input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
