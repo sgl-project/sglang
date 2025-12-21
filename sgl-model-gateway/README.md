@@ -14,7 +14,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 ### Architecture at a Glance
 **Control Plane**
 - Worker Manager validates workers, discovers capabilities, and keeps the registry in sync.
-- Job Queue serializes background operations (add/remove) and exposes status via `/workers/{url}`.
+- Job Queue serializes background operations (add/remove) and exposes status via `/workers/{worker_id}`.
 - Background health checker and load monitor keep circuit breakers and policies informed.
 - Optional Kubernetes service discovery keeps the registry aligned with pods.
 
@@ -193,8 +193,8 @@ Sample response (http workers):
 ```json
 {
   "workers": [
-    {"id":"http://0.0.0.0:31378","url":"http://0.0.0.0:31378","model_id":"mistral","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"},
-    {"id":"http://0.0.0.0:34881","url":"http://0.0.0.0:34881","model_id":"llama3","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"}
+    {"id":"2f3a0c3e-3a7b-4c3f-8c70-1b7d4c3a6e1f","url":"http://0.0.0.0:31378","model_id":"mistral","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"},
+    {"id":"9b0f6c2a-1c4f-4c2a-9f4a-1f2a6c0b9d3e","url":"http://0.0.0.0:34881","model_id":"llama3","priority":50,"cost":1.0,"worker_type":"regular","is_healthy":true,"load":0,"connection_mode":"Http"}
   ],
   "total": 2,
   "stats": {
@@ -204,7 +204,7 @@ Sample response (http workers):
   }
 }
 ```
-Add more workers with the same API; include optional `labels` (for per-model policies) or `tokenizer_path` / `reasoning_parser` / `tool_parser` fields as needed. `/workers/{url}` exposes queued job status while background jobs finalize registration.
+Add more workers with the same API; include optional `labels` (for per-model policies) or `tokenizer_path` / `reasoning_parser` / `tool_parser` fields as needed. `/workers/{worker_id}` exposes queued job status while background jobs finalize registration.
 
 ### gRPC Routing
 - **Rust binary**
@@ -413,8 +413,9 @@ Use upstream SGLang binaries to start dedicated worker processes.
 |----------|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `POST`   | `/workers`       | Queue worker registration (prefill/decode/regular). Body matches `WorkerConfigRequest`. Returns `202 Accepted` while the job queue processes the request. |
 | `GET`    | `/workers`       | List workers with health, load, policy metadata, and queued job status.                                                                                   |
-| `GET`    | `/workers/{url}` | Inspect a specific worker or job queue entry.                                                                                                             |
-| `DELETE` | `/workers/{url}` | Queue worker removal.                                                                                                                                     |
+| `GET`    | `/workers/{worker_id}` | Inspect a specific worker or job queue entry (UUID).                                                                                                   |
+| `PUT`    | `/workers/{worker_id}` | Queue worker update by UUID.                                                                                                                           |
+| `DELETE` | `/workers/{worker_id}` | Queue worker removal by UUID.                                                                                                                          |
 | `POST`   | `/flush_cache`   | Trigger cache flush across HTTP workers with success/failure breakdown.                                                                                   |
 | `GET`    | `/get_loads`     | Sample current load reported by each worker.                                                                                                              |
 

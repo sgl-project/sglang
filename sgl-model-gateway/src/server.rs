@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
+use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
@@ -484,6 +485,10 @@ async fn create_worker(
 
     // Submit job for async processing
     let worker_url = config.url.clone();
+    let worker_id = state
+        .context
+        .worker_registry
+        .reserve_id_for_url(&worker_url);
     let job = Job::AddWorker {
         config: Box::new(config),
     };
@@ -495,12 +500,20 @@ async fn create_worker(
         .expect("JobQueue not initialized");
     match job_queue.submit(job).await {
         Ok(_) => {
+            let location = format!("/workers/{}", worker_id.as_str());
             let response = json!({
                 "status": "accepted",
-                "worker_id": worker_url,
+                "worker_id": worker_id.as_str(),
+                "url": worker_url,
+                "location": location,
                 "message": "Worker addition queued for background processing"
             });
-            (StatusCode::ACCEPTED, Json(response)).into_response()
+            (
+                StatusCode::ACCEPTED,
+                [(http::header::LOCATION, location)],
+                Json(response),
+            )
+                .into_response()
         }
         Err(error) => {
             let error_response = WorkerErrorResponse {
@@ -513,8 +526,15 @@ async fn create_worker(
 }
 
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
-    let workers = state.context.worker_registry.get_all();
-    let worker_infos: Vec<WorkerInfo> = workers.iter().map(worker_to_info).collect();
+    let workers = state.context.worker_registry.get_all_with_ids();
+    let worker_infos: Vec<WorkerInfo> = workers
+        .iter()
+        .map(|(worker_id, worker)| {
+            let mut info = worker_to_info(worker);
+            info.id = worker_id.as_str().to_string();
+            info
+        })
+        .collect();
 
     let response = json!({
         "workers": worker_infos,
@@ -528,57 +548,102 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     Json(response).into_response()
 }
 
-async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
+fn parse_worker_id(raw: &str) -> Result<crate::core::WorkerId, String> {
+    Uuid::parse_str(raw)
+        .map_err(|e| format!("Invalid worker_id '{raw}' (expected UUID). Error: {e}"))?;
+    Ok(crate::core::WorkerId::from_string(raw.to_string()))
+}
+
+async fn get_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+) -> Response {
+    let worker_id = match parse_worker_id(&worker_id_raw) {
+        Ok(id) => id,
+        Err(msg) => {
+            let error = WorkerErrorResponse {
+                error: msg,
+                code: "BAD_REQUEST".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+        }
+    };
+
     let job_queue = state
         .context
         .worker_job_queue
         .get()
         .expect("JobQueue not initialized");
 
-    if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+    if let Some(worker) = state.context.worker_registry.get(&worker_id) {
         // Worker exists in registry, get its full info and attach job status if any
+        let worker_url = worker.url().to_string();
         let mut worker_info = worker_to_info(&worker);
-        if let Some(status) = job_queue.get_status(&url) {
+        worker_info.id = worker_id.as_str().to_string();
+        if let Some(status) = job_queue.get_status(&worker_url) {
             worker_info.job_status = Some(status);
         }
         return Json(worker_info).into_response();
     }
 
-    // Worker not in registry, check job queue for its status
-    if let Some(status) = job_queue.get_status(&url) {
-        // Create a partial WorkerInfo to report the job status
-        let worker_info = WorkerInfo {
-            id: url.clone(),
-            url: url.clone(),
-            model_id: "unknown".to_string(),
-            priority: 0,
-            cost: 1.0,
-            worker_type: "unknown".to_string(),
-            is_healthy: false,
-            load: 0,
-            connection_mode: "unknown".to_string(),
-            runtime_type: None,
-            tokenizer_path: None,
-            reasoning_parser: None,
-            tool_parser: None,
-            chat_template: None,
-            bootstrap_port: None,
-            metadata: HashMap::new(),
-            job_status: Some(status),
-        };
-        return Json(worker_info).into_response();
+    // Worker not in registry yet. If we can map id -> url (reserved IDs), return job status.
+    if let Some(worker_url) = state.context.worker_registry.get_url_by_id(&worker_id) {
+        if let Some(status) = job_queue.get_status(&worker_url) {
+            // Create a partial WorkerInfo to report the job status
+            let worker_info = WorkerInfo {
+                id: worker_id.as_str().to_string(),
+                url: worker_url.clone(),
+                model_id: "unknown".to_string(),
+                priority: 0,
+                cost: 1.0,
+                worker_type: "unknown".to_string(),
+                is_healthy: false,
+                load: 0,
+                connection_mode: "unknown".to_string(),
+                runtime_type: None,
+                tokenizer_path: None,
+                reasoning_parser: None,
+                tool_parser: None,
+                chat_template: None,
+                bootstrap_port: None,
+                metadata: HashMap::new(),
+                job_status: Some(status),
+            };
+            return Json(worker_info).into_response();
+        }
     }
 
     // Worker not found in registry or job queue
     let error = WorkerErrorResponse {
-        error: format!("Worker {url} not found"),
+        error: format!("Worker {worker_id_raw} not found"),
         code: "WORKER_NOT_FOUND".to_string(),
     };
     (StatusCode::NOT_FOUND, Json(error)).into_response()
 }
 
-async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    let worker_id = url.clone();
+async fn delete_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+) -> Response {
+    let worker_id = match parse_worker_id(&worker_id_raw) {
+        Ok(id) => id,
+        Err(msg) => {
+            let error = WorkerErrorResponse {
+                error: msg,
+                code: "BAD_REQUEST".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+        }
+    };
+
+    let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
+        let error = WorkerErrorResponse {
+            error: format!("Worker {worker_id_raw} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        };
+        return (StatusCode::NOT_FOUND, Json(error)).into_response();
+    };
+
     let job = Job::RemoveWorker { url };
 
     let job_queue = state
@@ -590,7 +655,7 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<Strin
         Ok(_) => {
             let response = json!({
                 "status": "accepted",
-                "worker_id": worker_id,
+                "worker_id": worker_id.as_str(),
                 "message": "Worker removal queued for background processing"
             });
             (StatusCode::ACCEPTED, Json(response)).into_response()
@@ -607,10 +672,28 @@ async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<Strin
 
 async fn update_worker(
     State(state): State<Arc<AppState>>,
-    Path(url): Path<String>,
+    Path(worker_id_raw): Path<String>,
     Json(update): Json<WorkerUpdateRequest>,
 ) -> Response {
-    let worker_id = url.clone();
+    let worker_id = match parse_worker_id(&worker_id_raw) {
+        Ok(id) => id,
+        Err(msg) => {
+            let error = WorkerErrorResponse {
+                error: msg,
+                code: "BAD_REQUEST".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+        }
+    };
+
+    let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
+        let error = WorkerErrorResponse {
+            error: format!("Worker {worker_id_raw} not found"),
+            code: "WORKER_NOT_FOUND".to_string(),
+        };
+        return (StatusCode::NOT_FOUND, Json(error)).into_response();
+    };
+
     let job = Job::UpdateWorker {
         url,
         update: Box::new(update),
@@ -625,7 +708,7 @@ async fn update_worker(
         Ok(_) => {
             let response = json!({
                 "status": "accepted",
-                "worker_id": worker_id,
+                "worker_id": worker_id.as_str(),
                 "message": "Worker update queued for background processing"
             });
             (StatusCode::ACCEPTED, Json(response)).into_response()
@@ -734,10 +817,9 @@ pub fn build_app(
         ));
 
     let worker_routes = Router::new()
-        .route("/workers", post(create_worker))
-        .route("/workers", get(list_workers_rest))
+        .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
-            "/workers/{url}",
+            "/workers/{worker_id}",
             get(get_worker).put(update_worker).delete(delete_worker),
         )
         .route_layer(axum::middleware::from_fn_with_state(
