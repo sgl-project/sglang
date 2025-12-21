@@ -44,6 +44,7 @@ use crate::{
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
+        parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
@@ -61,6 +62,20 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+}
+
+async fn parse_function_call(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ParseFunctionCallRequest>,
+) -> Response {
+    state.router.parse_function_call(&req).await
+}
+
+async fn parse_reasoning(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SeparateReasoningRequest>,
+) -> Response {
+    state.router.parse_reasoning(&req).await
 }
 
 async fn sink_handler() -> Response {
@@ -708,6 +723,8 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/parse/function_call", post(parse_function_call))
+        .route("/parse/reasoning", post(parse_reasoning))
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
