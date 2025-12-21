@@ -550,3 +550,80 @@ def ci_download_with_validation_and_retry(
 
     # This should never be reached, but just in case
     return hf_folder
+
+
+def ci_validate_and_clean_hf_cache(model_path: str) -> None:
+    """
+    Validate and clean corrupted safetensors files in HF cache before loading.
+
+    This function is needed because HFRunner (used in tests) calls transformers'
+    from_pretrained() directly, which bypasses SGLang's weight validation.
+    Corrupted cached files can cause cryptic errors like "EOF while parsing"
+    from safetensors.
+
+    Only runs in CI to avoid overhead for regular users.
+
+    Args:
+        model_path: Model identifier (e.g., "meta-llama/Llama-2-7b")
+    """
+    from sglang.utils import is_in_ci
+
+    if not is_in_ci():
+        return
+
+    # Skip for local paths
+    if os.path.isdir(model_path):
+        return
+
+    try:
+        import huggingface_hub.constants
+
+        # Find the HF cache directory for this model
+        cache_dir = huggingface_hub.constants.HF_HUB_CACHE
+        repo_folder = os.path.join(
+            cache_dir,
+            huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                ["models", *model_path.split("/")]
+            ),
+        )
+
+        if not os.path.isdir(repo_folder):
+            return
+
+        # Find snapshot directories
+        snapshots_dir = os.path.join(repo_folder, "snapshots")
+        if not os.path.isdir(snapshots_dir):
+            return
+
+        # Check each snapshot for corrupted files
+        corrupted_files = []
+        for snapshot_hash in os.listdir(snapshots_dir):
+            snapshot_dir = os.path.join(snapshots_dir, snapshot_hash)
+            if not os.path.isdir(snapshot_dir):
+                continue
+
+            # Find all safetensors files
+            safetensors_files = glob_module.glob(
+                os.path.join(snapshot_dir, "*.safetensors")
+            )
+
+            for sf_file in safetensors_files:
+                # Skip broken symlinks (os.path.exists returns False for them)
+                if not os.path.exists(sf_file):
+                    continue
+
+                if not _validate_safetensors_file(sf_file):
+                    corrupted_files.append(sf_file)
+
+        if corrupted_files:
+            logger.warning(
+                "HFRunner: Found %d corrupted safetensors file(s) for %s. "
+                "Removing to force re-download.",
+                len(corrupted_files),
+                model_path,
+            )
+            _cleanup_corrupted_files_selective(model_path, corrupted_files)
+
+    except Exception as e:
+        # Don't fail if validation itself fails - let HF handle it
+        logger.debug("HF cache validation failed (non-fatal): %s", e)

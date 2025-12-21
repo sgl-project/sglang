@@ -251,6 +251,14 @@ class HFRunner:
         # Apply model-specific patches
         monkey_patch_gemma2_sdpa()
 
+        # Validate and clean corrupted files in HF cache (CI only)
+        # This is needed because HFRunner bypasses SGLang's weight validation
+        from sglang.srt.model_loader.ci_weight_validation import (
+            ci_validate_and_clean_hf_cache,
+        )
+
+        ci_validate_and_clean_hf_cache(model_path)
+
         # Load the model and tokenizer
         if self.model_type == "generation":
             config = AutoConfig.from_pretrained(
