@@ -3,16 +3,24 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 
 
 Usage:
-
+    # Video
     t2v:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-video --dataset vbench --task t2v --num-prompts 20
+
+    i2v:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-video --dataset vbench --task i2v --num-prompts 20
+
+
+    # Image
+    t2i:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
          --backend sglang-image --dataset vbench --task t2v --num-prompts 20
 
     i2v:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
          --backend sglang-image --dataset vbench --task i2v --num-prompts 20
-
-
 
 
 """

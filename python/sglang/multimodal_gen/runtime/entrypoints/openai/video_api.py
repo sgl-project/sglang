@@ -30,8 +30,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
-    _save_upload_to_path,
+    merge_image_input_list,
     process_generation_batch,
+    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -114,10 +115,10 @@ def _video_job_from_sampling(
 
 
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
-    from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        await process_generation_batch(scheduler_client, batch)
+        await process_generation_batch(async_scheduler_client, batch)
         await VIDEO_STORE.update_fields(
             job_id,
             {"status": "completed", "progress": 100, "completed_at": int(time.time())},
@@ -136,6 +137,7 @@ async def create_video(
     # multipart/form-data fields (optional; used only when content-type is multipart)
     prompt: Optional[str] = Form(None),
     input_reference: Optional[UploadFile] = File(None),
+    reference_url: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
     seconds: Optional[int] = Form(None),
     size: Optional[str] = Form(None),
@@ -155,17 +157,24 @@ async def create_video(
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
-        if input_reference is None:
+        if input_reference is None and reference_url is None:
             raise HTTPException(
-                status_code=400, detail="input_reference file is required"
+                status_code=400,
+                detail="input_reference file or reference_url is required",
             )
-
+        image_list = merge_image_input_list(input_reference, reference_url)
+        # Save first input image
+        image = image_list[0]
         uploads_dir = os.path.join("outputs", "uploads")
         os.makedirs(uploads_dir, exist_ok=True)
-        input_path = os.path.join(
-            uploads_dir, f"{request_id}_{input_reference.filename}"
-        )
-        await _save_upload_to_path(input_reference, input_path)
+        filename = image.filename if hasattr(image, "filename") else f"url_image"
+        input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+        try:
+            input_path = await save_image_to_path(image, input_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to process image source: {str(e)}"
+            )
 
         # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
         extra_from_form: Dict[str, Any] = {}
@@ -207,6 +216,29 @@ async def create_video(
             if isinstance(extra, dict):
                 # Shallow-merge: only keys like fps/num_frames are expected
                 payload.update(extra)
+            # openai may turn extra_body to extra_json
+            extra_json = payload.pop("extra_json", None)
+            if isinstance(extra_json, dict):
+                payload.update(extra_json)
+            # for not multipart/form-data type
+            if payload.get("reference_url"):
+                image_list = merge_image_input_list(payload.get("reference_url"))
+                # Save first input image
+                image = image_list[0]
+                uploads_dir = os.path.join("outputs", "uploads")
+                os.makedirs(uploads_dir, exist_ok=True)
+                filename = (
+                    image.filename if hasattr(image, "filename") else f"url_image"
+                )
+                input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+                try:
+                    input_path = await save_image_to_path(image, input_path)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to process image source: {str(e)}",
+                    )
+                payload["input_reference"] = input_path
             req = VideoGenerationsRequest(**payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")

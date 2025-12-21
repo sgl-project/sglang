@@ -39,7 +39,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=thinking_kwargs,
+        extra_body=thinking_kwargs if thinking_kwargs else None,
     )
 
     # Run eval
