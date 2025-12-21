@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import warnings
 from typing import Optional
 
 import torch
@@ -68,7 +67,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
+        return g, o, A, final_state, None, h, None
     elif SUPPRESS_LEVEL >= 3:
         return g, o, A, final_state, w, h, v_new
 
@@ -109,7 +108,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
         )
-        return o.to(q.dtype), final_state
+        return o.to(q.dtype), final_state, h
 
 
 @torch.compiler.disable
@@ -225,7 +224,7 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
+    o, final_state, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
         v,
@@ -239,4 +238,4 @@ def chunk_gated_delta_rule(
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
-    return o, final_state
+    return o, final_state, h

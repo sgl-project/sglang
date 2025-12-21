@@ -9,18 +9,9 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_deterministic import BenchArgs, test_deterministic
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
-    DEFAULT_MODEL,
     TestDeterministicBase,
-)
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
 )
 
 

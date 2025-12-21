@@ -328,8 +328,7 @@ void verify_tree_greedy(
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
-    at::Tensor target_predict,
-    int64_t cuda_stream = 0) {
+    at::Tensor target_predict) {
   CHECK_INPUT(candidates);
   CHECK_INPUT(retrive_index);
   CHECK_INPUT(retrive_next_token);
@@ -389,7 +388,7 @@ void verify_tree_greedy(
     throw std::runtime_error("Expected 'target_predict' to be of type long (torch.int64).");
   }
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   dim3 grid(batch_size);
   dim3 block(1);
 

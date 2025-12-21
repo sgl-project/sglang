@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
@@ -55,6 +57,25 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        """
+        Return buffers of verify attention kernels that needs to be filled after draft.
+
+        Typically, these are tree mask and position buffers.
+        """
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        """
+        Update the buffers returned by get_verify_fill_after_draft_buffers if needed.
+
+        Here, we need to redo the computation of all metadata of the attention backend
+        that depends on tree mask and position buffers.
+        """
+        raise NotImplementedError()
+
     def forward(
         self,
         q: torch.Tensor,
@@ -70,6 +91,16 @@ class AttentionBackend(ABC):
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        elif forward_batch.forward_mode.is_mixed() and is_npu():
+            return self.forward_mixed(
                 q,
                 k,
                 v,
@@ -111,6 +142,18 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
     ):
         """Run a forward for extend."""
+        raise NotImplementedError()
+
+    def forward_mixed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        """Run a forward for mix."""
         raise NotImplementedError()
 
     def support_triton(self):

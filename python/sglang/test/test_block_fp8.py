@@ -1,5 +1,4 @@
 import itertools
-import os
 import unittest
 
 import torch
@@ -577,7 +576,7 @@ class TestW8A8BlockFP8BatchedDeepGemm(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
         try:
-            import deep_gemm
+            import deep_gemm  # noqa: F401
         except ImportError:
             raise unittest.SkipTest("DeepGEMM is not available")
         torch.set_default_device("cuda")

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 class IntelAMXAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        import sgl_kernel
+        import sgl_kernel  # noqa: F401
 
         super().__init__()
         self.forward_metadata = None

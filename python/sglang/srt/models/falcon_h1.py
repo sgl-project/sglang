@@ -1,4 +1,3 @@
-import enum
 import logging
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
@@ -33,9 +32,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -199,15 +198,17 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        # FalconH1 all layers are sparse and have no nextn now
+        # FalconH1 all layers are dense and have no nextn now
         self.is_layer_sparse = False
         is_previous_layer_sparse = False
+        is_next_layer_sparse = False
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.feed_forward = FalconH1MLP(
@@ -450,13 +451,6 @@ class FalconH1Model(nn.Module):
         return hidden_states
 
 
-class HybridLayerType(enum.Enum):
-    full_attention = "attention"
-    swa_attention = "swa_attention"
-    linear_attention = "linear_attention"
-    mamba2 = "mamba"
-
-
 class FalconH1ForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -483,7 +477,7 @@ class FalconH1ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 org_num_embeddings=config.vocab_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier

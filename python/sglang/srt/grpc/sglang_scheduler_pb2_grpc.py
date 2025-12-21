@@ -8,7 +8,7 @@ import warnings
 
 from . import sglang_scheduler_pb2 as sglang__scheduler__pb2
 
-GRPC_GENERATED_VERSION = '1.74.0'
+GRPC_GENERATED_VERSION = '1.75.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 

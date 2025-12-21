@@ -1,19 +1,13 @@
-import json
-import re
-import time
 import unittest
 from abc import ABC
 
-import numpy as np
 import openai
-import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

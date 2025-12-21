@@ -1,4 +1,3 @@
-import re
 from typing import Dict, Optional, Tuple, Type
 
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -250,6 +249,47 @@ class GptOssDetector(BaseReasoningFormatDetector):
         )
 
 
+class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
+    """
+    Append `<think>` token to the beginning of the text.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        # scheduler.py need `reasoning_parser.detector.think_end_token`
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+        self.is_first_chunk = False
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if not self.is_first_chunk:
+            self.is_first_chunk = True
+            new_text = self.think_start_token + new_text
+        return StreamingParseResult(normal_text=new_text)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        return StreamingParseResult(normal_text=self.think_start_token + text)
+
+
+class NanoV3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for NanoV3 model.
+    Uses the same reasoning format as DeepSeek-R1: (<think>)*(.*)</think>
+
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -267,9 +307,14 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
+        "kimi_k2": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "minimax": Qwen3Detector,
+        "minimax-append-think": MiniMaxAppendThinkDetector,
         "step3": DeepSeekR1Detector,
+        "nano_v3": NanoV3Detector,
+        "interns1": Qwen3Detector,
     }
 
     def __init__(
@@ -286,7 +331,7 @@ class ReasoningParser:
             raise ValueError(f"Unsupported model type: {model_type}")
 
         # Special cases where we override force_reasoning
-        if model_type.lower() in {"qwen3-thinking", "gpt-oss"}:
+        if model_type.lower() in {"qwen3-thinking", "gpt-oss", "minimax"}:
             force_reasoning = True
 
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
