@@ -33,12 +33,12 @@ sglang serve "${SERVER_ARGS[@]}" --webui --webui-port ${WEBUI_PORT}
 ## Port Forwarding
 Once the WebUI service is running, you need to use **SSH port forwarding** to securely access the remote service from your local machine.
 
-In most cases:​ Your IDE (like VS Code, Cursor, etc.) can handle this automatically. Check your IDE's remote development or port forwarding features. Otherwise, execute this command manually.
+In most cases: Your IDE (like VS Code, Cursor, etc.) can handle this automatically. Check your IDE's remote development or port forwarding features. Otherwise, execute this command manually.
 
 ```bash
 ssh -L ${WEBUI_PORT}:localhost:${WEBUI_PORT} user_name@machine_name
 ```
-Learn more about port forwarding:​ [Port Forwarding](https://en.wikipedia.org/wiki/Port_forwarding).
+Learn more about port forwarding: [Port Forwarding](https://en.wikipedia.org/wiki/Port_forwarding).
 
 
 ## Interface Instructions
