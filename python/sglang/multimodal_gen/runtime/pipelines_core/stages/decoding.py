@@ -6,10 +6,15 @@ Decoding stage for diffusion pipelines.
 """
 
 import weakref
+from collections.abc import Iterable
 
 import torch
+from tqdm.auto import tqdm
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_world_group,
+)
 from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
@@ -146,12 +151,48 @@ class DecodingStage(PipelineStage):
                 pass
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-            decode_output = self.vae.decode(latents)
-            image = _ensure_tensor_decode_output(decode_output)
+            frame_slices = []
+            if latents.dim() == 5:
+                # Decode video frames in chunks to avoid out of memory errors.
+                last_frame = None
+                num_frames = latents.shape[2]
+                num_sample_frames = num_frames * self.vae.temporal_compression_ratio
 
-        # De-normalize image to [0, 1] range
-        image = (image / 2 + 0.5).clamp(0, 1)
-        return image
+                # TODO: make it dynamic based on the available memory.
+                step_size = 100 // self.vae.temporal_compression_ratio
+
+                with self.progress_bar(total=num_sample_frames) as progress_bar:
+                    for i in range(0, num_frames, step_size):
+                        latent_step = min(step_size, num_frames - i)
+                        target_frame_step = (
+                            latent_step * self.vae.temporal_compression_ratio
+                        )
+
+                        decode_output = self.vae.decode(
+                            latents[:, :, i : i + latent_step + 1, :, :]
+                        )
+                        frame = _ensure_tensor_decode_output(decode_output)
+
+                        if i > 0:
+                            frame = self.vae.blend_t(
+                                last_frame, frame, self.vae.blend_num_frames
+                            )
+                        frame = frame[:, :, :target_frame_step, :, :]
+
+                        last_frame = frame
+                        frame = (frame / 2 + 0.5).clamp(0, 1)
+                        frame_slices.append(frame.cpu())
+
+                        if progress_bar is not None:
+                            progress_bar.update(target_frame_step)
+                    frames = torch.cat(frame_slices, dim=2)[:, :, :num_sample_frames]
+            else:
+                # Decode image
+                decode_output = self.vae.decode(latents)
+                frame = _ensure_tensor_decode_output(decode_output)
+                frame = (frame / 2 + 0.5).clamp(0, 1)
+                frames = frame.cpu()
+            return frames
 
     @torch.no_grad()
     def forward(
@@ -238,3 +279,20 @@ class DecodingStage(PipelineStage):
             server_args.model_loaded["vae"] = False
 
         return output_batch
+
+    def progress_bar(
+        self, iterable: Iterable | None = None, total: int | None = None
+    ) -> tqdm:
+        """
+        Create a progress bar for the denoising process.
+
+        Args:
+            iterable: The iterable to iterate over.
+            total: The total number of items.
+
+        Returns:
+            A tqdm progress bar.
+        """
+        local_rank = get_world_group().local_rank
+        disable = local_rank != 0
+        return tqdm(iterable=iterable, total=total, disable=disable)
