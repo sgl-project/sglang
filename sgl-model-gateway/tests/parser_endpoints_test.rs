@@ -153,7 +153,7 @@ mod parse_function_call_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/parse_function_call")
+            .uri("/parse/function_call")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -184,7 +184,7 @@ mod parse_function_call_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/parse_function_call")
+            .uri("/parse/function_call")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -222,7 +222,7 @@ mod parse_function_call_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/parse_function_call")
+            .uri("/parse/function_call")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -239,7 +239,7 @@ mod parse_function_call_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/parse_function_call")
+            .uri("/parse/function_call")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -263,7 +263,7 @@ mod parse_function_call_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/parse_function_call")
+            .uri("/parse/function_call")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -297,7 +297,7 @@ mod separate_reasoning_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -338,7 +338,7 @@ mod separate_reasoning_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -375,7 +375,7 @@ mod separate_reasoning_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -391,7 +391,7 @@ mod separate_reasoning_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -414,7 +414,7 @@ mod separate_reasoning_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -443,7 +443,7 @@ mod separate_reasoning_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -489,7 +489,7 @@ mod separate_reasoning_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -525,7 +525,7 @@ mod api_routing_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/parse_function_call")
+            .uri("/parse/function_call")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -535,7 +535,6 @@ mod api_routing_tests {
         // Should not be 404
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
 
-        // Test separate_reasoning endpoint
         let payload = json!({
             "text": "test",
             "reasoning_parser": "step3"
@@ -543,7 +542,7 @@ mod api_routing_tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
@@ -561,10 +560,10 @@ mod api_routing_tests {
         let ctx = ParserTestContext::new(vec![]).await;
         let app = ctx.create_app().await;
 
-        // Test GET request to parse_function_call
+        // Test GET request to parse/function_call
         let req = Request::builder()
             .method("GET")
-            .uri("/parse_function_call")
+            .uri("/parse/function_call")
             .body(Body::empty())
             .unwrap();
 
@@ -578,10 +577,10 @@ mod api_routing_tests {
             resp.status()
         );
 
-        // Test GET request to separate_reasoning
+        // Test GET request to parse/reasoning
         let req = Request::builder()
             .method("GET")
-            .uri("/separate_reasoning")
+            .uri("/parse/reasoning")
             .body(Body::empty())
             .unwrap();
 
