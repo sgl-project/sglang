@@ -322,6 +322,7 @@ class ServerManager:
                     with pipe:
                         for line in iter(pipe.readline, ""):
                             sys.stdout.write(line)
+                            sys.stdout.flush()
                             file.write(line)
                             file.flush()
                 except Exception as e:
