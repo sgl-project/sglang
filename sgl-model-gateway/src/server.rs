@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -31,7 +30,7 @@ use crate::{
             create_worker_registration_workflow, create_worker_removal_workflow,
             create_worker_update_workflow,
         },
-        worker_to_info, Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        worker_to_info, Job, JobQueue, JobQueueConfig, WorkerId, WorkerManager, WorkerType,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -56,7 +55,6 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{LoggingSubscriber, WorkflowEngine},
 };
-
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
@@ -548,27 +546,31 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     Json(response).into_response()
 }
 
-fn parse_worker_id(raw: &str) -> Result<crate::core::WorkerId, String> {
+fn parse_worker_id(raw: &str) -> Result<WorkerId, String> {
     Uuid::parse_str(raw)
         .map_err(|e| format!("Invalid worker_id '{raw}' (expected UUID). Error: {e}"))?;
-    Ok(crate::core::WorkerId::from_string(raw.to_string()))
+    Ok(WorkerId::from_string(raw.to_string()))
+}
+
+/// Parse worker ID from path parameter, returning an error response on failure.
+fn parse_worker_id_or_error(raw: &str) -> Result<WorkerId, Box<Response>> {
+    parse_worker_id(raw).map_err(|msg| {
+        let error = WorkerErrorResponse {
+            error: msg,
+            code: "BAD_REQUEST".to_string(),
+        };
+        Box::new((StatusCode::BAD_REQUEST, Json(error)).into_response())
+    })
 }
 
 async fn get_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
 ) -> Response {
-    let worker_id = match parse_worker_id(&worker_id_raw) {
+    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
         Ok(id) => id,
-        Err(msg) => {
-            let error = WorkerErrorResponse {
-                error: msg,
-                code: "BAD_REQUEST".to_string(),
-            };
-            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-        }
+        Err(resp) => return *resp,
     };
-
     let job_queue = state
         .context
         .worker_job_queue
@@ -589,26 +591,7 @@ async fn get_worker(
     // Worker not in registry yet. If we can map id -> url (reserved IDs), return job status.
     if let Some(worker_url) = state.context.worker_registry.get_url_by_id(&worker_id) {
         if let Some(status) = job_queue.get_status(&worker_url) {
-            // Create a partial WorkerInfo to report the job status
-            let worker_info = WorkerInfo {
-                id: worker_id.as_str().to_string(),
-                url: worker_url.clone(),
-                model_id: "unknown".to_string(),
-                priority: 0,
-                cost: 1.0,
-                worker_type: "unknown".to_string(),
-                is_healthy: false,
-                load: 0,
-                connection_mode: "unknown".to_string(),
-                runtime_type: None,
-                tokenizer_path: None,
-                reasoning_parser: None,
-                tool_parser: None,
-                chat_template: None,
-                bootstrap_port: None,
-                metadata: HashMap::new(),
-                job_status: Some(status),
-            };
+            let worker_info = WorkerInfo::pending(worker_id.as_str(), worker_url, Some(status));
             return Json(worker_info).into_response();
         }
     }
@@ -625,15 +608,9 @@ async fn delete_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
 ) -> Response {
-    let worker_id = match parse_worker_id(&worker_id_raw) {
+    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
         Ok(id) => id,
-        Err(msg) => {
-            let error = WorkerErrorResponse {
-                error: msg,
-                code: "BAD_REQUEST".to_string(),
-            };
-            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-        }
+        Err(resp) => return *resp,
     };
 
     let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
@@ -675,15 +652,9 @@ async fn update_worker(
     Path(worker_id_raw): Path<String>,
     Json(update): Json<WorkerUpdateRequest>,
 ) -> Response {
-    let worker_id = match parse_worker_id(&worker_id_raw) {
+    let worker_id = match parse_worker_id_or_error(&worker_id_raw) {
         Ok(id) => id,
-        Err(msg) => {
-            let error = WorkerErrorResponse {
-                error: msg,
-                code: "BAD_REQUEST".to_string(),
-            };
-            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-        }
+        Err(resp) => return *resp,
     };
 
     let Some(url) = state.context.worker_registry.get_url_by_id(&worker_id) else {
@@ -734,8 +705,6 @@ pub struct ServerConfig {
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
-    /// Grace period in seconds to wait for in-flight requests during shutdown.
-    /// Default is 30 seconds.
     pub shutdown_grace_period_secs: u64,
 }
 
