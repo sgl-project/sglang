@@ -21,6 +21,16 @@ on:
         required: false
         type: string
         default: '8'
+      batch_sizes:
+        description: 'Space-separated batch sizes (e.g. "1 2 4 8"). Leave empty for defaults.'
+        required: false
+        type: string
+        default: ''
+      create_pr:
+        description: 'Create a PR with tuned configs (true/false).'
+        required: false
+        type: string
+        default: 'false'
       runner:
         description: "Runner label to use (e.g. 4-gpu-a10). Use 'all' to run the full matrix."
         required: false
@@ -33,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runner == 'all' && '["4-gpu-a10","4-gpu-b200","4-gpu-gb200","4-gpu-h100","8-gpu-b200","8-gpu-h20","8-gpu-h200"]' || format('["{0}"]', inputs.runner)) }}
+        runner: ${{ fromJSON(inputs.runner == 'all' && '["4-gpu-b200","4-gpu-gb200","4-gpu-h100","8-gpu-b200","8-gpu-h20","8-gpu-h200"]' || format('["{0}"]', inputs.runner)) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -45,7 +55,12 @@ jobs:
 
       - name: Run auto tune
         run: |
-          python3 -m sglang.auto_tune --model "${{ inputs.model }}" --tp-size "${{ inputs.tp_size }}" --ep-size "${{ inputs.ep_size }}"
+          BATCH_SIZES="${{ inputs.batch_sizes }}"
+          args=(--model "${{ inputs.model }}" --tp-size "${{ inputs.tp_size }}" --ep-size "${{ inputs.ep_size }}")
+          if [[ -n "${BATCH_SIZES// }" ]]; then
+            args+=(--batch-sizes ${BATCH_SIZES})
+          fi
+          python3 -m sglang.auto_tune "${args[@]}"
 
       - name: Upload tuned configs
         if: always()
@@ -56,7 +71,7 @@ jobs:
           if-no-files-found: warn
 
   commit-configs:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && inputs.create_pr == 'true'
     needs: auto-tune-matrix
     runs-on: ubuntu-latest
     steps:
