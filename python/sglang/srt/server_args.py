@@ -726,9 +726,6 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
-        # Handle elastic expert parallelism.
-        self._handle_elastic_ep()
-
         # Handle two-batch overlap settings.
         self._handle_two_batch_overlap()
 
@@ -2374,14 +2371,6 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
-    def _handle_remote_instance_weight_loader_start_seed_via_transfer_engine(self):
-        # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
-        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
-            self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
-                self.validate_transfer_engine()
-            )
-
-
         # Validate limit_mm_per_prompt modalities
         if self.limit_mm_data_per_request:
             if isinstance(self.limit_mm_data_per_request, str):
@@ -2404,7 +2393,7 @@ class ServerArgs:
                 self.preferred_sampling_params = json.loads(
                     self.preferred_sampling_params
                 )
-                
+
     def _handle_two_batch_overlap(self):
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
