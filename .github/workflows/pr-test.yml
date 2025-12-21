@@ -523,7 +523,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu
 
   stage-c-test-large-4-gpu:
-    needs: [check-changes, call-gate, stage-b-test-large-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
