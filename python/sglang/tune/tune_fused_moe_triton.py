@@ -286,6 +286,7 @@ def tune_fused_moe_triton(
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
     workers = [BenchmarkWorker.remote(seed) for _ in range(num_gpus)]
+    print(f"Using {num_gpus} GPUs for tuning")
 
     def _distribute(inputs: List[Any]) -> List[Any]:
         outputs = []
@@ -302,14 +303,10 @@ def tune_fused_moe_triton(
     if block_shape is not None:
         block_n, block_k = block_shape[0], block_shape[1]
         search_space = [
-            config
-            for config in search_space
-            if block_k % config["BLOCK_SIZE_K"] == 0
+            config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
         ]
 
-    print(
-        f"Start tuning over {len(search_space)} configurations..."
-    )
+    print(f"Start tuning over {len(search_space)} configurations...")
 
     start = time.perf_counter()
     configs = _distribute(
@@ -332,9 +329,7 @@ def tune_fused_moe_triton(
             for batch_size in batch_sizes
         ],
     )
-    best_configs = {
-        M: sort_config(config) for M, config in zip(batch_sizes, configs)
-    }
+    best_configs = {M: sort_config(config) for M, config in zip(batch_sizes, configs)}
     end = time.perf_counter()
     print(f"Tuning took {end - start:.2f} seconds")
     return best_configs
