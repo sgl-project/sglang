@@ -281,14 +281,17 @@ def run_unittest_files(
             logger.info(f"  {test} ({attempts} attempts, {result})")
     logger.info(f"{'='*60}\n")
 
-    # Write GitHub Step Summary
+    # Write GitHub Step Summary only if retries occurred
     if retried_tests:
-        summary = "\n### CI Retry Summary\n\n"
-        summary += "| Test File | Attempts | Result |\n"
-        summary += "|-----------|----------|--------|\n"
-        for test, attempts, result in retried_tests:
-            summary += f"| `{test}` | {attempts} | {result} |\n"
-        summary += "\n"
+        passed_on_retry = [t for t, _, r in retried_tests if r == "passed"]
+        failed_after_retry = [t for t, _, r in retried_tests if r != "passed"]
+        summary = f"**↻ Retried {len(retried_tests)} test(s):** "
+        parts = []
+        if passed_on_retry:
+            parts.append(f"{len(passed_on_retry)} passed on retry")
+        if failed_after_retry:
+            parts.append(f"{len(failed_after_retry)} still failed")
+        summary += ", ".join(parts) + "\n"
         write_github_step_summary(summary)
 
     return 0 if success else -1
