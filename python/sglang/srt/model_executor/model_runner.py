@@ -97,9 +97,10 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
@@ -182,7 +183,10 @@ from sglang.srt.utils.offloader import (
     get_offloader,
     set_offloader,
 )
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.patch_torch import (
+    monkey_patch_torch_reductions,
+    register_sgl_tp_rank,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -451,7 +455,7 @@ class ModelRunner:
             else None
         )
         # Load the model
-        self.sampler = Sampler()
+        self.sampler = create_sampler()
         self.load_model()
 
         if (
@@ -759,6 +763,8 @@ class ModelRunner:
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
+            if is_npu():
+                register_sgl_tp_rank(self.gpu_id)
 
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
@@ -1718,6 +1724,13 @@ class ModelRunner:
                 "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
             )
             return False
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+            # TODO(yuwei): fix the compilation errors for MOE A2A backend
+            log_info_on_rank0(
+                logger,
+                "Disable piecewise CUDA graph due to existing compilation errors",
+            )
+            return False
         return True
 
     def init_memory_pool(
@@ -2618,9 +2631,10 @@ class ModelRunner:
         ):
             return
 
-        # Collect attention layers from the model
-        self.attention_layers = []
+        # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
+        self.attention_layers = []
+        self.moe_layers = []
         for layer in self.model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
@@ -2637,6 +2651,17 @@ class ModelRunner:
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):
                     self.attention_layers.append(layer.attention.attn)
+
+            moe_block = None
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                moe_block = layer.mlp.experts
+            if hasattr(layer, "block_sparse_moe") and hasattr(
+                layer.block_sparse_moe, "experts"
+            ):
+                moe_block = layer.block_sparse_moe.experts
+            if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
+                moe_block = layer.moe.experts
+            self.moe_layers.append(moe_block)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA
