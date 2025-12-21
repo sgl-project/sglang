@@ -2,9 +2,8 @@ import os
 import unittest
 import warnings
 
-from nightly_utils import NightlyBenchmarkRunner
-
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,

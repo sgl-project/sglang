@@ -6,7 +6,7 @@ from accuracy_test_runner import (
     run_accuracy_test,
     write_accuracy_github_summary,
 )
-from nightly_utils import NightlyBenchmarkRunner
+from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from performance_test_runner import (
     PerformanceTestParams,
     PerformanceTestResult,
