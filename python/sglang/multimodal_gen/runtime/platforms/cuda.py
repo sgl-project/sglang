@@ -114,8 +114,8 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def get_current_available_memory(
-        device: torch.types.Device | None = None
-    ) -> int:
+        cls, device: torch.types.Device | None = None
+    ) -> float:
         """
         Return current free GPU memory in GiB.
         """
