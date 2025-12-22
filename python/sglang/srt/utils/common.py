@@ -3775,12 +3775,6 @@ def get_or_create_event_loop():
         return loop
 
 
-import subprocess
-from functools import lru_cache
-
-import torch
-
-
 @lru_cache(maxsize=1)
 def get_current_device_numa_node() -> int:
     """
@@ -3795,6 +3789,7 @@ def get_current_device_numa_node() -> int:
     Raises:
         RuntimeError: If nvidia-smi fails, is not found, or output cannot be parsed.
     """
+    import torch
     device_id = torch.cuda.current_device()
 
     try:
