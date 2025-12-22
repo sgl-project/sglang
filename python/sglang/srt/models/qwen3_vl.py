@@ -967,7 +967,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
 
-            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+            if (
+                self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and self.config.tie_word_embeddings
+            ):
                 if "lm_head.weight" in params_dict:
                     lm_head_param = params_dict["lm_head.weight"]
                     weight_loader = getattr(
