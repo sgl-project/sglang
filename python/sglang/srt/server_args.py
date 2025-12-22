@@ -440,10 +440,6 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
 
-    # For Multi-Layer MTP
-    # FIXME: rename -> enable_multi_layer_mtp
-    enable_mtp: bool = False
-
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
@@ -3336,7 +3332,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "MTP"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3476,13 +3472,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
-        )
-
-        # Speculative decoding (MTP)
-        parser.add_argument(
-            "--enable-mtp",
-            action="store_true",
-            help="Enable multi-layer MTP speculative decoding.",
         )
 
         # Expert parallelism

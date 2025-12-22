@@ -162,7 +162,7 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
         return self is SpeculativeAlgorithm.NONE
 
     def is_eagle(self) -> bool:
-        return self._has_flag("EAGLE")
+        return self._has_flag("EAGLE") or self._has_flag("MTP")
 
     def is_eagle3(self) -> bool:
         return self._has_flag("EAGLE3")
@@ -172,6 +172,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
 
     def is_ngram(self) -> bool:
         return self._has_flag("NGRAM")
+
+    def is_mtp(self) -> bool:
+        return self._has_flag("MTP")
 
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
@@ -189,6 +192,7 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
         "STANDALONE", algorithm
     ),
     "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
+    "MTP": lambda algorithm: SpeculativeAlgorithm._add_flag("MTP", algorithm),
 }
 
 
@@ -285,6 +289,18 @@ def _create_ngram_worker(**kwargs: Any) -> Any:
     return NGRAMWorker(**kwargs)
 
 
+def _create_multi_layer_eagle_worker(**kwargs: Any) -> Any:
+    enable_overlap = kwargs.pop("enable_overlap", False)
+    if enable_overlap:
+        from sglang.srt.speculative.multi_layer_eagle_worker_v2 import MTPWorkerV2
+
+        return MTPWorkerV2(**kwargs)
+
+    from sglang.srt.speculative.multi_layer_eagle_worker import MTPWorker
+
+    return MTPWorker(**kwargs)
+
+
 # Register built-in algorithms.
 # Third-party integrations should import `SpeculativeAlgorithm` and either
 # call `register_speculative_algorithm` or use the helpers below to attach
@@ -314,6 +330,12 @@ register_speculative_algorithm(
     "NGRAM",
     worker_cls=_create_ngram_worker,
     flags=("NGRAM",),
+)
+
+register_speculative_algorithm(
+    "MTP",
+    worker_cls=_create_ngram_worker,
+    flags=("MTP",),
 )
 
 

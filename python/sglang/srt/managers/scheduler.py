@@ -275,7 +275,6 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.enable_mtp = server_args.enable_mtp
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -484,36 +483,9 @@ class Scheduler(
         if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
-        # FIXME: refactor the draft worker registration logic
-        if self.enable_mtp:
-            if self.enable_overlap:
-                from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
-
-                self.draft_worker = MTPWorkerV2(
-                    gpu_id=self.gpu_id,
-                    tp_rank=self.tp_rank,
-                    moe_ep_rank=self.moe_ep_rank,
-                    server_args=self.server_args,
-                    nccl_port=self.nccl_port,
-                    target_worker=self.tp_worker,
-                    dp_rank=self.dp_rank,
-                )
-            else:
-                from sglang.srt.speculative.mtp_worker import MTPWorker
-
-                self.draft_worker = MTPWorker(
-                    gpu_id=self.gpu_id,
-                    tp_rank=self.tp_rank,
-                    moe_ep_rank=self.moe_ep_rank,
-                    server_args=self.server_args,
-                    nccl_port=self.nccl_port,
-                    target_worker=self.tp_worker,
-                    dp_rank=self.dp_rank,
-                )
-        else:
-            self.draft_worker = self.spec_algorithm.create_draft_worker(
-                **draft_worker_kwargs
-            )
+        self.draft_worker = self.spec_algorithm.create_draft_worker(
+            **draft_worker_kwargs
+        )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -834,7 +806,7 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            if self.enable_mtp:
+            if self.spec_algorithm.is_mtp():
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
