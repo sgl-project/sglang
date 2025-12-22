@@ -44,44 +44,31 @@ impl ManualPolicy {
 
         // Fast path
         if let Some(info) = self.routing_map.get(&routing_id) {
-            for url in &info.worker_urls {
-                if let Some(idx) = find_worker_index_by_url(workers, url) {
-                    if healthy_indices.contains(&idx) {
-                        return idx;
-                    }
-                }
+            if let Some(idx) = find_healthy_worker(&info.worker_urls, workers, healthy_indices) {
+                return idx;
             }
         }
 
         // Slow path
         match self.routing_map.entry(routing_id) {
             Entry::Occupied(mut entry) => {
-                for url in &entry.get().worker_urls {
-                    if let Some(idx) = find_worker_index_by_url(workers, url) {
-                        if healthy_indices.contains(&idx) {
-                            return idx;
-                        }
-                    }
+                if let Some(idx) =
+                    find_healthy_worker(&entry.get().worker_urls, workers, healthy_indices)
+                {
+                    return idx;
                 }
-                let selected_idx = Self::random_select(healthy_indices);
+                let selected_idx = random_select(healthy_indices);
                 entry.get_mut().worker_urls.push(workers[selected_idx].url().to_string());
                 selected_idx
             }
             Entry::Vacant(entry) => {
-                let selected_idx = Self::random_select(healthy_indices);
+                let selected_idx = random_select(healthy_indices);
                 entry.insert(RoutingInfo {
                     worker_urls: vec![workers[selected_idx].url().to_string()],
                 });
                 selected_idx
             }
         }
-    }
-
-    // TODO: use load-aware selection later
-    fn random_select(healthy_indices: &[usize]) -> usize {
-        let mut rng = rand::rng();
-        let random_idx = rng.random_range(0..healthy_indices.len());
-        healthy_indices[random_idx]
     }
 }
 
@@ -102,7 +89,7 @@ impl LoadBalancingPolicy for ManualPolicy {
             }
         }
 
-        Some(Self::random_select(&healthy_indices))
+        Some(random_select(&healthy_indices))
     }
 
     fn name(&self) -> &'static str {
@@ -120,6 +107,28 @@ impl LoadBalancingPolicy for ManualPolicy {
 
 fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
     workers.iter().position(|w| w.url() == url)
+}
+
+fn find_healthy_worker(
+    urls: &[String],
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+) -> Option<usize> {
+    for url in urls {
+        if let Some(idx) = find_worker_index_by_url(workers, url) {
+            if healthy_indices.contains(&idx) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+// TODO: use load-aware selection later
+fn random_select(healthy_indices: &[usize]) -> usize {
+    let mut rng = rand::rng();
+    let random_idx = rng.random_range(0..healthy_indices.len());
+    healthy_indices[random_idx]
 }
 
 #[cfg(test)]
