@@ -7,7 +7,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 
-QuantizationMethods = Literal[None]
+QuantizationMethods = Literal["fp8"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
