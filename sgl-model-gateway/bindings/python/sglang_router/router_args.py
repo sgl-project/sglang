@@ -24,10 +24,17 @@ class RouterArgs:
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
 
+    # EPD-specific configuration
+    epd_disaggregation: bool = False  # Enable EPD (Encode-Prefill-Decode) disaggregated mode
+    encode_urls: List[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
+
     # Routing policy
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
+    encode_policy: Optional[str] = None  # Specific policy for encode nodes in EPD mode
     worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -50,6 +57,8 @@ class RouterArgs:
     # PD service discovery configuration
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # EPD service discovery configuration
+    encode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
     # Prometheus configuration
     prometheus_port: Optional[int] = None
@@ -188,6 +197,13 @@ class RouterArgs:
             choices=["random", "round_robin", "cache_aware", "power_of_two"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
+        parser.add_argument(
+            f"--{prefix}encode-policy",
+            type=str,
+            default=None,
+            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            help="Specific policy for encode nodes in EPD mode. If not specified, uses the main policy",
+        )
 
         # PD-specific arguments
         parser.add_argument(
@@ -214,6 +230,21 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+
+        # EPD-specific arguments
+        parser.add_argument(
+            f"--{prefix}epd-disaggregation",
+            action="store_true",
+            help="Enable EPD (Encode-Prefill-Decode) disaggregated mode",
+        )
+        parser.add_argument(
+            f"--{prefix}encode",
+            nargs="+",
+            action="append",
+            help="Encode server URL and optional bootstrap port. Can be specified multiple times. "
+            "Format: --encode URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -334,6 +365,13 @@ class RouterArgs:
             nargs="+",
             default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        parser.add_argument(
+            f"--{prefix}encode-selector",
+            type=str,
+            nargs="+",
+            default={},
+            help="Label selector for encode server pods in EPD mode (format: key1=value1 key2=value2)",
         )
         # Prometheus configuration
         parser.add_argument(
@@ -721,6 +759,9 @@ class RouterArgs:
         args_dict["decode_urls"] = cls._parse_decode_urls(
             cli_args_dict.get(f"{prefix}decode", None)
         )
+        args_dict["encode_urls"] = cls._parse_encode_urls(
+            cli_args_dict.get(f"{prefix}encode", None)
+        )
         args_dict["selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}selector", None)
         )
@@ -729,6 +770,9 @@ class RouterArgs:
         )
         args_dict["decode_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}decode_selector", None)
+        )
+        args_dict["encode_selector"] = cls._parse_selector(
+            cli_args_dict.get(f"{prefix}encode_selector", None)
         )
 
         # Mooncake-specific annotation
@@ -823,3 +867,42 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
+
+    @staticmethod
+    def _parse_encode_urls(encode_list):
+        """Parse encode URLs from --encode arguments.
+
+        Format: --encode URL [BOOTSTRAP_PORT]
+        Example:
+            --encode http://encode1:8080 9000  # With bootstrap port
+            --encode http://encode2:8080 none  # Explicitly no bootstrap port
+            --encode http://encode3:8080       # Defaults to no bootstrap port
+        """
+        if not encode_list:
+            return []
+
+        encode_urls = []
+        for encode_args in encode_list:
+
+            url = encode_args[0]
+
+            # Handle optional bootstrap port
+            if len(encode_args) >= 2:
+                bootstrap_port_str = encode_args[1]
+                # Handle 'none' as None
+                if bootstrap_port_str.lower() == "none":
+                    bootstrap_port = None
+                else:
+                    try:
+                        bootstrap_port = int(bootstrap_port_str)
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                        )
+            else:
+                # No bootstrap port specified, default to None
+                bootstrap_port = None
+
+            encode_urls.append((url, bootstrap_port))
+
+        return encode_urls

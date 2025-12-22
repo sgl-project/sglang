@@ -733,8 +733,10 @@ impl Router {
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
                 pd_mode: self.pd_disaggregation,
+                epd_mode: self.epd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
+                encode_selector: self.encode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
             })
         } else {
