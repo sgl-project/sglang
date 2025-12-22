@@ -8,11 +8,6 @@ use rand::Rng;
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
-/// Manual routing policy
-///
-/// Routes requests based on routing_id field with explicit worker URL mapping.
-/// Requests with the same routing_id are always routed to the same worker.
-/// Falls back to random selection when routing_id is not provided.
 #[derive(Debug, Default)]
 pub struct ManualPolicy {
     routing_map: DashMap<String, String>,
@@ -61,6 +56,7 @@ impl LoadBalancingPolicy for ManualPolicy {
             }
         }
 
+        // Fallback
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
         Some(healthy_indices[random_idx])
