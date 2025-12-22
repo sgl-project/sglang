@@ -1259,6 +1259,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
+    # Pending accept info from last batch for overlapped grammar processing
+    # list of (request, accepted_token_ids)
+    pending_accept_info: Optional[List[Tuple[Req, List[int]]]] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -2141,6 +2145,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            pending_accept_info=self.pending_accept_info,
+            return_hidden_states_before_norm=self.return_hidden_states_before_norm,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2165,6 +2171,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2270,6 +2277,9 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+    # Pending accept info from last batch for overlapped grammar processing
+    # Format: List[Tuple[Req, List[int]]] - list of (request, accepted_token_ids)
+    pending_accept_info: Optional[List] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

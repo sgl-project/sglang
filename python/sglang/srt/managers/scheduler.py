@@ -1130,6 +1130,22 @@ class Scheduler(
             if disable_overlap_for_batch:
                 pop_and_process()
 
+            # Prepare pending accept info for overlapped grammar processing
+            # The accept tokens from the last batch will be processed during
+            # the current batch's verify forward to overlap CPU and GPU operations.
+            if (
+                batch
+                and batch.is_eagle_v2
+                and batch.has_grammar
+                and batch.forward_mode.is_decode()
+                and len(self.result_queue) > 0
+            ):
+                last_batch, last_result = self.result_queue[-1]
+                if last_batch.has_grammar:
+                    batch.pending_accept_info = (last_batch, last_result)
+                    # Mark that grammar accept will be processed in the next batch's verify
+                    last_result.grammar_accept_processed = True
+
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
@@ -1158,26 +1174,13 @@ class Scheduler(
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
-        disable_overlap_for_batch = (
+        return (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
             and batch
             and batch.forward_mode.is_extend()
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         )
-
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
-        need_grammar_sync = (
-            batch
-            and batch.is_spec_v2
-            and batch.has_grammar
-            and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
-        )
-
-        return disable_overlap_for_batch or need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:

@@ -83,5 +83,8 @@ class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
     spec_v2 = True
 
 
+# TODO(yixin, liangsheng): Support Spec V2 + TopK > 1.
+
+
 if __name__ == "__main__":
     unittest.main()

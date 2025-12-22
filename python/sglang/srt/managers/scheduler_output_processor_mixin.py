@@ -170,16 +170,18 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
+                        # Skip if grammar accept was already processed in overlapped mode
+                        if not result.grammar_accept_processed:
+                            # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                            try:
+                                req.grammar.accept_token(next_token_id)
+                            except ValueError as e:
+                                # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                                # This can happen if the grammar is not set correctly or the token is invalid.
+                                logger.error(
+                                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                                )
+                                self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
                     trace_slice(
@@ -433,22 +435,24 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None:
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
-                        for token_id in next_token_id:
-                            req.grammar.accept_token(token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
+                # Skip if grammar accept was already processed in overlapped mode
+                if not result.grammar_accept_processed:
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        if batch.spec_algorithm.is_none():
+                            # Normal decode: single token
+                            req.grammar.accept_token(next_token_id)
+                        elif batch.is_eagle_v2:
+                            # Speculative decode: next_token_id is a list of accepted tokens
+                            for token_id in next_token_id:
+                                req.grammar.accept_token(token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        )
+                        self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)
