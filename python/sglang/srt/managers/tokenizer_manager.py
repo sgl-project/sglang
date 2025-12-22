@@ -1508,9 +1508,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     async def handle_loop(self):
         while True:
-            self.watchdog._active = False
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self.watchdog._active = True
+            with self.watchdog.disable():
+                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
             self.watchdog.feed()
