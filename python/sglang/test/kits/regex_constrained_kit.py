@@ -33,8 +33,9 @@ class TestRegexConstrainedMixin:
         print(json.dumps(ret, indent=2))
         print("=" * 100)
 
+        # Handle the case where n == 1
         if not isinstance(ret, list):
-            self.fail(f"Expected response to be a list, but got {type(ret)}")
+            ret = [ret]
 
         for item in ret:
             text = item.get("text", "").strip()

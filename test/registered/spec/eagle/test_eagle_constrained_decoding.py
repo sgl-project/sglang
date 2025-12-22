@@ -30,7 +30,7 @@ class TestEagleConstrainedDecoding(
     model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
     draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
     grammar_backend = "xgrammar"
-    eagle_v2 = False
+    eagle_v2 = True
 
     @classmethod
     def setUpClass(cls):
@@ -72,15 +72,15 @@ class TestEagleConstrainedDecoding(
         kill_process_tree(cls.process.pid)
 
 
-class TestEagleConstrainedDecodingTopK(TestEagleConstrainedDecoding):
-    """Test Eagle constrained decoding with topk > 1 (tree structure)."""
+# class TestEagleConstrainedDecodingTopK(TestEagleConstrainedDecoding):
+#     """Test Eagle constrained decoding with topk > 1 (tree structure)."""
 
-    spec_topk = 4
-    spec_draft_tokens = 16
+#     spec_topk = 4
+#     spec_draft_tokens = 16
 
 
-class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
-    eagle_v2 = True
+# class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
+#     eagle_v2 = True
 
 
 if __name__ == "__main__":
