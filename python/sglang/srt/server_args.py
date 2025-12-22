@@ -3469,7 +3469,7 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
-        # Multi-layer MTP speculative decoding
+        # Multi-layer Eagle speculative decoding
         parser.add_argument(
             "--enable-multi-layer-eagle",
             action="store_true",
