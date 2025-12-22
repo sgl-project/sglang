@@ -1201,6 +1201,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         min_p: 0.0,
         repetition_penalty: 1.0,
         conversation: None,
+        routing_id: None,
     };
 
     let response = router.route_responses(None, &req, None).await;
