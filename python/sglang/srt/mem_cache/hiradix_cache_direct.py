@@ -14,8 +14,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+
+device_module = get_device_module()
 
 
 class HiRadixCacheDirect(RadixCache):
@@ -45,6 +48,8 @@ class HiRadixCacheDirect(RadixCache):
 
         # # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        # record the nodes with ongoing write storage
+        self.ongoing_write_storage = {}
 
         super().__init__(params=params)
 
@@ -221,6 +226,7 @@ class HiRadixCacheDirect(RadixCache):
         return -1
 
     def check_hicache_events(self):
+        self.writing_check()
         self.loading_check()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
@@ -347,11 +353,12 @@ class HiRadixCacheDirect(RadixCache):
                     key.token_ids, last_hash, self.page_size
                 )
                 hash_keys.extend(new_node.hash_value)
+                node = new_node
 
             self._inc_hit_count(new_node, chunked)
 
         if self.enable_storage:
-            self.write_storage(origin_req_tokens, origin_values, hash_keys)
+            self.write_storage(origin_req_tokens, origin_values, hash_keys, node)
 
         return total_prefix_length
 
@@ -360,16 +367,38 @@ class HiRadixCacheDirect(RadixCache):
         origin_req_tokens,
         device_indices,
         hash_keys: List[str],
+        node: TreeNode,
     ):
-        token_num = len(origin_req_tokens)
-        if token_num == 0:
-            return
-        assert token_num == len(device_indices)
-        assert token_num == len(hash_keys) * self.page_size
-        succ_num_tokens = self.cache_controller.write(hash_keys, device_indices)
+        # No need to write to storage repeatedly
+        if node.id not in self.ongoing_write_storage:
+            token_num = len(origin_req_tokens)
+            if token_num == 0:
+                return
+            assert token_num == len(device_indices)
+            assert token_num == len(hash_keys) * self.page_size
+            self.cache_controller.write(hash_keys, device_indices, node.id)
+            self.ongoing_write_storage[node.id] = node
+            self.inc_lock_ref(node)
 
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_backuped_tokens(succ_num_tokens)
+    def writing_check(self):
+        # NOTE: all ranks has the same ongoing_write_storage, can skip sync if empty
+        if len(self.ongoing_write_storage) == 0:
+            return
+
+        finish_count = self.cache_controller.ack_write_queue.qsize()
+        finish_count = self.cache_controller.allreduce_results(finish_count)
+        while finish_count > 0:
+            operation = self.cache_controller.ack_write_queue.get()
+            device_module.synchronize()
+            node = self.ongoing_write_storage.pop(operation.node_id)
+            self.dec_lock_ref(node)
+
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_backuped_tokens(
+                    operation.completed_tokens
+                )
+
+            finish_count -= 1
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests

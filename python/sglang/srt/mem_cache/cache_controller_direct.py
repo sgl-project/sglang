@@ -1,5 +1,6 @@
 import logging
-from queue import Empty
+import threading
+from queue import Empty, Queue
 from typing import List, Optional
 
 import torch
@@ -59,6 +60,24 @@ class LoadStorageOperation:
 
         self.id = LoadStorageOperation.counter
         LoadStorageOperation.counter += 1
+
+
+class WriteStorageOperation:
+    counter = 0
+
+    def __init__(
+        self,
+        hash_keys: List[str],
+        device_indices: torch.Tensor,
+        node_id: int,
+    ):
+        self.hash_keys = hash_keys
+        self.device_indices = device_indices
+        self.node_id = node_id
+        self.completed_tokens = 0
+
+        self.id = WriteStorageOperation.counter
+        WriteStorageOperation.counter += 1
 
 
 class HiCacheControllerDirect:
@@ -135,10 +154,30 @@ class HiCacheControllerDirect:
 
         self.load_queue: List[LoadStorageOperation] = []
 
-    def reset(self):
-        self.load_queue.clear()
+        self.stop_event = threading.Event()
+        self.write_queue = Queue()
+        self.ack_write_queue = Queue()
+        self.write_thread = threading.Thread(
+            target=self.write_thread_func, daemon=True
+        )
+        self.write_thread.start()
 
-    def write(self, hash_keys: List[str], device_indices: torch.Tensor) -> int:
+    def reset(self):
+        self.stop_event.set()
+
+        self.load_queue.clear()
+        self.write_thread.join()
+        self.write_queue.queue.clear()
+        self.ack_write_queue.queue.clear()
+
+        self.stop_event.clear()
+
+        self.write_thread = threading.Thread(
+            target=self.write_thread_func, daemon=True
+        )
+        self.write_thread.start()
+
+    def write_sync(self, hash_keys: List[str], device_indices: torch.Tensor) -> int:
         if self.backup_skip:
             return 0
 
@@ -146,14 +185,49 @@ class HiCacheControllerDirect:
             succ_pages_num = self._memcpy_between_device_and_storage(
                 hash_keys, device_indices, "write"
             )
-            if self.tp_world_size > 1 and self.is_mla_model is False:
+            if not self.is_mla_model:
                 # only mha model need all reduce
-                succ_pages_num = self._allreduce_results(succ_pages_num)
+                succ_pages_num = self.allreduce_results(succ_pages_num)
 
             logger.debug(f"success write {succ_pages_num} pages")
             return succ_pages_num * self.page_size
         except Empty:
             return 0
+
+    def write(
+        self,
+        hash_keys: List[str],
+        device_indices: torch.Tensor,
+        node_id: int,
+    ):
+        """
+        Write KV caches from HBM memory to storage backend.
+        """
+        operation = WriteStorageOperation(
+            hash_keys, device_indices, node_id
+        )
+        self.write_queue.put(operation)
+
+    def write_thread_func(self):
+        """
+        Manage write operations from HBM memory to storage backend.
+        """
+        while not self.stop_event.is_set():
+            try:
+                operation = self.write_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+
+                if not self.backup_skip:
+                    succ_pages_num = self._memcpy_between_device_and_storage(
+                        operation.hash_keys, operation.device_indices, "write"
+                    )
+                    operation.completed_tokens = succ_pages_num * self.page_size
+                else:
+                    operation.completed_tokens = len(operation.hash_keys) * self.page_size
+                self.ack_write_queue.put(operation)
+            except Empty:
+                continue
 
     def load(
         self,
@@ -184,15 +258,15 @@ class HiCacheControllerDirect:
 
         try:
             hit_hash_len = self._storage_hit_query(op)
-            if self.tp_world_size > 1:
-                hit_hash_len = self._allreduce_results(hit_hash_len)
+            hit_hash_len = self.allreduce_results(hit_hash_len)
 
             hit_token_len = hit_hash_len * self.page_size
             if hit_token_len < self.load_tokens_threshold:
                 # not to load storage if not enough benefits
-                logger.debug(
-                    f"Revoking Load operation for request {op.request_id} due to insufficient hits ({hit_token_len})."
-                )
+                if self.tp_rank == 0:
+                    logger.debug(
+                        f"Revoking Load operation for request {op.request_id} due to insufficient hits ({hit_token_len})."
+                    )
                 return None, op.device_indices
             else:
                 hit_hash_keys = op.hash_keys[:hit_hash_len]
@@ -200,8 +274,7 @@ class HiCacheControllerDirect:
                 succ_pages_num = self._memcpy_between_device_and_storage(
                     hit_hash_keys, device_indices, "load"
                 )
-                if self.tp_world_size > 1:
-                    succ_pages_num = self._allreduce_results(succ_pages_num)
+                succ_pages_num = self.allreduce_results(succ_pages_num)
 
                 token_len = succ_pages_num * self.page_size
                 hit_device_indices = op.device_indices[:token_len]
@@ -217,7 +290,10 @@ class HiCacheControllerDirect:
             )
             return None, op.device_indices
 
-    def _allreduce_results(self, result: int) -> int:
+    def allreduce_results(self, result: int) -> int:
+        if self.tp_world_size <= 1:
+            return result
+
         result_tensor = torch.tensor(result, dtype=torch.int)
         torch.distributed.all_reduce(
             result_tensor,
