@@ -57,8 +57,6 @@ class BaseTestSoftWatchdog:
             print(f"requests.post timeout (but expected): {e}")
         print("End call /generate API", flush=True)
 
-        time.sleep(40)
-
         combined_output = self.stdout.getvalue() + self.stderr.getvalue()
         self.assertIn(self.expected_message, combined_output)
 
