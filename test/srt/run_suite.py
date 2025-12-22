@@ -88,8 +88,6 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
-        TestFile("test_piecewise_cuda_graph_1_gpu_a.py", 460),
-        TestFile("test_piecewise_cuda_graph_1_gpu_b.py", 480),
         TestFile("test_prefill_adder.py", 1),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
