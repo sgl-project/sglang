@@ -625,6 +625,27 @@ pytest py_test/
 ```
 For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
+### Build Caching
+
+**Local development** uses incremental compilation by default (configured in `.cargo/config.toml`), which is optimal for the edit-compile-test cycle.
+
+**For release builds or CI**, you can optionally use [sccache](https://github.com/mozilla/sccache) to cache compilation artifacts:
+
+```bash
+# Install sccache
+cargo install sccache
+
+# Option 1: Set environment variable (per-session)
+export RUSTC_WRAPPER=sccache
+cargo build --release
+
+# Option 2: Add to your global cargo config (~/.cargo/config.toml)
+# [build]
+# rustc-wrapper = "sccache"
+```
+
+> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more.
+
 ---
 
 ## Release Management
