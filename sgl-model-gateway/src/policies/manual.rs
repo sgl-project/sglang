@@ -21,15 +21,15 @@ const MAX_CANDIDATE_WORKERS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct RoutingInfo {
-    worker_urls: Vec<String>,
+    candi_worker_urls: Vec<String>,
 }
 
 impl RoutingInfo {
     fn push_bounded(&mut self, url: String) {
-        while self.worker_urls.len() >= MAX_CANDIDATE_WORKERS {
-            self.worker_urls.remove(0);
+        while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
+            self.candi_worker_urls.remove(0);
         }
-        self.worker_urls.push(url);
+        self.candi_worker_urls.push(url);
     }
 }
 
@@ -56,7 +56,7 @@ impl ManualPolicy {
 
         // Fast path
         if let Some(info) = self.routing_map.get(&routing_id) {
-            if let Some(idx) = find_healthy_worker(&info.worker_urls, workers, healthy_indices) {
+            if let Some(idx) = find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices) {
                 return idx;
             }
         }
@@ -65,7 +65,7 @@ impl ManualPolicy {
         match self.routing_map.entry(routing_id) {
             Entry::Occupied(mut entry) => {
                 if let Some(idx) =
-                    find_healthy_worker(&entry.get().worker_urls, workers, healthy_indices)
+                    find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
                 {
                     return idx;
                 }
@@ -76,7 +76,7 @@ impl ManualPolicy {
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
                 entry.insert(RoutingInfo {
-                    worker_urls: vec![workers[selected_idx].url().to_string()],
+                    candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                 });
                 selected_idx
             }
