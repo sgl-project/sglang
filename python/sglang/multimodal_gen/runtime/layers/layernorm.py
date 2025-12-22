@@ -140,6 +140,14 @@ class RMSNorm(CustomOp):
             return out, residual_out
         return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
+        return self.forward_native(x, residual)
+
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
         s += f", eps={self.variance_epsilon}"

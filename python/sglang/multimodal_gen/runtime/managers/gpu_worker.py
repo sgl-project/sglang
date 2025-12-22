@@ -25,8 +25,8 @@ from sglang.multimodal_gen.runtime.utils.common import is_cuda, set_cuda_arch
 _is_cuda = is_cuda()
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
+    globally_suppress_loggers,
     init_logger,
-    suppress_other_loggers,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
@@ -111,6 +111,9 @@ class GPUWorker:
                 output_batch.timings.total_duration_ms = duration_ms
                 PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
+            logger.error(
+                f"Error executing request {req.request_id}: {e}", exc_info=True
+            )
             if output_batch is None:
                 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
                     OutputBatch,
@@ -177,7 +180,7 @@ def run_scheduler_process(
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
     configure_logger(server_args)
-    suppress_other_loggers()
+    globally_suppress_loggers()
     if _is_cuda:
         set_cuda_arch()
 
