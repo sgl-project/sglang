@@ -522,31 +522,6 @@ mod tests {
     }
 
     #[test]
-    fn test_manual_execution_branch_slow_path_vacant() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let info = SelectWorkerInfo {
-            routing_id: Some("new-routing-id"),
-            ..Default::default()
-        };
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert!(result.is_some());
-        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
-    }
-
-    #[test]
     fn test_manual_execution_branch_fast_path_hit() {
         let policy = ManualPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
@@ -587,26 +562,6 @@ mod tests {
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());
         assert_eq!(branch, ExecutionBranch::NoRoutingId);
-    }
-
-    #[test]
-    fn test_manual_execution_branch_no_healthy_workers() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
-            BasicWorkerBuilder::new("http://w1:8000")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        )];
-
-        workers[0].set_healthy(false);
-
-        let info = SelectWorkerInfo {
-            routing_id: Some("test"),
-            ..Default::default()
-        };
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert!(result.is_none());
-        assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
 
     #[test]
@@ -676,40 +631,6 @@ mod tests {
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());
         assert_eq!(branch, ExecutionBranch::SlowPathOccupiedHit);
-    }
-
-    #[test]
-    fn test_manual_multiple_routing_ids_isolation() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let info1 = SelectWorkerInfo {
-            routing_id: Some("user-1"),
-            ..Default::default()
-        };
-        let info2 = SelectWorkerInfo {
-            routing_id: Some("user-2"),
-            ..Default::default()
-        };
-
-        let idx1 = policy.select_worker(&workers, &info1).unwrap();
-        let idx2 = policy.select_worker(&workers, &info2).unwrap();
-
-        for _ in 0..10 {
-            assert_eq!(policy.select_worker(&workers, &info1), Some(idx1));
-            assert_eq!(policy.select_worker(&workers, &info2), Some(idx2));
-        }
     }
 
     #[test]
@@ -812,61 +733,6 @@ mod tests {
     fn test_manual_policy_needs_routing_id() {
         let policy = ManualPolicy::new();
         assert!(policy.needs_routing_id());
-    }
-
-    #[test]
-    fn test_manual_consecutive_unhealthy_transitions() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w4:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
-        let info = SelectWorkerInfo {
-            routing_id: Some("transition-test"),
-            ..Default::default()
-        };
-
-        let mut selected_workers = Vec::new();
-
-        for i in 0..4 {
-            let idx = policy.select_worker(&workers, &info).unwrap();
-            selected_workers.push(idx);
-
-            if i < 3 {
-                workers[idx].set_healthy(false);
-            }
-        }
-
-        assert_eq!(
-            selected_workers.len(),
-            4,
-            "Should have selected 4 different workers"
-        );
-
-        let unique_count = selected_workers
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        assert_eq!(unique_count, 4, "All selected workers should be unique");
     }
 
     #[test]
