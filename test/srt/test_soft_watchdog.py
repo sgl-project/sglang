@@ -26,7 +26,7 @@ class BaseTestSoftWatchdog(CustomTestCase):
 
         with cls.env_override.override(5):
             cls.process = popen_launch_server(
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                "Qwen/Qwen3-0.6B",
                 DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=("--soft-watchdog-timeout", "2"),
