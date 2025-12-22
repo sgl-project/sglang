@@ -61,6 +61,11 @@ struct dtype_trait<__nv_bfloat16> {
 };
 #endif
 
+template <DLDeviceType Code>
+struct device_trait {
+  inline static constexpr DLDevice value = {.device_type = Code, .device_id = 0};
+};
+
 inline constexpr auto kAnyDeviceID = -1;
 inline constexpr auto kAnySize = static_cast<int64_t>(-1);
 inline constexpr auto kNullSize = static_cast<int64_t>(-1);
@@ -71,8 +76,7 @@ template <typename... Ts>
 inline constexpr auto kDTypeList = std::array<DLDataType, sizeof...(Ts)>{dtype_trait<Ts>::value...};
 
 template <DLDeviceType... Codes>
-inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{
-    DLDevice{.device_type = static_cast<DLDeviceType>(Codes), .device_id = kAnyDeviceID}...};
+inline constexpr auto kDeviceList = std::array<DLDevice, sizeof...(Codes)>{device_trait<Codes>::value...};
 
 template <typename T>
 struct PrintAbleSpan {
