@@ -26,11 +26,12 @@ def unpack(tensor, dim_len, pack_len):
 class TestEmbedInterpolate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        pass
+        cls.pDevice = torch.get_default_device()
+        torch.set_default_device("npu")
 
     @classmethod
     def tearDownClass(cls):
-        pass
+        torch.set_default_device(cls.pDevice)
 
     def test_embed_interpolate(self):
         self.assertTrue(issubclass(UnquantizedLinearMethod, LinearMethodBase))
@@ -38,8 +39,8 @@ class TestEmbedInterpolate(unittest.TestCase):
         s_dim = [192, 574]
         sarg = ServerArgs(model_path="dummy", device="npu")
         mconf = Qwen3VLConfig(
-            hidden_size=1024,
-            num_heads=16,
+            hidden_size=64,
+            num_heads=1,
             num_position_embeddings=2304,
             patch_size=16,
             spatial_merge_size=2,
@@ -47,7 +48,7 @@ class TestEmbedInterpolate(unittest.TestCase):
             deepstack_visual_indexes=[5, 11, 17],
             in_channels=3,
             depth=24,
-            intermediate_size=4096,
+            intermediate_size=256,
             hidden_act="gelu_pytorch_tanh",
             out_hidden_size=2560,
         )
