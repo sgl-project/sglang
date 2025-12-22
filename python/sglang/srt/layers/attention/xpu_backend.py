@@ -64,8 +64,8 @@ class XPUAttentionBackend(AttentionBackend):
             self.use_mla is False
         ), "XPUAttentionBackend doesn't support MLA yet, please use --attention-backend triton instead."
         self.skip_prefill = skip_prefill
-        self.is_hybrid = model_runner.is_hybrid
-        if self.is_hybrid:
+        self.is_hybrid_swa = model_runner.is_hybrid_swa
+        if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
             )
@@ -416,10 +416,10 @@ class XPUAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa = (
+        is_hybrid_swa = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_swa else (-1, -1)
+        window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
 
         # currently no FP8 KV cache supported
         k_descale, v_descale = None, None
@@ -450,7 +450,7 @@ class XPUAttentionBackend(AttentionBackend):
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
-            and not is_swa
+            and not is_hybrid_swa
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
@@ -465,7 +465,7 @@ class XPUAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
-        elif is_swa and metadata.swa_spec_metadata is not None:
+        elif is_hybrid_swa and metadata.swa_spec_metadata is not None:
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
             cu_seqlens_q = swa_spec_metadata.cu_seqlens_q
@@ -942,7 +942,7 @@ class XPUAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             page_table = self.full_to_swa_index_mapping[metadata.page_table].to(
                 torch.int32
             )

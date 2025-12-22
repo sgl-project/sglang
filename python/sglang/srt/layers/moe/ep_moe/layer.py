@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUW4A16Int4DynamicMoEMethod,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -16,7 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -86,7 +91,6 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
@@ -148,9 +152,28 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        if is_in_piecewise_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
 
         if self.deprecate_flag:
-            return super().forward(
+            return super().forward_impl(
                 hidden_states,
                 topk_output,
             )
@@ -303,8 +326,8 @@ class DeepEPMoE(FusedMoE):
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
-        assert get_bool_env_var(
-            "SGLANG_DEEPEP_BF16_DISPATCH"
+        assert (
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_ll(
             layer=self,
@@ -318,6 +341,9 @@ class DeepEPMoE(FusedMoE):
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
 
+        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+            npu_fused_moe_without_routing_weights_bf16,
+        )
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
@@ -343,7 +369,9 @@ class DeepEPMoE(FusedMoE):
                 )
             else:
                 input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
-                if not input_quant and self.w13_weight.dtype != torch.int32:
+                if not input_quant and not isinstance(
+                    self.quant_method, NPUW4A16Int4DynamicMoEMethod
+                ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
                         hidden_states
                     )
@@ -388,33 +416,6 @@ class DeepEPMoE(FusedMoE):
         return hidden_states
 
 
-def npu_fused_moe_without_routing_weights_bf16(
-    layer, hidden_states, group_list_type, group_list, output_dtype
-):
-    # gmm1: gate_up_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w13_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    hidden_states = torch_npu.npu_swiglu(hidden_states)
-    # gmm2: down_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w2_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    return hidden_states
-
-
 class NpuFuseEPMoE(DeepEPMoE):
     def __init__(
         self,
@@ -429,6 +430,7 @@ class NpuFuseEPMoE(DeepEPMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -442,6 +444,7 @@ class NpuFuseEPMoE(DeepEPMoE):
             prefix=prefix,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
         )
 
         self.quant_method.process_weights_after_loading = (
@@ -552,27 +555,23 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
 
-    # NEW: Direct FP4 detection (bypasses EP requirements)
-    # Check for FP4 quantization with TRTLLM flag, regardless of EP
     if get_moe_runner_backend().is_flashinfer_trtllm():
+        # NEW: Direct FP4 detection (bypasses EP requirements)
+        # Check for FP4 quantization with TRTLLM flag, regardless of EP
         # FlashInferFP4MoE must be paired with ModelOptNvFp4FusedMoEMethod.
-        # If UnquantizedFusedMoEMethod is detected, fall back to FusedMoE instead.
-        if quant_config is None:
-            return FusedMoE
-        try:
-            # Check the quantization argument directly
-            if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-                from sglang.srt.layers.moe.fused_moe_triton.layer import (
-                    FlashInferFP4MoE,
-                )
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
 
-                return FlashInferFP4MoE
-        except:
-            pass
+            return FlashInferFP4MoE
+        elif (
+            quant_config is None
+            or quant_config.get_name() == "fp8"
+            or quant_config.get_name() == "modelopt_fp8"
+            or quant_config.get_name() == "compressed_tensors"
+        ):
+            # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
+            return FlashInferFusedMoE
 
-    if get_moe_runner_backend().is_flashinfer_trtllm() and quant_config is not None:
-        # FIXME: FlashInferFusedMoE only supports fp8 quant now
-        return FlashInferFusedMoE
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE
     return FusedMoE

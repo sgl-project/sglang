@@ -12,7 +12,11 @@ SGLang Diffusion has the following features:
   - Broad model support: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux
   - Fast inference speed: enpowered by highly optimized kernel from sgl-kernel and efficient scheduler loop
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
-  - Diverse hardware support: H100, H200, A100, B200, 4090
+  - Multi-platform support: NVIDIA GPUs (H100, H200, A100, B200, 4090) and AMD GPUs (MI300X, MI325X)
+
+### AMD/ROCm Support
+
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [ROCm installation guide](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) for setup instructions.
 
 ## Getting Started
 
@@ -20,7 +24,7 @@ SGLang Diffusion has the following features:
 uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
-For more installation methods (e.g. pypi, uv, docker), check [install.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
+For more installation methods (e.g. pypi, uv, docker), check [install.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md). ROCm/AMD users should follow the [ROCm quickstart](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) that includes the additional kernel builds and attention backend settings we validated on MI300X.
 
 
 ## Inference
@@ -37,15 +41,14 @@ def main():
         num_gpus=1,  # Adjust based on your hardware
     )
 
-    # Provide a prompt for your video
-    prompt = "A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest."
-
     # Generate the video
     video = generator.generate(
-        prompt,
-        return_frames=True,  # Also return frames from this call (defaults to False)
-        output_path="my_videos/",  # Controls where videos are saved
-        save_output=True
+        sampling_params_kwargs=dict(
+            prompt="A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest.",
+            return_frames=True,  # Also return frames from this call (defaults to False)
+            output_path="my_videos/",  # Controls where videos are saved
+            save_output=True
+        )
     )
 
 if __name__ == '__main__':
@@ -71,6 +74,6 @@ All contributions are welcome. The contribution guide is available [here](https:
 
 We learnt and reused code from the following projects:
 
-- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVide on Sept. 24, 2025.
+- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVideo on Sept. 24, 2025.
 - [xDiT](https://github.com/xdit-project/xDiT). We used the parallelism library from it.
 - [diffusers](https://github.com/huggingface/diffusers) We used the pipeline design from it.

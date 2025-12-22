@@ -35,16 +35,16 @@ jobs:
 
       - name: Check proto files are in sync
         run: |
-          if ! diff -q python/sglang/srt/grpc/sglang_scheduler.proto sgl-router/src/proto/sglang_scheduler.proto; then
+          if ! diff -q python/sglang/srt/grpc/sglang_scheduler.proto sgl-model-gateway/src/proto/sglang_scheduler.proto; then
             echo "❌ ERROR: Proto files are out of sync!"
             echo ""
             echo "The following files must be kept identical:"
             echo "  - python/sglang/srt/grpc/sglang_scheduler.proto"
-            echo "  - sgl-router/src/proto/sglang_scheduler.proto"
+            echo "  - sgl-model-gateway/src/proto/sglang_scheduler.proto"
             echo ""
             echo "Please ensure both files have the same content."
             echo ""
             echo "Differences:"
-            diff python/sglang/srt/grpc/sglang_scheduler.proto sgl-router/src/proto/sglang_scheduler.proto || true
+            diff python/sglang/srt/grpc/sglang_scheduler.proto sgl-model-gateway/src/proto/sglang_scheduler.proto || true
             exit 1
           fi

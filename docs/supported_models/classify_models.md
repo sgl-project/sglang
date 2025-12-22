@@ -145,7 +145,7 @@ Error response format:
 
 The classification API is implemented using:
 
-1. **Rust Router**: Handles routing and request/response models in `sgl-router/src/protocols/spec.rs`
+1. **Rust Model Gateway**: Handles routing and request/response models in `sgl-model-gateway/src/protocols/spec.rs`
 2. **Python HTTP Server**: Implements the actual endpoint in `python/sglang/srt/entrypoints/http_server.py`
 3. **Classification Service**: Handles the classification logic in `python/sglang/srt/entrypoints/openai/serving_classify.py`
 
