@@ -60,11 +60,11 @@ logger = logging.getLogger(__name__)
 
 
 class MultiLayerEagleDraftExtendCudaGraphRunner:
-    def __init__(self, mtp_worker: MultiLayerEagleDraftWorker, step: int):
+    def __init__(self, eagle_worker: MultiLayerEagleDraftWorker, step: int):
         # Parse args
         self.step = step
-        self.mtp_worker = mtp_worker
-        self.model_runner = model_runner = mtp_worker.mtp_model_runner(self.step)
+        self.eagle_worker = eagle_worker
+        self.model_runner = model_runner = eagle_worker.mtp_model_runner(self.step)
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         self.graphs = {}
@@ -95,10 +95,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
-        self.mtp_worker.draft_extend_attn_backend_list[self.step].init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
-        self.seq_len_fill_value = self.mtp_worker.draft_extend_attn_backend_list[
+        self.eagle_worker.draft_extend_attn_backend_list[
+            self.step
+        ].init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.seq_len_fill_value = self.eagle_worker.draft_extend_attn_backend_list[
             self.step
         ].get_cuda_graph_seq_len_fill_value()
 
@@ -333,7 +333,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            attn_backend=self.mtp_worker.draft_extend_attn_backend_list[self.step],
+            attn_backend=self.eagle_worker.draft_extend_attn_backend_list[self.step],
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             padded_static_len=self.padded_static_len,
@@ -354,7 +354,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         num_tokens = bs * self.num_tokens_per_bs
         forward_batch = self.get_forward_batch(bs)
 
-        self.mtp_worker.draft_extend_attn_backend_list[
+        self.eagle_worker.draft_extend_attn_backend_list[
             self.step
         ].init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -422,7 +422,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                     self.step,
                     forward_batch.req_pool_indices,
                     forward_batch.req_to_token_pool.req_to_token,
-                    self.mtp_worker.req_to_hidden_states_pool,
+                    self.eagle_worker.req_to_hidden_states_pool,
                 )
                 self.next_cuda_graph_runner.swa_out_cache_loc.copy_(
                     self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
@@ -502,7 +502,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         forward_batch.spec_info.positions = self.positions[:num_tokens]
         forward_batch.spec_info.extend_seq_lens_tensor = self.extend_seq_lens[:bs]
 
-        self.mtp_worker.draft_extend_attn_backend_list[
+        self.eagle_worker.draft_extend_attn_backend_list[
             self.step
         ].init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -543,12 +543,14 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
-    def __init__(self, mtp_worker: MultiLayerEagleDraftWorker):
-        self.mtp_worker = mtp_worker
-        self.device = mtp_worker.device
-        self.gpu_id = mtp_worker.gpu_id
-        self.speculative_num_steps = mtp_worker.speculative_num_steps
-        self.draft_extend_attn_backend_list = mtp_worker.draft_extend_attn_backend_list
+    def __init__(self, eagle_worker: MultiLayerEagleDraftWorker):
+        self.eagle_worker = eagle_worker
+        self.device = eagle_worker.device
+        self.gpu_id = eagle_worker.gpu_id
+        self.speculative_num_steps = eagle_worker.speculative_num_steps
+        self.draft_extend_attn_backend_list = (
+            eagle_worker.draft_extend_attn_backend_list
+        )
 
         self.runners = []
         self.cuda_graph_buffers = {}
@@ -559,7 +561,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self._init_and_capture()
 
     def _init_and_capture(self):
-        if self.mtp_worker.server_args.disable_cuda_graph:
+        if self.eagle_worker.server_args.disable_cuda_graph:
             self.runners = [None] * self.speculative_num_steps
             return
 
@@ -570,7 +572,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         for step in range(self.speculative_num_steps):
             if self.draft_extend_attn_backend_list[step]:
                 runner = MultiLayerEagleDraftExtendCudaGraphRunner(
-                    self.mtp_worker, step
+                    self.eagle_worker, step
                 )
                 self.runners.append(runner)
 
