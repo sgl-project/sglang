@@ -9,27 +9,27 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RoutingId(String);
+struct RoutingId(String);
 
 impl RoutingId {
-    pub fn new(id: impl Into<String>) -> Self {
+    fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct RoutingInfo {
-    pub worker_urls: Vec<String>,
+struct RoutingInfo {
+    worker_urls: Vec<String>,
 }
 
 impl RoutingInfo {
-    pub fn new(worker_url: String) -> Self {
+    fn new(worker_url: String) -> Self {
         Self {
             worker_urls: vec![worker_url],
         }
     }
 
-    pub fn first_url(&self) -> Option<&str> {
+    fn first_url(&self) -> Option<&str> {
         self.worker_urls.first().map(|s| s.as_str())
     }
 }
