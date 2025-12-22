@@ -178,7 +178,14 @@ class RouterArgs:
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual", "bucket"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "bucket",
+            ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
