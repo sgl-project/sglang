@@ -29,7 +29,6 @@ from sglang.srt.utils import bind_to_closest_numa_node
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils import bind_to_closest_numa_node
 
 logger = logging.getLogger(__name__)
 

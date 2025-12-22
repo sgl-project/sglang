@@ -157,7 +157,7 @@ class MooncakeStore(HiCacheStorage):
 
     def __init__(self, storage_config: HiCacheStorageConfig = None):
         try:
-            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+            from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
@@ -167,7 +167,6 @@ class MooncakeStore(HiCacheStorage):
 
         try:
             self.store = MooncakeDistributedStore()
-            self.replica_config: Optional[ReplicateConfig] = None
 
             extra_config = (
                 getattr(storage_config, "extra_config", None)
@@ -555,16 +554,7 @@ class MooncakeStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        if self.replica_config is not None:
-            return self.store.batch_put_from(
-                keys=key_strs,
-                buffer_ptrs=buffer_ptrs,
-                sizes=buffer_sizes,
-                config=self.replica_config,
-            )
-        return self.store.batch_put_from(
-            keys=key_strs, buffer_ptrs=buffer_ptrs, sizes=buffer_sizes
-        )
+        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]

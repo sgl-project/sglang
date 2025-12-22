@@ -3694,6 +3694,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-numa-detect",
             action="store_true",
+            default=True,
             help="Bind the process to the NUMA node closest to the active CUDA device when hierarchical cache is enabled.",
         )
         parser.add_argument(
