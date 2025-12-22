@@ -1566,7 +1566,7 @@ class FlashInferMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
+            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
             dtype=torch.int32,
             device="cuda",
         )
