@@ -189,7 +189,11 @@ class AscendAttnMaskBuilder:
         :param seq_lens: Sequence lengths.
         :return: A tensor representing the splitfuse attention mask.
         """
-        attn_mask = torch.triu(torch.ones(seq_lens, seq_lens), diagonal=1).to(torch.int8).to(self.device)
+        attn_mask = (
+            torch.triu(torch.ones(seq_lens, seq_lens), diagonal=1)
+            .to(torch.int8)
+            .to(self.device)
+        )
         return attn_mask
 
 
