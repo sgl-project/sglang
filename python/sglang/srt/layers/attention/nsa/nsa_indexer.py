@@ -666,11 +666,18 @@ class Indexer(CustomOp):
         return topk_result
 
     def _get_index_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        index_loc = (
-            forward_batch.out_index_cache_loc
-            if forward_batch.out_index_cache_loc is not None
-            else forward_batch.out_cache_loc
-        )
+        pool = forward_batch.req_to_token_pool
+
+        if (
+            forward_batch.forward_mode.is_decode()
+            and hasattr(pool, "req_to_nsa_index_k")
+        ):
+            index_loc = pool.req_to_nsa_index_k[
+                forward_batch.req_pool_indices, forward_batch.seq_lens - 1
+            ].to(torch.int64)
+        else:
+            index_loc = forward_batch.out_cache_loc
+
         if not index_loc.is_contiguous():
             index_loc = index_loc.contiguous()
         return index_loc

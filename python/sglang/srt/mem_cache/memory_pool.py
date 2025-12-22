@@ -1621,7 +1621,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
-            index_k_max_size = index_k_max_size if index_k_max_size is not None else size
+            index_k_max_size = (
+                index_k_max_size if index_k_max_size is not None else size
+            )
             self.index_k_with_scale_buffer = [
                 torch.zeros(
                     # Layout:
@@ -1642,7 +1644,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
-        logger.info(f"NSATokenToKVPool initialized with index_k_max_size: {index_k_max_size},kv_max_size: {size}")
+        logger.info(
+            f"NSATokenToKVPool initialized with index_k_max_size: {index_k_max_size},kv_max_size: {size}"
+        )
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:

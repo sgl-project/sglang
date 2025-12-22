@@ -198,9 +198,6 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
-    # The indices of output nsa indexer_k (when enabling hierarchical NSA)
-    out_index_cache_loc: Optional[torch.Tensor] = None
-
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
@@ -350,7 +347,6 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            out_index_cache_loc=batch.out_index_cache_loc,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -785,10 +781,6 @@ class ForwardBatch:
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
-        if self.out_index_cache_loc is not None:
-            self.out_index_cache_loc = self._pad_tensor_to_size(
-                self.out_index_cache_loc, num_tokens
-            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

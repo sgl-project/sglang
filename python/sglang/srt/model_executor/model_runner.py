@@ -1671,9 +1671,8 @@ class ModelRunner:
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         pre_alloc_size=pre_alloc_size,
                     )
-                elif (
-                    self.server_args.enable_hierarchical_nsa
-                    and is_deepseek_nsa(self.model_config.hf_config)
+                elif self.server_args.enable_hierarchical_nsa and is_deepseek_nsa(
+                    self.model_config.hf_config
                 ):
                     # Use NSA DecodeReqToTokenPool for hierarchical NSA
                     self.req_to_token_pool = NSADecodeReqToTokenPool(
@@ -1767,7 +1766,7 @@ class ModelRunner:
                 self.server_args.max_nsa_index_k_cache_size
                 if self.server_args.max_nsa_index_k_cache_size is not None
                 else self.max_total_num_tokens
-            )         
+            )
             self.token_to_kv_pool = NSATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

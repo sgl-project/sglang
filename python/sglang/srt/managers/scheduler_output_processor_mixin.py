@@ -22,7 +22,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import (
     release_kv_cache,
-    truncate_kv_cache_after_prefill,
 )
 from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
@@ -104,7 +103,6 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
-            sparse_coordinator = get_sparse_coordinator()
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
@@ -116,23 +114,12 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
-                    if req.finished():  
-                        # Truncate KV cache after prefill completes
-                        truncate_kv_cache_after_prefill(
-                            req, batch.req_to_token_pool, self.tree_cache
-                        )                      
+                    if req.finished():
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
-
-                        if sparse_coordinator is not None:
-                            sparse_coordinator.on_request_prefill_end(req)
-                            # Truncate KV cache after prefill completes
-                            truncate_kv_cache_after_prefill(
-                                req, batch.req_to_token_pool, self.tree_cache
-                            )
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None

@@ -1884,9 +1884,8 @@ class Scheduler(
         # Notify sparse coordinator about new requests
         if self.server_args.enable_sparse_attn:
             sparse_coordinator = get_sparse_coordinator()
-            if sparse_coordinator is not None:
-                for req in new_batch.reqs:
-                    sparse_coordinator.on_request_begin(req)
+            for req in new_batch.reqs:
+                sparse_coordinator.on_request_begin(req)
 
         # Mixed-style chunked prefill
         if (

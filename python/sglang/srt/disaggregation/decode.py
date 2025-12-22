@@ -54,8 +54,10 @@ from sglang.srt.mem_cache.allocator import (
     is_enable_hierarchical_nsa,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.common import release_kv_cache, truncate_kv_cache_after_prefill
-from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
+from sglang.srt.mem_cache.common import (
+    release_kv_cache,
+    truncate_kv_cache_after_prefill,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -64,6 +66,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -149,7 +152,9 @@ class NSADecodeReqToTokenPool(DecodeReqToTokenPool):
         enable_memory_saver: bool,
         pre_alloc_size: int,
     ):
-        super().__init__(size, max_context_len, device, enable_memory_saver, pre_alloc_size)
+        super().__init__(
+            size, max_context_len, device, enable_memory_saver, pre_alloc_size
+        )
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
