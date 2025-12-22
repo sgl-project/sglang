@@ -118,15 +118,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             debug_name="DetokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
+            test_stuck=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
     def event_loop(self):
-        test_stuck = envs.SGLANG_TEST_STUCK_DETOKENIZER.get()
         while True:
             with self.watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
-            if test_stuck > 0:
-                time.sleep(test_stuck)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)

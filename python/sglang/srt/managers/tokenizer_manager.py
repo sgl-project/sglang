@@ -411,6 +411,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             debug_name="TokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
+            test_stuck=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
 
     async def generate_request(
@@ -1506,13 +1507,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         sys.exit(0)
 
     async def handle_loop(self):
-        test_stuck = envs.SGLANG_TEST_STUCK_TOKENIZER.get()
         while True:
             self.watchdog._active = False
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self.watchdog._active = True
-            if test_stuck > 0:
-                await asyncio.sleep(test_stuck)
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
             self.watchdog.feed()
