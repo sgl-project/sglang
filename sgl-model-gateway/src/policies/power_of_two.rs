@@ -30,7 +30,11 @@ impl PowerOfTwoPolicy {
 }
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], _info: &SelectWorkerInfo) -> Option<usize> {
+    fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        _info: &SelectWorkerInfo,
+    ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
