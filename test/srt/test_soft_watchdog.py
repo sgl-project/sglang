@@ -23,7 +23,7 @@ class TestSoftWatchdogDetokenizer(CustomTestCase):
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
 
-        with envs.SGLANG_TEST_WATCHDOG_SLOW_DETOKENIZER.override(5):
+        with envs.SGLANG_TEST_STUCK_DETOKENIZER.override(5):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -66,7 +66,7 @@ class TestSoftWatchdogTokenizer(CustomTestCase):
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
 
-        with envs.SGLANG_TEST_WATCHDOG_SLOW_TOKENIZER.override(5):
+        with envs.SGLANG_TEST_STUCK_TOKENIZER.override(5):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

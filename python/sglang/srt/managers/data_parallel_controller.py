@@ -508,7 +508,7 @@ class DataParallelController:
         self.round_robin_scheduler(req)
 
     def event_loop(self):
-        test_watchdog_slow = envs.SGLANG_TEST_WATCHDOG_SLOW_DP_CONTROLLER.get()
+        test_stuck = envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get()
         while True:
             while True:
                 try:
@@ -516,8 +516,8 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self.is_dispatching = True
-                if test_watchdog_slow > 0:
-                    time.sleep(test_watchdog_slow)
+                if test_stuck > 0:
+                    time.sleep(test_stuck)
                 self._request_dispatcher(recv_req)
                 self.is_dispatching = False
                 self.dispatch_ct += 1
