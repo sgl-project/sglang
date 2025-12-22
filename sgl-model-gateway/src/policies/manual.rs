@@ -32,9 +32,6 @@ impl ExecutionBranch {
         }
     }
 
-    fn record(&self) {
-        Metrics::record_policy_manual_branch(self.as_str());
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -144,7 +141,7 @@ impl ManualPolicy {
 impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
-        branch.record();
+        Metrics::record_policy_manual_branch(branch.as_str());
         result
     }
 

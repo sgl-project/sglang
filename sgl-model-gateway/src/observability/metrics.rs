@@ -802,15 +802,6 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record manual policy execution branch
-    pub fn record_policy_manual_branch(branch: &'static str) {
-        counter!(
-            "smg_policy_manual_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
-    }
-
     /// Set running requests per worker
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         gauge!(
@@ -818,6 +809,15 @@ impl Metrics {
             "worker" => worker.to_string()
         )
         .set(count as f64);
+    }
+
+    /// Record manual policy execution branch
+    pub fn record_policy_manual_branch(branch: &'static str) {
+        counter!(
+            "smg_policy_manual_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
     }
 
     // ========================================================================
