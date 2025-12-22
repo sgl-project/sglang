@@ -211,19 +211,19 @@ mod tests {
             ),
         ];
 
-        let routing_id = "user-123";
         let info = SelectWorkerInfo {
-            routing_id: Some(routing_id),
+            routing_id: Some("user-123"),
             ..Default::default()
         };
-        let first_idx = policy.select_worker(&workers, &info).unwrap();
+
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
 
         for _ in 0..10 {
-            let idx = policy.select_worker(&workers, &info).unwrap();
-            assert_eq!(
-                idx, first_idx,
-                "Same routing_id should route to same worker"
-            );
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, Some(first_idx), "Same routing_id should route to same worker");
+            assert_eq!(branch, ExecutionBranch::FastPathHit);
         }
     }
 
@@ -255,8 +255,9 @@ mod tests {
                 routing_id: Some(&routing_id),
                 ..Default::default()
             };
-            let idx = policy.select_worker(&workers, &info).unwrap();
-            *distribution.entry(idx).or_insert(0) += 1;
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+            *distribution.entry(result.unwrap()).or_insert(0) += 1;
         }
 
         assert!(
@@ -284,7 +285,9 @@ mod tests {
         let mut counts = HashMap::new();
         for _ in 0..100 {
             let info = SelectWorkerInfo::default();
-            if let Some(idx) = policy.select_worker(&workers, &info) {
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(branch, ExecutionBranch::NoRoutingId);
+            if let Some(idx) = result {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -310,13 +313,19 @@ mod tests {
 
         workers[0].set_healthy(false);
 
+        let info = SelectWorkerInfo {
+            routing_id: Some("test-routing-id"),
+            ..Default::default()
+        };
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(1), "Should only select healthy worker");
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+
         for _ in 0..10 {
-            let info = SelectWorkerInfo {
-                routing_id: Some("test-routing-id"),
-                ..Default::default()
-            };
-            let idx = policy.select_worker(&workers, &info).unwrap();
-            assert_eq!(idx, 1, "Should only select healthy worker");
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, Some(1), "Should only select healthy worker");
+            assert_eq!(branch, ExecutionBranch::FastPathHit);
         }
     }
 
@@ -334,7 +343,9 @@ mod tests {
             routing_id: Some("test"),
             ..Default::default()
         };
-        assert_eq!(policy.select_worker(&workers, &info), None);
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, None);
+        assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
 
     #[test]
@@ -359,7 +370,9 @@ mod tests {
                 routing_id: Some(""),
                 ..Default::default()
             };
-            if let Some(idx) = policy.select_worker(&workers, &info) {
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(branch, ExecutionBranch::NoRoutingId);
+            if let Some(idx) = result {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -391,16 +404,22 @@ mod tests {
             routing_id: Some("sticky-user"),
             ..Default::default()
         };
-        let first_idx = policy.select_worker(&workers, &info).unwrap();
+
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
 
         workers[first_idx].set_healthy(false);
 
-        let new_idx = policy.select_worker(&workers, &info).unwrap();
+        let (new_result, branch) = policy.select_worker_impl(&workers, &info);
+        let new_idx = new_result.unwrap();
         assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
+        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
 
         for _ in 0..10 {
-            let idx = policy.select_worker(&workers, &info).unwrap();
-            assert_eq!(idx, new_idx, "Should consistently route to new worker");
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, Some(new_idx), "Should consistently route to new worker");
+            assert_eq!(branch, ExecutionBranch::FastPathHit);
         }
     }
 
@@ -412,7 +431,9 @@ mod tests {
             routing_id: Some("test"),
             ..Default::default()
         };
-        assert_eq!(policy.select_worker(&workers, &info), None);
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, None);
+        assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
 
     #[test]
@@ -429,8 +450,14 @@ mod tests {
             ..Default::default()
         };
 
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(0));
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+
         for _ in 0..10 {
-            assert_eq!(policy.select_worker(&workers, &info), Some(0));
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, Some(0));
+            assert_eq!(branch, ExecutionBranch::FastPathHit);
         }
     }
 
@@ -455,19 +482,26 @@ mod tests {
             ..Default::default()
         };
 
-        let first_idx = policy.select_worker(&workers, &info).unwrap();
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+
         workers[first_idx].set_healthy(false);
 
-        let second_idx = policy.select_worker(&workers, &info).unwrap();
+        let (second_result, branch) = policy.select_worker_impl(&workers, &info);
+        let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
+        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
-        let after_recovery = policy.select_worker(&workers, &info).unwrap();
+        let (after_recovery, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(
-            after_recovery, first_idx,
+            after_recovery,
+            Some(first_idx),
             "Should return to original worker after recovery since it's first in candidate list"
         );
+        assert_eq!(branch, ExecutionBranch::FastPathHit);
     }
 
     #[test]
@@ -496,29 +530,39 @@ mod tests {
             ..Default::default()
         };
 
-        let first_idx = policy.select_worker(&workers, &info).unwrap();
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
+
         workers[first_idx].set_healthy(false);
 
-        let second_idx = policy.select_worker(&workers, &info).unwrap();
+        let (second_result, branch) = policy.select_worker_impl(&workers, &info);
+        let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
+        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
+
         workers[second_idx].set_healthy(false);
 
         let remaining_idx = (0..3)
             .find(|&i| i != first_idx && i != second_idx)
             .unwrap();
-        let third_idx = policy.select_worker(&workers, &info).unwrap();
+        let (third_result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(
-            third_idx, remaining_idx,
+            third_result,
+            Some(remaining_idx),
             "Should select the only remaining healthy worker"
         );
+        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
-        let idx_after_restore = policy.select_worker(&workers, &info).unwrap();
+        let (idx_after_restore, branch) = policy.select_worker_impl(&workers, &info);
         assert_ne!(
-            idx_after_restore, first_idx,
+            idx_after_restore,
+            Some(first_idx),
             "First worker should be evicted from candidates due to MAX_CANDIDATE_WORKERS=2"
         );
+        assert_eq!(branch, ExecutionBranch::FastPathHit);
     }
 
     #[test]
@@ -585,10 +629,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
         assert_eq!(branch, ExecutionBranch::SlowPathVacant);
 
-        let first_idx = policy.select_worker(&workers, &info).unwrap();
         workers[first_idx].set_healthy(false);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
@@ -756,23 +800,25 @@ mod tests {
             ..Default::default()
         };
 
-        let first_idx = policy.select_worker(&workers, &info).unwrap();
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, ExecutionBranch::SlowPathVacant);
 
         workers[0].set_healthy(false);
         workers[1].set_healthy(false);
 
-        assert_eq!(
-            policy.select_worker(&workers, &info),
-            None,
-            "Should return None when all workers are unhealthy"
-        );
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, None, "Should return None when all workers are unhealthy");
+        assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
 
         workers[first_idx].set_healthy(true);
 
-        let after_recovery = policy.select_worker(&workers, &info).unwrap();
+        let (after_recovery, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(
-            after_recovery, first_idx,
+            after_recovery,
+            Some(first_idx),
             "Should route to recovered worker in candidate list"
         );
+        assert_eq!(branch, ExecutionBranch::FastPathHit);
     }
 }
