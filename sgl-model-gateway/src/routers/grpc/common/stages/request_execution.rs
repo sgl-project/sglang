@@ -8,7 +8,7 @@ use super::PipelineStage;
 use crate::routers::{
     error,
     grpc::{
-        context::{ClientSelection, ExecutionResult, RequestContext},
+        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
         proto_wrapper::{ProtoGenerateRequest, ProtoStream},
     },
 };
@@ -56,6 +56,21 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
+        // Create load guards for worker load tracking (increment load when created)
+        // They will be automatically dropped (and decrement load) when RequestContext is dropped
+        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "Worker selection not completed"
+            );
+            error::internal_error(
+                "worker_selection_not_completed",
+                "Worker selection not completed",
+            )
+        })?;
+
+        ctx.state.load_guards = Some(LoadGuards::from(workers));
+
         // Extract dispatch metadata for tracing span
         let request_id = ctx
             .state
@@ -81,9 +96,10 @@ impl PipelineStage for RequestExecutionStage {
 
         let result = async {
             match self.mode {
-                ExecutionMode::Single => self.execute_single(proto_request, clients).await,
+                ExecutionMode::Single => self.execute_single(proto_request, clients, workers).await,
                 ExecutionMode::DualDispatch => {
-                    self.execute_dual_dispatch(proto_request, clients).await
+                    self.execute_dual_dispatch(proto_request, clients, workers)
+                        .await
                 }
             }
         }
@@ -105,6 +121,7 @@ impl RequestExecutionStage {
         &self,
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
+        workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
             error!(
@@ -117,7 +134,12 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let stream = client.generate(proto_request).await.map_err(|e| {
+        let result = client.generate(proto_request).await;
+
+        // Record circuit breaker outcome
+        workers.record_outcome(result.is_ok());
+
+        let stream = result.map_err(|e| {
             error!(
                 function = "execute_single",
                 error = %e,
@@ -136,6 +158,7 @@ impl RequestExecutionStage {
         &self,
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
+        workers: &WorkerSelection,
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
             error!(
@@ -155,6 +178,9 @@ impl RequestExecutionStage {
             prefill_client.generate(prefill_request),
             decode_client.generate(decode_request)
         );
+
+        // Record circuit breaker outcomes for each worker individually
+        workers.record_dual_outcomes(prefill_result.is_ok(), decode_result.is_ok());
 
         // Handle prefill result
         let prefill_stream = match prefill_result {
