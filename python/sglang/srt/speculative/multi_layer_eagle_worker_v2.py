@@ -34,7 +34,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
-    MTPMultiStepDraftExtendCudaGraphRunner,
+    MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.multi_layer_eagle_utils import (
     assign_hidden_states_pool_triton,
@@ -200,7 +200,7 @@ class MTPDraftWorker(BaseDraftWorker):
             return
 
         self.cuda_graph_runner_for_draft_extend = (
-            MTPMultiStepDraftExtendCudaGraphRunner(self)
+            MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
         )
 
     def reset_cuda_graph_buffers(self, forward_batch, batch_result):

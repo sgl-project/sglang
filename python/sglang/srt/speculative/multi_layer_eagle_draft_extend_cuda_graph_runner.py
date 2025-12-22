@@ -540,7 +540,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         return out
 
 
-class MTPMultiStepDraftExtendCudaGraphRunner:
+class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     def __init__(self, mtp_worker: MTPDraftWorker):
         self.mtp_worker = mtp_worker
         self.device = mtp_worker.device
