@@ -14,7 +14,6 @@ import time
 from typing import Any
 
 import numpy as np
-import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
