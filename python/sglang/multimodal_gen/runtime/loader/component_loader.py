@@ -23,6 +23,7 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
+from sglang.multimodal_gen.configs.models.encoders.qwen_image import QwenImageArchConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
@@ -239,9 +240,9 @@ class ComponentLoader(ABC):
         if module_type in module_loaders:
             loader_cls, expected_library = module_loaders[module_type]
             # Assert that the library matches what's expected for this module type
-            assert (
-                transformers_or_diffusers == expected_library
-            ), f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            assert transformers_or_diffusers == expected_library, (
+                f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            )
             return loader_cls()
 
         # For unknown module types, use a generic loader
@@ -402,6 +403,12 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config = server_args.pipeline_config.text_encoder_configs[0]
             encoder_config.update_model_arch(model_config)
             for key, value in diffusers_pretrained_config.__dict__.items():
+                # Preserve non-None values already set on arch_config.
+                if (
+                    value is None
+                    and getattr(encoder_config.arch_config, key, None) is not None
+                ):
+                    continue
                 setattr(encoder_config.arch_config, key, value)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
         else:
@@ -409,6 +416,10 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
+
+        self._ensure_qwen2_5_vl_tokens(
+            encoder_config.arch_config, component_model_path, server_args
+        )
         # TODO(will): add support for other dtypes
         return self.load_model(
             component_model_path,
@@ -481,6 +492,118 @@ class TextEncoderLoader(ComponentLoader):
                 )
 
         return model.eval()
+
+    def _is_qwen2_5_vl_config(self, arch_config) -> bool:
+        if isinstance(arch_config, QwenImageArchConfig):
+            return True
+        model_type = getattr(arch_config, "model_type", "")
+        architectures = getattr(arch_config, "architectures", []) or []
+        return ("qwen2_5_vl" in model_type) or any(
+            "Qwen2_5_VL" in str(a) for a in architectures
+        )
+
+    def _get_nested_config_value(self, cfg, key):
+        if cfg is None:
+            return None
+        if isinstance(cfg, dict):
+            return cfg.get(key)
+        return getattr(cfg, key, None)
+
+    def _load_tokenizer_for_text_encoder(
+        self, component_model_path: str, server_args: ServerArgs
+    ):
+        candidates = [
+            component_model_path,
+            os.path.join(os.path.dirname(component_model_path), "tokenizer"),
+            os.path.dirname(component_model_path),
+        ]
+        for cand in candidates:
+            if not os.path.exists(cand):
+                continue
+            try:
+                return AutoTokenizer.from_pretrained(
+                    cand,
+                    padding_size="right",
+                    local_files_only=True,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+            except Exception:
+                continue
+        return None
+
+    def _ensure_qwen2_5_vl_tokens(
+        self, arch_config, component_model_path: str, server_args: ServerArgs
+    ):
+        if not self._is_qwen2_5_vl_config(arch_config):
+            return
+
+        def set_if_missing(key: str, value):
+            if value is None:
+                return
+            current = getattr(arch_config, key, None)
+            if current is None:
+                setattr(arch_config, key, value)
+
+        # Prefer values already present or provided via aliases in the HF config.
+        set_if_missing(
+            "image_token_id", getattr(arch_config, "image_token_index", None)
+        )
+        set_if_missing(
+            "vision_start_token_id", getattr(arch_config, "vision_start_token", None)
+        )
+        set_if_missing(
+            "vision_end_token_id", getattr(arch_config, "vision_end_token", None)
+        )
+
+        text_cfg = getattr(arch_config, "text_config", None)
+        for key in (
+            "image_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+            "video_token_id",
+        ):
+            set_if_missing(key, self._get_nested_config_value(text_cfg, key))
+
+        missing_keys = [
+            k
+            for k in (
+                "image_token_id",
+                "vision_start_token_id",
+                "vision_end_token_id",
+                "video_token_id",
+            )
+            if getattr(arch_config, k, None) is None
+        ]
+        if not missing_keys:
+            return
+
+        tokenizer = self._load_tokenizer_for_text_encoder(
+            component_model_path, server_args
+        )
+        if tokenizer is None:
+            logger.warning(
+                "Qwen2.5-VL text encoder missing token ids and tokenizer could not be loaded; proceeding without filling."
+            )
+            if "video_token_id" in missing_keys:
+                setattr(arch_config, "video_token_id", -1)
+            return
+
+        token_map = {
+            "image_token_id": "<|image_pad|>",
+            "vision_start_token_id": "<|vision_start|>",
+            "vision_end_token_id": "<|vision_end|>",
+            "video_token_id": "<|video_pad|>",
+        }
+        for key, token_str in token_map.items():
+            if hasattr(arch_config, key):
+                continue
+            token_id = tokenizer.convert_tokens_to_ids(token_str)
+            if token_id is None or token_id == tokenizer.unk_token_id:
+                continue
+            setattr(arch_config, key, token_id)
+
+        if not hasattr(arch_config, "video_token_id"):
+            setattr(arch_config, "video_token_id", -1)
 
 
 class ImageEncoderLoader(TextEncoderLoader):
@@ -567,9 +690,9 @@ class VAELoader(ComponentLoader):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
         class_name = config.pop("_class_name", None)
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        assert class_name is not None, (
+            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        )
 
         server_args.model_paths["vae"] = component_model_path
 
@@ -613,9 +736,9 @@ class VAELoader(ComponentLoader):
             vae = vae_cls(vae_config).to(target_device)
 
         safetensors_list = _list_safetensors_files(component_model_path)
-        assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
+        assert len(safetensors_list) == 1, (
+            f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
+        )
         loaded = safetensors_load_file(safetensors_list[0])
         vae.load_state_dict(loaded, strict=False)
         return vae.eval()
@@ -664,15 +787,15 @@ class TransformerLoader(ComponentLoader):
             logger.info(
                 "Using custom initialization weights from: %s", custom_weights_path
             )
-            assert (
-                custom_weights_path is not None
-            ), "Custom initialization weights must be provided"
+            assert custom_weights_path is not None, (
+                "Custom initialization weights must be provided"
+            )
             if os.path.isdir(custom_weights_path):
                 safetensors_list = _list_safetensors_files(custom_weights_path)
             else:
-                assert custom_weights_path.endswith(
-                    ".safetensors"
-                ), "Custom initialization weights must be a safetensors file"
+                assert custom_weights_path.endswith(".safetensors"), (
+                    "Custom initialization weights must be a safetensors file"
+                )
                 safetensors_list = [custom_weights_path]
 
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
@@ -706,9 +829,9 @@ class TransformerLoader(ComponentLoader):
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
-        assert (
-            next(model.parameters()).dtype == default_dtype
-        ), "Model dtype does not match default dtype"
+        assert next(model.parameters()).dtype == default_dtype, (
+            "Model dtype does not match default dtype"
+        )
 
         model = model.eval()
 
@@ -742,9 +865,9 @@ class SchedulerLoader(ComponentLoader):
         config = get_diffusers_component_config(model_path=component_model_path)
 
         class_name = config.pop("_class_name")
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        assert class_name is not None, (
+            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        )
 
         scheduler_cls, _ = ModelRegistry.resolve_model_cls(class_name)
 
