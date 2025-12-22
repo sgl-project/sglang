@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
@@ -11,6 +11,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
 def npu_fused_experts(
@@ -138,22 +139,29 @@ def npu_fused_moe_without_routing_weights_bf16(
     return hidden_states
 
 
-class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
+class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 
-    @classmethod
-    def release_weight_cache(cls, weight: torch.Tensor):
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+    ):
+        self.quant_config = quant_config
+
+
+class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
+
+    def _release_weight_cache(self, weight: torch.Tensor):
         # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
         origin_weight = weight.data.transpose(1, 2)
         new_weight = origin_weight.contiguous()
         origin_weight.untyped_storage().resize_(0)
         return new_weight
 
-    @classmethod
-    def process_weights_after_loading(cls, layer: torch.nn.Module) -> None:
-        weight_data = cls.release_weight_cache(layer.w13_weight.data)
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight_data = self._release_weight_cache(layer.w13_weight.data)
         layer.w13_weight = torch.nn.Parameter(weight_data, requires_grad=False)
 
-        weight_data = cls.release_weight_cache(layer.w2_weight.data)
+        weight_data = self._release_weight_cache(layer.w2_weight.data)
         layer.w2_weight = torch.nn.Parameter(weight_data, requires_grad=False)
 
         layer.w13_weight_scale = torch.nn.Parameter(
@@ -178,8 +186,8 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
-    @staticmethod
     def apply(
+        self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
@@ -203,8 +211,8 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         )
         return StandardCombineInput(hidden_states=output)
 
-    @staticmethod
     def apply_without_routing_weights(
+        self,
         layer,
         hidden_states,
         hidden_states_scale,
@@ -251,12 +259,9 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         return hidden_states
 
 
-class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
+class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
-    @classmethod
-    def process_scale(
-        cls, weight: torch.Tensor, scale, per_group_scale, is_per_channel_weight
-    ):
+    def _process_scale(self, weight: torch.Tensor, scale, per_group_scale, is_per_channel_weight):
         scale = scale.transpose(1, 2).contiguous()
 
         if is_per_channel_weight:
@@ -289,8 +294,7 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         sscale_uint64_tensor = sscale_uint64_tensor.npu()
         return sscale_uint64_tensor, bias
 
-    @classmethod
-    def update_bias(cls, layer, w13_bias, w2_bias):
+    def _update_bias(self, layer, w13_bias, w2_bias):
         layer.w13_scale_bias.data = (
             layer.w13_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
         )
@@ -298,17 +302,15 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
             layer.w2_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
         )
 
-    @classmethod
-    def pack_to_int32(cls, weight: torch.Tensor):
+    def _pack_to_int32(self, weight: torch.Tensor):
         # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
         assert (
             weight.shape[-1] % 4 == 0
         ), "the last dim of weight needs to be divided by 4"
         return weight.view(torch.int32).contiguous()
 
-    @classmethod
     def process_weights_after_loading(
-        cls, layer: torch.nn.Module, is_per_channel_weight
+        self, layer: torch.nn.Module, is_per_channel_weight
     ) -> None:
         layer.w13_weight = torch.nn.Parameter(
             layer.w13_weight.data.transpose(1, 2).contiguous(), requires_grad=False
@@ -327,17 +329,17 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
             if hasattr(layer, "w2_weight_scale_second")
             else None
         )
-        layer.w13_weight_scale.data, w13_bias = cls.process_scale(
+        layer.w13_weight_scale.data, w13_bias = self._process_scale(
             layer.w13_weight,
             layer.w13_weight_scale.data,
             w13_weight_scale_second,
-            is_per_channel_weight,
+            is_per_channel_weight
         )
-        layer.w2_weight_scale.data, w2_bias = cls.process_scale(
+        layer.w2_weight_scale.data, w2_bias = self._process_scale(
             layer.w2_weight,
             layer.w2_weight_scale.data,
             w2_weight_scale_second,
-            is_per_channel_weight,
+            is_per_channel_weight
         )
         if hasattr(layer, "w13_weight_scale_second"):
             # scale_second is no longer used, release this part of the memory
@@ -346,15 +348,15 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
             del layer.w13_weight_offset_second
             del layer.w2_weight_offset_second
 
-        cls.update_bias(layer, w13_bias, w2_bias)
+        self._update_bias(layer, w13_bias, w2_bias)
 
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
-        layer.w13_weight.data = cls.pack_to_int32(layer.w13_weight.data)
-        layer.w2_weight.data = cls.pack_to_int32(layer.w2_weight.data)
+        layer.w13_weight.data = self._pack_to_int32(layer.w13_weight.data)
+        layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
 
-    @staticmethod
     def apply(
+        self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
@@ -437,8 +439,8 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
 
         return StandardCombineInput(hidden_states=final_hidden_states)
 
-    @staticmethod
     def apply_without_routing_weights(
+        self,
         layer,
         hidden_states,
         hidden_states_scale,
@@ -481,10 +483,9 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         return hidden_states
 
 
-class NPUW4A16Int4DynamicMoEMethod(FusedMoEMethodBase):
+class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
-    @classmethod
-    def pack_to_int32(cls, weight: torch.Tensor):
+    def _pack_to_int32(self, weight: torch.Tensor):
         assert weight.dim() == 3
         if weight.dtype == torch.int32:
             # pack 8 int4 to int32, we use a int32 to represent a int4
@@ -505,9 +506,8 @@ class NPUW4A16Int4DynamicMoEMethod(FusedMoEMethodBase):
             raise ValueError(f"{weight.dtype=} is not supported !")
         return new_weight
 
-    @classmethod
-    def unpack_from_int32(
-        cls,
+    def _unpack_from_int32(
+        self,
         value: torch.Tensor,
         num_bits: int,
         shape: torch.Size = None,
@@ -570,8 +570,7 @@ class NPUW4A16Int4DynamicMoEMethod(FusedMoEMethodBase):
 
         return unpacked
 
-    @classmethod
-    def process_weights_after_loading(cls, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_weight_scale = layer.w13_weight_scale.data.transpose(-1, -2).contiguous()
         w2_weight_scale = layer.w2_weight_scale.data.transpose(-1, -2).contiguous()
         layer.w13_weight_scale = torch.nn.Parameter(
@@ -592,28 +591,28 @@ class NPUW4A16Int4DynamicMoEMethod(FusedMoEMethodBase):
         # w13_weight = layer.w13_weight.data.transpose(1, 2).contiguous()
         # w2_weight = layer.w2_weight.data.transpose(1, 2).contiguous()
         unpacked_w13_weight = (
-            cls.unpack_from_int32(layer.w13_weight.data.flatten(0, 1), 4)
+            self._unpack_from_int32(layer.w13_weight.data.flatten(0, 1), 4)
             .view(layer.w13_weight.data.shape[0], layer.w13_weight.data.shape[1], -1)
             .transpose(1, 2)
             .contiguous()
             .int()
         )
         unpacked_w2_weight = (
-            cls.unpack_from_int32(layer.w2_weight.data.flatten(0, 1), 4)
+            self._unpack_from_int32(layer.w2_weight.data.flatten(0, 1), 4)
             .view(layer.w2_weight.data.shape[0], layer.w2_weight.data.shape[1], -1)
             .transpose(1, 2)
             .contiguous()
             .int()
         )
 
-        w13_weight = cls.pack_to_int32(unpacked_w13_weight)
-        w2_weight = cls.pack_to_int32(unpacked_w2_weight)
+        w13_weight = self._pack_to_int32(unpacked_w13_weight)
+        w2_weight = self._pack_to_int32(unpacked_w2_weight)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-    @staticmethod
     def apply(
+        self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
@@ -640,8 +639,8 @@ class NPUW4A16Int4DynamicMoEMethod(FusedMoEMethodBase):
         )
         return StandardCombineInput(hidden_states=output)
 
-    @staticmethod
     def apply_without_routing_weights(
+        self,
         layer,
         hidden_states,
         hidden_states_scale,
