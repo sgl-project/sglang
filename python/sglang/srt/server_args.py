@@ -2055,6 +2055,8 @@ class ServerArgs:
                     self.eplb_algorithm == "elasticity_aware"
                 ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
 
+        self._validate_ib_devices(self.mooncake_ib_device)
+
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -2383,6 +2385,73 @@ class ServerArgs:
             raise ValueError(
                 "requires at least one encoder urls to be set via --encoder-urls"
             )
+
+        self._validate_ib_devices(self.disaggregation_ib_device)
+
+    def _validate_ib_devices(self, device_str: str):
+        """
+        Validate IB devices before passing to mooncake.
+
+        Args:
+            device_str: List of IB device names (e.g., "mlx5_0,mlx5_1")
+        """
+        if device_str is None:
+            return None
+
+        import subprocess
+
+        # Strip whitespace from device names
+        devices = device_str.split(",")
+        devices = [device.strip() for device in devices if device.strip()]
+        assert len(devices) > 0, "No valid IB devices specified"
+
+        try:
+            # Run `ibstat` to get available devices
+            result = subprocess.run(
+                ["ibstat", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            assert (
+                result.returncode == 0
+            ), f"Failed to run `ibstat -l`, return code: {result.returncode}, stderr: {result.stderr}"
+
+            # Parse available devices from `ibstat -l` output
+            # Output format is one device per line:
+            #     mlx5_0
+            #     mlx5_1
+            available_devices = set()
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    available_devices.add(line)
+            assert (
+                len(available_devices) > 0
+            ), f"No IB devices found by `ibstat`, output: {result.stdout}"
+
+            invalid_devices = [d for d in devices if d not in available_devices]
+            assert (
+                len(invalid_devices) == 0
+            ), f"Invalid IB devices specified: {invalid_devices}."
+
+            valid_devices = [d for d in devices if d in available_devices]
+            assert (
+                len(valid_devices) > 0
+            ), f"None of the specified IB devices are valid, available devices: {sorted(available_devices)}."
+            assert len(valid_devices) == len(
+                devices
+            ), f"Some of the specified IB devices are not valid, available devices: {sorted(available_devices)}."
+            unique_valid_devices = set(valid_devices)
+            assert len(valid_devices) <= len(
+                unique_valid_devices
+            ), f"Some of the specified IB devices are duplicate."
+
+            return valid_devices
+
+        except Exception as e:
+            assert False, f"Error validating IB devices: {e}."
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
