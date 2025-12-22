@@ -1,6 +1,5 @@
 import pytest
 import torch
-from flashinfer.fused_moe import fused_topk_deepseek
 
 from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu, biased_grouped_topk_impl
 
