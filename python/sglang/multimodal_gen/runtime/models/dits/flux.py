@@ -43,10 +43,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -125,11 +122,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN,
-            },
         )
 
     def forward(
