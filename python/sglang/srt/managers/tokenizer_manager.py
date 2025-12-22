@@ -299,7 +299,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
 
-        self.watchdog: Optional[Watchdog] = None
+        self.watchdog: Watchdog = None
 
         # Initial weights status
         self.initial_weights_loaded = True
@@ -407,12 +407,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.init_communicators(server_args)
 
-        if (timeout := server_args.soft_watchdog_timeout) is not None:
-            self.watchdog = Watchdog(
-                debug_name="TokenizerManager",
-                watchdog_timeout=timeout,
-                soft=True,
-            )
+        self.watchdog = Watchdog.create(
+            debug_name="TokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+        )
 
     async def generate_request(
         self,

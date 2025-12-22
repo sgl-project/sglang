@@ -16,6 +16,25 @@ logger = logging.getLogger(__name__)
 
 
 class Watchdog:
+    @staticmethod
+    def create(
+        debug_name: str,
+        watchdog_timeout: Optional[float],
+        soft: bool = False,
+    ) -> Watchdog:
+        if watchdog_timeout is None:
+            return _WatchdogNoop()
+        return _WatchdogReal(debug_name, watchdog_timeout, soft)
+
+    def feed(self):
+        raise NotImplementedError
+
+    @contextmanager
+    def disable(self):
+        raise NotImplementedError
+
+
+class _WatchdogReal(Watchdog):
     def __init__(
         self,
         debug_name: str,
@@ -44,6 +63,15 @@ class Watchdog:
         finally:
             assert not self._active
             self._active = True
+
+
+class _WatchdogNoop(Watchdog):
+    def feed(self):
+        pass
+
+    @contextmanager
+    def disable(self):
+        yield
 
 
 class WatchdogRaw:

@@ -114,23 +114,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         )
 
-        self.watchdog: Optional[Watchdog] = None
+        self.watchdog: Watchdog = None
 
     def event_loop(self):
         test_stuck = envs.SGLANG_TEST_STUCK_DETOKENIZER.get()
         while True:
-            if self.watchdog is not None:
-                with self.watchdog.disable():
-                    recv_obj = self.recv_from_scheduler.recv_pyobj()
-            else:
+            with self.watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
             if test_stuck > 0:
                 time.sleep(test_stuck)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
-            if self.watchdog is not None:
-                self.watchdog.feed()
+            self.watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -370,12 +366,11 @@ def run_detokenizer_process(
     try:
         manager = detokenizer_manager_class(server_args, port_args)
 
-        if (timeout := server_args.soft_watchdog_timeout) is not None:
-            manager.watchdog = Watchdog(
-                debug_name="DetokenizerManager",
-                watchdog_timeout=timeout,
-                soft=True,
-            )
+        manager.watchdog = Watchdog.create(
+            debug_name="DetokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+        )
 
         if server_args.tokenizer_worker_num > 1:
             manager.multi_http_worker_event_loop()
