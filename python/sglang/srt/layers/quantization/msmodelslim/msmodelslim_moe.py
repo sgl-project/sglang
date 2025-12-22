@@ -52,11 +52,21 @@ class ModelSlimMoEMethod(FusedMoEMethodBase):
             quant_config.quant_description.get(prefix_in_quant_config, "STATIC")
             == "W4A8_DYNAMIC"
         )
-
+        is_moe_w8a8_dynamic = (
+            quant_config.quant_description.get(prefix_in_quant_config, "STATIC")
+            == "W8A8_DYNAMIC"
+        )
         if is_moe_w4a8_dynamic:
+            logger.info_once("Using ModelSlimW4A8Int8MoE")
             return ModelSlimW4A8Int8MoE(quant_config)
-
-        return ModelSlimW8A8Int8MoE(quant_config)
+        elif is_moe_w8a8_dynamic:
+            logger.info_once("Using ModelSlimW8A8Int8MoE")
+            return ModelSlimW8A8Int8MoE(quant_config)
+        else:
+            raise RuntimeError(
+                f"Unsupported FusedMoe modelslim scheme: \
+                    {quant_config.quant_description.get(prefix_in_quant_config)}"
+            )
 
 
 class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
@@ -69,6 +79,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         self.quant_config = quant_config
         self.group_size = 0
         self.tp_size = 1
+        self.kernel = NPUW4A8Int8DynamicMoEMethod()
 
     def create_weights(
         self,
@@ -212,9 +223,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        NPUW4A8Int8DynamicMoEMethod.process_weights_after_loading(
-            layer, self.is_per_channel_weight
-        )
+        self.kernel.process_weights_after_loading(layer, self.is_per_channel_weight)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -226,7 +235,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        return NPUW4A8Int8DynamicMoEMethod.apply(layer, dispatch_output)
+        return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
         self,
@@ -237,7 +246,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEMethod):
         group_list,
         output_dtype,
     ):
-        return NPUW4A8Int8DynamicMoEMethod.apply_without_routing_weights(
+        return self.kernel.apply_without_routing_weights(
             layer,
             hidden_states,
             hidden_states_scale,
@@ -255,6 +264,7 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
         prefix: str = None,
     ):
         self.quant_config = quant_config
+        self.kernel = NPUW8A8Int8DynamicMoEMethod()
 
     def create_weights(
         self,
@@ -327,7 +337,7 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        NPUW8A8Int8DynamicMoEMethod.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -339,7 +349,7 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        return NPUW8A8Int8DynamicMoEMethod.apply(layer, dispatch_output)
+        return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
         self,
@@ -350,7 +360,7 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEMethod):
         group_list,
         output_dtype,
     ):
-        return NPUW8A8Int8DynamicMoEMethod.apply_without_routing_weights(
+        return self.kernel.apply_without_routing_weights(
             layer,
             hidden_states,
             hidden_states_scale,
