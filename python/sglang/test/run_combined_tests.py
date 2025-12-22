@@ -6,13 +6,12 @@ from sglang.test.accuracy_test_runner import (
     run_accuracy_test,
     write_accuracy_github_summary,
 )
+from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.performance_test_runner import (
     PerformanceTestParams,
     PerformanceTestResult,
     run_performance_test,
 )
-
-from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings, is_in_ci
 
 

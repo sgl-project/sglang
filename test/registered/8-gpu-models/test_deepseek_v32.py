@@ -1,10 +1,9 @@
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 register_cuda_ci(est_time=8000, suite="nightly-8-gpu-common", nightly=True)
