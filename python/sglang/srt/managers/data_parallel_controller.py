@@ -27,6 +27,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -178,6 +179,7 @@ class DataParallelController:
             debug_name="DataParallelController",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
 
     def send_to_all_workers(self, obj):
