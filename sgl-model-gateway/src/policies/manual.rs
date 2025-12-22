@@ -105,10 +105,6 @@ impl LoadBalancingPolicy for ManualPolicy {
     }
 }
 
-fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
-    workers.iter().position(|w| w.url() == url)
-}
-
 fn find_healthy_worker(
     urls: &[String],
     workers: &[Arc<dyn Worker>],
@@ -122,6 +118,10 @@ fn find_healthy_worker(
         }
     }
     None
+}
+
+fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
+    workers.iter().position(|w| w.url() == url)
 }
 
 // TODO: use load-aware selection later
