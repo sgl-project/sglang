@@ -234,7 +234,7 @@ pub fn handle_json_tool_streaming(
     if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
         if !tool_indices.contains_key(name) {
             // Invalid tool name - skip this tool, preserve indexing for next tool
-            tracing::warn!("Invalid tool name '{}' - skipping", name);
+            tracing::debug!("Invalid tool name '{}' - skipping", name);
             reset_current_tool_state(
                 buffer,
                 current_tool_name_sent,
