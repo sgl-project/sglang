@@ -1505,6 +1505,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         sys.exit(0)
 
     async def handle_loop(self):
+        """The event loop that handles requests"""
         while True:
             with self.watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
