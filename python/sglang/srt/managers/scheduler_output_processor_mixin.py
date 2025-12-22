@@ -9,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -62,6 +63,14 @@ class SchedulerOutputProcessorMixin:
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
         self.stream_output(batch.reqs, batch.return_logprob)
 
+    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+        """Collect routed experts for a finished request."""
+        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -108,11 +117,15 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
+                    if req.time_stats.prefill_finished_ts == 0.0:
+                        req.time_stats.prefill_finished_ts = time.time()
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
                     if req.finished():
+                        self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -337,6 +350,8 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+        if self.enable_metrics:
+            self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -367,6 +382,8 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                self.maybe_collect_routed_experts(req)
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
@@ -786,11 +803,13 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
+        output_routed_experts = None
 
         queue_times = []
         forward_entry_times = []
         prefill_launch_delays = []
         prefill_launch_latencies = []
+        prefill_finished_timestamps = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -899,6 +918,9 @@ class SchedulerOutputProcessorMixin:
                 prefill_launch_latencies.append(
                     req.time_stats.get_prefill_launch_latency()
                 )
+                prefill_finished_timestamps.append(
+                    req.time_stats.get_prefill_finished_ts()
+                )
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -976,6 +998,10 @@ class SchedulerOutputProcessorMixin:
                     if output_hidden_states is None:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
+                if req.return_routed_experts:
+                    if output_routed_experts is None:
+                        output_routed_experts = []
+                    output_routed_experts.append(req.routed_experts)
 
             if (
                 req.finished()
@@ -999,6 +1025,7 @@ class SchedulerOutputProcessorMixin:
                     forward_entry_time=forward_entry_times,
                     prefill_launch_delay=prefill_launch_delays,
                     prefill_launch_latency=prefill_launch_latencies,
+                    prefill_finished_ts=prefill_finished_timestamps,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
                     decode_ids=decode_ids_list,
@@ -1024,6 +1051,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
+                    output_routed_experts=output_routed_experts,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
@@ -1042,6 +1070,7 @@ class SchedulerOutputProcessorMixin:
         forward_entry_times = []
         prefill_launch_delays = []
         prefill_launch_latencies = []
+        prefill_finished_timestamps = []
         retraction_counts = []
         for req in reqs:
             if req.finished():
@@ -1059,6 +1088,9 @@ class SchedulerOutputProcessorMixin:
                 prefill_launch_latencies.append(
                     req.time_stats.get_prefill_launch_latency()
                 )
+                prefill_finished_timestamps.append(
+                    req.time_stats.get_prefill_finished_ts()
+                )
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
@@ -1068,6 +1100,7 @@ class SchedulerOutputProcessorMixin:
                 forward_entry_time=forward_entry_times,
                 prefill_launch_delay=prefill_launch_delays,
                 prefill_launch_latency=prefill_launch_latencies,
+                prefill_finished_ts=prefill_finished_timestamps,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,

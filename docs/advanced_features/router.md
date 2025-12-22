@@ -46,7 +46,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 
 ### Control Plane
 - **Worker Manager** discovers capabilities (`/get_server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
-- **Job Queue** serializes add/remove requests and exposes status (`/workers/{url}`) so clients can track onboarding progress.
+- **Job Queue** serializes add/remove requests and exposes status (`/workers/{worker_id}`) so clients can track onboarding progress.
 - **Load Monitor** feeds cache-aware and power-of-two policies with live worker load statistics.
 - **Health Checker** continuously probes workers and updates readiness, circuit breaker state, and router metrics.
 
@@ -171,11 +171,13 @@ curl -X POST http://localhost:30000/workers \
 # Inspect registry
 curl http://localhost:30000/workers
 
-# Remove a worker
-curl -X DELETE http://localhost:30000/workers/grpc%3A%2F%2F0.0.0.0%3A31000
+# Remove a worker (RESTful: delete by UUID)
+# Tip: POST /workers returns a JSON body containing worker_id and a Location header.
+WORKER_ID="$(curl -s http://localhost:30000/workers | jq -r '.workers[0].id')"
+curl -X DELETE "http://localhost:30000/workers/${WORKER_ID}"
 ```
 
-Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{url}` returns both registry data and queued job status. The worker url in the removal request should be escaped.
+Legacy endpoints (`/add_worker`, `/remove_worker`, `/list_workers`) remain available but will be deprecated. `/workers/{worker_id}` returns both registry data and queued job status.
 
 ---
 
@@ -337,7 +339,7 @@ Use CLI flags to select parsers:
 | `GET`/`DELETE`        | `/v1/conversations/{id}/items/{item_id}` | Inspect/delete conversation item.              |
 | `GET`                 | `/workers`                               | List registered workers with health/load.      |
 | `POST`                | `/workers`                               | Queue worker registration.                     |
-| `DELETE`              | `/workers/{url}`                         | Queue worker removal.                          |
+| `GET`/`PUT`/`DELETE`  | `/workers/{worker_id}`                   | Get/update/remove a worker by UUID.            |
 | `POST`                | `/flush_cache`                           | Flush worker caches (HTTP workers).            |
 | `GET`                 | `/get_loads`                             | Retrieve worker load snapshot.                 |
 | `GET`                 | `/liveness` / `/readiness` / `/health`   | Health probes.                                 |

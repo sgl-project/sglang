@@ -19,7 +19,13 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: ["default"],
     HWBackend.AMD: ["stage-a-test-1"],
-    HWBackend.CUDA: ["stage-a-test-1", "stage-b-test-small-1-gpu"],
+    HWBackend.CUDA: [
+        "stage-a-test-1",
+        "stage-b-test-small-1-gpu",
+        "stage-b-test-large-1-gpu",
+        "stage-b-test-large-2-gpu",
+        "stage-b-test-4-gpu-b200",
+    ],
     HWBackend.NPU: [],
 }
 
@@ -34,8 +40,11 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200",
         "nightly-8-gpu-h20",
         "nightly-8-gpu-b200",
+        "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
+        "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
+        "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
     ],
-    HWBackend.AMD: ["nightly-amd"],
+    HWBackend.AMD: ["nightly-amd", "nightly-amd-8-gpu"],
     HWBackend.CPU: [],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
