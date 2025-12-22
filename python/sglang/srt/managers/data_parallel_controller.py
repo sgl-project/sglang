@@ -27,6 +27,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -508,6 +509,7 @@ class DataParallelController:
         self.round_robin_scheduler(req)
 
     def event_loop(self):
+        test_watchdog_slow = envs.SGLANG_TEST_WATCHDOG_SLOW_DP_CONTROLLER.get()
         while True:
             while True:
                 try:
@@ -515,6 +517,8 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self.is_dispatching = True
+                if test_watchdog_slow > 0:
+                    time.sleep(test_watchdog_slow)
                 self._request_dispatcher(recv_req)
                 self.is_dispatching = False
                 self.dispatch_ct += 1

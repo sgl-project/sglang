@@ -1512,9 +1512,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+        test_watchdog_slow = envs.SGLANG_TEST_WATCHDOG_SLOW_TOKENIZER.get()
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self.is_receiving = True
+            if test_watchdog_slow > 0:
+                await asyncio.sleep(test_watchdog_slow)
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
             self.is_receiving = False

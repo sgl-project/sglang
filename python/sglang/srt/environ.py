@@ -147,6 +147,9 @@ class Envs:
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_TEST_WATCHDOG_SLOW_DETOKENIZER = EnvFloat(0)
+    SGLANG_TEST_WATCHDOG_SLOW_DP_CONTROLLER = EnvFloat(0)
+    SGLANG_TEST_WATCHDOG_SLOW_TOKENIZER = EnvFloat(0)
     IS_BLACKWELL = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)

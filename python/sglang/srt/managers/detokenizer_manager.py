@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict
 from typing import Dict, List, Union
 
@@ -25,6 +26,7 @@ import pybase64
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
@@ -118,9 +120,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def event_loop(self):
         """The event loop that handles requests"""
+        test_watchdog_slow = envs.SGLANG_TEST_WATCHDOG_SLOW_DETOKENIZER.get()
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             self.is_processing = True
+            if test_watchdog_slow > 0:
+                time.sleep(test_watchdog_slow)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
