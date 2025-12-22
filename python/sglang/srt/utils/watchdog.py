@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 import psutil
@@ -14,7 +15,7 @@ from sglang.srt.utils.common import pyspy_dump_schedulers
 logger = logging.getLogger(__name__)
 
 
-class ProcessWatchdog:
+class ProcessWatchdogRaw:
     def __init__(
         self,
         debug_name: str,
@@ -70,3 +71,35 @@ class ProcessWatchdog:
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
+
+
+class ProcessWatchdog:
+    def __init__(
+        self,
+        debug_name: str,
+        watchdog_timeout: float,
+        soft: bool = False,
+        dump_info: Optional[Callable[[], str]] = None,
+    ):
+        self._counter = 0
+        self._active = False
+        self._raw = ProcessWatchdogRaw(
+            debug_name=debug_name,
+            get_counter=lambda: self._counter,
+            is_active=lambda: self._active,
+            watchdog_timeout=watchdog_timeout,
+            soft=soft,
+            dump_info=dump_info,
+        )
+
+    def feed(self):
+        self._counter += 1
+
+    @contextmanager
+    def disable(self):
+        self._active = False
+        try:
+            yield
+        finally:
+            self._active = True
+            self.feed()
