@@ -326,6 +326,9 @@ class ServerArgs:
     watchdog_timeout: float = 300
     soft_watchdog_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
+    unbalanced_model_loading_timeout_s: Optional[int] = (
+        None  # monitored_barrier timeout during model loading
+    )
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
@@ -2867,6 +2870,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dist_timeout,
             help="Set timeout for torch.distributed initialization.",
+        )
+        parser.add_argument(
+            "--unbalanced-model-loading-timeout-s",
+            type=int,
+            default=ServerArgs.unbalanced_model_loading_timeout_s,
+            help="Timeout (seconds) for dist.monitored_barrier during model loading (straggler rank detection). "
+            "Overrides SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S if set.",
         )
         parser.add_argument(
             "--download-dir",
