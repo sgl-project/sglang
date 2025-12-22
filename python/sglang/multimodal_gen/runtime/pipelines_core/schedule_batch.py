@@ -300,3 +300,4 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
+    peak_memory_mb: float = 0.0

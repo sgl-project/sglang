@@ -111,6 +111,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -403,6 +404,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ]
         )
         self.init_communicators(server_args)
+
+        self.watchdog = Watchdog.create(
+            debug_name="TokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
+        )
 
     async def generate_request(
         self,
@@ -846,6 +854,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
+                return_routed_experts=obj.return_routed_experts,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
@@ -1498,9 +1507,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            with self.watchdog.disable():
+                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+            self.watchdog.feed()
 
     def _add_metric_if_present(
         self,
@@ -1584,6 +1595,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
+            if getattr(recv_obj, "output_routed_experts", None):
+                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
@@ -2067,6 +2081,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if (
             self.server_args.dp_size == 1
             or self.server_args.load_balance_method == "round_robin"
+            or self.server_args.load_balance_method == "decode_round_robin"
         ):
             return
 

@@ -88,8 +88,6 @@ suites = {
         TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 82),
-        TestFile("test_piecewise_cuda_graph_1_gpu_a.py", 460),
-        TestFile("test_piecewise_cuda_graph_1_gpu_b.py", 480),
         TestFile("test_priority_scheduling.py", 130),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
@@ -140,7 +138,6 @@ suites = {
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_piecewise_cuda_graph_2_gpu.py", 400),
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
@@ -150,6 +147,7 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_epd_disaggregation.py", 150),
+        TestFile("rl/test_return_routed_experts.py", 300),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
@@ -165,10 +163,8 @@ suites = {
         TestFile("test_disaggregation_pp.py", 180),
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
-    "per-commit-4-gpu-b200-stage-b": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),  # Stage B test
-    ],
     "per-commit-4-gpu-b200": [
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
         TestFile("test_flash_attention_4.py", 90),
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
@@ -188,7 +184,7 @@ suites = {
         # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 338),
+        TestFile("ep/test_deepep_large.py", 563),
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
@@ -213,6 +209,7 @@ suites = {
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
+        TestFile("test_soft_watchdog.py"),
     ],
 }
 
