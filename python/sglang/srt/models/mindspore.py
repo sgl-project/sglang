@@ -239,7 +239,7 @@ class MindSporeForCausalLM(torch.nn.Module):
 
         return mutable(self.key_cache), mutable(self.value_cache)
 
-    def get_is_prefill(forward_batch: ForwardBatch):
+    def get_is_prefill(self, forward_batch: ForwardBatch):
         # Different processing for the mindspore attention operator
         # Without any prefix cache => Use FlashAttentionScore
         # With cache => Use PagedAttention, no matter the query length is 1 or not
