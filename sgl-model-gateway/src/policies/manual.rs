@@ -112,16 +112,15 @@ mod tests {
             ),
         ];
 
-        // Same routing_id should always route to the same worker
         let routing_id = "user-123";
-        let first_idx = policy
-            .select_worker(&workers, None, Some(routing_id))
-            .unwrap();
+        let info = SelectWorkerInfo {
+            routing_id: Some(routing_id),
+            ..Default::default()
+        };
+        let first_idx = policy.select_worker(&workers, &info).unwrap();
 
         for _ in 0..10 {
-            let idx = policy
-                .select_worker(&workers, None, Some(routing_id))
-                .unwrap();
+            let idx = policy.select_worker(&workers, &info).unwrap();
             assert_eq!(
                 idx, first_idx,
                 "Same routing_id should route to same worker"
@@ -150,17 +149,17 @@ mod tests {
             ),
         ];
 
-        // Different routing_ids should distribute across workers
         let mut distribution = HashMap::new();
         for i in 0..100 {
             let routing_id = format!("user-{}", i);
-            let idx = policy
-                .select_worker(&workers, None, Some(&routing_id))
-                .unwrap();
+            let info = SelectWorkerInfo {
+                routing_id: Some(&routing_id),
+                ..Default::default()
+            };
+            let idx = policy.select_worker(&workers, &info).unwrap();
             *distribution.entry(idx).or_insert(0) += 1;
         }
 
-        // Should have at least some distribution (not all to one worker)
         assert!(
             distribution.len() > 1,
             "Should distribute across multiple workers"
@@ -183,15 +182,14 @@ mod tests {
             ),
         ];
 
-        // Without routing_id, should use random selection
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None, None) {
+            let info = SelectWorkerInfo::default();
+            if let Some(idx) = policy.select_worker(&workers, &info) {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
 
-        // Both workers should be selected at least once
         assert_eq!(counts.len(), 2, "Random fallback should use all workers");
     }
 
@@ -211,14 +209,14 @@ mod tests {
             ),
         ];
 
-        // Mark first worker as unhealthy
         workers[0].set_healthy(false);
 
-        // Should only select the healthy worker
         for _ in 0..10 {
-            let idx = policy
-                .select_worker(&workers, None, Some("test-routing-id"))
-                .unwrap();
+            let info = SelectWorkerInfo {
+                routing_id: Some("test-routing-id"),
+                ..Default::default()
+            };
+            let idx = policy.select_worker(&workers, &info).unwrap();
             assert_eq!(idx, 1, "Should only select healthy worker");
         }
     }
@@ -233,7 +231,11 @@ mod tests {
         )];
 
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, None, Some("test")), None);
+        let info = SelectWorkerInfo {
+            routing_id: Some("test"),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &info), None);
     }
 
     #[test]
@@ -252,10 +254,13 @@ mod tests {
             ),
         ];
 
-        // Empty routing_id should fall back to random
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None, Some("")) {
+            let info = SelectWorkerInfo {
+                routing_id: Some(""),
+                ..Default::default()
+            };
+            if let Some(idx) = policy.select_worker(&workers, &info) {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -265,5 +270,38 @@ mod tests {
             2,
             "Empty routing_id should use random fallback"
         );
+    }
+
+    #[test]
+    fn test_manual_remaps_when_worker_becomes_unhealthy() {
+        let policy = ManualPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+
+        let info = SelectWorkerInfo {
+            routing_id: Some("sticky-user"),
+            ..Default::default()
+        };
+        let first_idx = policy.select_worker(&workers, &info).unwrap();
+
+        workers[first_idx].set_healthy(false);
+
+        let new_idx = policy.select_worker(&workers, &info).unwrap();
+        assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
+
+        for _ in 0..10 {
+            let idx = policy.select_worker(&workers, &info).unwrap();
+            assert_eq!(idx, new_idx, "Should consistently route to new worker");
+        }
     }
 }
