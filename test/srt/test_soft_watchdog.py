@@ -1,5 +1,4 @@
 import io
-import time
 import unittest
 
 import requests
