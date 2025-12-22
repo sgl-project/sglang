@@ -242,6 +242,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         all_calls: list[ToolCallItem] = []
         try:
+            # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
@@ -334,6 +335,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Continue loop to check for more invoke blocks
                     continue
                 else:
+                    # Tool call not complete yet, don't return anything
+                    # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
             # No more invoke blocks found
