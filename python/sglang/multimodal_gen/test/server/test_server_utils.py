@@ -768,16 +768,37 @@ def get_generate_fn(
 
     video_seconds = sampling_params.seconds or 4
 
+    def _get_int_env(name: str) -> int | None:
+        val = os.getenv(name)
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except ValueError:
+            return None
+
     def _build_video_extra_body(
         extra_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Compose extra_body for video generation with optional overrides."""
         body: dict[str, Any] = {}
-        if sampling_params.num_inference_steps is not None:
+        steps_override = _get_int_env("SGLANG_TEST_VIDEO_STEPS")
+        height_override = _get_int_env("SGLANG_TEST_VIDEO_HEIGHT")
+        width_override = _get_int_env("SGLANG_TEST_VIDEO_WIDTH")
+
+        if steps_override is not None:
+            body["steps"] = steps_override
+        elif sampling_params.num_inference_steps is not None:
             body["steps"] = sampling_params.num_inference_steps
-        if sampling_params.height is not None:
+
+        if height_override is not None:
+            body["height"] = height_override
+        elif sampling_params.height is not None:
             body["height"] = sampling_params.height
-        if sampling_params.width is not None:
+
+        if width_override is not None:
+            body["width"] = width_override
+        elif sampling_params.width is not None:
             body["width"] = sampling_params.width
         if sampling_params.num_frames is not None:
             body["num_frames"] = sampling_params.num_frames
