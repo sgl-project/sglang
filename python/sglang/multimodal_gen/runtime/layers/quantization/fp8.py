@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    register_quantization_config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -79,6 +82,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 
 
+@register_quantization_config("fp8")
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
