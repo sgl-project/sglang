@@ -898,9 +898,7 @@ mod tests {
         }
 
         // Send requests with char_count 20
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
-            .unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(20)), ..Default::default() }).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
@@ -925,9 +923,7 @@ mod tests {
             }
         }
 
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(7)))
-            .unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(7)), ..Default::default() }).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
@@ -1008,24 +1004,12 @@ mod tests {
             }
         }
 
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(5)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(15)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(24)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(26)))
-            .unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(5)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(10)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(15)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(20)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(24)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(26)), ..Default::default() }).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
@@ -1050,24 +1034,12 @@ mod tests {
             }
         }
 
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(30)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(32)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(45)))
-            .unwrap();
-        policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(55)))
-            .unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(10)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(20)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(30)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(32)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(45)), ..Default::default() }).unwrap();
+        policy.select_worker(&prefill_workers, &SelectWorkerInfo { request_text: Some(&*"a".repeat(55)), ..Default::default() }).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
