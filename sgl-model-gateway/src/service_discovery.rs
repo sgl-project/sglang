@@ -609,11 +609,14 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::{config::RouterConfig, middleware::TokenBucket};
+        use crate::{config::RouterConfig, core::WorkerService, middleware::TokenBucket};
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
             .build_unchecked();
+
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let worker_job_queue = Arc::new(std::sync::OnceLock::new());
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
@@ -621,7 +624,7 @@ mod tests {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
+            worker_registry: worker_registry.clone(),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
@@ -637,10 +640,15 @@ mod tests {
             load_monitor: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
-            worker_job_queue: Arc::new(std::sync::OnceLock::new()),
+            worker_job_queue: worker_job_queue.clone(),
             workflow_engine: Arc::new(std::sync::OnceLock::new()),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
             wasm_manager: None,
+            worker_service: Arc::new(WorkerService::new(
+                worker_registry,
+                worker_job_queue,
+                router_config,
+            )),
         })
     }
 
