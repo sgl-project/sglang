@@ -43,17 +43,15 @@ impl ManualPolicy {
         let key = RoutingId::new(routing_id);
         match self.routing_map.entry(key) {
             Entry::Occupied(mut entry) => {
-                if let Some(worker_url) = entry.get().worker_urls.first() {
-                    if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
+                for url in &entry.get().worker_urls {
+                    if let Some(idx) = find_worker_index_by_url(workers, url) {
                         if healthy_indices.contains(&idx) {
                             return idx;
                         }
                     }
                 }
                 let selected_idx = Self::random_select(healthy_indices);
-                entry.insert(RoutingInfo {
-                    worker_urls: vec![workers[selected_idx].url().to_string()],
-                });
+                entry.get_mut().worker_urls.push(workers[selected_idx].url().to_string());
                 selected_idx
             }
             Entry::Vacant(entry) => {
