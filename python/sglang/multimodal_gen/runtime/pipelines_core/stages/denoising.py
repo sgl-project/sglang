@@ -615,6 +615,7 @@ class DenoisingStage(PipelineStage):
                 dtype=target_dtype,
             ),
         )
+
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
                 getattr(self.transformer, "forward", self.transformer),
@@ -631,6 +632,7 @@ class DenoisingStage(PipelineStage):
             )
         else:
             neg_cond_kwargs = {}
+
         return {
             "extra_step_kwargs": extra_step_kwargs,
             "target_dtype": target_dtype,
@@ -1179,7 +1181,6 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
-        # print(f"current_model: {current_model}")
         return current_model(
             hidden_states=latent_model_input,
             encoder_hidden_states=prompt_embeds,
@@ -1315,7 +1316,6 @@ class DenoisingStage(PipelineStage):
         else:
             # Serial CFG: both cond and uncond are available locally
             assert noise_pred_cond is not None and noise_pred_uncond is not None
-
             noise_pred = noise_pred_uncond + current_guidance_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
