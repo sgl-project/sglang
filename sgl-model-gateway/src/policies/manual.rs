@@ -19,6 +19,31 @@ impl ManualPolicy {
             routing_map: DashMap::new(),
         }
     }
+
+    fn select_by_routing_id(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        routing_id: &str,
+        healthy_indices: &[usize],
+    ) -> usize {
+        if let Some(entry) = self.routing_map.get(routing_id) {
+            let worker_url = entry.value();
+            if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
+                if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute() {
+                    return idx;
+                }
+            }
+            drop(entry);
+            self.routing_map.remove(routing_id);
+        }
+
+        let mut rng = rand::rng();
+        let random_idx = rng.random_range(0..healthy_indices.len());
+        let selected_idx = healthy_indices[random_idx];
+        let worker_url = workers[selected_idx].url().to_string();
+        self.routing_map.insert(routing_id.to_string(), worker_url);
+        selected_idx
+    }
 }
 
 impl LoadBalancingPolicy for ManualPolicy {
@@ -34,25 +59,7 @@ impl LoadBalancingPolicy for ManualPolicy {
 
         if let Some(routing_id) = info.routing_id {
             if !routing_id.is_empty() {
-                if let Some(entry) = self.routing_map.get(routing_id) {
-                    let worker_url = entry.value();
-                    if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
-                        if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute()
-                        {
-                            return Some(idx);
-                        }
-                    }
-                    drop(entry);
-                    self.routing_map.remove(routing_id);
-                }
-
-                let mut rng = rand::rng();
-                let random_idx = rng.random_range(0..healthy_indices.len());
-                let selected_idx = healthy_indices[random_idx];
-                let worker_url = workers[selected_idx].url().to_string();
-                self.routing_map
-                    .insert(routing_id.to_string(), worker_url);
-                return Some(selected_idx);
+                return Some(self.select_by_routing_id(workers, routing_id, &healthy_indices));
             }
         }
 
