@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rand::Rng;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 /// Manual routing policy
@@ -32,8 +32,7 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
-        routing_id: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -42,7 +41,7 @@ impl LoadBalancingPolicy for ManualPolicy {
         }
 
         // Use routing_id for consistent routing
-        if let Some(routing_id) = routing_id {
+        if let Some(routing_id) = info.routing_id {
             if !routing_id.is_empty() {
                 let hash = Self::compute_hash(routing_id);
                 let idx = hash as usize % healthy_indices.len();

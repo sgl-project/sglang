@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
 };
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 /// Round-robin selection policy
@@ -28,8 +28,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
-        _routing_id: Option<&str>,
+        _info: &SelectWorkerInfo,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 

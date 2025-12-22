@@ -7,6 +7,15 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::core::Worker;
 
+/// Information passed to policy for worker selection
+#[derive(Debug, Default, Clone)]
+pub struct SelectWorkerInfo<'a> {
+    /// Request text for cache-aware routing
+    pub request_text: Option<&'a str>,
+    /// Routing ID for manual routing policy (consistent hashing)
+    pub routing_id: Option<&'a str>,
+}
+
 mod bucket;
 mod cache_aware;
 mod factory;
@@ -38,13 +47,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// # Arguments
     /// * `workers` - Available workers to select from
-    /// * `request_text` - Request text for cache-aware routing
-    /// * `routing_id` - Routing ID for manual routing policy (consistent hashing)
+    /// * `info` - Additional information for routing decisions
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-        routing_id: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<usize>;
 
     /// Update policy state after request completion
