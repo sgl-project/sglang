@@ -658,6 +658,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.batch_size = bs
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            ):
+                super().init_forward_metadata(forward_batch)
         else:
             return super().init_forward_metadata(forward_batch)
 
