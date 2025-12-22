@@ -17,7 +17,6 @@ import dataclasses
 import logging
 import os
 import signal
-import time
 from collections import OrderedDict
 from typing import Dict, List, Union
 
@@ -122,6 +121,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
 
     def event_loop(self):
+        """The event loop that handles requests"""
         while True:
             with self.watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
