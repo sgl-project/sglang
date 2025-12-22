@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::observability::metrics::Metrics;
+
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     model_card::ModelCard,
@@ -9,7 +9,7 @@ use super::{
         WorkerType,
     },
 };
-use crate::routers::grpc::client::GrpcClient;
+use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
