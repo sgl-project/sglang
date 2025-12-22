@@ -2058,11 +2058,15 @@ class Scheduler(
             if self.enable_metrics and (x := len(retracted_reqs)) > 0:
                 self.metrics_collector.increment_num_retracted_reqs(x)
             self.new_token_ratio = new_token_ratio
-            for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.send_to_tokenizer.send_output(
-                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+            if reqs_to_abort:
+                logger.warning(
+                    f"abort {len(reqs_to_abort)} requests because no space left for any request"
                 )
+                for req in reqs_to_abort:
+                    abort_reason: FINISH_ABORT = req.to_finish
+                    self.send_to_tokenizer.send_output(
+                        AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                    )
 
             logger.info(
                 "KV cache pool is full. Retract requests. "

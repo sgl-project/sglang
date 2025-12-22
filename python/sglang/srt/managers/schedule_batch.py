@@ -1022,6 +1022,9 @@ class Req:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            logger.debug(
+                f"check_finished: {self.rid=} finished by length, {self.sampling_params.to_dict()}"
+            )
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
@@ -1759,6 +1762,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        abort_reqs = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(
@@ -1766,7 +1770,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         ):
             if len(sorted_indices) == 1:
-                # Always keep at least one request
                 break
 
             first_iter = False
@@ -1780,9 +1783,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             selected_indices=sorted_indices, buf_multiplier=buf_multiplier
         ):
             # Retracting loops ends and still not enough memory
-            raise ValueError(
-                "Out of memory even after retracting all other requests in the decode batch."
+            # abort this request
+            logger.warning(
+                f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
             )
+            for req in self.reqs:
+                req.to_finish = FINISH_ABORT(message="No space left for any request")
+            abort_reqs.extend(self.reqs)
+            sorted_indices = []
+            self.release_req(0, 0, server_args)
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -1798,7 +1807,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio, []
+        return retracted_reqs, new_estimate_ratio, abort_reqs
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
