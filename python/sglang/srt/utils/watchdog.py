@@ -21,7 +21,6 @@ class Watchdog:
         debug_name: str,
         watchdog_timeout: float,
         soft: bool = False,
-        dump_info: Optional[Callable[[], str]] = None,
     ):
         self._counter = 0
         self._active = True
@@ -31,7 +30,6 @@ class Watchdog:
             is_active=lambda: self._active,
             watchdog_timeout=watchdog_timeout,
             soft=soft,
-            dump_info=dump_info,
         )
 
     def feed(self):
