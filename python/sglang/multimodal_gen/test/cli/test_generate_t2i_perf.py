@@ -79,6 +79,54 @@ class TestQwenImageEdit(TestGenerateBase):
         pass
 
 
+class TestQwenImageEditPlusMultiImageURL(TestGenerateBase):
+    """CLI-level test for multi-image URL input with Qwen-Image-Edit."""
+
+    model_path = "Qwen/Qwen-Image-Edit-2509"
+    extra_args = []
+    data_type: DataType = DataType.IMAGE
+
+    thresholds = {
+        "test_single_gpu": 33.4 * 1.05,
+    }
+
+    prompt: str | None = (
+        "The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square."
+    )
+
+    def setUp(self):
+        super().setUp()
+
+        img_urls = [
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+            "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+        ]
+
+        self.base_command = [
+            "sglang",
+            "generate",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+            "--prompt",
+            f"{self.prompt}",
+            "--save-output",
+            "--log-level=debug",
+            f"--width={self.width}",
+            f"--height={self.height}",
+            f"--output-path={self.output_path}",
+        ]
+        self.base_command += [
+            "--image-path",
+            *img_urls,
+        ]
+
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
+
+
 if __name__ == "__main__":
     del TestGenerateBase
     unittest.main()
