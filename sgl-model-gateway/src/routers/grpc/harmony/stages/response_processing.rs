@@ -70,15 +70,22 @@ impl PipelineStage for HarmonyResponseProcessingStage {
 
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
-                    return Ok(Some(
-                        self.streaming_processor
-                            .clone()
-                            .process_streaming_chat_response(
-                                execution_result,
-                                ctx.chat_request_arc(),
-                                dispatch,
-                            ),
-                    ));
+                    let response = self
+                        .streaming_processor
+                        .clone()
+                        .process_streaming_chat_response(
+                            execution_result,
+                            ctx.chat_request_arc(),
+                            dispatch,
+                        );
+
+                    // Attach load guards to response body for proper RAII lifecycle
+                    let response = match ctx.state.load_guards.take() {
+                        Some(guards) => guards.attach_to_response(response),
+                        None => response,
+                    };
+
+                    return Ok(Some(response));
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse

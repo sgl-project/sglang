@@ -168,6 +168,32 @@ pub struct WorkerInfo {
     pub job_status: Option<JobStatus>,
 }
 
+impl WorkerInfo {
+    /// Create a partial WorkerInfo for pending workers (not yet registered).
+    /// Used when a worker ID maps to a URL but the worker is still being registered.
+    pub fn pending(worker_id: &str, url: String, job_status: Option<JobStatus>) -> Self {
+        Self {
+            id: worker_id.to_string(),
+            url,
+            model_id: "unknown".to_string(),
+            priority: 0,
+            cost: 1.0,
+            worker_type: "unknown".to_string(),
+            is_healthy: false,
+            load: 0,
+            connection_mode: "unknown".to_string(),
+            runtime_type: None,
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            bootstrap_port: None,
+            metadata: HashMap::new(),
+            job_status,
+        }
+    }
+}
+
 /// Job status for async control plane operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {

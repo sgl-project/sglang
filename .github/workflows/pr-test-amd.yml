@@ -49,7 +49,8 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/**"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
@@ -59,7 +60,6 @@ jobs:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
               - "python/*.toml"
-              - ".github/workflows/pr-test-amd.yml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
@@ -102,6 +102,7 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
 
   # =============================================== primary ====================================================

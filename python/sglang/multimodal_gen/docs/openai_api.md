@@ -43,7 +43,6 @@ curl -sS -X GET "http://localhost:30010/models"
 {
   "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
   "task_type": "T2V",
-  "workload_type": "serving",
   "pipeline_name": "wan_pipeline",
   "pipeline_class": "WanPipeline",
   "num_gpus": 4,

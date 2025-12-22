@@ -121,6 +121,22 @@ impl WorkerRegistry {
         worker_id
     }
 
+    /// Reserve (or retrieve) a stable UUID for a worker URL.
+    /// Uses atomic entry API to avoid race conditions between check and insert.
+    pub fn reserve_id_for_url(&self, url: &str) -> WorkerId {
+        self.url_to_id.entry(url.to_string()).or_default().clone()
+    }
+
+    /// Best-effort lookup of the URL for a given worker ID.
+    pub fn get_url_by_id(&self, worker_id: &WorkerId) -> Option<String> {
+        if let Some(worker) = self.get(worker_id) {
+            return Some(worker.url().to_string());
+        }
+        self.url_to_id
+            .iter()
+            .find_map(|entry| (entry.value() == worker_id).then(|| entry.key().clone()))
+    }
+
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         if let Some((_, worker)) = self.workers.remove(worker_id) {

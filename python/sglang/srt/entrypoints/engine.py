@@ -273,6 +273,8 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
+        # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
@@ -284,6 +286,7 @@ class Engine(EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -319,6 +322,7 @@ class Engine(EngineBase):
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
+            return_routed_experts=return_routed_experts,
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
@@ -355,6 +359,8 @@ class Engine(EngineBase):
         # - Single image for a single request
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
+        # - List of preprocessed outputs from a Huggingface processor, each as a dict containing `format`: 'processor_output' and other data
+        # - List of precomputed image embeddings, each as a dict containing field `format`: 'precomputed_embedding' and `feature`: the precomputed embedding
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,

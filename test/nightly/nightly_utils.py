@@ -6,6 +6,8 @@ import subprocess
 import time
 from typing import List, Optional, Tuple
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
@@ -211,7 +213,7 @@ class NightlyBenchmarkRunner:
         other_args: Optional[List[str]] = None,
         variant: str = "",
         extra_bench_args: Optional[List[str]] = None,
-    ) -> Tuple[List[BenchmarkResult], bool]:
+    ) -> Tuple[List[BenchmarkResult], bool, Optional[float]]:
         """Run a complete benchmark for a single model with server management.
 
         This method handles:
@@ -219,6 +221,7 @@ class NightlyBenchmarkRunner:
         - Profile filename generation
         - Benchmark command construction and execution
         - Result loading and parsing
+        - Fetching speculative decoding accept length (for MTP/EAGLE)
 
         Args:
             model_path: Path to the model
@@ -230,9 +233,10 @@ class NightlyBenchmarkRunner:
             extra_bench_args: Extra arguments for the benchmark command
 
         Returns:
-            Tuple of (list of BenchmarkResult objects, success_bool)
+            Tuple of (list of BenchmarkResult objects, success_bool, avg_spec_accept_length or None)
         """
         benchmark_results = []
+        avg_spec_accept_length = None
         model_description = f"{model_path}" + (f" ({variant})" if variant else "")
 
         # Launch server
@@ -268,18 +272,41 @@ class NightlyBenchmarkRunner:
             result, cmd_success = self.run_benchmark_command(command, model_description)
 
             if not cmd_success:
-                return benchmark_results, False
+                return benchmark_results, False, None
 
             # Load results
             benchmark_results, load_success = self.load_benchmark_results(
                 json_output_file, model_description
             )
 
-            return benchmark_results, load_success
+            # Fetch speculative decoding accept length before killing server
+            avg_spec_accept_length = self._get_spec_accept_length()
+
+            return benchmark_results, load_success, avg_spec_accept_length
 
         finally:
             # Always clean up server process
             kill_process_tree(process.pid)
+
+    def _get_spec_accept_length(self) -> Optional[float]:
+        """Query the server for avg_spec_accept_length metric.
+
+        Returns:
+            The average speculative decoding accept length, or None if not available.
+        """
+        try:
+            response = requests.get(f"{self.base_url}/get_server_info", timeout=10)
+            if response.status_code == 200:
+                server_info = response.json()
+                internal_states = server_info.get("internal_states", [])
+                if internal_states and len(internal_states) > 0:
+                    accept_length = internal_states[0].get("avg_spec_accept_length")
+                    if accept_length is not None:
+                        print(f"  avg_spec_accept_length={accept_length:.2f}")
+                        return accept_length
+        except Exception as e:
+            print(f"  Warning: Could not fetch spec accept length: {e}")
+        return None
 
     def add_report(self, results: List[BenchmarkResult]) -> None:
         """Add benchmark results to the full report.

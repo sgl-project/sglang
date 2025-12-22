@@ -104,7 +104,9 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
 ## Kernel Size Analysis
 
-Analyze CUDA kernel sizes in compiled wheel files to identify optimization opportunities:
+Analyze CUDA kernel sizes in compiled wheel files to identify oversized kernels and template-instantiation bloat:
+
+This tool requires `cubloaty` (install with `pip install cubloaty`) to work.
 
 ```bash
 # Install cubloaty
@@ -118,9 +120,9 @@ python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl --output my_analysis
 ```
 
 The tool generates:
-- Text report with kernel groups (by name prefix) and individual kernel sizes
-- JSON file with detailed structured data
-- Timing information for each analysis step
+- A text report with:
+  - Kernel groups (by name prefix)
+  - Individual kernel sizes (sorted by size)
 
 Use this to identify large kernels and potential template instantiation bloat.
 
