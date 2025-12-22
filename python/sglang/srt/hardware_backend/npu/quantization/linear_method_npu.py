@@ -15,14 +15,36 @@ class _NPULinearMethodBase(LinearMethodBase):
         self,
         quant_config: Optional["QuantizationConfig"] = None,
     ):
-        super().__init__()
         self.quant_config = quant_config
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
-    @staticmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        layer.weight.data = npu_format_cast(layer.weight.data)
+
+        layer.weight_scale.data = layer.weight_scale.data.flatten()
+        # Compressed-tensors format doesn't have this field
+        if hasattr(layer, "weight_offset"):
+            layer.weight_offset.data = layer.weight_offset.data.flatten()
+
+        expanding_factor = layer.weight.data.shape[0]
+        layer.aclnn_input_scale = torch.nn.Parameter(
+            layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
+            requires_grad=False,
+        )
+        layer.aclnn_input_scale_reciprocal = 1 / torch.nn.Parameter(
+            layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
+            requires_grad=False,
+        )
+        layer.aclnn_input_offset = torch.nn.Parameter(
+            layer.input_offset.data.repeat(expanding_factor).to(device="npu"),
+            requires_grad=False,
+        )
+
     def apply(
+        self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
@@ -53,8 +75,10 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             output_dtype=original_dtype,
         )
 
-    @staticmethod
-    def process_weights_after_loading(layer: torch.nn.Module):
+
+class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
 
@@ -63,25 +87,8 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         if hasattr(layer, "weight_offset"):
             layer.weight_offset.data = layer.weight_offset.data.flatten()
 
-        expanding_factor = layer.weight.data.shape[0]
-        layer.aclnn_input_scale = torch.nn.Parameter(
-            layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
-            requires_grad=False,
-        )
-        layer.aclnn_input_scale_reciprocal = 1 / torch.nn.Parameter(
-            layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
-            requires_grad=False,
-        )
-        layer.aclnn_input_offset = torch.nn.Parameter(
-            layer.input_offset.data.repeat(expanding_factor).to(device="npu"),
-            requires_grad=False,
-        )
-
-
-class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
-
-    @staticmethod
     def apply(
+        self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
@@ -97,21 +104,20 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             output_dtype=original_dtype,
         )
 
-    @staticmethod
-    def process_weights_after_loading(layer: torch.nn.Module):
-        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight.data = npu_format_cast(layer.weight.data)
-
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
-        # Compressed-tensors format doesn't have this field
-        if hasattr(layer, "weight_offset"):
-            layer.weight_offset.data = layer.weight_offset.data.flatten()
-
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 
-    @staticmethod
+    def process_weights_after_loading(self, layer):
+        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        layer.weight_scale.data = layer.weight_scale.data.flatten()
+        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+        layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
+            layer.weight.data.to(torch.int32)
+        )
+
     def apply(
+        self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
@@ -128,13 +134,4 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
             pertoken_scale=dynamic_scale,
             bias=bias,
             output_dtype=original_dtype,
-        )
-
-    @staticmethod
-    def process_weights_after_loading(layer):
-        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
-        layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
-            layer.weight.data.to(torch.int32)
         )
