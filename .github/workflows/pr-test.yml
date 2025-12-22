@@ -195,7 +195,7 @@ jobs:
       - name: Compute partitions
         id: compute
         run: |
-          python scripts/ci/compute_diffusion_partitions.py --target-time 1200
+          python scripts/ci/compute_diffusion_partitions.py --target-time 1200 --max-partitions 10
 
   # =============================================== sgl-kernel ====================================================
 
