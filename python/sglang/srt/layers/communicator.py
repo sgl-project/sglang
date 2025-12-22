@@ -224,6 +224,7 @@ class _LayerModeComputationContext:
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
     is_next_layer_sparse: Optional[bool]
+    is_nextn: bool = False
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -244,6 +245,7 @@ class LayerScatterModes:
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
+    is_nextn: bool = False
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -254,6 +256,7 @@ class LayerScatterModes:
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
+            is_nextn=context.is_nextn,
         )
 
     @classmethod
@@ -271,6 +274,7 @@ class LayerScatterModes:
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or enable_nextn_moe_sparse_fully_dp(is_nextn=context.is_nextn)
                 )
                 else ScatterMode.FULL
             )
@@ -317,6 +321,10 @@ def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
 
 
+def enable_nextn_moe_sparse_fully_dp(is_nextn: bool):
+    return is_nextn and get_global_server_args().speculative_moe_tp_ep_size == 1
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -327,6 +335,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        is_nextn: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -334,7 +343,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
-
+        self.is_nextn = is_nextn
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(

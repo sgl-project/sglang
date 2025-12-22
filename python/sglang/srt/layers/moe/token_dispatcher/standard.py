@@ -12,6 +12,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.communicator import enable_nextn_moe_sparse_fully_dp
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
@@ -80,9 +81,14 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 class StandardDispatcher(BaseDispatcher):
 
-    def __init__(self, moe_runner_config: MoeRunnerConfig):
+    def __init__(self, moe_runner_config: MoeRunnerConfig, is_nextn: bool):
         super().__init__()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        if enable_nextn_moe_sparse_fully_dp(is_nextn):
+            self.moe_ep_size = 1
+            self.moe_ep_rank = 0
+        else:
+            self.moe_ep_size = get_moe_expert_parallel_world_size()
+            self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
@@ -91,7 +97,6 @@ class StandardDispatcher(BaseDispatcher):
         self.num_local_routed_experts = (
             moe_runner_config.num_local_experts - self.num_local_shared_experts
         )
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
 
     def dispatch(

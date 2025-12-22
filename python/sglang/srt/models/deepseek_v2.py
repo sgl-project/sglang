@@ -74,6 +74,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
+    enable_nextn_moe_sparse_fully_dp,
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
@@ -616,8 +617,12 @@ class DeepseekV2MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        if enable_nextn_moe_sparse_fully_dp(is_nextn):
+            self.tp_size = 1
+            self.moe_ep_size = 1
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -660,7 +665,11 @@ class DeepseekV2MoE(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + (
+                0
+                if enable_nextn_moe_sparse_fully_dp(is_nextn)
+                else get_global_server_args().ep_num_redundant_experts
+            ),
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -672,6 +681,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
+            is_nextn=is_nextn,
         )
 
         self.topk = TopK(
@@ -2791,6 +2801,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
+            is_nextn=is_nextn,
         )
 
         if self.is_layer_sparse:
@@ -2843,6 +2854,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
+                is_nextn=is_nextn,
             )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
