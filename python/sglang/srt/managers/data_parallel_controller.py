@@ -60,7 +60,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import ProcessWatchdogRaw
+from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)

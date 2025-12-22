@@ -111,7 +111,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
-from sglang.srt.utils.watchdog import ProcessWatchdogRaw
+from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())

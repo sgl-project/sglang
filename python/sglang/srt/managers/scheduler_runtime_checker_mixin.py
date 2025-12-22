@@ -338,7 +338,7 @@ class SchedulerRuntimeCheckerMixin:
 
 def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
-) -> ProcessWatchdogRaw:
+) -> WatchdogRaw:
     def dump_info() -> str:
         if disable_request_logging():
             return ""
@@ -356,7 +356,7 @@ def create_scheduler_watchdog(
             f"{info_msg}"
         )
 
-    return ProcessWatchdogRaw(
+    return WatchdogRaw(
         debug_name="Scheduler",
         get_counter=lambda: scheduler.forward_ct,
         is_active=lambda: scheduler.cur_batch is not None,
