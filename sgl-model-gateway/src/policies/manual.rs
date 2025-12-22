@@ -8,9 +8,35 @@ use rand::Rng;
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RoutingId(String);
+
+impl RoutingId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutingInfo {
+    pub worker_urls: Vec<String>,
+}
+
+impl RoutingInfo {
+    pub fn new(worker_url: String) -> Self {
+        Self {
+            worker_urls: vec![worker_url],
+        }
+    }
+
+    pub fn first_url(&self) -> Option<&str> {
+        self.worker_urls.first().map(|s| s.as_str())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ManualPolicy {
-    routing_map: DashMap<String, String>,
+    routing_map: DashMap<RoutingId, RoutingInfo>,
 }
 
 impl ManualPolicy {
@@ -26,21 +52,23 @@ impl ManualPolicy {
         routing_id: &str,
         healthy_indices: &[usize],
     ) -> usize {
-        match self.routing_map.entry(routing_id.to_string()) {
+        let key = RoutingId::new(routing_id);
+        match self.routing_map.entry(key) {
             Entry::Occupied(mut entry) => {
-                let worker_url = entry.get();
-                if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
-                    if healthy_indices.contains(&idx) {
-                        return idx;
+                if let Some(worker_url) = entry.get().first_url() {
+                    if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
+                        if healthy_indices.contains(&idx) {
+                            return idx;
+                        }
                     }
                 }
                 let selected_idx = Self::random_select(healthy_indices);
-                entry.insert(workers[selected_idx].url().to_string());
+                entry.insert(RoutingInfo::new(workers[selected_idx].url().to_string()));
                 selected_idx
             }
             Entry::Vacant(entry) => {
                 let selected_idx = Self::random_select(healthy_indices);
-                entry.insert(workers[selected_idx].url().to_string());
+                entry.insert(RoutingInfo::new(workers[selected_idx].url().to_string()));
                 selected_idx
             }
         }
