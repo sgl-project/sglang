@@ -24,6 +24,7 @@ from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
 
 from sglang.multimodal_gen.runtime.models.dits.stepvideo import StepVideoRMSNorm
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 class EmptyInitOnDevice(torch.overrides.TorchFunctionMode):
@@ -591,7 +592,9 @@ class STEP1TextEncoder(torch.nn.Module):
     def forward(self, prompts, with_mask=True, max_length=None):
         self.device = next(self.text_encoder.parameters()).device
 
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.no_grad(), torch.amp.autocast(
+            current_platform.device_type, dtype=torch.bfloat16
+        ):
             if type(prompts) is str:
                 prompts = [prompts]
             txt_tokens = self.text_tokenizer(

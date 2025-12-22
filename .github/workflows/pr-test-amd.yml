@@ -5,7 +5,6 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
@@ -14,12 +13,17 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
   workflow_dispatch:
+    inputs:
+      target_stage:
+        description: "Specific stage to run (optional, for quick testing)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: pr-test-amd-${{ github.ref }}
@@ -35,6 +39,7 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -44,21 +49,34 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/**"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/cli/**"
+              - "python/*.toml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
+        (
+          !inputs.target_stage &&
+          needs.check-changes.outputs.sgl_kernel == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -84,18 +102,27 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
 
   # =============================================== primary ====================================================
 
   stage-a-test-1-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-a-test-1-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -118,14 +145,258 @@ jobs:
         run: |
           docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-a-test-1
 
+  multimodal-gen-test-1-gpu-amd:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
+      matrix:
+        runner: [linux-mi325-gpu-1]
+        part: [0, 1]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+
+      - name: Setup kernel caches
+        run: |
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # This directory persists across container restarts on the self-hosted runner
+          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
+
+          # Clear pre-built AITER kernels from Docker image to avoid segfaults
+          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
+          echo "Clearing pre-built AITER kernels from Docker image..."
+          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
+          docker exec ci_sglang rm -rf /sgl-data/aiter-kernels/*.so 2>/dev/null || true
+          echo "AITER kernels cleared - will be rebuilt on first use"
+
+          # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
+          # This tells the test cleanup code to NOT delete downloaded models
+          if docker exec ci_sglang test -d /sgl-data && docker exec ci_sglang mountpoint -q /sgl-data 2>/dev/null; then
+            docker exec ci_sglang touch /sgl-data/hf-cache/.persistent_cache
+            echo "Created .persistent_cache marker - HF cache will persist"
+          else
+            echo "WARNING: /sgl-data is not a mount point - models will be cleaned up after each test"
+          fi
+
+          # Check MIOpen cache (VAE convolution kernels)
+          miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
+          echo "Found ${miopen_files} MIOpen cache files"
+
+      - name: Diagnose HF cache and system resources
+        run: |
+          echo "=== System Memory Status ==="
+          free -h
+          echo ""
+          echo "=== Disk Space ==="
+          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          echo ""
+          echo "=== HF Cache Directory Structure ==="
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/hub/ 2>/dev/null || echo "HF hub cache not found"
+          echo ""
+          echo "=== Checking for cached diffusion models (1-GPU tests) ==="
+          # Models used in 1-GPU tests: Wan2.1-T2V-1.3B, HunyuanVideo, Qwen-Image, FLUX.1, FLUX.2
+          for model in "Wan-AI--Wan2.1-T2V-1.3B-Diffusers" "tencent--HunyuanVideo" "Qwen--Qwen-Image" "black-forest-labs--FLUX.1-dev" "black-forest-labs--FLUX.2-dev"; do
+            cache_path="/sgl-data/hf-cache/hub/models--${model}"
+            if docker exec ci_sglang test -d "$cache_path"; then
+              size=$(docker exec ci_sglang du -sh "$cache_path" 2>/dev/null | cut -f1)
+              echo "✓ CACHED: $model ($size)"
+            else
+              echo "✗ NOT CACHED: $model"
+            fi
+          done
+          echo ""
+          echo "=== GPU Memory Status ==="
+          docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
+
+      - name: Run diffusion server tests (1-GPU)
+        timeout-minutes: 45
+        run: |
+          # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
+          # Tests: T2V, T2I, I2V, LoRA
+          #
+          # HF download env vars:
+          # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
+          # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
+          docker exec \
+            -e SGLANG_E2E_TOLERANCE=0.3 \
+            -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
+            -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
+            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+            -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite 1-gpu \
+              --partition-id ${{ matrix.part }} \
+              --total-partitions 2 \
+              -k "not flux_2"
+
+          # Post-test diagnostics
+          echo "=== Post-test System Memory Status ==="
+          free -h
+
+  multimodal-gen-test-2-gpu-amd:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
+      matrix:
+        runner: [linux-mi325-gpu-2]
+        part: [0, 1]  # 2 partitions: 9 tests ÷ 2 = ~4-5 tests each
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+
+      - name: Setup kernel caches
+        run: |
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
+
+          # Clear pre-built AITER kernels from Docker image to avoid segfaults
+          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
+          echo "Clearing pre-built AITER kernels from Docker image..."
+          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
+          docker exec ci_sglang rm -rf /sgl-data/aiter-kernels/*.so 2>/dev/null || true
+          echo "AITER kernels cleared - will be rebuilt on first use"
+
+          # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
+          # This tells the test cleanup code to NOT delete downloaded models
+          if docker exec ci_sglang test -d /sgl-data && docker exec ci_sglang mountpoint -q /sgl-data 2>/dev/null; then
+            docker exec ci_sglang touch /sgl-data/hf-cache/.persistent_cache
+            echo "Created .persistent_cache marker - HF cache will persist"
+          else
+            echo "WARNING: /sgl-data is not a mount point - models will be cleaned up after each test"
+          fi
+
+          # Check MIOpen cache (VAE convolution kernels)
+          miopen_files=$(docker exec ci_sglang find /sgl-data/miopen-cache -name "*.udb" 2>/dev/null | wc -l || echo "0")
+          echo "Found ${miopen_files} MIOpen cache files"
+
+      - name: Diagnose HF cache and system resources
+        run: |
+          echo "=== System Memory Status ==="
+          free -h
+          echo ""
+          echo "=== Disk Space ==="
+          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          echo ""
+          echo "=== HF Cache Directory Structure ==="
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
+          docker exec ci_sglang ls -la /sgl-data/hf-cache/hub/ 2>/dev/null || echo "HF hub cache not found"
+          echo ""
+          echo "=== Checking for cached diffusion models (2-GPU tests) ==="
+          # Models used in 2-GPU tests: Wan2.2-T2V-A14B, Wan2.1-T2V-14B, Qwen-Image, FLUX.1
+          for model in "Wan-AI--Wan2.2-T2V-A14B-Diffusers" "Wan-AI--Wan2.1-T2V-14B-Diffusers" "Qwen--Qwen-Image" "black-forest-labs--FLUX.1-dev"; do
+            cache_path="/sgl-data/hf-cache/hub/models--${model}"
+            if docker exec ci_sglang test -d "$cache_path"; then
+              size=$(docker exec ci_sglang du -sh "$cache_path" 2>/dev/null | cut -f1)
+              echo "✓ CACHED: $model ($size)"
+            else
+              echo "✗ NOT CACHED: $model"
+            fi
+          done
+          echo ""
+          echo "=== GPU Memory Status ==="
+          docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
+
+      - name: Run diffusion server tests (2-GPU)
+        timeout-minutes: 80
+        run: |
+          # AMD CI: All 2-GPU tests including LoRA
+          # Tests: T2V, T2I, I2V, LoRA
+          #
+          # HF download env vars:
+          # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
+          # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
+          docker exec \
+            -e SGLANG_E2E_TOLERANCE=0.3 \
+            -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
+            -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_DIFFUSION_ATTENTION_BACKEND=AITER \
+            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+            -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite 2-gpu \
+              --partition-id ${{ matrix.part }} \
+              --total-partitions 2
+
+          # Post-test diagnostics
+          echo "=== Post-test System Memory Status ==="
+          free -h
+
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{matrix.runner}}
     steps:
@@ -150,12 +421,20 @@ jobs:
 
   unit-test-backend-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-2]
+        runner: [linux-mi325-gpu-2]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -180,15 +459,23 @@ jobs:
 
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-8-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     env:
-      RUNNER_LABELS: linux-mi300-gpu-8
+      RUNNER_LABELS: linux-mi325-gpu-8
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-8]
-        part: [0, 1, 2]
+        runner: [linux-mi325-gpu-8]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -205,19 +492,33 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Test RCCL multi-GPU communication
+        timeout-minutes: 5
+        run: |
+          echo "Testing RCCL multi-GPU communication with debug info..."
+          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/test_rccl_multi_gpu.py"
+
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-1-gpu-part-1-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -257,12 +558,20 @@ jobs:
 
   performance-test-1-gpu-part-2-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-1-gpu-part-2-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -296,12 +605,20 @@ jobs:
 
   performance-test-2-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-2]
+        runner: [linux-mi325-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -345,12 +662,20 @@ jobs:
 
   accuracy-test-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'accuracy-test-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-1]
+        runner: [linux-mi325-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -376,12 +701,21 @@ jobs:
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    # Temporarily disabled - uncomment when ready to re-enable (tracked here: https://github.com/sgl-project/sglang/issues/13107)
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-2]
+        runner: [linux-mi325-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -401,7 +735,7 @@ jobs:
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
 
   pr-test-amd-finish:
     needs:
@@ -410,6 +744,8 @@ jobs:
         check-changes,
 
         sgl-kernel-unit-test-amd,
+        multimodal-gen-test-1-gpu-amd,
+        multimodal-gen-test-2-gpu-amd,
 
         stage-a-test-1-amd,
         unit-test-backend-1-gpu-amd,
@@ -419,7 +755,7 @@ jobs:
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,
         accuracy-test-1-gpu-amd,
-        accuracy-test-2-gpu-amd,
+        accuracy-test-2-gpu-amd, # Temporarily disabled
       ]
     if: always()
     runs-on: ubuntu-latest

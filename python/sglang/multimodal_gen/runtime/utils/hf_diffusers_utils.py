@@ -19,15 +19,12 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
-import hashlib
 import json
 import os
-import tempfile
 from functools import reduce
 from pathlib import Path
 from typing import Any, Optional, cast
 
-import filelock
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
@@ -35,10 +32,8 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    init_logger,
-    suppress_other_loggers,
-)
+from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -135,33 +130,33 @@ def get_diffusers_component_config(
     """Gets a configuration of a submodule for the given diffusers model.
 
     Args:
-        model_path: the path of the submodule
+        model_path: the path of the submodule (can be local path or HuggingFace model ID)
 
     Returns:
         The loaded configuration.
     """
 
-    # Check if the model path exists
-    if os.path.exists(model_path):
-        # tokenizer
-        config_names = ["generation_config.json"]
-        # By default, we load config.json, but scheduler_config.json for scheduler
-        if "scheduler" in model_path:
-            config_names.append("scheduler_config.json")
-        else:
-            config_names.append("config.json")
+    # Download from HuggingFace Hub if path doesn't exist locally
+    if not os.path.exists(model_path):
+        model_path = maybe_download_model(model_path)
 
-        config_file_paths = [
-            os.path.join(model_path, config_name) for config_name in config_names
-        ]
-
-        combined_config = reduce(
-            lambda acc, path: acc | load_dict(path), config_file_paths, {}
-        )
-
-        return combined_config
+    # tokenizer
+    config_names = ["generation_config.json"]
+    # By default, we load config.json, but scheduler_config.json for scheduler
+    if "scheduler" in model_path:
+        config_names.append("scheduler_config.json")
     else:
-        raise RuntimeError(f"Diffusers config file not found at {model_path}")
+        config_names.append("config.json")
+
+    config_file_paths = [
+        os.path.join(model_path, config_name) for config_name in config_names
+    ]
+
+    combined_config = reduce(
+        lambda acc, path: acc | load_dict(path), config_file_paths, {}
+    )
+
+    return combined_config
 
 
 # Models don't use the same configuration key for determining the maximum
@@ -198,18 +193,6 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
-
-
-def get_lock(model_name_or_path: str):
-    lock_dir = tempfile.gettempdir()
-    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
-    model_name = model_name_or_path.replace("/", "-")
-    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
-    # add hash to avoid conflict with old users' lock files
-    lock_file_name = hash_name + model_name + ".lock"
-    # mode 0o666 is required for the filelock to be shared across users
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
-    return lock
 
 
 def maybe_download_lora(
@@ -380,24 +363,54 @@ def maybe_download_model(
         Local path to the model
     """
 
-    # If the path exists locally, return it
+    def _verify_model_complete(path: str) -> bool:
+        """Check if model directory has required subdirectories."""
+        transformer_dir = os.path.join(path, "transformer")
+        vae_dir = os.path.join(path, "vae")
+        config_path = os.path.join(path, "model_index.json")
+        return (
+            os.path.exists(config_path)
+            and os.path.exists(transformer_dir)
+            and os.path.exists(vae_dir)
+        )
+
+    # If the path exists locally, verify it's complete
     if os.path.exists(model_name_or_path):
-        logger.info("Model already exists locally")
-        return model_name_or_path
+        if _verify_model_complete(model_name_or_path):
+            logger.info("Model already exists locally and is complete")
+            return model_name_or_path
+        else:
+            logger.warning(
+                "Local model at %s appears incomplete (missing transformer/ or vae/), "
+                "will attempt re-download",
+                model_name_or_path,
+            )
 
     # Otherwise, assume it's a HF Hub model ID and try to download it
     try:
         logger.info(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
-        with get_lock(model_name_or_path).acquire(
-            poll_interval=2
-        ), suppress_other_loggers(not_suppress_on_main_rank=True):
+        with get_lock(model_name_or_path).acquire(poll_interval=2):
             local_path = snapshot_download(
                 repo_id=model_name_or_path,
                 ignore_patterns=["*.onnx", "*.msgpack"],
                 local_dir=local_dir,
             )
+        # Verify downloaded model is complete
+        if not _verify_model_complete(local_path):
+            logger.warning(
+                "Downloaded model at %s is incomplete, retrying with force_download=True",
+                local_path,
+            )
+            with get_lock(model_name_or_path).acquire(poll_interval=2):
+                local_path = snapshot_download(
+                    repo_id=model_name_or_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    local_dir=local_dir,
+                    force_download=True,
+                )
+
         logger.info("Downloaded model to %s", local_path)
         return str(local_path)
     except Exception as e:

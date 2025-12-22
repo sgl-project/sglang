@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt import _custom_ops as ops
+import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -20,16 +20,6 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
-
-try:
-    # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-    import sgl_kernel  # noqa: F401
-
-    custom_ar = True
-except ImportError:
-    # For CPUs
-    custom_ar = False
-
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -79,7 +69,7 @@ class CustomAllreduce:
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
 
-        if not custom_ar:
+        if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
             return
@@ -383,6 +373,23 @@ class CustomAllreduce:
             )
         return out
 
+    def deterministic_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor = None,
+        registered: bool = False,
+    ):
+        """Deterministic all-reduce using 1-stage kernel with fixed ordering (AMD only)."""
+        if out is None:
+            out = torch.empty_like(inp)
+        if registered:
+            ops.deterministic_all_reduce_reg(self._ptr, inp, out)
+        else:
+            reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
+            ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
+        return out
+
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -421,20 +428,37 @@ class CustomAllreduce:
 
 
 def dispatch_custom_allreduce():
-    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
+
+    On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
+    Otherwise use AiterCustomAllreduce if available.
+    """
+    # Check if 1-stage AR should be used
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        use_1stage = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+    else:
+        use_1stage = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+
+    # On AMD with 1-stage AR, use sglang's CustomAllreduce
+    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
+    if is_hip() and use_1stage:
+        logger.info("[AR] Using sglang CustomAllreduce (1-stage kernel)")
+        return CustomAllreduce
+
     if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            logger.info("Using AiterCustomAllreduce for ROCm.")
+            logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             return AiterCustomAllreduce
         except ImportError as e:
             logger.warning(
-                "Aiter custom all-reduce not available (optional dependency missing); "
+                "[AR] Aiter custom all-reduce not available; "
                 "falling back to sglang CustomAllreduce. Details: %s",
                 e,
             )
             return CustomAllreduce
+    logger.info("[AR] Using sglang CustomAllreduce")
     return CustomAllreduce
