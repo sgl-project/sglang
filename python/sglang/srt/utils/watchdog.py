@@ -70,4 +70,3 @@ class ProcessWatchdog:
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
-

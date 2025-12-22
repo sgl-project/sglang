@@ -42,8 +42,8 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
-from sglang.srt.utils.watchdog import ProcessWatchdog
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.watchdog import ProcessWatchdog
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,

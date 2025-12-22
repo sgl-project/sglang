@@ -13,7 +13,6 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils.common import (
     ceil_align,
     disable_request_logging,
-    pyspy_dump_schedulers,
     raise_error_or_warn,
 )
 from sglang.srt.utils.watchdog import ProcessWatchdog
