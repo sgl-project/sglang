@@ -340,8 +340,6 @@ class SchedulerRuntimeCheckerMixin:
 def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> ProcessWatchdog:
-    """Create a watchdog that monitors scheduler forward progress."""
-
     def dump_info() -> str:
         if disable_request_logging():
             return ""
