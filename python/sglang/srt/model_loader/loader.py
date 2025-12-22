@@ -861,16 +861,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         quantized_modules = []
 
         for name, module in model.named_modules():
-            
+
             #  Skip modules that should not be quantized (lm_head, embeddings, layer norms, etc.)
             if any(
-                skip in name
-                for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
+                skip in name for skip in QuantizedRLModelLoader.SKIP_QUANTIZATION_PARAMS
             ):
                 logger.info(f"[QuantizedRL] Skip quantization for module: {name}")
                 continue
 
-        
             if not hasattr(module, "weight") or module.weight is None:
                 logger.info(
                     f"[QuantizedRL] Skip quantization for module: {name} since it does not have a weight tensor"
@@ -938,13 +936,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     logger.warning(
                         f"[QuantizedRL] Blockwise quantization failed for {name}: {e}, "
                     )
-                    # If blockwise is not applicable or fails, fallback to per-channel quantization 
+                    # If blockwise is not applicable or fails, fallback to per-channel quantization
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
                         logger.info(
                             f"[QuantizedRL] Fllback to per-channel quantization for module: {name}; "
-    
                         )
 
         model.flash_rl_initial_load_complete = True
@@ -1265,9 +1262,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                             logger.info(
                                 f"[QuantizedRL] Fallback to per-channel quantization for module: {name}; "
                             )
-
-
-
 
                     QuantizedRLModelLoader._store_quantized_scale(
                         quantized_scales, name, scale

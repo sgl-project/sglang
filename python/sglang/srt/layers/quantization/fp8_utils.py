@@ -1171,15 +1171,21 @@ def scaled_fp8_blockwise(
 ):
     # cast tensor from high precision to FP8 with 128*128 blockwise quantization.
     if data_hp.ndim != 2:
-        raise ValueError(f"Only 2d input tensor is supported, got shape {data_hp.shape}")
+        raise ValueError(
+            f"Only 2d input tensor is supported, got shape {data_hp.shape}"
+        )
 
     block_size0 = weight_block_size[0]
     block_size1 = weight_block_size[1]
 
-    if block_size0 !=block_size1:
-        raise ValueError(f"block_size0 {block_size0} must be equal to block_size1 {block_size1}")
+    if block_size0 != block_size1:
+        raise ValueError(
+            f"block_size0 {block_size0} must be equal to block_size1 {block_size1}"
+        )
 
-    shape_supported = data_hp.shape[0] % block_size0 == 0 and data_hp.shape[1] % block_size1 == 0
+    shape_supported = (
+        data_hp.shape[0] % block_size0 == 0 and data_hp.shape[1] % block_size1 == 0
+    )
     if not shape_supported:
         raise ValueError(
             f"data_hp.shape {data_hp.shape} must be divisible by block_size ({block_size0}, {block_size1})"
@@ -1189,7 +1195,6 @@ def scaled_fp8_blockwise(
 
     original_shape = data_hp.shape
     blk_m, blk_n = data_hp.shape[0] // block_size0, data_hp.shape[1] // block_size1
-
 
     data_hp = data_hp.reshape(blk_m, block_size0, blk_n, block_size1)
 
