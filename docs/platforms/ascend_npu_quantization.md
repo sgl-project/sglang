@@ -13,7 +13,6 @@ AWQ on Ascend support:
 - [x] W4A16 linear
 - [x] W8A16 linear # Test required
 - [x] W4A16 MOE # Test required
-- [x] W8A16 MOE # Test required
 
 Compressed-tensors (LLM Compressor) on Ascend support:
 - [x] W8A8 dynamic linear
