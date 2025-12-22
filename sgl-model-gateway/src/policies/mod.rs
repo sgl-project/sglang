@@ -35,10 +35,16 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is used for regular routing mode where requests go to a single worker.
     /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
+    ///
+    /// # Arguments
+    /// * `workers` - Available workers to select from
+    /// * `request_text` - Request text for cache-aware routing
+    /// * `routing_id` - Routing ID for manual routing policy (consistent hashing)
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
+        routing_id: Option<&str>,
     ) -> Option<usize>;
 
     /// Update policy state after request completion
@@ -55,6 +61,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
+    }
+
+    /// Check if this policy needs routing_id for routing decisions
+    fn needs_routing_id(&self) -> bool {
+        false // Default: most policies don't need routing_id
     }
 
     /// Update worker load information

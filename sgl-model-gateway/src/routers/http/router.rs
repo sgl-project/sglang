@@ -128,6 +128,7 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        routing_id: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -155,7 +156,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        let idx = policy.select_worker(&available, text, routing_id)?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -177,9 +178,8 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        // Use routing_id for manual policy, fall back to text for other policies
+        let text = typed_req.extract_text_for_routing();
         let routing_id = typed_req.get_routing_id().map(|s| s.to_string());
-        let text = routing_id.unwrap_or_else(|| typed_req.extract_text_for_routing());
         let model = model_id.unwrap_or("default");
         let endpoint = route_to_endpoint(route);
 
@@ -197,7 +197,7 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text, routing_id.as_deref())
                     .await
             },
             // should_retry predicate
@@ -247,8 +247,9 @@ impl Router {
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
+        routing_id: Option<&str>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+        let worker = match self.select_worker_for_model(model_id, Some(text), routing_id) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(

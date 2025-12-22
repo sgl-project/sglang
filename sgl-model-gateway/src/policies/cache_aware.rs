@@ -304,6 +304,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
+        _routing_id: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -479,14 +480,14 @@ mod tests {
         policy.init_workers(&workers);
 
         // First request should be distributed
-        let idx1 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let idx1 = policy.select_worker(&workers, Some("hello world"), None).unwrap();
 
         // Same request should go to same worker (cache hit)
-        let idx2 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let idx2 = policy.select_worker(&workers, Some("hello world"), None).unwrap();
         assert_eq!(idx1, idx2);
 
         // Similar request should also go to same worker
-        let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
+        let idx3 = policy.select_worker(&workers, Some("hello"), None).unwrap();
         assert_eq!(idx1, idx3);
     }
 
@@ -518,7 +519,7 @@ mod tests {
 
         // Should select worker2 (lower load) despite cache affinity
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, Some("test")).unwrap();
+            let idx = policy.select_worker(&workers, Some("test"), None).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
@@ -546,15 +547,15 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(&workers, Some("test1"));
-        policy.select_worker(&workers, Some("test2"));
+        policy.select_worker(&workers, Some("test1"), None);
+        policy.select_worker(&workers, Some("test2"), None);
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
         workers[0].set_healthy(false);
 
         // All requests should now go to worker2
-        let idx = policy.select_worker(&workers, Some("test1")).unwrap();
+        let idx = policy.select_worker(&workers, Some("test1"), None).unwrap();
         assert_eq!(idx, 1);
     }
 }

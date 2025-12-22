@@ -221,6 +221,7 @@ impl LoadBalancingPolicy for BucketPolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: Option<&str>,
+        _routing_id: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 

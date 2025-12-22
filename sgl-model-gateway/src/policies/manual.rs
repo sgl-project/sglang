@@ -32,7 +32,8 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
+        _request_text: Option<&str>,
+        routing_id: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -40,8 +41,8 @@ impl LoadBalancingPolicy for ManualPolicy {
             return None;
         }
 
-        // Use routing_id (passed as request_text) for consistent routing
-        if let Some(routing_id) = request_text {
+        // Use routing_id for consistent routing
+        if let Some(routing_id) = routing_id {
             if !routing_id.is_empty() {
                 let hash = Self::compute_hash(routing_id);
                 let idx = hash as usize % healthy_indices.len();
@@ -59,7 +60,7 @@ impl LoadBalancingPolicy for ManualPolicy {
         "manual"
     }
 
-    fn needs_request_text(&self) -> bool {
+    fn needs_routing_id(&self) -> bool {
         true
     }
 
@@ -98,10 +99,14 @@ mod tests {
 
         // Same routing_id should always route to the same worker
         let routing_id = "user-123";
-        let first_idx = policy.select_worker(&workers, Some(routing_id)).unwrap();
+        let first_idx = policy
+            .select_worker(&workers, None, Some(routing_id))
+            .unwrap();
 
         for _ in 0..10 {
-            let idx = policy.select_worker(&workers, Some(routing_id)).unwrap();
+            let idx = policy
+                .select_worker(&workers, None, Some(routing_id))
+                .unwrap();
             assert_eq!(
                 idx, first_idx,
                 "Same routing_id should route to same worker"
@@ -134,7 +139,9 @@ mod tests {
         let mut distribution = HashMap::new();
         for i in 0..100 {
             let routing_id = format!("user-{}", i);
-            let idx = policy.select_worker(&workers, Some(&routing_id)).unwrap();
+            let idx = policy
+                .select_worker(&workers, None, Some(&routing_id))
+                .unwrap();
             *distribution.entry(idx).or_insert(0) += 1;
         }
 
@@ -164,7 +171,7 @@ mod tests {
         // Without routing_id, should use random selection
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, None, None) {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -195,7 +202,7 @@ mod tests {
         // Should only select the healthy worker
         for _ in 0..10 {
             let idx = policy
-                .select_worker(&workers, Some("test-routing-id"))
+                .select_worker(&workers, None, Some("test-routing-id"))
                 .unwrap();
             assert_eq!(idx, 1, "Should only select healthy worker");
         }
@@ -211,7 +218,7 @@ mod tests {
         )];
 
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, Some("test")), None);
+        assert_eq!(policy.select_worker(&workers, None, Some("test")), None);
     }
 
     #[test]
@@ -233,7 +240,7 @@ mod tests {
         // Empty routing_id should fall back to random
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, Some("")) {
+            if let Some(idx) = policy.select_worker(&workers, None, Some("")) {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }

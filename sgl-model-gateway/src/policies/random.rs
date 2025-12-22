@@ -24,6 +24,7 @@ impl LoadBalancingPolicy for RandomPolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         _request_text: Option<&str>,
+        _routing_id: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -76,7 +77,7 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, None, None) {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -107,7 +108,7 @@ mod tests {
 
         // Should always select the healthy worker (index 1)
         for _ in 0..10 {
-            assert_eq!(policy.select_worker(&workers, None), Some(1));
+            assert_eq!(policy.select_worker(&workers, None, None), Some(1));
         }
     }
 
@@ -121,6 +122,6 @@ mod tests {
         )];
 
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, None), None);
+        assert_eq!(policy.select_worker(&workers, None, None), None);
     }
 }

@@ -58,6 +58,7 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    routing_id: Option<String>,
     model_id: Option<&'a str>,
 }
 
@@ -303,7 +304,7 @@ impl PDRouter {
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.model_id)
+                            .select_pd_pair(context.request_text.as_deref(), context.routing_id.as_deref(), context.model_id)
                             .await
                         {
                             Ok(pair) => pair,
@@ -691,6 +692,7 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        routing_id: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
@@ -729,6 +731,7 @@ impl PDRouter {
             &prefill_workers,
             &*prefill_policy,
             request_text,
+            routing_id,
             "prefill",
         )?;
 
@@ -736,6 +739,7 @@ impl PDRouter {
             &decode_workers,
             &*decode_policy,
             request_text,
+            routing_id,
             "decode",
         )?;
 
@@ -761,6 +765,7 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        routing_id: Option<&str>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -784,7 +789,7 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(&available_workers, request_text)
+            .select_worker(&available_workers, request_text, routing_id)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -1120,7 +1125,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1229,10 +1234,7 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.return_logprob.unwrap_or(false);
 
         let request_text = if self.policies_need_request_text() {
-            // Use routing_id if available, otherwise use text
-            body.routing_id
-                .clone()
-                .or_else(|| body.text.as_deref().map(|s| s.to_string()))
+            body.text.as_deref().map(|s| s.to_string())
         } else {
             None
         };
@@ -1245,6 +1247,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1261,20 +1264,17 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs;
 
         let request_text = if self.policies_need_request_text() {
-            // Use routing_id if available, otherwise extract from messages
-            body.routing_id.clone().or_else(|| {
-                body.messages.first().and_then(|msg| match msg {
-                    ChatMessage::User { content, .. } => match content {
-                        MessageContent::Text(text) => Some(text.clone()),
-                        MessageContent::Parts(_) => None,
-                    },
-                    ChatMessage::Developer { content, .. } => match content {
-                        MessageContent::Text(text) => Some(text.clone()),
-                        MessageContent::Parts(_) => None,
-                    },
-                    ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                    _ => None,
-                })
+            body.messages.first().and_then(|msg| match msg {
+                ChatMessage::User { content, .. } => match content {
+                    MessageContent::Text(text) => Some(text.clone()),
+                    MessageContent::Parts(_) => None,
+                },
+                ChatMessage::Developer { content, .. } => match content {
+                    MessageContent::Text(text) => Some(text.clone()),
+                    MessageContent::Parts(_) => None,
+                },
+                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
+                _ => None,
             })
         } else {
             None
@@ -1289,6 +1289,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1305,11 +1306,10 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs.is_some();
 
         let request_text = if self.policies_need_request_text() {
-            // Use routing_id if available, otherwise use prompt
-            body.routing_id.clone().or_else(|| match &body.prompt {
+            match &body.prompt {
                 StringOrArray::String(s) => Some(s.clone()),
                 StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-            })
+            }
         } else {
             None
         };
@@ -1323,6 +1323,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1335,10 +1336,8 @@ impl RouterTrait for PDRouter {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract text for cache-aware routing
-        // Use routing_id if available, otherwise use query
         let req_text = if self.policies_need_request_text() {
-            body.routing_id.clone().or_else(|| Some(body.query.clone()))
+            Some(body.query.clone())
         } else {
             None
         };
@@ -1349,6 +1348,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            routing_id: body.routing_id.clone(),
             model_id,
         };
 
@@ -1413,7 +1413,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1426,7 +1426,7 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None).await;
+        let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
