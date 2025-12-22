@@ -408,6 +408,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.init_communicators(server_args)
 
+        if (timeout := server_args.soft_watchdog_timeout) is not None:
+            ProcessWatchdog(
+                debug_name="TokenizerManager",
+                get_counter=lambda: self.receive_ct,
+                is_active=lambda: self.is_receiving,
+                watchdog_timeout=timeout,
+                soft=True,
+            )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1358,15 +1367,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
 
         self.event_loop = loop
-
-        if (timeout := self.server_args.soft_watchdog_timeout) is not None:
-            ProcessWatchdog(
-                debug_name="TokenizerManager",
-                get_counter=lambda: self.receive_ct,
-                is_active=lambda: self.is_receiving,
-                watchdog_timeout=timeout,
-                soft=True,
-            )
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
