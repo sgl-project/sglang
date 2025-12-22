@@ -58,6 +58,10 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.managers.schedule_batch_beam_search_mixin import (
+    ReqBeamSearchMixin,
+    ScheduleBatchBeamSearchMixin,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -467,7 +471,7 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
-class Req:
+class Req(ReqBeamSearchMixin):
     """The input and output status of a request."""
 
     def __init__(
@@ -739,6 +743,9 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+
+        # beam search (initialized via mixin)
+        self._init_beam_search_attributes(self.sampling_params)
 
         # For diffusion LLM
         self.dllm_ids = []
@@ -1118,7 +1125,9 @@ class Req:
 
 
 @dataclasses.dataclass
-class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+class ScheduleBatch(
+    ScheduleBatchDisaggregationDecodeMixin, ScheduleBatchBeamSearchMixin
+):
     """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
@@ -1843,6 +1852,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        if self.reqs[0].is_beam_search:
+            self.prepare_for_beam_search_decode()
+            return
+
         if self.is_eagle_v2:
             # TODO(spec-v2): all v2 spec should go through this path
             draft_input: EagleDraftInput = self.spec_info
@@ -1938,6 +1951,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
+
+        if self.reqs[0].is_beam_search:
+            self.filter_beam_search_batch(
+                chunked_req_to_exclude=chunked_req_to_exclude,
+                keep_indices=keep_indices,
+            )
+            return
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2127,6 +2147,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            is_beam_search=self.reqs[0].is_beam_search,
         )
 
     def copy(self):
@@ -2243,6 +2264,8 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    is_beam_search: bool = False
 
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None

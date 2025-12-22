@@ -21,6 +21,9 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_beam_search_processor_mixin import (
+    SchedulerBeamSearchProcessorMixin,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
@@ -93,6 +96,10 @@ class SchedulerOutputProcessorMixin:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+
+            if batch.reqs[0].is_beam_search:
+                self.process_beam_search_prefill_result(batch, logits_output)
+                return
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -811,6 +818,7 @@ class SchedulerOutputProcessorMixin:
         prefill_launch_latencies = []
         prefill_finished_timestamps = []
 
+        beam_search_output = []
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -853,7 +861,9 @@ class SchedulerOutputProcessorMixin:
                     req.finished_len = len(req.output_ids)
                 should_output = True
             else:
-                if req.stream:
+                if req.is_beam_search:
+                    should_output = False
+                elif req.stream:
                     stream_interval = (
                         req.sampling_params.stream_interval or self.stream_interval
                     )
@@ -1002,6 +1012,17 @@ class SchedulerOutputProcessorMixin:
                     if output_routed_experts is None:
                         output_routed_experts = []
                     output_routed_experts.append(req.routed_experts)
+                if req.is_beam_search:
+                    completion_tokens[-1] = (
+                        SchedulerBeamSearchProcessorMixin.sum_beam_completion_tokens(
+                            req
+                        )
+                    )
+                    beam_search_output.append(
+                        SchedulerBeamSearchProcessorMixin.convert_beam_sequences_to_output(
+                            req
+                        )
+                    )
 
             if (
                 req.finished()
@@ -1055,6 +1076,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
+                    beam_search_output=beam_search_output,
                 )
             )
 

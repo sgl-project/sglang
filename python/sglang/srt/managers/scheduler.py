@@ -132,6 +132,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_beam_search_processor_mixin import (
+    SchedulerBeamSearchProcessorMixin,
+)
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_enhancer import SchedulerEnhancer
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
@@ -213,6 +216,7 @@ class EmbeddingBatchResult:
 
 
 class Scheduler(
+    SchedulerBeamSearchProcessorMixin,
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
     SchedulerProfilerMixin,
@@ -1050,13 +1054,11 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
-            # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -1399,13 +1401,20 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # Check if beam search is enabled from request sampling params
+            is_beam_search = (
+                recv_req.sampling_params.use_beam_search
+                and recv_req.sampling_params.n > 1
+            )
+
+            # beam search not support return logprob
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
+                return_logprob=recv_req.return_logprob if not is_beam_search else False,
+                top_logprobs_num=recv_req.top_logprobs_num if not is_beam_search else 0,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
@@ -1935,6 +1944,14 @@ class Scheduler(
                 ):
                     break
 
+            # Ensure all requests in the batch have the same beam search type
+            if len(self.running_batch.reqs) > 0:
+                if req.is_beam_search != self.running_batch.reqs[0].is_beam_search:
+                    continue
+            if len(adder.can_run_list) > 0:
+                if req.is_beam_search != adder.can_run_list[0].is_beam_search:
+                    continue
+
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
@@ -2245,7 +2262,10 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
+            if batch.reqs[0].is_beam_search:
+                self.process_beam_search_decode_result(batch, result)
+            else:
+                self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
