@@ -114,7 +114,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         )
 
-        self.watchdog: Watchdog = None
+        self.watchdog = Watchdog.create(
+            debug_name="DetokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+        )
 
     def event_loop(self):
         test_stuck = envs.SGLANG_TEST_STUCK_DETOKENIZER.get()
@@ -365,12 +369,6 @@ def run_detokenizer_process(
 
     try:
         manager = detokenizer_manager_class(server_args, port_args)
-
-        manager.watchdog = Watchdog.create(
-            debug_name="DetokenizerManager",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
-            soft=True,
-        )
 
         if server_args.tokenizer_worker_num > 1:
             manager.multi_http_worker_event_loop()

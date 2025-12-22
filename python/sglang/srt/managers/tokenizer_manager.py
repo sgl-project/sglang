@@ -1508,17 +1508,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def handle_loop(self):
         test_stuck = envs.SGLANG_TEST_STUCK_TOKENIZER.get()
         while True:
-            if self.watchdog is not None:
-                self.watchdog._active = False
+            self.watchdog._active = False
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            if self.watchdog is not None:
-                self.watchdog._active = True
+            self.watchdog._active = True
             if test_stuck > 0:
                 await asyncio.sleep(test_stuck)
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
-            if self.watchdog is not None:
-                self.watchdog.feed()
+            self.watchdog.feed()
 
     def _add_metric_if_present(
         self,
