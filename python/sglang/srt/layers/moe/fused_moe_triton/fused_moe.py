@@ -575,7 +575,9 @@ def fused_experts_impl(
         elif activation == "gelu" and not is_gated:
             curr_intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
         elif activation == "relu2" and not is_gated:
-            curr_intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
+            curr_intermediate_cache2 = torch.square(
+                F.relu(intermediate_cache1.view(-1, N))
+            )
         else:
             raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
