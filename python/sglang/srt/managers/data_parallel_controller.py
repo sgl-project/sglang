@@ -472,16 +472,15 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        if self.server_args.disaggregation_mode == "null":
-            self.workers[self.round_robin_counter].send_pyobj(req)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
-        else:
+        if self.server_args.disaggregation_mode != "null":
             assert (
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+
+        self.workers[self.round_robin_counter].send_pyobj(req)
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(
+            self.workers
+        )
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):
