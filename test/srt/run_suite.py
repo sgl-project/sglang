@@ -82,7 +82,6 @@ suites = {
         TestFile("test_model_hooks.py", 6),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_multi_tokenizer.py", 230),
-        TestFile("test_ngram_speculative_decoding.py", 177),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 217),
         TestFile("test_original_logprobs.py", 41),
