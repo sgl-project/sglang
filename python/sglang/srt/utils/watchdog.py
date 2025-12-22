@@ -26,7 +26,12 @@ class Watchdog:
         if watchdog_timeout is None:
             assert test_stuck_time == 0
             return _WatchdogNoop()
-        return _WatchdogReal(debug_name, watchdog_timeout, soft, test_stuck_time)
+        return _WatchdogReal(
+            debug_name=debug_name,
+            watchdog_timeout=watchdog_timeout,
+            soft=soft,
+            test_stuck_time=test_stuck_time,
+        )
 
     def feed(self):
         pass
@@ -54,6 +59,7 @@ class _WatchdogReal(Watchdog):
             watchdog_timeout=watchdog_timeout,
             soft=soft,
         )
+        logger.info(f"Watchdog {self._raw.debug_name} initialized.")
         if self._test_stuck_time > 0:
             logger.info(f"Watchdog {self._raw.debug_name} is configured to use {test_stuck_time=}.")
 
