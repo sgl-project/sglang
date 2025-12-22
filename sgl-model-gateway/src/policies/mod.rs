@@ -7,15 +7,6 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::core::Worker;
 
-/// Information passed to policy for worker selection
-#[derive(Debug, Default, Clone)]
-pub struct SelectWorkerInfo<'a> {
-    /// Request text for cache-aware routing
-    pub request_text: Option<&'a str>,
-    /// Routing ID for manual routing policy (consistent hashing)
-    pub routing_id: Option<&'a str>,
-}
-
 mod bucket;
 mod cache_aware;
 mod factory;
@@ -136,6 +127,15 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
         .filter(|(_, w)| w.is_healthy() && w.circuit_breaker().can_execute())
         .map(|(idx, _)| idx)
         .collect()
+}
+
+/// Information passed to policy for worker selection
+#[derive(Debug, Default, Clone)]
+pub struct SelectWorkerInfo<'a> {
+    /// Request text for cache-aware routing
+    pub request_text: Option<&'a str>,
+    /// Routing ID for manual routing policy (consistent hashing)
+    pub routing_id: Option<&'a str>,
 }
 
 #[cfg(test)]
