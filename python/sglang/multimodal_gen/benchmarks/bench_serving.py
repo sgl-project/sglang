@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 import numpy as np
 import requests
+import torch
 from tqdm.asyncio import tqdm
 
 
@@ -63,6 +64,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     response_body: Dict[str, Any] = field(default_factory=dict)
+    peak_memory_mb: float = 0.0
 
 
 class BaseDataset(ABC):
@@ -334,6 +336,9 @@ async def async_request_image_sglang(
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     # Check if we need to use multipart (for image edits with input images)
     if input.image_paths and len(input.image_paths) > 0:
         # Use multipart/form-data for image edits
@@ -406,6 +411,11 @@ async def async_request_image_sglang(
             output.success = False
 
     output.latency = time.perf_counter() - output.start_time
+
+    if torch.cuda.is_available():
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        output.peak_memory_mb = peak_memory_bytes / (1024**2)
+
     if pbar:
         pbar.update(1)
     return output
@@ -418,6 +428,9 @@ async def async_request_video_sglang(
 ) -> RequestFuncOutput:
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     # 1. Submit Job
     job_id = None
@@ -557,6 +570,11 @@ async def async_request_video_sglang(
             break
 
     output.latency = time.perf_counter() - output.start_time
+
+    if torch.cuda.is_available():
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        output.peak_memory_mb = peak_memory_bytes / (1024**2)
+
     if pbar:
         pbar.update(1)
     return output
@@ -568,6 +586,7 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
+    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
     metrics = {
         "duration": total_duration,
@@ -578,6 +597,9 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
         "latency_median": np.median(latencies) if latencies else 0,
         "latency_p99": np.percentile(latencies, 99) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
+        "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
     }
 
     return metrics
@@ -718,6 +740,24 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
+
+    if metrics["peak_memory_mb_max"] > 0:
+        print(f"{'-' * 50}")
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Max (MB):", metrics["peak_memory_mb_max"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
+            )
+        )
 
     print("\n" + "=" * 60)
 

@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 import numpy as np
+import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
@@ -209,6 +210,10 @@ class DiffGenerator:
 
         results = []
         total_start_time = time.perf_counter()
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
@@ -239,12 +244,19 @@ class DiffGenerator:
                             data_type=req.data_type,
                         )
 
+                        peak_memory_mb = 0.0
+                        if torch.cuda.is_available():
+                            peak_memory_bytes = torch.cuda.max_memory_allocated()
+                            peak_memory_mb = peak_memory_bytes / (1024**2)
+                            torch.cuda.reset_peak_memory_stats()
+
                         result_item: dict[str, Any] = {
                             "samples": sample,
                             "frames": frames,
                             "prompts": req.prompt,
                             "size": (req.height, req.width, req.num_frames),
                             "generation_time": timer.duration,
+                            "peak_memory_mb": peak_memory_mb,
                             "timings": (
                                 output_batch.timings.to_dict()
                                 if output_batch.timings
@@ -261,6 +273,16 @@ class DiffGenerator:
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
+
+        if results and torch.cuda.is_available():
+            peak_memories = [r.get("peak_memory_mb", 0) for r in results]
+            if peak_memories:
+                max_peak_memory = max(peak_memories)
+                avg_peak_memory = sum(peak_memories) / len(peak_memories)
+                logger.info(
+                    f"Memory usage - Max peak: {max_peak_memory:.2f} MB, "
+                    f"Avg peak: {avg_peak_memory:.2f} MB"
+                )
 
         if len(results) == 0:
             return None
