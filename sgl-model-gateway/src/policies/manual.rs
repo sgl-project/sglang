@@ -22,6 +22,7 @@ struct RoutingInfo {
     worker_urls: Vec<String>,
 }
 
+// TODO may optimize performance
 #[derive(Debug, Default)]
 pub struct ManualPolicy {
     routing_map: DashMap<RoutingId, RoutingInfo>,
