@@ -405,6 +405,17 @@ mod tests {
     }
 
     #[test]
+    fn test_manual_empty_workers() {
+        let policy = ManualPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = vec![];
+        let info = SelectWorkerInfo {
+            routing_id: Some("test"),
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &info), None);
+    }
+
+    #[test]
     fn test_manual_single_worker() {
         let policy = ManualPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
