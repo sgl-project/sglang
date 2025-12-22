@@ -100,7 +100,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
-        is_mtp: bool = False,
+        speculative_algorithm: Optional[str] = None,
         encoder_only: bool = False,
         language_only: bool = False,
     ) -> None:
@@ -112,7 +112,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
-        self.is_mtp = is_mtp
+        self.speculative_algorithm = speculative_algorithm
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -252,7 +252,7 @@ class ModelConfig:
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
-            is_mtp=server_args.enable_mtp,
+            speculative_algorithm=server_args.speculative_algorithm,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,

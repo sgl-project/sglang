@@ -33,10 +33,10 @@ from sglang.srt.speculative.eagle_info_v2 import (
     fill_new_verified_id,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
-from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
+from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MTPMultiStepDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.mtp_utils import (
+from sglang.srt.speculative.multi_layer_eagle_worker_utils import (
     assign_hidden_states_pool_triton,
     rotate_input_ids_triton,
 )
