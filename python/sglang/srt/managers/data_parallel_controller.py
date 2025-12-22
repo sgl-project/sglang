@@ -560,7 +560,7 @@ def run_data_parallel_controller_process(
             WatchdogRaw(
                 debug_name="DataParallelController",
                 get_counter=lambda: controller.dispatch_ct,
-                is_active=lambda: controller.is_dispatching,
+                is_active=lambda: controller.is_processing,
                 watchdog_timeout=timeout,
                 soft=True,
             )

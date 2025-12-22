@@ -299,8 +299,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
 
-        self.watchdog: Watchdog = None
-
         # Initial weights status
         self.initial_weights_loaded = True
         if server_args.checkpoint_engine_wait_weights_before_ready:
