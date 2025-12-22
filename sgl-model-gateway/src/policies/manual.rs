@@ -20,6 +20,7 @@ pub enum ExecutionBranch {
 }
 
 impl ExecutionBranch {
+    // TODO auto generate
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
