@@ -53,8 +53,6 @@ class ProcessWatchdog:
                 else:
                     watchdog_last_counter = current_counter
                     watchdog_last_time = current
-            else:
-                watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
