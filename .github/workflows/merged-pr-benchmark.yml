@@ -1,0 +1,125 @@
+name: Merged PR Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [closed]
+    branches: [ main ]
+    #paths:
+
+concurrency:
+  group: merged-pr-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-ais-bench:
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'npu'))
+    runs-on: linux-aarch64-a3-16
+    container:
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+    steps:
+      - name: Pre-config git access token
+        run: |
+          # as we use a proxy but checkout@v4 only set basic auth header for github.com
+          # so we set the extraheader manually
+          TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
+          git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host ${CACHING_URL}
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          # install ais_bench
+          if [ ! -d "/opt/benchmark" ]; then
+            git clone https://gitee.com/aisbench/benchmark.git /opt/benchmark
+          fi
+          cd /opt/benchmark/
+          pip3 install -e ./ --use-pep517
+          pip3 install -r requirements/api.txt
+          cd -
+
+      - name: Preparation
+        shell: bash
+        run: |
+          # Extract PR basic information
+          COMMIT_SHA="${{ github.sha }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_CREATED_AT="${{ github.event.pull_request.created_at }}"
+          PR_MERGED_AT="${{ github.event.pull_request.merged_at }}"
+          PR_BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+
+          # Format date and time
+          PR_DATE=$(date -u -d "$PR_MERGED_AT" +%Y%m%d)  # -u ensures parsing with UTC time
+          PR_TIME=$(date -u -d "$PR_MERGED_AT" +%Y-%m-%dT%H:%M:%S)
+
+          DEVICE=""
+          runner_name="${{ runner.name }}"
+          if [[ "$runner_name" == *a3* ]]; then
+              DEVICE="910c"
+          fi
+          # Create directory
+          TARGET_DIR="/root/.cache/aisbench/$PR_DATE/$COMMIT_SHA"
+          echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
+          mkdir -p "$TARGET_DIR"  # Ensure directory exists
+
+          # Generate JSON file
+          cat > "$TARGET_DIR/pr.json" << EOF
+          {
+            "pr_id": "$PR_NUMBER",
+            "commit_id": "$COMMIT_SHA",
+            "pr_title": "$PR_TITLE",
+            "merged_at": "$PR_TIME",
+            "sglang_branch": "$PR_BASE_BRANCH",
+            "device": "$DEVICE"
+          }
+          EOF
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+        run: |
+          echo "$TARGET_DIR"
+          bash scripts/pr_performance_test.sh "$TARGET_DIR" ~/.cache/modelscope/hub/models/Qwen/Qwen3-32B 2
+          bash scripts/pr_performance_test.sh "$TARGET_DIR" ~/.cache/modelscope/hub/models/vllm-ascend/Qwen3-235B-A22B-W8A8 16 "--quantization w8a8_int8"
+          #bash scripts/pr_performance_test.sh "$TARGET_DIR" ~/.cache/modelscope/hub/models/Qwen/Qwen3-Next-80B-A3B-Instruct 16
+          #bash scripts/pr_performance_test.sh "$TARGET_DIR" ~/.cache/modelscope/hub/models/meituan-longcat/LongCat-Flash-Chat 16
+
+  run-ais-bench-finish:
+    if: always()
+    needs:
+      - run-ais-bench
+    runs-on: linux-amd64-cpu-1
+    container:
+      image: docker.m.daocloud.io/ubuntu:22.04
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          #!/bin/sh
+          results="${{ join(needs.*.result, ' ') }}"
+          set -- $results
+          for result in "$@"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
