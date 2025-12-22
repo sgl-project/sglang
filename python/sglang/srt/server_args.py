@@ -727,6 +727,12 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        # Handle two-batch overlap settings.
+        self._handle_two_batch_overlap()
+
+        # Handle debug utilities.
+        self._handle_debug_utils()
+
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -2395,6 +2401,17 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+    def _handle_two_batch_overlap(self):
+        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+            raise ValueError(
+                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+    def _handle_debug_utils(self):
+        if is_in_ci() and self.soft_watchdog_timeout is None:
+            logger.info("Set soft_watchdog_timeout since in CI")
+            self.soft_watchdog_timeout = 300
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
@@ -3130,6 +3147,7 @@ class ServerArgs:
             help="The load balancing strategy for data parallelism.",
             choices=[
                 "round_robin",
+                "decode_round_robin",
                 "shortest_queue",
                 "minimum_tokens",
             ],
