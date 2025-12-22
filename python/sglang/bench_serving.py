@@ -1650,9 +1650,10 @@ def sample_generated_shared_prefix_requests(
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
+    should_cache = range_ratio == 1
 
     # Try to load from cache first
-    if cache_path.exists() and range_ratio == 1:
+    if cache_path.exists() and should_cache:
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
@@ -1739,10 +1740,11 @@ def sample_generated_shared_prefix_requests(
         )
 
     # Save to cache
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Caching generated input data to {cache_path}")
-    with open(cache_path, "wb") as f:
-        pickle.dump(input_requests, f)
+    if should_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Caching generated input data to {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(input_requests, f)
 
     return input_requests
 
