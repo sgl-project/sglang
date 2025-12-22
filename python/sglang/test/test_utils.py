@@ -168,11 +168,6 @@ def is_blackwell_system():
     return envs.IS_BLACKWELL.get()
 
 
-def is_h200_system():
-    """Return whether it is running on an H200 system."""
-    return envs.IS_H200.get()
-
-
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -196,9 +191,6 @@ if is_in_amd_ci():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 if is_blackwell_system():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
-
-if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 
