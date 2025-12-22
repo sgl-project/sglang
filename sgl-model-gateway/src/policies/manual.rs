@@ -24,10 +24,6 @@ impl ManualPolicy {
             routing_map: DashMap::new(),
         }
     }
-
-    fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
-        workers.iter().position(|w| w.url() == url)
-    }
 }
 
 impl LoadBalancingPolicy for ManualPolicy {
@@ -37,7 +33,6 @@ impl LoadBalancingPolicy for ManualPolicy {
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
-
         if healthy_indices.is_empty() {
             return None;
         }
@@ -46,7 +41,7 @@ impl LoadBalancingPolicy for ManualPolicy {
             if !routing_id.is_empty() {
                 if let Some(entry) = self.routing_map.get(routing_id) {
                     let worker_url = entry.value();
-                    if let Some(idx) = Self::find_worker_index_by_url(workers, worker_url) {
+                    if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
                         if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute()
                         {
                             return Some(idx);
@@ -82,6 +77,10 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
+    workers.iter().position(|w| w.url() == url)
 }
 
 #[cfg(test)]
