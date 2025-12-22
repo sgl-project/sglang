@@ -147,7 +147,7 @@ from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
-    SchedulerWatchdog,
+    create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
@@ -294,7 +294,6 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.enable_mtp = server_args.enable_mtp
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -504,11 +503,13 @@ class Scheduler(
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
         # FIXME: refactor the draft worker registration logic
-        if self.enable_mtp:
+        if self.server_args.enable_multi_layer_eagle:
             if self.enable_overlap:
-                from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MultiLayerEagleWorkerV2,
+                )
 
-                self.draft_worker = MTPWorkerV2(
+                self.draft_worker = MultiLayerEagleWorkerV2(
                     gpu_id=self.gpu_id,
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
@@ -518,9 +519,11 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
             else:
-                from sglang.srt.speculative.mtp_worker import MTPWorker
+                from sglang.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEagleWorker,
+                )
 
-                self.draft_worker = MTPWorker(
+                self.draft_worker = MultiLayerEagleWorker(
                     gpu_id=self.gpu_id,
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
@@ -816,11 +819,13 @@ class Scheduler(
 
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
-        self.watchdog = SchedulerWatchdog(
+        self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
         if (x := self.server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = SchedulerWatchdog(self, watchdog_timeout=x, soft=True)
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -851,7 +856,7 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            if self.enable_mtp:
+            if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -1435,6 +1440,7 @@ class Scheduler(
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
+                return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,

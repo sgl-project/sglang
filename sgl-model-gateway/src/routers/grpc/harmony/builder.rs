@@ -12,7 +12,7 @@ use openai_harmony::{
     },
     HarmonyEncoding, HarmonyEncodingName,
 };
-use tracing::debug;
+use tracing::{debug, trace};
 
 use super::types::HarmonyBuildOutput;
 use crate::protocols::{
@@ -33,8 +33,10 @@ static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 /// Uses HarmonyGptOss encoding which supports the gpt-oss model family.
 pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
     HARMONY_ENCODING.get_or_init(|| {
-        openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-            .expect("Failed to load Harmony encoding")
+        tokio::task::block_in_place(|| {
+            openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+                .expect("Failed to load Harmony encoding")
+        })
     })
 }
 
@@ -211,13 +213,13 @@ impl HarmonyBuilder {
             .tokenizer()
             .decode_utf8(&token_ids)
             .unwrap_or_else(|_| "<decode error>".to_string());
-        debug!(
+        trace!(
             token_count = token_ids.len(),
             token_preview = ?&token_ids[..token_ids.len().min(20)],
             decoded_length = decoded_text.len(),
             "Encoded conversation to tokens - decoded text follows:"
         );
-        debug!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
 
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
@@ -230,7 +232,6 @@ impl HarmonyBuilder {
         })
     }
 
-    /// Build system message from ChatCompletionRequest
     /// Build system message with common logic
     ///
     /// # Arguments

@@ -10,6 +10,7 @@ import httpx
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
+from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -156,7 +157,7 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
 
 
 async def process_generation_batch(
-    scheduler_client,
+    scheduler_client: AsyncSchedulerClient,
     batch,
 ):
     total_start_time = time.perf_counter()
@@ -164,7 +165,10 @@ async def process_generation_batch(
         result = await scheduler_client.forward([batch])
 
         if result.output is None:
-            raise RuntimeError("Model generation returned no output.")
+            error_msg = getattr(result, "error", "Unknown error")
+            raise RuntimeError(
+                f"Model generation returned no output. Error from scheduler: {error_msg}"
+            )
 
         save_file_path = str(os.path.join(batch.output_path, batch.output_file_name))
         post_process_sample(
@@ -178,7 +182,10 @@ async def process_generation_batch(
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
 
-    return save_file_path
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
+
+    return save_file_path, result
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
