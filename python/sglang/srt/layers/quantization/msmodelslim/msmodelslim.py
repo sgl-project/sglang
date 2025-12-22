@@ -150,10 +150,6 @@ class ModelSlimConfig(QuantizationConfig):
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix_in_quant_config)
-            if scheme is None:
-                raise NotImplementedError(
-                    "At the moment SGLang on Ascend supports only w4a4 dynamic, w8a8 static/dynamic linear schemes."
-                )
             layer.scheme = scheme
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
@@ -174,6 +170,7 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimW4A4Int4(
                 quant_config=self.quant_description, prefix=layer_name
             )
+        raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
