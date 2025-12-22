@@ -1032,6 +1032,20 @@ impl Metrics {
         )
         .increment(1);
     }
+
+    // ========================================================================
+    // Worker cleanup
+    // ========================================================================
+
+    pub fn remove_worker_metrics(worker_url: &str) {
+        gauge!("smg_worker_cb_consecutive_failures", "worker" => worker_url.to_string()).set(0.0);
+        gauge!("smg_worker_cb_consecutive_successes", "worker" => worker_url.to_string()).set(0.0);
+        gauge!("smg_worker_requests_active", "worker" => worker_url.to_string()).set(0.0);
+
+        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
+        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
+        gauge!("smg_worker_cb_state", "worker" => worker_url.to_string()).set(-1.0);
+    }
 }
 
 #[cfg(test)]
@@ -1270,5 +1284,17 @@ mod tests {
         let socket_addr = SocketAddr::new(ip_addr, config.port);
 
         assert_eq!(socket_addr.to_string(), "127.0.0.1:29000");
+    }
+
+    #[test]
+    fn test_remove_worker_metrics() {
+        let worker_url = "http://worker1:8000";
+
+        Metrics::set_worker_requests_active(worker_url, 10);
+        Metrics::set_worker_cb_state(worker_url, 1);
+        Metrics::set_worker_cb_consecutive_failures(worker_url, 5);
+        Metrics::set_worker_cb_consecutive_successes(worker_url, 3);
+
+        Metrics::remove_worker_metrics(worker_url);
     }
 }
