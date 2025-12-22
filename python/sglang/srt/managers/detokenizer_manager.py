@@ -21,6 +21,7 @@ from collections import OrderedDict
 from typing import Dict, List, Union
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 
@@ -179,7 +180,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Decode token ids to strings
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-        if not self.disable_tokenizer_batch_decode:
+        skip_uniform = len(set(recv_obj.skip_special_tokens)) == 1
+        space_uniform = len(set(recv_obj.spaces_between_special_tokens)) == 1
+        if not self.disable_tokenizer_batch_decode or not (
+            skip_uniform and space_uniform
+        ):
             if not self.is_dummy:
                 # Run normal batch decode
                 surr_texts = self.tokenizer.batch_decode(
@@ -262,8 +267,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
+    def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
+        output_routed_experts = None
+        if recv_obj.output_routed_experts is not None:
+            output_routed_experts = [
+                (
+                    pybase64.b64encode(output_routed_experts.numpy().tobytes()).decode(
+                        "utf-8"
+                    )
+                    if output_routed_experts is not None
+                    else []
+                )
+                for output_routed_experts in recv_obj.output_routed_experts
+            ]
+        return output_routed_experts
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         output_strs = self._decode_batch_token_id_output(recv_obj)
+        output_routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -290,6 +311,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
+            output_routed_experts=output_routed_experts,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
@@ -298,6 +320,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
+            prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
