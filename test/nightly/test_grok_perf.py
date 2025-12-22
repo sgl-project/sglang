@@ -127,26 +127,41 @@ class TestNightlyGrokPerformance(unittest.TestCase):
         try:
             for model_config in self.models:
                 with self.subTest(model=model_config["name"]):
-                    result_tuple = self.runner.run_benchmark_for_model(
-                        model_path=model_config["model_path"],
-                        batch_sizes=self.batch_sizes,
-                        input_lens=self.input_lens,
-                        output_lens=self.output_lens,
-                        other_args=model_config["other_args"],
-                        variant=model_config["name"],
-                        extra_bench_args=["--trust-remote-code"],
-                    )
-                    results = result_tuple[0]
-                    success = result_tuple[1]
+                    # Set environment variables for this model
+                    old_env = {}
+                    for key, value in model_config.get("env_vars", {}).items():
+                        old_env[key] = os.environ.get(key)
+                        os.environ[key] = value
+                        print(f"Setting env: {key}={value}")
 
-                    if not success:
-                        failed_models.append(model_config["name"])
-
-                    # Use simplified report format without traces
-                    if results:
-                        self.runner.full_report += (
-                            generate_simple_markdown_report(results) + "\n"
+                    try:
+                        result_tuple = self.runner.run_benchmark_for_model(
+                            model_path=model_config["model_path"],
+                            batch_sizes=self.batch_sizes,
+                            input_lens=self.input_lens,
+                            output_lens=self.output_lens,
+                            other_args=model_config["other_args"],
+                            variant=model_config["name"],
+                            extra_bench_args=["--trust-remote-code"],
                         )
+                        results = result_tuple[0]
+                        success = result_tuple[1]
+
+                        if not success:
+                            failed_models.append(model_config["name"])
+
+                        # Use simplified report format without traces
+                        if results:
+                            self.runner.full_report += (
+                                generate_simple_markdown_report(results) + "\n"
+                            )
+                    finally:
+                        # Restore original environment
+                        for key, value in old_env.items():
+                            if value is None:
+                                os.environ.pop(key, None)
+                            else:
+                                os.environ[key] = value
         finally:
             self.runner.write_final_report()
 
