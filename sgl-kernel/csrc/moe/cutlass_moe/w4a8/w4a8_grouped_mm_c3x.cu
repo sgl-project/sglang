@@ -100,7 +100,8 @@ void dispatch_w4a8_moe_mm_sm90(
     int64_t chunk_size,
     int64_t topk,
     int64_t expected_m_per_group) {
-  // ll and normal: int(num_max_dispatch_tokens_per_rank * rank / num_experts);  other: int(m / num_local_experts * topk)
+  // ll and normal: int(num_max_dispatch_tokens_per_rank * rank / num_experts);  other: int(m / num_local_experts *
+  // topk)
   uint32_t const m = expected_m_per_group;
   uint32_t const n = d_tensors.size(-1);
   uint32_t const k = a_tensors.size(-1);
@@ -128,66 +129,70 @@ void dispatch_w4a8_moe_mm_sm90(
     // group gemm 2
     if (m <= 8) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 512, 1, 1, 1>));
-    else if (m <= 64) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-    } else if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
-    } else if (m <= 512) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-    } else if (m <= 4096) {
-      // Optimized for prefill: larger cluster for better throughput
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 2, 1, 1>));
-    } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
-    }
-  } else if (n == 512 && k == 7168) {
-    // group gemm 1 for tp
-    if (m <= 4) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
-    } else if (m <= 32) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
-    } else if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
-    } else if (m <= 1024) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
-    } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
-    }
-  } else if (n == 7168 && k == 256) {
-    // group gemm 2 for tp
-    if (m <= 8) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 128, 1, 1, 1>));
-    } else if (m <= 32) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 1, 1, 1>));
-    } else if (m <= 512) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 2, 1, 1>));
-    } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 64, 128, 1, 1, 1>));
-    }
-  } else {
-    if (k % 512 == 0) {
-      // For large m (prefill), prefer larger cluster
-      if (m <= 32) {
-        // Decode: target batch size (16-32) - use cluster size 1 for better latency
-        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
-      } else if (m <= 1024) {
-        // Decode: large batch or small prefill
+      else if (m <= 64) {
         INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-      } else {
-        // Prefill: large sequence length - prefer larger cluster
+      }
+      else if (m <= 256) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
+      }
+      else if (m <= 512) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+      }
+      else if (m <= 4096) {
+        // Optimized for prefill: larger cluster for better throughput
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 2, 1, 1>));
+      }
+      else {
         INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
       }
-    } else {
-      if (m <= 32) {
-        // Decode: target batch size (16-32) - use larger tile for better throughput
-        INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 1, 1, 1>));
+    } else if (n == 512 && k == 7168) {
+      // group gemm 1 for tp
+      if (m <= 4) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
+      } else if (m <= 32) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+      } else if (m <= 256) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
+      } else if (m <= 1024) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
       } else {
-        // Prefill: larger sequence length
+        INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+      }
+    } else if (n == 7168 && k == 256) {
+      // group gemm 2 for tp
+      if (m <= 8) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 128, 1, 1, 1>));
+      } else if (m <= 32) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 1, 1, 1>));
+      } else if (m <= 512) {
+        INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 2, 1, 1>));
+      } else {
         INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 64, 128, 1, 1, 1>));
+      }
+    } else {
+      if (k % 512 == 0) {
+        // For large m (prefill), prefer larger cluster
+        if (m <= 32) {
+          // Decode: target batch size (16-32) - use cluster size 1 for better latency
+          INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
+        } else if (m <= 1024) {
+          // Decode: large batch or small prefill
+          INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+        } else {
+          // Prefill: large sequence length - prefer larger cluster
+          INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+        }
+      } else {
+        if (m <= 32) {
+          // Decode: target batch size (16-32) - use larger tile for better throughput
+          INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 1, 1, 1>));
+        } else {
+          // Prefill: larger sequence length
+          INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 64, 128, 1, 1, 1>));
+        }
       }
     }
   }
-}
 
 }  // namespace
 
