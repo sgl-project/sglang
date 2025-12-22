@@ -77,7 +77,8 @@ RUN git clone https://github.com/feifeibear/long-context-attention.git long-cont
     && pip install .
 
 # Install SGLang
-RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
+RUN git clone https://github.com/sgl-project/sglang --branch main && \
+    (cd sglang && git fetch origin $SGLANG_TAG:branch && git checkout branch) && \
     (cd sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && ${PIP_INSTALL} -v .[all_npu]) && \
     rm -rf sglang
 
