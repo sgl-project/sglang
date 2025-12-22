@@ -6,7 +6,6 @@ import logging
 from typing import Tuple
 
 import torch
-from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 

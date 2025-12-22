@@ -46,7 +46,12 @@ from sglang.srt.model_loader.weight_validation import (
     _validate_safetensors_file,
     _validate_sharded_model,
 )
-from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once, BAR_FORMAT
+from sglang.srt.utils import (
+    BAR_FORMAT,
+    find_local_repo_dir,
+    log_info_on_rank0,
+    print_warning_once,
+)
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)

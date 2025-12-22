@@ -82,7 +82,6 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
