@@ -731,19 +731,22 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
+        let info = crate::policies::SelectWorkerInfo {
+            request_text,
+            routing_id,
+        };
+
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
-            request_text,
-            routing_id,
+            &info,
             "prefill",
         )?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
             &*decode_policy,
-            request_text,
-            routing_id,
+            &info,
             "decode",
         )?;
 
@@ -768,8 +771,7 @@ impl PDRouter {
     fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
-        request_text: Option<&str>,
-        routing_id: Option<&str>,
+        info: &crate::policies::SelectWorkerInfo,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -792,12 +794,8 @@ impl PDRouter {
             ));
         }
 
-        let info = crate::policies::SelectWorkerInfo {
-            request_text,
-            routing_id,
-        };
         let selected_idx = policy
-            .select_worker(&available_workers, &info)
+            .select_worker(&available_workers, info)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",

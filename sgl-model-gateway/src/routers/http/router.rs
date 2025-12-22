@@ -127,8 +127,7 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
-        routing_id: Option<&str>,
+        info: &crate::policies::SelectWorkerInfo,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -156,11 +155,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let info = crate::policies::SelectWorkerInfo {
-            request_text: text,
-            routing_id,
-        };
-        let idx = policy.select_worker(&available, &info)?;
+        let idx = policy.select_worker(&available, info)?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -261,7 +256,11 @@ impl Router {
         text: &str,
         routing_id: Option<&str>,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), routing_id) {
+        let info = crate::policies::SelectWorkerInfo {
+            request_text: Some(text),
+            routing_id,
+        };
+        let worker = match self.select_worker_for_model(model_id, &info) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
