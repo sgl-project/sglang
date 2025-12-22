@@ -384,7 +384,6 @@ class NPUW4A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         bias2 = [layer.w2_scale_bias]
         w1_scale = [layer.w13_weight_scale]
         w2_scale = [layer.w2_weight_scale]
-        # TODO w4a8 scene: dynamic acquisition of dtype in the future
         _output_dtype = torch.bfloat16
 
         hidden_states = torch.ops.npu.npu_grouped_matmul(
