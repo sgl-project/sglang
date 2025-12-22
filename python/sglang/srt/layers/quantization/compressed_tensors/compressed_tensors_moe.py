@@ -887,6 +887,7 @@ class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
             "input_activations"
         )
+        self.kernel = NPUW8A8Int8DynamicMoEMethod()
 
         self.static_input_scales = not self.input_quant.dynamic
         per_channel = (
@@ -973,7 +974,7 @@ class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        NPUW8A8Int8DynamicMoEMethod.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -986,7 +987,7 @@ class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        return NPUW8A8Int8DynamicMoEMethod.apply(layer, dispatch_output)
+        return self.kernel.apply(layer, dispatch_output)
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
@@ -1310,6 +1311,8 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
             ].group_size
         else:
             self.group_size = 128
+        
+        self.kernel = NPUW4A16Int4DynamicMoEMethod()
 
     # TODO: See if we can merge this method's logic
     # with CompressedTensorsWNA16MoEMethod. Need more models and tests.
@@ -1412,7 +1415,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        NPUW4A16Int4DynamicMoEMethod.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1425,7 +1428,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        return NPUW4A16Int4DynamicMoEMethod.apply(layer, dispatch_output)
+        return self.kernel.apply(layer, dispatch_output)
 
     def apply_without_routing_weights(
         self,
@@ -1436,7 +1439,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
         group_list,
         output_dtype,
     ):
-        return NPUW4A16Int4DynamicMoEMethod.apply_without_routing_weights(
+        return self.kernel.apply_without_routing_weights(
             layer,
             hidden_states,
             hidden_states_scale,
