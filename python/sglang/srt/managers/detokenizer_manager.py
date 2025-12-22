@@ -371,7 +371,7 @@ def run_detokenizer_process(
 
         if (timeout := server_args.soft_watchdog_timeout) is not None:
             ProcessWatchdog(
-                process_name="DetokenizerManager",
+                debug_name="DetokenizerManager",
                 get_counter=lambda: manager.process_ct,
                 is_active=lambda: manager.is_processing,
                 watchdog_timeout=timeout,

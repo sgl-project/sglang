@@ -358,7 +358,7 @@ def create_scheduler_watchdog(
         )
 
     return ProcessWatchdog(
-        process_name="Scheduler",
+        debug_name="Scheduler",
         get_counter=lambda: scheduler.forward_ct,
         is_active=lambda: scheduler.cur_batch is not None,
         watchdog_timeout=watchdog_timeout,

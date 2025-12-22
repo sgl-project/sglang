@@ -558,7 +558,7 @@ def run_data_parallel_controller_process(
 
         if (timeout := server_args.soft_watchdog_timeout) is not None:
             ProcessWatchdog(
-                process_name="DataParallelController",
+                debug_name="DataParallelController",
                 get_counter=lambda: controller.dispatch_ct,
                 is_active=lambda: controller.is_dispatching,
                 watchdog_timeout=timeout,

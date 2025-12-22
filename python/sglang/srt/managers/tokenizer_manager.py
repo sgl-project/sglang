@@ -1361,7 +1361,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         if (timeout := self.server_args.soft_watchdog_timeout) is not None:
             ProcessWatchdog(
-                process_name="TokenizerManager",
+                debug_name="TokenizerManager",
                 get_counter=lambda: self.receive_ct,
                 is_active=lambda: self.is_receiving,
                 watchdog_timeout=timeout,
