@@ -296,7 +296,5 @@ def rocm_aiter_swizzle_hipb_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
-    output = AiterHipblaslt.hip_bpreshuffle_gemm(x, weight, bias=None)
-    if bias is not None:
-        output = output + bias
+    output = AiterHipblaslt.hip_bpreshuffle_gemm(x, weight, bias=bias)
     return output
