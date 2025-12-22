@@ -737,10 +737,12 @@ def biased_grouped_topk_gpu(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
- 
+
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
-    experts_per_group = num_experts // num_expert_group if num_expert_group else num_experts
+    experts_per_group = (
+        num_experts // num_expert_group if num_expert_group else num_experts
+    )
 
     if (
         _is_cuda
@@ -758,13 +760,17 @@ def biased_grouped_topk_gpu(
         )
     ):
         # Pre-allocate output tensors (flashinfer mutates them in-place)
-        topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=gating_output.device)
-        topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=gating_output.device)
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
 
         # flashinfer always applies the scaling_factor internally
         scaling_factor = 1.0
         if routed_scaling_factor is not None and apply_routed_scaling_factor_on_output:
-            scaling_factor = routed_scaling_factor 
+            scaling_factor = routed_scaling_factor
 
         # flashinfer's fused_topk_deepseek
         fused_topk_deepseek(
@@ -776,7 +782,7 @@ def biased_grouped_topk_gpu(
             scaling_factor,
             topk_weights,
             topk_ids,
-            True
+            True,
         )
 
         if (expert_location_dispatch_info is not None) or (
