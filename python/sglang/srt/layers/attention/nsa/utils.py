@@ -50,30 +50,29 @@ def is_nsa_enable_prefill_cp():
     return get_global_server_args().enable_nsa_prefill_context_parallel
 
 
-def is_nsa_prefill_cp_mode0():
+def is_nsa_prefill_cp_in_seq_split():
     return (
-        is_nsa_enable_prefill_cp() and get_global_server_args().nsa_prefill_cp_mode == 0
+        is_nsa_enable_prefill_cp()
+        and get_global_server_args().nsa_prefill_cp_mode == "in-seq-split"
     )
 
 
-def is_nsa_prefill_cp_mode1():
+def is_nsa_prefill_cp_continuous_split():
     return (
-        is_nsa_enable_prefill_cp() and get_global_server_args().nsa_prefill_cp_mode == 1
+        is_nsa_enable_prefill_cp()
+        and get_global_server_args().nsa_prefill_cp_mode == "continuous-split"
     )
 
 
-def can_nsa_prefill_cp_mode1(forward_batch: "ForwardBatch"):
+def can_nsa_prefill_cp_continuous_split(forward_batch: "ForwardBatch"):
+    if not forward_batch.forward_mode.is_context_parallel_extend():
+        return False
     cp_size = get_attention_tp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return (
-        is_nsa_prefill_cp_mode1()
-        and seq_len > 0
-        and cp_size > 1
-        and forward_batch.forward_mode.is_context_parallel_extend()
-    )
+    return is_nsa_prefill_cp_continuous_split() and seq_len > 0 and cp_size > 1
 
 
-def nsa_cp_mode1_split_data(input_: Union[torch.Tensor, List]):
+def nsa_cp_continuous_split_data(input_: Union[torch.Tensor, List]):
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
     if isinstance(input_, (tuple, list)) or len(input_) % cp_size != 0:
@@ -104,11 +103,11 @@ class NSAContextParallelMetadata:
 
 
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
-    if is_nsa_prefill_cp_mode1():
+    if is_nsa_prefill_cp_continuous_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
             seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is 1"
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is continuous-split"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -127,12 +126,12 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    if is_nsa_prefill_cp_mode1():
+    if is_nsa_prefill_cp_continuous_split():
         cp_size = get_attention_tp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_mode1_split_data(input_)
+        return nsa_cp_continuous_split_data(input_)
 
     input_list = list(
         torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
@@ -144,13 +143,13 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    if is_nsa_prefill_cp_mode1():
+    if is_nsa_prefill_cp_continuous_split():
         cp_size = get_attention_tp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_mode1_split_data(positions)
+        return nsa_cp_continuous_split_data(positions)
 
     position_id_list = list(
         torch.split(positions, forward_batch.nsa_cp_metadata.split_list, dim=-1)
@@ -231,7 +230,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
-    if is_nsa_prefill_cp_mode1():
+    if is_nsa_prefill_cp_continuous_split():
         output_tensor = input_tensor.new_empty(
             (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
         )
@@ -321,6 +320,8 @@ def prepare_input_dp_with_cp_dsa(
     cp_size,
     seqs_len,
 ):
+    if is_nsa_prefill_cp_continuous_split():
+        return True
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4):
     Description:

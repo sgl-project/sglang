@@ -25,10 +25,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_ENABLE_MTP_PRECOMPUTE_METADATA,
     NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     NSA_FUSE_TOPK,
-    can_nsa_prefill_cp_mode1,
+    can_nsa_prefill_cp_continuous_split,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
-    nsa_cp_mode1_split_data,
+    nsa_cp_continuous_split_data,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -549,7 +549,7 @@ class NativeSparseAttnBackend(
             cu_seqlens_q,
             cu_seqlens_k,
             topk_indices_offset,
-        ) = self._cp_mode1_split(
+        ) = self._cp_continuous_split(
             forward_batch,
             seqlens_expanded,
             forward_batch.seq_lens_cpu,
@@ -632,7 +632,7 @@ class NativeSparseAttnBackend(
         )
         self.forward_metadata = metadata
 
-    def _cp_mode1_split(
+    def _cp_continuous_split(
         self,
         forward_batch: ForwardBatch,
         seqlens_expanded: torch.Tensor,
@@ -643,7 +643,7 @@ class NativeSparseAttnBackend(
         cu_seqlens_k,
         topk_indices_offset,
     ):
-        if not can_nsa_prefill_cp_mode1(forward_batch):
+        if not can_nsa_prefill_cp_continuous_split(forward_batch):
             return (
                 None,
                 seqlens_expanded,
@@ -656,7 +656,7 @@ class NativeSparseAttnBackend(
             )
         rank_size = get_attention_tp_size()
         rank_id = get_attention_tp_rank()
-        seqlens_expanded = nsa_cp_mode1_split_data(seqlens_expanded)
+        seqlens_expanded = nsa_cp_continuous_split_data(seqlens_expanded)
 
         extend_seqs = forward_batch.extend_seq_lens_cpu
         extra_seq = 0
@@ -712,7 +712,7 @@ class NativeSparseAttnBackend(
 
     def _pad_nsa_cache_seqlens(self, forward_batch: ForwardBatch, nsa_cache_seqlens):
         attn_tp_size = get_attention_tp_size()
-        if attn_tp_size == 1 and not can_nsa_prefill_cp_mode1(forward_batch):
+        if attn_tp_size == 1 or not can_nsa_prefill_cp_continuous_split(forward_batch):
             return nsa_cache_seqlens
         tokens = sum(forward_batch.extend_seq_lens_cpu)
         pad_len = (tokens - 1) // attn_tp_size + 1 - nsa_cache_seqlens.shape[0]
@@ -794,10 +794,10 @@ class NativeSparseAttnBackend(
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
-            assert can_nsa_prefill_cp_mode1(forward_batch)
-            ks = nsa_cp_mode1_split_data(ks)
-            ke = nsa_cp_mode1_split_data(ke)
-            token_to_batch_idx = nsa_cp_mode1_split_data(token_to_batch_idx)
+            assert can_nsa_prefill_cp_continuous_split(forward_batch)
+            ks = nsa_cp_continuous_split_data(ks)
+            ke = nsa_cp_continuous_split_data(ke)
+            token_to_batch_idx = nsa_cp_continuous_split_data(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
