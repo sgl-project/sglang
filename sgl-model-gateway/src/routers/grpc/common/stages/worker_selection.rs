@@ -10,7 +10,7 @@ use super::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     observability::metrics::{metrics_labels, Metrics},
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         error,
         grpc::context::{RequestContext, WorkerSelection},
