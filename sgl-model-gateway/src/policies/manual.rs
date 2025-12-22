@@ -12,11 +12,11 @@ use crate::observability::metrics::Metrics;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
     NoHealthyWorkers,
-    RoutingIdFastPathHit,
-    RoutingIdSlowPathOccupiedHit,
-    RoutingIdSlowPathOccupiedMiss,
-    RoutingIdSlowPathVacant,
-    RandomFallback,
+    FastPathHit,
+    SlowPathOccupiedHit,
+    SlowPathOccupiedMiss,
+    SlowPathVacant,
+    NoRoutingId,
 }
 
 impl ExecutionBranch {
@@ -24,14 +24,13 @@ impl ExecutionBranch {
     fn as_str(&self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
-            Self::RoutingIdFastPathHit => "routing_id_fast_path_hit",
-            Self::RoutingIdSlowPathOccupiedHit => "routing_id_slow_path_occupied_hit",
-            Self::RoutingIdSlowPathOccupiedMiss => "routing_id_slow_path_occupied_miss",
-            Self::RoutingIdSlowPathVacant => "routing_id_slow_path_vacant",
-            Self::RandomFallback => "random_fallback",
+            Self::FastPathHit => "fast_path_hit",
+            Self::SlowPathOccupiedHit => "slow_path_occupied_hit",
+            Self::SlowPathOccupiedMiss => "slow_path_occupied_miss",
+            Self::SlowPathVacant => "slow_path_vacant",
+            Self::NoRoutingId => "no_routing_id",
         }
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -85,7 +84,7 @@ impl ManualPolicy {
             if let Some(idx) =
                 find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
             {
-                return (idx, ExecutionBranch::RoutingIdFastPathHit);
+                return (idx, ExecutionBranch::FastPathHit);
             }
         }
 
@@ -95,20 +94,20 @@ impl ManualPolicy {
                 if let Some(idx) =
                     find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
                 {
-                    return (idx, ExecutionBranch::RoutingIdSlowPathOccupiedHit);
+                    return (idx, ExecutionBranch::SlowPathOccupiedHit);
                 }
                 let selected_idx = random_select(healthy_indices);
                 entry
                     .get_mut()
                     .push_bounded(workers[selected_idx].url().to_string());
-                (selected_idx, ExecutionBranch::RoutingIdSlowPathOccupiedMiss)
+                (selected_idx, ExecutionBranch::SlowPathOccupiedMiss)
             }
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
                 entry.insert(RoutingInfo {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                 });
-                (selected_idx, ExecutionBranch::RoutingIdSlowPathVacant)
+                (selected_idx, ExecutionBranch::SlowPathVacant)
             }
         }
     }
@@ -133,7 +132,7 @@ impl ManualPolicy {
 
         (
             Some(random_select(&healthy_indices)),
-            ExecutionBranch::RandomFallback,
+            ExecutionBranch::NoRoutingId,
         )
     }
 }
