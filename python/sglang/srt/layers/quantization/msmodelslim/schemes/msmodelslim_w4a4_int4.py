@@ -22,6 +22,7 @@ class ModelSlimW4A4Int4(ModelSlimScheme):
     ):
         self.quant_config = quant_config
         self.is_dynamic = self.quant_config[prefix + ".weight"] == "W4A4_DYNAMIC"
+        self.kernel = NPU_W4A4DynamicLinearMethod()
 
     @staticmethod
     def get_weight(
@@ -87,7 +88,7 @@ class ModelSlimW4A4Int4(ModelSlimScheme):
             set_weight_attrs(param, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        NPU_W4A4DynamicLinearMethod.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self,
@@ -95,4 +96,4 @@ class ModelSlimW4A4Int4(ModelSlimScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return NPU_W4A4DynamicLinearMethod.apply(layer, x, bias)
+        return self.kernel.apply(layer, x, bias)
