@@ -1,35 +1,13 @@
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.test_utils import CustomTestCase
 
 
-class GSM8KMixin(CustomTestCase):
+class GSM8KMixin:
     accuracy: float
-    model: str
-    other_args: list[str] = []
 
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
+    def test_gsm8k(self: CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
