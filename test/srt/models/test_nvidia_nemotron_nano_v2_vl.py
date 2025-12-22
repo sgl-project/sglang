@@ -3,12 +3,13 @@ from types import SimpleNamespace
 
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
 from sglang.test.mmmu_vlm_mixin import MMMUVLMMixin
+from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import CustomTestCase
 
 MODEL = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
 
 
-class TestNvidiaNemotronNanoV2VLTextOnly(GSM8KMixin, CustomTestCase):
+class TestNvidiaNemotronNanoV2VLTextOnly(GSM8KMixin, DefaultServerBase):
     accuracy = 0.87
     model = MODEL
     other_args = ["--max-mamba-cache-size", "256", "--trust-remote-code"]
