@@ -1,4 +1,5 @@
 import io
+import os
 import time
 import unittest
 
@@ -23,7 +24,7 @@ class BaseTestSoftWatchdog:
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
 
-        with cls.env_override.override(120):
+        with cls.env_override():
             cls.process = popen_launch_server(
                 "Qwen/Qwen3-0.6B",
                 DEFAULT_URL_FOR_TEST,
@@ -57,12 +58,12 @@ class BaseTestSoftWatchdog:
 
 
 class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = envs.SGLANG_TEST_STUCK_DETOKENIZER
+    env_override = lambda: envs.SGLANG_TEST_STUCK_DETOKENIZER.override(120)
     expected_message = "DetokenizerManager watchdog timeout"
 
 
 class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = envs.SGLANG_TEST_STUCK_TOKENIZER
+    env_override = lambda: envs.SGLANG_TEST_STUCK_TOKENIZER.override(120)
     expected_message = "TokenizerManager watchdog timeout"
 
 
