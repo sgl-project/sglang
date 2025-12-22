@@ -65,15 +65,14 @@ class RMSNorm(CustomOp):
             out = self.forward_triton(x, residual)
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
-        elif residual is not None:
-            from sgl_kernel import fused_add_rmsnorm
-
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x.view(shape), residual.view(residual_shape)
         else:
-            from sgl_kernel import rmsnorm
+            from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
-            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            if residual is not None:
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x.view(shape), residual.view(residual_shape)
+            else:
+                out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
