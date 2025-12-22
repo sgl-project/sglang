@@ -65,5 +65,5 @@ git clone https://github.com/feifeibear/long-context-attention.git long-context-
 (cd long-context-attention && git checkout 7a52abd669efb35e550680a239e1745b620b2bae && ${PIP_INSTALL} .)
 
 ### Install SGLang
-rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${PIP_INSTALL} -v -e "python[srt_npu]"

@@ -69,6 +69,18 @@ runtime_common = [
 ]
 
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+diffusion = [
+    "PyYAML==6.0.1",
+    "cloudpickle",
+    "diffusers==0.36.0",
+    "imageio==2.36.0",
+    "imageio-ffmpeg==0.5.1",
+    "moviepy>=2.0.0",
+    "opencv-python==4.10.0.84",
+    "remote-pdb",
+    #"yunchang==0.6.3.post1", # for now need to install yunchang from sources
+    "cache-dit==1.1.8"
+]
 
 tracing = [
   "opentelemetry-api",
@@ -85,6 +97,9 @@ srt_hip = [
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
 ]
+
+# https://docs.sglang.io/platforms/ascend_npu.html
+srt_npu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
@@ -103,14 +118,19 @@ test = [
   "tabulate",
 ]
 all_hip = ["sglang[srt_hip]"]
+all_npu = ["sglang[srt_npu, diffusion]"]
 all_hpu = ["sglang[srt_hpu]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
+dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
