@@ -34,8 +34,8 @@ DEFAULT_SERVER_ARGS = [
 class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
     model = DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy = 0.79  # derived tests need to override this
-    spec_accept_length_thres = 1.8  # derived spec decoding tests need to override this
+    gsm8k_accuracy_thres = 0.79  # derived tests need to override this
+    gsm8k_accept_length_thres = 1.8  # derived spec decoding tests need to override this
 
     @classmethod
     def get_server_args(cls):
