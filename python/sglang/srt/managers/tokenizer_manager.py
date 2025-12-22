@@ -1015,6 +1015,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
+        # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+        is_stream = getattr(obj, "stream", False)
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -1064,7 +1066,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         finish_reason.get("type") == "abort"
                         and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
                     ):
-                        if not obj.stream:
+                        if not is_stream:
                             raise ValueError(finish_reason["message"])
                         else:
                             yield out
@@ -1085,7 +1087,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
                             await self.lora_registry.release(state.obj.lora_id)
-                        if not obj.stream:
+                        if not is_stream:
                             raise fastapi.HTTPException(
                                 status_code=finish_reason["status_code"],
                                 detail=finish_reason["message"],
@@ -1098,7 +1100,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.event.clear()
 
-            if obj.stream:
+            if is_stream:
                 # Record response sent time right before we send response.
                 if not state.response_sent_to_client_ts:
                     state.response_sent_to_client_ts = time.time()
