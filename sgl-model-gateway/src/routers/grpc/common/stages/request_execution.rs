@@ -4,12 +4,17 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::{debug, error, info_span, warn, Instrument};
 
-use super::{helpers, EncodeHttpClient, EncodeRequest, PipelineStage};
-use crate::routers::{
-    error,
-    grpc::{
-        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
-        proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+use super::{helpers, PipelineStage};
+use crate::{
+    http_client::{EncodeHttpClient, EncodeRequest},
+    routers::{
+        error,
+        grpc::{
+            context::{
+                ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection,
+            },
+            proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+        },
     },
 };
 
@@ -178,53 +183,13 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let prefill_request = proto_request.clone_inner();
-        let decode_request = proto_request;
+        let result =
+            Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client).await;
 
-        let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(
-            prefill_client.generate(prefill_request),
-            decode_client.generate(decode_request)
-        );
+        // Record circuit breaker outcomes for each worker
+        workers.record_dual_outcomes(result.is_ok(), result.is_ok());
 
-        // Record circuit breaker outcomes for each worker individually
-        workers.record_dual_outcomes(prefill_result.is_ok(), decode_result.is_ok());
-
-        // Handle prefill result
-        let prefill_stream = match prefill_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch",
-                    error = %e,
-                    "Prefill worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "prefill_worker_failed_to_start",
-                    format!("Prefill worker failed to start: {}", e),
-                ));
-            }
-        };
-
-        // Handle decode result
-        let decode_stream = match decode_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch",
-                    error = %e,
-                    "Decode worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "decode_worker_failed_to_start",
-                    format!("Decode worker failed to start: {}", e),
-                ));
-            }
-        };
-
-        Ok(ExecutionResult::Dual {
-            prefill: prefill_stream,
-            decode: Box::new(decode_stream),
-        })
+        result
     }
 
     /// Execute triple dispatch for EPD (Encode-Prefill-Decode) mode
@@ -257,7 +222,6 @@ impl RequestExecutionStage {
                 )
             })?;
 
-        // Get prefill worker for bootstrap host info
         let prefill_worker = workers.and_then(|w| w.prefill_worker()).ok_or_else(|| {
             error!(
                 function = "execute_triple_dispatch",
@@ -269,7 +233,6 @@ impl RequestExecutionStage {
             )
         })?;
 
-        // Generate request ID
         let request_id = uuid::Uuid::new_v4().to_string();
 
         // Extract multimodal items for encode worker
@@ -283,8 +246,7 @@ impl RequestExecutionStage {
             );
             // Clear mm_inputs and proceed with PD-like dual dispatch
             helpers::clear_multimodal_inputs(&mut proto_request);
-            return self
-                .execute_dual_dispatch_with_clients(proto_request, prefill_client, decode_client)
+            return Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client)
                 .await;
         }
 
@@ -306,13 +268,15 @@ impl RequestExecutionStage {
             embedding_port: None, // Let runtime allocate ZMQ ports dynamically
         };
 
-        // Wait for encode to complete (embeddings will be sent to prefill via ZMQ)
         if let Err(e) = encode_client.encode(encode_url, encode_request).await {
             error!(
                 request_id = %request_id,
                 error = %e,
                 "Encode worker HTTP call failed"
             );
+            if let Some(w) = workers {
+                w.record_triple_outcomes(false, true, true);
+            }
             return Err(error::internal_error(
                 "encode_worker_http_failed",
                 format!("Encode worker HTTP call failed: {}", e),
@@ -325,22 +289,28 @@ impl RequestExecutionStage {
         );
 
         // Step 2: Clear multimodal inputs from prefill request
-        // (encode worker handles multimodal, prefill receives embeddings via ZMQ)
         helpers::clear_multimodal_inputs(&mut proto_request);
 
         // Step 3: Mark request as waiting for image embeddings
-        // The prefill scheduler will wait for embeddings from encode via ZMQ
         Self::set_wait_for_image(&mut proto_request, true);
 
         // Step 4: Execute prefill and decode in parallel via gRPC
-        self.execute_dual_dispatch_with_clients(proto_request, prefill_client, decode_client)
-            .await
+        let result =
+            Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client).await;
+
+        // Record circuit breaker outcomes for all workers
+        if let Some(w) = workers {
+            // Encode succeeded (we got here), prefill/decode success based on result
+            w.record_triple_outcomes(true, result.is_ok(), result.is_ok());
+        }
+
+        result
     }
 
-    /// Execute dual dispatch with explicit client references
-    /// Used by both PD mode and EPD mode (after encode completes)
-    async fn execute_dual_dispatch_with_clients(
-        &self,
+    /// Execute gRPC requests to prefill and decode workers in parallel
+    ///
+    /// Shared logic for PD mode and EPD mode (after encode completes).
+    async fn execute_prefill_decode_grpc(
         proto_request: ProtoGenerateRequest,
         prefill_client: &mut crate::routers::grpc::client::GrpcClient,
         decode_client: &mut crate::routers::grpc::client::GrpcClient,
@@ -354,36 +324,30 @@ impl RequestExecutionStage {
         );
 
         // Handle prefill result
-        let prefill_stream = match prefill_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch_with_clients",
-                    error = %e,
-                    "Prefill worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "prefill_worker_failed_to_start",
-                    format!("Prefill worker failed to start: {}", e),
-                ));
-            }
-        };
+        let prefill_stream = prefill_result.map_err(|e| {
+            error!(
+                function = "execute_prefill_decode_grpc",
+                error = %e,
+                "Prefill worker failed to start"
+            );
+            error::internal_error(
+                "prefill_worker_failed_to_start",
+                format!("Prefill worker failed to start: {}", e),
+            )
+        })?;
 
         // Handle decode result
-        let decode_stream = match decode_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch_with_clients",
-                    error = %e,
-                    "Decode worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "decode_worker_failed_to_start",
-                    format!("Decode worker failed to start: {}", e),
-                ));
-            }
-        };
+        let decode_stream = decode_result.map_err(|e| {
+            error!(
+                function = "execute_prefill_decode_grpc",
+                error = %e,
+                "Decode worker failed to start"
+            );
+            error::internal_error(
+                "decode_worker_failed_to_start",
+                format!("Decode worker failed to start: {}", e),
+            )
+        })?;
 
         Ok(ExecutionResult::Dual {
             prefill: prefill_stream,

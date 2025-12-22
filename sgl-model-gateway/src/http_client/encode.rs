@@ -179,30 +179,31 @@ impl EncodeHttpClient {
         }
 
         // For zmq_to_scheduler backend, response body may be null
-        // Try to parse as JSON, but fall back to empty response
-        let encode_response = response
-            .json::<Option<EncodeResponse>>()
-            .await
-            .map_err(|e| {
-                // This is usually not an error - zmq_to_scheduler returns null
+        // Try to parse as JSON; treat null as empty response, but surface real parse errors
+        let encode_response = match response.json::<Option<EncodeResponse>>().await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => {
+                // Expected case for zmq_to_scheduler: encode worker returns null
                 debug!(
                     req_id = %request.req_id,
-                    "Could not parse encode response as JSON (this is normal for zmq_to_scheduler): {}",
-                    e
+                    "Encode worker returned null response (expected for zmq_to_scheduler backend)"
                 );
-                // Return empty response instead of error
-                EncodeError::HttpError(e.to_string())
-            })
-            .unwrap_or(Some(EncodeResponse {
-                embedding_size: None,
-                embedding_len: None,
-                embedding_dim: None,
-            }))
-            .unwrap_or(EncodeResponse {
-                embedding_size: None,
-                embedding_len: None,
-                embedding_dim: None,
-            });
+                EncodeResponse {
+                    embedding_size: None,
+                    embedding_len: None,
+                    embedding_dim: None,
+                }
+            }
+            Err(e) => {
+                // Genuine JSON parsing error - log at higher level and propagate as error
+                warn!(
+                    req_id = %request.req_id,
+                    error = %e,
+                    "Failed to parse encode worker response as JSON"
+                );
+                return Err(EncodeError::HttpError(e.to_string()));
+            }
+        };
 
         debug!(
             req_id = %request.req_id,

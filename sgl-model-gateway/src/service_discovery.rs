@@ -103,7 +103,7 @@ impl PodInfo {
                 && config.prefill_selector.is_empty()
                 && config.decode_selector.is_empty()
             {
-                warn!("EPD mode enabled but encode selector is empty");
+                warn!("EPD mode enabled but all selectors (encode, prefill, decode) are empty");
                 return false;
             }
             Self::matches_selector(pod, &config.encode_selector)

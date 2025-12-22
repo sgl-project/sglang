@@ -71,24 +71,11 @@ impl RouterFactory {
                     )
                     .await
                 }
-                RoutingMode::EncodePrefillDecode {
-                    encode_policy,
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                } => {
-                    // Note: HTTP EPD mode falls back to PD router as triple dispatch
-                    // is only implemented for gRPC mode. Encode workers are still
-                    // registered but routing goes through PD path.
-                    Self::create_epd_http_router(
-                        encode_policy.as_ref(),
-                        prefill_policy.as_ref(),
-                        decode_policy.as_ref(),
-                        &ctx.router_config.policy,
-                        ctx,
-                    )
-                    .await
-                }
+                RoutingMode::EncodePrefillDecode { .. } => Err(
+                    "EPD (Encode-Prefill-Decode) mode requires gRPC connection_mode. \
+                         Use --connection-mode grpc or configure connection_mode: grpc in config."
+                        .to_string(),
+                ),
 
                 RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
             },
@@ -170,36 +157,6 @@ impl RouterFactory {
         ctx.policy_registry.set_decode_policy(decode_policy);
 
         let router = GrpcEPDRouter::new(ctx).await?;
-
-        Ok(Box::new(router))
-    }
-
-    /// Create an HTTP EPD router (falls back to PD router with encode policy set)
-    ///
-    /// Note: HTTP EPD mode uses the PD router implementation as triple dispatch
-    /// is only fully implemented for gRPC mode. Encode workers are registered
-    /// in the policy registry but routing follows PD path.
-    pub async fn create_epd_http_router(
-        encode_policy_config: Option<&PolicyConfig>,
-        prefill_policy_config: Option<&PolicyConfig>,
-        decode_policy_config: Option<&PolicyConfig>,
-        main_policy_config: &PolicyConfig,
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        let encode_policy =
-            PolicyFactory::create_from_config(encode_policy_config.unwrap_or(main_policy_config));
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
-
-        // Set all three policies even though HTTP router only uses prefill/decode
-        ctx.policy_registry.set_encode_policy(encode_policy);
-        ctx.policy_registry.set_prefill_policy(prefill_policy);
-        ctx.policy_registry.set_decode_policy(decode_policy);
-
-        // Use PD router for HTTP EPD mode
-        let router = PDRouter::new(ctx).await?;
 
         Ok(Box::new(router))
     }

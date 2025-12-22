@@ -431,6 +431,25 @@ impl WorkerSelection {
         }
     }
 
+    /// Record circuit breaker outcomes for triple dispatch (individual tracking)
+    pub fn record_triple_outcomes(
+        &self,
+        encode_success: bool,
+        prefill_success: bool,
+        decode_success: bool,
+    ) {
+        if let Self::Triple {
+            encode,
+            prefill,
+            decode,
+        } = self
+        {
+            encode.record_outcome(encode_success);
+            prefill.record_outcome(prefill_success);
+            decode.record_outcome(decode_success);
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn dual(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {

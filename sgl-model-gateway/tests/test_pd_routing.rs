@@ -4,7 +4,7 @@ mod test_pd_routing {
     use sgl_model_gateway::{
         app_context::AppContext,
         config::{PolicyConfig, RouterConfig, RoutingMode},
-        core::{BasicWorkerBuilder, Worker, WorkerType},
+        core::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
     };
 
@@ -1045,6 +1045,7 @@ mod test_pd_routing {
                         prefill_policy,
                         decode_policy,
                     )
+                    .connection_mode(ConnectionMode::Grpc { port: None })
                     .policy(policy)
                     .host("127.0.0.1")
                     .port(3001)
@@ -1110,11 +1111,10 @@ mod test_pd_routing {
                 )
             };
 
-            let result = RouterFactory::create_router(&app_context).await;
-            assert!(
-                result.is_ok(),
-                "EPD Router creation should succeed with empty workers"
-            );
+            // Note: We don't test RouterFactory::create_router here because
+            // GrpcEPDRouter requires tokenizer/parsers which need actual model files.
+            // This test validates configuration structure and AppContext creation.
+            // For full router creation tests, see integration tests with real model setup.
 
             let stats = app_context.worker_registry.stats();
             assert_eq!(
@@ -1259,7 +1259,7 @@ mod test_pd_routing {
     #[test]
     fn test_epd_encode_http_client_request_format() {
         // Test that EncodeRequest serializes correctly for HTTP /encode endpoint
-        use sgl_model_gateway::routers::grpc::common::stages::{EncodeHttpClient, EncodeRequest};
+        use sgl_model_gateway::http_client::{EncodeHttpClient, EncodeRequest};
 
         let request = EncodeRequest {
             mm_items: vec![
@@ -1288,7 +1288,7 @@ mod test_pd_routing {
 
     #[test]
     fn test_epd_encode_request_with_embedding_ports() {
-        use sgl_model_gateway::routers::grpc::common::stages::EncodeRequest;
+        use sgl_model_gateway::http_client::EncodeRequest;
 
         let request = EncodeRequest {
             mm_items: vec!["data:image/png;base64,iVBORw0KGgo=".to_string()],
@@ -1377,7 +1377,7 @@ mod test_pd_routing {
 
     #[test]
     fn test_epd_encode_error_handling() {
-        use sgl_model_gateway::routers::grpc::common::stages::EncodeError;
+        use sgl_model_gateway::http_client::EncodeError;
 
         // Test various encode error types
         let http_err = EncodeError::HttpError("connection refused".to_string());
@@ -1405,7 +1405,7 @@ mod test_pd_routing {
         assert!(!mm_items.is_empty(), "Should have multimodal items");
 
         // Step 2: Build encode request
-        use sgl_model_gateway::routers::grpc::common::stages::EncodeRequest;
+        use sgl_model_gateway::http_client::EncodeRequest;
         let encode_request = EncodeRequest {
             mm_items: mm_items.clone(),
             req_id: "epd-test-001".to_string(),
@@ -1429,7 +1429,9 @@ mod test_pd_routing {
     async fn test_epd_encode_http_client_integration() {
         use std::time::Duration;
 
-        use sgl_model_gateway::routers::grpc::common::stages::{EncodeHttpClient, EncodeRequest};
+        use sgl_model_gateway::http_client::{
+            EncodeError, EncodeHttpClient, EncodeRequest, EncodeResponse,
+        };
 
         // Create client with short timeout for testing
         let client = EncodeHttpClient::with_timeout(Duration::from_millis(100));
@@ -1445,7 +1447,8 @@ mod test_pd_routing {
         };
 
         // This should return an error (connection refused or timeout)
-        let result = client.encode("http://127.0.0.1:59999", request).await;
+        let result: Result<EncodeResponse, EncodeError> =
+            client.encode("http://127.0.0.1:59999", request).await;
         assert!(
             result.is_err(),
             "Should fail to connect to non-existent server"
@@ -1463,20 +1466,12 @@ mod test_pd_routing {
             bootstrap_host: "prefill-host".to_string(),
             bootstrap_port: 8998,
             bootstrap_room: 12345,
-            // EPD encode bootstrap fields are not used - encode uses HTTP REST API
-            encode_bootstrap_host: None,
-            encode_bootstrap_port: None,
-            encode_bootstrap_room: None,
         };
 
         // Verify prefill bootstrap is set (for prefill→decode KV transfer)
         assert_eq!(params.bootstrap_host, "prefill-host");
         assert_eq!(params.bootstrap_port, 8998);
-
-        // Verify encode bootstrap fields are None (HTTP+ZMQ, not bootstrap)
-        assert!(params.encode_bootstrap_host.is_none());
-        assert!(params.encode_bootstrap_port.is_none());
-        assert!(params.encode_bootstrap_room.is_none());
+        assert_eq!(params.bootstrap_room, 12345);
     }
 
     #[test]

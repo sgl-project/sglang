@@ -55,8 +55,8 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
-            // For EPD mode, use prefill client to check backend type
-            // (encode uses HTTP, not gRPC)
+            // For EPD mode, use the prefill client as the upstream client for building the request
+            // (the current encode path uses HTTP, not gRPC, so we don't build the request against it)
             ClientSelection::Triple { prefill, .. } => prefill,
         };
 

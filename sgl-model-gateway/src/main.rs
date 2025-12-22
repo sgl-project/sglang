@@ -822,11 +822,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => cli.router_args,
     };
 
+    // Validate that both flags are not set simultaneously
+    if cli_args.pd_disaggregation && cli_args.epd_disaggregation {
+        return Err(
+            "Cannot specify both --pd-disaggregation and --epd-disaggregation. \
+Use --pd-disaggregation for Prefill-Decode mode or --epd-disaggregation for \
+Encode-Prefill-Decode mode."
+                .into(),
+        );
+    }
+
     let wants_disaggregation = cli_args.pd_disaggregation || cli_args.epd_disaggregation;
     let has_encode_discovery = cli_args.service_discovery && !cli_args.encode_selector.is_empty();
     let encode_configured = !encode_urls.is_empty() || has_encode_discovery;
-    let epd_mode = wants_disaggregation && encode_configured;
-    let pd_mode = wants_disaggregation && !epd_mode;
+    let epd_mode = cli_args.epd_disaggregation && encode_configured;
+    let pd_mode = cli_args.pd_disaggregation || (wants_disaggregation && !epd_mode);
 
     // Warn if EPD was explicitly requested but no encode workers configured
     if cli_args.epd_disaggregation && !encode_configured {

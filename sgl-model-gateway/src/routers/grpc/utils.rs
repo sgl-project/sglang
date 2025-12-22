@@ -458,8 +458,7 @@ fn parse_data_uri(url: &str) -> Option<Vec<u8>> {
     let data_start = base64_start + base64_marker.len();
     let encoded = &url[data_start..];
 
-    // Early rejection based on encoded length to avoid arithmetic on maliciously large inputs.
-    // This check is simpler and more robust than computing decoded size estimates.
+    // Rejects obviously too-large inputs before allocation
     if encoded.len() > MAX_DATA_URI_ENCODED_SIZE {
         warn!(
             function = "parse_data_uri",
@@ -470,22 +469,10 @@ fn parse_data_uri(url: &str) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Secondary pre-check on estimated decoded size for defense in depth
-    let chunks = encoded.len().div_ceil(4);
-    let estimated_decoded_len = chunks * 3;
-    if estimated_decoded_len > MAX_DATA_URI_DECODED_SIZE {
-        warn!(
-            function = "parse_data_uri",
-            estimated_decoded_len,
-            limit = MAX_DATA_URI_DECODED_SIZE,
-            "Data URI payload exceeds allowed size"
-        );
-        return None;
-    }
-
-    // Decode base64 data
     use base64::{engine::general_purpose::STANDARD, Engine};
     let decoded = STANDARD.decode(encoded).ok()?;
+
+    // 2. Final Validation: Strict check on actual data
     if decoded.len() > MAX_DATA_URI_DECODED_SIZE {
         warn!(
             function = "parse_data_uri",

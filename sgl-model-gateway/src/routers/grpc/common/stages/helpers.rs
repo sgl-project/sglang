@@ -32,10 +32,6 @@ pub fn inject_bootstrap_metadata(
         bootstrap_host: hostname.to_string(),
         bootstrap_port: bootstrap_port as i32,
         bootstrap_room: room_id,
-        // EPD encode bootstrap fields are not used - encode uses HTTP REST API
-        encode_bootstrap_host: None,
-        encode_bootstrap_port: None,
-        encode_bootstrap_room: None,
     };
 
     debug!(
@@ -82,25 +78,6 @@ pub fn extract_multimodal_items(request: &ProtoGenerateRequest) -> Vec<String> {
     }
 
     items
-}
-
-/// Check if a proto request contains multimodal inputs
-pub fn has_multimodal_inputs(request: &ProtoGenerateRequest) -> bool {
-    match request {
-        ProtoGenerateRequest::Sglang(req) => {
-            if let Some(ref mm) = req.mm_inputs {
-                !mm.image_urls.is_empty()
-                    || !mm.video_urls.is_empty()
-                    || !mm.audio_urls.is_empty()
-                    || !mm.image_data.is_empty()
-                    || !mm.video_data.is_empty()
-                    || !mm.audio_data.is_empty()
-            } else {
-                false
-            }
-        }
-        ProtoGenerateRequest::Vllm(_) => false,
-    }
 }
 
 /// Clear multimodal inputs from a proto request
