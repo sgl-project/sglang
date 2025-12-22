@@ -13,11 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
 )
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 
 logger = logging.getLogger(__name__)
 
@@ -1475,6 +1471,3 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def supports_structural_tag(self) -> bool:
         return False
-
-    def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError
