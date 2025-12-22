@@ -240,10 +240,10 @@ struct HiCacheKernel {
       const tvm::ffi::TensorView indices_src) {
     using namespace host;
 
-    auto D = SymbolicSize{"D"};  // cache dimension
-    auto N = SymbolicSize{"N"};  // src kv stride
-    auto M = SymbolicSize{"M"};  // dst kv stride
-    auto L = SymbolicSize{"L"};  // indices length
+    auto D = SymbolicSize{"head dimension"};
+    auto N = SymbolicSize{"src kv stride"};
+    auto M = SymbolicSize{"dst kv stride"};
+    auto L = SymbolicSize{"indices length"};
     auto cache_dtype = SymbolicDType{};
     auto indices_dtype = SymbolicDType{};
     auto indices_device = SymbolicDevice{};
@@ -311,8 +311,8 @@ struct HiCacheKernel {
       const std::size_t kv_dst_stride) {
     using namespace host;
 
-    auto N = SymbolicSize{"N"};  // num layers
-    auto L = SymbolicSize{"L"};  // indices length
+    auto N = SymbolicSize{"num_layers"};
+    auto L = SymbolicSize{"indices length"};
     auto dtype_ = SymbolicDType{};
     auto device_ = SymbolicDevice{};
 

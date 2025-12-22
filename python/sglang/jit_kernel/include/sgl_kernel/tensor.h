@@ -119,7 +119,9 @@ inline auto& operator<<(std::ostream& os, DLDevice device) {
   const auto name = mapping[entry];
   RuntimeCheck(!name.empty(), "Unknown device: ", int(device.device_type));
   os << name;
-  if (device.device_id != kAnyDeviceID) os << "[" << device.device_id << "]";
+  if (device.device_id != kAnyDeviceID && device.device_type != DLDeviceType::kDLCPU) {
+    os << ":" << device.device_id;
+  }
   return os;
 }
 
