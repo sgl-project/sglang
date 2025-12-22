@@ -29,7 +29,7 @@ pub mod tree;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
-pub use manual::{ExecutionBranch as ManualExecutionBranch, ManualPolicy};
+pub use manual::ManualPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

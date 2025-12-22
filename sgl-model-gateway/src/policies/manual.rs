@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use metrics::counter;
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
+use crate::observability::metrics::Metrics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
@@ -33,11 +33,7 @@ impl ExecutionBranch {
     }
 
     fn record(&self) {
-        counter!(
-            "smg_policy_manual_branch_total",
-            "branch" => self.as_str()
-        )
-        .increment(1);
+        Metrics::record_policy_manual_branch(self.as_str());
     }
 }
 
