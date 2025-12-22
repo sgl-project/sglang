@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -9,6 +10,9 @@ from sglang.test.test_utils import (
     SimpleNamespace,
     popen_launch_server,
 )
+
+# CI Registration - 2-GPU tests (80GB GPUs required)
+register_cuda_ci(est_time=255, suite="stage-b-test-large-2-gpu")
 
 
 class TestPiecewiseCudaGraphQwen3OmniMOE(CustomTestCase):

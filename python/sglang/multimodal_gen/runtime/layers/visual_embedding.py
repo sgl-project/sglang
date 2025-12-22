@@ -14,7 +14,11 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 from diffusers.models.embeddings import Timesteps as _Timesteps
-from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
+
+try:
+    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
+except Exception as _e:
+    pass
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
