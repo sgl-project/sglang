@@ -79,7 +79,7 @@ class QuarkInt4Fp8Config(QuantizationConfig):
         position = 1 + tqdm._get_free_pos()
         self.online_quant_progress_bar = tqdm(
             total=0,
-            desc=f"Online int4fp8_moe quantization on rank={tp_rank}",
+            desc=f"Online quark_int4fp8_moe quantization on rank={tp_rank}",
             position=position,
             bar_format=BAR_FORMAT,
             mininterval=2.0,
@@ -144,7 +144,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
         if not _is_hip:
             raise NotImplementedError(
-                "The int4fp8_moe online quantization scheme is only supported on AMD GPUs."
+                "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
             )
 
     def get_weight_loader(self, layer, original_weight_loader):
