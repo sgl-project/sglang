@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
     mcp::{self, McpManager},
-    observability::metrics::{smg_labels, SmgMetrics},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
@@ -326,7 +326,7 @@ async fn execute_with_mcp_loop(
         iteration_count += 1;
 
         // Record tool loop iteration metric
-        SmgMetrics::record_mcp_tool_iteration(&current_request.model);
+        Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
@@ -770,7 +770,7 @@ async fn execute_mcp_tool_loop_streaming(
         iteration_count += 1;
 
         // Record tool loop iteration metric
-        SmgMetrics::record_mcp_tool_iteration(&current_request.model);
+        Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
         if iteration_count > MAX_TOOL_ITERATIONS {
@@ -787,8 +787,8 @@ async fn execute_mcp_tool_loop_streaming(
             "Harmony Responses streaming iteration"
         );
 
-        // Execute pipeline and get stream
-        let execution_result = match ctx
+        // Execute pipeline and get stream + load guards
+        let (execution_result, _load_guards) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(&current_request, ctx)
             .await
@@ -805,6 +805,7 @@ async fn execute_mcp_tool_loop_streaming(
         };
 
         // Process stream with token-level streaming (mixed tools - emits correct events per tool type)
+        // Load guards are held during processing and dropped when iteration completes
         let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
             execution_result,
             emitter,
@@ -999,8 +1000,8 @@ async fn execute_without_mcp_streaming(
 ) {
     debug!("No MCP tools - executing single iteration");
 
-    // Execute pipeline and get stream
-    let execution_result = match ctx
+    // Execute pipeline and get stream + load guards
+    let (execution_result, _load_guards) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(current_request, ctx)
         .await
@@ -1018,6 +1019,7 @@ async fn execute_without_mcp_streaming(
 
     // Process stream (emits all output items during streaming - function tool path emits function_call_arguments.* events)
     // Pass empty HashSet so all tools are treated as function tools (per-tool detection)
+    // Load guards are held during processing and dropped when iteration completes
     let empty_mcp_tools = std::collections::HashSet::new();
     let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
         execution_result,
@@ -1033,6 +1035,7 @@ async fn execute_without_mcp_streaming(
             return;
         }
     };
+    // _load_guards dropped here after iteration completes
 
     // Extract usage from iteration result
     let usage = match iteration_result {
@@ -1253,18 +1256,18 @@ async fn execute_mcp_tools(
                 );
 
                 // Record MCP tool metrics
-                SmgMetrics::record_mcp_tool_duration(
+                Metrics::record_mcp_tool_duration(
                     model_id,
                     &tool_call.function.name,
                     tool_duration,
                 );
-                SmgMetrics::record_mcp_tool_call(
+                Metrics::record_mcp_tool_call(
                     model_id,
                     &tool_call.function.name,
                     if is_error {
-                        smg_labels::RESULT_ERROR
+                        metrics_labels::RESULT_ERROR
                     } else {
-                        smg_labels::RESULT_SUCCESS
+                        metrics_labels::RESULT_SUCCESS
                     },
                 );
 
@@ -1301,15 +1304,15 @@ async fn execute_mcp_tools(
                 );
 
                 // Record MCP tool metrics
-                SmgMetrics::record_mcp_tool_duration(
+                Metrics::record_mcp_tool_duration(
                     model_id,
                     &tool_call.function.name,
                     tool_duration,
                 );
-                SmgMetrics::record_mcp_tool_call(
+                Metrics::record_mcp_tool_call(
                     model_id,
                     &tool_call.function.name,
-                    smg_labels::RESULT_ERROR,
+                    metrics_labels::RESULT_ERROR,
                 );
 
                 // Return error result to model (let it handle gracefully)

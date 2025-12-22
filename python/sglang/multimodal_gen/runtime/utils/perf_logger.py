@@ -168,7 +168,7 @@ class StageProfiler:
 
         if self.simple_log:
             self.logger.info(
-                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds"
+                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
         if self.metrics_enabled and self.timings:
@@ -207,6 +207,11 @@ class PerformanceLogger:
             for name, duration_ms in timings.stages.items()
         ]
 
+        denoise_steps_ms = [
+            {"step": idx, "duration_ms": duration_ms}
+            for idx, duration_ms in enumerate(timings.steps)
+        ]
+
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
             "request_id": timings.request_id,
@@ -214,6 +219,7 @@ class PerformanceLogger:
             "tag": tag,
             "total_duration_ms": timings.total_duration_ms,
             "steps": formatted_steps,
+            "denoise_steps_ms": denoise_steps_ms,
             "meta": meta or {},
         }
 
