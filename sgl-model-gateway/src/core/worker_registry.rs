@@ -11,8 +11,10 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
-use crate::observability::metrics::Metrics;
+use crate::{
+    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    observability::metrics::Metrics,
+};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
