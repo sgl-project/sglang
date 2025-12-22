@@ -174,7 +174,7 @@ class DataParallelController:
         self.init_dispatcher()
 
         self.dispatch_ct = 0
-        self.is_dispatching = False
+        self.is_processing = False
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -515,11 +515,11 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                self.is_dispatching = True
+                self.is_processing = True
                 if test_stuck > 0:
                     time.sleep(test_stuck)
                 self._request_dispatcher(recv_req)
-                self.is_dispatching = False
+                self.is_processing = False
                 self.dispatch_ct += 1
 
 
