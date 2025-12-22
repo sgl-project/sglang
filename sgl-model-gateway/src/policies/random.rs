@@ -107,7 +107,10 @@ mod tests {
 
         // Should always select the healthy worker (index 1)
         for _ in 0..10 {
-            assert_eq!(policy.select_worker(&workers, &SelectWorkerInfo::default()), Some(1));
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(1)
+            );
         }
     }
 
@@ -121,6 +124,9 @@ mod tests {
         )];
 
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, &SelectWorkerInfo::default()), None);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            None
+        );
     }
 }

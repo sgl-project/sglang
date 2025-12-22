@@ -201,8 +201,16 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text, routing_id.as_deref())
-                    .await
+                self.route_typed_request_once(
+                    headers,
+                    typed_req,
+                    route,
+                    model_id,
+                    is_stream,
+                    &text,
+                    routing_id.as_deref(),
+                )
+                .await
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),

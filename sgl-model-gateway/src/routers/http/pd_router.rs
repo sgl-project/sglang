@@ -304,7 +304,11 @@ impl PDRouter {
                     let context = context.clone();
                     async move {
                         let (prefill, decode) = match self
-                            .select_pd_pair(context.request_text.as_deref(), context.routing_id.as_deref(), context.model_id)
+                            .select_pd_pair(
+                                context.request_text.as_deref(),
+                                context.routing_id.as_deref(),
+                                context.model_id,
+                            )
                             .await
                         {
                             Ok(pair) => pair,

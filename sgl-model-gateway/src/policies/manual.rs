@@ -56,7 +56,9 @@ impl ManualPolicy {
 
         // Fast path
         if let Some(info) = self.routing_map.get(&routing_id) {
-            if let Some(idx) = find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices) {
+            if let Some(idx) =
+                find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
+            {
                 return idx;
             }
         }
@@ -70,7 +72,9 @@ impl ManualPolicy {
                     return idx;
                 }
                 let selected_idx = random_select(healthy_indices);
-                entry.get_mut().push_bounded(workers[selected_idx].url().to_string());
+                entry
+                    .get_mut()
+                    .push_bounded(workers[selected_idx].url().to_string());
                 selected_idx
             }
             Entry::Vacant(entry) => {
@@ -85,11 +89,7 @@ impl ManualPolicy {
 }
 
 impl LoadBalancingPolicy for ManualPolicy {
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo,
-    ) -> Option<usize> {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
         if healthy_indices.is_empty() {
             return None;

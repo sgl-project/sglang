@@ -217,11 +217,7 @@ impl BucketPolicy {
 }
 
 impl LoadBalancingPolicy for BucketPolicy {
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo,
-    ) -> Option<usize> {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
