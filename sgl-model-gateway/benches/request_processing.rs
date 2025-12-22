@@ -67,6 +67,7 @@ fn default_generate_request() -> GenerateRequest {
         return_bytes: false,
         return_entropy: false,
         rid: None,
+        routing_id: None,
     }
 }
 
