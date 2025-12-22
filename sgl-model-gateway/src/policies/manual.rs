@@ -22,18 +22,6 @@ struct RoutingInfo {
     worker_urls: Vec<String>,
 }
 
-impl RoutingInfo {
-    fn new(worker_url: String) -> Self {
-        Self {
-            worker_urls: vec![worker_url],
-        }
-    }
-
-    fn first_url(&self) -> Option<&str> {
-        self.worker_urls.first().map(|s| s.as_str())
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct ManualPolicy {
     routing_map: DashMap<RoutingId, RoutingInfo>,
@@ -55,7 +43,7 @@ impl ManualPolicy {
         let key = RoutingId::new(routing_id);
         match self.routing_map.entry(key) {
             Entry::Occupied(mut entry) => {
-                if let Some(worker_url) = entry.get().first_url() {
+                if let Some(worker_url) = entry.get().worker_urls.first() {
                     if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
                         if healthy_indices.contains(&idx) {
                             return idx;
@@ -63,12 +51,16 @@ impl ManualPolicy {
                     }
                 }
                 let selected_idx = Self::random_select(healthy_indices);
-                entry.insert(RoutingInfo::new(workers[selected_idx].url().to_string()));
+                entry.insert(RoutingInfo {
+                    worker_urls: vec![workers[selected_idx].url().to_string()],
+                });
                 selected_idx
             }
             Entry::Vacant(entry) => {
                 let selected_idx = Self::random_select(healthy_indices);
-                entry.insert(RoutingInfo::new(workers[selected_idx].url().to_string()));
+                entry.insert(RoutingInfo {
+                    worker_urls: vec![workers[selected_idx].url().to_string()],
+                });
                 selected_idx
             }
         }
