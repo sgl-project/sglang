@@ -159,31 +159,40 @@ class DecodingStage(PipelineStage):
 
                 # TODO: make it dynamic based on the available memory.
                 # Currently it's a heuristic hardcoded number that decodes 100 frames at a time.
-                step_size = 100 // self.vae.temporal_compression_ratio
+                tile_latent_stride_num_frames = 100 // self.vae.temporal_compression_ratio
 
-                # After the first chunk, the first few frames of the next chunks are not useful.
-                # TODO: Verify if this is correct for all models. Tested only on WanVAE.
-                overlap_t = 4
-
+                sample_overlap_frames = (
+                    self.vae.temporal_tiling_num_overlap_latent_frames
+                    * self.vae.temporal_compression_ratio
+                )
                 with self.progress_bar(total=num_sample_frames) as progress_bar:
-                    for i in range(0, num_frames, step_size):
-                        latent_step = min(step_size, num_frames - i)
-                        target_frame_step = (
+                    for i in range(0, num_frames, tile_latent_stride_num_frames):
+                        latent_step = min(
+                            tile_latent_stride_num_frames,
+                            num_frames - i,
+                        )
+                        sample_frame_step = (
                             latent_step * self.vae.temporal_compression_ratio
+                        )
+                        latent_step_with_overlap = (
+                            latent_step
+                            + self.vae.temporal_tiling_num_overlap_latent_frames
                         )
 
                         decode_output = self.vae.decode(
-                            latents[:, :, i : i + latent_step + overlap_t + 1, :, :]
+                            latents[:, :, i : i + latent_step_with_overlap + 1, :, :]
                         )
                         if i > 0:
-                            decode_output = decode_output[:, :, overlap_t * self.vae.temporal_compression_ratio + 1:, :, :]
+                            decode_output = decode_output[
+                                :, :, sample_overlap_frames + 1 :, :, :
+                            ]
 
                         frame = _ensure_tensor_decode_output(decode_output)
                         frame = (frame / 2 + 0.5).clamp(0, 1)
                         frame_slices.append(frame.cpu())
 
                         if progress_bar is not None:
-                            progress_bar.update(target_frame_step)
+                            progress_bar.update(sample_frame_step)
                     frames = torch.cat(frame_slices, dim=2)[:, :, :num_sample_frames]
             else:
                 # Decode image
