@@ -43,7 +43,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils.watchdog import WatchdogRaw
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -114,22 +114,23 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         )
 
-        self.process_ct = 0
-        self.is_processing = False
+        self.watchdog: Optional[Watchdog] = None
 
     def event_loop(self):
-        """The event loop that handles requests"""
         test_stuck = envs.SGLANG_TEST_STUCK_DETOKENIZER.get()
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
-            self.is_processing = True
+            if self.watchdog is not None:
+                with self.watchdog.disable():
+                    recv_obj = self.recv_from_scheduler.recv_pyobj()
+            else:
+                recv_obj = self.recv_from_scheduler.recv_pyobj()
             if test_stuck > 0:
                 time.sleep(test_stuck)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
-            self.is_processing = False
-            self.process_ct += 1
+            if self.watchdog is not None:
+                self.watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -370,10 +371,8 @@ def run_detokenizer_process(
         manager = detokenizer_manager_class(server_args, port_args)
 
         if (timeout := server_args.soft_watchdog_timeout) is not None:
-            ProcessWatchdogRaw(
+            manager.watchdog = Watchdog(
                 debug_name="DetokenizerManager",
-                get_counter=lambda: manager.process_ct,
-                is_active=lambda: manager.is_processing,
                 watchdog_timeout=timeout,
                 soft=True,
             )

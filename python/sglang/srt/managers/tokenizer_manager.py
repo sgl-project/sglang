@@ -111,7 +111,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
-from sglang.srt.utils.watchdog import WatchdogRaw
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -299,8 +299,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
 
-        self.receive_ct = 0
-        self.is_processing = False
+        self.watchdog: Optional[Watchdog] = None
 
         # Initial weights status
         self.initial_weights_loaded = True
@@ -409,10 +408,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.init_communicators(server_args)
 
         if (timeout := server_args.soft_watchdog_timeout) is not None:
-            ProcessWatchdogRaw(
+            self.watchdog = Watchdog(
                 debug_name="TokenizerManager",
-                get_counter=lambda: self.receive_ct,
-                is_active=lambda: self.is_processing,
                 watchdog_timeout=timeout,
                 soft=True,
             )
@@ -1510,17 +1507,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         sys.exit(0)
 
     async def handle_loop(self):
-        """The event loop that handles requests"""
         test_stuck = envs.SGLANG_TEST_STUCK_TOKENIZER.get()
         while True:
+            if self.watchdog is not None:
+                self.watchdog._active = False
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self.is_processing = True
+            if self.watchdog is not None:
+                self.watchdog._active = True
             if test_stuck > 0:
                 await asyncio.sleep(test_stuck)
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
-            self.is_processing = False
-            self.receive_ct += 1
+            if self.watchdog is not None:
+                self.watchdog.feed()
 
     def _add_metric_if_present(
         self,
