@@ -1,6 +1,6 @@
 import unittest
 
-from test_vlm_utils import TestVLMModels
+from sglang.test.ascend.vlm_utils import TestVLMModels
 
 from sglang.test.ci.ci_register import register_npu_ci
 
