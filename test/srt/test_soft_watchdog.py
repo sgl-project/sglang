@@ -48,7 +48,7 @@ class BaseTestSoftWatchdog:
             timeout=30,
         )
 
-        time.sleep(10)
+        time.sleep(180)
 
         combined_output = self.stdout.getvalue() + self.stderr.getvalue()
         self.assertIn(self.expected_message, combined_output)

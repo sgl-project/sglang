@@ -56,7 +56,7 @@ class _WatchdogReal(Watchdog):
 
     def feed(self):
         if self._test_stuck_time > 0:
-            logger.info(f"Watchdog {self.debug_name} is deliberately stuck for {self._test_stuck_time} seconds")
+            logger.info(f"Watchdog {self._raw.debug_name} is deliberately stuck for {self._test_stuck_time} seconds")
             time.sleep(self._test_stuck_time)
         self._counter += 1
 
