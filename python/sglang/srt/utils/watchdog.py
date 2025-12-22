@@ -82,7 +82,7 @@ class ProcessWatchdog:
         dump_info: Optional[Callable[[], str]] = None,
     ):
         self._counter = 0
-        self._active = False
+        self._active = True
         self._raw = ProcessWatchdogRaw(
             debug_name=debug_name,
             get_counter=lambda: self._counter,
@@ -97,9 +97,10 @@ class ProcessWatchdog:
 
     @contextmanager
     def disable(self):
+        assert self._active
         self._active = False
         try:
             yield
         finally:
+            assert not self._active
             self._active = True
-            self.feed()
