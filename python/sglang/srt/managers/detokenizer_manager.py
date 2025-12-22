@@ -25,7 +25,6 @@ import pybase64
 import setproctitle
 import zmq
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
@@ -117,7 +116,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             debug_name="DetokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
-            test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
     def event_loop(self):

@@ -21,18 +21,13 @@ class Watchdog:
         debug_name: str,
         watchdog_timeout: Optional[float],
         soft: bool = False,
-        test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert (
-                test_stuck_time == 0
-            ), f"stuck tester can be enabled only if soft watchdog is enabled."
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,
             watchdog_timeout=watchdog_timeout,
             soft=soft,
-            test_stuck_time=test_stuck_time,
         )
 
     def feed(self):
@@ -49,11 +44,9 @@ class _WatchdogReal(Watchdog):
         debug_name: str,
         watchdog_timeout: float,
         soft: bool = False,
-        test_stuck_time: float = 0,
     ):
         self._counter = 0
         self._active = True
-        self._test_stuck_time = test_stuck_time
         self._raw = WatchdogRaw(
             debug_name=debug_name,
             get_counter=lambda: self._counter,
@@ -62,21 +55,8 @@ class _WatchdogReal(Watchdog):
             soft=soft,
         )
         logger.info(f"Watchdog {self._raw.debug_name} initialized.")
-        if self._test_stuck_time > 0:
-            logger.info(
-                f"Watchdog {self._raw.debug_name} is configured to use {test_stuck_time=}."
-            )
 
     def feed(self):
-        if self._test_stuck_time > 0:
-            logger.info(
-                f"Watchdog {self._raw.debug_name} start deliberately stuck for {self._test_stuck_time}s"
-            )
-            time.sleep(self._test_stuck_time)
-            logger.info(
-                f"Watchdog {self._raw.debug_name} end deliberately stuck for {self._test_stuck_time}s"
-            )
-
         self._counter += 1
 
     @contextmanager
