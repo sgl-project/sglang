@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -9,22 +10,23 @@ use crate::core::Worker;
 
 /// Manual routing policy
 ///
-/// Routes requests based on routing_id field using consistent hashing.
+/// Routes requests based on routing_id field with explicit worker URL mapping.
 /// Requests with the same routing_id are always routed to the same worker.
 /// Falls back to random selection when routing_id is not provided.
 #[derive(Debug, Default)]
-pub struct ManualPolicy;
+pub struct ManualPolicy {
+    routing_map: DashMap<String, String>,
+}
 
 impl ManualPolicy {
     pub fn new() -> Self {
-        Self
+        Self {
+            routing_map: DashMap::new(),
+        }
     }
 
-    /// Compute hash for routing_id using a simple hash function
-    fn compute_hash(routing_id: &str) -> u64 {
-        routing_id
-            .bytes()
-            .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64))
+    fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
+        workers.iter().position(|w| w.url() == url)
     }
 }
 
@@ -40,16 +42,30 @@ impl LoadBalancingPolicy for ManualPolicy {
             return None;
         }
 
-        // Use routing_id for consistent routing
         if let Some(routing_id) = info.routing_id {
             if !routing_id.is_empty() {
-                let hash = Self::compute_hash(routing_id);
-                let idx = hash as usize % healthy_indices.len();
-                return Some(healthy_indices[idx]);
+                if let Some(entry) = self.routing_map.get(routing_id) {
+                    let worker_url = entry.value();
+                    if let Some(idx) = Self::find_worker_index_by_url(workers, worker_url) {
+                        if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute()
+                        {
+                            return Some(idx);
+                        }
+                    }
+                    drop(entry);
+                    self.routing_map.remove(routing_id);
+                }
+
+                let mut rng = rand::rng();
+                let random_idx = rng.random_range(0..healthy_indices.len());
+                let selected_idx = healthy_indices[random_idx];
+                let worker_url = workers[selected_idx].url().to_string();
+                self.routing_map
+                    .insert(routing_id.to_string(), worker_url);
+                return Some(selected_idx);
             }
         }
 
-        // Fallback to random selection when routing_id is not provided
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
         Some(healthy_indices[random_idx])
