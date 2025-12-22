@@ -80,7 +80,7 @@ logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
-class MTPWorker(TpModelWorker):
+class MultiLayerEagleWorker(TpModelWorker):
 
     def __init__(
         self,

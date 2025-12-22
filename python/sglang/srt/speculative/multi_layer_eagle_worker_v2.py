@@ -528,7 +528,7 @@ class MTPDraftWorker(BaseDraftWorker):
         )
 
 
-class MTPWorkerV2(BaseSpecWorker):
+class MutiLayerEagleWorkerV2(BaseSpecWorker):
     def __init__(
         self,
         server_args: ServerArgs,

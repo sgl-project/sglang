@@ -487,10 +487,10 @@ class Scheduler(
         if self.server_args.enable_multi_layer_eagle:
             if self.enable_overlap:
                 from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
-                    MTPWorkerV2,
+                    MutiLayerEagleWorkerV2,
                 )
 
-                self.draft_worker = MTPWorkerV2(
+                self.draft_worker = MutiLayerEagleWorkerV2(
                     gpu_id=self.gpu_id,
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
@@ -500,9 +500,11 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
             else:
-                from sglang.srt.speculative.multi_layer_eagle_worker import MTPWorker
+                from sglang.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEagleWorker,
+                )
 
-                self.draft_worker = MTPWorker(
+                self.draft_worker = MultiLayerEagleWorker(
                     gpu_id=self.gpu_id,
                     tp_rank=self.tp_rank,
                     moe_ep_rank=self.moe_ep_rank,
