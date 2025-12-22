@@ -275,7 +275,6 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.enable_mtp = server_args.enable_multi_layer_eagle
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -485,7 +484,7 @@ class Scheduler(
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
         # FIXME: refactor the draft worker registration logic
-        if self.enable_mtp:
+        if self.server_args.enable_multi_layer_eagle:
             if self.enable_overlap:
                 from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
 
@@ -832,7 +831,7 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            if self.enable_mtp:
+            if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
