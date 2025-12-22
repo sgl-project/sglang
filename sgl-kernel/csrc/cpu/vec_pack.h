@@ -67,6 +67,39 @@ inline void pack_vnni_Nx32(
   }
 }
 
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_N_remainder(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int N,
+    int K,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[16];
+
+  int K2 = K >> 1;
+  const __mmask16 vmask = (1 << K2) - 1;
+
+  int n = 0;
+  for (; n < N; ++n) {
+    index_t index = get_index(ind, n);
+    vinputs[n] = _mm512_maskz_loadu_epi32(vmask, src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  // pack key
+  transpose_16x16_32bit(vinputs);
+
+  const __mmask16 vmask2 = (1 << N) - 1;
+  for (int k = 0; k < K2; ++k) {
+    _mm512_mask_storeu_epi32(dst + k * ld_dst * 2, vmask2, vinputs[k]);
+  }
+}
+
 // value: from [K, 32] to [K/2, 32, 2]
 template <typename scalar_t>
 inline void
@@ -116,6 +149,57 @@ inline void pack_vnni_Kx32(
   _mm512_storeu_si512(dst + 0 * ld_dst * 2, d0);
   _mm512_storeu_si512(dst + 0 * ld_dst * 2 + 32, d1);
 }
+
+void print_32x16(__m512i v) {
+  at::BFloat16 arr[32];
+  _mm512_storeu_si512(arr, v);
+  for (int i = 0; i < 32; ++i) {
+    std::cout << " " << float(arr[i]);
+  }
+  std::cout << std::endl;
+}
+
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_K_remainder(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int K,
+    int N,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[2];
+
+  const __mmask32 vmask = (1 << N) - 1;
+
+  int k = 0;
+  for (; k < K; ++k) {
+    index_t index = get_index(ind, k);
+    vinputs[k] = _mm512_maskz_loadu_epi16(vmask, src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; k < 2; ++k) {
+    vinputs[k] = _mm512_set1_epi32(0);
+  }
+  // std::cout << "\n !!!!!!!!! doing packing" << std::endl;
+  // print_32x16(vinputs[0]);
+  // print_32x16(vinputs[1]);
+
+  // pack value
+  __m512i d0, d1;
+  std::tie(d0, d1) = transpose_2x32_16bit(vinputs[0], vinputs[1]);
+
+  if (N <= 16) {
+    // 2N * 16bits: N * 32bits
+    const __mmask16 vmask2 = (1 << N) - 1;
+    _mm512_mask_storeu_epi32(dst + 0 * ld_dst * 2, vmask2, d0);
+  } else {
+    // 2(N-16) * 16bits: (N-16) * 32bits
+    const __mmask16 vmask2 = (1 << (N - 16)) - 1;
+    _mm512_storeu_epi32(dst + 0 * ld_dst * 2, d0);
+    _mm512_mask_storeu_epi32(dst + 0 * ld_dst * 2 + 32, vmask2, d1);
+  }
+}
 #endif
 
 // convert to vnni format
@@ -162,18 +246,29 @@ void pack_vnni(
     int ld_dst) {
 #if defined(CPU_CAPABILITY_AVX512)
   const int NB = div_up(N, 16);
-  const int KB = K / 32;  // no remainder
+  const int KB = K / 32;
+  const int K_remainder = K - KB * 32;
   const bool is_indexed = ind != nullptr;
 
   for (int nb = 0; nb < NB; ++nb) {
+    int nb_size = std::min(N - nb * 16, 16);
     for (int kb = 0; kb < KB; ++kb) {
       // handle 16x512bits each block
-      int nb_size = std::min(N - nb * 16, 16);
       pack_vnni_Nx32<scalar_t, index_t>(
           /*    dst */ dst + ((kb * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
           /*    src */ src + kb * 32 + (is_indexed ? 0 : nb * 16 * ld_src),
           /*    ind */ is_indexed ? ind + nb * 16 : nullptr,
           /*      N */ nb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+    if (K_remainder > 0) {
+      pack_vnni_N_remainder<scalar_t, index_t>(
+          /*    dst */ dst + ((KB * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
+          /*    src */ src + KB * 32 + (is_indexed ? 0 : nb * 16 * ld_src),
+          /*    ind */ is_indexed ? ind + nb * 16 : nullptr,
+          /*      N */ nb_size,
+          /*      K */ K_remainder,
           /* ld_src */ ld_src,
           /* ld_dst */ ld_dst);
     }
@@ -241,18 +336,29 @@ void pack_vnni2(
     int ld_dst) {
 #if defined(CPU_CAPABILITY_AVX512)
   const int KB = div_up(K, 2);
-  const int NB = N / 32;  // no remainder
+  const int NB = N / 32;
+  const int N_remainder = N - NB * 32;
   const bool is_indexed = ind != nullptr;
 
   for (int kb = 0; kb < KB; ++kb) {
+    int kb_size = std::min(K - kb * 2, 2);
     for (int nb = 0; nb < NB; ++nb) {
       // handle 2x512bits each block
-      int kb_size = std::min(K - kb * 2, 2);
       pack_vnni_Kx32<scalar_t, index_t>(
           /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + nb * 32 * 2,
           /*    src */ src + (is_indexed ? 0 : kb * 2 * ld_src) + nb * 32,
           /*    ind */ is_indexed ? ind + kb * 2 : nullptr,
           /*      K */ kb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+    if (N_remainder > 0) {
+      pack_vnni_K_remainder(
+          /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + NB * 32 * 2,
+          /*    src */ src + (is_indexed ? 0 : kb * 2 * ld_src) + NB * 32,
+          /*    ind */ is_indexed ? ind + kb * 2 : nullptr,
+          /*      K */ kb_size,
+          /*      N */ N_remainder,
           /* ld_src */ ld_src,
           /* ld_dst */ ld_dst);
     }
