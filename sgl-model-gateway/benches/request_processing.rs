@@ -123,6 +123,7 @@ fn default_completion_request() -> CompletionRequest {
         return_hidden_states: false,
         sampling_seed: None,
         other: serde_json::Map::new(),
+        routing_id: None,
     }
 }
 
