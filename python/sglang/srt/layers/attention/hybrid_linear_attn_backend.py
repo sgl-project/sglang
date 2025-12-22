@@ -198,8 +198,21 @@ class MambaAttnBackendBase(AttentionBackend):
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
-        elif forward_batch.forward_mode.is_extend():
-            if forward_batch.forward_mode.is_target_verify():
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                # DRAFT_EXTEND_V2 is used by EAGLEWorkerV2 to fill draft KV cache after verification.
+                # spec_info here is EagleDraftInput (not EagleVerifyInput), so we get draft_token_num
+                # from extend_seq_lens_cpu. using the cpu list avoids a tensor.item() cuda sync.
+                draft_token_num = forward_batch.extend_seq_lens_cpu[0]
+                query_start_loc = torch.arange(
+                    0,
+                    forward_batch.input_ids.shape[0] + 1,
+                    step=draft_token_num,
+                    dtype=torch.int32,
+                    device=forward_batch.input_ids.device,
+                )
+                # topk > 1 tree attention handling only applies to TARGET_VERIFY, not here
+            elif forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
                     forward_batch.input_ids.shape[0] + 1,
@@ -1328,6 +1341,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
+        skip_masking: bool = False,
     ):
         request_number = accepted_steps.shape[0]
 
@@ -1349,13 +1363,23 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Compute common indices once to avoid duplication
-        valid_mask = accepted_steps >= 0
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        src_state_indices = intermediate_state_indices[valid_mask].to(
-            torch.int64
-        )  # [N]
-        last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
+        # boolean indexing like tensor[mask] internally calls aten::nonzero which triggers
+        # cudaStreamSynchronize. when the caller guarantees all accepted_steps >= 0 (e.g. V2 path
+        # with idle/empty batches already filtered out), we can skip masking entirely.
+        # acc check is fine. TODO: understand if this overshadows gains from spec v2 alone?, but
+        # in this case it is bounded to spec v2 functionality (as shown by tests of main, branch, v2, non v2)
+        if skip_masking:
+            dst_state_indices = state_indices_tensor.to(torch.int64)
+            src_state_indices = intermediate_state_indices.to(torch.int64)
+            last_steps = accepted_steps.to(torch.int64)
+        else:
+            # masking needed for cases like DP attention idle batches or padding?
+            valid_mask = accepted_steps >= 0
+            dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
+            src_state_indices = intermediate_state_indices[valid_mask].to(
+                torch.int64
+            )  # [N]
+            last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
 
         # scatter into ssm_states at the chosen cache lines
         ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
