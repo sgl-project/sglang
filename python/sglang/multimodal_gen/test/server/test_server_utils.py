@@ -768,6 +768,29 @@ def get_generate_fn(
 
     video_seconds = sampling_params.seconds or 4
 
+    def _build_video_extra_body(
+        extra_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Compose extra_body for video generation with optional overrides."""
+        body: dict[str, Any] = {}
+        if sampling_params.num_inference_steps is not None:
+            body["steps"] = sampling_params.num_inference_steps
+        if sampling_params.height is not None:
+            body["height"] = sampling_params.height
+        if sampling_params.width is not None:
+            body["width"] = sampling_params.width
+        if sampling_params.num_frames is not None:
+            body["num_frames"] = sampling_params.num_frames
+        if sampling_params.fps is not None:
+            body["fps"] = sampling_params.fps
+        if sampling_params.guidance_scale is not None:
+            body["guidance_scale"] = sampling_params.guidance_scale
+
+        if extra_fields:
+            body.update(extra_fields)
+
+        return body or None
+
     def generate_image(case_id, client) -> str:
         """T2I: Text to Image generation."""
         if not sampling_params.prompt:
@@ -911,6 +934,7 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=output_size,
             seconds=video_seconds,
+            extra_body=_build_video_extra_body(),
         )
 
     def generate_image_to_video(case_id, client) -> str:
@@ -934,6 +958,7 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body=_build_video_extra_body(),
             )
 
     def generate_text_url_image_to_video(case_id, client) -> str:
@@ -944,9 +969,11 @@ def get_generate_fn(
             case_id,
             model=model_path,
             prompt=sampling_params.prompt,
-            size=sampling_params.output_size,
+            size=output_size,
             seconds=video_seconds,
-            extra_body={"reference_url": sampling_params.image_path},
+            extra_body=_build_video_extra_body(
+                {"reference_url": sampling_params.image_path}
+            ),
         )
 
     def generate_text_image_to_video(case_id, client) -> str:
@@ -970,6 +997,7 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body=_build_video_extra_body(),
             )
 
     if modality == "video":

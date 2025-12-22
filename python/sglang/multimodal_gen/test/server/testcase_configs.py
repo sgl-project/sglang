@@ -132,6 +132,12 @@ class DiffusionSamplingParams:
 
     output_size: str = ""
 
+    # optional overrides for sampling behavior
+    num_inference_steps: int | None = None
+    height: int | None = None
+    width: int | None = None
+    guidance_scale: float | None = None
+
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
     image_path: Path | str | None = None  # input image/video for editing (Path or URL)
