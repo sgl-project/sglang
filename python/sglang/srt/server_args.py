@@ -730,6 +730,9 @@ class ServerArgs:
         # Handle two-batch overlap settings.
         self._handle_two_batch_overlap()
 
+        # Handle debug utilities.
+        self._handle_debug_utils()
+
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -2400,6 +2403,11 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+    def _handle_debug_utils(self):
+        if is_in_ci() and self.soft_watchdog_timeout is None:
+            logger.info("Set soft_watchdog_timeout since in CI")
+            self.soft_watchdog_timeout = 300
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
