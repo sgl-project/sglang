@@ -26,7 +26,7 @@ impl Default for WasmRuntimeConfig {
         let default_thread_pool_size = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .max(1);
+            .clamp(1, 128);
 
         Self {
             max_memory_pages: 1024,                     // 64MB

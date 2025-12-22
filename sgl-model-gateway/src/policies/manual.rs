@@ -679,7 +679,7 @@ mod tests {
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());
-        assert_eq!(branch, ExecutionBranch::SlowPathOccupiedHit);
+        assert_eq!(branch, ExecutionBranch::FastPathHit);
     }
 
     #[test]
