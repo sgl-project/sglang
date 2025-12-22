@@ -319,7 +319,6 @@ class ComposedPipelineBase(ABC):
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
-            logger.info("Loaded module %s from %s", module_name, component_model_path)
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
@@ -364,10 +363,13 @@ class ComposedPipelineBase(ABC):
                 "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
             )
 
+        batch.log(server_args=server_args)
+
         # Execute each stage
         logger.info(
             "Running pipeline stages: %s",
             list(self._stage_name_mapping.keys()),
             main_process_only=True,
         )
+
         return self.executor.execute(self.stages, batch, server_args)

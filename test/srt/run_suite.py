@@ -13,11 +13,6 @@ suites = {
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 7),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 13),
-        TestFile("lora/test_lora.py", 82),
-        TestFile("lora/test_lora_eviction.py", 224),
-        TestFile("lora/test_lora_update.py", 451),
-        TestFile("lora/test_lora_backend.py", 200),
-        TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
         TestFile("models/test_embedding_models.py", 73),
@@ -56,6 +51,7 @@ suites = {
         TestFile("rl/test_fp32_lm_head.py", 9),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 195),
+        TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_create_kvindices.py", 7),
@@ -122,7 +118,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 84),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
-        TestFile("test_vision_chunked_prefill.py", 117),
+        TestFile("test_vision_chunked_prefill.py", 150),
         TestFile("test_vision_openai_server_a.py", 778),
         TestFile("test_vlm_input_format.py", 166),
         TestFile("test_modelopt_export.py", 9),
@@ -133,7 +129,6 @@ suites = {
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
-        TestFile("lora/test_lora_tp.py", 116),
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
@@ -146,17 +141,18 @@ suites = {
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 472),
+        TestFile("models/test_qwen3_next_models.py", 650),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
-        TestFile("test_pp_single_node.py", 800),
-        TestFile("test_piecewise_cuda_graph.py", 1200),
+        TestFile("test_pp_single_node.py", 500),
+        TestFile("test_epd_disaggregation.py", 150),
+        TestFile("rl/test_return_routed_experts.py", 300),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 200),
+        TestFile("test_disaggregation_hybrid_attention.py", 600),
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
@@ -164,11 +160,11 @@ suites = {
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
         TestFile("test_disaggregation_different_tp.py", 600),
-        TestFile("test_disaggregation_pp.py", 140),
+        TestFile("test_disaggregation_pp.py", 180),
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
+        TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
         TestFile("test_flash_attention_4.py", 90),
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 700),
@@ -188,7 +184,7 @@ suites = {
         # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 338),
+        TestFile("ep/test_deepep_large.py", 563),
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
@@ -198,10 +194,8 @@ suites = {
         TestFile("test_quantization.py", 185),
         TestFile("test_gguf.py", 96),
     ],
-    # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
-        TestFile("lora/test_lora_hf_sgl_logprob_diff.py"),  # Nightly test
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
             "rl/test_update_weights_from_disk.py"
@@ -215,6 +209,7 @@ suites = {
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
+        TestFile("test_soft_watchdog.py"),
     ],
 }
 
@@ -225,12 +220,10 @@ suite_amd = {
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
-        TestFile("lora/test_lora.py", 665),
+        # LoRA tests moved to test/registered/lora/ - AMD entries need to be re-added there
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("lora/test_lora_eviction.py", 240),
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
@@ -305,7 +298,7 @@ suite_amd = {
         TestFile("test_mla.py", 242),
     ],
     "per-commit-2-gpu-amd": [
-        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
+        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107. Moved to test/registered/lora/
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
@@ -320,6 +313,10 @@ suite_amd = {
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
+    ],
+    # AMD 8-GPU tests for base models using gsm8k completion benchmark
+    "nightly-amd-8-gpu": [
+        TestFile("nightly/test_gsm8k_completion_eval_amd.py"),
     ],
 }
 
@@ -365,6 +362,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
@@ -511,24 +509,6 @@ def main():
         default=False,
         help="Continue running remaining tests even if one fails (useful for nightly tests)",
     )
-    arg_parser.add_argument(
-        "--enable-retry",
-        action="store_true",
-        default=False,
-        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
-    )
-    arg_parser.add_argument(
-        "--max-attempts",
-        type=int,
-        default=2,
-        help="Maximum number of attempts per file including initial run (default: 2)",
-    )
-    arg_parser.add_argument(
-        "--retry-wait-seconds",
-        type=int,
-        default=60,
-        help="Seconds to wait between retries (default: 60)",
-    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -544,14 +524,7 @@ def main():
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(
-        files,
-        args.timeout_per_file,
-        args.continue_on_error,
-        enable_retry=args.enable_retry,
-        max_attempts=args.max_attempts,
-        retry_wait_seconds=args.retry_wait_seconds,
-    )
+    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
     exit(exit_code)
 
 

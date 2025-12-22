@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
     get_hf_config,
 )
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    LayerwiseOffloadManager,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -87,33 +90,6 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
-def load_native(library, component_module_path: str, server_args: ServerArgs):
-    if library == "transformers":
-        from transformers import AutoModel
-
-        config = get_hf_config(
-            component_module_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-        )
-        return AutoModel.from_pretrained(
-            component_module_path,
-            config=config,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-        )
-    elif library == "diffusers":
-        from diffusers import AutoModel
-
-        return AutoModel.from_pretrained(
-            component_module_path,
-            revision=server_args.revision,
-            trust_remote_code=server_args.trust_remote_code,
-        )
-    else:
-        raise ValueError(f"Unsupported library: {library}")
-
-
 class ComponentLoader(ABC):
     """Base class for loading a specific type of model component."""
 
@@ -155,11 +131,16 @@ class ComponentLoader(ABC):
                 component_model_path, server_args, module_name
             )
             source = "customized"
-        except Exception as _e:
-            traceback.print_exc()
-            logger.error(
-                f"Error while loading customized {module_name}, falling back to native version"
-            )
+        except Exception as e:
+            if "Unsupported model architecture" in str(e):
+                logger.info(
+                    f"Module: {module_name} doesn't have a customized version yet, using native version"
+                )
+            else:
+                traceback.print_exc()
+                logger.error(
+                    f"Error while loading customized {module_name}, falling back to native version"
+                )
             # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
@@ -193,7 +174,30 @@ class ComponentLoader(ABC):
         """
         Load the component using the native library (transformers/diffusers).
         """
-        return load_native(transformers_or_diffusers, component_model_path, server_args)
+        if transformers_or_diffusers == "transformers":
+            from transformers import AutoModel
+
+            config = get_hf_config(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+            return AutoModel.from_pretrained(
+                component_model_path,
+                config=config,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        elif transformers_or_diffusers == "diffusers":
+            from diffusers import AutoModel
+
+            return AutoModel.from_pretrained(
+                component_model_path,
+                revision=server_args.revision,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+        else:
+            raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, module_name: str
@@ -272,7 +276,13 @@ class TextEncoderLoader(ComponentLoader):
 
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.text_encoder_cpu_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -447,7 +457,7 @@ class TextEncoderLoader(ComponentLoader):
                     )
                 else:
                     mesh = init_device_mesh(
-                        "cuda",
+                        current_platform.device_type,
                         mesh_shape=(1, dist.get_world_size()),
                         mesh_dim_names=("offload", "replicate"),
                     )
@@ -476,7 +486,13 @@ class TextEncoderLoader(ComponentLoader):
 class ImageEncoderLoader(TextEncoderLoader):
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.image_encoder_cpu_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -621,7 +637,6 @@ class TransformerLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
 
-        logger.info("transformer cls_name: %s", cls_name)
         if server_args.override_transformer_cls_name is not None:
             cls_name = server_args.override_transformer_cls_name
             logger.info("Overriding transformer cls_name to %s", cls_name)
@@ -660,16 +675,16 @@ class TransformerLoader(ComponentLoader):
                 ), "Custom initialization weights must be a safetensors file"
                 safetensors_list = [custom_weights_path]
 
-        logger.info(
-            "Loading model from %s safetensors files: %s",
-            len(safetensors_list),
-            safetensors_list,
-        )
-
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
+        logger.info(
+            "Loading %s from %s safetensors files, default_dtype: %s",
+            cls_name,
+            len(safetensors_list),
+            default_dtype,
+        )
+
         # Load the model using FSDP loader
-        logger.info("Loading %s, default_dtype: %s", cls_name, default_dtype)
         assert server_args.hsdp_shard_dim is not None
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
@@ -697,9 +712,22 @@ class TransformerLoader(ComponentLoader):
 
         model = model.eval()
 
-        if hasattr(model, "fuse_qkv_projections"):
-            logger.info("Fusing QKV projections for better performance")
-            model.fuse_qkv_projections()
+        if server_args.dit_layerwise_offload and hasattr(model, "blocks"):
+            try:
+                num_layers = len(getattr(model, "blocks"))
+            except Exception:
+                num_layers = None
+
+            if isinstance(num_layers, int) and num_layers > 0:
+                mgr = LayerwiseOffloadManager(
+                    model,
+                    module_list_attr="blocks",
+                    num_layers=num_layers,
+                    enabled=True,
+                    pin_cpu_memory=server_args.pin_cpu_memory,
+                    auto_initialize=True,
+                )
+                setattr(model, "_layerwise_offload_manager", mgr)
 
         return model
 
@@ -760,12 +788,6 @@ class PipelineComponentLoader:
         Returns:
             The loaded module
         """
-        logger.info(
-            "Loading %s using %s from %s",
-            module_name,
-            transformers_or_diffusers,
-            component_model_path,
-        )
 
         # Get the appropriate loader for this module type
         loader = ComponentLoader.for_module_type(module_name, transformers_or_diffusers)

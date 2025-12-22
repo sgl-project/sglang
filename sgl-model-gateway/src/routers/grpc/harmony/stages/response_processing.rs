@@ -7,10 +7,12 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{FinalResponse, RequestContext, RequestType},
+use crate::routers::{
     error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{FinalResponse, RequestContext, RequestType},
+    },
 };
 
 /// Harmony Response Processing stage: Parse and format Harmony responses
@@ -54,7 +56,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             request_type = "Chat",
                             "No execution result available"
                         );
-                        error::internal_error("No execution result")
+                        error::internal_error("no_execution_result", "No execution result")
                     })?;
 
                 let dispatch = ctx.state.dispatch.as_ref().cloned().ok_or_else(|| {
@@ -63,20 +65,27 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                         request_type = "Chat",
                         "Dispatch metadata not set"
                     );
-                    error::internal_error("Dispatch metadata not set")
+                    error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
-                    return Ok(Some(
-                        self.streaming_processor
-                            .clone()
-                            .process_streaming_chat_response(
-                                execution_result,
-                                ctx.chat_request_arc(),
-                                dispatch,
-                            ),
-                    ));
+                    let response = self
+                        .streaming_processor
+                        .clone()
+                        .process_streaming_chat_response(
+                            execution_result,
+                            ctx.chat_request_arc(),
+                            dispatch,
+                        );
+
+                    // Attach load guards to response body for proper RAII lifecycle
+                    let response = match ctx.state.load_guards.take() {
+                        Some(guards) => guards.attach_to_response(response),
+                        None => response,
+                    };
+
+                    return Ok(Some(response));
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
@@ -105,7 +114,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             request_type = "Responses",
                             "No execution result available"
                         );
-                        error::internal_error("No execution result")
+                        error::internal_error("no_execution_result", "No execution result")
                     })?;
 
                 let dispatch = ctx.state.dispatch.as_ref().cloned().ok_or_else(|| {
@@ -114,7 +123,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                         request_type = "Responses",
                         "Dispatch metadata not set"
                     );
-                    error::internal_error("Dispatch metadata not set")
+                    error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
                 let responses_request = ctx.responses_request_arc();
@@ -132,6 +141,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                     "Generate request type not supported in Harmony pipeline"
                 );
                 Err(error::internal_error(
+                    "generate_requests_not_supported_in_harmony",
                     "Generate requests not supported in Harmony pipeline",
                 ))
             }

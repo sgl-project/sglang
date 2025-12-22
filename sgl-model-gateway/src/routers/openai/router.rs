@@ -2,6 +2,7 @@ use std::{
     any::Any,
     collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
+    time::Instant,
 };
 
 use axum::{
@@ -33,8 +34,13 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    core::{model_type::Endpoint, ModelCard, ProviderType, RuntimeType, Worker, WorkerRegistry},
+    config::types::RetryConfig,
+    core::{
+        is_retryable_status, model_type::Endpoint, ModelCard, ProviderType, RetryExecutor,
+        RuntimeType, Worker, WorkerRegistry,
+    },
     data_connector::{ConversationId, ListParams, ResponseId, SortOrder},
+    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
         responses::{
@@ -51,6 +57,7 @@ pub struct OpenAIRouter {
     healthy: AtomicBool,
     shared_components: Arc<SharedComponents>,
     responses_components: Arc<ResponsesComponents>,
+    retry_config: RetryConfig,
 }
 
 impl std::fmt::Debug for OpenAIRouter {
@@ -174,6 +181,7 @@ impl OpenAIRouter {
             healthy: AtomicBool::new(true),
             shared_components,
             responses_components,
+            retry_config: ctx.router_config.effective_retry_config(),
         })
     }
 
@@ -576,6 +584,20 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+        let streaming = body.stream;
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            metrics_labels::ENDPOINT_CHAT,
+            bool_to_static_str(streaming),
+        );
+
         let auth_header = extract_auth_header(headers, &None);
 
         let worker = match self
@@ -583,18 +605,44 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             .await
         {
             Ok(w) => w,
-            Err(response) => return response,
+            Err(response) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
         };
 
         let mut payload = match to_value(body) {
             Ok(v) => v,
             Err(e) => {
-                return error_responses::bad_request(format!("Failed to serialize request: {}", e))
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_CHAT,
+                metrics_labels::ERROR_VALIDATION,
+            );
             return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
 
@@ -617,77 +665,149 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             previous_response_id: None,
         });
 
+        // Wrap values in Arc to avoid cloning large objects on each retry attempt
         let payload_ref = ctx.payload().expect("Payload not prepared");
-        let mut req = ctx.components.client().post(&url).json(&payload_ref.json);
-        let auth_header = extract_auth_header(ctx.headers(), worker.api_key());
-        req = apply_provider_headers(req, &url, auth_header.as_ref());
+        let payload_json = Arc::new(payload_ref.json.clone());
+        let client = ctx.components.client().clone();
+        let headers_cloned = Arc::new(ctx.headers().cloned());
+        let worker_api_key = Arc::new(worker.api_key().clone());
+        let is_streaming = ctx.is_streaming();
 
-        if ctx.is_streaming() {
-            req = req.header("Accept", "text/event-stream");
-        }
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_attempt| {
+                let client = client.clone();
+                let url = url.clone();
+                let payload = Arc::clone(&payload_json);
+                let headers = Arc::clone(&headers_cloned);
+                let worker_api_key = Arc::clone(&worker_api_key);
+                let worker = Arc::clone(&worker);
 
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                worker.circuit_breaker().record_failure();
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to contact upstream: {}", e),
-                )
-                    .into_response();
-            }
-        };
+                async move {
+                    let mut req = client.post(&url).json(&*payload);
+                    let auth_header = extract_auth_header((*headers).as_ref(), &worker_api_key);
+                    req = apply_provider_headers(req, &url, auth_header.as_ref());
 
-        let status = StatusCode::from_u16(resp.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        if !ctx.is_streaming() {
-            let content_type = resp.headers().get(CONTENT_TYPE).cloned();
-            match resp.bytes().await {
-                Ok(body) => {
-                    worker.circuit_breaker().record_success();
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    if let Some(ct) = content_type {
-                        response.headers_mut().insert(CONTENT_TYPE, ct);
+                    if is_streaming {
+                        req = req.header("Accept", "text/event-stream");
                     }
-                    response
-                }
-                Err(e) => {
-                    worker.circuit_breaker().record_failure();
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read response: {}", e),
-                    )
-                        .into_response()
-                }
-            }
-        } else {
-            let stream = resp.bytes_stream();
-            let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(async move {
-                let mut s = stream;
-                while let Some(chunk) = s.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
+
+                    let resp = match req.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            worker.circuit_breaker().record_failure();
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("Failed to contact upstream: {}", e),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let status = StatusCode::from_u16(resp.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+                    // Record circuit breaker failure for error status codes
+                    if !status.is_success() {
+                        worker.circuit_breaker().record_failure();
+                    }
+
+                    if !is_streaming {
+                        let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+                        match resp.bytes().await {
+                            Ok(body) => {
+                                // Only record success after body is fully read
+                                if status.is_success() {
+                                    worker.circuit_breaker().record_success();
+                                }
+                                let mut response = Response::new(Body::from(body));
+                                *response.status_mut() = status;
+                                if let Some(ct) = content_type {
+                                    response.headers_mut().insert(CONTENT_TYPE, ct);
+                                }
+                                response
+                            }
+                            Err(e) => {
+                                worker.circuit_breaker().record_failure();
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Failed to read response: {}", e),
+                                )
+                                    .into_response()
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
+                    } else {
+                        // Streaming response - record success when stream starts
+                        if status.is_success() {
+                            worker.circuit_breaker().record_success();
                         }
+                        let stream = resp.bytes_stream();
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        tokio::spawn(async move {
+                            let mut s = stream;
+                            while let Some(chunk) = s.next().await {
+                                match chunk {
+                                    Ok(bytes) => {
+                                        if tx.send(Ok(bytes)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        let mut response =
+                            Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+                        *response.status_mut() = status;
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                        response
                     }
                 }
-            });
-            let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
-            *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            response
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+            },
+        )
+        .await;
+
+        // Record duration/error metrics after retry completes
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_CHAT,
+                start.elapsed(),
+            );
+        } else {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_CHAT,
+                metrics_labels::ERROR_BACKEND,
+            );
         }
+
+        response
     }
 
     async fn route_responses(
@@ -696,15 +816,38 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(body.model.as_str());
+        let streaming = body.stream.unwrap_or(false);
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            metrics_labels::ENDPOINT_RESPONSES,
+            bool_to_static_str(streaming),
+        );
+
         let auth_header = extract_auth_header(headers, &None);
 
-        let model = model_id.unwrap_or(body.model.as_str());
         let worker = match self
             .select_worker_for_model(model, auth_header.as_ref())
             .await
         {
             Ok(w) => w,
-            Err(response) => return response,
+            Err(response) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_NO_WORKERS,
+                );
+                return response;
+            }
         };
 
         let mut request_body = body.clone();
@@ -755,6 +898,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .get_conversation(&conv_id)
                 .await
             {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_VALIDATION,
+                );
                 return error_responses::not_found("conversation", &conv_id.0);
             }
 
@@ -864,12 +1015,28 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut payload = match to_value(&request_body) {
             Ok(v) => v,
             Err(e) => {
-                return error_responses::bad_request(format!("Failed to serialize request: {}", e))
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_VALIDATION,
+                );
+                return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ERROR_VALIDATION,
+            );
             return error_responses::bad_request(format!("Provider transform error: {}", e));
         }
 
@@ -891,11 +1058,25 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             previous_response_id: original_previous_response_id,
         });
 
-        if ctx.is_streaming() {
+        let response = if ctx.is_streaming() {
             handle_streaming_response(ctx).await
         } else {
             self.handle_non_streaming_response(ctx).await
+        };
+
+        // Record duration only for successful requests (errors tracked inside handlers)
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_RESPONSES,
+                start.elapsed(),
+            );
         }
+
+        response
     }
 
     async fn get_response(
