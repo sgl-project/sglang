@@ -4,10 +4,10 @@ import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
+import torch
 from sglang.jit_kernel.utils import load_jit, make_cpp_args
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 
@@ -17,7 +17,7 @@ def _jit_merlin_module() -> Module:
         "merlin",
         cuda_files=["marlin_moe_wna16/ops.cuh"],
         cuda_wrappers=[
-            ("moe_wna16_marlin_gemm", f"moe_wna16_marlin_gemm"),
+            ("moe_wna16_marlin_gemm", f"marlin::moe_wna16_marlin_gemm"),
         ],
     )
 
@@ -50,8 +50,12 @@ def moe_wna16_marlin_gemm(
     use_fp32_reduce: bool,
     is_zp_float: bool,
 ):
-    c = torch.empty({size_m * top_k, size_n}, device=a.device, dtype=a.dtype)
-    _jit_merlin_module().moe_wna16_marlin_gemm.default(
+    c = (
+        c_or_none
+        if c_or_none is not None
+        else torch.empty((size_m * top_k, size_n), device=a.device, dtype=a.dtype)
+    )
+    _jit_merlin_module().moe_wna16_marlin_gemm(
         a,
         c,
         b_q_weight,
@@ -66,17 +70,17 @@ def moe_wna16_marlin_gemm(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
-        moe_block_size=moe_block_size,
-        top_k=top_k,
-        mul_topk_weights=mul_topk_weights,
-        is_ep=is_ep,
-        b_q_type_id=b_q_type_id,
-        size_m=size_m,
-        size_n=size_n,
-        size_k=size_k,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=use_fp32_reduce,
-        is_zp_float=is_zp_float,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        is_ep,
+        b_q_weight.dtype,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
     )
     return c

@@ -4,11 +4,63 @@
 #include <sgl_kernel/utils.h>
 #include <sgl_kernel/warp.cuh>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm_ffi_utils.h>
 
 #include <optional>
+
+#include "marlin.cuh"
+
+#ifndef MARLIN_NAMESPACE_NAME
+#define MARLIN_NAMESPACE_NAME marlin
+#endif
+
+namespace MARLIN_NAMESPACE_NAME {
+
+template <typename scalar_t>
+void marlin_mm(
+    const void* A,
+    const void* B,
+    void* C,
+    void* C_tmp,
+    void* b_bias,
+    void* s,
+    void* s2,
+    void* zp,
+    void* g_idx,
+    void* perm,
+    void* a_tmp,
+    void* sorted_token_ids,
+    void* expert_ids,
+    void* num_tokens_past_padded,
+    void* topk_weights,
+    int moe_block_size,
+    int top_k,
+    bool mul_topk_weights,
+    bool is_ep,
+    int prob_m,
+    int prob_n,
+    int prob_k,
+    void* workspace,
+    int q_type,
+    bool has_bias,
+    bool has_act_order,
+    bool is_k_full,
+    bool has_zp,
+    int num_groups,
+    int group_size,
+    int dev,
+    cudaStream_t stream,
+    int thread_k,
+    int thread_n,
+    int sms,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float) {}
 
 void moe_wna16_marlin_gemm(
     const tvm::ffi::TensorView& a,
@@ -29,11 +81,243 @@ void moe_wna16_marlin_gemm(
     int64_t top_k,
     bool mul_topk_weights,
     bool is_ep,
-    DLDataType b_q_type_id,
+    DLDataType b_q_type,
     int64_t size_m,
     int64_t size_n,
     int64_t size_k,
     bool is_k_full,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {}
+    bool is_zp_float) {
+  int pack_factor = 32 / b_q_type.bits;
+
+  if (moe_block_size != 8) {
+    TVM_FFI_ICHECK(moe_block_size % 16 == 0) << "unsupported moe_block_size=" << moe_block_size;
+    TVM_FFI_ICHECK(moe_block_size >= 16 && moe_block_size <= 64) << "unsupported moe_block_size=" << moe_block_size;
+  }
+
+  // Verify A
+  TVM_FFI_ICHECK(a.size(0) == size_m) << "Shape mismatch: a.size(0) = " << a.size(0) << ", size_m = " << size_m;
+  TVM_FFI_ICHECK(a.size(1) == size_k) << "Shape mismatch: a.size(1) = " << a.size(1) << ", size_k = " << size_k;
+
+  // Verify B
+  TVM_FFI_ICHECK(size_k % MARLIN_NAMESPACE_NAME::tile_size == 0)
+      << "size_k = " << size_k << " is not divisible by tile_size = " << MARLIN_NAMESPACE_NAME::tile_size;
+  TVM_FFI_ICHECK((size_k / MARLIN_NAMESPACE_NAME::tile_size) == b_q_weight.size(1))
+      << "Shape mismatch: b_q_weight.size(1) = " << b_q_weight.size(1) << ", size_k = " << size_k
+      << ", tile_size = " << MARLIN_NAMESPACE_NAME::tile_size;
+  TVM_FFI_ICHECK(b_q_weight.size(2) % MARLIN_NAMESPACE_NAME::tile_size == 0)
+      << "b_q_weight.size(2) = " << b_q_weight.size(2)
+      << " is not divisible by tile_size = " << MARLIN_NAMESPACE_NAME::tile_size;
+  int actual_size_n = (b_q_weight.size(2) / MARLIN_NAMESPACE_NAME::tile_size) * pack_factor;
+  TVM_FFI_ICHECK(size_n == actual_size_n) << "size_n = " << size_n << ", actual_size_n = " << actual_size_n;
+
+  // Verify device and strides
+  TVM_FFI_ICHECK(a.device().device_type == kDLCUDA) << "A is not on GPU";
+  TVM_FFI_ICHECK(a.is_contiguous()) << "A is not contiguous";
+
+  TVM_FFI_ICHECK(b_q_weight.device().device_type == kDLCUDA) << "b_q_weight is not on GPU";
+  TVM_FFI_ICHECK(b_q_weight.is_contiguous()) << "b_q_weight is not contiguous";
+
+  TVM_FFI_ICHECK(b_scales.device().device_type == kDLCUDA) << "b_scales is not on GPU";
+  TVM_FFI_ICHECK(b_scales.is_contiguous()) << "b_scales is not contiguous";
+
+  // thread_k: `k` size of a thread_tile in `weights` (can usually be left as
+  // auto -1)
+  int thread_k = -1;
+  // thread_n: `n` size of a thread_tile in `weights` (can usually be left as
+  // auto -1)
+  int thread_n = -1;
+  // sms: number of SMs to use for the kernel
+  int sms = -1;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, a.device().device_id);
+
+  // Verify C
+  TVM_FFI_ICHECK(c.device().device_type == kDLCUDA) << "c is not on GPU";
+  TVM_FFI_ICHECK(c.is_contiguous()) << "c is not contiguous";
+  TVM_FFI_ICHECK(c.size(0) == size_m * top_k)
+      << "Shape mismatch: c.size(0) = " << c.size(0) << ", size_m * topk = " << size_m * top_k;
+  TVM_FFI_ICHECK(c.size(1) == size_n) << "Shape mismatch: c.size(1) = " << c.size(1) << ", size_n = " << size_n;
+
+  // Alloc C tmp buffer that is going to be used for the global reduce
+  tvm::ffi::Tensor c_tmp;
+  if (use_fp32_reduce && !use_atomic_add) {
+    // max num of threadblocks is sms * 4
+    long max_c_tmp_size = min(
+        (long)size_n * sorted_token_ids.size(0), (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
+    if (moe_block_size == 8) max_c_tmp_size *= 2;
+    c_tmp =
+        tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {max_c_tmp_size}, DLDataType{kDLFloat, 32, 4}, c.device());
+  } else {
+    c_tmp = tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {0}, DLDataType{kDLFloat, 32, 4}, c.device());
+  }
+
+  // Detect groupsize and act_order
+  int num_groups = -1;
+  int group_size = -1;
+
+  int rank = b_scales.ndim();
+  TVM_FFI_ICHECK(rank == 3) << "b_scales rank = " << rank << " is not 3";
+  TVM_FFI_ICHECK(b_scales.size(2) == size_n)
+      << "b_scales dim 2 = " << b_scales.size(2) << " is not size_n = " << size_n;
+  num_groups = b_scales.size(1);
+
+  const auto empty_tensor = tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {0}, DLDataType{2, 32, 4}, c.device());
+  tvm::ffi::TensorView g_idx = empty_tensor, perm = empty_tensor, a_tmp = empty_tensor;
+
+  if (g_idx_or_none.has_value() && perm_or_none.has_value()) {
+    g_idx = g_idx_or_none.value();
+    perm = perm_or_none.value();
+
+    TVM_FFI_ICHECK(g_idx.device().device_type == kDLCUDA) << "g_idx is not on GPU";
+    TVM_FFI_ICHECK(g_idx.is_contiguous()) << "g_idx is not contiguous";
+    TVM_FFI_ICHECK(perm.device().device_type == kDLCUDA) << "perm is not on GPU";
+    TVM_FFI_ICHECK(perm.is_contiguous()) << "perm is not contiguous";
+
+    TVM_FFI_ICHECK((g_idx.size(-1) == 0 && perm.size(-1) == 0) || (g_idx.size(-1) == size_k && perm.size(-1) == size_k))
+        << "Unexpected g_idx.size(-1) = " << g_idx.size(-1) << " and perm.size(-1) = " << perm.size(-1)
+        << ", where size_k = " << size_k;
+  }
+  bool has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
+
+  if (has_act_order) {
+    const auto a_tensor =
+        tvm::ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, {size_m * top_k, size_k}, a.dtype(), a.device());
+    a_tmp = a_tensor;
+    if (is_k_full) {
+      TVM_FFI_ICHECK(num_groups > 1) << "For act_order, num_groups must be > 1";
+      TVM_FFI_ICHECK(size_k % num_groups == 0)
+          << "size_k = " << size_k << " is not divisible by num_groups = " << num_groups;
+      group_size = size_k / num_groups;
+    } else {
+      group_size = 0;
+    }
+  } else {
+    if (num_groups > 1) {
+      TVM_FFI_ICHECK(size_k % num_groups == 0)
+          << "size_k = " << size_k << " is not divisible by num_groups = " << num_groups;
+      group_size = size_k / num_groups;
+    } else {
+      group_size = -1;
+    }
+  }
+
+  tvm::ffi::TensorView global_scale = empty_tensor;
+  if (global_scale_or_none.has_value()) {
+    global_scale = global_scale_or_none.value();
+    TVM_FFI_ICHECK(b_q_type.code == kDLFloat4_e2m1fn && group_size == 16)
+        << "global_scale can only be used for nvfp4 format.";
+  } else {
+    TVM_FFI_ICHECK(!(b_q_type.code == kDLFloat4_e2m1fn && group_size == 16))
+        << "the global_scale parameter must be passed for nvfp4 format.";
+  }
+
+  bool has_bias = b_bias_or_none.has_value();
+  tvm::ffi::TensorView b_bias = empty_tensor;
+  if (has_bias) {
+    b_bias = b_bias_or_none.value();
+    TVM_FFI_ICHECK(b_bias.device().device_type == kDLCUDA) << "b_bias is not on GPU";
+    TVM_FFI_ICHECK(b_bias.is_contiguous()) << "b_bias is not contiguous";
+    TVM_FFI_ICHECK(b_bias.size(1) == size_n) << "b_bias.size(1) != size_n";
+    TVM_FFI_ICHECK(b_bias.stride(1) == 1) << "b_bias.stride(1) != 1";
+  }
+
+  tvm::ffi::TensorView b_zeros = empty_tensor;
+  if (b_zeros_or_none.has_value()) {
+    b_zeros = b_zeros_or_none.value();
+    TVM_FFI_ICHECK(b_zeros.device().device_type == kDLCUDA) << "b_zeros is not on GPU";
+    TVM_FFI_ICHECK(b_zeros.is_contiguous()) << "b_zeros is not contiguous";
+  }
+  bool has_zp = b_zeros.size(-1) > 0;
+  if (has_zp) {
+    TVM_FFI_ICHECK(b_q_type.code == kDLUInt && (b_q_type.bits == 4 || b_q_type.bits == 8))
+        << "b_q_type must be u4 or u8 when has_zp = True. Got = " << b_q_type;
+  } else {
+    TVM_FFI_ICHECK(
+        (b_q_type.code == kDLUInt && (b_q_type.bits == 4 || b_q_type.bits == 8)) || b_q_type.code == kDLFloat4_e2m1fn)
+        << "b_q_type must be uint4b8, uint8b128 or float4_e2m1f when has_zp = False. Got = " << b_q_type;
+  }
+
+  if (has_zp && is_zp_float) {
+    TVM_FFI_ICHECK(a.dtype().code == kDLFloat && a.dtype().bits == 16)
+        << "Computation type must be float16 (half) when using float zero points.";
+  }
+
+  // Verify b_zeros
+  if (has_zp) {
+    int rank = b_zeros.ndim();
+    TVM_FFI_ICHECK(rank == 3) << "b_zeros rank = " << rank << " is not 3";
+    if (is_zp_float) {
+      TVM_FFI_ICHECK(b_zeros.size(2) == size_n)
+          << "b_zeros dim 2 = " << b_zeros.size(2) << " is not size_n = " << size_n;
+      TVM_FFI_ICHECK(num_groups == b_zeros.size(1))
+          << "b_zeros dim 1 = " << b_zeros.size(1) << " is not num_groups = " << num_groups;
+      TVM_FFI_ICHECK(num_groups != -1) << "num_groups must be != -1";
+    } else {
+      TVM_FFI_ICHECK(b_zeros.size(1) == num_groups)
+          << "b_zeros dim 1 = " << b_zeros.size(1) << " is not num_groups = " << num_groups;
+      TVM_FFI_ICHECK(b_zeros.size(2) == size_n / pack_factor)
+          << "b_zeros dim 2 = " << b_zeros.size(2) << " is not size_n / pack_factor = " << size_n / pack_factor;
+    }
+  }
+
+  // Verify workspace size
+  TVM_FFI_ICHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0)
+      << "size_n = " << size_n << " is not divisible by min_thread_n = " << MARLIN_NAMESPACE_NAME::min_thread_n;
+
+  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
+  int min_workspace_size = min(max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
+  TVM_FFI_ICHECK(workspace.numel() >= min_workspace_size)
+      << "workspace.numel = " << workspace.numel() << " is below min_workspace_size = " << min_workspace_size;
+
+  int dev = a.device().device_id;
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FLOAT16(a.dtype(), scalar_t, [&]() {
+    if (b_q_type.code == kDLFloat4_e2m1fn) {
+      TVM_FFI_ICHECK(group_size == 16 || group_size == 32) << "group_size must be 16 or 32";
+    }
+    void* scales_ptr = b_scales.data_ptr();
+
+    marlin_mm<scalar_t>(
+        a.data_ptr(),
+        b_q_weight.data_ptr(),
+        c.data_ptr(),
+        c_tmp.data_ptr(),
+        b_bias.data_ptr(),
+        scales_ptr,
+        global_scale.data_ptr(),
+        b_zeros.data_ptr(),
+        g_idx.data_ptr(),
+        perm.data_ptr(),
+        a_tmp.data_ptr(),
+        sorted_token_ids.data_ptr(),
+        expert_ids.data_ptr(),
+        num_tokens_past_padded.data_ptr(),
+        topk_weights.data_ptr(),
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        is_ep,
+        size_m,
+        size_n,
+        size_k,
+        workspace.data_ptr(),
+        b_q_type.bits,
+        has_bias,
+        has_act_order,
+        is_k_full,
+        has_zp,
+        num_groups,
+        group_size,
+        dev,
+        static_cast<cudaStream_t>(TVMFFIEnvGetStream(a.device().device_type, dev)),
+        thread_k,
+        thread_n,
+        sms,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float);
+  });
+}
+
+}  // namespace MARLIN_NAMESPACE_NAME
