@@ -173,7 +173,6 @@ class DataParallelController:
 
         self.init_dispatcher()
 
-        # Watchdog state
         self.dispatch_ct = 0
         self.is_dispatching = False
 

@@ -299,7 +299,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
 
-        # Watchdog state
         self.receive_ct = 0
         self.is_receiving = False
 

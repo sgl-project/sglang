@@ -114,7 +114,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         )
 
-        # Watchdog state
         self.process_ct = 0
         self.is_processing = False
 
