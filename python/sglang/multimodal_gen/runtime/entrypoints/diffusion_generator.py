@@ -211,9 +211,6 @@ class DiffGenerator:
         results = []
         total_start_time = time.perf_counter()
 
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
@@ -244,19 +241,13 @@ class DiffGenerator:
                             data_type=req.data_type,
                         )
 
-                        peak_memory_mb = 0.0
-                        if torch.cuda.is_available():
-                            peak_memory_bytes = torch.cuda.max_memory_allocated()
-                            peak_memory_mb = peak_memory_bytes / (1024**2)
-                            torch.cuda.reset_peak_memory_stats()
-
                         result_item: dict[str, Any] = {
                             "samples": sample,
                             "frames": frames,
                             "prompts": req.prompt,
                             "size": (req.height, req.width, req.num_frames),
                             "generation_time": timer.duration,
-                            "peak_memory_mb": peak_memory_mb,
+                            "peak_memory_mb": output_batch.peak_memory_mb,
                             "timings": (
                                 output_batch.timings.to_dict()
                                 if output_batch.timings
