@@ -736,19 +736,11 @@ impl PDRouter {
             routing_id,
         };
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            &info,
-            "prefill",
-        )?;
+        let prefill =
+            Self::pick_worker_by_policy_arc(&prefill_workers, &*prefill_policy, &info, "prefill")?;
 
-        let decode = Self::pick_worker_by_policy_arc(
-            &decode_workers,
-            &*decode_policy,
-            &info,
-            "decode",
-        )?;
+        let decode =
+            Self::pick_worker_by_policy_arc(&decode_workers, &*decode_policy, &info, "decode")?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or("default");

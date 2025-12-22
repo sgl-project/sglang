@@ -6,8 +6,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::core::Worker;
-use crate::observability::metrics::Metrics;
+use crate::{core::Worker, observability::metrics::Metrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
@@ -222,7 +221,11 @@ mod tests {
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(result, Some(first_idx), "Same routing_id should route to same worker");
+            assert_eq!(
+                result,
+                Some(first_idx),
+                "Same routing_id should route to same worker"
+            );
             assert_eq!(branch, ExecutionBranch::FastPathHit);
         }
     }
@@ -418,7 +421,11 @@ mod tests {
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(result, Some(new_idx), "Should consistently route to new worker");
+            assert_eq!(
+                result,
+                Some(new_idx),
+                "Should consistently route to new worker"
+            );
             assert_eq!(branch, ExecutionBranch::FastPathHit);
         }
     }
@@ -543,9 +550,7 @@ mod tests {
 
         workers[second_idx].set_healthy(false);
 
-        let remaining_idx = (0..3)
-            .find(|&i| i != first_idx && i != second_idx)
-            .unwrap();
+        let remaining_idx = (0..3).find(|&i| i != first_idx && i != second_idx).unwrap();
         let (third_result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(
             third_result,
@@ -725,7 +730,11 @@ mod tests {
         let healthy_indices = vec![0, 1, 2];
 
         let result = find_healthy_worker(&urls, &workers, &healthy_indices);
-        assert_eq!(result, Some(0), "Should return first healthy worker in urls");
+        assert_eq!(
+            result,
+            Some(0),
+            "Should return first healthy worker in urls"
+        );
 
         workers[0].set_healthy(false);
         let healthy_indices = vec![1, 2];
@@ -758,8 +767,14 @@ mod tests {
             ),
         ];
 
-        assert_eq!(find_worker_index_by_url(&workers, "http://w1:8000"), Some(0));
-        assert_eq!(find_worker_index_by_url(&workers, "http://w2:8000"), Some(1));
+        assert_eq!(
+            find_worker_index_by_url(&workers, "http://w1:8000"),
+            Some(0)
+        );
+        assert_eq!(
+            find_worker_index_by_url(&workers, "http://w2:8000"),
+            Some(1)
+        );
         assert_eq!(
             find_worker_index_by_url(&workers, "http://w3:8000"),
             None,
@@ -808,7 +823,10 @@ mod tests {
         workers[1].set_healthy(false);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, None, "Should return None when all workers are unhealthy");
+        assert_eq!(
+            result, None,
+            "Should return None when all workers are unhealthy"
+        );
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
 
         workers[first_idx].set_healthy(true);
