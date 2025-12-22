@@ -40,7 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.mtp_utils import assign_new_state_triton
+from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -51,7 +51,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.mtp_worker_v2 import MTPDraftWorker
+    from sglang.srt.speculative.multi_layer_eagle_worker_v2 import MTPDraftWorker
 
 
 logger = logging.getLogger(__name__)

@@ -48,7 +48,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
-from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
+from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MTPDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

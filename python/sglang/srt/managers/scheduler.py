@@ -486,7 +486,9 @@ class Scheduler(
         # FIXME: refactor the draft worker registration logic
         if self.server_args.enable_multi_layer_eagle:
             if self.enable_overlap:
-                from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MTPWorkerV2,
+                )
 
                 self.draft_worker = MTPWorkerV2(
                     gpu_id=self.gpu_id,
@@ -498,7 +500,7 @@ class Scheduler(
                     dp_rank=self.dp_rank,
                 )
             else:
-                from sglang.srt.speculative.mtp_worker import MTPWorker
+                from sglang.srt.speculative.multi_layer_eagle_worker import MTPWorker
 
                 self.draft_worker = MTPWorker(
                     gpu_id=self.gpu_id,
