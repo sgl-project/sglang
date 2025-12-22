@@ -3,7 +3,7 @@
 //! This module defines the RequestPipeline orchestrator that coordinates
 //! the execution of pipeline stages from request preparation to response delivery.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::response::{IntoResponse, Response};
 use tracing::error;
@@ -11,17 +11,20 @@ use tracing::error;
 use super::{
     common::stages::*,
     context::*,
-    error, harmony,
+    harmony,
     regular::{processor, stages::*, streaming},
+    utils::error_type_from_status,
 };
 use crate::{
     core::WorkerRegistry,
+    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         generate::GenerateRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::error,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -33,6 +36,8 @@ use crate::{
 #[derive(Clone)]
 pub struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
+    /// Backend type for metrics labeling
+    backend_type: &'static str,
 }
 
 impl RequestPipeline {
@@ -60,6 +65,7 @@ impl RequestPipeline {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            metrics_labels::BACKEND_REGULAR,
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
@@ -78,6 +84,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_REGULAR,
         }
     }
 
@@ -107,6 +114,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_REGULAR,
         }
     }
 
@@ -136,6 +144,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_PD,
         }
     }
 
@@ -163,6 +172,7 @@ impl RequestPipeline {
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
+            metrics_labels::BACKEND_PD,
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
@@ -181,6 +191,7 @@ impl RequestPipeline {
 
         Self {
             stages: Arc::new(stages),
+            backend_type: metrics_labels::BACKEND_PD,
         }
     }
 
@@ -192,22 +203,49 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
+        let start = Instant::now();
+        // Clone Arc for metrics (cheap atomic increment) to avoid borrow issues
+        let request_for_metrics = Arc::clone(&request);
+        let streaming = request.stream;
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            &request_for_metrics.model,
+            metrics_labels::ENDPOINT_CHAT,
+            bool_to_static_str(streaming),
+        );
+
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
-        for (idx, stage) in self.stages.iter().enumerate() {
+        for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
-                    // Stage completed successfully with a response (e.g., streaming)
+                    // Stage completed with streaming response - record success and return
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        &request_for_metrics.model,
+                        metrics_labels::ENDPOINT_CHAT,
+                        start.elapsed(),
+                    );
                     return response;
                 }
-                Ok(None) => {
-                    continue;
-                }
+                Ok(None) => continue,
                 Err(response) => {
-                    // Error occurred
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        &request_for_metrics.model,
+                        metrics_labels::ENDPOINT_CHAT,
+                        error_type_from_status(response.status()),
+                    );
                     error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
+                        "Stage {} failed with status {}",
                         stage.name(),
                         response.status()
                     );
@@ -217,20 +255,46 @@ impl RequestPipeline {
         }
 
         match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Chat(response)) => {
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    &request_for_metrics.model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    start.elapsed(),
+                );
+                axum::Json(response).into_response()
+            }
             Some(FinalResponse::Generate(_)) => {
                 error!(
                     function = "execute_chat",
                     "Wrong response type: expected Chat, got Generate"
                 );
-                error::internal_error("Internal error: wrong response type")
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    &request_for_metrics.model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_INTERNAL,
+                );
+                error::internal_error("wrong_response_type", "Internal error: wrong response type")
             }
             None => {
                 error!(
                     function = "execute_chat",
                     "No response produced by pipeline"
                 );
-                error::internal_error("No response produced")
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    &request_for_metrics.model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    metrics_labels::ERROR_INTERNAL,
+                );
+                error::internal_error("no_response_produced", "No response produced")
             }
         }
     }
@@ -243,22 +307,49 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
+        let start = Instant::now();
+        // Clone model_id for metrics before moving into context
+        // GenerateRequest doesn't have a model field, so we use model_id
+        let model_for_metrics = model_id.clone();
+        let streaming = request.stream;
+
+        // Record request start
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model_for_metrics.as_deref().unwrap_or("unknown"),
+            metrics_labels::ENDPOINT_GENERATE,
+            bool_to_static_str(streaming),
+        );
+
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
 
-        for (idx, stage) in self.stages.iter().enumerate() {
+        for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
-                    // Stage completed successfully with a response (e.g., streaming)
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        metrics_labels::ENDPOINT_GENERATE,
+                        start.elapsed(),
+                    );
                     return response;
                 }
-                Ok(None) => {
-                    continue;
-                }
+                Ok(None) => continue,
                 Err(response) => {
-                    // Error occurred
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_GRPC,
+                        self.backend_type,
+                        metrics_labels::CONNECTION_GRPC,
+                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        metrics_labels::ENDPOINT_GENERATE,
+                        error_type_from_status(response.status()),
+                    );
                     error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
+                        "Stage {} failed with status {}",
                         stage.name(),
                         response.status()
                     );
@@ -268,20 +359,46 @@ impl RequestPipeline {
         }
 
         match ctx.state.response.final_response {
-            Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Generate(response)) => {
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    metrics_labels::ENDPOINT_GENERATE,
+                    start.elapsed(),
+                );
+                axum::Json(response).into_response()
+            }
             Some(FinalResponse::Chat(_)) => {
                 error!(
                     function = "execute_generate",
                     "Wrong response type: expected Generate, got Chat"
                 );
-                error::internal_error("Internal error: wrong response type")
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    metrics_labels::ENDPOINT_GENERATE,
+                    metrics_labels::ERROR_INTERNAL,
+                );
+                error::internal_error("wrong_response_type", "Internal error: wrong response type")
             }
             None => {
                 error!(
                     function = "execute_generate",
                     "No response produced by pipeline"
                 );
-                error::internal_error("No response produced")
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    metrics_labels::ENDPOINT_GENERATE,
+                    metrics_labels::ERROR_INTERNAL,
+                );
+                error::internal_error("no_response_produced", "No response produced")
             }
         }
     }
@@ -310,6 +427,7 @@ impl RequestPipeline {
                         "Streaming attempted in responses context"
                     );
                     return Err(error::bad_request(
+                        "streaming_not_supported",
                         "Streaming is not supported in this context".to_string(),
                     ));
                 }
@@ -336,14 +454,20 @@ impl RequestPipeline {
                     function = "execute_chat_for_responses",
                     "Wrong response type: expected Chat, got Generate"
                 );
-                Err(error::internal_error("Internal error: wrong response type"))
+                Err(error::internal_error(
+                    "wrong_response_type",
+                    "Internal error: wrong response type",
+                ))
             }
             None => {
                 error!(
                     function = "execute_chat_for_responses",
                     "No response produced by pipeline"
                 );
-                Err(error::internal_error("No response produced"))
+                Err(error::internal_error(
+                    "no_response_produced",
+                    "No response produced",
+                ))
             }
         }
     }
@@ -414,19 +538,23 @@ impl RequestPipeline {
                     function = "execute_harmony_responses",
                     "No ResponsesIterationResult produced by pipeline"
                 );
-                error::internal_error("No ResponsesIterationResult produced by pipeline")
+                error::internal_error(
+                    "no_responses_iteration_result",
+                    "No ResponsesIterationResult produced by pipeline",
+                )
             })
     }
 
     /// Execute Harmony Responses pipeline iteration with streaming support
     ///
     /// This version executes the pipeline up to the dispatch stage and returns
-    /// the raw ExecutionResult (with stream) for token-level streaming processing.
+    /// the raw ExecutionResult (with stream) and LoadGuards for token-level streaming processing.
+    /// The caller is responsible for keeping load_guards alive until stream processing completes.
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &crate::protocols::responses::ResponsesRequest,
         harmony_ctx: &harmony::responses::HarmonyResponsesContext,
-    ) -> Result<ExecutionResult, Response> {
+    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
@@ -458,13 +586,20 @@ impl RequestPipeline {
             }
         }
 
-        // Extract execution_result (the raw stream from workers)
-        ctx.state.response.execution_result.take().ok_or_else(|| {
+        // Extract execution_result (the raw stream from workers) and load_guards
+        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
             error!(
                 function = "execute_harmony_responses_streaming",
                 "No ExecutionResult produced by pipeline"
             );
-            error::internal_error("No ExecutionResult produced by pipeline")
-        })
+            error::internal_error(
+                "no_execution_result_produced",
+                "No ExecutionResult produced by pipeline",
+            )
+        })?;
+
+        let load_guards = ctx.state.load_guards.take();
+
+        Ok((execution_result, load_guards))
     }
 }

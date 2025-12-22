@@ -25,10 +25,15 @@ from sglang.multimodal_gen.configs.sample.teacache import (
     WanTeaCacheParams,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import align_to
 
 if TYPE_CHECKING:
 
     from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -51,12 +56,13 @@ class Req:
     generator: torch.Generator | list[torch.Generator] | None = None
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
+    vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -88,7 +94,9 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str = (
+        "cuda"  # Device for random generator: "cuda", "musa" or "cpu"
+    )
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
@@ -126,7 +134,10 @@ class Req:
     boundary_ratio: float | None = None
 
     # Scheduler parameters
-    num_inference_steps: int = 50
+    # Can be overridden via SGLANG_TEST_NUM_INFERENCE_STEPS env var for faster testing
+    num_inference_steps: int = int(
+        os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS", "50")
+    )
     guidance_scale: float = 1.0
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
@@ -196,7 +207,7 @@ class Req:
         batch_size *= self.num_outputs_per_prompt
         return batch_size
 
-    def output_file_path(self, num_outputs, output_idx):
+    def output_file_path(self, num_outputs=1, output_idx=None):
         output_file_name = self.output_file_name
         if num_outputs > 1 and output_file_name:
             base, ext = os.path.splitext(output_file_name)
@@ -223,6 +234,37 @@ class Req:
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
+
+    def log(self, server_args: ServerArgs):
+        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
+        if self.height:
+            target_height = align_to(self.height, 16)
+        else:
+            target_height = -1
+        if self.width:
+            target_width = align_to(self.width, 16)
+        else:
+            target_width = -1
+
+        # Log sampling parameters
+        debug_str = f"""Sampling params:
+                       width: {target_width}
+                      height: {target_height}
+                  num_frames: {self.num_frames}
+                      prompt: {self.prompt}
+                  neg_prompt: {self.negative_prompt}
+                        seed: {self.seed}
+                 infer_steps: {self.num_inference_steps}
+      num_outputs_per_prompt: {self.num_outputs_per_prompt}
+              guidance_scale: {self.guidance_scale}
+     embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
+                    n_tokens: {self.n_tokens}
+                  flow_shift: {server_args.pipeline_config.flow_shift}
+                  image_path: {self.image_path}
+                 save_output: {self.save_output}
+            output_file_path: {self.output_file_path()}
+        """  # type: ignore[attr-defined]
+        logger.info(debug_str)
 
 
 @dataclass

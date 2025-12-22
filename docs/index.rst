@@ -23,6 +23,7 @@ Its core features include:
 
    basic_usage/send_request.ipynb
    basic_usage/openai_api.rst
+   basic_usage/ollama_api.md
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
@@ -45,6 +46,8 @@ Its core features include:
    advanced_features/expert_parallelism.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
+   advanced_features/epd_disaggregation.md
+   advanced_features/pipeline_parallelism.md
    advanced_features/hicache.rst
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
@@ -60,6 +63,7 @@ Its core features include:
 
    supported_models/generative_models.md
    supported_models/multimodal_language_models.md
+   supported_models/diffusion_language_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md

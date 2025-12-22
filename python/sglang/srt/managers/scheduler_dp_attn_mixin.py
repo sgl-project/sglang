@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -73,6 +74,7 @@ def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
+    skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
@@ -83,9 +85,10 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
-    batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
-    batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
-    batch.global_forward_mode = mlp_sync_info.global_forward_mode
+    if not skip_all_gather:
+        batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+        batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
+        batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
@@ -124,6 +127,7 @@ def prepare_mlp_sync_batch_raw(
             # When return_logprob = False, only need last token per request
             num_tokens_for_logprob = local_batch.batch_size()
 
+    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
@@ -154,15 +158,17 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
     )
-    mlp_sync_info.all_gather(device=device, group=group)
 
-    mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
-        tbo_preparer.compute_output(
-            mlp_sync_info.tp0_info[:, 4:6],
+    if not skip_all_gather:
+        mlp_sync_info.all_gather(device=device, group=group)
+
+        mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
+            tbo_preparer.compute_output(
+                mlp_sync_info.tp0_info[:, 4:6],
+            )
         )
-    )
 
-    need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
+    need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
         batch_to_gather = local_batch
         if local_batch is None:
@@ -170,7 +176,9 @@ def prepare_mlp_sync_batch_raw(
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
-        _update_gather_batch(batch_to_gather, mlp_sync_info, require_mlp_tp_gather)
+        _update_gather_batch(
+            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+        )
 
     return local_batch
 

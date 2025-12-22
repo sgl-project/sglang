@@ -1,27 +1,129 @@
-//! Unified Worker Management Module
+//! Worker Management Module
 //!
-//! Handles all aspects of worker lifecycle including discovery, initialization,
-//! runtime management, and health monitoring.
+//! Provides worker lifecycle operations and fan-out request utilities.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use axum::response::{IntoResponse, Response};
-use futures::future;
-use http::{Method, StatusCode};
-use serde_json::Value;
+use axum::{
+    response::{IntoResponse, Response},
+    Json,
+};
+use futures::{
+    future,
+    stream::{self, StreamExt},
+};
+use http::StatusCode;
+use serde_json::{json, Value};
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    core::{metrics_aggregator::MetricPack, ConnectionMode, WorkerRegistry, WorkerType},
+    core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
 
-/// Unified worker management
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT: usize = 32;
+
+/// Result of a fan-out request to a single worker
+struct WorkerResponse {
+    url: String,
+    result: Result<reqwest::Response, reqwest::Error>,
+}
+
+/// Fan out requests to workers in parallel
+async fn fan_out(
+    workers: &[Arc<dyn Worker>],
+    client: &reqwest::Client,
+    endpoint: &str,
+    method: reqwest::Method,
+) -> Vec<WorkerResponse> {
+    let futures: Vec<_> = workers
+        .iter()
+        .map(|worker| {
+            let client = client.clone();
+            let url = worker.url().to_string();
+            let full_url = format!("{}/{}", url, endpoint);
+            let api_key = worker.api_key().clone();
+            let method = method.clone();
+
+            async move {
+                let mut req = client.request(method, &full_url).timeout(REQUEST_TIMEOUT);
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
+                WorkerResponse {
+                    url,
+                    result: req.send().await,
+                }
+            }
+        })
+        .collect();
+
+    stream::iter(futures)
+        .buffer_unordered(MAX_CONCURRENT)
+        .collect()
+        .await
+}
+
+impl IntoResponse for FlushCacheResult {
+    fn into_response(self) -> Response {
+        let status = if self.failed.is_empty() {
+            StatusCode::OK
+        } else {
+            StatusCode::PARTIAL_CONTENT
+        };
+
+        let mut body = json!({
+            "status": if self.failed.is_empty() { "success" } else { "partial_success" },
+            "message": self.message,
+            "workers_flushed": self.successful.len(),
+            "total_http_workers": self.http_workers,
+            "total_workers": self.total_workers
+        });
+
+        if !self.failed.is_empty() {
+            body["successful"] = json!(self.successful);
+            body["failed"] = json!(self
+                .failed
+                .into_iter()
+                .map(|(url, err)| json!({"worker": url, "error": err}))
+                .collect::<Vec<_>>());
+        }
+
+        (status, Json(body)).into_response()
+    }
+}
+
+impl IntoResponse for WorkerLoadsResult {
+    fn into_response(self) -> Response {
+        let loads: Vec<Value> = self
+            .loads
+            .iter()
+            .map(|info| json!({"worker": &info.worker, "load": info.load}))
+            .collect();
+        Json(json!({"workers": loads})).into_response()
+    }
+}
+
+pub enum EngineMetricsResult {
+    Ok(String),
+    Err(String),
+}
+
+impl IntoResponse for EngineMetricsResult {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Ok(text) => (StatusCode::OK, text).into_response(),
+            Self::Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        }
+    }
+}
+
 pub struct WorkerManager;
 
 impl WorkerManager {
@@ -33,77 +135,44 @@ impl WorkerManager {
             .collect()
     }
 
-    /// Flush cache on all workers
-    ///
-    /// Sends a POST request to /flush_cache endpoint on all HTTP workers.
-    /// Returns detailed results showing which workers succeeded and which failed.
     pub async fn flush_cache_all(
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
-    ) -> Result<FlushCacheResult, String> {
-        warn!("Flushing cache for ALL workers - this may impact performance temporarily");
-
+    ) -> FlushCacheResult {
         let workers = worker_registry.get_all();
+        let total_workers = workers.len();
 
         let http_workers: Vec<_> = workers
-            .iter()
+            .into_iter()
             .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
             .collect();
 
         if http_workers.is_empty() {
-            return Ok(FlushCacheResult {
+            return FlushCacheResult {
                 successful: vec![],
                 failed: vec![],
-                total_workers: workers.len(),
+                total_workers,
                 http_workers: 0,
                 message: "No HTTP workers available for cache flush".to_string(),
-            });
+            };
         }
 
         info!(
-            "Flushing cache on {} HTTP workers (out of {} total workers)",
+            "Flushing cache on {} HTTP workers (out of {} total)",
             http_workers.len(),
-            workers.len()
+            total_workers
         );
 
-        let mut tasks = Vec::new();
-        for worker in &http_workers {
-            let url = worker.url().to_string();
-            let flush_url = format!("{}/flush_cache", url);
-            let mut request = client.post(&flush_url);
-
-            if let Some(api_key) = worker.api_key() {
-                request = request.header("Authorization", format!("Bearer {}", api_key));
-            }
-
-            let worker_url = url.clone();
-            tasks.push(async move {
-                let result = request.send().await;
-                (worker_url, result)
-            });
-        }
-
-        let results = future::join_all(tasks).await;
+        let responses = fan_out(&http_workers, client, "flush_cache", reqwest::Method::POST).await;
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();
 
-        for (url, result) in results {
-            match result {
-                Ok(response) if response.status().is_success() => {
-                    debug!("Successfully flushed cache on worker: {}", url);
-                    successful.push(url);
-                }
-                Ok(response) => {
-                    let error = format!("HTTP {}", response.status());
-                    warn!("Failed to flush cache on worker {}: {}", url, error);
-                    failed.push((url, error));
-                }
-                Err(e) => {
-                    let error = e.to_string();
-                    error!("Failed to connect to worker {}: {}", url, error);
-                    failed.push((url, error));
-                }
+        for resp in responses {
+            match resp.result {
+                Ok(r) if r.status().is_success() => successful.push(resp.url),
+                Ok(r) => failed.push((resp.url, format!("HTTP {}", r.status()))),
+                Err(e) => failed.push((resp.url, e.to_string())),
             }
         }
 
@@ -114,76 +183,20 @@ impl WorkerManager {
             )
         } else {
             format!(
-                "Cache flush completed: {} succeeded, {} failed (out of {} HTTP workers)",
+                "Cache flush: {} succeeded, {} failed",
                 successful.len(),
-                failed.len(),
-                http_workers.len()
+                failed.len()
             )
         };
 
         info!("{}", message);
 
-        Ok(FlushCacheResult {
+        FlushCacheResult {
             successful,
             failed,
-            total_workers: workers.len(),
+            total_workers,
             http_workers: http_workers.len(),
             message,
-        })
-    }
-    pub async fn get_worker_load(
-        url: &str,
-        api_key: Option<&str>,
-        client: &reqwest::Client,
-    ) -> Option<isize> {
-        let load_url = format!("{}/get_load", url);
-        let mut request = client.get(&load_url);
-
-        if let Some(key) = api_key {
-            request = request.bearer_auth(key);
-        }
-
-        match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(json) => {
-                        // The /get_load endpoint returns an array of load info objects (one per DP rank)
-                        // Each object has: {dp_rank, num_reqs, num_waiting_reqs, num_tokens}
-                        if let Some(array) = json.as_array() {
-                            let total_tokens: i64 = array
-                                .iter()
-                                .filter_map(|entry| {
-                                    entry.get("num_tokens").and_then(|v| v.as_i64())
-                                })
-                                .sum();
-                            debug!("Worker {} load (total tokens): {}", url, total_tokens);
-                            Some(total_tokens as isize)
-                        } else {
-                            warn!(
-                                "Invalid load response from {}: expected array, got {:?}",
-                                url, json
-                            );
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse load response from {}: {}", url, e);
-                        None
-                    }
-                }
-            }
-            Ok(response) => {
-                warn!(
-                    "Failed to get load from {}: HTTP {}",
-                    url,
-                    response.status()
-                );
-                None
-            }
-            Err(e) => {
-                warn!("Failed to connect to {} for load check: {}", url, e);
-                None
-            }
         }
     }
 
@@ -194,38 +207,35 @@ impl WorkerManager {
         let workers = worker_registry.get_all();
         let total_workers = workers.len();
 
-        // Prepare tasks for parallel execution
-        let mut tasks = Vec::new();
-        for worker in &workers {
-            let url = worker.url().to_string();
-            let api_key = worker.api_key().clone();
-            let worker_type = match worker.worker_type() {
-                WorkerType::Regular => None,
-                WorkerType::Prefill { .. } => Some("prefill".to_string()),
-                WorkerType::Decode => Some("decode".to_string()),
-            };
-            let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
-            let client = client.clone();
-
-            tasks.push(async move {
-                let load = if is_http {
-                    Self::get_worker_load(&url, api_key.as_deref(), &client)
-                        .await
-                        .unwrap_or(-1)
-                } else {
-                    -1
+        let futures: Vec<_> = workers
+            .iter()
+            .map(|worker| {
+                let url = worker.url().to_string();
+                let api_key = worker.api_key().clone();
+                let worker_type = match worker.worker_type() {
+                    WorkerType::Regular => None,
+                    WorkerType::Prefill { .. } => Some("prefill".to_string()),
+                    WorkerType::Decode => Some("decode".to_string()),
                 };
+                let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
+                let client = client.clone();
 
-                WorkerLoadInfo {
-                    worker: url,
-                    worker_type,
-                    load,
+                async move {
+                    let load = if is_http {
+                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
+                    } else {
+                        -1
+                    };
+                    WorkerLoadInfo {
+                        worker: url,
+                        worker_type,
+                        load,
+                    }
                 }
-            });
-        }
+            })
+            .collect();
 
-        let loads = future::join_all(tasks).await;
-
+        let loads = future::join_all(futures).await;
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();
 
@@ -237,88 +247,65 @@ impl WorkerManager {
         }
     }
 
+    async fn parse_load_response(
+        client: &reqwest::Client,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> isize {
+        let load_url = format!("{}/get_load", url);
+        let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
+        if let Some(key) = api_key {
+            req = req.bearer_auth(key);
+        }
+
+        match req.send().await {
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(json) if json.is_array() => json
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|e| e.get("num_tokens").and_then(|v| v.as_i64()))
+                    .sum::<i64>() as isize,
+                _ => -1,
+            },
+            _ => -1,
+        }
+    }
+
     pub async fn get_engine_metrics(
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
-    ) -> Response {
-        let engine_responses =
-            match Self::fan_out_simple_request(worker_registry, client, "metrics", Method::GET)
-                .await
-            {
-                Ok(x) => x,
-                Err(e) => return e,
-            };
-        let engine_responses = engine_responses
-            .into_iter()
-            .map(|(worker_base_url, metrics_text)| MetricPack {
-                labels: vec![("worker_addr".into(), worker_base_url)],
-                metrics_text,
-            })
-            .collect();
-        let text = match crate::core::metrics_aggregator::aggregate_metrics(engine_responses) {
-            Ok(x) => x,
-            Err(e) => {
-                let error_msg = format!("Failed to aggregate metrics: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response();
-            }
-        };
-        (StatusCode::OK, text).into_response()
-    }
-
-    async fn fan_out_simple_request(
-        worker_registry: &WorkerRegistry,
-        client: &reqwest::Client,
-        endpoint: &str,
-        method: Method,
-    ) -> Result<Vec<(String, String)>, Response> {
+    ) -> EngineMetricsResult {
         let workers = worker_registry.get_all();
+
         if workers.is_empty() {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
+            return EngineMetricsResult::Err("No available workers".to_string());
         }
 
-        let mut responses = vec![];
-        // May do parallel requests later
-        for worker in workers {
-            let worker_url = worker.url().to_string();
+        let responses = fan_out(&workers, client, "metrics", reqwest::Method::GET).await;
 
-            let url = format!("{}/{}", worker_url, endpoint);
-            let mut request_builder = match method {
-                Method::GET => client.get(url),
-                Method::POST => client.post(url),
-                _ => {
-                    return Err((
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Unsupported method for simple routing",
-                    )
-                        .into_response())
-                }
-            };
-
-            if let Some(api_key) = worker.api_key() {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
-            }
-
-            match request_builder.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match res.text().await {
-                        Ok(body_text) => {
-                            if status.is_success() {
-                                responses.push((worker_url, body_text));
-                            }
-                        }
-                        Err(e) => {
-                            warn!("fan_out_simple_request failed when reading text: {}", e)
-                        }
+        let mut metric_packs = Vec::new();
+        for resp in responses {
+            if let Ok(r) = resp.result {
+                if r.status().is_success() {
+                    if let Ok(text) = r.text().await {
+                        metric_packs.push(MetricPack {
+                            labels: vec![("worker_addr".into(), resp.url)],
+                            metrics_text: text,
+                        });
                     }
                 }
-                Err(e) => warn!("fan_out_simple_request failed when sending: {}", e),
             }
         }
 
-        Ok(responses)
+        if metric_packs.is_empty() {
+            return EngineMetricsResult::Err("All backend requests failed".to_string());
+        }
+
+        match crate::core::metrics_aggregator::aggregate_metrics(metric_packs) {
+            Ok(text) => EngineMetricsResult::Ok(text),
+            Err(e) => EngineMetricsResult::Err(format!("Failed to aggregate metrics: {}", e)),
+        }
     }
 }
 
@@ -334,7 +321,6 @@ pub struct LoadMonitor {
 }
 
 impl LoadMonitor {
-    /// Create a new load monitor
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -354,7 +340,6 @@ impl LoadMonitor {
         }
     }
 
-    /// Start monitoring worker loads
     pub async fn start(&self) {
         let mut handle_guard = self.monitor_handle.lock().await;
         if handle_guard.is_some() {
@@ -380,7 +365,6 @@ impl LoadMonitor {
         *handle_guard = Some(handle);
     }
 
-    /// Stop monitoring worker loads
     pub async fn stop(&self) {
         let mut handle_guard = self.monitor_handle.lock().await;
         if let Some(handle) = handle_guard.take() {
@@ -390,12 +374,10 @@ impl LoadMonitor {
         }
     }
 
-    /// Get a receiver for load updates
     pub fn subscribe(&self) -> watch::Receiver<HashMap<String, isize>> {
         self.rx.clone()
     }
 
-    /// The main monitoring loop
     async fn monitor_loop(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -438,7 +420,6 @@ impl LoadMonitor {
         }
     }
 
-    /// Check if monitoring is currently active
     pub async fn is_running(&self) -> bool {
         let handle_guard = self.monitor_handle.lock().await;
         handle_guard.is_some()

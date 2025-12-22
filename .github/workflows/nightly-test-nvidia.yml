@@ -22,6 +22,7 @@ on:
           - 'nightly-test-general-4-gpu-h100'
           - 'nightly-test-general-8-gpu-h200'
           - 'nightly-test-general-8-gpu-h20'
+          - 'nightly-test-general-8-gpu-b200'
           - 'nightly-test-text-accuracy-2-gpu-runner'
           - 'nightly-test-text-perf-2-gpu-runner'
           - 'nightly-test-vlm-accuracy-2-gpu-runner'
@@ -107,6 +108,17 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
+      - name: Run common 8-GPU model tests
+        if: always()
+        timeout-minutes: 200
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-h200"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
+
       - name: Run test
         timeout-minutes: 30
         env:
@@ -114,82 +126,6 @@ jobs:
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
-
-      - name: Run MiniMax-M2 nightly performance test
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-h200"
-        run: |
-          rm -rf test/performance_profiles_minimax_m2/
-          cd test
-          python3 nightly/test_minimax_m2_perf.py
-
-      - name: Publish MiniMax-M2 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_minimax_m2
-
-      - name: Run Qwen3-235B nightly performance test
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-h200"
-        run: |
-          rm -rf test/performance_profiles_qwen3_235b/
-          cd test
-          python3 nightly/test_qwen3_235b_perf.py
-
-      - name: Publish Qwen3-235B traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_qwen3_235b
-
-      - name: Run Kimi-K2-Thinking nightly performance test
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-h200"
-        run: |
-          rm -rf test/performance_profiles_kimi_k2_thinking/
-          cd test
-          python3 nightly/test_kimi_k2_thinking_perf.py
-
-      - name: Publish Kimi-K2-Thinking traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_kimi_k2_thinking
-
-      - name: Run GLM-4.6 nightly performance test
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-h200"
-        run: |
-          rm -rf test/performance_profiles_glm_4_6/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_glm_4_6_perf.py
-
-      - name: Publish GLM-4.6 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6
 
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
@@ -214,6 +150,28 @@ jobs:
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h20 --nightly --continue-on-error
+
+  # General tests - 8 GPU B200
+  nightly-test-general-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
+    runs-on: 8-gpu-b200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          GPU_CONFIG: "8-gpu-b200"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
@@ -423,145 +381,17 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run Mistral-Large-3 nightly performance test
-        timeout-minutes: 180
+      - name: Run common 8-GPU model tests
+        if: always()
+        timeout-minutes: 200
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
           SGLANG_ENABLE_JIT_DEEPGEMM: "0"
         run: |
-          rm -rf test/performance_profiles_mistral_large3/
           cd test
-          IS_BLACKWELL=1 python3 nightly/test_mistral_large3_perf.py
-
-      - name: Publish Mistral-Large-3 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_mistral_large3
-
-      - name: Run DeepSeek v3.1 nightly performance test
-        if: always()
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/performance_profiles_deepseek_v31/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py
-
-      - name: Publish DeepSeek v3.1 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v31
-
-      - name: Run DeepSeek v3.2 nightly performance test
-        if: always()
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/performance_profiles_deepseek_v32/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py
-
-      - name: Publish DeepSeek v3.2 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v32
-
-      - name: Run Kimi-K2-Thinking nightly performance test
-        if: always()
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/performance_profiles_kimi_k2_thinking/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_kimi_k2_thinking_perf.py
-
-      - name: Publish Kimi-K2-Thinking traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_kimi_k2_thinking
-
-      - name: Run Qwen3-235B nightly performance test
-        if: always()
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/performance_profiles_qwen3_235b/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_qwen3_235b_perf.py
-
-      - name: Publish Qwen3-235B traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_qwen3_235b
-
-      - name: Run GLM-4.6 nightly performance test
-        if: always()
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/performance_profiles_glm_4_6/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_glm_4_6_perf.py
-
-      - name: Publish GLM-4.6 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6
-
-      - name: Run MiniMax-M2 nightly performance test
-        if: always()
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/performance_profiles_minimax_m2/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_minimax_m2_perf.py
-
-      - name: Publish MiniMax-M2 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_minimax_m2
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
 
   # Final check job
   check-all-jobs:
@@ -571,6 +401,7 @@ jobs:
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20
+      - nightly-test-general-8-gpu-b200
       - nightly-test-text-accuracy-2-gpu-runner
       - nightly-test-text-perf-2-gpu-runner
       - nightly-test-vlm-accuracy-2-gpu-runner

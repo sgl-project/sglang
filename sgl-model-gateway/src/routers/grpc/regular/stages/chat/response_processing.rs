@@ -9,11 +9,13 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{FinalResponse, RequestContext},
+use crate::routers::{
     error,
-    regular::{processor, streaming},
+    grpc::{
+        common::stages::PipelineStage,
+        context::{FinalResponse, RequestContext},
+        regular::{processor, streaming},
+    },
 };
 
 /// Chat response processing stage
@@ -60,7 +62,7 @@ impl ChatResponseProcessingStage {
                 function = "ChatResponseProcessingStage::execute",
                 "No execution result"
             );
-            error::internal_error("No execution result")
+            error::internal_error("no_execution_result", "No execution result")
         })?;
 
         // Get dispatch metadata (needed by both streaming and non-streaming)
@@ -73,19 +75,25 @@ impl ChatResponseProcessingStage {
                     function = "ChatResponseProcessingStage::execute",
                     "Dispatch metadata not set"
                 );
-                error::internal_error("Dispatch metadata not set")
+                error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
             })?
             .clone();
 
         if is_streaming {
-            // Streaming: Use StreamingProcessor and return SSE response (done)
-            return Ok(Some(
-                self.streaming_processor.clone().process_streaming_response(
-                    execution_result,
-                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch,
-                ),
-            ));
+            // Streaming: Use StreamingProcessor and return SSE response
+            let response = self.streaming_processor.clone().process_streaming_response(
+                execution_result,
+                ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
+                dispatch,
+            );
+
+            // Attach load guards to response body for proper RAII lifecycle
+            let response = match ctx.state.load_guards.take() {
+                Some(guards) => guards.attach_to_response(response),
+                None => response,
+            };
+
+            return Ok(Some(response));
         }
 
         // Non-streaming: Delegate to ResponseProcessor
@@ -98,7 +106,10 @@ impl ChatResponseProcessingStage {
                 function = "ChatResponseProcessingStage::execute",
                 "Stop decoder not initialized"
             );
-            error::internal_error("Stop decoder not initialized")
+            error::internal_error(
+                "stop_decoder_not_initialized",
+                "Stop decoder not initialized",
+            )
         })?;
 
         let response = self

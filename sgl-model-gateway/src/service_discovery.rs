@@ -18,7 +18,12 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
+use crate::{
+    app_context::AppContext,
+    core::Job,
+    observability::metrics::{metrics_labels, Metrics},
+    protocols::worker_spec::WorkerConfigRequest,
+};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -328,7 +333,8 @@ async fn handle_pod_event(
     let worker_url = pod_info.worker_url(port);
 
     if pod_info.is_healthy() {
-        let should_add = {
+        // Track whether to add and get count in single lock acquisition
+        let (should_add, tracked_count) = {
             let mut tracker = match tracked_pods.lock() {
                 Ok(tracker) => tracker,
                 Err(e) => {
@@ -338,10 +344,10 @@ async fn handle_pod_event(
             };
 
             if tracker.contains(pod_info) {
-                false
+                (false, tracker.len())
             } else {
                 tracker.insert(pod_info.clone());
-                true
+                (true, tracker.len())
             }
         };
 
@@ -404,12 +410,31 @@ async fn handle_pod_event(
                 match job_queue.submit(job).await {
                     Ok(_) => {
                         debug!("Worker addition job submitted for: {}", worker_url);
+
+                        // Layer 4: Record successful registration from K8s discovery
+                        Metrics::record_discovery_registration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::REGISTRATION_SUCCESS,
+                        );
+
+                        // Update workers discovered gauge (using count from initial lock)
+                        Metrics::set_discovery_workers_discovered(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            tracked_count,
+                        );
                     }
                     Err(e) => {
                         error!(
                             "Failed to submit worker addition job for {}: {}",
                             worker_url, e
                         );
+
+                        // Layer 4: Record failed registration
+                        Metrics::record_discovery_registration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::REGISTRATION_FAILED,
+                        );
+
                         if let Ok(mut tracker) = tracked_pods.lock() {
                             tracker.remove(pod_info);
                         }
@@ -421,6 +446,12 @@ async fn handle_pod_event(
                     worker_url
                 );
             }
+        } else {
+            // Pod already tracked - this is a duplicate event
+            Metrics::record_discovery_registration(
+                metrics_labels::DISCOVERY_KUBERNETES,
+                metrics_labels::REGISTRATION_DUPLICATE,
+            );
         }
     }
 }
@@ -433,7 +464,8 @@ async fn handle_pod_deletion(
 ) {
     let worker_url = pod_info.worker_url(port);
 
-    let was_tracked = {
+    // Remove pod and get remaining count in single lock acquisition
+    let (was_tracked, remaining_count) = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
@@ -441,7 +473,8 @@ async fn handle_pod_deletion(
                 return;
             }
         };
-        tracked.remove(pod_info)
+        let removed = tracked.remove(pod_info);
+        (removed, tracked.len())
     };
 
     if was_tracked {
@@ -462,6 +495,18 @@ async fn handle_pod_deletion(
                 );
             } else {
                 debug!("Submitted worker removal job for {}", worker_url);
+
+                // Layer 4: Record deregistration from K8s pod deletion
+                Metrics::record_discovery_deregistration(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::DEREGISTRATION_POD_DELETED,
+                );
+
+                // Update workers discovered gauge (using count from initial lock)
+                Metrics::set_discovery_workers_discovered(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    remaining_count,
+                );
             }
         } else {
             error!(
@@ -564,11 +609,14 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::{config::RouterConfig, middleware::TokenBucket};
+        use crate::{config::RouterConfig, core::WorkerService, middleware::TokenBucket};
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
             .build_unchecked();
+
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let worker_job_queue = Arc::new(std::sync::OnceLock::new());
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
@@ -576,7 +624,7 @@ mod tests {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
+            worker_registry: worker_registry.clone(),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
@@ -592,10 +640,15 @@ mod tests {
             load_monitor: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
-            worker_job_queue: Arc::new(std::sync::OnceLock::new()),
+            worker_job_queue: worker_job_queue.clone(),
             workflow_engine: Arc::new(std::sync::OnceLock::new()),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
             wasm_manager: None,
+            worker_service: Arc::new(WorkerService::new(
+                worker_registry,
+                worker_job_queue,
+                router_config,
+            )),
         })
     }
 
