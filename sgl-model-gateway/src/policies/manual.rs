@@ -17,7 +17,7 @@ impl RoutingId {
     }
 }
 
-const MAX_CANDIDATE_WORKERS: usize = 3;
+const MAX_CANDIDATE_WORKERS: usize = 2;
 
 #[derive(Debug, Clone)]
 struct RoutingInfo {
