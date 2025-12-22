@@ -24,6 +24,15 @@ struct RoutingInfo {
     worker_urls: Vec<String>,
 }
 
+impl RoutingInfo {
+    fn push_bounded(&mut self, url: String) {
+        while self.worker_urls.len() >= MAX_CANDIDATE_WORKERS {
+            self.worker_urls.remove(0);
+        }
+        self.worker_urls.push(url);
+    }
+}
+
 // TODO may optimize performance
 #[derive(Debug, Default)]
 pub struct ManualPolicy {
@@ -61,11 +70,7 @@ impl ManualPolicy {
                     return idx;
                 }
                 let selected_idx = random_select(healthy_indices);
-                let urls = &mut entry.get_mut().worker_urls;
-                while urls.len() >= MAX_CANDIDATE_WORKERS {
-                    urls.remove(0);
-                }
-                urls.push(workers[selected_idx].url().to_string());
+                entry.get_mut().push_bounded(workers[selected_idx].url().to_string());
                 selected_idx
             }
             Entry::Vacant(entry) => {
