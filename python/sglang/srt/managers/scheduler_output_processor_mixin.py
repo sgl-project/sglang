@@ -9,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -61,6 +62,14 @@ class SchedulerOutputProcessorMixin:
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
         self.stream_output(batch.reqs, batch.return_logprob)
+
+    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+        """Collect routed experts for a finished request."""
+        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -116,6 +125,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -372,6 +382,8 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                self.maybe_collect_routed_experts(req)
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
@@ -791,6 +803,7 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
+        output_routed_experts = None
 
         queue_times = []
         forward_entry_times = []
@@ -985,6 +998,10 @@ class SchedulerOutputProcessorMixin:
                     if output_hidden_states is None:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
+                if req.return_routed_experts:
+                    if output_routed_experts is None:
+                        output_routed_experts = []
+                    output_routed_experts.append(req.routed_experts)
 
             if (
                 req.finished()
@@ -1034,6 +1051,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
+                    output_routed_experts=output_routed_experts,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
