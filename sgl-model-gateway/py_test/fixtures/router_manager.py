@@ -32,6 +32,10 @@ class RouterManager:
         decode_urls: Optional[List[str]] = None,
         prefill_policy: Optional[str] = None,
         decode_policy: Optional[str] = None,
+        # EPD options
+        epd_disaggregation: bool = False,
+        encode_urls: Optional[List[tuple]] = None,
+        encode_policy: Optional[str] = None,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
         port = port or find_free_port()
@@ -66,6 +70,31 @@ class RouterManager:
             if decode_urls:
                 for url in decode_urls:
                     cmd.extend(["--decode", url])
+            if prefill_policy:
+                cmd.extend(["--prefill-policy", prefill_policy])
+            if decode_policy:
+                cmd.extend(["--decode-policy", decode_policy])
+
+        # EPD routing configuration
+        if epd_disaggregation:
+            cmd.append("--epd-disaggregation")
+            if encode_urls:
+                for url, bport in encode_urls:
+                    if bport is None:
+                        cmd.extend(["--encode", url])
+                    else:
+                        cmd.extend(["--encode", url, str(bport)])
+            if prefill_urls:
+                for url, bport in prefill_urls:
+                    if bport is None:
+                        cmd.extend(["--prefill", url, "none"])
+                    else:
+                        cmd.extend(["--prefill", url, str(bport)])
+            if decode_urls:
+                for url in decode_urls:
+                    cmd.extend(["--decode", url])
+            if encode_policy:
+                cmd.extend(["--encode-policy", encode_policy])
             if prefill_policy:
                 cmd.extend(["--prefill-policy", prefill_policy])
             if decode_policy:
@@ -144,9 +173,9 @@ class RouterManager:
 
     def add_worker(self, base_url: str, worker_url: str, timeout: float = 30.0) -> None:
         r = requests.post(f"{base_url}/workers", json={"url": worker_url})
-        assert (
-            r.status_code == 202
-        ), f"add_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
+        assert r.status_code == 202, (
+            f"add_worker failed: {r.status_code} {r.text}"
+        )  # ACCEPTED status
 
         payload = r.json()
         worker_id = payload.get("worker_id")
@@ -182,21 +211,21 @@ class RouterManager:
     ) -> None:
         # Resolve worker_id from the current registry snapshot
         r_list = requests.get(f"{base_url}/workers")
-        assert (
-            r_list.status_code == 200
-        ), f"list_workers failed: {r_list.status_code} {r_list.text}"
+        assert r_list.status_code == 200, (
+            f"list_workers failed: {r_list.status_code} {r_list.text}"
+        )
         workers = r_list.json().get("workers", [])
         worker_id = next(
             (w.get("id") for w in workers if w.get("url") == worker_url), None
         )
-        assert (
-            worker_id
-        ), f"could not find worker_id for url={worker_url}. workers={workers}"
+        assert worker_id, (
+            f"could not find worker_id for url={worker_url}. workers={workers}"
+        )
 
         r = requests.delete(f"{base_url}/workers/{worker_id}")
-        assert (
-            r.status_code == 202
-        ), f"remove_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
+        assert r.status_code == 202, (
+            f"remove_worker failed: {r.status_code} {r.text}"
+        )  # ACCEPTED status
 
         # Poll until worker is actually removed (GET returns 404) or timeout
         start = time.time()
