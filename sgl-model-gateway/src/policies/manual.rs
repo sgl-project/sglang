@@ -30,7 +30,7 @@ impl ManualPolicy {
             Entry::Occupied(mut entry) => {
                 let worker_url = entry.get();
                 if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
-                    if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute() {
+                    if healthy_indices.contains(&idx) {
                         return idx;
                     }
                 }
