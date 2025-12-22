@@ -409,6 +409,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             debug_name="TokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
 
     async def generate_request(
