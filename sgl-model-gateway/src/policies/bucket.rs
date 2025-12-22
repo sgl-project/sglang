@@ -58,7 +58,7 @@ impl BucketPolicy {
                             bucket_guard.adjust_boundary();
                         }
                         Err(e) => {
-                            eprintln!(
+                            error!(
                                 "Failed to acquire write lock for bucket {}: {}",
                                 model_id, e
                             );
@@ -112,7 +112,7 @@ impl BucketPolicy {
             if let Ok(mut bucket_guard) = lock_result {
                 bucket_guard.init_prefill_worker_urls(worker_urls);
             } else {
-                eprintln!("Failed to acquire write lock for bucket initialization");
+                error!("Failed to acquire write lock for bucket initialization");
             }
         }
     }
