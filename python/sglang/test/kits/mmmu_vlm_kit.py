@@ -17,6 +17,7 @@ DEFAULT_MEM_FRACTION_STATIC = 0.8
 
 
 class MMMUVLMTestBase(CustomTestCase):
+    # TODO: split the MMMUVLMTestBase into a fixture and a mixin
     parsed_args = None  # Class variable to store args
     other_args = []
     mmmu_args = []
