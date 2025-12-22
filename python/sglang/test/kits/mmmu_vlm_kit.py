@@ -2,13 +2,13 @@ import glob
 import json
 import os
 import subprocess
-from abc import ABC
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 DEFAULT_MEM_FRACTION_STATIC = 0.8
 
 
-class MMMUVLMMixin(ABC):
+class MMMUVLMTestBase(CustomTestCase):
     parsed_args = None  # Class variable to store args
     other_args = []
     mmmu_args = []
