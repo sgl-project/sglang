@@ -389,7 +389,7 @@ class MinimaxM2Detector(BaseFormatDetector):
             param_name = match.group(1).strip()
             param_value = match.group(2)
             new_params[param_name] = self._parse_parameter(
-                param_name, param_value, tools
+                self._current_function_name, param_name, param_value, tools
             )
 
         # Calculate parameter diff to stream with proper incremental JSON building
@@ -491,7 +491,7 @@ class MinimaxM2Detector(BaseFormatDetector):
                 pidx = ptxt.index('">')
                 pname = ptxt[:pidx].strip()
                 pval = ptxt[pidx + 2 :].lstrip("\n").rstrip("\n")
-                params[pname] = self._parse_parameter(pname, pval, tools)
+                params[pname] = self._parse_parameter(fname, pname, pval, tools)
             raw = {"name": fname, "arguments": params}
             try:
                 # TODO: fix idx in function call, the index for a function
@@ -501,10 +501,12 @@ class MinimaxM2Detector(BaseFormatDetector):
                 logger.warning("invalid tool call for %s dropped", fname)
         return res
 
-    def _parse_parameter(self, pname: str, pval: str, tools: List[Tool]) -> Any:
+    def _parse_parameter(
+        self, fname: str, pname: str, pval: str, tools: List[Tool]
+    ) -> Any:
         param_config = {}
         for tool in tools:
-            if tool.function.name == pname and tool.function.parameters is not None:
+            if tool.function.name == fname and tool.function.parameters is not None:
                 parameters = tool.function.parameters
                 if isinstance(parameters, dict) and "properties" in parameters:
                     param_config = parameters["properties"]
