@@ -154,12 +154,16 @@ class DecodingStage(PipelineStage):
             frame_slices = []
             if latents.dim() == 5:
                 # Decode video frames in chunks to avoid out of memory errors.
-                last_frame = None
                 num_frames = latents.shape[2]
                 num_sample_frames = num_frames * self.vae.temporal_compression_ratio
 
                 # TODO: make it dynamic based on the available memory.
+                # Currently it's a heuristic hardcoded number that decodes 100 frames at a time.
                 step_size = 100 // self.vae.temporal_compression_ratio
+
+                # After the first chunk, the first few frames of the next chunks are not useful.
+                # TODO: Verify if this is correct for all models. Tested only on WanVAE.
+                overlap_t = 4
 
                 with self.progress_bar(total=num_sample_frames) as progress_bar:
                     for i in range(0, num_frames, step_size):
@@ -169,17 +173,12 @@ class DecodingStage(PipelineStage):
                         )
 
                         decode_output = self.vae.decode(
-                            latents[:, :, i : i + latent_step + 1, :, :]
+                            latents[:, :, i : i + latent_step + overlap_t + 1, :, :]
                         )
-                        frame = _ensure_tensor_decode_output(decode_output)
-
                         if i > 0:
-                            frame = self.vae.blend_t(
-                                last_frame, frame, self.vae.blend_num_frames
-                            )
-                        frame = frame[:, :, :target_frame_step, :, :]
+                            decode_output = decode_output[:, :, overlap_t * self.vae.temporal_compression_ratio + 1:, :, :]
 
-                        last_frame = frame
+                        frame = _ensure_tensor_decode_output(decode_output)
                         frame = (frame / 2 + 0.5).clamp(0, 1)
                         frame_slices.append(frame.cpu())
 
