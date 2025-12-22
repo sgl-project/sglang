@@ -240,9 +240,9 @@ class ComponentLoader(ABC):
         if module_type in module_loaders:
             loader_cls, expected_library = module_loaders[module_type]
             # Assert that the library matches what's expected for this module type
-            assert transformers_or_diffusers == expected_library, (
-                f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
-            )
+            assert (
+                transformers_or_diffusers == expected_library
+            ), f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
             return loader_cls()
 
         # For unknown module types, use a generic loader
@@ -690,9 +690,9 @@ class VAELoader(ComponentLoader):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
         class_name = config.pop("_class_name", None)
-        assert class_name is not None, (
-            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
-        )
+        assert (
+            class_name is not None
+        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
         server_args.model_paths["vae"] = component_model_path
 
@@ -736,9 +736,9 @@ class VAELoader(ComponentLoader):
             vae = vae_cls(vae_config).to(target_device)
 
         safetensors_list = _list_safetensors_files(component_model_path)
-        assert len(safetensors_list) == 1, (
-            f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        )
+        assert (
+            len(safetensors_list) == 1
+        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
         vae.load_state_dict(loaded, strict=False)
         return vae.eval()
@@ -787,15 +787,15 @@ class TransformerLoader(ComponentLoader):
             logger.info(
                 "Using custom initialization weights from: %s", custom_weights_path
             )
-            assert custom_weights_path is not None, (
-                "Custom initialization weights must be provided"
-            )
+            assert (
+                custom_weights_path is not None
+            ), "Custom initialization weights must be provided"
             if os.path.isdir(custom_weights_path):
                 safetensors_list = _list_safetensors_files(custom_weights_path)
             else:
-                assert custom_weights_path.endswith(".safetensors"), (
-                    "Custom initialization weights must be a safetensors file"
-                )
+                assert custom_weights_path.endswith(
+                    ".safetensors"
+                ), "Custom initialization weights must be a safetensors file"
                 safetensors_list = [custom_weights_path]
 
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
@@ -829,9 +829,9 @@ class TransformerLoader(ComponentLoader):
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
-        assert next(model.parameters()).dtype == default_dtype, (
-            "Model dtype does not match default dtype"
-        )
+        assert (
+            next(model.parameters()).dtype == default_dtype
+        ), "Model dtype does not match default dtype"
 
         model = model.eval()
 
@@ -865,9 +865,9 @@ class SchedulerLoader(ComponentLoader):
         config = get_diffusers_component_config(model_path=component_model_path)
 
         class_name = config.pop("_class_name")
-        assert class_name is not None, (
-            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
-        )
+        assert (
+            class_name is not None
+        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
         scheduler_cls, _ = ModelRegistry.resolve_model_cls(class_name)
 
