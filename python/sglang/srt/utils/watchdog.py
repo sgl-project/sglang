@@ -17,14 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 class ProcessWatchdog:
-    """A generic watchdog that monitors a counter to detect stuck processes.
-
-    The watchdog runs in a background thread and checks if the process is making
-    progress by monitoring a counter. If the counter doesn't change within the
-    timeout period while the process is active, it triggers a warning (soft mode)
-    or kills the process (hard mode).
-    """
-
     def __init__(
         self,
         process_name: str,
@@ -34,17 +26,6 @@ class ProcessWatchdog:
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
     ):
-        """Initialize the watchdog.
-
-        Args:
-            process_name: Name of the process for logging.
-            get_counter: A callable that returns the current activity counter.
-            is_active: A callable that returns True if the process should be active
-                      (i.e., watchdog should check for progress).
-            watchdog_timeout: Timeout in seconds before triggering.
-            soft: If True, only log warnings. If False, kill the process.
-            dump_info: Optional callable to dump additional debug info.
-        """
         self.process_name = process_name
         self.get_counter = get_counter
         self.is_active = is_active
