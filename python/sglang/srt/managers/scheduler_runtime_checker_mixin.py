@@ -343,7 +343,6 @@ def create_scheduler_watchdog(
     def dump_info() -> str:
         if disable_request_logging():
             return ""
-        # Print batch size and memory pool info to check whether there are de-sync issues.
         if scheduler.is_hybrid_swa:
             _, info_msg = scheduler._check_hybrid_memory()
         elif scheduler.is_hybrid_ssm and isinstance(

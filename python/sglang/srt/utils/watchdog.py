@@ -1,5 +1,3 @@
-"""Generic watchdog utilities for monitoring process health."""
-
 from __future__ import annotations
 
 import logging

@@ -1,10 +1,3 @@
-"""
-Test soft watchdog functionality for various processes.
-
-Usage:
-python -m pytest test/srt/test_soft_watchdog.py -v -s
-"""
-
 import io
 import time
 import unittest
@@ -23,8 +16,6 @@ from sglang.test.test_utils import (
 
 
 class TestSoftWatchdogDetokenizer(CustomTestCase):
-    """Test that DetokenizerManager soft watchdog triggers on slow processing."""
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -49,8 +40,7 @@ class TestSoftWatchdogDetokenizer(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_detokenizer_watchdog_triggers(self):
-        """Send a request and verify watchdog timeout appears in logs."""
-        response = requests.post(
+        requests.post(
             self.base_url + "/generate",
             json={
                 "text": "Hello",
@@ -65,13 +55,10 @@ class TestSoftWatchdogDetokenizer(CustomTestCase):
         self.assertIn(
             "DetokenizerManager watchdog timeout",
             combined_output,
-            "Soft watchdog timeout message not found in logs",
         )
 
 
 class TestSoftWatchdogTokenizer(CustomTestCase):
-    """Test that TokenizerManager soft watchdog triggers on slow processing."""
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -96,8 +83,7 @@ class TestSoftWatchdogTokenizer(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_tokenizer_watchdog_triggers(self):
-        """Send a request and verify watchdog timeout appears in logs."""
-        response = requests.post(
+        requests.post(
             self.base_url + "/generate",
             json={
                 "text": "Hello",
@@ -112,7 +98,6 @@ class TestSoftWatchdogTokenizer(CustomTestCase):
         self.assertIn(
             "TokenizerManager watchdog timeout",
             combined_output,
-            "Soft watchdog timeout message not found in logs",
         )
 
 
