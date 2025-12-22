@@ -53,6 +53,8 @@ class FluxPipelineConfig(ImagePipelineConfig):
     # VAE
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
 
+    enable_autocast: bool = False
+
     # Text encoding stage
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (CLIPTextConfig(), T5Config())
@@ -405,7 +407,7 @@ def flux2_pack_latents(latents):
 class Flux2PipelineConfig(FluxPipelineConfig):
     embedded_cfg_scale: float = 4.0
 
-    task_type: ModelTaskType = ModelTaskType.I2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 

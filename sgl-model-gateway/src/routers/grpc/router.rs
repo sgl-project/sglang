@@ -22,7 +22,9 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    core::WorkerRegistry,
+    config::types::RetryConfig,
+    core::{is_retryable_status, RetryExecutor, WorkerRegistry},
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
         generate::GenerateRequest,
@@ -41,6 +43,7 @@ pub struct GrpcRouter {
     shared_components: Arc<SharedComponents>,
     responses_context: responses::ResponsesContext,
     harmony_responses_context: responses::ResponsesContext,
+    retry_config: RetryConfig,
 }
 
 impl GrpcRouter {
@@ -126,6 +129,7 @@ impl GrpcRouter {
             shared_components,
             responses_context,
             harmony_responses_context,
+            retry_config: ctx.router_config.effective_retry_config(),
         })
     }
 
@@ -151,14 +155,45 @@ impl GrpcRouter {
             &self.pipeline
         };
 
-        pipeline
-            .execute_chat(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-            )
-            .await
+        // Clone values needed for retry closure
+        let request = Arc::new(body.clone());
+        let headers_cloned = headers.cloned();
+        let model_id_cloned = model_id.map(|s| s.to_string());
+        let components = self.shared_components.clone();
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // Operation: execute pipeline (creates fresh context each attempt)
+            |_attempt| {
+                let request = Arc::clone(&request);
+                let headers = headers_cloned.clone();
+                let model_id = model_id_cloned.clone();
+                let components = Arc::clone(&components);
+                async move {
+                    pipeline
+                        .execute_chat(request, headers, model_id, components)
+                        .await
+                }
+            },
+            // Should retry: check if status is retryable
+            |res, _attempt| is_retryable_status(res.status()),
+            // On backoff: record retry metrics
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            // On exhausted: record exhaustion
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+            },
+        )
+        .await
     }
 
     /// Main route_generate implementation
@@ -170,14 +205,46 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {:?}", model_id);
 
-        self.pipeline
-            .execute_generate(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-            )
-            .await
+        // Clone values needed for retry closure
+        let request = Arc::new(body.clone());
+        let headers_cloned = headers.cloned();
+        let model_id_cloned = model_id.map(|s| s.to_string());
+        let components = self.shared_components.clone();
+        let pipeline = &self.pipeline;
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // Operation: execute pipeline (creates fresh context each attempt)
+            |_attempt| {
+                let request = Arc::clone(&request);
+                let headers = headers_cloned.clone();
+                let model_id = model_id_cloned.clone();
+                let components = Arc::clone(&components);
+                async move {
+                    pipeline
+                        .execute_generate(request, headers, model_id, components)
+                        .await
+                }
+            },
+            // Should retry: check if status is retryable
+            |res, _attempt| is_retryable_status(res.status()),
+            // On backoff: record retry metrics
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            // On exhausted: record exhaustion
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+            },
+        )
+        .await
     }
 
     /// Main route_responses implementation
