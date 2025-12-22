@@ -16,6 +16,7 @@ import pytest
 import requests
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.utils.common import is_hip
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
@@ -47,14 +48,31 @@ logger = init_logger(__name__)
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
+    server_args = case.server_args
+
+    # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
+    # which is not available on AMD. Use Ulysses parallelism instead.
+    if is_hip() and server_args.ring_degree is not None and server_args.ring_degree > 1:
+        pytest.skip(
+            f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
+            "requires Flash Attention which is not available on AMD/ROCm"
+        )
+
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    server_args = case.server_args
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    extra_args += (
-        f" --num-gpus {server_args.num_gpus} --ulysses-degree {server_args.num_gpus}"
-    )
+    extra_args += f" --num-gpus {server_args.num_gpus}"
+
+    if server_args.tp_size is not None:
+        extra_args += f" --tp-size {server_args.tp_size}"
+
+    if server_args.ulysses_degree is not None:
+        extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
+
+    if server_args.ring_degree is not None:
+        extra_args += f" --ring-degree {server_args.ring_degree}"
+
     # LoRA support
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
@@ -70,7 +88,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     try:
         # Reconstruct output size for OpenAI API
-        output_size = sampling_params.output_size
+        # Allow override via environment variable (useful for AMD where large resolutions can cause GPU hang)
+        output_size = os.environ.get(
+            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
+        )
         warmup = WarmupRunner(
             port=ctx.port,
             model=server_args.model_path,
@@ -85,15 +106,25 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             and sampling_params.image_path
         ):
             # Handle URL or local path
-            if is_image_url(sampling_params.image_path):
-                image_path = download_image_from_url(str(sampling_params.image_path))
-            else:
-                image_path = Path(sampling_params.image_path)
+            image_path_list = sampling_params.image_path
+            if not isinstance(image_path_list, list):
+                image_path_list = [image_path_list]
+
+            new_image_path_list = []
+            for image_path in image_path_list:
+                if is_image_url(image_path):
+                    new_image_path_list.append(download_image_from_url(str(image_path)))
+                else:
+                    new_image_path_list.append(Path(image_path))
+                    if not image_path.exists():
+                        pytest.skip(f"{case.id}: file missing: {image_path}")
+
+            image_path_list = new_image_path_list
 
             warmup.run_edit_warmups(
                 count=server_args.warmup_edit,
                 edit_prompt=sampling_params.prompt,
-                image_path=image_path,
+                image_path=image_path_list,
             )
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
@@ -491,6 +522,7 @@ Consider updating perf_baselines.json with the snippets below:
             case.id,
             generate_fn,
         )
+
         self._validate_and_record(case, perf_record)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
