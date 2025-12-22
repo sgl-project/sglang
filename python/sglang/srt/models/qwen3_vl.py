@@ -724,8 +724,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
 
         # TODO: make it more elegant
-        if language_model_cls.__name__ in ["Qwen3LLMModel", "Qwen3MoeLLMModel"]:
-            self.config = config  # for qwen3-vl-dense or qwen3-vl-moe
+        if language_model_cls is Qwen3LLMModel:
+            self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
             self.config.encoder_only = getattr(config, "encoder_only", False)

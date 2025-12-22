@@ -21,7 +21,7 @@ from typing import Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -40,15 +40,16 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
     def __init__(
         self,
         *,
-        config: Qwen3VLMoeConfig,
+        config: Qwen3VLMoeTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self.hidden_size = config.hidden_size
-        self.deepstack_embed_to_decoder_layer = range(
-            len(config.vision_config.deepstack_visual_indexes)
-        )
+        # Currently, we use 3 as len(config.vision_config.deepstack_visual_indexes) is not directly accessible here.
+        # This approach follows the original implementation.
+        # TODO: make config of type Qwen3VLMoeConfig, so that we can directly obtain deepstack_visual_indexes.
+        self.deepstack_embed_to_decoder_layer = range(3)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
