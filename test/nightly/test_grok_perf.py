@@ -1,11 +1,15 @@
-"""Nightly performance benchmark for Grok-2 model.
+"""Nightly performance benchmark for Grok models (Grok-1 and Grok-2).
 
-This test benchmarks the Grok-2 model with FP8 quantization on 8 GPUs.
-The model path can be configured via GROK2_MODEL_PATH environment variable.
-A separate tokenizer path can be specified via GROK2_TOKENIZER_PATH.
+This test benchmarks both Grok-1 and Grok-2 models with FP8 quantization on 8 GPUs.
+
+Model paths can be configured via environment variables:
+- GROK1_MODEL_PATH: Path to Grok-1 model (default: amd/grok-1-W4A8KV8)
+- GROK1_TOKENIZER_PATH: Path to Grok-1 tokenizer (default: Xenova/grok-1-tokenizer)
+- GROK2_MODEL_PATH: Path to Grok-2 model (default: xai-org/grok-2)
+- GROK2_TOKENIZER_PATH: Path to Grok-2 tokenizer (default: alvarobartt/grok-2-tokenizer)
 
 Example usage:
-    GROK2_MODEL_PATH=/path/to/grok-2 python -m pytest test_grok2_perf.py -v
+    python -m pytest test_grok_perf.py -v
 """
 
 import os
@@ -40,32 +44,56 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 # Model and tokenizer paths can be overridden via environment variables
+GROK1_MODEL_PATH = os.environ.get("GROK1_MODEL_PATH", "amd/grok-1-W4A8KV8")
+GROK1_TOKENIZER_PATH = os.environ.get("GROK1_TOKENIZER_PATH", "Xenova/grok-1-tokenizer")
 GROK2_MODEL_PATH = os.environ.get("GROK2_MODEL_PATH", "xai-org/grok-2")
 GROK2_TOKENIZER_PATH = os.environ.get(
     "GROK2_TOKENIZER_PATH", "alvarobartt/grok-2-tokenizer"
 )
-PROFILE_DIR = "performance_profiles_grok2"
+PROFILE_DIR = "performance_profiles_grok"
 
 
-class TestNightlyGrok2Performance(unittest.TestCase):
-    """Nightly performance benchmark for Grok-2 model.
+class TestNightlyGrokPerformance(unittest.TestCase):
+    """Nightly performance benchmark for Grok models (Grok-1 and Grok-2).
 
-    Tests the Grok-2 model with FP8 quantization across different configurations:
-    - basic: Standard TP=8 configuration with FP8 quantization
+    Tests both Grok-1 (314B MOE) and Grok-2 models with FP8 quantization on TP=8.
+    Combined runtime: ~43 minutes (Grok-1: ~23min, Grok-2: ~20min)
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.model = GROK2_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
-        # Define variant configurations for Grok-2
-        cls.variants = [
+        # Define model configurations for both Grok-1 and Grok-2
+        cls.models = [
             {
-                "name": "basic",
+                "name": "grok1",
+                "model_path": GROK1_MODEL_PATH,
+                "other_args": [
+                    "--trust-remote-code",
+                    "--tp",
+                    "8",
+                    "--quantization",
+                    "fp8",
+                    "--mem-fraction-static",
+                    "0.85",
+                    "--tokenizer-path",
+                    GROK1_TOKENIZER_PATH,
+                    "--attention-backend",
+                    "aiter",
+                ],
+                "env_vars": {
+                    "RCCL_MSCCL_ENABLE": "0",
+                    "SGLANG_USE_AITER": "1",
+                    "SGLANG_INT4_WEIGHT": "1",
+                },
+            },
+            {
+                "name": "grok2",
+                "model_path": GROK2_MODEL_PATH,
                 "other_args": [
                     "--trust-remote-code",
                     "--tp",
@@ -93,26 +121,26 @@ class TestNightlyGrok2Performance(unittest.TestCase):
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
-        """Run benchmark across all configured variants."""
-        failed_variants = []
+        """Run benchmark across all Grok models."""
+        failed_models = []
 
         try:
-            for variant_config in self.variants:
-                with self.subTest(variant=variant_config["name"]):
+            for model_config in self.models:
+                with self.subTest(model=model_config["name"]):
                     result_tuple = self.runner.run_benchmark_for_model(
-                        model_path=self.model,
+                        model_path=model_config["model_path"],
                         batch_sizes=self.batch_sizes,
                         input_lens=self.input_lens,
                         output_lens=self.output_lens,
-                        other_args=variant_config["other_args"],
-                        variant=variant_config["name"],
+                        other_args=model_config["other_args"],
+                        variant=model_config["name"],
                         extra_bench_args=["--trust-remote-code"],
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]
 
                     if not success:
-                        failed_variants.append(variant_config["name"])
+                        failed_models.append(model_config["name"])
 
                     # Use simplified report format without traces
                     if results:
@@ -122,10 +150,9 @@ class TestNightlyGrok2Performance(unittest.TestCase):
         finally:
             self.runner.write_final_report()
 
-        if failed_variants:
+        if failed_models:
             raise AssertionError(
-                f"Benchmark failed for {self.model} with the following variants: "
-                f"{', '.join(failed_variants)}"
+                f"Benchmark failed for the following models: {', '.join(failed_models)}"
             )
 
 

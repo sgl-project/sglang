@@ -41,6 +41,7 @@ MODEL_SCORE_THRESHOLDS = {
     # Google Gemma
     "google/gemma-2-27b-it": 0.91,
     "google/gemma-2-9b-it": 0.72,
+    "neuralmagic/gemma-2-2b-it-FP8": 0.4,  # Small 2B model, lower accuracy expected
     # FP8 quantized models
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.8,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
@@ -52,7 +53,6 @@ MODEL_SCORE_THRESHOLDS = {
 }
 
 failing_models = {
-    "neuralmagic/gemma-2-2b-it-FP8",
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",  # RuntimeError: This GEMM is not supported!
     "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
     "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
