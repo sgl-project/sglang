@@ -125,7 +125,7 @@ class MTPDraftWorker(BaseDraftWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                is_mtp_worker=True,
+                is_multi_layer_eagle=True,
             )
 
         # Alias for better readability

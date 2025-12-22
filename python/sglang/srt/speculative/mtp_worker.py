@@ -152,7 +152,7 @@ class MTPWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                is_mtp_worker=True,
+                is_multi_layer_eagle=True,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
