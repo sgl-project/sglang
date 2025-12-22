@@ -57,8 +57,7 @@ class ProcessWatchdog:
                 watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None:
-            info_msg = self.dump_info()
+        if self.dump_info is not None and (info_msg := self.dump_info()):
             logger.error(f"{self.process_name} debug info:\n{info_msg}")
 
         pyspy_dump_schedulers()
