@@ -439,10 +439,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
-
-    # For Multi-Layer MTP
-    # FIXME: rename -> enable_multi_layer_mtp
-    enable_mtp: bool = False
+    enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -1189,6 +1186,8 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
+            self.enable_multi_layer_eagle = True
+            logger.info("Enable multi-layer eagle for MiMoV2FlashForCausalLM model")
             self.swa_full_tokens_ratio = 1.0
             logger.warning(
                 "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model"
@@ -3478,11 +3477,11 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
-        # Speculative decoding (MTP)
+        # Multi-layer Eagle speculative decoding
         parser.add_argument(
-            "--enable-mtp",
+            "--enable-multi-layer-eagle",
             action="store_true",
-            help="Enable multi-layer MTP speculative decoding.",
+            help="Enable multi-layer Eagle speculative decoding.",
         )
 
         # Expert parallelism
