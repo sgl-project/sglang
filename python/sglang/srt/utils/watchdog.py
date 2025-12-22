@@ -21,11 +21,11 @@ class Watchdog:
         debug_name: str,
         watchdog_timeout: Optional[float],
         soft: bool = False,
-        test_stuck: float = 0,
+        test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
             return _WatchdogNoop()
-        return _WatchdogReal(debug_name, watchdog_timeout, soft, test_stuck)
+        return _WatchdogReal(debug_name, watchdog_timeout, soft, test_stuck_time)
 
     def feed(self):
         pass
@@ -41,11 +41,11 @@ class _WatchdogReal(Watchdog):
         debug_name: str,
         watchdog_timeout: float,
         soft: bool = False,
-        test_stuck: float = 0,
+        test_stuck_time: float = 0,
     ):
         self._counter = 0
         self._active = True
-        self._test_stuck = test_stuck
+        self._test_stuck_time = test_stuck_time
         self._raw = WatchdogRaw(
             debug_name=debug_name,
             get_counter=lambda: self._counter,
@@ -55,8 +55,8 @@ class _WatchdogReal(Watchdog):
         )
 
     def feed(self):
-        if self._test_stuck > 0:
-            time.sleep(self._test_stuck)
+        if self._test_stuck_time > 0:
+            time.sleep(self._test_stuck_time)
         self._counter += 1
 
     @contextmanager

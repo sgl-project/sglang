@@ -118,7 +118,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             debug_name="DetokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
             soft=True,
-            test_stuck=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
     def event_loop(self):
