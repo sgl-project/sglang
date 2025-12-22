@@ -31,7 +31,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import orjson
 import uvloop
 import zmq
 import zmq.asyncio
@@ -73,7 +72,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import RequestStage
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -112,6 +111,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -184,11 +184,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
-        self.preferred_sampling_params = (
-            orjson.loads(server_args.preferred_sampling_params)
-            if server_args.preferred_sampling_params
-            else None
-        )
+        self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
 
@@ -215,10 +211,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
-            if envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value:
-                import_processors(
-                    envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
-                )
+            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+                import_processors(mm_process_pkg, overwrite=True)
             _processor = _get_processor_wrapper(server_args)
             transport_mode = _determine_tensor_transport_mode(self.server_args)
 
@@ -410,6 +404,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ]
         )
         self.init_communicators(server_args)
+
+        self.watchdog = Watchdog.create(
+            debug_name="TokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
+        )
 
     async def generate_request(
         self,
@@ -630,6 +631,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            self._validate_mm_limits(obj)
 
             mm_inputs = None
 
@@ -655,6 +657,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            if (
+                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                and mm_inputs
+                and "mm_items" in mm_inputs
+            ):
+                for item in mm_inputs["mm_items"]:
+                    if isinstance(item, MultimodalDataItem):
+                        item.set_pad_value()
         else:
             mm_inputs = None
 
@@ -741,6 +751,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+
+    def _validate_mm_limits(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if not self.server_args.limit_mm_data_per_request:
+            return
+
+        for modality, limit in self.server_args.limit_mm_data_per_request.items():
+            data = getattr(obj, f"{modality}_data", None)
+            if data:
+                count = len(data) if isinstance(data, list) else 1
+                if count > limit:
+                    raise ValueError(
+                        f"{modality.capitalize()} count {count} exceeds limit {limit} per request."
+                    )
 
     def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
         """Validate the request for Matryoshka dim if it has the field set."""
@@ -829,6 +854,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
+                return_routed_experts=obj.return_routed_experts,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
@@ -1259,6 +1285,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         return success, message, num_paused_requests
 
+    def _update_model_path_info(self, model_path: str, load_format: str):
+        self.served_model_name = model_path
+        self.server_args.model_path = model_path
+        self.server_args.load_format = load_format
+        self.model_path = model_path
+
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
@@ -1267,10 +1299,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
             if result.success:
-                self.served_model_name = obj.model_path
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp = []
@@ -1278,9 +1307,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self.server_args.model_path = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
+                self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
@@ -1480,9 +1507,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            with self.watchdog.disable():
+                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+            self.watchdog.feed()
 
     def _add_metric_if_present(
         self,
@@ -1540,6 +1569,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self._add_metric_if_present(
                     recv_obj, "prefill_launch_latency", meta_info, i
                 )
+                self._add_metric_if_present(
+                    recv_obj, "prefill_finished_ts", meta_info, i
+                )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -1563,6 +1595,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
+            if getattr(recv_obj, "output_routed_experts", None):
+                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
@@ -1838,12 +1873,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             meta_info["request_sent_to_scheduler_ts"] = (
                 state.request_sent_to_scheduler_ts
             )
-        # For embeddings, there's no separate prefill phase, so omit `prefill_finished_ts`.
-        if (
-            not isinstance(recv_obj, BatchEmbeddingOutput)
-            and state.first_token_time > 0
-        ):
-            meta_info["prefill_finished_ts"] = state.first_token_time
         if state.response_sent_to_client_ts > 0:
             meta_info["response_sent_to_client_ts"] = state.response_sent_to_client_ts
         if state.finished_time > 0:
@@ -2052,6 +2081,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if (
             self.server_args.dp_size == 1
             or self.server_args.load_balance_method == "round_robin"
+            or self.server_args.load_balance_method == "decode_round_robin"
         ):
             return
 
