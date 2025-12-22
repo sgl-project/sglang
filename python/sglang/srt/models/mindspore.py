@@ -239,18 +239,29 @@ class MindSporeForCausalLM(torch.nn.Module):
 
         return mutable(self.key_cache), mutable(self.value_cache)
 
+    def get_is_prefill(forward_batch: ForwardBatch):
+        # Different processing for the mindspore attention operator
+        # Without any prefix cache => Use FlashAttentionScore
+        # With cache => Use PagedAttention, no matter the query length is 1 or not
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_draft_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
+        if forward_batch.extend_prefix_lens is not None:
+            is_prefill = (
+                is_prefill and forward_batch.extend_prefix_lens.sum().item() == 0
+            )
+        return is_prefill
+
     def prepare_inputs(self, input_ids, positions, forward_batch):
         if self.use_mla:
             key_cache = self.get_kvcache(forward_batch)
         else:
             key_cache, value_cache = self.get_kvcache(forward_batch)
 
-        # Different processing for the mindspore attention operator
-        # Without any prefix cache => Use FlashAttentionScore
-        # With cache => Use PagedAttention, no matter the query length is 1 or not
-        is_prefill = forward_batch.forward_mode.is_extend()
-        is_prefill = is_prefill and forward_batch.extend_prefix_lens.sum().item() == 0
-
+        is_prefill = self.get_is_prefill(forward_batch)
         batch_valid_length = forward_batch.seq_lens.cpu().numpy()
 
         if forward_batch.extend_seq_lens is not None:
@@ -286,6 +297,8 @@ class MindSporeForCausalLM(torch.nn.Module):
         if not self.use_mla:
             model_inputs["value_cache"] = value_cache
         model_inputs["block_tables"] = block_tables
+        # for speculative decode
+        model_inputs["forward_mode"] = forward_batch.forward_mode
         return model_inputs
 
     def forward(
