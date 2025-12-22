@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from enum import Enum, auto
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.speculative.eagle_info import EagleVerifyOutput
+    from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
 
 class LogprobStage(Enum):
@@ -312,12 +313,18 @@ def get_token_ids_logprobs_chunk(
 
 def add_logprob_values(
     batch: ScheduleBatch,
-    res: EagleVerifyOutput,
+    res: Union[EagleVerifyOutput, NgramVerifyInput],
     logits_output: Optional[LogitsProcessorOutput] = None,
 ):
     # Extract args
     if logits_output is None:
         logits_output = res.logits_output
+
+    if hasattr(res, "accept_length_per_req_cpu"):
+        accept_length_per_req_cpu = res.accept_length_per_req_cpu
+    else:
+        # FIXME: Get a NgramVerifyOutput class and use that instead of this hack.
+        accept_length_per_req_cpu = res.accept_length.tolist()
 
     top_logprobs_nums = batch.top_logprobs_nums
     token_ids_logprobs = batch.token_ids_logprobs
@@ -338,7 +345,7 @@ def add_logprob_values(
             logits_output.next_token_logits / temperatures, dim=-1
         )
     batch_next_token_ids = res.verified_id
-    num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
+    num_tokens_per_req = [accept + 1 for accept in accept_length_per_req_cpu]
 
     # We should repeat top_logprobs_nums to match num_tokens_per_req.
     top_logprobs_nums_repeat_interleaved = []
