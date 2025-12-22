@@ -58,6 +58,7 @@ impl RoutingInfo {
 }
 
 // TODO may optimize performance
+// TODO evict old data periodically
 #[derive(Debug, Default)]
 pub struct ManualPolicy {
     routing_map: DashMap<RoutingId, RoutingInfo>,
