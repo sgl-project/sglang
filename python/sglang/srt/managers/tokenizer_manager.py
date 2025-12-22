@@ -111,6 +111,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.watchdog import ProcessWatchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -297,6 +298,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
+
+        # Watchdog state
+        self.receive_ct = 0
+        self.is_receiving = False
 
         # Initial weights status
         self.initial_weights_loaded = True
@@ -1355,6 +1360,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         self.event_loop = loop
 
+        if (timeout := self.server_args.soft_watchdog_timeout) is not None:
+            ProcessWatchdog(
+                process_name="TokenizerManager",
+                get_counter=lambda: self.receive_ct,
+                is_active=lambda: self.is_receiving,
+                watchdog_timeout=timeout,
+                soft=True,
+            )
+
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
@@ -1500,8 +1514,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """The event loop that handles requests"""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            self.is_receiving = True
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
+            self.is_receiving = False
+            self.receive_ct += 1
 
     def _add_metric_if_present(
         self,

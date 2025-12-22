@@ -59,6 +59,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import ProcessWatchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -170,6 +171,10 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.init_dispatcher()
+
+        # Watchdog state
+        self.dispatch_ct = 0
+        self.is_dispatching = False
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -509,7 +514,10 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                self.is_dispatching = True
                 self._request_dispatcher(recv_req)
+                self.is_dispatching = False
+                self.dispatch_ct += 1
 
 
 def run_data_parallel_controller_process(
@@ -544,6 +552,16 @@ def run_data_parallel_controller_process(
                 "max_req_input_len": controller.max_req_input_len,
             }
         )
+
+        if (timeout := server_args.soft_watchdog_timeout) is not None:
+            ProcessWatchdog(
+                process_name="DataParallelController",
+                get_counter=lambda: controller.dispatch_ct,
+                is_active=lambda: controller.is_dispatching,
+                watchdog_timeout=timeout,
+                soft=True,
+            )
+
         if server_args.node_rank == 0:
             controller.event_loop()
         for proc in controller.scheduler_procs:
