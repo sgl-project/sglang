@@ -333,7 +333,9 @@ class PrefillAdder:
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
-        self.enable_hierarchical_cache_direct = get_global_server_args().enable_hierarchical_cache_direct
+        self.enable_hierarchical_cache_direct = (
+            get_global_server_args().enable_hierarchical_cache_direct
+        )
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio

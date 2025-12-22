@@ -73,7 +73,9 @@ class HiRadixCacheDirect(RadixCache):
                 )
                 return False
         except Exception as e:
-            logger.error(f"Failed to clear hierarchical cache direct storage backend: {e}")
+            logger.error(
+                f"Failed to clear hierarchical cache direct storage backend: {e}"
+            )
             return False
 
     def evict(self, num_tokens: int):

@@ -157,9 +157,7 @@ class HiCacheControllerDirect:
         self.stop_event = threading.Event()
         self.write_queue = Queue()
         self.ack_write_queue = Queue()
-        self.write_thread = threading.Thread(
-            target=self.write_thread_func, daemon=True
-        )
+        self.write_thread = threading.Thread(target=self.write_thread_func, daemon=True)
         self.write_thread.start()
 
     def reset(self):
@@ -172,9 +170,7 @@ class HiCacheControllerDirect:
 
         self.stop_event.clear()
 
-        self.write_thread = threading.Thread(
-            target=self.write_thread_func, daemon=True
-        )
+        self.write_thread = threading.Thread(target=self.write_thread_func, daemon=True)
         self.write_thread.start()
 
     def write_sync(self, hash_keys: List[str], device_indices: torch.Tensor) -> int:
@@ -203,9 +199,7 @@ class HiCacheControllerDirect:
         """
         Write KV caches from HBM memory to storage backend.
         """
-        operation = WriteStorageOperation(
-            hash_keys, device_indices, node_id
-        )
+        operation = WriteStorageOperation(hash_keys, device_indices, node_id)
         self.write_queue.put(operation)
 
     def write_thread_func(self):
@@ -224,7 +218,9 @@ class HiCacheControllerDirect:
                     )
                     operation.completed_tokens = succ_pages_num * self.page_size
                 else:
-                    operation.completed_tokens = len(operation.hash_keys) * self.page_size
+                    operation.completed_tokens = (
+                        len(operation.hash_keys) * self.page_size
+                    )
                 self.ack_write_queue.put(operation)
             except Empty:
                 continue
