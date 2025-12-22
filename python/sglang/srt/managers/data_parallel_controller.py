@@ -519,7 +519,7 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
-                self.watchdog.feed()
+            self.watchdog.feed()
 
 
 def run_data_parallel_controller_process(
@@ -554,7 +554,6 @@ def run_data_parallel_controller_process(
                 "max_req_input_len": controller.max_req_input_len,
             }
         )
-
         if server_args.node_rank == 0:
             controller.event_loop()
         for proc in controller.scheduler_procs:
