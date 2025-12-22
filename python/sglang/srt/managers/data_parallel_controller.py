@@ -514,12 +514,12 @@ class DataParallelController:
     def event_loop(self):
         while True:
             while True:
+                self.watchdog.feed()
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
-            self.watchdog.feed()
 
 
 def run_data_parallel_controller_process(
