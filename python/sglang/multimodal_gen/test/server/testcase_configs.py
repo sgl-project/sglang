@@ -119,6 +119,7 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     # LoRA
@@ -139,6 +140,9 @@ class DiffusionSamplingParams:
     seconds: int = 1  # for video: duration in seconds
     num_frames: int | None = None  # for video: number of frames
     fps: int | None = None  # for video: frames per second
+
+    # URL direct test flag - if True, don't pre-download URL images
+    direct_url_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,6 +236,7 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
         "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
     ],
+    direct_url_test=True,
 )
 
 T2V_PROMPT = "A curious raccoon"
@@ -239,6 +244,7 @@ T2V_PROMPT = "A curious raccoon"
 TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
 )
 
 # All test cases with clean default values
@@ -518,6 +524,19 @@ TWO_GPU_CASES_B = [
             modality="image",
             warmup_text=1,
             warmup_edit=0,
+            num_gpus=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            num_gpus=2,
+            tp_size=2,
         ),
         T2I_sampling_params,
     ),

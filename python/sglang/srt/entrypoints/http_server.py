@@ -54,6 +54,12 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.entrypoints.ollama.protocol import (
+    OllamaChatRequest,
+    OllamaGenerateRequest,
+    OllamaShowRequest,
+)
+from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -123,6 +129,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
@@ -152,6 +161,15 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
+    # Dict{
+    #   rank: Tuple(
+    #           session_id,
+    #           Dict{
+    #               name: Tuple (d_ptr, numel, element_size)
+    #           }
+    #         )
+    # }
+    remote_instance_transfer_engine_info: Optional[Dict] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -268,6 +286,9 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
     )
+
+    # Initialize Ollama-compatible serving handler
+    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
 
     # Launch tool server
     tool_server = None
@@ -825,6 +846,30 @@ async def send_weights_to_remote_instance(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.get("/get_remote_instance_transfer_engine_info")
+async def get_remote_instance_transfer_engine_info(rank: int = None):
+    if rank is None or rank < 0:
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    if (
+        _global_state.remote_instance_transfer_engine_info is None
+        or len(_global_state.remote_instance_transfer_engine_info) == 0
+    ):
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    try:
+        result = {
+            "rank": rank,
+            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
+                rank
+            ],
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Exception: {e}")
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
@@ -1327,6 +1372,42 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     )
 
 
+##### Ollama-compatible API endpoints #####
+
+
+@app.get(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
+@app.head(os.environ.get("SGLANG_OLLAMA_ROOT_ROUTE", "/"))
+async def ollama_root():
+    """Ollama-compatible root endpoint for health check."""
+    return "Ollama is running"
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_CHAT_ROUTE", "/api/chat"))
+async def ollama_chat(request: OllamaChatRequest, raw_request: Request):
+    """Ollama-compatible chat endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_chat(request, raw_request)
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_GENERATE_ROUTE", "/api/generate"))
+async def ollama_generate(request: OllamaGenerateRequest, raw_request: Request):
+    """Ollama-compatible generate endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_generate(
+        request, raw_request
+    )
+
+
+@app.get(os.environ.get("SGLANG_OLLAMA_TAGS_ROUTE", "/api/tags"))
+async def ollama_tags(raw_request: Request):
+    """Ollama-compatible list models endpoint."""
+    return raw_request.app.state.ollama_serving.get_tags()
+
+
+@app.post(os.environ.get("SGLANG_OLLAMA_SHOW_ROUTE", "/api/show"))
+async def ollama_show(request: OllamaShowRequest, raw_request: Request):
+    """Ollama-compatible show model info endpoint."""
+    return raw_request.app.state.ollama_serving.get_show(request.model)
+
+
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
@@ -1396,7 +1477,7 @@ def _execute_server_warmup(
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/model_info", timeout=5, headers=headers)
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -1501,7 +1582,7 @@ def _execute_server_warmup(
                     i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],
-                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
             res = requests.post(
                 url + request_name,
@@ -1615,15 +1696,24 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, template_manager, scheduler_info, port_args = (
+    tokenizer_manager, template_manager, scheduler_infos, port_args = (
         launch_subprocesses_func(server_args=server_args)
     )
 
+    scheduler_info = scheduler_infos[0]
+    remote_instance_transfer_engine_info = None
+    if server_args.remote_instance_weight_loader_use_transfer_engine():
+        remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_info,
+            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
 
