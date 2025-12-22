@@ -3,10 +3,42 @@
 use std::sync::Arc;
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use metrics::counter;
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionBranch {
+    NoHealthyWorkers,
+    RoutingIdFastPathHit,
+    RoutingIdSlowPathOccupiedHit,
+    RoutingIdSlowPathOccupiedMiss,
+    RoutingIdSlowPathVacant,
+    RandomFallback,
+}
+
+impl ExecutionBranch {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoHealthyWorkers => "no_healthy_workers",
+            Self::RoutingIdFastPathHit => "routing_id_fast_path_hit",
+            Self::RoutingIdSlowPathOccupiedHit => "routing_id_slow_path_occupied_hit",
+            Self::RoutingIdSlowPathOccupiedMiss => "routing_id_slow_path_occupied_miss",
+            Self::RoutingIdSlowPathVacant => "routing_id_slow_path_vacant",
+            Self::RandomFallback => "random_fallback",
+        }
+    }
+
+    fn record(&self) {
+        counter!(
+            "smg_policy_manual_branch_total",
+            "branch" => self.as_str()
+        )
+        .increment(1);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RoutingId(String);
@@ -51,7 +83,7 @@ impl ManualPolicy {
         workers: &[Arc<dyn Worker>],
         routing_id: &str,
         healthy_indices: &[usize],
-    ) -> usize {
+    ) -> (usize, ExecutionBranch) {
         let routing_id = RoutingId::new(routing_id);
 
         // Fast path
@@ -59,7 +91,7 @@ impl ManualPolicy {
             if let Some(idx) =
                 find_healthy_worker(&info.candi_worker_urls, workers, healthy_indices)
             {
-                return idx;
+                return (idx, ExecutionBranch::RoutingIdFastPathHit);
             }
         }
 
@@ -69,39 +101,54 @@ impl ManualPolicy {
                 if let Some(idx) =
                     find_healthy_worker(&entry.get().candi_worker_urls, workers, healthy_indices)
                 {
-                    return idx;
+                    return (idx, ExecutionBranch::RoutingIdSlowPathOccupiedHit);
                 }
                 let selected_idx = random_select(healthy_indices);
                 entry
                     .get_mut()
                     .push_bounded(workers[selected_idx].url().to_string());
-                selected_idx
+                (selected_idx, ExecutionBranch::RoutingIdSlowPathOccupiedMiss)
             }
             Entry::Vacant(entry) => {
                 let selected_idx = random_select(healthy_indices);
                 entry.insert(RoutingInfo {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                 });
-                selected_idx
+                (selected_idx, ExecutionBranch::RoutingIdSlowPathVacant)
             }
         }
+    }
+
+    fn select_worker_impl(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> (Option<usize>, ExecutionBranch) {
+        let healthy_indices = get_healthy_worker_indices(workers);
+        if healthy_indices.is_empty() {
+            return (None, ExecutionBranch::NoHealthyWorkers);
+        }
+
+        if let Some(routing_id) = info.routing_id {
+            if !routing_id.is_empty() {
+                let (idx, branch) =
+                    self.select_by_routing_id(workers, routing_id, &healthy_indices);
+                return (Some(idx), branch);
+            }
+        }
+
+        (
+            Some(random_select(&healthy_indices)),
+            ExecutionBranch::RandomFallback,
+        )
     }
 }
 
 impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy_indices = get_healthy_worker_indices(workers);
-        if healthy_indices.is_empty() {
-            return None;
-        }
-
-        if let Some(routing_id) = info.routing_id {
-            if !routing_id.is_empty() {
-                return Some(self.select_by_routing_id(workers, routing_id, &healthy_indices));
-            }
-        }
-
-        Some(random_select(&healthy_indices))
+        let (result, branch) = self.select_worker_impl(workers, info);
+        branch.record();
+        result
     }
 
     fn name(&self) -> &'static str {

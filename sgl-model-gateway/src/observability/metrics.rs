@@ -183,6 +183,10 @@ pub fn init_metrics() {
         "Worker selection events by worker_type, connection_mode, model, policy"
     );
     describe_counter!(
+        "smg_policy_manual_branch_total",
+        "Manual policy execution branch by branch type"
+    );
+    describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
