@@ -337,37 +337,34 @@ class SchedulerRuntimeCheckerMixin:
         self.maybe_sleep_on_idle()
 
 
-class SchedulerWatchdog:
-    """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
+def create_scheduler_watchdog(
+    scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
+) -> ProcessWatchdog:
+    """Create a watchdog that monitors scheduler forward progress."""
 
-    def __init__(
-        self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
-    ):
-        self.scheduler = scheduler
-
-        def dump_info() -> str:
-            if disable_request_logging():
-                return ""
-            # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.scheduler.is_hybrid_swa:
-                _, info_msg = self.scheduler._check_hybrid_memory()
-            elif self.scheduler.is_hybrid_ssm and isinstance(
-                self.scheduler.tree_cache, MambaRadixCache
-            ):
-                _, info_msg = self.scheduler._check_mamba_memory()
-            else:
-                _, info_msg = self.scheduler._check_radix_cache_memory()
-            return (
-                f"{self.scheduler.cur_batch.batch_size()=}\n"
-                f"{self.scheduler.cur_batch.reqs=}\n"
-                f"{info_msg}"
-            )
-
-        self.watchdog = ProcessWatchdog(
-            process_name="Scheduler",
-            get_counter=lambda: self.scheduler.forward_ct,
-            is_active=lambda: self.scheduler.cur_batch is not None,
-            watchdog_timeout=watchdog_timeout,
-            soft=soft,
-            dump_info=dump_info,
+    def dump_info() -> str:
+        if disable_request_logging():
+            return ""
+        # Print batch size and memory pool info to check whether there are de-sync issues.
+        if scheduler.is_hybrid_swa:
+            _, info_msg = scheduler._check_hybrid_memory()
+        elif scheduler.is_hybrid_ssm and isinstance(
+            scheduler.tree_cache, MambaRadixCache
+        ):
+            _, info_msg = scheduler._check_mamba_memory()
+        else:
+            _, info_msg = scheduler._check_radix_cache_memory()
+        return (
+            f"{scheduler.cur_batch.batch_size()=}\n"
+            f"{scheduler.cur_batch.reqs=}\n"
+            f"{info_msg}"
         )
+
+    return ProcessWatchdog(
+        process_name="Scheduler",
+        get_counter=lambda: scheduler.forward_ct,
+        is_active=lambda: scheduler.cur_batch is not None,
+        watchdog_timeout=watchdog_timeout,
+        soft=soft,
+        dump_info=dump_info,
+    )
