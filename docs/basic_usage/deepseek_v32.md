@@ -290,3 +290,12 @@ Some features are still not supported at present.
 - **Other Args**: Currently only supports moe_dense_tp_size=1, kv_cache_dtype = "bf16", moe_a2a_backend = "deepep",
 - **DP_size**: `CP_size` reuses `atten_tp_size`, which is equal to `TP_size` / `DP_size`. For the cp function to work correctly, `TP_size` must be divisible by `DP_size`, and TP_size / DP_size > 1 (to ensure CP_size > 1).
 - **Detailed design reference**: https://github.com/sgl-project/sglang/pull/12065
+
+You can switch the CP token splitting mode for prefill by specifying the parameter `--nsa-prefill-cp-mode continuous-split`. In this scenario, compared with the aforementioned method, it additionally supports the fused MoE
+backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. For more details, please refer to PR https://github.com/sgl-project/sglang/pull/13959.
+
+Example usage:
+```bash
+# Launch with FusedMoe + CP8 + DP1
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --dp 1 --enable-dp-attention --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode continuous-split --max-running-requests 32
+```

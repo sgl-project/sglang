@@ -149,6 +149,8 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
+NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "continuous-split"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -578,7 +580,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
-    nsa_prefill_cp_mode: int = 0
+    nsa_prefill_cp_mode: str = "in-seq-split"
     enable_fused_qk_norm_rope: bool = False
 
     # Dynamic batch tokenizer
@@ -1033,7 +1035,7 @@ class ServerArgs:
                     if self.enable_nsa_prefill_context_parallel:
                         # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
                         self.moe_dense_tp_size = 1
-                        if self.nsa_prefill_cp_mode != 1:
+                        if self.nsa_prefill_cp_mode != "continuous-split":
                             self.moe_a2a_backend = "deepep"
                             self.ep_size = self.tp_size
                             self.kv_cache_dtype = "bf16"
@@ -4164,10 +4166,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--nsa-prefill-cp-mode",
-            type=int,
+            type=str,
             default=ServerArgs.nsa_prefill_cp_mode,
-            choices=[0, 1],
-            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 0 (default), 1.",
+            choices=NSA_PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'continuous-split'. "
+            "'continuous-split' supports multi-batch prefill, fused_moe, and FP8 KVcache.",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",

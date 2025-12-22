@@ -123,7 +123,7 @@ class TestDeepseekV32CPMode1(CustomTestCase):
             "32",
             "--enable-nsa-prefill-context-parallel",
             "--nsa-prefill-cp-mode",
-            "1",
+            "continuous-split",
         ]
         cls.process = popen_launch_server(
             cls.model,

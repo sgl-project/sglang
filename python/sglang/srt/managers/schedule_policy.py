@@ -26,7 +26,7 @@ import torch
 
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
-    is_nsa_prefill_cp_mode0,
+    is_nsa_prefill_cp_in_seq_split,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
@@ -367,7 +367,7 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        self.nsa_prefill_cp_mode0 = is_nsa_prefill_cp_mode0()
+        self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.prefill_max_requests = prefill_max_requests
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
@@ -577,7 +577,7 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if self.nsa_prefill_cp_mode0 and len(self.can_run_list) >= 1:
+        if self.nsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:

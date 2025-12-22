@@ -28,7 +28,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_DUAL_STREAM,
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
-    is_nsa_prefill_cp_mode0,
+    is_nsa_prefill_cp_in_seq_split,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -888,7 +888,7 @@ class Indexer(CustomOp):
             else:
                 if (
                     forward_batch.nsa_cp_metadata is not None
-                    and is_nsa_prefill_cp_mode0()
+                    and is_nsa_prefill_cp_in_seq_split()
                 ):
                     kv_len_prev = forward_batch.nsa_cp_metadata.kv_len_prev
                     kv_len_next = forward_batch.nsa_cp_metadata.kv_len_next
