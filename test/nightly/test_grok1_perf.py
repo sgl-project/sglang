@@ -101,7 +101,7 @@ class TestNightlyGrok1Performance(unittest.TestCase):
         try:
             for variant_config in self.variants:
                 with self.subTest(variant=variant_config["name"]):
-                    results, success = self.runner.run_benchmark_for_model(
+                    result_tuple = self.runner.run_benchmark_for_model(
                         model_path=self.model,
                         batch_sizes=self.batch_sizes,
                         input_lens=self.input_lens,
@@ -110,6 +110,8 @@ class TestNightlyGrok1Performance(unittest.TestCase):
                         variant=variant_config["name"],
                         extra_bench_args=["--trust-remote-code"],
                     )
+                    results = result_tuple[0]
+                    success = result_tuple[1]
 
                     if not success:
                         failed_variants.append(variant_config["name"])
