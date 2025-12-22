@@ -15,14 +15,9 @@ entire transformer implementation. Those legacy entry points have been removed
 to avoid confusion.
 """
 
-import os
-from pathlib import Path
-from typing import Optional, Union
-
-import torch
-import torch.nn as nn
-
-from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import NunchakuConfig
+from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+    NunchakuConfig,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -31,10 +26,10 @@ logger = init_logger(__name__)
 def create_nunchaku_config_from_server_args(server_args) -> NunchakuConfig:
     """
     Create NunchakuConfig from server arguments.
-    
+
     Args:
         server_args: Server configuration arguments
-        
+
     Returns:
         NunchakuConfig instance
     """
@@ -45,4 +40,3 @@ def create_nunchaku_config_from_server_args(server_args) -> NunchakuConfig:
         quantized_model_path=getattr(server_args, "quantized_model_path", None),
         enable_offloading=getattr(server_args, "quantization_enable_offloading", False),
     )
-
