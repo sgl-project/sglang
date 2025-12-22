@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 import logging
-import signal
-import sys
-import threading
 import time
 import warnings
 from typing import TYPE_CHECKING
-
-import psutil
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -21,6 +16,7 @@ from sglang.srt.utils.common import (
     pyspy_dump_schedulers,
     raise_error_or_warn,
 )
+from sglang.srt.utils.watchdog import ProcessWatchdog
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -348,34 +344,10 @@ class SchedulerWatchdog:
         self, scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
     ):
         self.scheduler = scheduler
-        self.soft = soft
 
-        self.watchdog_timeout = watchdog_timeout
-        t = threading.Thread(target=self._watchdog_thread, daemon=True)
-        t.start()
-        self.parent_process = psutil.Process().parent()
-
-    def _watchdog_thread(self):
-        while True:
-            self._watchdog_once()
-
-    def _watchdog_once(self):
-        watchdog_last_forward_ct = 0
-        watchdog_last_time = time.perf_counter()
-
-        while True:
-            current = time.perf_counter()
-            if self.scheduler.cur_batch is not None:
-                if watchdog_last_forward_ct == self.scheduler.forward_ct:
-                    if current > watchdog_last_time + self.watchdog_timeout:
-                        break
-                else:
-                    watchdog_last_forward_ct = self.scheduler.forward_ct
-                    watchdog_last_time = current
-            time.sleep(self.watchdog_timeout // 2)
-
-        if not disable_request_logging():
-            # TODO extract this duplicated logic w/ another place
+        def dump_info() -> str:
+            if disable_request_logging():
+                return ""
             # Print batch size and memory pool info to check whether there are de-sync issues.
             if self.scheduler.is_hybrid_swa:
                 _, info_msg = self.scheduler._check_hybrid_memory()
@@ -385,18 +357,17 @@ class SchedulerWatchdog:
                 _, info_msg = self.scheduler._check_mamba_memory()
             else:
                 _, info_msg = self.scheduler._check_radix_cache_memory()
-            logger.error(
+            return (
                 f"{self.scheduler.cur_batch.batch_size()=}\n"
                 f"{self.scheduler.cur_batch.reqs=}\n"
                 f"{info_msg}"
             )
 
-        pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=}, {self.soft=})")
-        print(file=sys.stderr, flush=True)
-        print(file=sys.stdout, flush=True)
-
-        if not self.soft:
-            # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
-            self.parent_process.send_signal(signal.SIGQUIT)
+        self.watchdog = ProcessWatchdog(
+            process_name="Scheduler",
+            get_counter=lambda: self.scheduler.forward_ct,
+            is_active=lambda: self.scheduler.cur_batch is not None,
+            watchdog_timeout=watchdog_timeout,
+            soft=soft,
+            dump_info=dump_info,
+        )
