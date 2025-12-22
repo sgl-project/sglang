@@ -17,6 +17,8 @@ impl RoutingId {
     }
 }
 
+const MAX_CANDIDATE_WORKERS: usize = 3;
+
 #[derive(Debug, Clone)]
 struct RoutingInfo {
     worker_urls: Vec<String>,
@@ -59,7 +61,11 @@ impl ManualPolicy {
                     return idx;
                 }
                 let selected_idx = random_select(healthy_indices);
-                entry.get_mut().worker_urls.push(workers[selected_idx].url().to_string());
+                let urls = &mut entry.get_mut().worker_urls;
+                if urls.len() >= MAX_CANDIDATE_WORKERS {
+                    urls.remove(0);
+                }
+                urls.push(workers[selected_idx].url().to_string());
                 selected_idx
             }
             Entry::Vacant(entry) => {
