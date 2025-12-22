@@ -40,9 +40,10 @@ impl ManualPolicy {
         routing_id: &str,
         healthy_indices: &[usize],
     ) -> usize {
-        let key = RoutingId::new(routing_id);
+        let routing_id = RoutingId::new(routing_id);
 
-        if let Some(info) = self.routing_map.get(&key) {
+        // Fast path
+        if let Some(info) = self.routing_map.get(&routing_id) {
             for url in &info.worker_urls {
                 if let Some(idx) = find_worker_index_by_url(workers, url) {
                     if healthy_indices.contains(&idx) {
@@ -52,7 +53,8 @@ impl ManualPolicy {
             }
         }
 
-        match self.routing_map.entry(key) {
+        // Slow path
+        match self.routing_map.entry(routing_id) {
             Entry::Occupied(mut entry) => {
                 for url in &entry.get().worker_urls {
                     if let Some(idx) = find_worker_index_by_url(workers, url) {
