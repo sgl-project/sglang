@@ -591,6 +591,7 @@ class MTPWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.return_hidden_states_before_norm = True
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
@@ -645,6 +646,7 @@ class MTPWorkerV2(BaseSpecWorker):
                     self.target_worker,
                 )
             )
+        verify_forward_batch.return_hidden_states_before_norm = True
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
