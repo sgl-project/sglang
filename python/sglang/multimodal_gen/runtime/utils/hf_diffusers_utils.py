@@ -176,6 +176,8 @@ def get_quant_config(
     packed_modules_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
+    if "quantization_config" not in model_config:
+        return None
     quant_cls = get_quantization_config(
         model_config["quantization_config"]["quant_method"]
     )
