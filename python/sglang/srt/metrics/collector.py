@@ -1025,6 +1025,7 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    prefetch_occupied_ratios: List[float] = field(default_factory=list)
 
 
 class StorageMetricsCollector:
@@ -1065,7 +1066,16 @@ class StorageMetricsCollector:
             50,
             100,
         ]
-
+        bucket_prefetch_occupied_ratio = [
+            0.0,
+            0.3,
+            0.5,
+            0.8,
+            0.9,
+            1.0,
+            1.2,
+            1.5,
+        ]
         self.histogram_prefetch_pgs = Histogram(
             name="sglang:prefetch_pgs",
             documentation="Histogram of prefetch pages of batches.",
@@ -1093,6 +1103,12 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
+        self.histogram_prefetch_occupied_ratio = Histogram(
+            name="sglang:prefetch_occupied_ratio",
+            documentation="Histogram of prefetch occupied ratio.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_occupied_ratio,
+        )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
@@ -1119,6 +1135,8 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+        for v in storage_metrics.prefetch_occupied_ratios:
+            self._log_histogram(self.histogram_prefetch_occupied_ratio, v)
 
 
 class ExpertDispatchCollector:
