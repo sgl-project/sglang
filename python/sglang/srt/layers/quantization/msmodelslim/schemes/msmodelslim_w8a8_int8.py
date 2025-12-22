@@ -28,6 +28,10 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
         self.is_dynamic = (
             self.quant_config.get(prefix + ".weight", "") == "W8A8_DYNAMIC"
         )
+        if self.is_dynamic:
+            self.kernel = NPUW8A8Int8DynamicLinearMethod()
+        else:
+            self.kernel = NPUW8A8Int8LinearMethod()
 
     def create_weights(
         self,
@@ -102,10 +106,7 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
             layer.register_parameter("deq_scale", deq_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        if self.is_dynamic:
-            NPUW8A8Int8DynamicLinearMethod.process_weights_after_loading(layer)
-        else:
-            NPUW8A8Int8LinearMethod.process_weights_after_loading(layer)
+            self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self,
@@ -113,7 +114,4 @@ class ModelSlimW8A8Int8(ModelSlimScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.is_dynamic:
-            return NPUW8A8Int8DynamicLinearMethod.apply(layer, x, bias)
-        else:
-            return NPUW8A8Int8LinearMethod.apply(layer, x, bias)
+            return self.kernel.apply(layer, x, bias)
