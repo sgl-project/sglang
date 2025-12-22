@@ -300,7 +300,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.last_receive_tstamp = 0
 
         self.receive_ct = 0
-        self.is_receiving = False
+        self.is_processing = False
 
         # Initial weights status
         self.initial_weights_loaded = True
@@ -412,7 +412,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ProcessWatchdog(
                 debug_name="TokenizerManager",
                 get_counter=lambda: self.receive_ct,
-                is_active=lambda: self.is_receiving,
+                is_active=lambda: self.is_processing,
                 watchdog_timeout=timeout,
                 soft=True,
             )
@@ -1514,12 +1514,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         test_stuck = envs.SGLANG_TEST_STUCK_TOKENIZER.get()
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self.is_receiving = True
+            self.is_processing = True
             if test_stuck > 0:
                 await asyncio.sleep(test_stuck)
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
-            self.is_receiving = False
+            self.is_processing = False
             self.receive_ct += 1
 
     def _add_metric_if_present(
