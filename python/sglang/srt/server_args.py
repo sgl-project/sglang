@@ -1183,6 +1183,8 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
+            self.enable_multi_layer_eagle = True
+            logger.info("Enable multi-layer eagle for MiMoV2FlashForCausalLM model")
             self.swa_full_tokens_ratio = 1.0
             logger.warning(
                 "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model"
