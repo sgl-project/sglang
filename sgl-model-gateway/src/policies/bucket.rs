@@ -7,7 +7,7 @@ use std::{
 
 use dashmap::DashMap;
 use rand::Rng;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy};
@@ -58,7 +58,7 @@ impl BucketPolicy {
                             bucket_guard.adjust_boundary();
                         }
                         Err(e) => {
-                            eprintln!(
+                            error!(
                                 "Failed to acquire write lock for bucket {}: {}",
                                 model_id, e
                             );
@@ -112,7 +112,7 @@ impl BucketPolicy {
             if let Ok(mut bucket_guard) = lock_result {
                 bucket_guard.init_prefill_worker_urls(worker_urls);
             } else {
-                eprintln!("Failed to acquire write lock for bucket initialization");
+                error!("Failed to acquire write lock for bucket initialization");
             }
         }
     }
@@ -259,14 +259,14 @@ impl LoadBalancingPolicy for BucketPolicy {
             let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
             let is_imbalanced =
                 abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
-            info!(
+            debug!(
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
             );
 
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
-                info!("select prefill instance by Load Balance policy");
+                debug!("select prefill instance by Load Balance policy");
                 let min_url = chars_per_url_snapshot
                     .iter()
                     .min_by_key(|(_, &chars)| chars)
@@ -279,7 +279,7 @@ impl LoadBalancingPolicy for BucketPolicy {
                     });
                 min_url
             } else {
-                info!("select prefill instance by Bucket policy");
+                debug!("select prefill instance by Bucket policy");
                 match choiced_url {
                     Some(url) if !url.is_empty() => url,
                     _ => {

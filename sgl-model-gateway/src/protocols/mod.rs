@@ -9,6 +9,8 @@ pub mod completion;
 pub mod embedding;
 pub mod event_types;
 pub mod generate;
+pub mod messages;
+pub mod parser;
 pub mod rerank;
 pub mod responses;
 pub mod sampling_params;

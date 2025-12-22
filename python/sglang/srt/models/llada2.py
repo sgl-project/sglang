@@ -579,12 +579,14 @@ class LLaDA2MoeBlock(nn.Module):
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
         is_previous_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id - 1)
+        is_next_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id + 1)
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1

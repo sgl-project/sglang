@@ -89,8 +89,15 @@ class SamplingBatchInfo:
         )
         sampling_seed = (
             torch.tensor(
-                [r.sampling_params.sampling_seed for r in reqs],
-                dtype=torch.int32,
+                [
+                    (
+                        r.sampling_params.sampling_seed
+                        if r.sampling_params.sampling_seed is not None
+                        else 42
+                    )
+                    for r in reqs
+                ],
+                dtype=torch.int64,
                 device=device,
             )
             if enable_deterministic
@@ -173,7 +180,12 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
         )
+        ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
+
+    # placeholder for override
+    def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
+        pass
 
     def __len__(self):
         return len(self.temperatures)
