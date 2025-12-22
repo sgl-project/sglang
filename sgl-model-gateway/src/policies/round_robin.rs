@@ -83,11 +83,12 @@ mod tests {
         ];
 
         // Should select workers in order: 0, 1, 2, 0, 1, 2, ...
-        assert_eq!(policy.select_worker(&workers, None, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(1));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(1));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
     }
 
     #[test]
@@ -115,10 +116,11 @@ mod tests {
         workers[1].set_healthy(false);
 
         // Should skip unhealthy worker: 0, 2, 0, 2, ...
-        assert_eq!(policy.select_worker(&workers, None, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(2));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(2));
     }
 
     #[test]
@@ -138,11 +140,12 @@ mod tests {
         ];
 
         // Advance the counter
-        assert_eq!(policy.select_worker(&workers, None, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None, None), Some(1));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
 
         // Reset should start from beginning
         policy.reset();
-        assert_eq!(policy.select_worker(&workers, None, None), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
     }
 }

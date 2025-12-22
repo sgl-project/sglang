@@ -10,7 +10,7 @@ use rand::Rng;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 #[derive(Debug)]
@@ -220,9 +220,9 @@ impl LoadBalancingPolicy for BucketPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-        _routing_id: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {

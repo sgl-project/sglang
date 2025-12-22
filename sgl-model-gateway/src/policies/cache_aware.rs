@@ -72,7 +72,10 @@ use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
+use super::{
+    get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy,
+    SelectWorkerInfo,
+};
 use crate::core::Worker;
 
 /// Cache-aware routing policy
@@ -303,9 +306,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-        _routing_id: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<usize> {
+        let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
@@ -481,17 +484,17 @@ mod tests {
 
         // First request should be distributed
         let idx1 = policy
-            .select_worker(&workers, Some("hello world"), None)
+            .select_worker(&workers, &SelectWorkerInfo { request_text: Some("hello world"), ..Default::default() })
             .unwrap();
 
         // Same request should go to same worker (cache hit)
         let idx2 = policy
-            .select_worker(&workers, Some("hello world"), None)
+            .select_worker(&workers, &SelectWorkerInfo { request_text: Some("hello world"), ..Default::default() })
             .unwrap();
         assert_eq!(idx1, idx2);
 
         // Similar request should also go to same worker
-        let idx3 = policy.select_worker(&workers, Some("hello"), None).unwrap();
+        let idx3 = policy.select_worker(&workers, &SelectWorkerInfo { request_text: Some("hello"), ..Default::default() }).unwrap();
         assert_eq!(idx1, idx3);
     }
 
@@ -523,7 +526,7 @@ mod tests {
 
         // Should select worker2 (lower load) despite cache affinity
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, Some("test"), None).unwrap();
+            let idx = policy.select_worker(&workers, &SelectWorkerInfo { request_text: Some("test"), ..Default::default() }).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
@@ -551,15 +554,15 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(&workers, Some("test1"), None);
-        policy.select_worker(&workers, Some("test2"), None);
+        policy.select_worker(&workers, &SelectWorkerInfo { request_text: Some("test1"), ..Default::default() });
+        policy.select_worker(&workers, &SelectWorkerInfo { request_text: Some("test2"), ..Default::default() });
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
         workers[0].set_healthy(false);
 
         // All requests should now go to worker2
-        let idx = policy.select_worker(&workers, Some("test1"), None).unwrap();
+        let idx = policy.select_worker(&workers, &SelectWorkerInfo { request_text: Some("test1"), ..Default::default() }).unwrap();
         assert_eq!(idx, 1);
     }
 }
