@@ -167,7 +167,7 @@ class MMEncoder:
         self.mm_cache_lock = asyncio.Lock()
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
+            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
         )
 
         if schedule_path is not None:
