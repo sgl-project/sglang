@@ -977,9 +977,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            intermediate_state_indices = torch.arange(
-                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            )
+            # intermediate_state_indices = torch.arange(
+            #     cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
+            # )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 

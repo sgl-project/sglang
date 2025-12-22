@@ -212,7 +212,7 @@ class MambaPool:
                 intermediate_k = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        spec_state_size + 1,
+                        size + 1,
                         speculative_num_draft_tokens,
                         num_k_heads,
                         head_dim
@@ -223,7 +223,7 @@ class MambaPool:
                 intermediate_v = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        spec_state_size + 1,
+                        size + 1,
                         speculative_num_draft_tokens,
                         num_heads,
                         head_dim
@@ -234,7 +234,7 @@ class MambaPool:
                 intermediate_g = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        spec_state_size + 1,
+                        size + 1,
                         speculative_num_draft_tokens,
                         num_heads
                     ),
@@ -244,7 +244,7 @@ class MambaPool:
                 intermediate_beta = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        spec_state_size + 1,
+                        size + 1,
                         speculative_num_draft_tokens,
                         num_heads
                     ),
@@ -253,7 +253,7 @@ class MambaPool:
                 )
                 intermediate_accepted_steps = torch.full(
                     size=(
-                        spec_state_size + 1,
+                        size + 1,
                     ),
                     fill_value=-1,
                     dtype=torch.int32,
@@ -265,7 +265,7 @@ class MambaPool:
                     torch.zeros(
                         size=(
                             num_mamba_layers,
-                            spec_state_size + 1,
+                            size + 1,
                             speculative_num_draft_tokens,
                             conv_shape[0],
                             conv_shape[1],
@@ -351,6 +351,26 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
             :, src_index
         ]
+        if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+            self.mamba_cache.intermediate_k[:, dst_index] = self.mamba_cache.intermediate_k[
+                :, src_index
+            ]
+            self.mamba_cache.intermediate_v[:, dst_index] = self.mamba_cache.intermediate_v[
+                :, src_index
+            ]
+            self.mamba_cache.intermediate_g[:, dst_index] = self.mamba_cache.intermediate_g[
+                :, src_index
+            ]
+            self.mamba_cache.intermediate_beta[:, dst_index] = self.mamba_cache.intermediate_beta[
+                :, src_index
+            ]
+            self.mamba_cache.intermediate_accepted_steps[dst_index] = self.mamba_cache.intermediate_accepted_steps[
+                src_index
+            ]
+            for i in range(len(self.mamba_cache.conv)):
+                self.mamba_cache.intermediate_conv_window[i][:, dst_index] = self.mamba_cache.intermediate_conv_window[i][
+                    :, src_index
+                ]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
