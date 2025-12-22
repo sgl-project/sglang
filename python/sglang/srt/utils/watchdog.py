@@ -97,8 +97,11 @@ class WatchdogRaw:
         t.start()
 
     def _watchdog_thread(self):
-        while True:
-            self._watchdog_once()
+        try:
+            while True:
+                self._watchdog_once()
+        except Exception as e:
+            logger.error(f"{self.debug_name} watchdog thread crashed: {e}", exc_info=True)
 
     def _watchdog_once(self):
         watchdog_last_counter = 0
