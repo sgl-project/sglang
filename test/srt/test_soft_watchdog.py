@@ -15,23 +15,21 @@ from sglang.test.test_utils import (
 )
 
 
-class TestSoftWatchdogDetokenizer(CustomTestCase):
+class BaseTestSoftWatchdog(CustomTestCase):
+    env_override = None
+    expected_message = None
+
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
 
-        with envs.SGLANG_TEST_STUCK_DETOKENIZER.override(5):
+        with cls.env_override.override(5):
             cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=(
-                    "--soft-watchdog-timeout",
-                    "2",
-                ),
+                other_args=("--soft-watchdog-timeout", "2"),
                 return_stdout_stderr=(cls.stdout, cls.stderr),
             )
 
@@ -39,9 +37,9 @@ class TestSoftWatchdogDetokenizer(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_detokenizer_watchdog_triggers(self):
+    def test_watchdog_triggers(self):
         requests.post(
-            self.base_url + "/generate",
+            DEFAULT_URL_FOR_TEST + "/generate",
             json={
                 "text": "Hello",
                 "sampling_params": {"max_new_tokens": 1, "temperature": 0},
@@ -52,53 +50,17 @@ class TestSoftWatchdogDetokenizer(CustomTestCase):
         time.sleep(10)
 
         combined_output = self.stdout.getvalue() + self.stderr.getvalue()
-        self.assertIn(
-            "DetokenizerManager watchdog timeout",
-            combined_output,
-        )
+        self.assertIn(self.expected_message, combined_output)
 
 
-class TestSoftWatchdogTokenizer(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.stdout = io.StringIO()
-        cls.stderr = io.StringIO()
+class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog):
+    env_override = envs.SGLANG_TEST_STUCK_DETOKENIZER
+    expected_message = "DetokenizerManager watchdog timeout"
 
-        with envs.SGLANG_TEST_STUCK_TOKENIZER.override(5):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=(
-                    "--soft-watchdog-timeout",
-                    "2",
-                ),
-                return_stdout_stderr=(cls.stdout, cls.stderr),
-            )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_tokenizer_watchdog_triggers(self):
-        requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "Hello",
-                "sampling_params": {"max_new_tokens": 1, "temperature": 0},
-            },
-            timeout=30,
-        )
-
-        time.sleep(10)
-
-        combined_output = self.stdout.getvalue() + self.stderr.getvalue()
-        self.assertIn(
-            "TokenizerManager watchdog timeout",
-            combined_output,
-        )
+class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog):
+    env_override = envs.SGLANG_TEST_STUCK_TOKENIZER
+    expected_message = "TokenizerManager watchdog timeout"
 
 
 if __name__ == "__main__":
