@@ -51,14 +51,11 @@ class ChunkCache(BasePrefixCache):
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
-        self.protected_size_ -= len(req.prefix_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
-        self.protected_size_ += len(kv_indices) - len(req.prefix_indices)
-
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
@@ -72,7 +69,8 @@ class ChunkCache(BasePrefixCache):
         return 0
 
     def protected_size(self):
-        return self.protected_size_
+        # NOTE: no protected size in chunk cache. Chunk cache's eviction is the same with request's lifecycle.
+        return 0
 
     def pretty_print(self):
         return ""
@@ -84,6 +82,7 @@ class SWAChunkCache(ChunkCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
+        self.is_local_attention = params.is_local_attention
 
     def evict_swa(
         self,
@@ -91,10 +90,14 @@ class SWAChunkCache(ChunkCache):
         prelen: int,
         attention_chunk_size: int,
     ):
-        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
-            new_evicted_seqlen_local = attention_chunk_size * (
-                prelen // attention_chunk_size
-            )
+        thresh = req.evicted_seqlen_local + attention_chunk_size * 2
+        if self.is_local_attention:
+            thresh -= attention_chunk_size
+
+        if prelen >= thresh:
+            new_evicted_seqlen_local = (
+                prelen // attention_chunk_size * attention_chunk_size
+            ) - (attention_chunk_size if not self.is_local_attention else 0)
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]
