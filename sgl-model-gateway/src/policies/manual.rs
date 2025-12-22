@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -26,23 +26,30 @@ impl ManualPolicy {
         routing_id: &str,
         healthy_indices: &[usize],
     ) -> usize {
-        if let Some(entry) = self.routing_map.get(routing_id) {
-            let worker_url = entry.value();
-            if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
-                if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute() {
-                    return idx;
+        match self.routing_map.entry(routing_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let worker_url = entry.get();
+                if let Some(idx) = find_worker_index_by_url(workers, worker_url) {
+                    if workers[idx].is_healthy() && workers[idx].circuit_breaker().can_execute() {
+                        return idx;
+                    }
                 }
+                let selected_idx = Self::random_select(healthy_indices);
+                entry.insert(workers[selected_idx].url().to_string());
+                selected_idx
             }
-            drop(entry);
-            self.routing_map.remove(routing_id);
+            Entry::Vacant(entry) => {
+                let selected_idx = Self::random_select(healthy_indices);
+                entry.insert(workers[selected_idx].url().to_string());
+                selected_idx
+            }
         }
+    }
 
+    fn random_select(healthy_indices: &[usize]) -> usize {
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
-        let selected_idx = healthy_indices[random_idx];
-        let worker_url = workers[selected_idx].url().to_string();
-        self.routing_map.insert(routing_id.to_string(), worker_url);
-        selected_idx
+        healthy_indices[random_idx]
     }
 }
 
@@ -63,10 +70,7 @@ impl LoadBalancingPolicy for ManualPolicy {
             }
         }
 
-        // Fallback
-        let mut rng = rand::rng();
-        let random_idx = rng.random_range(0..healthy_indices.len());
-        Some(healthy_indices[random_idx])
+        Some(Self::random_select(&healthy_indices))
     }
 
     fn name(&self) -> &'static str {
