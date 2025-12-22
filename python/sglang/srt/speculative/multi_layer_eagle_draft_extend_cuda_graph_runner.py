@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class MTPDraftExtendCudaGraphRunner:
+class MultiLayerEagleDraftExtendCudaGraphRunner:
     def __init__(self, mtp_worker: MTPDraftWorker, step: int):
         # Parse args
         self.step = step
@@ -567,7 +567,9 @@ class MTPMultiStepDraftExtendCudaGraphRunner:
         # 1. Capture loop
         for step in range(self.speculative_num_steps):
             if self.draft_extend_attn_backend_list[step]:
-                runner = MTPDraftExtendCudaGraphRunner(self.mtp_worker, step)
+                runner = MultiLayerEagleDraftExtendCudaGraphRunner(
+                    self.mtp_worker, step
+                )
                 self.runners.append(runner)
 
                 self.seq_len_fill_value = runner.seq_len_fill_value

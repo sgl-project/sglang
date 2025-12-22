@@ -49,7 +49,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
-    MTPDraftExtendCudaGraphRunner,
+    MultiLayerEagleDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -235,7 +235,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
                 )
                 self.cuda_graph_runner_for_draft_extend_list.append(
-                    MTPDraftExtendCudaGraphRunner(self, step)
+                    MultiLayerEagleDraftExtendCudaGraphRunner(self, step)
                 )
                 after_mem = get_available_gpu_memory(self.device, self.gpu_id)
                 logger.info(
