@@ -17,14 +17,14 @@ logger = logging.getLogger(__name__)
 class ProcessWatchdog:
     def __init__(
         self,
-        process_name: str,
+        debug_name: str,
         get_counter: Callable[[], int],
         is_active: Callable[[], bool],
         watchdog_timeout: float,
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
     ):
-        self.process_name = process_name
+        self.debug_name = debug_name
         self.get_counter = get_counter
         self.is_active = is_active
         self.watchdog_timeout = watchdog_timeout
@@ -58,11 +58,11 @@ class ProcessWatchdog:
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.process_name} debug info:\n{info_msg}")
+            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
 
         pyspy_dump_schedulers()
         logger.error(
-            f"{self.process_name} watchdog timeout "
+            f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
         )
         print(file=sys.stderr, flush=True)
