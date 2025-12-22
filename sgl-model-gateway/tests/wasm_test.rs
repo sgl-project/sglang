@@ -218,7 +218,6 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "requires large memory allocation, run manually"]
 async fn test_wasm_api_add_module() {
     let (app, app_context, temp_dir) = create_test_app_with_wasm().await;
     let wasm_file_path = create_test_wasm_component(&temp_dir).await;
@@ -288,7 +287,6 @@ async fn test_wasm_api_add_module() {
 }
 
 #[tokio::test]
-#[ignore = "requires large memory allocation, run manually"]
 async fn test_wasm_api_add_module_invalid_file() {
     let (app, _app_context, _temp_dir) = create_test_app_with_wasm().await;
 
@@ -338,7 +336,6 @@ async fn test_wasm_api_add_module_invalid_file() {
 }
 
 #[tokio::test]
-#[ignore = "requires large memory allocation, run manually"]
 async fn test_wasm_api_add_module_invalid_wasm() {
     let (app, _app_context, temp_dir) = create_test_app_with_wasm().await;
 
@@ -394,7 +391,6 @@ async fn test_wasm_api_add_module_invalid_wasm() {
 }
 
 #[tokio::test]
-#[ignore = "requires large memory allocation, run manually"]
 async fn test_wasm_api_list_modules() {
     let (app, _app_context, temp_dir) = create_test_app_with_wasm().await;
     let wasm_file_path = create_test_wasm_component(&temp_dir).await;
@@ -463,7 +459,6 @@ async fn test_wasm_api_list_modules() {
 }
 
 #[tokio::test]
-#[ignore = "requires large memory allocation, run manually"]
 async fn test_wasm_api_remove_module() {
     let (app, app_context, temp_dir) = create_test_app_with_wasm().await;
     let wasm_file_path = create_test_wasm_component(&temp_dir).await;
