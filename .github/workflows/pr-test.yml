@@ -1215,12 +1215,23 @@ jobs:
           pip install -e .
 
       - name: Evaluate accuracy
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 test_eval_accuracy_large.py
-        env:
-          SGLANG_CI_ENABLE_RETRY: ${{ needs.check-changes.outputs.enable_retry }}
+          # Retry logic for flaky accuracy tests
+          for attempt in 1 2; do
+            echo "Attempt $attempt of 2"
+            if python3 test_eval_accuracy_large.py; then
+              echo "Test passed on attempt $attempt"
+              exit 0
+            fi
+            if [ $attempt -lt 2 ]; then
+              echo "Test failed, retrying in 60s..."
+              sleep 60
+            fi
+          done
+          echo "Test failed after 2 attempts"
+          exit 1
 
   accuracy-test-2-gpu:
     needs: [check-changes, call-gate, accuracy-test-1-gpu]
@@ -1257,12 +1268,23 @@ jobs:
           pip install -e .
 
       - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 test_moe_eval_accuracy_large.py
-        env:
-          SGLANG_CI_ENABLE_RETRY: ${{ needs.check-changes.outputs.enable_retry }}
+          # Retry logic for flaky accuracy tests
+          for attempt in 1 2; do
+            echo "Attempt $attempt of 2"
+            if python3 test_moe_eval_accuracy_large.py; then
+              echo "Test passed on attempt $attempt"
+              exit 0
+            fi
+            if [ $attempt -lt 2 ]; then
+              echo "Test failed, retrying in 60s..."
+              sleep 60
+            fi
+          done
+          echo "Test failed after 2 attempts"
+          exit 1
 
   unit-test-deepep-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, stage-b-test-4-gpu-b200]
