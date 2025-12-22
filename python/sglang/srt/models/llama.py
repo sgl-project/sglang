@@ -52,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import DynamicGradMode, add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -456,7 +456,7 @@ class LlamaForCausalLM(nn.Module):
     ):
         return LlamaModel(config, quant_config=quant_config, prefix=prefix)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -492,7 +492,7 @@ class LlamaForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_split_prefill(
         self,
         input_ids: torch.Tensor,

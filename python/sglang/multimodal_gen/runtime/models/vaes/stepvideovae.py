@@ -22,6 +22,7 @@ from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.vaes import StepVideoVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.srt.utils import DynamicGradMode
 
 
 def base_group_norm(x, norm_layer, act_silu=False, channel_last=False) -> torch.Tensor:
@@ -746,7 +747,7 @@ class VideoEncoder(nn.Module):
                 block_in, 2 * z_channels if double_z else z_channels, kernel_size=3
             )
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def forward(self, x, video_frame_num, is_init=True) -> torch.Tensor:
         # timestep embedding
         temb = None
@@ -974,7 +975,7 @@ class VideoDecoder(nn.Module):
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in)
         self.conv_out = CausalConvAfterNorm(block_in, out_channels, kernel_size=3)
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def forward(self, z, is_init=True) -> torch.Tensor:
         z = rearrange(z, "b t c h w -> b c t h w")
         h = self.conv_in(z, is_init=is_init)
@@ -1122,7 +1123,7 @@ class AutoencoderKLStepvideo(nn.Module, ParallelTiledVAE):
         z = self.encoder(x, len, True)  # 下采样[1, 4, 8, 16, 16]
         return z
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def encode(self, x):
         # b (nc cf) c h w -> (b nc) cf c h w -> encode -> (b nc) cf c h w -> b (nc cf) c h w
         chunks = list(x.split(self.frame_len, dim=1))

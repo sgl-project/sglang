@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils import DynamicGradMode
 
 logger = init_logger(__name__)
 
@@ -78,7 +79,7 @@ class ImageEncodingStage(PipelineStage):
         prompt_embeds = qwen_image_postprocess_text(outputs, image_inputs, 64)
         return prompt_embeds
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         batch: Req,

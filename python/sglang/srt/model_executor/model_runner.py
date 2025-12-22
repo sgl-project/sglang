@@ -159,6 +159,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    DynamicGradMode,
     MultiprocessingSerializer,
     cpu_has_amx_support,
     dynamic_import,
@@ -2389,7 +2390,7 @@ class ModelRunner:
 
         logger.info("Running FlashInfer autotune...")
 
-        with torch.inference_mode(), autotune():
+        with DynamicGradMode(), autotune():
             self._dummy_run(batch_size=self.req_to_token_pool.size)
 
         logger.info("FlashInfer autotune completed.")

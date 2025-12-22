@@ -90,6 +90,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
+    DynamicGradMode,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
@@ -606,7 +607,7 @@ class LongcatFlashForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

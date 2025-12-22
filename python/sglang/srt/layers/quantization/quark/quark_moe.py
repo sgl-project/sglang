@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_qu
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
 from sglang.srt.utils import (
+    DynamicGradMode,
     get_bool_env_var,
     is_gfx95_supported,
     is_hip,
@@ -460,7 +461,7 @@ class QuarkW8A8FP8MoEMethod(QuarkMoEMethod):
             and self.is_weight_per_channel
             and self.moe_runner_config.apply_router_weight_on_input
         ):
-            with torch.no_grad():
+            with DynamicGradMode():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w13_weight.data, (16, 16)),

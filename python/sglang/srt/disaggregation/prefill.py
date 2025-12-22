@@ -25,8 +25,6 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
 
-import torch
-
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -55,6 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
+from sglang.srt.utils import DynamicGradMode
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -333,7 +332,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         return batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
@@ -361,7 +360,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
 

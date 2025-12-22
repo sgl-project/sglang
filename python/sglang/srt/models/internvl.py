@@ -38,6 +38,7 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import DynamicGradMode
 from sglang.utils import logger
 
 
@@ -586,7 +587,7 @@ class InternVLChatModel(nn.Module):
         image_features = self.extract_feature(pixel_values)
         return image_features
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

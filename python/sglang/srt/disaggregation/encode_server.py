@@ -37,7 +37,12 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
+from sglang.srt.utils import (
+    DynamicGradMode,
+    get_local_ip_auto,
+    get_zmq_socket,
+    random_uuid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +215,7 @@ class MMEncoder:
                     mm_embedding = mm_cache
 
         if mm_embedding is None:
-            with torch.inference_mode():
+            with DynamicGradMode():
                 mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
                 mm_embedding = mm_embedding.cpu()
             if len(mm_embedding.shape) != 2:

@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import DynamicGradMode
 
 logger = init_logger(__name__)
 
@@ -37,7 +38,7 @@ class StepvideoPromptEncodingStage(PipelineStage):
         self.stepllm = stepllm
         self.clip = clip
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(self, batch: Req, server_args) -> Req:
 
         prompts = [batch.prompt + server_args.pipeline_config.pos_magic]

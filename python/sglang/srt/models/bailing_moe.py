@@ -79,7 +79,13 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    DynamicGradMode,
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    make_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -857,7 +863,7 @@ class BailingMoEForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

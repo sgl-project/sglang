@@ -72,6 +72,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
 from sglang.srt.utils import (
     BumpAllocator,
+    DynamicGradMode,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
@@ -302,7 +303,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.utils import get_mixed_precision_state
+from sglang.srt.utils import DynamicGradMode
 
 torch._dynamo.config.recompile_limit = 16
 
@@ -110,7 +111,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.merge_lora_weights()
         self.lora_path = lora_path
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def merge_lora_weights(self) -> None:
         if self.disable_lora:
             return
@@ -168,7 +169,7 @@ class BaseLayerWithLoRA(nn.Module):
 
         self.merged = True
 
-    @torch.no_grad()
+    @DynamicGradMode()
     # @torch.compile(dynamic=True)
     def unmerge_lora_weights(self) -> None:
         if self.disable_lora:

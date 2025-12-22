@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils import DynamicGradMode
 
 logger = init_logger(__name__)
 
@@ -101,7 +102,7 @@ class DecodingStage(PipelineStage):
                 latents += shift_factor
         return latents
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def decode(self, latents: torch.Tensor, server_args: ServerArgs) -> torch.Tensor:
         """
         Decode latent representations into pixel space using VAE.
@@ -153,7 +154,7 @@ class DecodingStage(PipelineStage):
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         batch: Req,

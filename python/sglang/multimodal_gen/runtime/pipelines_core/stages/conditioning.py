@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import DynamicGradMode
 
 logger = init_logger(__name__)
 
@@ -29,7 +30,7 @@ class ConditioningStage(PipelineStage):
     to the diffusion process.
     """
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         batch: Req,

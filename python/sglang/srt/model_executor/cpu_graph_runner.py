@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    DynamicGradMode,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -68,7 +69,7 @@ def patch_model(
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
             yield torch.compile(
-                torch.no_grad()(model.forward),
+                DynamicGradMode()(model.forward),
                 dynamic=False,
             )
         else:
@@ -548,7 +549,7 @@ class CPUGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
-        with torch.no_grad():
+        with DynamicGradMode():
             for _ in range(2):
                 self.model_runner.tp_group.barrier()
                 out = run_once()

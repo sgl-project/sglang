@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import DynamicGradMode
+
 FMIX32_C1 = 0x85EBCA6B
 FMIX32_C2 = 0xC2B2AE35
 POS_C1 = 0x27D4EB2D
@@ -141,7 +143,7 @@ def _final_splitmix64(x: int) -> int:
     return x
 
 
-@torch.inference_mode()
+@DynamicGradMode()
 def gpu_tensor_hash(
     tensor: torch.Tensor,
     *,

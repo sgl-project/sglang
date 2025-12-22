@@ -66,7 +66,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, make_layers
+from sglang.srt.utils import DynamicGradMode, LazyValue, add_prefix, make_layers
 
 MiMoV2FlashConfig = None
 
@@ -819,7 +819,7 @@ class MiMoV2FlashForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

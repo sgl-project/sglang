@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import DynamicGradMode
 
 logger = init_logger(__name__)
 
@@ -340,7 +341,7 @@ class ComposedPipelineBase(ABC):
         setattr(self, stage_name, stage)
 
     # TODO(will): don't hardcode no_grad
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         batch: Req,

@@ -55,6 +55,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.utils import DynamicGradMode
 from sglang.utils import logger
 
 #################################################################################
@@ -196,7 +197,7 @@ def trunc_normal_tf_(
         a: the minimum cutoff value
         b: the maximum cutoff value
     """
-    with torch.no_grad():
+    with DynamicGradMode():
         _trunc_normal_(tensor, 0, 1.0, a, b)
         tensor.mul_(std).add_(mean)
 
@@ -355,7 +356,7 @@ class PatchEmbed(nn.Module):
         if patch_size is not None:
             new_patch_size = to_2tuple(patch_size)
         if new_patch_size is not None and new_patch_size != self.patch_size:
-            with torch.no_grad():
+            with DynamicGradMode():
                 new_proj = nn.Conv2d(
                     self.proj.in_channels,
                     self.proj.out_channels,
@@ -1976,7 +1977,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.LongTensor,

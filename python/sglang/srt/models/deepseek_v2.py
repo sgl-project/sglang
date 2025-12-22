@@ -141,6 +141,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
+    DynamicGradMode,
     LazyValue,
     add_prefix,
     bind_or_assign,
@@ -3369,7 +3370,7 @@ class DeepseekV2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

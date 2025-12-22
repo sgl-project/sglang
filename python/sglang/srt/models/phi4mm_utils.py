@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from sglang.srt.utils import DynamicGradMode
+
 
 class BlockBase(nn.Module):
     """Block abstract module"""
@@ -1443,7 +1445,7 @@ class NemoConvSubsampling(torch.nn.Module):
     def reset_parameters(self):
         # initialize weights
         if self._subsampling == "dw_striding":
-            with torch.no_grad():
+            with DynamicGradMode():
                 # init conv
                 scale = 1.0 / self._kernel_size
                 dw_max = (self._kernel_size**2) ** -0.5

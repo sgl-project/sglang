@@ -24,7 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 logger = logging.getLogger(__name__)
 _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
@@ -567,7 +567,7 @@ class MiDashengLMModel(nn.Module):
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

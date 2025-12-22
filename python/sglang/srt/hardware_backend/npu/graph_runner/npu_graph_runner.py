@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.utils import DynamicGradMode
 
 
 @contextmanager
@@ -62,7 +63,7 @@ def patch_model_npu(
     if enable_compile:
         backend = get_compiler_backend("npugraph_ex")
         yield torch.compile(
-            torch.no_grad()(model.forward),
+            DynamicGradMode()(model.forward),
             fullgraph=True,
             dynamic=False,
             backend=backend,

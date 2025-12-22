@@ -18,6 +18,7 @@ from sglang.srt.multiplex.pdmux_context import (
     load_pdmux_config,
     set_current_stream_idx,
 )
+from sglang.srt.utils import DynamicGradMode
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ class SchedulerMultiplexMixin:
             return True
         return False
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def event_loop_pdmux(self):
         """A scheduler loop for pd multiplexing."""
         decode_done = False

@@ -52,7 +52,7 @@ from sglang.srt.models.deepseek_v2 import (
     enable_nextn_moe_bf16_cast_to_fp8,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from sglang.srt.utils import BumpAllocator, DynamicGradMode, add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -72,6 +72,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    DynamicGradMode,
     add_prefix,
     cpu_has_amx_support,
     is_cpu,
@@ -697,7 +698,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -723,7 +724,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_split_prefill(
         self,
         input_ids: torch.Tensor,

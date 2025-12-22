@@ -77,6 +77,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    DynamicGradMode,
     add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
@@ -1064,7 +1065,7 @@ class Glm4MoeForCausalLM(nn.Module):
         ), "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

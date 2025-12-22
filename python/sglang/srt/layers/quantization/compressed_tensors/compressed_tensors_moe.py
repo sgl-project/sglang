@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.utils import (
+    DynamicGradMode,
     get_bool_env_var,
     is_cuda,
     is_hip,
@@ -761,7 +762,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
 
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
-            with torch.no_grad():
+            with DynamicGradMode():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w13_weight.data, (16, 16)),

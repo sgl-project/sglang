@@ -30,7 +30,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import DynamicGradMode, add_prefix, is_cuda, is_npu
 
 Qwen3Config = None
 
@@ -411,7 +411,7 @@ class Qwen3ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -447,7 +447,7 @@ class Qwen3ForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_split_prefill(
         self,
         input_ids: torch.Tensor,

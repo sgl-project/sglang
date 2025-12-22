@@ -45,7 +45,7 @@ from sglang.srt.models.mimo_v2_flash import (
     MiMoV2MLP,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 MiMoV2FlashConfig = None
 
@@ -248,7 +248,7 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,

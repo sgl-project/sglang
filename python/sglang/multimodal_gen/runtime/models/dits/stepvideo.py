@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.utils import DynamicGradMode
 
 
 class PatchEmbed2D(nn.Module):
@@ -423,7 +424,7 @@ class StepVideoTransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         q: torch.Tensor,
@@ -626,7 +627,7 @@ class StepVideoModel(BaseDiT):
             )
         return self._rope_cache[key]
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def forward(
         self,
         hidden_states: torch.Tensor,

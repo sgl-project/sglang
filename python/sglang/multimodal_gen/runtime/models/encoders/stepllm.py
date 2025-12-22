@@ -25,6 +25,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from sglang.multimodal_gen.runtime.models.dits.stepvideo import StepVideoRMSNorm
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import DynamicGradMode
 
 
 class EmptyInitOnDevice(torch.overrides.TorchFunctionMode):
@@ -588,11 +589,11 @@ class STEP1TextEncoder(torch.nn.Module):
         text_encoder = Step1Model.from_pretrained(model_dir)
         self.text_encoder = text_encoder.eval().to(torch.bfloat16)
 
-    @torch.no_grad
+    @DynamicGradMode()
     def forward(self, prompts, with_mask=True, max_length=None):
         self.device = next(self.text_encoder.parameters()).device
 
-        with torch.no_grad(), torch.amp.autocast(
+        with DynamicGradMode(), torch.amp.autocast(
             current_platform.device_type, dtype=torch.bfloat16
         ):
             if type(prompts) is str:

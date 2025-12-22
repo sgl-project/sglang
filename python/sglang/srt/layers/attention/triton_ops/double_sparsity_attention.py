@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import DynamicGradMode, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -188,7 +188,7 @@ def _fwd_kernel_flash_decode_stage2(
     return
 
 
-@torch.no_grad()
+@DynamicGradMode()
 def flash_decode_stage1(
     q,
     k,
@@ -251,7 +251,7 @@ def flash_decode_stage1(
     return
 
 
-@torch.no_grad()
+@DynamicGradMode()
 def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
     Lk = mid_out.shape[-1]
     assert Lk in {16, 32, 64, 128}
@@ -609,7 +609,7 @@ def sparse_flash_decode_stage1(
     )
 
 
-@torch.no_grad()
+@DynamicGradMode()
 def sparse_flash_decode_stage2(
     q,
     k,
@@ -670,7 +670,7 @@ def sparse_flash_decode_stage2(
     return
 
 
-@torch.no_grad()
+@DynamicGradMode()
 def sparse_flash_decode_stage3(Seqlen, mid_out, mid_out_logexpsum, O, block_seq):
     Lk = mid_out.shape[-1]
     assert Lk in {16, 32, 64, 128}

@@ -53,7 +53,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import logger
+from sglang.srt.utils import DynamicGradMode, logger
 
 try:
     from transformers import LogitsWarper
@@ -379,7 +379,7 @@ class DVAE(nn.Module):
             R=2,
         )
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def forward(
         self, inp: torch.Tensor, mode: Literal["encode", "decode"] = "decode"
     ) -> torch.Tensor:
@@ -603,7 +603,7 @@ class ConditionalChatTTS(PreTrainedModel):
         model = LlamaModel(model_config)
         self.model = model
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def merge_inputs_embeds(
         self,
         input_ids: torch.Tensor,
@@ -649,7 +649,7 @@ class ConditionalChatTTS(PreTrainedModel):
 
         return inputs_embeds
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def prefill_text(
         self,
         input_ids: torch.Tensor,
@@ -721,7 +721,7 @@ class ConditionalChatTTS(PreTrainedModel):
 
         return past_key_values
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def prefill_audio_ids(
         self,
         input_ids: torch.Tensor,
@@ -781,7 +781,7 @@ class ConditionalChatTTS(PreTrainedModel):
         past_key_values = outputs.past_key_values
         return past_key_values
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -1049,7 +1049,7 @@ class ConditionalChatTTS(PreTrainedModel):
             finished=finish.all(),
         )
 
-    @torch.inference_mode()
+    @DynamicGradMode()
     def decode_to_mel_specs(
         self,
         result_list: List[torch.Tensor],

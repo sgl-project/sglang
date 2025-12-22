@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs, flatten_nested_
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import DynamicGradMode, add_prefix
 
 
 class LlavaVidForCausalLM(nn.Module):
@@ -105,7 +105,7 @@ class LlavaVidForCausalLM(nn.Module):
 
         return image_features
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.LongTensor,

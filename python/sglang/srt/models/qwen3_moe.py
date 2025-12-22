@@ -68,6 +68,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    DynamicGradMode,
     add_prefix,
     is_cuda,
     is_flashinfer_available,
@@ -925,7 +926,7 @@ class Qwen3MoeForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -953,7 +954,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_split_prefill(
         self,
         input_ids: torch.Tensor,

@@ -3,7 +3,7 @@ import logging
 import torch
 import triton
 
-from sglang.srt.utils import ceil_div, is_cuda
+from sglang.srt.utils import DynamicGradMode, ceil_div, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -711,7 +711,7 @@ def _fwd_kernel_ep_scatter_2(
 
 
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
-@torch.no_grad()
+@DynamicGradMode()
 def ep_scatter(
     recv_x: torch.Tensor,
     recv_x_scale: torch.Tensor,
@@ -853,7 +853,7 @@ def _fwd_kernel_ep_gather(
         )
 
 
-@torch.no_grad()
+@DynamicGradMode()
 def ep_gather(
     input_tensor: torch.Tensor,
     recv_topk_ids: torch.Tensor,
