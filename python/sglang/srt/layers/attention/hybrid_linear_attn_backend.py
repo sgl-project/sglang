@@ -1366,8 +1366,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         # boolean indexing like tensor[mask] internally calls aten::nonzero which triggers
         # cudaStreamSynchronize. when the caller guarantees all accepted_steps >= 0 (e.g. V2 path
         # with idle/empty batches already filtered out), we can skip masking entirely.
-        # acc check is fine. TODO: understand if this overshadows gains from spec v2 alone?, but
-        # in this case it is bounded to spec v2 functionality (as shown by tests of main, branch, v2, non v2)
+        # this improvement is limited to apply on spec v2, could not improve spec non
+        # v2 in the same way (because of condition for skip_mask)
         if skip_masking:
             dst_state_indices = state_indices_tensor.to(torch.int64)
             src_state_indices = intermediate_state_indices.to(torch.int64)
