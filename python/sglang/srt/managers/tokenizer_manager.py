@@ -2071,6 +2071,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if (
             self.server_args.dp_size == 1
             or self.server_args.load_balance_method == "round_robin"
+            or self.server_args.load_balance_method == "decode_round_robin"
         ):
             return
 
