@@ -712,7 +712,7 @@ class NativeSparseAttnBackend(
 
     def _pad_nsa_cache_seqlens(self, forward_batch: ForwardBatch, nsa_cache_seqlens):
         attn_tp_size = get_attention_tp_size()
-        if attn_tp_size == 1 or not can_nsa_prefill_cp_mode1(forward_batch):
+        if attn_tp_size == 1 and not can_nsa_prefill_cp_mode1(forward_batch):
             return nsa_cache_seqlens
         tokens = sum(forward_batch.extend_seq_lens_cpu)
         pad_len = (tokens - 1) // attn_tp_size + 1 - nsa_cache_seqlens.shape[0]
@@ -1350,13 +1350,7 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
-        nsa_prefill_impl = (
-            self.nsa_prefill_impl
-            if not forward_batch.forward_mode.is_target_verify()
-            else self.nsa_decode_impl
-        )
-
-        if nsa_prefill_impl == "tilelang":
+        if self.nsa_prefill_impl == "tilelang":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
@@ -1366,7 +1360,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif nsa_prefill_impl == "flashmla_sparse":
+        elif self.nsa_prefill_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
 
@@ -1392,7 +1386,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif nsa_prefill_impl == "flashmla_kv":
+        elif self.nsa_prefill_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
@@ -1405,7 +1399,7 @@ class NativeSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif nsa_prefill_impl == "fa3":
+        elif self.nsa_prefill_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -1421,7 +1415,7 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
         else:
-            raise ValueError(f"Unsupported {nsa_prefill_impl = }")
+            raise ValueError(f"Unsupported {self.nsa_prefill_impl = }")
 
     def forward_decode(
         self,
