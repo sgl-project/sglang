@@ -112,7 +112,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
-        self.is_mult_layer_eagle = is_multi_layer_eagle
+        self.is_multi_layer_eagle = is_multi_layer_eagle
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
