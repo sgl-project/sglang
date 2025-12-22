@@ -23,10 +23,8 @@ from typing import List
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
-    ONE_GPU_CASES_A,
-    ONE_GPU_CASES_B,
-    TWO_GPU_CASES_A,
-    TWO_GPU_CASES_B,
+    ONE_GPU_CASES,
+    TWO_GPU_CASES,
     DiffusionTestCase,
 )
 
@@ -34,22 +32,20 @@ logger = init_logger(__name__)
 
 # Suite definitions using DiffusionTestCase lists
 SUITES = {
-    "1-gpu": ONE_GPU_CASES_A + ONE_GPU_CASES_B,
-    "2-gpu": TWO_GPU_CASES_A + TWO_GPU_CASES_B,
+    "1-gpu": ONE_GPU_CASES,
+    "2-gpu": TWO_GPU_CASES,
 }
 
 # Mapping from suite to test files
 SUITE_FILES = {
     "1-gpu": [
-        "test_server_a.py",
-        "test_server_b.py",
+        "test_server_1_gpu.py",
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
     ],
     "2-gpu": [
-        "test_server_2_gpu_a.py",
-        "test_server_2_gpu_b.py",
+        "test_server_2_gpu.py",
     ],
 }
 

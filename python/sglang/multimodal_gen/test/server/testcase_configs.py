@@ -89,9 +89,6 @@ class ScenarioConfig:
     expected_e2e_ms: float
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
-    estimated_full_test_time_s: float | None = (
-        None  # 完整测试时间（秒），包含服务器启动
-    )
 
 
 @dataclass
@@ -124,7 +121,6 @@ class BaselineConfig:
                 expected_e2e_ms=float(cfg["expected_e2e_ms"]),
                 expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
                 expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
-                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
             )
 
         return cls(

@@ -30,8 +30,8 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Mapping from suite name to list variable names in testcase_configs.py
 SUITE_LISTS = {
-    "1gpu": ["ONE_GPU_CASES_A", "ONE_GPU_CASES_B"],
-    "2gpu": ["TWO_GPU_CASES_A", "TWO_GPU_CASES_B"],
+    "1gpu": ["ONE_GPU_CASES"],
+    "2gpu": ["TWO_GPU_CASES"],
 }
 
 
@@ -83,7 +83,8 @@ def extract_case_ids_from_list(content: str, list_name: str) -> List[str]:
         return []
 
     # Match DiffusionTestCase("case_id", ...) or DiffusionTestCase('case_id', ...)
-    pattern = r'DiffusionTestCase\(\s*["\'](\w+)["\']'
+    pattern = "DiffusionTestCase\\(\\s*[\"']([^\"']+)[\"']"
+
     matches = re.findall(pattern, list_content)
     return matches
 
