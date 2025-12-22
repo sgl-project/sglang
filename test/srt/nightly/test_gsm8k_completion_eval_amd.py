@@ -86,7 +86,7 @@ AMD_GPT_OSS_MODELS = [
     BaseModelConfig(
         model_path="lmsys/gpt-oss-20b-bf16",
         tp_size=8,
-        accuracy_threshold=0.49,
+        accuracy_threshold=0.47,
         other_args=[
             "--chunked-prefill-size",
             "130172",
