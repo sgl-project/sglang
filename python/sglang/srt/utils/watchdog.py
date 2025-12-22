@@ -27,11 +27,11 @@ class Watchdog:
         return _WatchdogReal(debug_name, watchdog_timeout, soft)
 
     def feed(self):
-        raise NotImplementedError
+        pass
 
     @contextmanager
     def disable(self):
-        raise NotImplementedError
+        yield
 
 
 class _WatchdogReal(Watchdog):
@@ -66,12 +66,7 @@ class _WatchdogReal(Watchdog):
 
 
 class _WatchdogNoop(Watchdog):
-    def feed(self):
-        pass
-
-    @contextmanager
-    def disable(self):
-        yield
+    pass
 
 
 class WatchdogRaw:
