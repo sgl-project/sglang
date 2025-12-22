@@ -106,7 +106,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_H200=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run common 8-GPU model tests
         if: always()
@@ -117,7 +117,7 @@ jobs:
           GPU_CONFIG: "8-gpu-h200"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
+          IS_H200=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
 
       - name: Run test
         timeout-minutes: 30
@@ -125,7 +125,7 @@ jobs:
           GPU_CONFIG: "8-gpu-h200"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
+          IS_H200=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
 
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
