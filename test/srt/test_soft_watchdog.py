@@ -36,6 +36,8 @@ class BaseTestSoftWatchdog(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        cls.stdout.close()
+        cls.stderr.close()
 
     def test_watchdog_triggers(self):
         requests.post(
