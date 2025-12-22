@@ -576,17 +576,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
         role = data["role"]
-        attn_tp_size = data["attn_tp_size"]
-        attn_tp_rank = data["attn_tp_rank"]
-        attn_dp_size = data["attn_dp_size"]
-        attn_dp_rank = data["attn_dp_rank"]
-        pp_size = data["pp_size"]
-        pp_rank = data["pp_rank"]
-        system_dp_size = data["system_dp_size"]
-        system_dp_rank = data["system_dp_rank"]
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         bootstrap_room = int(data["bootstrap_room"])
+        attn_dp_rank = data["attn_dp_rank"]
 
         # Use real bootstrap_room id to put prefill dp rank
         if bootstrap_room != -1:
@@ -599,6 +592,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 }
             logger.debug(f"register bootstrap_room table {bootstrap_room=}")
             return web.Response(text="OK", status=200)
+
+        attn_tp_size = data["attn_tp_size"]
+        attn_tp_rank = data["attn_tp_rank"]
+        attn_dp_size = data["attn_dp_size"]
+        pp_size = data["pp_size"]
+        pp_rank = data["pp_rank"]
+        system_dp_size = data["system_dp_size"]
+        system_dp_rank = data["system_dp_rank"]
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
