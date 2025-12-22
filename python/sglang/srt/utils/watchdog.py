@@ -24,7 +24,9 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert test_stuck_time == 0, f"stuck tester can be enabled only if soft watchdog is enabled."
+            assert (
+                test_stuck_time == 0
+            ), f"stuck tester can be enabled only if soft watchdog is enabled."
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,
@@ -61,13 +63,19 @@ class _WatchdogReal(Watchdog):
         )
         logger.info(f"Watchdog {self._raw.debug_name} initialized.")
         if self._test_stuck_time > 0:
-            logger.info(f"Watchdog {self._raw.debug_name} is configured to use {test_stuck_time=}.")
+            logger.info(
+                f"Watchdog {self._raw.debug_name} is configured to use {test_stuck_time=}."
+            )
 
     def feed(self):
         if self._test_stuck_time > 0:
-            logger.info(f"Watchdog {self._raw.debug_name} start deliberately stuck for {self._test_stuck_time}s")
+            logger.info(
+                f"Watchdog {self._raw.debug_name} start deliberately stuck for {self._test_stuck_time}s"
+            )
             time.sleep(self._test_stuck_time)
-            logger.info(f"Watchdog {self._raw.debug_name} end deliberately stuck for {self._test_stuck_time}s")
+            logger.info(
+                f"Watchdog {self._raw.debug_name} end deliberately stuck for {self._test_stuck_time}s"
+            )
 
         self._counter += 1
 
@@ -112,7 +120,9 @@ class WatchdogRaw:
             while True:
                 self._watchdog_once()
         except Exception as e:
-            logger.error(f"{self.debug_name} watchdog thread crashed: {e}", exc_info=True)
+            logger.error(
+                f"{self.debug_name} watchdog thread crashed: {e}", exc_info=True
+            )
 
     def _watchdog_once(self):
         watchdog_last_counter = 0

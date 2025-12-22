@@ -1,5 +1,4 @@
 import io
-import os
 import time
 import unittest
 
@@ -29,7 +28,7 @@ class BaseTestSoftWatchdog:
                 "Qwen/Qwen3-0.6B",
                 DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=("--soft-watchdog-timeout", "90"),
+                other_args=("--soft-watchdog-timeout", "20"),
                 return_stdout_stderr=(cls.stdout, cls.stderr),
             )
 
@@ -51,19 +50,19 @@ class BaseTestSoftWatchdog:
         )
         print("End call /generate API", flush=True)
 
-        time.sleep(180)
+        time.sleep(40)
 
         combined_output = self.stdout.getvalue() + self.stderr.getvalue()
         self.assertIn(self.expected_message, combined_output)
 
 
 class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_DETOKENIZER.override(120)
+    env_override = lambda: envs.SGLANG_TEST_STUCK_DETOKENIZER.override(30)
     expected_message = "DetokenizerManager watchdog timeout"
 
 
 class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_TOKENIZER.override(120)
+    env_override = lambda: envs.SGLANG_TEST_STUCK_TOKENIZER.override(30)
     expected_message = "TokenizerManager watchdog timeout"
 
 
