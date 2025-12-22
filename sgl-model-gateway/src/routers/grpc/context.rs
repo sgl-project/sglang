@@ -166,6 +166,11 @@ pub enum LoadGuards {
         prefill: WorkerLoadGuard,
         decode: WorkerLoadGuard,
     },
+    Triple {
+        encode: WorkerLoadGuard,
+        prefill: WorkerLoadGuard,
+        decode: WorkerLoadGuard,
+    },
 }
 
 impl From<&WorkerSelection> for LoadGuards {
@@ -175,6 +180,15 @@ impl From<&WorkerSelection> for LoadGuards {
                 LoadGuards::Single(WorkerLoadGuard::new(worker.clone()))
             }
             WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
+                prefill: WorkerLoadGuard::new(prefill.clone()),
+                decode: WorkerLoadGuard::new(decode.clone()),
+            },
+            WorkerSelection::Triple {
+                encode,
+                prefill,
+                decode,
+            } => LoadGuards::Triple {
+                encode: WorkerLoadGuard::new(encode.clone()),
                 prefill: WorkerLoadGuard::new(prefill.clone()),
                 decode: WorkerLoadGuard::new(decode.clone()),
             },
@@ -196,6 +210,11 @@ impl LoadGuards {
         let guards = match self {
             LoadGuards::Single(guard) => vec![guard],
             LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
+            LoadGuards::Triple {
+                encode,
+                prefill,
+                decode,
+            } => vec![encode, prefill, decode],
         };
 
         attach_guards_to_response(guards, response)
@@ -389,6 +408,15 @@ impl WorkerSelection {
         match self {
             Self::Single { worker } => worker.record_outcome(success),
             Self::Dual { prefill, decode } => {
+                prefill.record_outcome(success);
+                decode.record_outcome(success);
+            }
+            Self::Triple {
+                encode,
+                prefill,
+                decode,
+            } => {
+                encode.record_outcome(success);
                 prefill.record_outcome(success);
                 decode.record_outcome(success);
             }

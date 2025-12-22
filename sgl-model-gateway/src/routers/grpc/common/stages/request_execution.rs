@@ -96,9 +96,6 @@ impl PipelineStage for RequestExecutionStage {
             mode = ?self.mode,
         );
 
-        // For triple dispatch, we need workers from context
-        let workers = ctx.state.workers.as_ref();
-
         let result = async {
             match self.mode {
                 ExecutionMode::Single => self.execute_single(proto_request, clients, workers).await,
@@ -107,7 +104,8 @@ impl PipelineStage for RequestExecutionStage {
                         .await
                 }
                 ExecutionMode::TripleDispatch => {
-                    self.execute_triple_dispatch(proto_request, clients, workers)
+                    // For triple dispatch, we pass workers as Option since encode worker handling differs
+                    self.execute_triple_dispatch(proto_request, clients, Some(workers))
                         .await
                 }
             }
