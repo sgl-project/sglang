@@ -43,7 +43,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils.watchdog import ProcessWatchdogRaw
+from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,

@@ -15,7 +15,7 @@ from sglang.srt.utils.common import (
     disable_request_logging,
     raise_error_or_warn,
 )
-from sglang.srt.utils.watchdog import ProcessWatchdogRaw
+from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler

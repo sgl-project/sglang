@@ -15,7 +15,7 @@ from sglang.srt.utils.common import pyspy_dump_schedulers
 logger = logging.getLogger(__name__)
 
 
-class ProcessWatchdogRaw:
+class WatchdogRaw:
     def __init__(
         self,
         debug_name: str,
@@ -73,7 +73,7 @@ class ProcessWatchdogRaw:
             self.parent_process.send_signal(signal.SIGQUIT)
 
 
-class ProcessWatchdog:
+class Watchdog:
     def __init__(
         self,
         debug_name: str,
@@ -83,7 +83,7 @@ class ProcessWatchdog:
     ):
         self._counter = 0
         self._active = True
-        self._raw = ProcessWatchdogRaw(
+        self._raw = WatchdogRaw(
             debug_name=debug_name,
             get_counter=lambda: self._counter,
             is_active=lambda: self._active,
