@@ -221,7 +221,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
       - name: Run test
         timeout-minutes: 30
@@ -327,7 +327,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh diffusion
 
       - name: Run sgl-kernel unit tests on B200
         timeout-minutes: 30
@@ -685,7 +685,7 @@ jobs:
 
 
   stage-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu]
+    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -721,8 +721,8 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          cd test/srt
-          IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200-stage-b --timeout-per-file 1800
+          cd test
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200
 
 
   unit-test-backend-2-gpu:
