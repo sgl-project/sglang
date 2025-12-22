@@ -24,7 +24,6 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.fp8 import Fp8KVCacheMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
