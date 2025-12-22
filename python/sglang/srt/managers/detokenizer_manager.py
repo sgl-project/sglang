@@ -43,7 +43,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils.watchdog import ProcessWatchdog
+from sglang.srt.utils.watchdog import ProcessWatchdogRaw
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -370,7 +370,7 @@ def run_detokenizer_process(
         manager = detokenizer_manager_class(server_args, port_args)
 
         if (timeout := server_args.soft_watchdog_timeout) is not None:
-            ProcessWatchdog(
+            ProcessWatchdogRaw(
                 debug_name="DetokenizerManager",
                 get_counter=lambda: manager.process_ct,
                 is_active=lambda: manager.is_processing,

@@ -60,7 +60,7 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import ProcessWatchdog
+from sglang.srt.utils.watchdog import ProcessWatchdogRaw
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -557,7 +557,7 @@ def run_data_parallel_controller_process(
         )
 
         if (timeout := server_args.soft_watchdog_timeout) is not None:
-            ProcessWatchdog(
+            ProcessWatchdogRaw(
                 debug_name="DataParallelController",
                 get_counter=lambda: controller.dispatch_ct,
                 is_active=lambda: controller.is_dispatching,

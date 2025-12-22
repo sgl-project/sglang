@@ -111,7 +111,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
-from sglang.srt.utils.watchdog import ProcessWatchdog
+from sglang.srt.utils.watchdog import ProcessWatchdogRaw
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -409,7 +409,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.init_communicators(server_args)
 
         if (timeout := server_args.soft_watchdog_timeout) is not None:
-            ProcessWatchdog(
+            ProcessWatchdogRaw(
                 debug_name="TokenizerManager",
                 get_counter=lambda: self.receive_ct,
                 is_active=lambda: self.is_processing,

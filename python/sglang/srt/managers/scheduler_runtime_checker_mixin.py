@@ -15,7 +15,7 @@ from sglang.srt.utils.common import (
     disable_request_logging,
     raise_error_or_warn,
 )
-from sglang.srt.utils.watchdog import ProcessWatchdog
+from sglang.srt.utils.watchdog import ProcessWatchdogRaw
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -338,7 +338,7 @@ class SchedulerRuntimeCheckerMixin:
 
 def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
-) -> ProcessWatchdog:
+) -> ProcessWatchdogRaw:
     def dump_info() -> str:
         if disable_request_logging():
             return ""
@@ -356,7 +356,7 @@ def create_scheduler_watchdog(
             f"{info_msg}"
         )
 
-    return ProcessWatchdog(
+    return ProcessWatchdogRaw(
         debug_name="Scheduler",
         get_counter=lambda: scheduler.forward_ct,
         is_active=lambda: scheduler.cur_batch is not None,
