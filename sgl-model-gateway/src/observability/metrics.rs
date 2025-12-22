@@ -787,6 +787,15 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record manual policy execution branch
+    pub fn record_policy_manual_branch(branch: &'static str) {
+        counter!(
+            "smg_policy_manual_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
     /// Record worker error
     pub fn record_worker_error(
         worker_type: &'static str,

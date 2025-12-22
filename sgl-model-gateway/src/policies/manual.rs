@@ -10,7 +10,7 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionBranch {
+enum ExecutionBranch {
     NoHealthyWorkers,
     RoutingIdFastPathHit,
     RoutingIdSlowPathOccupiedHit,
@@ -21,7 +21,7 @@ pub enum ExecutionBranch {
 
 impl ExecutionBranch {
     // TODO auto generate
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
             Self::RoutingIdFastPathHit => "routing_id_fast_path_hit",
