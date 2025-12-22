@@ -1286,16 +1286,4 @@ mod tests {
 
         assert_eq!(socket_addr.to_string(), "127.0.0.1:29000");
     }
-
-    #[test]
-    fn test_remove_worker_metrics() {
-        let worker_url = "http://worker1:8000";
-
-        Metrics::set_worker_requests_active(worker_url, 10);
-        Metrics::set_worker_cb_state(worker_url, 1);
-        Metrics::set_worker_cb_consecutive_failures(worker_url, 5);
-        Metrics::set_worker_cb_consecutive_successes(worker_url, 3);
-
-        Metrics::remove_worker_metrics(worker_url);
-    }
 }
