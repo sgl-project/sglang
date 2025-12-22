@@ -54,12 +54,12 @@ class BaseTestSoftWatchdog:
         self.assertIn(self.expected_message, combined_output)
 
 
-class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog):
+class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog, CustomTestCase):
     env_override = envs.SGLANG_TEST_STUCK_DETOKENIZER
     expected_message = "DetokenizerManager watchdog timeout"
 
 
-class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog):
+class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
     env_override = envs.SGLANG_TEST_STUCK_TOKENIZER
     expected_message = "TokenizerManager watchdog timeout"
 
