@@ -3773,3 +3773,65 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+import subprocess
+from functools import lru_cache
+
+import torch
+
+
+@lru_cache(maxsize=1)
+def get_current_device_numa_node() -> int:
+    """
+    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+
+    Executes `nvidia-smi topo -C -i <device_id>` and parses the single-line output.
+    The result is cached since system topology does not change at runtime.
+
+    Returns:
+        int: The NUMA node ID (e.g., 0, 1).
+
+    Raises:
+        RuntimeError: If nvidia-smi fails, is not found, or output cannot be parsed.
+    """
+    device_id = torch.cuda.current_device()
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "topo", "-C", "-i", str(device_id)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("nvidia-smi not found. Ensure NVIDIA drivers are installed.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"nvidia-smi failed (code {e.returncode}): {e.stderr.strip()}"
+        ) from e
+
+    output_line = result.stdout.strip()
+    prefix = "NUMA IDs of closest CPU:"
+
+    if not output_line.startswith(prefix):
+        raise RuntimeError(
+            f"Unexpected nvidia-smi output: '{output_line}'. "
+            f"Expected line starting with '{prefix}'."
+        )
+
+    try:
+        numa_id_str = output_line[len(prefix) :].strip()
+        return int(numa_id_str)
+    except ValueError as e:
+        raise RuntimeError(f"Failed to parse NUMA ID from: '{output_line}'") from e
+
+
+def bind_to_closest_numa_node():
+    """
+    Bind the current process to the NUMA node closest to the active CUDA device.
+
+    Uses `numa` library calls via ctypes to set the CPU affinity of the process.
+    """
+    node_id = get_current_device_numa_node()
+    numa_bind_to_node(node_id)
