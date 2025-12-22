@@ -24,6 +24,7 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
+            assert test_stuck_time == 0
             return _WatchdogNoop()
         return _WatchdogReal(debug_name, watchdog_timeout, soft, test_stuck_time)
 
