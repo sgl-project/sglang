@@ -88,6 +88,7 @@ class RequestFuncInput:
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
+    routing_id: Optional[str] = None
 
 
 @dataclass
@@ -233,6 +234,9 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
+        if request_func_input.routing_id:
+            payload["routing_id"] = request_func_input.routing_id
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -369,6 +373,9 @@ async def async_request_openai_chat_completions(
         if request_func_input.lora_name:
             payload["model"] = request_func_input.lora_name
             payload["lora_path"] = request_func_input.lora_name
+
+        if request_func_input.routing_id:
+            payload["routing_id"] = request_func_input.routing_id
 
         headers = get_auth_headers()
 
@@ -565,6 +572,7 @@ async def async_request_sglang_generate(
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
+            "return_routed_experts": args.return_routed_experts,
             "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
@@ -572,6 +580,9 @@ async def async_request_sglang_generate(
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
+
+        if request_func_input.routing_id:
+            payload["routing_id"] = request_func_input.routing_id
 
         headers = get_auth_headers()
 
@@ -918,13 +929,25 @@ class BenchmarkMetrics:
     max_concurrent_requests: int = 0
 
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 MOONCAKE_DATASET_URL = {
     "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
     "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
     "synthetic": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl",
     "toolagent": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/toolagent_trace.jsonl",
 }
+
+
+def download_and_cache_hf_file(
+    repo_id: str,
+    filename: str,
+    repo_type: str = "dataset",
+):
+    """Download a file from Hugging Face and cache it locally."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
@@ -986,6 +1009,7 @@ class DatasetRow:
     vision_prompt_len: Optional[int] = None
     image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
+    routing_id: Optional[str] = None
 
     def __post_init__(self):
         if self.text_prompt_len is None:
@@ -1171,7 +1195,10 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not is_file_valid_json(dataset_path) and dataset_path == "":
-        dataset_path = download_and_cache_file(SHAREGPT_URL)
+        dataset_path = download_and_cache_hf_file(
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
+        )
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -1283,7 +1310,10 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not is_file_valid_json(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = download_and_cache_hf_file(
+                repo_id=SHAREGPT_REPO_ID,
+                filename=SHAREGPT_FILENAME,
+            )
 
         # Load the dataset.
         with open(dataset_path) as f:
@@ -1631,10 +1661,13 @@ def sample_generated_shared_prefix_requests(
     args: argparse.Namespace,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
+    send_routing_id = getattr(args, "gsp_send_routing_id", False)
+
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
+    should_cache = (range_ratio == 1) and not send_routing_id
 
     # Try to load from cache first
-    if cache_path.exists() and range_ratio == 1:
+    if cache_path.exists() and should_cache:
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
@@ -1643,6 +1676,9 @@ def sample_generated_shared_prefix_requests(
         f"\nGenerating new input data... "
         f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=})"
     )
+
+    run_random_str = uuid.uuid4().hex[:8]
+    run_start_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
     system_prompt_lens = compute_random_lens(
         full_len=system_prompt_len,
@@ -1680,6 +1716,11 @@ def sample_generated_shared_prefix_requests(
 
     for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
+        routing_id = (
+            f"{run_random_str}_{run_start_timestamp}_{group_idx}"
+            if send_routing_id
+            else None
+        )
         for prompt_idx in tqdm(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
@@ -1697,6 +1738,7 @@ def sample_generated_shared_prefix_requests(
                     prompt=full_prompt,
                     prompt_len=prompt_len,
                     output_len=output_lens[flat_index].item(),
+                    routing_id=routing_id,
                 )
             )
             total_input_tokens += prompt_len
@@ -1721,10 +1763,11 @@ def sample_generated_shared_prefix_requests(
         )
 
     # Save to cache
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Caching generated input data to {cache_path}")
-    with open(cache_path, "wb") as f:
-        pickle.dump(input_requests, f)
+    if should_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Caching generated input data to {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(input_requests, f)
 
     return input_requests
 
@@ -2132,6 +2175,7 @@ async def benchmark(
             image_data=request.image_data,
             extra_request_body=extra_request_body,
             timestamp=request.timestamp,
+            routing_id=request.routing_id,
         )
 
         tasks.append(
@@ -2791,6 +2835,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Return logprob.",
     )
+    parser.add_argument(
+        "--return-routed-experts",
+        action="store_true",
+        help="Return routed experts.",
+    )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--disable-ignore-eos",
@@ -2954,6 +3003,11 @@ if __name__ == "__main__":
         "--gsp-fast-prepare",
         action="store_true",
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
+    )
+    group.add_argument(
+        "--gsp-send-routing-id",
+        action="store_true",
+        help="Send routing_id in requests. Requests with the same prefix share the same routing_id.",
     )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
