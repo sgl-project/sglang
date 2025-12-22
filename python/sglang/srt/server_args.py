@@ -109,7 +109,7 @@ QUANTIZATION_CHOICES = [
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
-    "int4fp8_moe",
+    "quark_int4fp8_moe",
 ]
 
 ATTENTION_BACKEND_CHOICES = [

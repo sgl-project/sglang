@@ -23,8 +23,8 @@ class TestMixtralAccuracy(CustomTestCase):
             "--context-length",
             "38768",
             "--quantization",
-            "int4fp8_moe",
-            # The default aiter attention backend raises segmentation faults and other errors - as int4fp8_moe is not related to attention, let's just use triton here.
+            "quark_int4fp8_moe",
+            # The default aiter attention backend raises segmentation faults and other errors - as quark_int4fp8_moe is not related to attention, let's just use triton here.
             "--attention-backend",
             "triton",
         ]

@@ -672,7 +672,7 @@ class ModelConfig:
             "quark",
             "mxfp4",
             "auto-round",
-            "int4fp8_moe",
+            "quark_int4fp8_moe",
         ]
         optimized_quantization_methods = [
             "fp8",

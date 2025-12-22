@@ -92,7 +92,7 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
         "compressed-tensors",
         "gptq_marlin",
         "awq_marlin",
-        "int4fp8_moe",
+        "quark_int4fp8_moe",
     ]
 
     if (
