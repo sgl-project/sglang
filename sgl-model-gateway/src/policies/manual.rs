@@ -62,7 +62,7 @@ impl ManualPolicy {
                 }
                 let selected_idx = random_select(healthy_indices);
                 let urls = &mut entry.get_mut().worker_urls;
-                if urls.len() >= MAX_CANDIDATE_WORKERS {
+                while urls.len() >= MAX_CANDIDATE_WORKERS {
                     urls.remove(0);
                 }
                 urls.push(workers[selected_idx].url().to_string());
