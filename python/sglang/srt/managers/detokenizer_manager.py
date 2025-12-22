@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -111,13 +112,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         )
 
+        self.watchdog = Watchdog.create(
+            debug_name="DetokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+        )
+
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            with self.watchdog.disable():
+                recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+            self.watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
