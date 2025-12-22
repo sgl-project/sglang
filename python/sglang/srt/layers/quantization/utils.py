@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
-
+import fnmatch
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 
 if TYPE_CHECKING:
@@ -93,7 +93,7 @@ def is_layer_skipped(
                 is_skipped = True
         elif "experts" in prefix:
             # Check if any ignored pattern contains this prefix (specific logic for experts)
-            # We adapt it to use strict string containment as before, 
+            # We adapt it to use strict string containment as before,
             # or we can rely on _is_ignored if the user uses wildcards.
             # Preserving original logic structure for safety but cleaning it up.
             experts_skipped = any(
