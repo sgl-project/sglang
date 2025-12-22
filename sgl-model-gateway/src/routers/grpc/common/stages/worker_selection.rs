@@ -61,16 +61,18 @@ impl PipelineStage for WorkerSelectionStage {
 
         // For Harmony, use selection_text produced during Harmony encoding
         // Otherwise, use original_text from regular preparation
-        let text = if prep.harmony_mode {
-            prep.selection_text.as_deref()
-        } else {
-            prep.original_text.as_deref()
+        let info = SelectWorkerInfo {
+            request_text: if prep.harmony_mode {
+                prep.selection_text.as_deref()
+            } else {
+                prep.original_text.as_deref()
+            },
+            routing_id: prep.routing_id.as_deref(),
         };
-        let routing_id = prep.routing_id.as_deref();
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(ctx.input.model_id.as_deref(), text, routing_id) {
+                match self.select_single_worker(ctx.input.model_id.as_deref(), &info) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         error!(
@@ -87,7 +89,7 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, routing_id) {
+                match self.select_pd_pair(ctx.input.model_id.as_deref(), &info) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
                         error!(
@@ -121,8 +123,7 @@ impl WorkerSelectionStage {
     fn select_single_worker(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
-        routing_id: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
@@ -148,11 +149,7 @@ impl WorkerSelectionStage {
         };
 
         // Select worker using the policy
-        let info = SelectWorkerInfo {
-            request_text: text,
-            routing_id,
-        };
-        let idx = policy.select_worker(&available, &info)?;
+        let idx = policy.select_worker(&available, info)?;
         let selected = available[idx].clone();
 
         // Record worker selection metric
@@ -169,8 +166,7 @@ impl WorkerSelectionStage {
     fn select_pd_pair(
         &self,
         model_id: Option<&str>,
-        text: Option<&str>,
-        routing_id: Option<&str>,
+        info: &SelectWorkerInfo,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -210,12 +206,8 @@ impl WorkerSelectionStage {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let info = SelectWorkerInfo {
-            request_text: text,
-            routing_id,
-        };
-        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
-        let decode_idx = policy.select_worker(&available_decode, &info)?;
+        let prefill_idx = policy.select_worker(&available_prefill, info)?;
+        let decode_idx = policy.select_worker(&available_decode, info)?;
 
         let model = model_id.unwrap_or("default");
         let policy_name = policy.name();
