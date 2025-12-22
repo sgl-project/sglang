@@ -10,7 +10,7 @@ use super::PipelineStage;
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     observability::metrics::{metrics_labels, Metrics},
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         error,
         grpc::context::{RequestContext, WorkerSelection},
@@ -148,7 +148,11 @@ impl WorkerSelectionStage {
         };
 
         // Select worker using the policy
-        let idx = policy.select_worker(&available, text, routing_id)?;
+        let info = SelectWorkerInfo {
+            request_text: text,
+            routing_id,
+        };
+        let idx = policy.select_worker(&available, &info)?;
         let selected = available[idx].clone();
 
         // Record worker selection metric
@@ -206,8 +210,12 @@ impl WorkerSelectionStage {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let prefill_idx = policy.select_worker(&available_prefill, text, routing_id)?;
-        let decode_idx = policy.select_worker(&available_decode, text, routing_id)?;
+        let info = SelectWorkerInfo {
+            request_text: text,
+            routing_id,
+        };
+        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
+        let decode_idx = policy.select_worker(&available_decode, &info)?;
 
         let model = model_id.unwrap_or("default");
         let policy_name = policy.name();

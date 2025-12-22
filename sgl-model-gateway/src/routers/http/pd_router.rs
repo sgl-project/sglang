@@ -788,8 +788,12 @@ impl PDRouter {
             ));
         }
 
+        let info = crate::policies::SelectWorkerInfo {
+            request_text,
+            routing_id,
+        };
         let selected_idx = policy
-            .select_worker(&available_workers, request_text, routing_id)
+            .select_worker(&available_workers, &info)
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",

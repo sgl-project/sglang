@@ -156,7 +156,11 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text, routing_id)?;
+        let info = crate::policies::SelectWorkerInfo {
+            request_text: text,
+            routing_id,
+        };
+        let idx = policy.select_worker(&available, &info)?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
