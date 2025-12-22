@@ -376,7 +376,6 @@ class Gemma3RotaryEmbedding(nn.Module):
                 "rope_type", config.rope_scaling.get("type", "default")
             )
 
-
         else:
             self.rope_type = "default"
 
